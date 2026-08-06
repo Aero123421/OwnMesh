@@ -42,6 +42,11 @@ pub enum Commands {
     Doctor,
     /// Emergency lockdown of the local agent.
     Lockdown,
+    /// Lift emergency lockdown (local recovery).
+    Unlock,
+    /// Local / control-plane token controls.
+    #[command(subcommand)]
+    Tokens(TokensCmd),
     /// Configuration helpers.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -214,6 +219,15 @@ pub struct ExecArgs {
     /// Working directory.
     #[arg(long)]
     pub cwd: Option<String>,
+    /// Idempotency key to suppress duplicate execution.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    /// Invoke via platform shell (`cmd.exe /C` or `sh -c`).
+    #[arg(long)]
+    pub raw_shell: bool,
+    /// Timeout in milliseconds.
+    #[arg(long)]
+    pub timeout_ms: Option<u64>,
     /// Command and arguments.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
@@ -354,6 +368,12 @@ pub enum ApprovalCmd {
     Approve {
         /// Approval id.
         id: String,
+        /// Also issue a temporary capability grant.
+        #[arg(long)]
+        grant: bool,
+        /// Temporary grant lifetime in seconds (with `--grant`).
+        #[arg(long, default_value_t = 3600)]
+        grant_seconds: i64,
     },
     /// Deny a request.
     Deny {
@@ -471,6 +491,17 @@ pub enum McpCmd {
         /// Use stdio transport.
         #[arg(long)]
         stdio: bool,
+    },
+}
+
+/// `ownmesh tokens` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum TokensCmd {
+    /// Revoke tokens for a client label (e.g. chatgpt).
+    Revoke {
+        /// Client label to revoke.
+        #[arg(long)]
+        client: String,
     },
 }
 

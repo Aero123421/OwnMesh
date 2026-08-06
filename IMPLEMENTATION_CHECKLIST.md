@@ -91,41 +91,41 @@
 
 ## 6. Command、Process、Filesystem、Logs
 
-- [ ] structured command execution
-- [ ] raw shell execution
-- [ ] environment と working directory
-- [ ] timeout、cancel、process tree kill
-- [ ] stdout/stderr 分離
-- [ ] bounded output と local spool
-- [ ] idempotency journal
-- [ ] file list/stat/search/read/write/delete
-- [ ] hash-checked patch apply
-- [ ] canonical path と symlink/junction/reparse-point test
+- [x] structured command execution
+- [x] raw shell execution
+- [x] environment と working directory
+- [x] timeout、cancel、process tree kill
+- [x] stdout/stderr 分離
+- [x] bounded output と local spool
+- [x] idempotency journal
+- [x] file list/stat/search/read/write/delete
+- [x] hash-checked patch apply
+- [x] canonical path と symlink/junction/reparse-point test
 - [ ] Git status/diff
 - [ ] Windows Event Log provider
 - [ ] journald/systemd provider
 - [ ] Docker/process/file log providers
-- [ ] cursor-based log query
+- [x] cursor-based log query
 
 **完了条件:** 3 OS で generic command と file/log 操作が同じ契約で動き、重複 operation が再実行されない。
 
 ## 7. Policy、Approval、Full Access
 
-- [ ] allow / ask / deny evaluator
-- [ ] cloud policy と local policy の合成
-- [ ] rule priority と deny > ask > allow
-- [ ] operation facts classifier
-- [ ] Recommended preset
-- [ ] Workspace Only preset
-- [ ] Full User Access preset
-- [ ] Full Access preset
+- [x] allow / ask / deny evaluator
+- [x] cloud policy と local policy の合成
+- [x] rule priority と deny > ask > allow
+- [x] operation facts classifier
+- [x] Recommended preset
+- [x] Workspace Only preset
+- [x] Full User Access preset
+- [x] Full Access preset
 - [ ] Custom policy editor API
-- [ ] temporary grant と scope
+- [x] temporary grant と scope
 - [ ] TUI approval queue
-- [ ] CLI approval commands
+- [x] CLI approval commands
 - [ ] one-time browser approval page
-- [ ] lockdown / unlock / token revoke
-- [ ] Full Access に隠れた hard deny がないことを conformance test
+- [x] lockdown / unlock / token revoke
+- [x] Full Access に隠れた hard deny がないことを conformance test
 
 **完了条件:** ユーザーが全 allow を選択した場合は追加確認なしで実行され、ask rule の場合だけ明示承認が必要になる。
 

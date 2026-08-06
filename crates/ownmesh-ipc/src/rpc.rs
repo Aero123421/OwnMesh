@@ -16,6 +16,46 @@ pub mod methods {
     pub const STATUS: &str = "daemon.status";
     /// Graceful ping used by reconnect probes.
     pub const PING: &str = "ipc.ping";
+
+    /// Structured / raw command execution (policy-gated).
+    pub const OPS_EXEC: &str = "ops.exec";
+    /// Filesystem list.
+    pub const OPS_FS_LIST: &str = "ops.fs.list";
+    /// Filesystem stat.
+    pub const OPS_FS_STAT: &str = "ops.fs.stat";
+    /// Filesystem read.
+    pub const OPS_FS_READ: &str = "ops.fs.read";
+    /// Filesystem write.
+    pub const OPS_FS_WRITE: &str = "ops.fs.write";
+    /// Filesystem delete.
+    pub const OPS_FS_DELETE: &str = "ops.fs.delete";
+    /// Log query.
+    pub const OPS_LOGS_QUERY: &str = "ops.logs.query";
+
+    /// List pending / recent approvals.
+    pub const APPROVAL_LIST: &str = "approval.list";
+    /// Show one approval.
+    pub const APPROVAL_SHOW: &str = "approval.show";
+    /// Approve a pending request (may execute + temporary grant).
+    pub const APPROVAL_APPROVE: &str = "approval.approve";
+    /// Deny a pending request.
+    pub const APPROVAL_DENY: &str = "approval.deny";
+
+    /// Show effective policy.
+    pub const POLICY_SHOW: &str = "policy.show";
+    /// Select built-in preset.
+    pub const POLICY_PRESET: &str = "policy.preset";
+    /// Validate policy document.
+    pub const POLICY_VALIDATE: &str = "policy.validate";
+    /// Explain a decision for facts.
+    pub const POLICY_EXPLAIN: &str = "policy.explain";
+
+    /// Emergency lockdown (deny new ops; local unlock remains).
+    pub const DAEMON_LOCKDOWN: &str = "daemon.lockdown";
+    /// Lift lockdown.
+    pub const DAEMON_UNLOCK: &str = "daemon.unlock";
+    /// Revoke a local token / client label.
+    pub const TOKEN_REVOKE: &str = "token.revoke";
 }
 
 /// Correlation identifier for a single request/response pair.
@@ -221,4 +261,12 @@ pub mod app_error {
     pub const INVALID_PARAMS: i64 = -32_602;
     /// Internal error.
     pub const INTERNAL: i64 = -32_603;
+    /// Policy deny.
+    pub const POLICY_DENIED: i64 = -32_010;
+    /// Emergency lockdown active.
+    pub const LOCKDOWN: i64 = -32_011;
+    /// Token / client revoked.
+    pub const TOKEN_REVOKED: i64 = -32_012;
+    /// Conflict (e.g. approval already decided).
+    pub const CONFLICT: i64 = -32_013;
 }

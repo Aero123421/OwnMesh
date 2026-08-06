@@ -9,6 +9,7 @@
 )]
 
 mod daemon;
+mod runtime;
 
 use clap::{Parser, Subcommand};
 use ownmesh_domain::ExitCode;

@@ -55,6 +55,9 @@ mod tests {
             "privileged",
             "completion",
             "approval",
+            "lockdown",
+            "unlock",
+            "tokens",
         ] {
             assert!(help.contains(needle), "missing {needle} in help/registration");
         }
@@ -77,6 +80,8 @@ mod tests {
             vec!["ownmesh", "logout"],
             vec!["ownmesh", "doctor"],
             vec!["ownmesh", "lockdown"],
+            vec!["ownmesh", "unlock"],
+            vec!["ownmesh", "tokens", "revoke", "--client", "chatgpt"],
             vec!["ownmesh", "setup"],
             vec!["ownmesh", "config", "validate"],
             vec!["ownmesh", "config", "get", "lang"],
@@ -122,6 +127,7 @@ mod tests {
             vec!["ownmesh", "approval", "list"],
             vec!["ownmesh", "approval", "show", "apr_x"],
             vec!["ownmesh", "approval", "approve", "apr_x"],
+            vec!["ownmesh", "approval", "approve", "apr_x", "--grant"],
             vec!["ownmesh", "approval", "deny", "apr_x"],
             vec!["ownmesh", "approval", "watch"],
             vec!["ownmesh", "policy", "show"],

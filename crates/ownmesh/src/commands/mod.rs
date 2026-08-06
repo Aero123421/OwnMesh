@@ -1,11 +1,15 @@
-//! Command dispatch. Bodies for most subcommands are stubs until later chapters.
+//! Command dispatch.
 
+mod approval;
+mod exec;
+mod ipc_util;
+mod lockdown;
+mod policy_cmd;
 mod status;
 
 use crate::cli::{
-    ApprovalCmd, Cli, Commands, ConfigCmd, DeviceCmd, InstanceCmd, McpCmd, PolicyCmd,
-    PrivilegedCmd, ProcessCmd, ProfileCmd, ServiceCmd, SessionCmd, TransferCmd, UpdateCmd,
-    WorkspaceCmd,
+    Cli, Commands, ConfigCmd, DeviceCmd, InstanceCmd, McpCmd, PrivilegedCmd, ProcessCmd,
+    ProfileCmd, ServiceCmd, SessionCmd, TransferCmd, UpdateCmd, WorkspaceCmd,
 };
 use ownmesh_domain::ExitCode;
 use serde_json::json;
@@ -28,23 +32,19 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         ),
         Some(Commands::Logout) => stub(cli, "logout", "Logout arrives with OAuth in chapter 5."),
         Some(Commands::Doctor) => stub(cli, "doctor", "Doctor diagnostics expand in later chapters."),
-        Some(Commands::Lockdown) => {
-            stub(cli, "lockdown", "Emergency lockdown arrives with policy chapter.")
-        }
+        Some(Commands::Lockdown) => lockdown::run_lockdown(cli),
+        Some(Commands::Unlock) => lockdown::run_unlock(cli),
+        Some(Commands::Tokens(cmd)) => lockdown::dispatch_tokens(cli, cmd),
         Some(Commands::Config(cmd)) => dispatch_config(cli, cmd),
         Some(Commands::Instance(cmd)) => dispatch_instance(cli, cmd),
         Some(Commands::Device(cmd)) => dispatch_device(cli, cmd),
         Some(Commands::Workspace(cmd)) => dispatch_workspace(cli, cmd),
-        Some(Commands::Exec(args)) => stub(
-            cli,
-            "exec",
-            &format!("exec {:?} (chapter 6)", args.command),
-        ),
+        Some(Commands::Exec(args)) => exec::run_exec(cli, args),
         Some(Commands::Process(cmd)) => dispatch_process(cli, cmd),
         Some(Commands::Session(cmd)) => dispatch_session(cli, cmd),
         Some(Commands::Profile(cmd)) => dispatch_profile(cli, cmd),
-        Some(Commands::Approval(cmd)) => dispatch_approval(cli, cmd),
-        Some(Commands::Policy(cmd)) => dispatch_policy(cli, cmd),
+        Some(Commands::Approval(cmd)) => approval::dispatch_approval(cli, cmd),
+        Some(Commands::Policy(cmd)) => policy_cmd::dispatch_policy(cli, cmd),
         Some(Commands::Transfer(cmd)) => dispatch_transfer(cli, cmd),
         Some(Commands::Service(cmd)) => dispatch_service(cli, cmd),
         Some(Commands::Privileged(cmd)) => dispatch_privileged(cli, cmd),
@@ -200,26 +200,6 @@ fn dispatch_profile(cli: &Cli, cmd: &ProfileCmd) -> Result<(), ExitCode> {
         ProfileCmd::Resume { id, native_id } => {
             stub(cli, "profile resume", &format!("{id} {native_id}"))
         }
-    }
-}
-
-fn dispatch_approval(cli: &Cli, cmd: &ApprovalCmd) -> Result<(), ExitCode> {
-    match cmd {
-        ApprovalCmd::List => stub(cli, "approval list", "chapter 7"),
-        ApprovalCmd::Show { id } => stub(cli, "approval show", id),
-        ApprovalCmd::Approve { id } => stub(cli, "approval approve", id),
-        ApprovalCmd::Deny { id } => stub(cli, "approval deny", id),
-        ApprovalCmd::Watch => stub(cli, "approval watch", "chapter 7"),
-    }
-}
-
-fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
-    match cmd {
-        PolicyCmd::Show => stub(cli, "policy show", "chapter 7"),
-        PolicyCmd::Preset { name } => stub(cli, "policy preset", name),
-        PolicyCmd::Rule { spec } => stub(cli, "policy rule", spec),
-        PolicyCmd::Validate => stub(cli, "policy validate", "chapter 7"),
-        PolicyCmd::Explain { query } => stub(cli, "policy explain", query),
     }
 }
 

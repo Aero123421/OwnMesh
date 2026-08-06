@@ -1601,6 +1601,7 @@ dependencies = [
  "ownmesh-domain",
  "ownmesh-identity",
  "ownmesh-ipc",
+ "ownmesh-policy",
  "ownmesh-protocol",
  "rand 0.8.7",
  "reqwest",
@@ -1857,13 +1858,19 @@ dependencies = [
  "clap",
  "ownmesh-config",
  "ownmesh-domain",
+ "ownmesh-exec",
+ "ownmesh-fs",
  "ownmesh-identity",
  "ownmesh-ipc",
+ "ownmesh-logs",
+ "ownmesh-policy",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

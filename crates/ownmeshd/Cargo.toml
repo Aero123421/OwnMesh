@@ -21,8 +21,13 @@ workspace = true
 clap = { version = "4.5.27", features = ["derive", "env", "wrap_help"] }
 ownmesh-config = { path = "../ownmesh-config" }
 ownmesh-domain = { path = "../ownmesh-domain" }
+ownmesh-exec = { path = "../ownmesh-exec" }
+ownmesh-fs = { path = "../ownmesh-fs" }
 ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
+ownmesh-logs = { path = "../ownmesh-logs" }
+ownmesh-policy = { path = "../ownmesh-policy" }
+serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 tokio = { version = "1.43.0", features = [
     "fs",
@@ -36,6 +41,7 @@ tokio = { version = "1.43.0", features = [
 ] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+uuid = { version = "1.12.1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.15.0"
