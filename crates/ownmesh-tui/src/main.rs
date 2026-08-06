@@ -8,6 +8,7 @@
     clippy::must_use_candidate
 )]
 
+mod i18n;
 mod terminal;
 
 use clap::Parser;

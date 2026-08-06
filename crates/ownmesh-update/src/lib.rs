@@ -1,6 +1,10 @@
 //! OwnMesh update channels, manifests, and verification.
 //!
-//! Chapter 0 skeleton — signed release flows arrive later.
+//! Telemetry and auto-phone-home are off by default.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
 #[must_use]
@@ -14,13 +18,170 @@ pub const fn crate_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Update errors.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum UpdateError {
+    #[error("updates disabled")]
+    Disabled,
+    #[error("signature invalid")]
+    BadSignature,
+    #[error("checksum mismatch")]
+    BadChecksum,
+    #[error("channel unknown: {0}")]
+    UnknownChannel(String),
+    #[error("protocol incompatible: {0}")]
+    ProtocolIncompatible(String),
+}
+
+pub type UpdateResult<T> = Result<T, UpdateError>;
+
+/// Update mode — default off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    #[default]
+    Off,
+    Check,
+    Notify,
+    Download,
+    Auto,
+}
+
+/// Release channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    Stable,
+    Beta,
+    Nightly,
+}
+
+/// Local update settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSettings {
+    #[serde(default)]
+    pub mode: UpdateMode,
+    #[serde(default = "default_channel")]
+    pub channel: UpdateChannel,
+    /// OwnMesh project telemetry — must default false.
+    #[serde(default)]
+    pub telemetry_enabled: bool,
+    #[serde(default)]
+    pub crash_reports_opt_in: bool,
+}
+
+fn default_channel() -> UpdateChannel {
+    UpdateChannel::Stable
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            mode: UpdateMode::Off,
+            channel: UpdateChannel::Stable,
+            telemetry_enabled: false,
+            crash_reports_opt_in: false,
+        }
+    }
+}
+
+/// Remote manifest entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateManifest {
+    pub version: String,
+    pub channel: UpdateChannel,
+    pub url: String,
+    pub sha256: String,
+    /// hex-encoded signature over `version|url|sha256` (demo scheme).
+    pub signature: String,
+    pub min_protocol: u32,
+    pub max_protocol: u32,
+}
+
+/// Verify checksum bytes.
+pub fn verify_checksum(data: &[u8], expected_hex: &str) -> UpdateResult<()> {
+    let mut h = Sha256::new();
+    h.update(data);
+    let actual = hex::encode(h.finalize());
+    if actual != expected_hex {
+        return Err(UpdateError::BadChecksum);
+    }
+    Ok(())
+}
+
+/// Demo signature: sha256(secret || payload). Production uses real signing keys (see ADR).
+pub fn sign_manifest_payload(secret: &[u8], manifest: &UpdateManifest) -> String {
+    let payload = format!(
+        "{}|{}|{}",
+        manifest.version, manifest.url, manifest.sha256
+    );
+    let mut h = Sha256::new();
+    h.update(secret);
+    h.update(payload.as_bytes());
+    hex::encode(h.finalize())
+}
+
+pub fn verify_signature(secret: &[u8], manifest: &UpdateManifest) -> UpdateResult<()> {
+    let expected = sign_manifest_payload(secret, manifest);
+    if expected != manifest.signature {
+        return Err(UpdateError::BadSignature);
+    }
+    Ok(())
+}
+
+pub fn check_protocol(manifest: &UpdateManifest, local_protocol: u32) -> UpdateResult<()> {
+    if local_protocol < manifest.min_protocol || local_protocol > manifest.max_protocol {
+        return Err(UpdateError::ProtocolIncompatible(format!(
+            "local={local_protocol} range={}..{}",
+            manifest.min_protocol, manifest.max_protocol
+        )));
+    }
+    Ok(())
+}
+
+/// Whether any network check is permitted under settings.
+#[must_use]
+pub fn network_check_allowed(settings: &UpdateSettings) -> bool {
+    !matches!(settings.mode, UpdateMode::Off)
+}
+
+/// Privacy guarantees for tests.
+#[must_use]
+pub fn default_sends_nothing_to_vendor(settings: &UpdateSettings) -> bool {
+    !settings.telemetry_enabled && !settings.crash_reports_opt_in && settings.mode == UpdateMode::Off
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn crate_metadata_is_stable() {
-        assert_eq!(crate_name(), "ownmesh-update");
-        assert!(!crate_version().is_empty());
+    fn defaults_are_private() {
+        let s = UpdateSettings::default();
+        assert!(default_sends_nothing_to_vendor(&s));
+        assert!(!network_check_allowed(&s));
+    }
+
+    #[test]
+    fn signature_and_checksum() {
+        let secret = b"test-secret";
+        let data = b"artifact";
+        let mut h = Sha256::new();
+        h.update(data);
+        let sha = hex::encode(h.finalize());
+        let mut m = UpdateManifest {
+            version: "1.0.0".into(),
+            channel: UpdateChannel::Stable,
+            url: "https://example.invalid/ownmesh".into(),
+            sha256: sha,
+            signature: String::new(),
+            min_protocol: 1,
+            max_protocol: 1,
+        };
+        m.signature = sign_manifest_payload(secret, &m);
+        verify_signature(secret, &m).unwrap();
+        verify_checksum(data, &m.sha256).unwrap();
+        check_protocol(&m, 1).unwrap();
+        assert!(check_protocol(&m, 2).is_err());
     }
 }

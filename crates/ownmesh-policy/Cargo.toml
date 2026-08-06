@@ -7,10 +7,18 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "OwnMesh allow/ask/deny policy evaluation and presets"
+description = "ownmesh-policy"
 readme = "README.md"
 
 [lints]
 workspace = true
 
 [dependencies]
+ownmesh-domain = { path = "../ownmesh-domain" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.8"
+
+[dev-dependencies]
+

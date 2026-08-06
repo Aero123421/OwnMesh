@@ -1,0 +1,49 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  crates:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.92.0"
+      - name: Build release binaries
+        run: cargo build --release --workspace
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          for b in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do
+            cp "target/release/${b}.exe" "dist/" 2>/dev/null || cp "target/release/${b}" "dist/" || true
+          done
+          (cd dist && sha256sum * > SHA256SUMS.txt || shasum -a 256 * > SHA256SUMS.txt)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ownmesh-windows
+          path: dist/
+
+  publish:
+    needs: crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ownmesh-windows
+          path: dist
+      - name: GH Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: docs/RELEASE_NOTES_v1.0.0.md
+          generate_release_notes: true

@@ -1,12 +1,32 @@
 {
-  // OwnMesh control plane — Cloudflare Workers skeleton (chapter 0).
-  // D1, Durable Objects, routes, and secrets are wired in later chapters.
+  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "ownmesh-control-plane",
   "main": "src/index.ts",
   "compatibility_date": "2024-12-01",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": true,
-  "observability": {
-    "enabled": true
-  }
+  "vars": {
+    "OAUTH_ISSUER": ""
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ownmesh",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DEVICE_ROOM",
+        "class_name": "DeviceRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["DeviceRoom"]
+    }
+  ]
 }
