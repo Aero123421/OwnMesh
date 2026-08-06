@@ -1,25 +1,24 @@
-//! OwnMesh networkless privileged broker.
-//!
-//! Listens only on local IPC (loopback TCP with shared secret for portable tests;
-//! production OS service uses named pipe / unix socket + peer credentials).
-//! Never opens outbound network connections.
+//! OwnMesh networkless privileged broker binary.
 
 use clap::{Parser, Subcommand};
+use ownmesh_broker::{
+    broker_status, enforce_bind_is_networkless, execute_verified, install_broker,
+    load_or_create_secret, now_unix, run_broker, uninstall_broker, BrokerServeConfig,
+};
 use ownmesh_broker_client::{
-    build_request, verify_request, BrokerRequest, BrokerResponse, BrokerSecret, ElevatedCommand,
-    ReplayCache, DEFAULT_BROKER_ENDPOINT,
+    broker_endpoint_display, build_request, default_broker_endpoint, resolve_broker_endpoint,
+    BrokerEndpoint, ElevatedCommand, ReplayCache, DEFAULT_BROKER_ENDPOINT,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex as AsyncMutex;
 
 /// CLI.
 #[derive(Debug, Parser)]
-#[command(name = "ownmesh-broker", version, about = "OwnMesh privileged broker (networkless)")]
+#[command(
+    name = "ownmesh-broker",
+    version,
+    about = "OwnMesh privileged broker (networkless)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
@@ -31,23 +30,48 @@ enum Commands {
     Help,
     /// Show version.
     Version,
-    /// Run broker (local loopback for dev/test).
+    /// Run broker (OS pipe/socket or loopback fallback).
     Run {
-        /// Bind address (loopback only enforced).
-        #[arg(long, default_value = "127.0.0.1:0")]
-        bind: String,
+        /// Endpoint override: `tcp:127.0.0.1:0`, `pipe:NAME`, `unix:/path.sock`.
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Legacy bind address (loopback only). Prefer `--endpoint`.
+        #[arg(long)]
+        bind: Option<String>,
         /// Path to secret file (32+ bytes). Generated if missing.
         #[arg(long)]
         secret_file: PathBuf,
-        /// Write chosen bind address to this file.
+        /// Write chosen bind address / endpoint to this file.
         #[arg(long)]
         addr_file: Option<PathBuf>,
         /// Allowed caller principal ids (comma-separated).
         #[arg(long, default_value = "ownmeshd")]
         allow_callers: String,
+        /// Require capability token on every request.
+        #[arg(long, default_value_t = false)]
+        require_capability: bool,
+        /// Runtime dir used when resolving default endpoint.
+        #[arg(long)]
+        runtime_dir: Option<PathBuf>,
     },
     /// Status (always local; no network probes).
-    Status,
+    Status {
+        /// State base directory (defaults to ./ownmesh-broker-state for bare binary).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// Install service templates + local marker.
+    Install {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
+    /// Uninstall local marker + templates.
+    Uninstall {
+        #[arg(long)]
+        state_dir: PathBuf,
+    },
     /// One-shot local elevated run via in-process verify (test helper).
     Exec {
         #[arg(long)]
@@ -76,7 +100,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!(
                 "ownmesh-broker — networkless privileged broker\n\
                  endpoint basename: {DEFAULT_BROKER_ENDPOINT}\n\
-                 commands: help, version, run, status, exec"
+                 commands: help, version, run, status, install, uninstall, exec"
             );
             Ok(())
         }
@@ -84,55 +108,90 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Commands::Status => {
-            println!("status=idle network=disabled endpoint={DEFAULT_BROKER_ENDPOINT}");
+        Commands::Status { state_dir } => {
+            let base = state_dir.unwrap_or_else(|| PathBuf::from("."));
+            let st = broker_status(&base)?;
+            println!(
+                "status={} network={} endpoint={} kind={} secret={}",
+                if st.installed {
+                    "installed"
+                } else {
+                    "idle"
+                },
+                st.network,
+                st.endpoint.as_deref().unwrap_or("-"),
+                st.endpoint_kind,
+                st.secret_present
+            );
+            Ok(())
+        }
+        Commands::Install {
+            state_dir,
+            endpoint,
+        } => {
+            let ep = match endpoint {
+                Some(s) => Some(resolve_broker_endpoint(
+                    &state_dir.join("runtime"),
+                    Some(&s),
+                )
+                .map_err(|e| e.to_string())?),
+                None => None,
+            };
+            let rec = install_broker(&state_dir, ep)?;
+            println!(
+                "installed endpoint={} kind={}",
+                rec.endpoint, rec.endpoint_kind
+            );
+            Ok(())
+        }
+        Commands::Uninstall { state_dir } => {
+            uninstall_broker(&state_dir)?;
+            println!("uninstalled");
             Ok(())
         }
         Commands::Run {
+            endpoint,
             bind,
             secret_file,
             addr_file,
             allow_callers,
+            require_capability,
+            runtime_dir,
         } => {
-            let addr: SocketAddr = bind
-                .parse()
-                .map_err(|e| format!("invalid bind address: {e}"))?;
-            if !addr.ip().is_loopback() {
-                return Err("broker must bind to loopback only (networkless design)".into());
-            }
-            let secret = load_or_create_secret(&secret_file)?;
+            let runtime = runtime_dir.unwrap_or_else(|| {
+                secret_file
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            let ep = if let Some(bind) = bind {
+                let addr: SocketAddr = bind
+                    .parse()
+                    .map_err(|e| format!("invalid bind address: {e}"))?;
+                enforce_bind_is_networkless(addr)?;
+                BrokerEndpoint::LoopbackTcp(addr)
+            } else {
+                resolve_broker_endpoint(&runtime, endpoint.as_deref())
+                    .map_err(|e| e.to_string())?
+            };
+            ep.enforce_networkless().map_err(|e| e.to_string())?;
             let allowed: Vec<String> = allow_callers
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let listener = TcpListener::bind(addr)
-                .await
-                .map_err(|e| format!("bind failed: {e}"))?;
-            let local = listener
-                .local_addr()
-                .map_err(|e| format!("local_addr: {e}"))?;
-            if let Some(path) = addr_file {
-                std::fs::write(&path, local.to_string()).map_err(|e| e.to_string())?;
-            }
-            eprintln!("ownmesh-broker listening on {local} (loopback only)");
-            let state = Arc::new(AsyncMutex::new(BrokerState {
-                secret,
-                replay: ReplayCache::new(),
-                allowed_callers: allowed,
-            }));
-            loop {
-                let (sock, peer) = listener.accept().await.map_err(|e| e.to_string())?;
-                if !peer.ip().is_loopback() {
-                    continue;
-                }
-                let st = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_conn(sock, st).await {
-                        eprintln!("conn error: {e}");
-                    }
-                });
-            }
+            eprintln!(
+                "ownmesh-broker starting endpoint={}",
+                broker_endpoint_display(&ep)
+            );
+            run_broker(BrokerServeConfig {
+                endpoint: ep,
+                secret_file,
+                allow_callers: allowed,
+                require_capability,
+                addr_file,
+            })
+            .await
         }
         Commands::Exec {
             secret_file,
@@ -145,7 +204,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let req = build_request(
                 &secret,
                 caller,
-                format!("op_{}", now),
+                format!("op_{now}"),
                 ElevatedCommand {
                     program,
                     args,
@@ -166,155 +225,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
-struct BrokerState {
-    secret: BrokerSecret,
-    replay: ReplayCache,
-    allowed_callers: Vec<String>,
-}
-
-async fn handle_conn(mut sock: TcpStream, state: Arc<AsyncMutex<BrokerState>>) -> Result<(), String> {
-    let (reader, mut writer) = sock.split();
-    let mut lines = BufReader::new(reader).lines();
-    let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? else {
-        return Ok(());
-    };
-    let req: BrokerRequest = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-    let now = now_unix();
-    let resp = {
-        let mut st = state.lock().await;
-        let allowed = st.allowed_callers.clone();
-        let secret_bytes = st.secret.as_bytes().to_vec();
-        let secret = BrokerSecret::from_bytes(secret_bytes);
-        match execute_verified(&secret, &mut st.replay, &allowed, &req, now) {
-            Ok(r) => r,
-            Err(e) => BrokerResponse {
-                request_id: req.request_id.clone(),
-                ok: false,
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(e),
-            },
-        }
-    };
-    let mut out = serde_json::to_string(&resp).map_err(|e| e.to_string())?;
-    out.push('\n');
-    writer
-        .write_all(out.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn execute_verified(
-    secret: &BrokerSecret,
-    replay: &mut ReplayCache,
-    allowed: &[String],
-    req: &BrokerRequest,
-    now: i64,
-) -> Result<BrokerResponse, String> {
-    verify_request(secret, req, now).map_err(|e| e.to_string())?;
-    replay.check_and_insert(req).map_err(|e| e.to_string())?;
-    if !allowed.iter().any(|a| a == &req.caller_principal) {
-        return Ok(BrokerResponse {
-            request_id: req.request_id.clone(),
-            ok: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some("unauthorized caller".into()),
-        });
-    }
-    // Structured elevated execution only — never pass through a raw shell string.
-    let mut cmd = Command::new(&req.command.program);
-    cmd.args(&req.command.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(cwd) = &req.command.cwd {
-        cmd.current_dir(cwd);
-    }
-    for (k, v) in &req.command.env {
-        cmd.env(k, v);
-    }
-    match cmd.output() {
-        Ok(out) => Ok(BrokerResponse {
-            request_id: req.request_id.clone(),
-            ok: out.status.success(),
-            exit_code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            error: None,
-        }),
-        Err(e) => Ok(BrokerResponse {
-            request_id: req.request_id.clone(),
-            ok: false,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: Some(e.to_string()),
-        }),
-    }
-}
-
-fn load_or_create_secret(path: &PathBuf) -> Result<BrokerSecret, String> {
-    if path.exists() {
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        if bytes.len() < 32 {
-            return Err("secret file too short".into());
-        }
-        Ok(BrokerSecret::from_bytes(bytes))
-    } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let secret = BrokerSecret::generate();
-        std::fs::write(path, secret.as_bytes()).map_err(|e| e.to_string())?;
-        Ok(secret)
-    }
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn rejects_non_loopback_bind_config() {
-        // Unit-level: parse check used by run()
-        let addr: SocketAddr = "8.8.8.8:9".parse().unwrap();
-        assert!(!addr.ip().is_loopback());
-    }
-
-    #[test]
-    fn unprivileged_caller_rejected() {
-        let dir = tempdir().unwrap();
-        let secret_path = dir.path().join("sec");
-        let secret = load_or_create_secret(&secret_path).unwrap();
-        let req = build_request(
-            &secret,
-            "evil",
-            "op",
-            ElevatedCommand {
-                program: "cmd.exe".into(),
-                args: vec!["/C".into(), "echo no".into()],
-                cwd: None,
-                env: vec![],
-            },
-            now_unix(),
-            30,
-        );
-        let mut replay = ReplayCache::new();
-        let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-            .unwrap();
-        assert!(!resp.ok);
-        assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
-    }
+// silence unused import when default_broker_endpoint only used on some cfgs
+#[allow(dead_code)]
+fn _keep(p: &std::path::Path) -> BrokerEndpoint {
+    default_broker_endpoint(p)
 }

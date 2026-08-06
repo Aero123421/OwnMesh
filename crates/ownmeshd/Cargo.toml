@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 clap = { version = "4.5.27", features = ["derive", "env", "wrap_help"] }
+ownmesh-broker-client = { path = "../ownmesh-broker-client" }
 ownmesh-config = { path = "../ownmesh-config" }
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-exec = { path = "../ownmesh-exec" }
@@ -27,6 +28,7 @@ ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
 ownmesh-logs = { path = "../ownmesh-logs" }
 ownmesh-policy = { path = "../ownmesh-policy" }
+ownmesh-session = { path = "../ownmesh-session" }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 tokio = { version = "1.43.0", features = [

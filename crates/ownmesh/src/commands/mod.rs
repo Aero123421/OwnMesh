@@ -5,6 +5,8 @@ mod exec;
 mod ipc_util;
 mod lockdown;
 mod policy_cmd;
+mod privileged;
+mod session_cmd;
 mod status;
 
 use crate::cli::{
@@ -168,25 +170,7 @@ fn dispatch_process(cli: &Cli, cmd: &ProcessCmd) -> Result<(), ExitCode> {
 }
 
 fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
-    match cmd {
-        SessionCmd::Open { device, command } => stub(
-            cli,
-            "session open",
-            &format!("device={device:?} cmd={command:?}"),
-        ),
-        SessionCmd::List => stub(cli, "session list", "chapter 9"),
-        SessionCmd::Show { id } => stub(cli, "session show", id),
-        SessionCmd::Attach { id, read_only } => {
-            stub(cli, "session attach", &format!("{id} read_only={read_only}"))
-        }
-        SessionCmd::Claim { id } => stub(cli, "session claim", id),
-        SessionCmd::Release { id } => stub(cli, "session release", id),
-        SessionCmd::Give { id, to } => stub(cli, "session give", &format!("{id} -> {to}")),
-        SessionCmd::Close { id } => stub(cli, "session close", id),
-        SessionCmd::Terminate { id, all } => {
-            stub(cli, "session terminate", &format!("id={id:?} all={all}"))
-        }
-    }
+    session_cmd::dispatch_session(cli, cmd)
 }
 
 fn dispatch_profile(cli: &Cli, cmd: &ProfileCmd) -> Result<(), ExitCode> {
@@ -229,11 +213,7 @@ fn dispatch_service(cli: &Cli, cmd: &ServiceCmd) -> Result<(), ExitCode> {
 }
 
 fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
-    match cmd {
-        PrivilegedCmd::Install => stub(cli, "privileged install", "chapter 8"),
-        PrivilegedCmd::Status => stub(cli, "privileged status", "chapter 8"),
-        PrivilegedCmd::Uninstall => stub(cli, "privileged uninstall", "chapter 8"),
-    }
+    privileged::dispatch_privileged(cli, cmd)
 }
 
 fn dispatch_update(cli: &Cli, cmd: &UpdateCmd) -> Result<(), ExitCode> {

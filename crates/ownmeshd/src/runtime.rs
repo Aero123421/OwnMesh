@@ -4,6 +4,9 @@
 //! allow execute | ask enqueue | deny. Completed results are journaled by
 //! idempotency key so duplicate operations are not re-executed.
 
+use ownmesh_broker_client::{
+    default_broker_endpoint, elevate, BrokerEndpoint, BrokerSecret, ElevatedCommand,
+};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{run_command, CommandKind, IdempotencyJournal, RunRequest, RunResult};
 use ownmesh_fs::{
@@ -15,6 +18,9 @@ use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
     AccessPreset, Decision, OperationFacts, PolicyDocument, TemporaryGrant,
 };
+use ownmesh_session::{
+    SessionKind, SessionManager, StreamKind as SessionStreamKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +29,23 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+/// Session IPC method names (owned here; ipc crate methods table is ms1-stable).
+pub mod session_methods {
+    pub const OPEN: &str = "session.open";
+    pub const LIST: &str = "session.list";
+    pub const SHOW: &str = "session.show";
+    pub const ATTACH: &str = "session.attach";
+    pub const CLAIM: &str = "session.claim";
+    pub const RELEASE: &str = "session.release";
+    pub const GIVE: &str = "session.give";
+    pub const CLOSE: &str = "session.close";
+    pub const TERMINATE: &str = "session.terminate";
+    pub const REPLAY: &str = "session.replay";
+    pub const PUSH_OUTPUT: &str = "session.push_output";
+    pub const WRITE: &str = "session.write";
+    pub const RESIZE: &str = "session.resize";
+}
 
 const LOCAL_PRINCIPAL: &str = "prin_local";
 const DEFAULT_GRANT_SECS: i64 = 3600;
@@ -168,6 +191,10 @@ pub struct DaemonRuntime {
     workspace_root: PathBuf,
     enforce_workspace: bool,
     log_path: PathBuf,
+    sessions: SessionManager,
+    sessions_path: PathBuf,
+    broker_endpoint: Option<BrokerEndpoint>,
+    broker_secret: Option<BrokerSecret>,
 }
 
 impl DaemonRuntime {
@@ -196,6 +223,11 @@ impl DaemonRuntime {
         let grants = load_grants(&paths.state_dir.join("grants.json"));
         let lockdown = paths.state_dir.join("lockdown.flag").exists();
         let revoked_clients = load_revoked(&paths.state_dir.join("revoked-clients.json"));
+        let sessions_path = paths.state_dir.join("sessions").join("sessions.json");
+        let mut sessions =
+            SessionManager::load_from_path(&sessions_path).unwrap_or_else(|_| SessionManager::new());
+        let _ = sessions.mark_hosts_detached_after_restart();
+        let (broker_endpoint, broker_secret) = load_broker_client(paths);
         Ok(Self {
             paths: paths.clone(),
             policy,
@@ -209,7 +241,15 @@ impl DaemonRuntime {
             workspace_root,
             enforce_workspace,
             log_path,
+            sessions,
+            sessions_path,
+            broker_endpoint,
+            broker_secret,
         })
+    }
+
+    fn persist_sessions(&self) {
+        let _ = self.sessions.save_to_path(&self.sessions_path);
     }
 
     fn persist_op_journal(&self) {
@@ -432,6 +472,12 @@ impl DaemonRuntime {
     }
 
     async fn execute_exec(&mut self, p: &ExecParams) -> IpcResult<Value> {
+        if p.elevated {
+            if let Some(value) = self.try_broker_elevated(p).await? {
+                return Ok(value);
+            }
+            // Broker unavailable: fall back to local structured exec (ms1 behavior).
+        }
         let kind = match p.kind.as_deref() {
             Some("raw_shell") | Some("raw") => CommandKind::RawShell,
             _ => CommandKind::Structured,
@@ -457,6 +503,45 @@ impl DaemonRuntime {
             code: app_error::INTERNAL,
             message: e.to_string(),
         })
+    }
+
+    async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Option<Value>> {
+        let (Some(endpoint), Some(secret)) = (&self.broker_endpoint, &self.broker_secret) else {
+            return Ok(None);
+        };
+        let cmd = ElevatedCommand {
+            program: p.program.clone(),
+            args: p.args.clone(),
+            cwd: p.cwd.clone(),
+            env: vec![],
+        };
+        match elevate(
+            endpoint,
+            secret,
+            "ownmeshd",
+            p.idempotency_key
+                .clone()
+                .unwrap_or_else(|| Self::new_id("elev_")),
+            cmd,
+            Self::now(),
+            60,
+        )
+        .await
+        {
+            Ok(resp) => Ok(Some(json!({
+                "exit_code": resp.exit_code,
+                "stdout": resp.stdout,
+                "stderr": resp.stderr,
+                "timed_out": false,
+                "duration_ms": 0,
+                "truncated": false,
+                "replayed": false,
+                "elevated_via": "broker",
+                "broker_ok": resp.ok,
+                "broker_error": resp.error,
+            }))),
+            Err(_) => Ok(None),
+        }
     }
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
@@ -935,11 +1020,286 @@ impl DaemonRuntime {
             methods::DAEMON_LOCKDOWN => self.handle_lockdown(),
             methods::DAEMON_UNLOCK => self.handle_unlock(),
             methods::TOKEN_REVOKE => self.handle_token_revoke(params),
+            session_methods::OPEN => self.handle_session_open(params),
+            session_methods::LIST => self.handle_session_list(),
+            session_methods::SHOW => self.handle_session_show(params),
+            session_methods::ATTACH => self.handle_session_attach(params),
+            session_methods::CLAIM => self.handle_session_claim(params),
+            session_methods::RELEASE => self.handle_session_release(params),
+            session_methods::GIVE => self.handle_session_give(params),
+            session_methods::CLOSE => self.handle_session_close(params),
+            session_methods::TERMINATE => self.handle_session_terminate(params),
+            session_methods::REPLAY => self.handle_session_replay(params),
+            session_methods::PUSH_OUTPUT => self.handle_session_push_output(params),
+            session_methods::WRITE => self.handle_session_write(params),
+            session_methods::RESIZE => self.handle_session_resize(params),
             other => Err(IpcError::Remote {
                 code: app_error::METHOD_NOT_FOUND,
                 message: format!("method not found: {other}"),
             }),
         }
+    }
+
+    fn handle_session_open(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            principal: Option<String>,
+            #[serde(default)]
+            kind: Option<String>,
+            #[serde(default)]
+            profile_id: Option<String>,
+            #[serde(default)]
+            command: Option<Vec<String>>,
+            #[serde(default)]
+            cwd: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let kind = match p.kind.as_deref() {
+            Some("process") => SessionKind::Process,
+            Some("profile_agent") | Some("profile") => SessionKind::ProfileAgent,
+            _ => SessionKind::Pty,
+        };
+        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        let title = p.title.unwrap_or_else(|| "session".into());
+        let info = self.sessions.open_with(
+            kind,
+            title,
+            principal,
+            Self::now(),
+            p.profile_id,
+            None,
+            p.command,
+            p.cwd,
+            None,
+        );
+        self.persist_sessions();
+        serde_json::to_value(info).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })
+    }
+
+    fn handle_session_list(&self) -> IpcResult<Value> {
+        Ok(json!({ "sessions": self.sessions.list() }))
+    }
+
+    fn handle_session_show(&self, params: Option<Value>) -> IpcResult<Value> {
+        let id = require_id(params, "id")?;
+        let info = self.sessions.get(&id).map_err(session_err)?;
+        serde_json::to_value(info).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })
+    }
+
+    fn handle_session_attach(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            principal: Option<String>,
+            #[serde(default)]
+            read_only: bool,
+        }
+        let p: P = parse_params(params)?;
+        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        if p.read_only {
+            self.sessions
+                .attach_observer(&p.id, principal.clone())
+                .map_err(session_err)?;
+        } else {
+            let _ = self
+                .sessions
+                .claim_controller(&p.id, principal.clone(), Self::now())
+                .map_err(session_err)?;
+        }
+        self.persist_sessions();
+        let info = self.sessions.get(&p.id).map_err(session_err)?;
+        Ok(json!({
+            "session": info,
+            "principal": principal,
+            "read_only": p.read_only,
+            "readers": self.sessions.readers(&p.id).map_err(session_err)?.into_iter().collect::<Vec<_>>(),
+        }))
+    }
+
+    fn handle_session_claim(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            principal: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        let lease = self
+            .sessions
+            .claim_controller(&p.id, principal, Self::now())
+            .map_err(session_err)?;
+        self.persist_sessions();
+        Ok(json!({ "lease": lease, "session_id": p.id }))
+    }
+
+    fn handle_session_release(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            principal: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        self.sessions
+            .release_controller(&p.id, &principal)
+            .map_err(session_err)?;
+        self.persist_sessions();
+        Ok(json!({ "released": true, "session_id": p.id }))
+    }
+
+    fn handle_session_give(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            to: String,
+            #[serde(default)]
+            from: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let from = p.from.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        let lease = self
+            .sessions
+            .give_controller(&p.id, &from, p.to, Self::now())
+            .map_err(session_err)?;
+        self.persist_sessions();
+        let readers: Vec<String> = self
+            .sessions
+            .readers(&p.id)
+            .map_err(session_err)?
+            .into_iter()
+            .collect();
+        Ok(json!({ "lease": lease, "readers": readers }))
+    }
+
+    fn handle_session_close(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        let id = require_id(params, "id")?;
+        self.sessions.close(&id).map_err(session_err)?;
+        self.persist_sessions();
+        Ok(json!({ "closed": true, "session_id": id }))
+    }
+
+    fn handle_session_terminate(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            all: bool,
+        }
+        let p: P = parse_params(params)?;
+        if p.all {
+            let n = self.sessions.terminate_all();
+            self.persist_sessions();
+            return Ok(json!({ "terminated": n, "all": true }));
+        }
+        let id = p.id.ok_or_else(|| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: "id or all required".into(),
+        })?;
+        self.sessions.terminate(&id).map_err(session_err)?;
+        self.persist_sessions();
+        Ok(json!({ "terminated": 1, "session_id": id }))
+    }
+
+    fn handle_session_replay(&self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            from_seq: Option<u64>,
+            #[serde(default)]
+            principal: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        if let Some(prin) = p.principal {
+            let readers = self.sessions.readers(&p.id).map_err(session_err)?;
+            if !readers.contains(&prin) {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!("principal {prin} cannot read session {}", p.id),
+                });
+            }
+        }
+        let chunks = self
+            .sessions
+            .replay_from(&p.id, p.from_seq.unwrap_or(1))
+            .map_err(session_err)?;
+        Ok(json!({ "chunks": chunks, "session_id": p.id }))
+    }
+
+    fn handle_session_push_output(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            data: String,
+            #[serde(default)]
+            stream: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let stream = match p.stream.as_deref() {
+            Some("stderr") => SessionStreamKind::Stderr,
+            Some("system") => SessionStreamKind::System,
+            _ => SessionStreamKind::Stdout,
+        };
+        let chunk = self
+            .sessions
+            .push_output(&p.id, p.data, stream)
+            .map_err(session_err)?;
+        self.persist_sessions();
+        Ok(json!({ "chunk": chunk }))
+    }
+
+    fn handle_session_write(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            data: String,
+            #[serde(default)]
+            principal: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        self.sessions
+            .authorize_stdin(&p.id, &principal, Self::now())
+            .map_err(session_err)?;
+        // Record input echo for observers (controller write path).
+        let chunk = self
+            .sessions
+            .push_output(
+                &p.id,
+                format!("[stdin] {}", p.data),
+                SessionStreamKind::System,
+            )
+            .map_err(session_err)?;
+        self.persist_sessions();
+        Ok(json!({ "accepted": true, "chunk": chunk }))
+    }
+
+    fn handle_session_resize(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            cols: u16,
+            rows: u16,
+        }
+        let p: P = parse_params(params)?;
+        self.sessions
+            .resize(&p.id, p.cols, p.rows)
+            .map_err(session_err)?;
+        self.persist_sessions();
+        Ok(json!({ "resized": true, "cols": p.cols, "rows": p.rows }))
     }
 
     /// Test helper: set policy in-memory without touching disk preset file optionally.
@@ -995,6 +1355,50 @@ fn fs_err(err: ownmesh_fs::FsError) -> IpcError {
         code: app_error::INTERNAL,
         message: err.to_string(),
     }
+}
+
+fn session_err(err: ownmesh_session::SessionError) -> IpcError {
+    let code = match err {
+        ownmesh_session::SessionError::NotFound => app_error::INVALID_PARAMS,
+        ownmesh_session::SessionError::LeaseHeld(_)
+        | ownmesh_session::SessionError::NotController
+        | ownmesh_session::SessionError::ObserverCannotWrite
+        | ownmesh_session::SessionError::Closed => app_error::CONFLICT,
+        _ => app_error::INTERNAL,
+    };
+    IpcError::Remote {
+        code,
+        message: err.to_string(),
+    }
+}
+
+fn load_broker_client(paths: &OwnMeshPaths) -> (Option<BrokerEndpoint>, Option<BrokerSecret>) {
+    let secret_path = paths.state_dir.join("broker").join("broker.secret");
+    if !secret_path.exists() {
+        return (None, None);
+    }
+    let bytes = match std::fs::read(&secret_path) {
+        Ok(b) if b.len() >= 32 => b,
+        _ => return (None, None),
+    };
+    let endpoint = default_broker_endpoint(&paths.runtime_dir);
+    // Optional override via addr file written by broker --addr-file.
+    let addr_file = paths.state_dir.join("broker").join("broker.addr");
+    let endpoint = if addr_file.exists() {
+        std::fs::read_to_string(&addr_file)
+            .ok()
+            .and_then(|s| {
+                let s = s.trim().to_string();
+                s.parse::<std::net::SocketAddr>()
+                    .ok()
+                    .filter(|a| a.ip().is_loopback())
+                    .map(BrokerEndpoint::LoopbackTcp)
+            })
+            .unwrap_or(endpoint)
+    } else {
+        endpoint
+    };
+    (Some(endpoint), Some(BrokerSecret::from_bytes(bytes)))
 }
 
 fn decision_str(d: Decision) -> &'static str {

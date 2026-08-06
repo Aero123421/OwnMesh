@@ -667,4 +667,187 @@ mod tests {
         server.request_shutdown();
         let _ = handle.await;
     }
+
+    #[tokio::test]
+    async fn session_handoff_observer_reads_during_controller_transfer() {
+        use crate::runtime::session_methods;
+
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+        let client = test_client(endpoint, paths.runtime_dir.clone());
+
+        let opened = client
+            .call(
+                session_methods::OPEN,
+                Some(json!({
+                    "title": "handoff",
+                    "principal": "chatgpt",
+                    "kind": "pty",
+                })),
+            )
+            .await
+            .expect("open");
+        let sid = opened["id"].as_str().unwrap().to_owned();
+
+        client
+            .call(
+                session_methods::PUSH_OUTPUT,
+                Some(json!({
+                    "id": sid,
+                    "data": "hello from agent\n",
+                })),
+            )
+            .await
+            .expect("push");
+
+        let given = client
+            .call(
+                session_methods::GIVE,
+                Some(json!({
+                    "id": sid,
+                    "from": "chatgpt",
+                    "to": "human",
+                })),
+            )
+            .await
+            .expect("give");
+        assert_eq!(given["lease"]["principal_id"], "human");
+        let readers = given["readers"].as_array().unwrap();
+        assert!(readers.iter().any(|r| r == "chatgpt"));
+        assert!(readers.iter().any(|r| r == "human"));
+
+        // Observer (chatgpt) can still replay output.
+        let replay = client
+            .call(
+                session_methods::REPLAY,
+                Some(json!({
+                    "id": sid,
+                    "from_seq": 1,
+                    "principal": "chatgpt",
+                })),
+            )
+            .await
+            .expect("observer replay");
+        let chunks = replay["chunks"].as_array().unwrap();
+        assert!(chunks.iter().any(|c| c["data"]
+            .as_str()
+            .unwrap_or("")
+            .contains("hello from agent")));
+
+        // Observer cannot write stdin.
+        let denied = client
+            .call(
+                session_methods::WRITE,
+                Some(json!({
+                    "id": sid,
+                    "data": "nope",
+                    "principal": "chatgpt",
+                })),
+            )
+            .await
+            .expect_err("observer write denied");
+        match denied {
+            IpcError::Remote { code, .. } => assert_eq!(code, app_error::CONFLICT),
+            other => panic!("{other:?}"),
+        }
+
+        // Human controller can write.
+        let wrote = client
+            .call(
+                session_methods::WRITE,
+                Some(json!({
+                    "id": sid,
+                    "data": "from-human",
+                    "principal": "human",
+                })),
+            )
+            .await
+            .expect("controller write");
+        assert_eq!(wrote["accepted"], true);
+
+        server.request_shutdown();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn session_survives_daemon_restart() {
+        use crate::runtime::{session_methods, DaemonRuntime};
+
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+
+        // Phase 1: live daemon writes session + handoff + output.
+        let sid = {
+            let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+            let client = test_client(endpoint, paths.runtime_dir.clone());
+            let opened = client
+                .call(
+                    session_methods::OPEN,
+                    Some(json!({
+                        "title": "persist",
+                        "principal": "chatgpt",
+                    })),
+                )
+                .await
+                .expect("open");
+            let sid = opened["id"].as_str().unwrap().to_owned();
+            client
+                .call(
+                    session_methods::PUSH_OUTPUT,
+                    Some(json!({ "id": sid, "data": "before-restart\n" })),
+                )
+                .await
+                .expect("push");
+            client
+                .call(
+                    session_methods::GIVE,
+                    Some(json!({
+                        "id": sid,
+                        "from": "chatgpt",
+                        "to": "human",
+                    })),
+                )
+                .await
+                .expect("give");
+            server.request_shutdown();
+            let _ = handle.await;
+            sid
+        };
+
+        // Phase 2: simulate process restart by constructing a fresh runtime from disk
+        // (avoids Windows named-pipe first-instance races while proving persistence).
+        let mut rt = DaemonRuntime::open(&paths).expect("reload runtime");
+        let shown = rt
+            .dispatch(session_methods::SHOW, Some(json!({ "id": sid })))
+            .await
+            .expect("show after restart");
+        assert_eq!(shown["id"], sid);
+        assert_eq!(shown["controller"]["principal_id"], "human");
+        assert!(shown["observers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o == "chatgpt"));
+
+        let replay = rt
+            .dispatch(
+                session_methods::REPLAY,
+                Some(json!({
+                    "id": sid,
+                    "principal": "chatgpt",
+                    "from_seq": 1,
+                })),
+            )
+            .await
+            .expect("replay after restart");
+        assert!(replay["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["data"]
+                .as_str()
+                .unwrap_or("")
+                .contains("before-restart")));
+    }
 }
