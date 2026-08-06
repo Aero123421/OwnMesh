@@ -11,7 +11,7 @@ use tempfile::tempdir;
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -63,14 +63,15 @@ fn default_and_resolved_endpoints_are_local_only() {
     let ep = default_broker_endpoint(dir.path());
     match &ep {
         BrokerEndpoint::LoopbackTcp(addr) => assert!(addr.ip().is_loopback()),
-        BrokerEndpoint::UnixSocket(path) => assert!(path.is_absolute() || path.starts_with(dir.path())),
+        BrokerEndpoint::UnixSocket(path) => {
+            assert!(path.is_absolute() || path.starts_with(dir.path()));
+        }
         BrokerEndpoint::NamedPipe(name) => assert!(!name.contains("://")),
     }
     ep.enforce_networkless().unwrap();
     let remoteish = resolve_broker_endpoint(dir.path(), Some("tcp:8.8.8.8:53"));
-    match remoteish {
-        Ok(ep) => assert!(ep.enforce_networkless().is_err()),
-        Err(_) => {}
+    if let Ok(ep) = remoteish {
+        assert!(ep.enforce_networkless().is_err());
     }
 }
 
@@ -97,8 +98,14 @@ fn forged_mac_and_wrong_caller_rejected() {
         now_unix(),
         60,
     );
-    let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &good, now_unix())
-        .unwrap();
+    let resp = execute_verified(
+        &secret,
+        &mut replay,
+        &["ownmeshd".into()],
+        &good,
+        now_unix(),
+    )
+    .unwrap();
     assert!(!resp.ok);
     assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
 }
@@ -117,8 +124,8 @@ fn replayed_nonce_rejected_even_with_valid_mac() {
     let mut replay = ReplayCache::new();
     let _first =
         execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
-    let err = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-        .unwrap_err();
+    let err =
+        execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap_err();
     assert!(err.to_ascii_lowercase().contains("replay"), "{err}");
 }
 

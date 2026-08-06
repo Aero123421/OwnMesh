@@ -1,4 +1,4 @@
-//! OwnMesh configuration loading, paths, and migration.
+//! `OwnMesh` configuration loading, paths, and migration.
 //!
 //! Secrets never belong in `config.toml`. Device keys and refresh tokens live in
 //! `ownmesh-identity` keychain backends.

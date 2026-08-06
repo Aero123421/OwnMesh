@@ -1,4 +1,4 @@
-//! OwnMesh local IPC transport (Named Pipe on Windows, Unix domain sockets elsewhere).
+//! `OwnMesh` local IPC transport (Named Pipe on Windows, Unix domain sockets elsewhere).
 //!
 //! Framing is 4-byte big-endian length + UTF-8 JSON-RPC 2.0. Peers authenticate with a
 //! daemon-issued token stored under the user runtime directory (OS ACL + application token).

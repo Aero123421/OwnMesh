@@ -4,8 +4,8 @@ mod approval;
 pub(crate) mod device_cmd;
 mod exec;
 mod ipc_util;
-pub(crate) mod login;
 mod lockdown;
+pub(crate) mod login;
 mod policy_cmd;
 mod privileged;
 mod session_cmd;
@@ -25,10 +25,18 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
     match &cli.command {
         None => run_tui_launch(cli),
         Some(Commands::Status) => run_status(cli),
-        Some(Commands::Setup) => stub(cli, "setup", "Interactive setup arrives in a later chapter."),
+        Some(Commands::Setup) => stub(
+            cli,
+            "setup",
+            "Interactive setup arrives in a later chapter.",
+        ),
         Some(Commands::Login(args)) => login::run_login(cli, args),
         Some(Commands::Logout) => login::run_logout(cli),
-        Some(Commands::Doctor) => stub(cli, "doctor", "Doctor diagnostics expand in later chapters."),
+        Some(Commands::Doctor) => stub(
+            cli,
+            "doctor",
+            "Doctor diagnostics expand in later chapters.",
+        ),
         Some(Commands::Lockdown) => lockdown::run_lockdown(cli),
         Some(Commands::Unlock) => lockdown::run_unlock(cli),
         Some(Commands::Tokens(cmd)) => lockdown::dispatch_tokens(cli, cmd),

@@ -21,9 +21,7 @@ use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
     AccessPreset, Decision, OperationFacts, PolicyDocument, TemporaryGrant,
 };
-use ownmesh_session::{
-    SessionKind, SessionManager, StreamKind as SessionStreamKind,
-};
+use ownmesh_session::{SessionKind, SessionManager, StreamKind as SessionStreamKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -254,8 +252,7 @@ impl DaemonRuntime {
     pub fn open(paths: &OwnMeshPaths) -> Result<Self, String> {
         paths.ensure_layout().map_err(|e| e.to_string())?;
         let journal_path = paths.state_dir.join("idempotency-journal.json");
-        let exec_journal =
-            IdempotencyJournal::open(&journal_path).map_err(|e| e.to_string())?;
+        let exec_journal = IdempotencyJournal::open(&journal_path).map_err(|e| e.to_string())?;
         let policy_file = load_policy(paths).unwrap_or_default();
         let policy = policy_from_file(&policy_file);
         let enforce_workspace = matches!(
@@ -276,8 +273,8 @@ impl DaemonRuntime {
         let lockdown = paths.state_dir.join("lockdown.flag").exists();
         let revoked_clients = load_revoked(&paths.state_dir.join("revoked-clients.json"));
         let sessions_path = paths.state_dir.join("sessions").join("sessions.json");
-        let mut sessions =
-            SessionManager::load_from_path(&sessions_path).unwrap_or_else(|_| SessionManager::new());
+        let mut sessions = SessionManager::load_from_path(&sessions_path)
+            .unwrap_or_else(|_| SessionManager::new());
         let _ = sessions.mark_hosts_detached_after_restart();
         let (broker_endpoint, broker_secret) = load_broker_client(paths);
         Ok(Self {
@@ -305,7 +302,10 @@ impl DaemonRuntime {
     }
 
     fn persist_op_journal(&self) {
-        let _ = write_json(&self.paths.state_dir.join("op-journal.json"), &self.op_journal);
+        let _ = write_json(
+            &self.paths.state_dir.join("op-journal.json"),
+            &self.op_journal,
+        );
     }
 
     fn persist_grants(&self) {
@@ -329,7 +329,7 @@ impl DaemonRuntime {
     fn now() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
             .unwrap_or(0)
     }
 
@@ -533,7 +533,7 @@ impl DaemonRuntime {
             // Broker unavailable: fall back to local structured exec (ms1 behavior).
         }
         let kind = match p.kind.as_deref() {
-            Some("raw_shell") | Some("raw") => CommandKind::RawShell,
+            Some("raw_shell" | "raw") => CommandKind::RawShell,
             _ => CommandKind::Structured,
         };
         let req = RunRequest {
@@ -600,19 +600,14 @@ impl DaemonRuntime {
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        let entries = list_dir(
-            &ws,
-            &p.path,
-            p.recursive,
-            p.max_entries.unwrap_or(1000),
-        )
-        .map_err(fs_err)?;
+        let entries = list_dir(&ws, &p.path, p.recursive, p.max_entries.unwrap_or(1000))
+            .map_err(|err| fs_err(&err))?;
         Ok(json!({ "entries": entries }))
     }
 
     fn execute_fs_stat(&self, p: &FsStatParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        let st = stat_path(&ws, &p.path, p.hash).map_err(fs_err)?;
+        let st = stat_path(&ws, &p.path, p.hash).map_err(|err| fs_err(&err))?;
         serde_json::to_value(st).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
@@ -621,20 +616,21 @@ impl DaemonRuntime {
 
     fn execute_fs_read(&self, p: &FsReadParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        let data = read_file(&ws, &p.path, p.max_bytes.unwrap_or(1024 * 1024)).map_err(fs_err)?;
+        let data = read_file(&ws, &p.path, p.max_bytes.unwrap_or(1024 * 1024))
+            .map_err(|err| fs_err(&err))?;
         let text = String::from_utf8_lossy(&data).into_owned();
         Ok(json!({ "path": p.path, "content": text, "bytes": data.len() }))
     }
 
     fn execute_fs_write(&self, p: &FsWriteParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        write_file(&ws, &p.path, p.content.as_bytes()).map_err(fs_err)?;
+        write_file(&ws, &p.path, p.content.as_bytes()).map_err(|err| fs_err(&err))?;
         Ok(json!({ "path": p.path, "bytes_written": p.content.len() }))
     }
 
     fn execute_fs_delete(&self, p: &FsDeleteParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        delete_path(&ws, &p.path, p.recursive).map_err(fs_err)?;
+        delete_path(&ws, &p.path, p.recursive).map_err(|err| fs_err(&err))?;
         Ok(json!({ "path": p.path, "deleted": true }))
     }
 
@@ -657,10 +653,7 @@ impl DaemonRuntime {
             &BuiltinProviderConfig {
                 file_id: "audit".into(),
                 file_path: self.log_path.clone(),
-                windows_channel: p
-                    .channel
-                    .clone()
-                    .unwrap_or_else(|| "Application".into()),
+                windows_channel: p.channel.clone().unwrap_or_else(|| "Application".into()),
                 journald_unit: p.unit.clone(),
                 docker_container: p.container.clone(),
                 process_id: "process".into(),
@@ -708,7 +701,7 @@ impl DaemonRuntime {
                 limit: p.limit.unwrap_or(100),
             },
         )
-        .map_err(fs_err)?;
+        .map_err(|err| fs_err(&err))?;
         serde_json::to_value(page).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
@@ -728,7 +721,7 @@ impl DaemonRuntime {
                 max_bytes: p.max_bytes.unwrap_or(1024 * 1024),
             },
         )
-        .map_err(fs_err)?;
+        .map_err(|err| fs_err(&err))?;
         serde_json::to_value(page).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
@@ -875,10 +868,10 @@ impl DaemonRuntime {
             .await
     }
 
-    fn handle_approval_list(&self) -> IpcResult<Value> {
+    fn handle_approval_list(&self) -> Value {
         let mut list: Vec<&ApprovalRecord> = self.approvals.values().collect();
         list.sort_by(|a, b| b.created_at_unix.cmp(&a.created_at_unix));
-        Ok(json!({ "approvals": list }))
+        json!({ "approvals": list })
     }
 
     fn handle_approval_show(&self, params: Option<Value>) -> IpcResult<Value> {
@@ -1004,8 +997,8 @@ impl DaemonRuntime {
         }))
     }
 
-    fn handle_policy_show(&self) -> IpcResult<Value> {
-        Ok(json!({
+    fn handle_policy_show(&self) -> Value {
+        json!({
             "preset": preset_name(self.policy.preset),
             "note": self.policy.note,
             "rules": self.policy.rules,
@@ -1018,7 +1011,7 @@ impl DaemonRuntime {
             } else {
                 true
             },
-        }))
+        })
     }
 
     fn handle_policy_preset(&mut self, params: Option<Value>) -> IpcResult<Value> {
@@ -1051,21 +1044,21 @@ impl DaemonRuntime {
             None,
             format!("preset set to {}", preset_name(preset)),
         );
-        self.handle_policy_show()
+        Ok(self.handle_policy_show())
     }
 
-    fn handle_policy_validate(&self) -> IpcResult<Value> {
+    fn handle_policy_validate(&self) -> Value {
         let ok_full = if self.policy.preset == AccessPreset::FullAccess {
             full_access_has_no_hidden_restrictive_rules(&self.policy)
         } else {
             true
         };
-        Ok(json!({
+        json!({
             "ok": ok_full,
             "preset": preset_name(self.policy.preset),
             "rule_count": self.policy.rules.len(),
             "full_access_no_hidden_deny": ok_full,
-        }))
+        })
     }
 
     fn handle_policy_explain(&self, params: Option<Value>) -> IpcResult<Value> {
@@ -1126,18 +1119,18 @@ impl DaemonRuntime {
         }))
     }
 
-    fn handle_lockdown(&mut self) -> IpcResult<Value> {
+    fn handle_lockdown(&mut self) -> Value {
         self.lockdown = true;
         self.persist_lockdown();
         self.append_audit("daemon.lockdown", None, None, Some("deny"), "lockdown on");
-        Ok(json!({ "lockdown": true }))
+        json!({ "lockdown": true })
     }
 
-    fn handle_unlock(&mut self) -> IpcResult<Value> {
+    fn handle_unlock(&mut self) -> Value {
         self.lockdown = false;
         self.persist_lockdown();
         self.append_audit("daemon.unlock", None, None, Some("allow"), "lockdown off");
-        Ok(json!({ "lockdown": false }))
+        json!({ "lockdown": false })
     }
 
     fn handle_token_revoke(&mut self, params: Option<Value>) -> IpcResult<Value> {
@@ -1178,19 +1171,19 @@ impl DaemonRuntime {
             ops_methods::LOGS_LIST_PROVIDERS => self.handle_logs_list_providers(params),
             ops_methods::GIT_STATUS => self.handle_git_status(params).await,
             ops_methods::GIT_DIFF => self.handle_git_diff(params).await,
-            methods::APPROVAL_LIST => self.handle_approval_list(),
+            methods::APPROVAL_LIST => Ok(self.handle_approval_list()),
             methods::APPROVAL_SHOW => self.handle_approval_show(params),
             methods::APPROVAL_APPROVE => self.handle_approval_approve(params).await,
             methods::APPROVAL_DENY => self.handle_approval_deny(params),
-            methods::POLICY_SHOW => self.handle_policy_show(),
+            methods::POLICY_SHOW => Ok(self.handle_policy_show()),
             methods::POLICY_PRESET => self.handle_policy_preset(params),
-            methods::POLICY_VALIDATE => self.handle_policy_validate(),
+            methods::POLICY_VALIDATE => Ok(self.handle_policy_validate()),
             methods::POLICY_EXPLAIN => self.handle_policy_explain(params),
-            methods::DAEMON_LOCKDOWN => self.handle_lockdown(),
-            methods::DAEMON_UNLOCK => self.handle_unlock(),
+            methods::DAEMON_LOCKDOWN => Ok(self.handle_lockdown()),
+            methods::DAEMON_UNLOCK => Ok(self.handle_unlock()),
             methods::TOKEN_REVOKE => self.handle_token_revoke(params),
             session_methods::OPEN => self.handle_session_open(params),
-            session_methods::LIST => self.handle_session_list(),
+            session_methods::LIST => Ok(self.handle_session_list()),
             session_methods::SHOW => self.handle_session_show(params),
             session_methods::ATTACH => self.handle_session_attach(params),
             session_methods::CLAIM => self.handle_session_claim(params),
@@ -1228,7 +1221,7 @@ impl DaemonRuntime {
         let p: P = parse_params(params)?;
         let kind = match p.kind.as_deref() {
             Some("process") => SessionKind::Process,
-            Some("profile_agent") | Some("profile") => SessionKind::ProfileAgent,
+            Some("profile_agent" | "profile") => SessionKind::ProfileAgent,
             _ => SessionKind::Pty,
         };
         let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
@@ -1251,13 +1244,13 @@ impl DaemonRuntime {
         })
     }
 
-    fn handle_session_list(&self) -> IpcResult<Value> {
-        Ok(json!({ "sessions": self.sessions.list() }))
+    fn handle_session_list(&self) -> Value {
+        json!({ "sessions": self.sessions.list() })
     }
 
     fn handle_session_show(&self, params: Option<Value>) -> IpcResult<Value> {
         let id = require_id(params, "id")?;
-        let info = self.sessions.get(&id).map_err(session_err)?;
+        let info = self.sessions.get(&id).map_err(|err| session_err(&err))?;
         serde_json::to_value(info).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
@@ -1278,20 +1271,20 @@ impl DaemonRuntime {
         if p.read_only {
             self.sessions
                 .attach_observer(&p.id, principal.clone())
-                .map_err(session_err)?;
+                .map_err(|err| session_err(&err))?;
         } else {
             let _ = self
                 .sessions
                 .claim_controller(&p.id, principal.clone(), Self::now())
-                .map_err(session_err)?;
+                .map_err(|err| session_err(&err))?;
         }
         self.persist_sessions();
-        let info = self.sessions.get(&p.id).map_err(session_err)?;
+        let info = self.sessions.get(&p.id).map_err(|err| session_err(&err))?;
         Ok(json!({
             "session": info,
             "principal": principal,
             "read_only": p.read_only,
-            "readers": self.sessions.readers(&p.id).map_err(session_err)?.into_iter().collect::<Vec<_>>(),
+            "readers": self.sessions.readers(&p.id).map_err(|err| session_err(&err))?.into_iter().collect::<Vec<_>>(),
         }))
     }
 
@@ -1307,7 +1300,7 @@ impl DaemonRuntime {
         let lease = self
             .sessions
             .claim_controller(&p.id, principal, Self::now())
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         self.persist_sessions();
         Ok(json!({ "lease": lease, "session_id": p.id }))
     }
@@ -1323,7 +1316,7 @@ impl DaemonRuntime {
         let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
         self.sessions
             .release_controller(&p.id, &principal)
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         self.persist_sessions();
         Ok(json!({ "released": true, "session_id": p.id }))
     }
@@ -1341,12 +1334,12 @@ impl DaemonRuntime {
         let lease = self
             .sessions
             .give_controller(&p.id, &from, p.to, Self::now())
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         self.persist_sessions();
         let readers: Vec<String> = self
             .sessions
             .readers(&p.id)
-            .map_err(session_err)?
+            .map_err(|err| session_err(&err))?
             .into_iter()
             .collect();
         Ok(json!({ "lease": lease, "readers": readers }))
@@ -1354,7 +1347,7 @@ impl DaemonRuntime {
 
     fn handle_session_close(&mut self, params: Option<Value>) -> IpcResult<Value> {
         let id = require_id(params, "id")?;
-        self.sessions.close(&id).map_err(session_err)?;
+        self.sessions.close(&id).map_err(|err| session_err(&err))?;
         self.persist_sessions();
         Ok(json!({ "closed": true, "session_id": id }))
     }
@@ -1377,7 +1370,9 @@ impl DaemonRuntime {
             code: app_error::INVALID_PARAMS,
             message: "id or all required".into(),
         })?;
-        self.sessions.terminate(&id).map_err(session_err)?;
+        self.sessions
+            .terminate(&id)
+            .map_err(|err| session_err(&err))?;
         self.persist_sessions();
         Ok(json!({ "terminated": 1, "session_id": id }))
     }
@@ -1393,7 +1388,10 @@ impl DaemonRuntime {
         }
         let p: P = parse_params(params)?;
         if let Some(prin) = p.principal {
-            let readers = self.sessions.readers(&p.id).map_err(session_err)?;
+            let readers = self
+                .sessions
+                .readers(&p.id)
+                .map_err(|err| session_err(&err))?;
             if !readers.contains(&prin) {
                 return Err(IpcError::Remote {
                     code: app_error::POLICY_DENIED,
@@ -1404,7 +1402,7 @@ impl DaemonRuntime {
         let chunks = self
             .sessions
             .replay_from(&p.id, p.from_seq.unwrap_or(1))
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         Ok(json!({ "chunks": chunks, "session_id": p.id }))
     }
 
@@ -1425,7 +1423,7 @@ impl DaemonRuntime {
         let chunk = self
             .sessions
             .push_output(&p.id, p.data, stream)
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         self.persist_sessions();
         Ok(json!({ "chunk": chunk }))
     }
@@ -1442,7 +1440,7 @@ impl DaemonRuntime {
         let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
         self.sessions
             .authorize_stdin(&p.id, &principal, Self::now())
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         // Record input echo for observers (controller write path).
         let chunk = self
             .sessions
@@ -1451,7 +1449,7 @@ impl DaemonRuntime {
                 format!("[stdin] {}", p.data),
                 SessionStreamKind::System,
             )
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         self.persist_sessions();
         Ok(json!({ "accepted": true, "chunk": chunk }))
     }
@@ -1466,7 +1464,7 @@ impl DaemonRuntime {
         let p: P = parse_params(params)?;
         self.sessions
             .resize(&p.id, p.cols, p.rows)
-            .map_err(session_err)?;
+            .map_err(|err| session_err(&err))?;
         self.persist_sessions();
         Ok(json!({ "resized": true, "cols": p.cols, "rows": p.rows }))
     }
@@ -1519,14 +1517,14 @@ fn require_id(params: Option<Value>, field: &str) -> IpcResult<String> {
         })
 }
 
-fn fs_err(err: ownmesh_fs::FsError) -> IpcError {
+fn fs_err(err: &ownmesh_fs::FsError) -> IpcError {
     IpcError::Remote {
         code: app_error::INTERNAL,
         message: err.to_string(),
     }
 }
 
-fn session_err(err: ownmesh_session::SessionError) -> IpcError {
+fn session_err(err: &ownmesh_session::SessionError) -> IpcError {
     let code = match err {
         ownmesh_session::SessionError::NotFound => app_error::INVALID_PARAMS,
         ownmesh_session::SessionError::LeaseHeld(_)

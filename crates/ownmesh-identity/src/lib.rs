@@ -1,4 +1,4 @@
-//! OwnMesh device identity, keychain, and credential storage.
+//! `OwnMesh` device identity, keychain, and credential storage.
 //!
 //! Device private keys and human refresh tokens are stored by purpose in an OS keychain
 //! when available, with an encrypted on-disk keystore fallback for headless environments.

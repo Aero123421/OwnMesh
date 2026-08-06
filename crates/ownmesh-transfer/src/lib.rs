@@ -1,4 +1,4 @@
-//! OwnMesh optional device-to-device transfer planning.
+//! `OwnMesh` optional device-to-device transfer planning.
 //!
 //! Direct/LAN encrypted transfer only by default. Cloud relay (R2/TURN/S3)
 //! is never used as an implicit fallback.
@@ -54,7 +54,7 @@ pub enum TransportKind {
 /// Transfer configuration (defaults safe).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferConfig {
-    /// When false (default), CloudRelay is never chosen.
+    /// When false (default), `CloudRelay` is never chosen.
     #[serde(default)]
     pub relay_enabled: bool,
     #[serde(default)]
@@ -108,13 +108,18 @@ pub struct PlanRequest {
     pub consent: TransferConsent,
 }
 
-/// Build a plan or fail closed (no silent relay).
+/// Builds a plan or fails closed (no silent relay).
+///
+/// # Errors
+///
+/// Returns an error when consent or a permitted transport is unavailable, the
+/// source is invalid or unreadable, or the configured size limit is exceeded.
 pub fn plan_transfer(cfg: &TransferConfig, req: &PlanRequest) -> TransferResult<TransferPlan> {
     if !req.consent.sender_ok || !req.consent.receiver_ok {
-        let who = if !req.consent.sender_ok {
-            req.consent.sender_principal.clone()
-        } else {
+        let who = if req.consent.sender_ok {
             req.consent.receiver_principal.clone()
+        } else {
+            req.consent.sender_principal.clone()
         };
         return Err(TransferError::ConsentRequired(who));
     }
@@ -159,7 +164,12 @@ fn select_transport(
     Err(TransferError::NoDirectPathRelayDisabled)
 }
 
-/// Copy local file with hash verification (loopback path).
+/// Copies a local file with hash verification (loopback path).
+///
+/// # Errors
+///
+/// Returns an error when the plan is not local-loopback, the source hash does
+/// not match, or the source or destination cannot be accessed.
 pub fn execute_local_copy(plan: &TransferPlan) -> TransferResult<()> {
     if plan.transport != TransportKind::LocalLoopback {
         return Err(TransferError::Invalid(

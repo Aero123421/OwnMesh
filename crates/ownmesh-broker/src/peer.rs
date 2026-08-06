@@ -6,10 +6,10 @@
 //! represented as a structured hook. Install templates document enabling
 //! peercred at the service layer; request auth remains MAC + allow-list.
 //!
-//! Windows: Named Pipe ACL via CreateNamedPipe security descriptor
-//! (https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights).
+//! Windows: Named Pipe ACL via `CreateNamedPipe` security descriptor
+//! (<https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights>).
 //!
-//! macOS: LaunchDaemon socket ownership/permission + code signature at install.
+//! macOS: `LaunchDaemon` socket ownership/permission + code signature at install.
 
 use ownmesh_broker_client::PeerCred;
 
@@ -52,9 +52,7 @@ pub fn check_unix_peer_unsupported() -> PeerCheck {
     PeerCheck {
         cred: None,
         method: "named_pipe_acl",
-        notes: vec![
-            "Windows Named Pipe security descriptor controls client access".into(),
-        ],
+        notes: vec!["Windows Named Pipe security descriptor controls client access".into()],
     }
 }
 

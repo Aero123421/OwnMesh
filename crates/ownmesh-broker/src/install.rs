@@ -155,16 +155,23 @@ fn write_unit_template(
     secret_file: &Path,
     notes: &mut Vec<String>,
 ) -> Result<Option<PathBuf>, String> {
-    let readme = dir.join("README-INSTALL.txt");
-    #[cfg(windows)]
-    {
-        let xml = dir.join("ownmesh-broker-service.xml");
-        let pipe = match endpoint {
-            BrokerEndpoint::NamedPipe(n) => n.clone(),
-            other => broker_endpoint_display(other),
-        };
-        let body = format!(
-            r#"<!-- OwnMesh privileged broker Windows Service template
+    write_platform_unit_template(dir, endpoint, secret_file, notes)
+}
+
+#[cfg(windows)]
+fn write_platform_unit_template(
+    dir: &Path,
+    endpoint: &BrokerEndpoint,
+    secret_file: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<PathBuf>, String> {
+    let xml = dir.join("ownmesh-broker-service.xml");
+    let pipe = match endpoint {
+        BrokerEndpoint::NamedPipe(n) => n.clone(),
+        other => broker_endpoint_display(other),
+    };
+    let body = format!(
+        r#"<!-- OwnMesh privileged broker Windows Service template
   Named Pipe ACL: CreateNamedPipe security descriptor controls access.
   Docs: https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights
   Default SD: LocalSystem, Administrators, creator owner (full); tighten to registered user + ownmeshd.
@@ -177,26 +184,32 @@ fn write_unit_template(
   <arguments>run --endpoint pipe:{pipe} --secret-file "{secret}" --allow-callers ownmeshd</arguments>
 </service>
 "#,
-            secret = secret_file.display()
-        );
-        std::fs::write(&xml, body).map_err(|e| e.to_string())?;
-        std::fs::write(
-            &readme,
-            "Install (elevated):\n  sc.exe create ownmesh-broker binPath= \"...\\ownmesh-broker.exe run ...\"\n  Or use the generated ownmesh-broker-service.xml with your service wrapper.\n",
-        )
-        .map_err(|e| e.to_string())?;
-        notes.push("Windows Service template written (Named Pipe ACL)".into());
-        return Ok(Some(xml));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let plist = dir.join("com.ownmesh.broker.plist");
-        let sock = match endpoint {
-            BrokerEndpoint::UnixSocket(p) => p.display().to_string(),
-            other => broker_endpoint_display(other),
-        };
-        let body = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+        secret = secret_file.display()
+    );
+    std::fs::write(&xml, body).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("README-INSTALL.txt"),
+        "Install (elevated):\n  sc.exe create ownmesh-broker binPath= \"...\\ownmesh-broker.exe run ...\"\n  Or use the generated ownmesh-broker-service.xml with your service wrapper.\n",
+    )
+    .map_err(|e| e.to_string())?;
+    notes.push("Windows Service template written (Named Pipe ACL)".into());
+    Ok(Some(xml))
+}
+
+#[cfg(target_os = "macos")]
+fn write_platform_unit_template(
+    dir: &Path,
+    endpoint: &BrokerEndpoint,
+    secret_file: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<PathBuf>, String> {
+    let plist = dir.join("com.ownmesh.broker.plist");
+    let sock = match endpoint {
+        BrokerEndpoint::UnixSocket(p) => p.display().to_string(),
+        other => broker_endpoint_display(other),
+    };
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- LaunchDaemon template: root-owned unix socket + code signature verification at install -->
 <plist version="1.0">
@@ -215,21 +228,27 @@ fn write_unit_template(
 </dict>
 </plist>
 "#,
-            secret = secret_file.display()
-        );
-        std::fs::write(&plist, body).map_err(|e| e.to_string())?;
-        notes.push("macOS LaunchDaemon plist written".into());
-        return Ok(Some(plist));
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let unit = dir.join("ownmesh-broker.service");
-        let sock = match endpoint {
-            BrokerEndpoint::UnixSocket(p) => p.display().to_string(),
-            other => broker_endpoint_display(other),
-        };
-        let body = format!(
-            r#"[Unit]
+        secret = secret_file.display()
+    );
+    std::fs::write(&plist, body).map_err(|e| e.to_string())?;
+    notes.push("macOS LaunchDaemon plist written".into());
+    Ok(Some(plist))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn write_platform_unit_template(
+    dir: &Path,
+    endpoint: &BrokerEndpoint,
+    secret_file: &Path,
+    notes: &mut Vec<String>,
+) -> Result<Option<PathBuf>, String> {
+    let unit = dir.join("ownmesh-broker.service");
+    let sock = match endpoint {
+        BrokerEndpoint::UnixSocket(p) => p.display().to_string(),
+        other => broker_endpoint_display(other),
+    };
+    let body = format!(
+        r#"[Unit]
 Description=OwnMesh networkless privileged broker
 After=network-online.target
 
@@ -247,15 +266,19 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 "#,
-            secret = secret_file.display()
-        );
-        std::fs::write(&unit, body).map_err(|e| e.to_string())?;
-        notes.push("Linux systemd unit written (SO_PEERCRED on accept)".into());
-        return Ok(Some(unit));
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = (dir, endpoint, secret_file, notes);
-        Ok(None)
-    }
+        secret = secret_file.display()
+    );
+    std::fs::write(&unit, body).map_err(|e| e.to_string())?;
+    notes.push("Linux systemd unit written (SO_PEERCRED on accept)".into());
+    Ok(Some(unit))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn write_platform_unit_template(
+    _dir: &Path,
+    _endpoint: &BrokerEndpoint,
+    _secret_file: &Path,
+    _notes: &mut Vec<String>,
+) -> Result<Option<PathBuf>, String> {
+    Ok(None)
 }

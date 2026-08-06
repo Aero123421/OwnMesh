@@ -87,7 +87,7 @@ impl IpcServer {
     ///
     /// Returns bind failures. Per-connection errors are logged and swallowed.
     pub async fn serve(self: Arc<Self>) -> IpcResult<()> {
-        let listener = LocalListener::bind(self.cfg.endpoint.clone()).await?;
+        let listener = LocalListener::bind(self.cfg.endpoint.clone())?;
         tracing::info!(endpoint = %listener.endpoint().display(), "ipc server listening");
 
         let mut shutdown_rx = self.shutdown_rx.clone();
@@ -157,9 +157,7 @@ impl IpcServer {
                     *authenticated = true;
                     match serde_json::to_value(result) {
                         Ok(v) => RpcResponse::success(id, v),
-                        Err(err) => {
-                            RpcResponse::failure(id, app_error::INTERNAL, err.to_string())
-                        }
+                        Err(err) => RpcResponse::failure(id, app_error::INTERNAL, err.to_string()),
                     }
                 }
                 Err(err) => RpcResponse::failure(id, app_error::UNAUTHORIZED, err.to_string()),

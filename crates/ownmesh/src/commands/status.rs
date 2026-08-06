@@ -84,13 +84,11 @@ async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
 #[allow(dead_code)]
 pub fn spawn_ownmeshd_for_tests(runtime_dir: &std::path::Path) -> Option<std::process::Child> {
     let exe = std::env::current_exe().ok()?;
-    let ownmeshd = exe
-        .parent()?
-        .join(if cfg!(windows) {
-            "ownmeshd.exe"
-        } else {
-            "ownmeshd"
-        });
+    let ownmeshd = exe.parent()?.join(if cfg!(windows) {
+        "ownmeshd.exe"
+    } else {
+        "ownmeshd"
+    });
     if !ownmeshd.exists() {
         return None;
     }

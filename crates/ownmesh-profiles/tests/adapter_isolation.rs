@@ -100,9 +100,9 @@ fn malformed_adapter_events_do_not_panic_and_are_dropped_or_normalized() {
         "null",
         "[]",
         "\"str\"",
-        r#"{"type":"message"}"# ,
+        r#"{"type":"message"}"#,
         r#"{"event":"tool_call","args":{"x":1}}"#,
-        r#"{"type":"message","text":"hi","session_id":"s"}"# ,
+        r#"{"type":"message","text":"hi","session_id":"s"}"#,
     ];
     for s in samples {
         let _ = normalize_event_json(s.trim());

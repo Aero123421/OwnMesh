@@ -1,4 +1,4 @@
-//! OwnMesh structured command and process execution.
+//! `OwnMesh` structured command and process execution.
 //!
 //! Provides shell-free structured commands, optional raw shell, timeouts,
 //! process-tree kill best-effort, bounded output, and an idempotency journal.
@@ -105,6 +105,11 @@ pub struct IdempotencyJournal {
 
 impl IdempotencyJournal {
     /// Open or create a journal at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when an existing journal cannot be read, or a journal
+    /// error when its JSON content cannot be deserialized.
     pub fn open(path: impl Into<PathBuf>) -> ExecResult<Self> {
         let path = path.into();
         let entries = if path.exists() {
@@ -123,6 +128,11 @@ impl IdempotencyJournal {
     }
 
     /// Record a result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O or serialization error when the updated journal cannot be
+    /// persisted.
     pub fn put(&mut self, key: String, result: RunResult) -> ExecResult<()> {
         self.entries.insert(key, result);
         self.flush()
@@ -215,6 +225,11 @@ fn truncate_bytes(mut data: Vec<u8>, max: usize) -> (String, bool) {
 }
 
 /// Run a command, optionally consulting/updating an idempotency journal.
+///
+/// # Errors
+///
+/// Returns an error when the command cannot be built, spawned, supplied with
+/// standard input, or awaited, or when an idempotency result cannot be persisted.
 pub async fn run_command(
     req: &RunRequest,
     journal: Option<&mut IdempotencyJournal>,
@@ -250,7 +265,7 @@ pub async fn run_command(
                     stdout: String::new(),
                     stderr: format!("command timed out after {dur:?}"),
                     timed_out: true,
-                    duration_ms: start.elapsed().as_millis() as u64,
+                    duration_ms: elapsed_millis(start),
                     truncated: false,
                     replayed: false,
                 });
@@ -268,7 +283,7 @@ pub async fn run_command(
         stdout,
         stderr,
         timed_out: false,
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_millis(start),
         truncated: t1 || t2,
         replayed: false,
     };
@@ -279,8 +294,20 @@ pub async fn run_command(
     Ok(result)
 }
 
-/// Synchronous helper for simple tests (blocks on current runtime or creates one).
-pub fn run_command_blocking(req: &RunRequest, journal_path: Option<&Path>) -> ExecResult<RunResult> {
+fn elapsed_millis(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Synchronous helper for simple tests (blocks on a newly created runtime).
+///
+/// # Errors
+///
+/// Returns an error when the runtime or journal cannot be created, or when
+/// command execution fails. See [`run_command`] for execution errors.
+pub fn run_command_blocking(
+    req: &RunRequest,
+    journal_path: Option<&Path>,
+) -> ExecResult<RunResult> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

@@ -1,4 +1,4 @@
-//! OwnMesh client library for the privileged broker.
+//! `OwnMesh` client library for the privileged broker.
 //!
 //! Capability tokens, request signing, OS-local transport, and networkless protocol types.
 //! The broker itself never opens non-loopback network listeners.
@@ -130,7 +130,13 @@ impl CapabilityToken {
         tok
     }
 
-    /// Verify MAC + expiry.
+    /// Verify the MAC, expiry, and required identity fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Expired`] for an expired token,
+    /// [`BrokerError::BadSignature`] for a MAC mismatch, or
+    /// [`BrokerError::InvalidToken`] when required identity fields are empty.
     pub fn verify(&self, secret: &BrokerSecret, now_unix: i64) -> BrokerResult<()> {
         if now_unix > self.expires_at_unix {
             return Err(BrokerError::Expired);
@@ -278,7 +284,14 @@ pub fn build_request_with_capability(
     req
 }
 
-/// Verify request MAC, expiry, protocol version, optional capability. Does not check replay set.
+/// Verify a request's MAC, expiry, protocol version, and optional capability.
+///
+/// This does not check a replay set.
+///
+/// # Errors
+///
+/// Returns an appropriate [`BrokerError`] if the request is expired, malformed,
+/// signed incorrectly, uses an unsupported protocol, or has an invalid capability.
 pub fn verify_request(
     secret: &BrokerSecret,
     req: &BrokerRequest,
@@ -319,10 +332,10 @@ pub fn verify_request(
     Ok(())
 }
 
-/// Replay cache keyed by nonce/request_id with optional pruning by expiry.
+/// Replay cache keyed by `nonce/request_id` with optional pruning by expiry.
 #[derive(Debug, Default)]
 pub struct ReplayCache {
-    /// key -> expires_at_unix
+    /// Key mapped to `expires_at_unix`.
     seen: HashMap<String, i64>,
 }
 
@@ -332,6 +345,11 @@ impl ReplayCache {
         Self::default()
     }
 
+    /// Record a request unless its request identifier and nonce were already seen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Replay`] if the request is already cached.
     pub fn check_and_insert(&mut self, req: &BrokerRequest) -> BrokerResult<()> {
         self.prune(req.issued_at_unix.saturating_sub(3600));
         let key = format!("{}:{}", req.request_id, req.nonce);
@@ -347,7 +365,12 @@ impl ReplayCache {
     }
 }
 
-/// High-level helper: sign + send elevated command.
+/// Sign and send an elevated command.
+///
+/// # Errors
+///
+/// Returns a [`BrokerError`] if endpoint validation, connection, request writing,
+/// response reading, or response deserialization fails.
 pub async fn elevate(
     endpoint: &BrokerEndpoint,
     secret: &BrokerSecret,
@@ -449,15 +472,8 @@ mod tests {
             cwd: None,
             env: vec![],
         };
-        let req = build_request_with_capability(
-            &secret,
-            "ownmeshd",
-            "op",
-            cmd,
-            Some(tok),
-            1000,
-            60,
-        );
+        let req =
+            build_request_with_capability(&secret, "ownmeshd", "op", cmd, Some(tok), 1000, 60);
         verify_request(&secret, &req, 1010).unwrap();
 
         let mut mismatched = req;

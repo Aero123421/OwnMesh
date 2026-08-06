@@ -151,6 +151,10 @@ impl ErrorCode {
     }
 
     /// Parse a stable wire code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when `raw` is not a recognized error code.
     pub fn parse(raw: &str) -> Result<Self, DomainError> {
         match raw {
             "OWNMESH_E_INVALID_ID" => Ok(Self::InvalidId),
@@ -383,7 +387,10 @@ mod tests {
     #[test]
     fn device_offline_is_retryable() {
         assert!(ErrorCode::DeviceOffline.retryable());
-        assert_eq!(ErrorCode::DeviceOffline.exit_code(), ExitCode::DeviceOffline);
+        assert_eq!(
+            ErrorCode::DeviceOffline.exit_code(),
+            ExitCode::DeviceOffline
+        );
     }
 
     #[test]

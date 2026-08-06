@@ -1,7 +1,7 @@
 /** Shared helpers for the OwnMesh control plane. */
 
 export const SERVICE_NAME = "ownmesh-control-plane";
-export const SERVICE_VERSION = "1.0.1";
+export const SERVICE_VERSION = "1.0.2";
 
 export function json(data: unknown, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers);

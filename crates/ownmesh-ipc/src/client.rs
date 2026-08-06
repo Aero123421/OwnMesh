@@ -197,19 +197,14 @@ impl IpcClient {
         loop {
             attempts = attempts.saturating_add(1);
             self.ensure_connected().await?;
-            let result = self
-                .call_once(method, params.clone(), cancel)
-                .await;
+            let result = self.call_once(method, params.clone(), cancel).await;
             match result {
                 Ok(value) => return Ok(value),
-                Err(IpcError::Disconnected(_)) | Err(IpcError::Io(_))
+                Err(IpcError::Disconnected(_) | IpcError::Io(_))
                     if attempts <= self.options.max_reconnect_attempts =>
                 {
                     self.disconnect().await;
-                    let delay = self
-                        .options
-                        .reconnect_base_delay
-                        .saturating_mul(attempts);
+                    let delay = self.options.reconnect_base_delay.saturating_mul(attempts);
                     tokio::time::sleep(delay).await;
                 }
                 Err(err) => return Err(err),
@@ -266,23 +261,19 @@ impl IpcClient {
                     Err(IpcError::Cancelled)
                 }
                 result = timeout(self.options.request_timeout, call_future) => {
-                    match result {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            self.disconnect().await;
-                            Err(IpcError::Timeout)
-                        }
+                    if let Ok(inner) = result {
+                        inner
+                    } else {
+                        self.disconnect().await;
+                        Err(IpcError::Timeout)
                     }
                 }
             }
+        } else if let Ok(inner) = timeout(self.options.request_timeout, call_future).await {
+            inner
         } else {
-            match timeout(self.options.request_timeout, call_future).await {
-                Ok(inner) => inner,
-                Err(_) => {
-                    self.disconnect().await;
-                    Err(IpcError::Timeout)
-                }
-            }
+            self.disconnect().await;
+            Err(IpcError::Timeout)
         }
     }
 
@@ -322,7 +313,12 @@ mod tests {
 
     async fn start_test_server(
         runtime: &Path,
-    ) -> (Arc<IpcServer>, Endpoint, String, tokio::task::JoinHandle<()>) {
+    ) -> (
+        Arc<IpcServer>,
+        Endpoint,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
         let token = generate_token();
         write_token_file(runtime, &token).unwrap();
         let endpoint = Endpoint::default_for(runtime, IpcBus::Daemon);
@@ -400,7 +396,10 @@ mod tests {
 
         let err = client.status().await.expect_err("must reject");
         assert!(
-            matches!(err, IpcError::Unauthorized(_) | IpcError::Remote { .. } | IpcError::Disconnected(_)),
+            matches!(
+                err,
+                IpcError::Unauthorized(_) | IpcError::Remote { .. } | IpcError::Disconnected(_)
+            ),
             "unexpected error: {err:?}"
         );
         assert!(

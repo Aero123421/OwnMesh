@@ -12,7 +12,12 @@ pub enum PersistError {
     Serde(String),
 }
 
-/// Save manager snapshot.
+/// Save a manager snapshot.
+///
+/// # Errors
+///
+/// Returns [`PersistError::Serde`] if serialization fails, or
+/// [`PersistError::Io`] if creating directories, writing, or renaming fails.
 pub fn save_manager(path: &Path, mgr: &SessionManager) -> Result<(), PersistError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| PersistError::Io(e.to_string()))?;
@@ -24,7 +29,12 @@ pub fn save_manager(path: &Path, mgr: &SessionManager) -> Result<(), PersistErro
     Ok(())
 }
 
-/// Load manager; missing file yields empty manager.
+/// Load a manager; a missing file yields an empty manager.
+///
+/// # Errors
+///
+/// Returns [`PersistError::Io`] if reading fails, or [`PersistError::Serde`]
+/// if the snapshot is not valid JSON for a session manager.
 pub fn load_manager(path: &Path) -> Result<SessionManager, PersistError> {
     if !path.exists() {
         return Ok(SessionManager::new());

@@ -1,4 +1,6 @@
-# IMPLEMENTATION_CHECKLIST Coverage Map (v1.0.1)
+# IMPLEMENTATION_CHECKLIST Coverage Map (v1.0.x)
+
+> **Release-quality correction (v1.0.2):** This map records ownership/disposition of unchecked specification work; it is not evidence that the product surface is complete. The shipped CLI contract is `release/SUPPORTED_SURFACES.json`, whose 43 generic stubs plus additional hard-error unsupported surfaces remain outside 1.0.x completeness.
 
 **Source:** [`IMPLEMENTATION_CHECKLIST.md`](../IMPLEMENTATION_CHECKLIST.md)  
 **Authority:** meta-loop board plan (run `2026-08-06T10-56-25-625Z-phl3z8`) + [`docs/DOD_1.0.md`](./DOD_1.0.md)  
@@ -316,8 +318,9 @@ Legend for `Kind`: `impl` = implement in ticket · `waiver` = accepted deferral 
 | harden-07 | §15 + §12/§14 invariant regression (no feature build) |
 | release-08 | §16 + version/tag; gated on this document |
 
-## Notes for release-08 gate
+## Notes for the v1.0.2+ release gate
 
-1. Do **not** tag v1.0.1 until cli-auth-09 and logs-git-10 are green (no login/log-provider stubs).
-2. Do **not** tag until release notes explicitly list **W-§12**, **W-§14**, **W-SIGN**, **W-LIVE-E2E**, **W-EXT-SEC**.
-3. Checkbox updates in `IMPLEMENTATION_CHECKLIST.md` are release-08's job, aligned to this map (waiver rows stay unchecked or marked waived in notes — do not fake `[x]` for waived LAN/update depth).
+1. A ticket owner or waiver is not a completion marker. `docs/DOD_1.0.md` and `release/SUPPORTED_SURFACES.json` control release claims.
+2. Release notes must explicitly list **W-§12**, **W-§14**, **W-SIGN**, **W-LIVE-E2E**, and **W-EXT-SEC**.
+3. Waiver rows stay incomplete/unsupported; do not fake `[x]` or **done** for deferred LAN/update/signing/live/external-review depth.
+4. `python scripts/check_release_quality.py` must pass before tagging.

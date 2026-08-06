@@ -1,4 +1,4 @@
-//! OwnMesh CLI entrypoint.
+//! `OwnMesh` CLI entrypoint.
 
 #![forbid(unsafe_code)]
 #![allow(
@@ -14,15 +14,17 @@ mod commands;
 
 use clap::Parser;
 use cli::Cli;
-use ownmesh_domain::ExitCode;
 use std::process::ExitCode as StdExitCode;
 
 fn main() -> StdExitCode {
     init_tracing();
     let cli = Cli::parse();
     match commands::dispatch(&cli) {
-        Ok(()) => StdExitCode::from(ExitCode::Success.code() as u8),
-        Err(code) => StdExitCode::from(code.code() as u8),
+        Ok(()) => StdExitCode::SUCCESS,
+        Err(code) => {
+            let code = u8::try_from(code.code()).unwrap_or(u8::MAX);
+            StdExitCode::from(code)
+        }
     }
 }
 
@@ -60,7 +62,10 @@ mod tests {
             "unlock",
             "tokens",
         ] {
-            assert!(help.contains(needle), "missing {needle} in help/registration");
+            assert!(
+                help.contains(needle),
+                "missing {needle} in help/registration"
+            );
         }
         let approval_help = cmd
             .find_subcommand_mut("approval")

@@ -1,4 +1,4 @@
-//! OwnMesh networkless privileged broker library.
+//! `OwnMesh` networkless privileged broker library.
 //!
 //! Listens only on local IPC:
 //! - Windows Named Pipe (default ACL grants creator/admin/LocalSystem; see Microsoft docs)
@@ -8,9 +8,9 @@
 //! Never opens outbound network connections or non-loopback listeners.
 //!
 //! References:
-//! - https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights
-//! - https://www.man7.org/linux/man-pages/man7/unix.7.html
-//! - https://www.man7.org/linux/man-pages/man7/socket.7.html
+//! - <https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights>
+//! - <https://www.man7.org/linux/man-pages/man7/unix.7.html>
+//! - <https://www.man7.org/linux/man-pages/man7/socket.7.html>
 
 #![allow(
     clippy::missing_errors_doc,
@@ -23,9 +23,7 @@ mod install;
 mod peer;
 mod serve;
 
-pub use install::{
-    install_broker, broker_status, uninstall_broker, InstallRecord, InstallStatus,
-};
+pub use install::{broker_status, install_broker, uninstall_broker, InstallRecord, InstallStatus};
 pub use serve::{
     enforce_bind_is_networkless, execute_verified, load_or_create_secret, run_broker,
     BrokerServeConfig, BrokerState,
@@ -56,7 +54,7 @@ pub fn default_endpoint_name() -> &'static str {
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -121,8 +119,8 @@ mod tests {
             30,
         );
         let mut replay = ReplayCache::new();
-        let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-            .unwrap();
+        let resp =
+            execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
     }
@@ -144,8 +142,8 @@ mod tests {
             60,
         );
         let mut replay = ReplayCache::new();
-        let _ = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-            .unwrap();
+        let _ =
+            execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
         let err = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
             .unwrap_err();
         assert!(err.to_lowercase().contains("replay"), "{err}");
@@ -208,7 +206,7 @@ mod tests {
         assert!(rec.installed);
         let st = broker_status(base).unwrap();
         assert!(st.installed);
-        assert_eq!(st.endpoint_kind.is_empty(), false);
+        assert!(!st.endpoint_kind.is_empty());
 
         uninstall_broker(base).unwrap();
         let st = broker_status(base).unwrap();
@@ -304,7 +302,10 @@ mod tests {
         });
         let ep2 = BrokerEndpoint::LoopbackTcp(addr2);
         let r1 = connect_and_call(&ep2, &req).await.unwrap();
-        assert!(r1.ok || r1.error.is_none() || r1.exit_code.is_some(), "{r1:?}");
+        assert!(
+            r1.ok || r1.error.is_none() || r1.exit_code.is_some(),
+            "{r1:?}"
+        );
         let r2 = connect_and_call(&ep2, &req).await.unwrap();
         assert!(!r2.ok);
         assert!(

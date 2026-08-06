@@ -1,4 +1,4 @@
-//! OwnMesh interactive session model and handoff primitives.
+//! `OwnMesh` interactive session model and handoff primitives.
 //!
 //! Multiple observers, single controller lease, claim/release/give,
 //! detached persistence across daemon restarts, PTY size/view metadata.
@@ -106,7 +106,7 @@ pub struct SessionInfo {
     pub rows: u16,
     pub next_seq: u64,
     pub profile_id: Option<String>,
-    /// Profile / coding-CLI native session id (distinct from OwnMesh id).
+    /// Profile / coding-CLI native session id (distinct from the `OwnMesh` id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
     /// View mode preference (raw/cooked).
@@ -165,15 +165,7 @@ impl SessionManager {
         profile_id: Option<String>,
     ) -> SessionInfo {
         self.open_with(
-            kind,
-            title,
-            creator,
-            now_unix,
-            profile_id,
-            None,
-            None,
-            None,
-            None,
+            kind, title, creator, now_unix, profile_id, None, None, None, None,
         )
     }
 
@@ -227,6 +219,11 @@ impl SessionManager {
         info
     }
 
+    /// Return metadata for the session identified by `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn get(&self, id: &str) -> SessionResult<&SessionInfo> {
         self.sessions
             .get(id)
@@ -234,11 +231,18 @@ impl SessionManager {
             .ok_or(SessionError::NotFound)
     }
 
+    /// Return snapshots of all managed sessions.
+    #[must_use]
     pub fn list(&self) -> Vec<SessionInfo> {
         self.sessions.values().map(|s| s.info.clone()).collect()
     }
 
     /// Attach as observer (no stdin).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist, or
+    /// [`SessionError::Closed`] if it has already closed.
     pub fn attach_observer(&mut self, id: &str, principal: impl Into<String>) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         if s.info.state == SessionState::Closed {
@@ -249,8 +253,7 @@ impl SessionManager {
             && s.info
                 .controller
                 .as_ref()
-                .map(|c| c.principal_id != p)
-                .unwrap_or(true)
+                .is_none_or(|c| c.principal_id != p)
         {
             s.info.observers.push(p);
         }
@@ -258,6 +261,12 @@ impl SessionManager {
     }
 
     /// Claim controller lease (fails if held by someone else and not expired).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist,
+    /// [`SessionError::Closed`] if it has closed, or [`SessionError::LeaseHeld`]
+    /// if another principal has an unexpired lease.
     pub fn claim_controller(
         &mut self,
         id: &str,
@@ -286,6 +295,12 @@ impl SessionManager {
     }
 
     /// Give controller to another principal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist,
+    /// [`SessionError::LeaseHeld`] if another principal controls it, or
+    /// [`SessionError::NotController`] if it has no controller.
     pub fn give_controller(
         &mut self,
         id: &str,
@@ -314,6 +329,11 @@ impl SessionManager {
     }
 
     /// Release controller (session becomes detached; observers remain).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist, or
+    /// [`SessionError::NotController`] if `principal` does not control it.
     pub fn release_controller(&mut self, id: &str, principal: &str) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         match &s.info.controller {
@@ -331,6 +351,11 @@ impl SessionManager {
     }
 
     /// Append output visible to controller + observers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist, or
+    /// [`SessionError::Closed`] if it has already closed.
     pub fn push_output(
         &mut self,
         id: &str,
@@ -354,7 +379,12 @@ impl SessionManager {
         Ok(chunk)
     }
 
-    /// Controller-only stdin gate.
+    /// Controller-only standard-input gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session does not exist, is closed, or `principal`
+    /// does not hold a current controller lease.
     pub fn authorize_stdin(&self, id: &str, principal: &str, now_unix: i64) -> SessionResult<()> {
         let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
         if s.info.state == SessionState::Closed {
@@ -369,6 +399,10 @@ impl SessionManager {
     }
 
     /// Replay from sequence (inclusive).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn replay_from(&self, id: &str, from_seq: u64) -> SessionResult<Vec<OutputChunk>> {
         let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
         Ok(s.replay
@@ -378,6 +412,11 @@ impl SessionManager {
             .collect())
     }
 
+    /// Update the terminal dimensions for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn resize(&mut self, id: &str, cols: u16, rows: u16) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.cols = cols;
@@ -385,18 +424,33 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Set the terminal view mode for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn set_view_mode(&mut self, id: &str, mode: PtyViewMode) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.view_mode = mode;
         Ok(())
     }
 
+    /// Record the session host process identifier, if known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn set_host_pid(&mut self, id: &str, pid: Option<u32>) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.host_pid = pid;
         Ok(())
     }
 
+    /// Record the profile-native identifier associated with a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn set_native_session_id(
         &mut self,
         id: &str,
@@ -407,6 +461,11 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Mark a session closed and release its controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn close(&mut self, id: &str) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.state = SessionState::Closed;
@@ -414,6 +473,11 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Close and remove a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn terminate(&mut self, id: &str) -> SessionResult<()> {
         self.close(id)?;
         self.sessions.remove(id);
@@ -458,7 +522,7 @@ impl SessionManager {
                     s.info.state = SessionState::Detached;
                     n += 1;
                 }
-                let _ = s.replay.push_back(OutputChunk {
+                s.replay.push_back(OutputChunk {
                     seq: s.info.next_seq,
                     data: "[system] session host disconnected after daemon restart\n".into(),
                     stream: StreamKind::System,
@@ -470,6 +534,10 @@ impl SessionManager {
     }
 
     /// Principals that can read output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] if the session does not exist.
     pub fn readers(&self, id: &str) -> SessionResult<HashSet<String>> {
         let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
         let mut set: HashSet<String> = s.info.observers.iter().cloned().collect();
@@ -479,12 +547,20 @@ impl SessionManager {
         Ok(set)
     }
 
-    /// Persist to JSON path.
+    /// Persist to a JSON path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Persist`] if serialization or file operations fail.
     pub fn save_to_path(&self, path: &Path) -> SessionResult<()> {
         save_manager(path, self).map_err(|e| SessionError::Persist(e.to_string()))
     }
 
-    /// Load from JSON path (empty manager if missing).
+    /// Load from a JSON path (empty manager if missing).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::Persist`] if reading or deserialization fails.
     pub fn load_from_path(path: &Path) -> SessionResult<Self> {
         load_manager(path).map_err(|e| SessionError::Persist(e.to_string()))
     }

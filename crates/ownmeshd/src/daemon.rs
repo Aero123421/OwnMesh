@@ -3,9 +3,7 @@
 use crate::runtime::{runtime_handler, DaemonRuntime};
 use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_identity::{
-    load_or_create_device_key, PreferredSecretStore, DEFAULT_KEYCHAIN_SERVICE,
-};
+use ownmesh_identity::{load_or_create_device_key, PreferredSecretStore, DEFAULT_KEYCHAIN_SERVICE};
 use ownmesh_ipc::{
     generate_token, write_token_file, AuthGate, ClientIdentity, ClientOptions, Endpoint, IpcBus,
     IpcClient, IpcServer, MethodHandler, ServerConfig,
@@ -210,7 +208,7 @@ pub async fn start_test_daemon(
 mod tests {
     use super::*;
     use ownmesh_ipc::{app_error, methods, ClientIdentity, ClientOptions, IpcClient, IpcError};
-    use ownmesh_policy::{preset_document, AccessPreset, PolicyDocument, PolicyRule, Decision};
+    use ownmesh_policy::{preset_document, AccessPreset, Decision, PolicyDocument, PolicyRule};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -282,6 +280,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cohesive end-to-end policy scenario"
+    )]
     async fn policy_allow_ask_deny_on_exec_fs_logs() {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
@@ -328,10 +330,7 @@ mod tests {
             .expect("fs write");
         assert_eq!(wrote["approval_required"], false);
         let read = client
-            .call(
-                methods::OPS_FS_READ,
-                Some(json!({ "path": "hello.txt" })),
-            )
+            .call(methods::OPS_FS_READ, Some(json!({ "path": "hello.txt" })))
             .await
             .expect("fs read");
         assert_eq!(read["result"]["content"], "hi-fs");
@@ -655,10 +654,7 @@ mod tests {
         assert_eq!(ok["approval_required"], false);
 
         let revoked = client
-            .call(
-                methods::TOKEN_REVOKE,
-                Some(json!({ "client": "chatgpt" })),
-            )
+            .call(methods::TOKEN_REVOKE, Some(json!({ "client": "chatgpt" })))
             .await
             .expect("token revoke");
         assert_eq!(revoked["revoked"], "chatgpt");
@@ -845,13 +841,14 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|c| c["data"]
-                .as_str()
-                .unwrap_or("")
-                .contains("before-restart")));
+            .any(|c| c["data"].as_str().unwrap_or("").contains("before-restart")));
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cohesive end-to-end operations scenario"
+    )]
     async fn logs_providers_and_git_ops_e2e() {
         use crate::runtime::ops_methods;
         use std::process::Command;
@@ -1059,10 +1056,7 @@ mod tests {
             .await
             .expect("fs write");
         let read = client
-            .call(
-                methods::OPS_FS_READ,
-                Some(json!({ "path": "note.txt" })),
-            )
+            .call(methods::OPS_FS_READ, Some(json!({ "path": "note.txt" })))
             .await
             .expect("fs read");
         assert_eq!(read["result"]["content"], "file-and-log-contract");
@@ -1072,7 +1066,7 @@ mod tests {
     }
 
     /// Prompt-injection / model-judgment text in operation payloads must never
-    /// bypass OwnMesh policy. Final enforcement is always the local policy engine.
+    /// bypass `OwnMesh` policy. Final enforcement is always the local policy engine.
     #[tokio::test]
     async fn prompt_injection_cannot_bypass_device_policy() {
         let dir = tempdir().unwrap();
@@ -1115,10 +1109,7 @@ mod tests {
         match denied {
             IpcError::Remote { code, message } => {
                 assert_eq!(code, app_error::POLICY_DENIED);
-                assert!(
-                    message.to_ascii_lowercase().contains("denied"),
-                    "{message}"
-                );
+                assert!(message.to_ascii_lowercase().contains("denied"), "{message}");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1146,7 +1137,11 @@ mod tests {
         assert!(ask["approval_id"].as_str().unwrap().starts_with("apr_"));
         // File must not exist until human approval.
         assert!(
-            !paths.state_dir.join("workspace").join("injected.txt").exists(),
+            !paths
+                .state_dir
+                .join("workspace")
+                .join("injected.txt")
+                .exists(),
             "must not execute before approval"
         );
 

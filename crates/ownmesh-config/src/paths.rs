@@ -4,7 +4,7 @@ use crate::error::{ConfigError, ConfigResult};
 use std::env;
 use std::path::PathBuf;
 
-/// Resolved OwnMesh filesystem layout for the current user.
+/// Resolved `OwnMesh` filesystem layout for the current user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnMeshPaths {
     /// Human-editable configuration directory (`config.toml`, `policy.toml`).
@@ -66,7 +66,7 @@ impl OwnMeshPaths {
         self.config_dir.join("policy.toml")
     }
 
-    /// Path to local SQLite state database.
+    /// Path to local `SQLite` state database.
     #[must_use]
     pub fn state_db(&self) -> PathBuf {
         self.state_dir.join("state.db")
@@ -101,7 +101,9 @@ impl OwnMeshPaths {
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
-    env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
+    env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn home_dir() -> ConfigResult<PathBuf> {

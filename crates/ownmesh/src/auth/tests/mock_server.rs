@@ -114,11 +114,9 @@ impl MockControlPlane {
                 if shutdown_clone.load(Ordering::SeqCst) {
                     break;
                 }
-                let accept = tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
-                    listener.accept(),
-                )
-                .await;
+                let accept =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                        .await;
                 let Ok(Ok((stream, _))) = accept else {
                     continue;
                 };
@@ -142,9 +140,7 @@ impl MockControlPlane {
     }
 
     pub fn set_auto_approve_device(&self, on: bool) {
-        self.inner
-            .auto_approve_device
-            .store(on, Ordering::SeqCst);
+        self.inner.auto_approve_device.store(on, Ordering::SeqCst);
     }
 
     pub async fn shutdown(&self) {
@@ -178,7 +174,7 @@ async fn handle_client(mut stream: TcpStream, inner: Arc<Inner>, base: &str) -> 
         ("POST", "/oauth/device_authorization") => {
             handle_device_authorization(&inner, base, &body).await
         }
-        ("GET", "/oauth/device") | ("POST", "/oauth/device") => {
+        ("GET" | "POST", "/oauth/device") => {
             handle_device_verify(&inner, method.as_str(), &body, &url).await
         }
         ("POST", "/v1/devices/enroll") => handle_enroll(&inner, &headers, &body).await,
@@ -256,7 +252,7 @@ async fn handle_authorize(inner: &Inner, url: &str) -> Vec<u8> {
         .get("scope")
         .cloned()
         .unwrap_or_else(|| super::super::oauth::DEFAULT_SCOPES.to_owned());
-    let auto = q.get("auto").map(|s| s == "1").unwrap_or(false);
+    let auto = q.get("auto").is_some_and(|s| s == "1");
 
     if redirect.is_empty() || client_id.is_empty() || challenge.is_empty() || method != "S256" {
         return json_response(400, json!({"error":"invalid_request"}));
@@ -285,10 +281,7 @@ async fn handle_authorize(inner: &Inner, url: &str) -> Vec<u8> {
 
     if !auto {
         // HTML consent page — tests always pass auto=1.
-        let html = format!(
-            "<html><body>approve <a href=\"{}&auto=1\">ok</a></body></html>",
-            url
-        );
+        let html = format!("<html><body>approve <a href=\"{url}&auto=1\">ok</a></body></html>");
         return html_response(200, &html);
     }
 
@@ -302,7 +295,7 @@ async fn handle_authorize(inner: &Inner, url: &str) -> Vec<u8> {
 
 async fn handle_token(inner: &Inner, _headers: &HashMap<String, String>, body: &str) -> Vec<u8> {
     let form = parse_form(body);
-    let grant = form.get("grant_type").map(String::as_str).unwrap_or("");
+    let grant = form.get("grant_type").map_or("", String::as_str);
 
     match grant {
         "authorization_code" => {
@@ -429,12 +422,7 @@ async fn handle_device_authorization(inner: &Inner, base: &str, body: &str) -> V
     )
 }
 
-async fn handle_device_verify(
-    inner: &Inner,
-    method: &str,
-    body: &str,
-    url: &str,
-) -> Vec<u8> {
+async fn handle_device_verify(inner: &Inner, method: &str, body: &str, url: &str) -> Vec<u8> {
     if method == "GET" {
         return html_response(200, "<html><body>device login</body></html>");
     }
@@ -703,7 +691,9 @@ fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
 
 fn bearer(headers: &HashMap<String, String>) -> Option<String> {
     let h = headers.get("authorization")?;
-    let rest = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer "))?;
+    let rest = h
+        .strip_prefix("Bearer ")
+        .or_else(|| h.strip_prefix("bearer "))?;
     Some(rest.trim().to_owned())
 }
 
@@ -766,7 +756,7 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn json_response(status: u16, body: Value) -> Vec<u8> {
+fn json_response(status: u16, body: impl serde::Serialize) -> Vec<u8> {
     let bytes = serde_json::to_vec(&body).unwrap_or_default();
     http_raw(status, "application/json; charset=utf-8", &bytes)
 }
@@ -801,5 +791,3 @@ fn http_raw(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(body);
     out
 }
-
-

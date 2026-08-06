@@ -1,7 +1,7 @@
-//! OwnMesh session host — PTY/ConPTY supervisor with IPC + terminal restore.
+//! `OwnMesh` session host — PTY/ConPTY supervisor with IPC + terminal restore.
 //!
-//! ConPTY (Windows) / openpty (POSIX) via `portable-pty`:
-//! https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session
+//! `ConPTY` (Windows) / openpty (POSIX) via `portable-pty`:
+//! <https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session>
 
 #![forbid(unsafe_code)]
 #![allow(
@@ -84,7 +84,7 @@ fn main() -> StdExitCode {
         Err(code) => code,
     };
     let _ = restore_terminal();
-    StdExitCode::from(code.code() as u8)
+    StdExitCode::from(u8::try_from(code.code()).unwrap_or(1))
 }
 
 fn run(cli: Cli) -> Result<(), ExitCode> {
@@ -226,8 +226,7 @@ fn run_serve(
     } else {
         mgr.list()
             .first()
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| sid.clone())
+            .map_or_else(|| sid.clone(), |s| s.id.clone())
     };
     let _ = mgr.set_host_pid(&persist_id, handle.handle.pid);
 
@@ -272,7 +271,7 @@ fn default_shell() -> String {
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 

@@ -1,4 +1,4 @@
-//! OwnMesh networkless privileged broker binary.
+//! `OwnMesh` networkless privileged broker binary.
 
 use clap::{Parser, Subcommand};
 use ownmesh_broker::{
@@ -113,11 +113,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let st = broker_status(&base)?;
             println!(
                 "status={} network={} endpoint={} kind={} secret={}",
-                if st.installed {
-                    "installed"
-                } else {
-                    "idle"
-                },
+                if st.installed { "installed" } else { "idle" },
                 st.network,
                 st.endpoint.as_deref().unwrap_or("-"),
                 st.endpoint_kind,
@@ -130,11 +126,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             endpoint,
         } => {
             let ep = match endpoint {
-                Some(s) => Some(resolve_broker_endpoint(
-                    &state_dir.join("runtime"),
-                    Some(&s),
-                )
-                .map_err(|e| e.to_string())?),
+                Some(s) => Some(
+                    resolve_broker_endpoint(&state_dir.join("runtime"), Some(&s))
+                        .map_err(|e| e.to_string())?,
+                ),
                 None => None,
             };
             let rec = install_broker(&state_dir, ep)?;
@@ -158,39 +153,15 @@ async fn run(cli: Cli) -> Result<(), String> {
             require_capability,
             runtime_dir,
         } => {
-            let runtime = runtime_dir.unwrap_or_else(|| {
-                secret_file
-                    .parent()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
-            let ep = if let Some(bind) = bind {
-                let addr: SocketAddr = bind
-                    .parse()
-                    .map_err(|e| format!("invalid bind address: {e}"))?;
-                enforce_bind_is_networkless(addr)?;
-                BrokerEndpoint::LoopbackTcp(addr)
-            } else {
-                resolve_broker_endpoint(&runtime, endpoint.as_deref())
-                    .map_err(|e| e.to_string())?
-            };
-            ep.enforce_networkless().map_err(|e| e.to_string())?;
-            let allowed: Vec<String> = allow_callers
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            eprintln!(
-                "ownmesh-broker starting endpoint={}",
-                broker_endpoint_display(&ep)
-            );
-            run_broker(BrokerServeConfig {
-                endpoint: ep,
+            run_server(
+                endpoint,
+                bind,
                 secret_file,
-                allow_callers: allowed,
-                require_capability,
                 addr_file,
-            })
+                allow_callers,
+                require_capability,
+                runtime_dir,
+            )
             .await
         }
         Commands::Exec {
@@ -198,31 +169,82 @@ async fn run(cli: Cli) -> Result<(), String> {
             program,
             caller,
             args,
-        } => {
-            let secret = load_or_create_secret(&secret_file)?;
-            let now = now_unix();
-            let req = build_request(
-                &secret,
-                caller,
-                format!("op_{now}"),
-                ElevatedCommand {
-                    program,
-                    args,
-                    cwd: None,
-                    env: vec![],
-                },
-                now,
-                60,
-            );
-            let mut replay = ReplayCache::new();
-            let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now)?;
-            println!("{}", serde_json::to_string_pretty(&resp).unwrap());
-            if !resp.ok {
-                std::process::exit(resp.exit_code.unwrap_or(1));
-            }
-            Ok(())
-        }
+        } => run_exec(&secret_file, program, caller, args),
     }
+}
+
+async fn run_server(
+    endpoint: Option<String>,
+    bind: Option<String>,
+    secret_file: PathBuf,
+    addr_file: Option<PathBuf>,
+    allow_callers: String,
+    require_capability: bool,
+    runtime_dir: Option<PathBuf>,
+) -> Result<(), String> {
+    let runtime = runtime_dir.unwrap_or_else(|| {
+        secret_file
+            .parent()
+            .map_or_else(|| PathBuf::from("."), PathBuf::from)
+    });
+    let endpoint = if let Some(bind) = bind {
+        let addr: SocketAddr = bind
+            .parse()
+            .map_err(|e| format!("invalid bind address: {e}"))?;
+        enforce_bind_is_networkless(addr)?;
+        BrokerEndpoint::LoopbackTcp(addr)
+    } else {
+        resolve_broker_endpoint(&runtime, endpoint.as_deref()).map_err(|e| e.to_string())?
+    };
+    endpoint.enforce_networkless().map_err(|e| e.to_string())?;
+    let allowed = allow_callers
+        .split(',')
+        .map(str::trim)
+        .filter(|caller| !caller.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    eprintln!(
+        "ownmesh-broker starting endpoint={}",
+        broker_endpoint_display(&endpoint)
+    );
+    run_broker(BrokerServeConfig {
+        endpoint,
+        secret_file,
+        allow_callers: allowed,
+        require_capability,
+        addr_file,
+    })
+    .await
+}
+
+fn run_exec(
+    secret_file: &std::path::Path,
+    program: String,
+    caller: String,
+    args: Vec<String>,
+) -> Result<(), String> {
+    let secret = load_or_create_secret(secret_file)?;
+    let now = now_unix();
+    let req = build_request(
+        &secret,
+        caller,
+        format!("op_{now}"),
+        ElevatedCommand {
+            program,
+            args,
+            cwd: None,
+            env: vec![],
+        },
+        now,
+        60,
+    );
+    let mut replay = ReplayCache::new();
+    let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now)?;
+    println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+    if !resp.ok {
+        std::process::exit(resp.exit_code.unwrap_or(1));
+    }
+    Ok(())
 }
 
 // silence unused import when default_broker_endpoint only used on some cfgs

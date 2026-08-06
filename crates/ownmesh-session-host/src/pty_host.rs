@@ -1,7 +1,7 @@
 //! Portable PTY/ConPTY spawn + read helpers.
 //!
-//! Uses `portable-pty` which selects ConPTY on Windows and openpty on POSIX.
-//! Docs: https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session
+//! Uses `portable-pty` which selects `ConPTY` on Windows and openpty on POSIX.
+//! Docs: <https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session>
 
 use ownmesh_session::{PtyBackend, PtyCommand, PtySize, SessionHostHandle};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize as PortableSize};
@@ -43,7 +43,10 @@ pub struct WriterRef<'a> {
 
 impl Write for WriterRef<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut g = self.writer.lock().map_err(lock_err)?;
+        let mut g = self
+            .writer
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         match g.as_mut() {
             Some(w) => w.write(buf),
             None => Err(std::io::Error::new(
@@ -54,16 +57,15 @@ impl Write for WriterRef<'_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut g = self.writer.lock().map_err(lock_err)?;
+        let mut g = self
+            .writer
+            .lock()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         match g.as_mut() {
             Some(w) => w.flush(),
             None => Ok(()),
         }
     }
-}
-
-fn lock_err(e: std::sync::PoisonError<impl Sized>) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
 }
 
 /// Spawn a PTY-backed process (pipe fallback on failure).
@@ -180,9 +182,7 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
             let mut g = output.lock().map_err(|e| e.to_string())?;
             Ok(g.take().unwrap_or_default())
         }
-        SessionKindInner::Pty {
-            reader, child, ..
-        } => {
+        SessionKindInner::Pty { reader, child, .. } => {
             let max = if max_ms == 0 { 5_000 } else { max_ms };
             // Take reader into a background thread so blocking reads cannot hang the caller.
             let mut reader_opt = reader.lock().map_err(|e| e.to_string())?;
@@ -195,7 +195,7 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                 let mut acc = Vec::new();
                 loop {
                     match rdr.read(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) | Err(_) => break,
                         Ok(n) => {
                             acc.extend_from_slice(&buf[..n]);
                             if acc.len() > 2 * 1024 * 1024 {
@@ -204,7 +204,6 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                             // Opportunistic send of progress
                             let _ = tx.send(acc.clone());
                         }
-                        Err(_) => break,
                     }
                 }
                 let _ = tx.send(acc);

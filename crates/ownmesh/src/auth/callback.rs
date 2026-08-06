@@ -138,14 +138,10 @@ async fn handle_connection(
     if path_only != "/callback" && path_only != "/callback/" {
         return Ok(None);
     }
-    let url = Url::parse(&format!("http://127.0.0.1{path}"))
-        .context("parse callback URL")?;
+    let url = Url::parse(&format!("http://127.0.0.1{path}")).context("parse callback URL")?;
     let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
     if let Some(err) = params.get("error") {
-        let desc = params
-            .get("error_description")
-            .map(String::as_str)
-            .unwrap_or("");
+        let desc = params.get("error_description").map_or("", String::as_str);
         return Err(anyhow!("authorization server error: {err} {desc}"));
     }
     let code = params

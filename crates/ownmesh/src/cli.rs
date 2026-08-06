@@ -5,7 +5,7 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-/// OwnMesh command-line interface.
+/// `OwnMesh` command-line interface.
 #[derive(Debug, Parser)]
 #[command(
     name = "ownmesh",
@@ -521,7 +521,7 @@ pub enum CompletionShell {
     Zsh,
     /// Fish.
     Fish,
-    /// PowerShell.
+    /// `PowerShell`.
     Powershell,
     /// Elvish.
     Elvish,

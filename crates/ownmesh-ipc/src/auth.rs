@@ -90,7 +90,7 @@ pub fn generate_token() -> String {
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(u128::from(pid) << 32)
             .wrapping_add(idx as u128 * 0xA24B_AED4_96E9_23FD);
-        *slot = (mix ^ (mix >> 8) ^ (mix >> 16)) as u8;
+        *slot = (mix ^ (mix >> 8) ^ (mix >> 16)).to_le_bytes()[0];
     }
     // Overlay with uuid bytes for stronger uniqueness.
     let u = uuid::Uuid::new_v4();
@@ -116,7 +116,10 @@ pub fn write_token_file(runtime_dir: &Path, token: &str) -> IpcResult<PathBuf> {
         file.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
     restrict_file_mode(&path)?;
+    #[cfg(windows)]
+    restrict_file_mode(&path);
     Ok(path)
 }
 
@@ -144,21 +147,19 @@ pub fn read_token_file(runtime_dir: &Path) -> IpcResult<String> {
     Ok(token)
 }
 
-/// Best-effort restrictive mode for token / socket files.
+/// Apply a restrictive mode to token files on Unix.
+#[cfg(unix)]
 fn restrict_file_mode(path: &Path) -> IpcResult<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(path, perms)?;
-    }
-    #[cfg(windows)]
-    {
-        // Named-pipe ACL is enforced on the pipe itself; the token file inherits the
-        // user profile ACL. No extra chmod equivalent is required here.
-        let _ = path;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let perms = fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, perms)?;
     Ok(())
+}
+
+/// Token files inherit the user profile ACL on Windows.
+#[cfg(windows)]
+fn restrict_file_mode(_path: &Path) {
+    // Named-pipe ACL is enforced on the pipe itself; there is no chmod equivalent.
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

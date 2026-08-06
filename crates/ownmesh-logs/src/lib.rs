@@ -1,4 +1,4 @@
-//! OwnMesh log providers and cursor-based queries.
+//! `OwnMesh` log providers and cursor-based queries.
 //!
 //! Providers share one contract: opaque `LogCursor` + page limit → `LogPage`.
 //! Platform backends (Windows Event Log, journald) are cfg-gated; Docker and
@@ -76,6 +76,13 @@ pub struct LogPage {
 /// Provider trait.
 pub trait LogProvider: Send + Sync {
     fn id(&self) -> &str;
+
+    /// Queries up to `limit` log lines after `cursor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cursor is invalid or the provider cannot query
+    /// its backing log source.
     fn query(&self, cursor: Option<&LogCursor>, limit: usize) -> LogResult<LogPage>;
 }
 
@@ -109,13 +116,14 @@ pub(crate) fn check_cursor(id: &str, cursor: Option<&LogCursor>) -> LogResult<u6
 }
 
 /// Build a page from a slice of text lines starting at absolute `start` offset.
-pub(crate) fn page_from_lines(
-    id: &str,
-    all_lines: &[String],
-    start: u64,
-    limit: usize,
-) -> LogPage {
-    let start_idx = start as usize;
+pub(crate) fn page_from_lines(id: &str, all_lines: &[String], start: u64, limit: usize) -> LogPage {
+    let Ok(start_idx) = usize::try_from(start) else {
+        return LogPage {
+            lines: vec![],
+            next_cursor: None,
+            exhausted: true,
+        };
+    };
     if start_idx >= all_lines.len() || limit == 0 {
         return LogPage {
             lines: vec![],
@@ -123,7 +131,7 @@ pub(crate) fn page_from_lines(
             exhausted: true,
         };
     }
-    let end = (start_idx + limit).min(all_lines.len());
+    let end = start_idx.saturating_add(limit).min(all_lines.len());
     let mut lines = Vec::with_capacity(end - start_idx);
     for (i, text) in all_lines[start_idx..end].iter().enumerate() {
         let offset = start + i as u64 + 1;
@@ -224,14 +232,11 @@ mod tests {
                 // Linux with journalctl may return zero or more lines.
                 assert!(page.lines.len() <= 5);
             }
-            Err(LogError::Unavailable(_)) => {
-                assert!(
-                    !cfg!(target_os = "linux"),
-                    "linux journald should not be hard-unavailable without attempting query"
-                );
+            Err(LogError::Unavailable(_)) if cfg!(target_os = "linux") => {
+                panic!("linux journald should not be hard-unavailable without attempting query");
             }
-            Err(LogError::Backend(_)) => {
-                // journalctl missing or permission denied is acceptable in CI.
+            Err(LogError::Unavailable(_) | LogError::Backend(_)) => {
+                // Unsupported hosts, a missing journalctl, or denied permission are acceptable.
             }
             Err(e) => panic!("unexpected journald error: {e}"),
         }

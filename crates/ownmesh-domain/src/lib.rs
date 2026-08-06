@@ -1,4 +1,4 @@
-//! OwnMesh domain types, stable identifiers, shared models, and error taxonomy.
+//! `OwnMesh` domain types, stable identifiers, shared models, and error taxonomy.
 //!
 //! Design authority: `OWNMESH_SPECIFICATION.ja.md` (§7, §12, §14.7, §16.3, §20, §21).
 
@@ -60,17 +60,14 @@ mod tests {
         T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
     {
         let path = Path::new(SHARED_FIXTURES_DIR).join(name);
-        let raw = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let raw =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let value: T = serde_json::from_str(&raw).unwrap_or_else(|e| {
             panic!("deserialize {name}: {e}\n{raw}");
         });
         let encoded = serde_json::to_value(&value).expect("serialize");
         let original: serde_json::Value = serde_json::from_str(&raw).expect("parse original");
-        assert_eq!(
-            encoded, original,
-            "round-trip mismatch for fixture {name}"
-        );
+        assert_eq!(encoded, original, "round-trip mismatch for fixture {name}");
         // write path: serialize to a temp file beside the shared fixtures, then reload
         let pretty = serde_json::to_string_pretty(&value).expect("pretty");
         let tmp = path.with_extension("json.roundtrip-tmp");

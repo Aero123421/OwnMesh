@@ -1,4 +1,4 @@
-//! OwnMesh allow / ask / deny policy evaluation and presets.
+//! `OwnMesh` allow / ask / deny policy evaluation and presets.
 //!
 //! Decision precedence: deny > ask > allow among matching rules; higher
 //! priority wins within the same decision. Cloud + local synthesis is the
@@ -69,7 +69,7 @@ pub enum AccessPreset {
 pub struct OperationFacts {
     /// e.g. `command.run`, `filesystem.write`, `session.open`, `broker.elevated`
     pub capability: String,
-    /// structured | raw_shell | file | session | ...
+    /// `structured | raw_shell | file | session | ...`
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
@@ -230,6 +230,8 @@ pub fn evaluate_combined(
 
 /// Built-in presets.
 #[must_use]
+// Keeping each complete preset together makes its security rules auditable.
+#[allow(clippy::too_many_lines)]
 pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
     match preset {
         AccessPreset::WorkspaceOnly => PolicyDocument {
@@ -429,11 +431,12 @@ pub fn evaluate_with_grants(
 pub fn decision_histogram(doc: &PolicyDocument) -> BTreeMap<&'static str, usize> {
     let mut m = BTreeMap::from([("allow", 0usize), ("ask", 0), ("deny", 0)]);
     for r in &doc.rules {
-        match r.decision {
-            Decision::Allow => *m.get_mut("allow").unwrap() += 1,
-            Decision::Ask => *m.get_mut("ask").unwrap() += 1,
-            Decision::Deny => *m.get_mut("deny").unwrap() += 1,
-        }
+        let key = match r.decision {
+            Decision::Allow => "allow",
+            Decision::Ask => "ask",
+            Decision::Deny => "deny",
+        };
+        *m.entry(key).or_default() += 1;
     }
     m
 }

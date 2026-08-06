@@ -1,4 +1,4 @@
-//! OwnMesh device agent (`ownmeshd`) entrypoint.
+//! `OwnMesh` device agent (`ownmeshd`) entrypoint.
 
 #![forbid(unsafe_code)]
 #![allow(
@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use ownmesh_domain::ExitCode;
 use std::process::ExitCode as StdExitCode;
 
-/// OwnMesh user-level device agent.
+/// `OwnMesh` user-level device agent.
 #[derive(Debug, Parser)]
 #[command(
     name = "ownmeshd",
@@ -58,7 +58,8 @@ fn main() -> StdExitCode {
             Err(code) => code,
         },
     };
-    StdExitCode::from(code.code() as u8)
+    let status = u8::try_from(code.code()).unwrap_or(u8::MAX);
+    StdExitCode::from(status)
 }
 
 fn init_tracing() {

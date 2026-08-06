@@ -22,7 +22,7 @@ pub const PREFERRED_CALLBACK_PORT: u16 = 8750;
 pub struct AuthSession {
     /// Control-plane issuer / base URL.
     pub issuer: String,
-    /// OAuth client_id used for token operations.
+    /// OAuth `client_id` used for token operations.
     pub client_id: String,
     /// Last enrolled device id, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,8 +68,7 @@ impl SessionPaths {
             .with_context(|| format!("read {}", self.session_file.display()))?;
         // Defense: session file must never carry raw tokens.
         assert_no_plaintext_tokens(&raw)?;
-        let session: AuthSession =
-            serde_json::from_str(&raw).context("parse auth_session.json")?;
+        let session: AuthSession = serde_json::from_str(&raw).context("parse auth_session.json")?;
         Ok(session)
     }
 
@@ -127,11 +126,11 @@ fn active_instance_url(cfg: &OwnMeshConfig) -> Option<String> {
 }
 
 /// Ensure an instance alias exists and is active (best-effort after login).
-pub fn ensure_instance_alias(paths: &OwnMeshPaths, issuer: &str) -> Result<()> {
+pub fn ensure_instance_alias(paths: &OwnMeshPaths, issuer: &str) {
     let mut cfg = load_config(paths).unwrap_or_default();
     let id = "default".to_owned();
     if let Some(existing) = cfg.instances.iter_mut().find(|i| i.id == id) {
-        existing.base_url = issuer.to_owned();
+        issuer.clone_into(&mut existing.base_url);
     } else {
         cfg.instances.push(InstanceConfig {
             id: id.clone(),
@@ -142,7 +141,6 @@ pub fn ensure_instance_alias(paths: &OwnMeshPaths, issuer: &str) -> Result<()> {
     cfg.active_instance = Some(id);
     // Ignore validation failures for http:// in odd environments — save_config validates.
     let _ = save_config(paths, &cfg);
-    Ok(())
 }
 
 /// Save a token set: refresh → keychain; metadata → session file. Never logs secrets.
@@ -157,7 +155,10 @@ pub fn save_token_set(
             .map_err(|err| anyhow!("store refresh token: {err}"))?;
     }
     let mut session = session_paths.load_session().unwrap_or_default();
-    session.issuer = issuer.trim().trim_end_matches('/').to_owned();
+    issuer
+        .trim()
+        .trim_end_matches('/')
+        .clone_into(&mut session.issuer);
     session.client_id = if tokens.client_id.is_empty() {
         DEFAULT_CLIENT_ID.to_owned()
     } else {
@@ -168,7 +169,7 @@ pub fn save_token_set(
         session.scope = Some(scope.clone());
     }
     session_paths.save_session(&session)?;
-    let _ = ensure_instance_alias(&session_paths.paths, &session.issuer);
+    ensure_instance_alias(&session_paths.paths, &session.issuer);
     Ok(session)
 }
 
@@ -186,13 +187,8 @@ pub async fn load_access_token(
         .map_err(|err| anyhow!("load refresh token: {err}"))?
         .ok_or_else(|| anyhow!("not logged in (no refresh token in keychain)"))?;
 
-    let tokens = refresh_access_token(
-        http,
-        &session.issuer,
-        &session.client_id,
-        refresh.expose(),
-    )
-    .await?;
+    let tokens =
+        refresh_access_token(http, &session.issuer, &session.client_id, refresh.expose()).await?;
     // Persist rotated refresh token when the server rotates it.
     if let Some(new_rt) = &tokens.refresh_token {
         if new_rt != refresh.expose() {
@@ -211,10 +207,7 @@ pub async fn load_access_token(
 }
 
 /// Clear human credentials from keychain + session file.
-pub fn clear_session_secrets(
-    session_paths: &SessionPaths,
-    store: &dyn SecretStore,
-) -> Result<()> {
+pub fn clear_session_secrets(session_paths: &SessionPaths, store: &dyn SecretStore) -> Result<()> {
     let _ = store.delete(SecretPurpose::HumanRefreshToken);
     let mut session = session_paths.load_session().unwrap_or_default();
     session.has_refresh_token = false;

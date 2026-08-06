@@ -30,8 +30,8 @@ pub fn connect_daemon() -> Result<(OwnMeshPaths, IpcClient), ExitCode> {
 }
 
 /// Map IPC errors onto CLI exit codes.
-pub fn map_ipc_err(err: IpcError) -> ExitCode {
-    match &err {
+pub fn map_ipc_err(err: &IpcError) -> ExitCode {
+    match err {
         IpcError::Unauthorized(_) => {
             eprintln!("authentication failed: {err}");
             ExitCode::Authentication
@@ -79,7 +79,10 @@ pub fn call_daemon(method: &str, params: Option<Value>) -> Result<Value, ExitCod
         })?;
     rt.block_on(async {
         let (_paths, client) = connect_daemon()?;
-        client.call(method, params).await.map_err(map_ipc_err)
+        client
+            .call(method, params)
+            .await
+            .map_err(|err| map_ipc_err(&err))
     })
 }
 

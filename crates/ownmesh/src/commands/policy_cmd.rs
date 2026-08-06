@@ -36,15 +36,26 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
             Err(e) => Err(e),
         },
         PolicyCmd::Preset { name } => {
-            let value =
-                call_daemon(methods::POLICY_PRESET, Some(json!({ "name": name })))?;
+            let value = call_daemon(methods::POLICY_PRESET, Some(json!({ "name": name })))?;
             print_value(cli.json, &value, |v| {
                 println!("preset set to {}", v["preset"].as_str().unwrap_or(name));
             });
             Ok(())
         }
         PolicyCmd::Rule { spec } => {
-            eprintln!("policy rule mutation via DSL is not implemented yet ({spec})");
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({
+                        "schema_version": 1,
+                        "status": "not_implemented",
+                        "command": "policy rule",
+                        "message": "policy rule mutation via DSL is unsupported",
+                    })
+                );
+            } else {
+                eprintln!("policy rule mutation via DSL is not implemented yet ({spec})");
+            }
             Err(ExitCode::ProfileUnavailable)
         }
         PolicyCmd::Validate => match call_daemon(methods::POLICY_VALIDATE, None) {

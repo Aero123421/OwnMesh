@@ -63,7 +63,7 @@ fn token_file_roundtrip_does_not_echo_into_redacted_logs() {
 #[test]
 fn frame_decoder_rejects_oversize_length_prefix() {
     let mut dec = FrameDecoder::new();
-    let evil_len = (MAX_FRAME_BYTES as u64 + 1).to_be_bytes();
+    let evil_len = (u64::from(MAX_FRAME_BYTES) + 1).to_be_bytes();
     let err = dec.push(&evil_len).unwrap_err();
     let msg = err.to_string();
     assert!(

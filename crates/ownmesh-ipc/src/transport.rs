@@ -5,7 +5,9 @@ use crate::error::{IpcError, IpcResult};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
 #[cfg(windows)]
 use tokio::sync::Mutex;
 
@@ -170,7 +172,7 @@ impl LocalListener {
     /// # Errors
     ///
     /// Returns transport IO errors.
-    pub async fn bind(endpoint: Endpoint) -> IpcResult<Self> {
+    pub fn bind(endpoint: Endpoint) -> IpcResult<Self> {
         match &endpoint {
             #[cfg(windows)]
             Endpoint::NamedPipe(name) => {
@@ -188,10 +190,7 @@ impl LocalListener {
                 prepare_unix_path(path)?;
                 let listener = UnixListener::bind(path)?;
                 restrict_unix_socket(path)?;
-                Ok(Self {
-                    listener,
-                    endpoint,
-                })
+                Ok(Self { listener, endpoint })
             }
             #[cfg(windows)]
             Endpoint::UnixSocket(_) => Err(IpcError::Protocol(
@@ -275,9 +274,7 @@ pub async fn connect(endpoint: &Endpoint) -> IpcResult<ClientConnection> {
             }
             Err(IpcError::Disconnected(format!(
                 "failed to open named pipe {name}: {}",
-                last_err
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "unknown".into())
+                last_err.map_or_else(|| "unknown".into(), |e| e.to_string())
             )))
         }
         #[cfg(unix)]

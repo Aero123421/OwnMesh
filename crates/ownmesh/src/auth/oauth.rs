@@ -10,6 +10,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
+use std::fmt::Write;
 use std::time::Duration;
 use tracing::{debug, info};
 use url::Url;
@@ -18,8 +19,9 @@ use super::callback::CallbackServer;
 use super::pkce::{generate_pkce, generate_state};
 use super::session::{DEFAULT_CLIENT_ID, PREFERRED_CALLBACK_PORT};
 
-/// Default scopes requested by the OwnMesh CLI.
-pub const DEFAULT_SCOPES: &str = "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access";
+/// Default scopes requested by the `OwnMesh` CLI.
+pub const DEFAULT_SCOPES: &str =
+    "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access";
 
 /// Token response subset used by the CLI.
 #[derive(Debug, Clone)]
@@ -48,6 +50,11 @@ pub struct DeviceCodeStart {
 
 fn default_interval() -> u64 {
     5
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisteredClient {
+    client_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,8 +118,8 @@ pub async fn login_browser_pkce(
 
     let pkce = generate_pkce();
     let state = generate_state();
-    let mut auth = Url::parse(&format!("{issuer}/oauth/authorize"))
-        .context("build authorize URL")?;
+    let mut auth =
+        Url::parse(&format!("{issuer}/oauth/authorize")).context("build authorize URL")?;
     {
         let mut q = auth.query_pairs_mut();
         q.append_pair("response_type", "code");
@@ -199,10 +206,7 @@ pub async fn login_device_code(
     let start_resp = http
         .post(format!("{issuer}/oauth/device_authorization"))
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(form(&[
-            ("client_id", client_id),
-            ("scope", DEFAULT_SCOPES),
-        ]))
+        .body(form(&[("client_id", client_id), ("scope", DEFAULT_SCOPES)]))
         .send()
         .await
         .context("device_authorization endpoint")?;
@@ -250,10 +254,7 @@ async fn poll_device_token(
             .post(format!("{issuer}/oauth/token"))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(form(&[
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:device_code",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", &start.device_code),
                 ("client_id", client_id),
             ]))
@@ -316,11 +317,7 @@ pub async fn refresh_access_token(
 }
 
 /// Best-effort token revocation (RFC 7009).
-pub async fn revoke_token(
-    http: &reqwest::Client,
-    issuer: &str,
-    token: &str,
-) -> Result<()> {
+pub async fn revoke_token(http: &reqwest::Client, issuer: &str, token: &str) -> Result<()> {
     let issuer = issuer.trim().trim_end_matches('/');
     let resp = http
         .post(format!("{issuer}/oauth/revoke"))
@@ -358,11 +355,7 @@ pub async fn register_public_client(
         let body = resp.text().await.unwrap_or_default();
         bail!("DCR failed ({status}): {body}");
     }
-    #[derive(Deserialize)]
-    struct Reg {
-        client_id: String,
-    }
-    let reg: Reg = resp.json().await.context("parse DCR response")?;
+    let reg: RegisteredClient = resp.json().await.context("parse DCR response")?;
     if reg.client_id.is_empty() {
         return Err(anyhow!("DCR response missing client_id"));
     }
@@ -407,7 +400,7 @@ fn urlencoding_encode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(*b as char);
             }
-            _ => out.push_str(&format!("%{b:02X}")),
+            _ => write!(out, "%{b:02X}").expect("writing to a String cannot fail"),
         }
     }
     out

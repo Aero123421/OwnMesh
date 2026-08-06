@@ -49,19 +49,19 @@ impl LogProvider for FileLogProvider {
             });
         }
         let mut file = File::open(&self.path)?;
-        let start = cursor.map(|c| c.offset).unwrap_or(0);
+        let start = cursor.map_or(0, |c| c.offset);
         file.seek(SeekFrom::Start(start))?;
         let reader = BufReader::new(file);
         let mut lines = Vec::new();
         let mut offset = start;
-        let mut line_no = 0u64;
-        for line_res in reader.lines() {
+        for (line_index, line_res) in reader.lines().enumerate() {
             let text = line_res?;
             // +1 for newline approximation
             offset += text.len() as u64 + 1;
-            line_no += 1;
             lines.push(LogLine {
-                line_no,
+                line_no: u64::try_from(line_index)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
                 text,
                 cursor_after: LogCursor {
                     provider: self.id.clone(),

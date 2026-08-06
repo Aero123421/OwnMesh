@@ -1,13 +1,11 @@
 //! Device protocol envelope (specification §21.3).
 
-use ownmesh_domain::{
-    DomainError, ErrorCode, Expiry, MessageId, Timestamp, DEFAULT_CLOCK_SKEW,
-};
+use ownmesh_domain::{DomainError, ErrorCode, Expiry, MessageId, Timestamp, DEFAULT_CLOCK_SKEW};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-/// Canonical protocol identifier for OwnMesh device channel 1.0.
+/// Canonical protocol identifier for the `OwnMesh` device channel 1.0.
 pub const PROTOCOL_DEVICE_V1: &str = "ownmesh.device/1.0";
 
 /// WebSocket JSON envelope between Agent and Control Plane.
@@ -29,6 +27,10 @@ pub struct Envelope {
 
 impl Envelope {
     /// Serialize to canonical JSON bytes (UTF-8).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if the envelope cannot be serialized.
     pub fn to_vec(&self) -> Result<Vec<u8>, DomainError> {
         serde_json::to_vec(self).map_err(|e| {
             DomainError::new(
@@ -39,6 +41,10 @@ impl Envelope {
     }
 
     /// Serialize to a pretty JSON string (fixtures / diagnostics).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if the envelope cannot be serialized.
     pub fn to_pretty_json(&self) -> Result<String, DomainError> {
         serde_json::to_string_pretty(self).map_err(|e| {
             DomainError::new(
@@ -49,7 +55,14 @@ impl Envelope {
     }
 
     /// Parse from UTF-8 JSON bytes without temporal validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if the input is empty, oversized, invalid JSON, or
+    /// fails the envelope's structural checks.
     pub fn parse_slice(data: &[u8]) -> Result<Self, DomainError> {
+        const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
+
         if data.is_empty() {
             return Err(DomainError::new(
                 ErrorCode::BadEnvelope,
@@ -57,7 +70,6 @@ impl Envelope {
             ));
         }
         // Reject oversized frames early (1 MiB soft limit for parser safety).
-        const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
         if data.len() > MAX_ENVELOPE_BYTES {
             return Err(DomainError::new(
                 ErrorCode::BadEnvelope,
@@ -75,11 +87,21 @@ impl Envelope {
     }
 
     /// Parse from a JSON string without temporal validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if the input cannot be parsed into a structurally
+    /// valid envelope.
     pub fn parse_str(data: &str) -> Result<Self, DomainError> {
         Self::parse_slice(data.as_bytes())
     }
 
     /// Structural checks independent of wall clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] for an unsupported protocol, empty message type,
+    /// or non-object payload.
     pub fn validate_structure(&self) -> Result<(), DomainError> {
         if self.protocol != PROTOCOL_DEVICE_V1 {
             return Err(DomainError::new(
@@ -106,11 +128,12 @@ impl Envelope {
     }
 
     /// Validate `expires_at` against `now` with the given skew.
-    pub fn validate_expiry_at(
-        &self,
-        now: Timestamp,
-        skew: Duration,
-    ) -> Result<(), DomainError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if the envelope is expired at `now` after applying
+    /// `skew`.
+    pub fn validate_expiry_at(&self, now: Timestamp, skew: Duration) -> Result<(), DomainError> {
         if let Some(exp) = self.expires_at {
             exp.check_at(now, skew).map_err(|e| {
                 DomainError::new(
@@ -123,11 +146,21 @@ impl Envelope {
     }
 
     /// Validate expiry with default skew against current time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if the envelope is expired after applying the
+    /// default clock skew.
     pub fn validate_expiry_now(&self) -> Result<(), DomainError> {
         self.validate_expiry_at(Timestamp::now(), DEFAULT_CLOCK_SKEW)
     }
 
     /// Full parse + structure + expiry validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if parsing, structural validation, or expiry
+    /// validation fails.
     pub fn parse_and_validate_at(
         data: &[u8],
         now: Timestamp,

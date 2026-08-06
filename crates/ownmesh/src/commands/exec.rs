@@ -4,15 +4,37 @@ use crate::cli::{Cli, ExecArgs};
 use crate::commands::ipc_util::{call_daemon, print_value};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::methods;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
+    run_exec_with(cli, args, call_daemon)
+}
+
+fn run_exec_with(
+    cli: &Cli,
+    args: &ExecArgs,
+    call_local_daemon: impl FnOnce(&str, Option<Value>) -> Result<Value, ExitCode>,
+) -> Result<(), ExitCode> {
     if args.command.is_empty() {
         eprintln!("exec: command is required");
         return Err(ExitCode::UsageConfig);
     }
-    if args.device.is_some() {
-        eprintln!("exec: --device routing is not implemented yet; using local daemon");
+    if let Some(device) = &args.device {
+        if cli.json {
+            println!(
+                "{}",
+                json!({
+                    "schema_version": 1,
+                    "status": "not_implemented",
+                    "command": "exec --device",
+                    "device": device,
+                    "message": "remote execution is unsupported; local execution refused",
+                })
+            );
+        } else {
+            eprintln!("exec: --device routing is not implemented; refusing local execution");
+        }
+        return Err(ExitCode::ProfileUnavailable);
     }
     let program = args.command[0].clone();
     let rest = args.command[1..].to_vec();
@@ -24,7 +46,7 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
         "timeout_ms": args.timeout_ms,
         "idempotency_key": args.idempotency_key,
     });
-    let value = call_daemon(methods::OPS_EXEC, Some(params))?;
+    let value = call_local_daemon(methods::OPS_EXEC, Some(params))?;
     print_value(cli.json, &value, |v| {
         if v["approval_required"].as_bool() == Some(true) {
             println!(
@@ -51,8 +73,7 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
                     }
                 }
             }
-            if result["replayed"].as_bool() == Some(true) || v["replayed"].as_bool() == Some(true)
-            {
+            if result["replayed"].as_bool() == Some(true) || v["replayed"].as_bool() == Some(true) {
                 eprintln!("(replayed from idempotency journal)");
             }
         }
@@ -62,4 +83,38 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
         return Err(ExitCode::Authorization);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Commands;
+    use clap::Parser;
+    use std::cell::Cell;
+
+    #[test]
+    fn device_exec_fails_without_attempting_local_daemon() {
+        let cli = Cli::try_parse_from([
+            "ownmesh",
+            "exec",
+            "--device",
+            "dev_remote",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .expect("device exec arguments should parse");
+        let Commands::Exec(args) = cli.command.as_ref().expect("exec command") else {
+            panic!("expected exec command");
+        };
+        let local_daemon_attempted = Cell::new(false);
+
+        let result = run_exec_with(&cli, args, |_, _| {
+            local_daemon_attempted.set(true);
+            Ok(json!({}))
+        });
+
+        assert_eq!(result, Err(ExitCode::ProfileUnavailable));
+        assert!(!local_daemon_attempted.get());
+    }
 }

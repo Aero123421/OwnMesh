@@ -96,10 +96,8 @@ impl OsKeychainStore {
 impl SecretStore for OsKeychainStore {
     fn store(&self, purpose: SecretPurpose, secret: &SecretBytes) -> IdentityResult<()> {
         let entry = self.entry(purpose)?;
-        let encoded = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            secret.expose(),
-        );
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret.expose());
         entry
             .set_password(&encoded)
             .map_err(|err| IdentityError::Keychain(err.to_string()))
@@ -283,7 +281,10 @@ impl PreferredSecretStore {
     /// # Errors
     ///
     /// Returns IO errors while preparing the fallback unlock material.
-    pub fn open(service: impl Into<String>, fallback_dir: impl AsRef<Path>) -> IdentityResult<Self> {
+    pub fn open(
+        service: impl Into<String>,
+        fallback_dir: impl AsRef<Path>,
+    ) -> IdentityResult<Self> {
         let fallback_dir = fallback_dir.as_ref();
         std::fs::create_dir_all(fallback_dir)?;
         let passphrase = resolve_fallback_passphrase(fallback_dir)?;
@@ -322,8 +323,7 @@ impl SecretStore for PreferredSecretStore {
     fn load(&self, purpose: SecretPurpose) -> IdentityResult<Option<SecretBytes>> {
         match self.primary.load(purpose) {
             Ok(Some(v)) => Ok(Some(v)),
-            Ok(None) => self.fallback.load(purpose),
-            Err(_) => self.fallback.load(purpose),
+            Ok(None) | Err(_) => self.fallback.load(purpose),
         }
     }
 
@@ -371,6 +371,7 @@ mod tests {
         load_human_refresh_token, load_or_create_device_key, store_human_refresh_token,
     };
     use crate::secret::SecretString;
+    use std::fmt::Write as _;
     use tempfile::tempdir;
 
     #[test]
@@ -405,14 +406,14 @@ mod tests {
 
         let key = load_or_create_device_key(&store).unwrap();
         let seed_debug = format!("{:?}", key.seed_bytes());
-        assert!(!seed_debug.chars().any(|c| c.is_ascii_hexdigit()) || seed_debug.contains("redacted"));
+        assert!(
+            !seed_debug.chars().any(|c| c.is_ascii_hexdigit()) || seed_debug.contains("redacted")
+        );
         // Stronger check: raw seed hex must not appear.
-        let seed_hex = key
-            .seed_bytes()
-            .expose()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+        let mut seed_hex = String::with_capacity(64);
+        for byte in key.seed_bytes().expose() {
+            write!(seed_hex, "{byte:02x}").unwrap();
+        }
         assert!(!format!("{key:?}").contains(&seed_hex));
         let cfg_sim = toml_like_config_dump();
         assert!(!cfg_sim.contains("VERY_SECRET"));

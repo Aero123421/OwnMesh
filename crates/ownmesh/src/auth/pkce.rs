@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 /// PKCE code verifier + S256 challenge pair.
 #[derive(Debug, Clone)]
 pub struct PkcePair {
-    /// High-entropy code_verifier (43–128 chars, unreserved).
+    /// High-entropy `code_verifier` (43–128 chars, unreserved).
     pub verifier: String,
     /// BASE64URL-ENCODE(SHA256(verifier)) without padding.
     pub challenge: String,

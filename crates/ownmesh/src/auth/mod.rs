@@ -1,4 +1,4 @@
-//! OAuth 2.1 / device enrollment client for the OwnMesh CLI (§5-CLI).
+//! OAuth 2.1 / device enrollment client for the `OwnMesh` CLI (§5-CLI).
 //!
 //! Contract mirrors `packages/control-plane` (cp-04):
 //! - Authorization Code + PKCE S256 with loopback callback (RFC 7636 / OAuth 2.1)

@@ -1,4 +1,4 @@
-//! OwnMesh update channels, manifests, and verification.
+//! `OwnMesh` update channels, manifests, and verification.
 //!
 //! Telemetry and auto-phone-home are off by default.
 
@@ -63,7 +63,7 @@ pub struct UpdateSettings {
     pub mode: UpdateMode,
     #[serde(default = "default_channel")]
     pub channel: UpdateChannel,
-    /// OwnMesh project telemetry — must default false.
+    /// `OwnMesh` project telemetry — must default false.
     #[serde(default)]
     pub telemetry_enabled: bool,
     #[serde(default)]
@@ -98,7 +98,12 @@ pub struct UpdateManifest {
     pub max_protocol: u32,
 }
 
-/// Verify checksum bytes.
+/// Verifies artifact bytes against a hexadecimal checksum.
+///
+/// # Errors
+///
+/// Returns [`UpdateError::BadChecksum`] when the computed checksum differs
+/// from `expected_hex`.
 pub fn verify_checksum(data: &[u8], expected_hex: &str) -> UpdateResult<()> {
     let mut h = Sha256::new();
     h.update(data);
@@ -110,17 +115,20 @@ pub fn verify_checksum(data: &[u8], expected_hex: &str) -> UpdateResult<()> {
 }
 
 /// Demo signature: sha256(secret || payload). Production uses real signing keys (see ADR).
+#[must_use]
 pub fn sign_manifest_payload(secret: &[u8], manifest: &UpdateManifest) -> String {
-    let payload = format!(
-        "{}|{}|{}",
-        manifest.version, manifest.url, manifest.sha256
-    );
+    let payload = format!("{}|{}|{}", manifest.version, manifest.url, manifest.sha256);
     let mut h = Sha256::new();
     h.update(secret);
     h.update(payload.as_bytes());
     hex::encode(h.finalize())
 }
 
+/// Verifies the manifest's demo signature.
+///
+/// # Errors
+///
+/// Returns [`UpdateError::BadSignature`] when the signature does not match.
 pub fn verify_signature(secret: &[u8], manifest: &UpdateManifest) -> UpdateResult<()> {
     let expected = sign_manifest_payload(secret, manifest);
     if expected != manifest.signature {
@@ -129,6 +137,12 @@ pub fn verify_signature(secret: &[u8], manifest: &UpdateManifest) -> UpdateResul
     Ok(())
 }
 
+/// Checks whether a local protocol version is supported by the manifest.
+///
+/// # Errors
+///
+/// Returns [`UpdateError::ProtocolIncompatible`] when `local_protocol` is
+/// outside the manifest's inclusive protocol range.
 pub fn check_protocol(manifest: &UpdateManifest, local_protocol: u32) -> UpdateResult<()> {
     if local_protocol < manifest.min_protocol || local_protocol > manifest.max_protocol {
         return Err(UpdateError::ProtocolIncompatible(format!(
@@ -148,7 +162,9 @@ pub fn network_check_allowed(settings: &UpdateSettings) -> bool {
 /// Privacy guarantees for tests.
 #[must_use]
 pub fn default_sends_nothing_to_vendor(settings: &UpdateSettings) -> bool {
-    !settings.telemetry_enabled && !settings.crash_reports_opt_in && settings.mode == UpdateMode::Off
+    !settings.telemetry_enabled
+        && !settings.crash_reports_opt_in
+        && settings.mode == UpdateMode::Off
 }
 
 #[cfg(test)]

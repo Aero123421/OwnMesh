@@ -1,11 +1,11 @@
-//! Stable OwnMesh identifiers: `{prefix}_{body}` with body `[A-Za-z0-9][A-Za-z0-9._-]*`.
+//! Stable `OwnMesh` identifiers: `{prefix}_{body}` with body `[A-Za-z0-9][A-Za-z0-9._-]*`.
 
 use crate::error::{DomainError, ErrorCode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
 
-/// Known ID prefixes used across the OwnMesh domain and protocol.
+/// Known ID prefixes used across the `OwnMesh` domain and protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IdKind {
     Tenant,
@@ -126,6 +126,11 @@ fn validate_body(body: &str) -> Result<(), DomainError> {
 }
 
 /// Parse and validate a prefixed stable ID.
+///
+/// # Errors
+///
+/// Returns [`DomainError`] when the ID is empty, too long, has the wrong prefix,
+/// or contains an invalid body.
 pub fn parse_prefixed_id(raw: &str, kind: IdKind) -> Result<String, DomainError> {
     if raw.len() > MAX_ID_LEN {
         return Err(DomainError::new(
@@ -134,7 +139,10 @@ pub fn parse_prefixed_id(raw: &str, kind: IdKind) -> Result<String, DomainError>
         ));
     }
     if raw.is_empty() {
-        return Err(DomainError::new(ErrorCode::InvalidId, "id must not be empty"));
+        return Err(DomainError::new(
+            ErrorCode::InvalidId,
+            "id must not be empty",
+        ));
     }
     let prefix = kind.prefix();
     if !raw.starts_with(prefix) {
@@ -151,7 +159,11 @@ pub fn parse_prefixed_id(raw: &str, kind: IdKind) -> Result<String, DomainError>
     Ok(raw.to_owned())
 }
 
-/// Validate any known OwnMesh stable ID and return its kind.
+/// Validate any known `OwnMesh` stable ID and return its kind.
+///
+/// # Errors
+///
+/// Returns [`DomainError`] when the prefix is unknown or the ID body is invalid.
 pub fn parse_any_id(raw: &str) -> Result<(IdKind, String), DomainError> {
     let Some(kind) = IdKind::from_id(raw) else {
         return Err(DomainError::new(
@@ -174,6 +186,10 @@ macro_rules! define_id {
             pub const KIND: IdKind = $kind;
 
             /// Parse a stable ID string.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`DomainError`] when the string is not a valid ID of this kind.
             pub fn parse(raw: impl AsRef<str>) -> Result<Self, DomainError> {
                 let s = parse_prefixed_id(raw.as_ref(), Self::KIND)?;
                 Ok(Self(s))
@@ -293,8 +309,14 @@ mod tests {
 
     #[test]
     fn parses_valid_ids() {
-        assert_eq!(TenantId::parse("ten_example").unwrap().as_str(), "ten_example");
-        assert_eq!(DeviceId::parse("dev_windows-01").unwrap().body(), "windows-01");
+        assert_eq!(
+            TenantId::parse("ten_example").unwrap().as_str(),
+            "ten_example"
+        );
+        assert_eq!(
+            DeviceId::parse("dev_windows-01").unwrap().body(),
+            "windows-01"
+        );
         assert_eq!(
             SessionId::parse("sess_01HABCXYZ").unwrap().as_str(),
             "sess_01HABCXYZ"

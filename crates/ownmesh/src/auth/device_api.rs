@@ -65,6 +65,16 @@ struct ProofResponse {
     connect_path: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct DeviceListResponse {
+    devices: Vec<DeviceInfo>,
+}
+
+#[derive(Deserialize)]
+struct RevokeResponse {
+    ok: bool,
+}
+
 /// Enroll this machine: challenge → Ed25519 proof → active device.
 pub async fn enroll_device(
     http: &reqwest::Client,
@@ -75,16 +85,14 @@ pub async fn enroll_device(
     name: Option<&str>,
 ) -> Result<EnrollResult> {
     let issuer = issuer.trim().trim_end_matches('/');
-    let key = load_or_create_device_key(store)
-        .map_err(|err| anyhow!("load/create device key: {err}"))?;
+    let key =
+        load_or_create_device_key(store).map_err(|err| anyhow!("load/create device key: {err}"))?;
     let public = key.public_identity();
 
     let hostname = hostname_string();
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let display = name
-        .map(str::to_owned)
-        .unwrap_or_else(|| hostname.clone());
+    let display = name.map_or_else(|| hostname.clone(), str::to_owned);
 
     let enroll_resp = http
         .post(format!("{issuer}/v1/devices/enroll"))
@@ -113,10 +121,7 @@ pub async fn enroll_device(
     let sig = key.sign(enroll.challenge.message.as_bytes());
     let signature_hex = hex_encode(sig.expose());
 
-    let proof_token = enroll
-        .enrollment_token
-        .as_deref()
-        .unwrap_or(access_token);
+    let proof_token = enroll.enrollment_token.as_deref().unwrap_or(access_token);
 
     let proof_resp = http
         .post(format!("{issuer}/v1/devices/enroll/proof"))
@@ -143,7 +148,7 @@ pub async fn enroll_device(
     let mut session = session_paths.load_session().unwrap_or_default();
     session.device_id = Some(enroll.device_id.clone());
     if session.issuer.is_empty() {
-        session.issuer = issuer.to_owned();
+        issuer.clone_into(&mut session.issuer);
     }
     session_paths.save_session(&session)?;
 
@@ -177,11 +182,7 @@ pub async fn list_devices(
         let body = resp.text().await.unwrap_or_default();
         bail!("list devices failed ({status}): {body}");
     }
-    #[derive(Deserialize)]
-    struct List {
-        devices: Vec<DeviceInfo>,
-    }
-    let list: List = resp.json().await.context("parse devices list")?;
+    let list: DeviceListResponse = resp.json().await.context("parse devices list")?;
     Ok(list.devices)
 }
 
@@ -206,11 +207,7 @@ pub async fn revoke_device(
         let body = resp.text().await.unwrap_or_default();
         bail!("revoke failed ({status}): {body}");
     }
-    #[derive(Deserialize)]
-    struct Rev {
-        ok: bool,
-    }
-    let rev: Rev = resp.json().await.context("parse revoke response")?;
+    let rev: RevokeResponse = resp.json().await.context("parse revoke response")?;
     let mut session = session_paths.load_session().unwrap_or_default();
     if session.device_id.as_deref() == Some(device_id) {
         session.device_id = None;
