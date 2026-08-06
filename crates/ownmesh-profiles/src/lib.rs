@@ -1,10 +1,12 @@
 //! OwnMesh official and custom CLI profile definitions.
 //!
-//! Official 9 profiles plus generic unknown-CLI execution path.
+//! Official 9 profiles (OWNMESH_SPECIFICATION.ja.md §13) plus generic
+//! unknown-CLI execution path. Fixture-based conformance tests live in
+//! `tests` module and `fixtures/`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -24,6 +26,8 @@ pub const fn crate_version() -> &'static str {
 pub enum ProfileError {
     #[error("unknown profile: {0}")]
     Unknown(String),
+    #[error("unsupported version: {0}")]
+    UnsupportedVersion(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("parse: {0}")]
@@ -36,41 +40,68 @@ pub type ProfileResult<T> = Result<T, ProfileError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfacePreference {
-    StructuredRpc,
-    Jsonl,
+    /// Official Agent Client Protocol
     Acp,
+    /// App Server / JSON-RPC (e.g. codex app-server)
+    StructuredRpc,
+    /// JSON / JSONL / stream-json non-interactive
+    Jsonl,
+    /// Headless HTTP API
     Http,
+    /// PTY fallback (always last resort)
     Pty,
 }
 
-/// Official profile identifiers.
+impl InterfacePreference {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Acp => "acp",
+            Self::StructuredRpc => "structured_rpc",
+            Self::Jsonl => "jsonl",
+            Self::Http => "http",
+            Self::Pty => "pty",
+        }
+    }
+}
+
+/// Official profile identifiers — must match OWNMESH_SPECIFICATION.ja.md §13.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OfficialProfileId {
-    CodexCli,
+    /// OpenAI Codex CLI (`codex`)
+    Codex,
+    /// Claude Code (`claude`)
     ClaudeCode,
+    /// Kimi Code (`kimi`)
     KimiCode,
+    /// OpenCode (`opencode`)
     OpenCode,
-    PiCodingAgent,
-    AntigravityCli,
+    /// Pi Coding Agent (`pi`)
+    Pi,
+    /// Antigravity CLI (`agy`)
+    Agy,
+    /// Qwen Code (`qwen`)
     QwenCode,
+    /// Hermes Agent (`hermes`)
     HermesAgent,
-    QoderCli,
+    /// Qoder CLI (`qodercli`)
+    Qoder,
 }
 
 impl OfficialProfileId {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::CodexCli => "codex-cli",
+            Self::Codex => "codex",
             Self::ClaudeCode => "claude-code",
             Self::KimiCode => "kimi-code",
             Self::OpenCode => "opencode",
-            Self::PiCodingAgent => "pi-coding-agent",
-            Self::AntigravityCli => "antigravity-cli",
+            Self::Pi => "pi",
+            Self::Agy => "agy",
             Self::QwenCode => "qwen-code",
             Self::HermesAgent => "hermes-agent",
-            Self::QoderCli => "qoder-cli",
+            Self::Qoder => "qoder",
         }
     }
 
@@ -78,35 +109,90 @@ impl OfficialProfileId {
     pub fn all() -> &'static [OfficialProfileId] {
         &OFFICIAL_ALL
     }
+
+    /// Parse from stable id string.
+    pub fn parse(s: &str) -> Option<Self> {
+        // Accept legacy aliases used in early scaffolding.
+        match s {
+            "codex" | "codex-cli" => Some(Self::Codex),
+            "claude-code" => Some(Self::ClaudeCode),
+            "kimi-code" => Some(Self::KimiCode),
+            "opencode" => Some(Self::OpenCode),
+            "pi" | "pi-coding-agent" => Some(Self::Pi),
+            "agy" | "antigravity-cli" => Some(Self::Agy),
+            "qwen-code" => Some(Self::QwenCode),
+            "hermes-agent" => Some(Self::HermesAgent),
+            "qoder" | "qoder-cli" => Some(Self::Qoder),
+            _ => None,
+        }
+    }
 }
 
 const OFFICIAL_ALL: [OfficialProfileId; 9] = [
-    OfficialProfileId::CodexCli,
+    OfficialProfileId::Codex,
     OfficialProfileId::ClaudeCode,
     OfficialProfileId::KimiCode,
     OfficialProfileId::OpenCode,
-    OfficialProfileId::PiCodingAgent,
-    OfficialProfileId::AntigravityCli,
+    OfficialProfileId::Pi,
+    OfficialProfileId::Agy,
     OfficialProfileId::QwenCode,
     OfficialProfileId::HermesAgent,
-    OfficialProfileId::QoderCli,
+    OfficialProfileId::Qoder,
 ];
 
-/// Profile definition.
+/// Profile definition (runtime + TOML).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Profile {
     pub id: String,
     pub display_name: String,
+    /// Candidate executable names on PATH.
+    #[serde(alias = "commands")]
     pub binaries: Vec<String>,
     pub interface_order: Vec<InterfacePreference>,
-    #[serde(default)]
+    #[serde(default = "default_version_args")]
     pub version_args: Vec<String>,
+    #[serde(default)]
+    pub version_regex: Option<String>,
     #[serde(default)]
     pub auth_status_args: Vec<String>,
     #[serde(default)]
     pub supports_native_resume: bool,
     #[serde(default)]
+    pub supports_structured: bool,
+    #[serde(default)]
+    pub supports_acp: bool,
+    /// Minimum supported version (semver-ish major.minor.patch prefix).
+    #[serde(default)]
+    pub min_version: Option<String>,
+    /// Args template for non-interactive one-shot (may include `{{prompt}}`).
+    #[serde(default)]
+    pub non_interactive_args: Vec<String>,
+    /// Args for structured/RPC start when preferred interface is available.
+    #[serde(default)]
+    pub structured_start_args: Vec<String>,
+    /// Args for native resume (`{{native_id}}` placeholder).
+    #[serde(default)]
+    pub resume_args: Vec<String>,
+    #[serde(default)]
     pub official: bool,
+}
+
+fn default_version_args() -> Vec<String> {
+    vec!["--version".into()]
+}
+
+/// Detection / status result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileReadyState {
+    NotInstalled,
+    Installed,
+    NeedsLogin,
+    Authenticated,
+    UnsupportedVersion,
+    AdapterDegraded,
+    Ready,
+    Running,
 }
 
 /// Detection / status result.
@@ -117,96 +203,224 @@ pub struct ProfileStatus {
     pub binary_path: Option<String>,
     pub version: Option<String>,
     pub preferred_interface: Option<InterfacePreference>,
+    pub state: ProfileReadyState,
     pub notes: Vec<String>,
 }
 
-/// Build the nine official profiles.
+/// Launch plan for a profile or generic CLI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchPlan {
+    pub profile_id: Option<String>,
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub interface: InterfacePreference,
+    pub use_pty: bool,
+    pub env: BTreeMap<String, String>,
+}
+
+/// Build the nine official profiles (spec §13.4 adapter policy).
 #[must_use]
 pub fn official_profiles() -> Vec<Profile> {
     vec![
-        profile(
-            OfficialProfileId::CodexCli,
-            "OpenAI Codex CLI",
-            &["codex"],
-            &[InterfacePreference::StructuredRpc, InterfacePreference::Pty],
-            true,
-        ),
-        profile(
-            OfficialProfileId::ClaudeCode,
-            "Claude Code",
-            &["claude"],
-            &[InterfacePreference::Acp, InterfacePreference::Pty],
-            true,
-        ),
-        profile(
-            OfficialProfileId::KimiCode,
-            "Kimi Code",
-            &["kimi"],
-            &[InterfacePreference::Jsonl, InterfacePreference::Pty],
-            false,
-        ),
-        profile(
-            OfficialProfileId::OpenCode,
-            "OpenCode",
-            &["opencode"],
-            &[InterfacePreference::Jsonl, InterfacePreference::Pty],
-            false,
-        ),
-        profile(
-            OfficialProfileId::PiCodingAgent,
-            "Pi Coding Agent",
-            &["pi"],
-            &[InterfacePreference::Jsonl, InterfacePreference::Pty],
-            true,
-        ),
-        profile(
-            OfficialProfileId::AntigravityCli,
-            "Antigravity CLI",
-            &["agy"],
-            &[InterfacePreference::Jsonl, InterfacePreference::Pty],
-            false,
-        ),
-        profile(
-            OfficialProfileId::QwenCode,
-            "Qwen Code",
-            &["qwen"],
-            &[InterfacePreference::Jsonl, InterfacePreference::Pty],
-            false,
-        ),
-        profile(
-            OfficialProfileId::HermesAgent,
-            "Hermes Agent",
-            &["hermes"],
-            &[InterfacePreference::Jsonl, InterfacePreference::Pty],
-            false,
-        ),
-        profile(
-            OfficialProfileId::QoderCli,
-            "Qoder CLI",
-            &["qoder"],
-            &[InterfacePreference::Jsonl, InterfacePreference::Pty],
-            false,
-        ),
+        Profile {
+            id: OfficialProfileId::Codex.as_str().into(),
+            display_name: "OpenAI Codex CLI".into(),
+            binaries: vec!["codex".into()],
+            interface_order: vec![
+                InterfacePreference::StructuredRpc,
+                InterfacePreference::Jsonl,
+                InterfacePreference::Pty,
+            ],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: true,
+            supports_structured: true,
+            supports_acp: false,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec!["exec".into(), "--json".into(), "{{prompt}}".into()],
+            structured_start_args: vec!["app-server".into()],
+            resume_args: vec!["resume".into(), "{{native_id}}".into()],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::ClaudeCode.as_str().into(),
+            display_name: "Claude Code".into(),
+            binaries: vec!["claude".into()],
+            interface_order: vec![
+                InterfacePreference::Jsonl,
+                InterfacePreference::Pty,
+            ],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: true,
+            supports_structured: true,
+            supports_acp: false,
+            min_version: Some("1.0.0".into()),
+            non_interactive_args: vec![
+                "-p".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            structured_start_args: vec![
+                "-p".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            resume_args: vec!["--resume".into(), "{{native_id}}".into()],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::KimiCode.as_str().into(),
+            display_name: "Kimi Code".into(),
+            binaries: vec!["kimi".into()],
+            interface_order: vec![
+                InterfacePreference::Acp,
+                InterfacePreference::Jsonl,
+                InterfacePreference::Pty,
+            ],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: false,
+            supports_structured: true,
+            supports_acp: true,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec![
+                "--prompt".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            structured_start_args: vec!["--acp".into()],
+            resume_args: vec![],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::OpenCode.as_str().into(),
+            display_name: "OpenCode".into(),
+            binaries: vec!["opencode".into()],
+            interface_order: vec![
+                InterfacePreference::Http,
+                InterfacePreference::Jsonl,
+                InterfacePreference::Pty,
+            ],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: false,
+            supports_structured: true,
+            supports_acp: false,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
+            structured_start_args: vec!["serve".into()],
+            resume_args: vec![],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::Pi.as_str().into(),
+            display_name: "Pi Coding Agent".into(),
+            binaries: vec!["pi".into()],
+            interface_order: vec![InterfacePreference::Jsonl, InterfacePreference::Pty],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: true,
+            supports_structured: true,
+            supports_acp: false,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec!["--mode".into(), "rpc".into()],
+            structured_start_args: vec!["--mode".into(), "rpc".into()],
+            // Session resume when native id is known (PTY/RPC host tracks OwnMesh session separately).
+            resume_args: vec!["--resume".into(), "{{native_id}}".into()],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::Agy.as_str().into(),
+            display_name: "Antigravity CLI".into(),
+            binaries: vec!["agy".into()],
+            interface_order: vec![InterfacePreference::Jsonl, InterfacePreference::Pty],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: false,
+            supports_structured: true,
+            supports_acp: false,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
+            structured_start_args: vec![],
+            resume_args: vec![],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::QwenCode.as_str().into(),
+            display_name: "Qwen Code".into(),
+            binaries: vec!["qwen".into()],
+            interface_order: vec![
+                InterfacePreference::Acp,
+                InterfacePreference::Jsonl,
+                InterfacePreference::Pty,
+            ],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: false,
+            supports_structured: true,
+            supports_acp: true,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec!["-p".into(), "{{prompt}}".into()],
+            structured_start_args: vec![],
+            resume_args: vec![],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::HermesAgent.as_str().into(),
+            display_name: "Hermes Agent".into(),
+            binaries: vec!["hermes".into()],
+            interface_order: vec![
+                InterfacePreference::Acp,
+                InterfacePreference::Jsonl,
+                InterfacePreference::Pty,
+            ],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: true,
+            supports_structured: true,
+            supports_acp: true,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
+            structured_start_args: vec![],
+            resume_args: vec!["resume".into(), "{{native_id}}".into()],
+            official: true,
+        },
+        Profile {
+            id: OfficialProfileId::Qoder.as_str().into(),
+            display_name: "Qoder CLI".into(),
+            // Spec §13.1: primary command is qodercli
+            binaries: vec!["qodercli".into(), "qoder".into()],
+            interface_order: vec![
+                InterfacePreference::Acp,
+                InterfacePreference::Jsonl,
+                InterfacePreference::Pty,
+            ],
+            version_args: vec!["--version".into()],
+            version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
+            auth_status_args: vec![],
+            supports_native_resume: false,
+            supports_structured: true,
+            supports_acp: true,
+            min_version: Some("0.1.0".into()),
+            non_interactive_args: vec![],
+            structured_start_args: vec!["--acp".into()],
+            resume_args: vec![],
+            official: true,
+        },
     ]
-}
-
-fn profile(
-    id: OfficialProfileId,
-    name: &str,
-    bins: &[&str],
-    iface: &[InterfacePreference],
-    resume: bool,
-) -> Profile {
-    Profile {
-        id: id.as_str().into(),
-        display_name: name.into(),
-        binaries: bins.iter().map(|s| (*s).to_string()).collect(),
-        interface_order: iface.to_vec(),
-        version_args: vec!["--version".into()],
-        auth_status_args: vec![],
-        supports_native_resume: resume,
-        official: true,
-    }
 }
 
 /// Registry of official + custom profiles.
@@ -230,13 +444,35 @@ impl ProfileRegistry {
     }
 
     pub fn get(&self, id: &str) -> ProfileResult<&Profile> {
-        self.profiles
-            .get(id)
-            .ok_or_else(|| ProfileError::Unknown(id.to_string()))
+        if let Some(p) = self.profiles.get(id) {
+            return Ok(p);
+        }
+        // Legacy alias resolution
+        if let Some(official) = OfficialProfileId::parse(id) {
+            return self
+                .profiles
+                .get(official.as_str())
+                .ok_or_else(|| ProfileError::Unknown(id.to_string()));
+        }
+        Err(ProfileError::Unknown(id.to_string()))
     }
 
     pub fn list(&self) -> Vec<&Profile> {
         self.profiles.values().collect()
+    }
+
+    /// Select best interface given optional capability flags from version probe.
+    #[must_use]
+    pub fn select_interface(
+        profile: &Profile,
+        available: &[InterfacePreference],
+    ) -> InterfacePreference {
+        for pref in &profile.interface_order {
+            if available.is_empty() || available.contains(pref) {
+                return *pref;
+            }
+        }
+        InterfacePreference::Pty
     }
 
     /// Detect binary on PATH and pick preferred interface.
@@ -260,12 +496,31 @@ impl ProfileRegistry {
         } else {
             None
         };
+
+        let state = if !detected {
+            ProfileReadyState::NotInstalled
+        } else if let (Some(min), Some(ver)) = (&p.min_version, &version) {
+            if let Some(parsed) = parse_semver_prefix(ver) {
+                if version_less(&parsed, min) {
+                    notes.push(format!("version {ver} below minimum {min}"));
+                    ProfileReadyState::UnsupportedVersion
+                } else {
+                    ProfileReadyState::Ready
+                }
+            } else {
+                ProfileReadyState::Installed
+            }
+        } else {
+            ProfileReadyState::Installed
+        };
+
         Ok(ProfileStatus {
             id: p.id.clone(),
             detected,
             binary_path,
             version,
             preferred_interface,
+            state,
             notes,
         })
     }
@@ -276,13 +531,104 @@ impl ProfileRegistry {
             .filter_map(|id| self.detect(id).ok())
             .collect()
     }
+
+    /// Build a launch plan for interactive or structured start.
+    pub fn launch_plan(
+        &self,
+        id: &str,
+        prompt: Option<&str>,
+        force_pty: bool,
+    ) -> ProfileResult<LaunchPlan> {
+        let p = self.get(id)?;
+        let status = self.detect(id)?;
+        let program = status
+            .binary_path
+            .clone()
+            .or_else(|| p.binaries.first().cloned())
+            .ok_or_else(|| ProfileError::Unknown(id.into()))?;
+
+        if matches!(status.state, ProfileReadyState::UnsupportedVersion) {
+            return Err(ProfileError::UnsupportedVersion(
+                status.version.unwrap_or_else(|| "unknown".into()),
+            ));
+        }
+
+        let interface = if force_pty {
+            InterfacePreference::Pty
+        } else {
+            Self::select_interface(p, &p.interface_order)
+        };
+
+        let args = match interface {
+            InterfacePreference::Pty => vec![],
+            InterfacePreference::StructuredRpc
+            | InterfacePreference::Acp
+            | InterfacePreference::Http
+            | InterfacePreference::Jsonl => {
+                let template = if p.structured_start_args.is_empty() {
+                    &p.non_interactive_args
+                } else {
+                    &p.structured_start_args
+                };
+                expand_template(template, prompt, None)
+            }
+        };
+
+        Ok(LaunchPlan {
+            profile_id: Some(p.id.clone()),
+            program,
+            args,
+            cwd: None,
+            interface,
+            use_pty: interface == InterfacePreference::Pty || force_pty,
+            env: BTreeMap::new(),
+        })
+    }
+
+    /// Native resume plan when supported.
+    pub fn resume_plan(&self, id: &str, native_id: &str) -> ProfileResult<LaunchPlan> {
+        let p = self.get(id)?;
+        if !p.supports_native_resume || p.resume_args.is_empty() {
+            return Err(ProfileError::Parse(format!(
+                "profile {id} does not support native resume"
+            )));
+        }
+        let status = self.detect(id)?;
+        let program = status
+            .binary_path
+            .or_else(|| p.binaries.first().cloned())
+            .ok_or_else(|| ProfileError::Unknown(id.into()))?;
+        Ok(LaunchPlan {
+            profile_id: Some(p.id.clone()),
+            program,
+            args: expand_template(&p.resume_args, None, Some(native_id)),
+            cwd: None,
+            interface: InterfacePreference::StructuredRpc,
+            use_pty: false,
+            env: BTreeMap::new(),
+        })
+    }
+}
+
+fn expand_template(template: &[String], prompt: Option<&str>, native_id: Option<&str>) -> Vec<String> {
+    template
+        .iter()
+        .map(|s| {
+            let mut out = s.clone();
+            if let Some(p) = prompt {
+                out = out.replace("{{prompt}}", p);
+            }
+            if let Some(n) = native_id {
+                out = out.replace("{{native_id}}", n);
+            }
+            out
+        })
+        .filter(|s| !s.contains("{{prompt}}") && !s.contains("{{native_id}}"))
+        .collect()
 }
 
 fn probe_version(bin: &str, args: &[String]) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = std::process::Command::new(bin).args(args).output().ok()?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -295,6 +641,60 @@ fn probe_version(bin: &str, args: &[String]) -> Option<String> {
     }
 }
 
+/// Extract `major.minor.patch` prefix from a version string.
+#[must_use]
+pub fn parse_semver_prefix(raw: &str) -> Option<String> {
+    let re = regex_lite_semver(raw)?;
+    Some(re)
+}
+
+fn regex_lite_semver(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && !(bytes[i].is_ascii_digit()) {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let start = i;
+    let mut dots = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            i += 1;
+        } else if c == b'.' {
+            dots += 1;
+            if dots > 2 {
+                break;
+            }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let s = raw.get(start..i)?.trim_matches('.').to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn version_less(a: &str, b: &str) -> bool {
+    let pa = parse_parts(a);
+    let pb = parse_parts(b);
+    pa < pb
+}
+
+fn parse_parts(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.');
+    let maj = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let min = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let pat = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (maj, min, pat)
+}
+
 /// Generic launch plan for unknown CLI (no profile required).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenericLaunch {
@@ -304,9 +704,13 @@ pub struct GenericLaunch {
     pub use_pty: bool,
 }
 
-/// Build generic launch — always available without registration.
+/// Build generic command launch — always available without registration.
 #[must_use]
-pub fn generic_launch(program: impl Into<String>, args: Vec<String>, use_pty: bool) -> GenericLaunch {
+pub fn generic_launch(
+    program: impl Into<String>,
+    args: Vec<String>,
+    use_pty: bool,
+) -> GenericLaunch {
     GenericLaunch {
         program: program.into(),
         args,
@@ -315,14 +719,406 @@ pub fn generic_launch(program: impl Into<String>, args: Vec<String>, use_pty: bo
     }
 }
 
-/// Load optional custom profile TOML.
+/// Build generic interactive session launch (PTY) without profile.
+#[must_use]
+pub fn generic_interactive_session(
+    program: impl Into<String>,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+) -> LaunchPlan {
+    LaunchPlan {
+        profile_id: None,
+        program: program.into(),
+        args,
+        cwd,
+        interface: InterfacePreference::Pty,
+        use_pty: true,
+        env: BTreeMap::new(),
+    }
+}
+
+/// Convert generic launch into a LaunchPlan.
+#[must_use]
+pub fn generic_to_plan(g: &GenericLaunch) -> LaunchPlan {
+    LaunchPlan {
+        profile_id: None,
+        program: g.program.clone(),
+        args: g.args.clone(),
+        cwd: g.cwd.clone(),
+        interface: if g.use_pty {
+            InterfacePreference::Pty
+        } else {
+            InterfacePreference::Jsonl
+        },
+        use_pty: g.use_pty,
+        env: BTreeMap::new(),
+    }
+}
+
+/// Load optional custom profile TOML (spec §13.6 shape + extended fields).
 pub fn load_custom_profile_toml(raw: &str) -> ProfileResult<Profile> {
-    let mut p: Profile = toml::from_str(raw).map_err(|e| ProfileError::Parse(e.to_string()))?;
-    p.official = false;
-    if p.id.trim().is_empty() {
+    // Support both `binaries` and schema `commands`.
+    #[derive(Deserialize)]
+    struct Raw {
+        id: String,
+        display_name: String,
+        #[serde(default)]
+        binaries: Vec<String>,
+        #[serde(default)]
+        commands: Vec<String>,
+        #[serde(default)]
+        interface_order: Vec<InterfacePreference>,
+        #[serde(default)]
+        interactive: Option<bool>,
+        #[serde(default)]
+        detect: Option<DetectSection>,
+        #[serde(default)]
+        non_interactive: Option<NonInteractiveSection>,
+        #[serde(default)]
+        capabilities: Option<CapsSection>,
+    }
+    #[derive(Deserialize, Default)]
+    struct DetectSection {
+        #[serde(default)]
+        version_args: Vec<String>,
+        #[serde(default)]
+        version_regex: Option<String>,
+    }
+    #[derive(Deserialize, Default)]
+    struct NonInteractiveSection {
+        #[serde(default)]
+        args: Vec<String>,
+    }
+    #[derive(Deserialize, Default)]
+    struct CapsSection {
+        #[serde(default)]
+        resume: bool,
+        #[serde(default)]
+        structured_output: bool,
+        #[serde(default)]
+        acp: bool,
+    }
+
+    // Try extended Profile first; fall back to schema-shaped TOML.
+    if let Ok(mut p) = toml::from_str::<Profile>(raw) {
+        p.official = false;
+        if p.id.trim().is_empty() {
+            return Err(ProfileError::Parse("id required".into()));
+        }
+        if p.binaries.is_empty() {
+            return Err(ProfileError::Parse("binaries/commands required".into()));
+        }
+        if p.interface_order.is_empty() {
+            p.interface_order = vec![InterfacePreference::Pty];
+        }
+        return Ok(p);
+    }
+
+    let r: Raw = toml::from_str(raw).map_err(|e| ProfileError::Parse(e.to_string()))?;
+    if r.id.trim().is_empty() {
         return Err(ProfileError::Parse("id required".into()));
     }
-    Ok(p)
+    let mut binaries = r.binaries;
+    if binaries.is_empty() {
+        binaries = r.commands;
+    }
+    if binaries.is_empty() {
+        return Err(ProfileError::Parse("commands required".into()));
+    }
+    let detect = r.detect.unwrap_or_default();
+    let ni = r.non_interactive.unwrap_or_default();
+    let caps = r.capabilities.unwrap_or_default();
+    let mut interface_order = r.interface_order;
+    if interface_order.is_empty() {
+        interface_order = if r.interactive.unwrap_or(true) {
+            vec![InterfacePreference::Pty]
+        } else {
+            vec![InterfacePreference::Jsonl, InterfacePreference::Pty]
+        };
+        if caps.acp {
+            interface_order.insert(0, InterfacePreference::Acp);
+        }
+    }
+    Ok(Profile {
+        id: r.id,
+        display_name: r.display_name,
+        binaries,
+        interface_order,
+        version_args: if detect.version_args.is_empty() {
+            default_version_args()
+        } else {
+            detect.version_args
+        },
+        version_regex: detect.version_regex,
+        auth_status_args: vec![],
+        supports_native_resume: caps.resume,
+        supports_structured: caps.structured_output,
+        supports_acp: caps.acp,
+        min_version: None,
+        non_interactive_args: ni.args,
+        structured_start_args: vec![],
+        resume_args: vec![],
+        official: false,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Fixture-based conformance
+// ---------------------------------------------------------------------------
+
+/// On-disk / embedded fixture describing expected profile behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileFixture {
+    pub id: String,
+    pub display_name: String,
+    pub binaries: Vec<String>,
+    pub interface_order: Vec<InterfacePreference>,
+    pub supports_native_resume: bool,
+    pub supports_structured: bool,
+    pub supports_acp: bool,
+    pub min_version: Option<String>,
+    /// Example version strings that must parse and be accepted.
+    #[serde(default)]
+    pub sample_versions_ok: Vec<String>,
+    /// Example version strings that must be rejected as unsupported.
+    #[serde(default)]
+    pub sample_versions_bad: Vec<String>,
+    /// Expected structured start argv head (first tokens).
+    #[serde(default)]
+    pub structured_start_prefix: Vec<String>,
+    /// Expected non-interactive argv contains these tokens when prompt applied.
+    #[serde(default)]
+    pub non_interactive_contains: Vec<String>,
+}
+
+/// Build fixtures for all 9 official profiles (conformance matrix).
+#[must_use]
+pub fn official_fixtures() -> Vec<ProfileFixture> {
+    official_profiles()
+        .into_iter()
+        .map(|p| ProfileFixture {
+            id: p.id.clone(),
+            display_name: p.display_name.clone(),
+            binaries: p.binaries.clone(),
+            interface_order: p.interface_order.clone(),
+            supports_native_resume: p.supports_native_resume,
+            supports_structured: p.supports_structured,
+            supports_acp: p.supports_acp,
+            min_version: p.min_version.clone(),
+            sample_versions_ok: vec![
+                format!("{} (test)", p.min_version.clone().unwrap_or_else(|| "1.0.0".into())),
+                "v9.9.9-beta".into(),
+            ],
+            sample_versions_bad: p
+                .min_version
+                .as_ref()
+                .map(|m| {
+                    let parts = parse_parts(m);
+                    if parts.0 > 0 {
+                        vec!["0.0.1".into()]
+                    } else {
+                        vec![]
+                    }
+                })
+                .unwrap_or_default(),
+            structured_start_prefix: p
+                .structured_start_args
+                .iter()
+                .take(2)
+                .cloned()
+                .collect(),
+            non_interactive_contains: p
+                .non_interactive_args
+                .iter()
+                .filter(|a| !a.contains("{{"))
+                .take(2)
+                .cloned()
+                .collect(),
+        })
+        .collect()
+}
+
+/// Run conformance checks for one profile against its fixture.
+pub fn conform_profile(profile: &Profile, fixture: &ProfileFixture) -> ProfileResult<Vec<String>> {
+    let mut ok = Vec::new();
+    if profile.id != fixture.id {
+        return Err(ProfileError::Parse(format!(
+            "id mismatch {} != {}",
+            profile.id, fixture.id
+        )));
+    }
+    if profile.binaries != fixture.binaries {
+        return Err(ProfileError::Parse(format!(
+            "{} binaries mismatch",
+            profile.id
+        )));
+    }
+    if profile.interface_order != fixture.interface_order {
+        return Err(ProfileError::Parse(format!(
+            "{} interface_order mismatch",
+            profile.id
+        )));
+    }
+    if profile.supports_native_resume != fixture.supports_native_resume
+        || profile.supports_structured != fixture.supports_structured
+        || profile.supports_acp != fixture.supports_acp
+    {
+        return Err(ProfileError::Parse(format!(
+            "{} capability flags mismatch",
+            profile.id
+        )));
+    }
+    // PTY must be last in preference order (spec §13.3)
+    if let Some(last) = profile.interface_order.last() {
+        if *last != InterfacePreference::Pty {
+            return Err(ProfileError::Parse(format!(
+                "{} must list PTY as fallback last",
+                profile.id
+            )));
+        }
+    } else {
+        return Err(ProfileError::Parse(format!(
+            "{} empty interface_order",
+            profile.id
+        )));
+    }
+    ok.push("interface_order".into());
+
+    // Version samples
+    for v in &fixture.sample_versions_ok {
+        let parsed = parse_semver_prefix(v).ok_or_else(|| {
+            ProfileError::Parse(format!("{} failed to parse ok version {v}", profile.id))
+        })?;
+        if let Some(min) = &fixture.min_version {
+            if version_less(&parsed, min) {
+                return Err(ProfileError::Parse(format!(
+                    "{} sample ok version {v} below min {min}",
+                    profile.id
+                )));
+            }
+        }
+    }
+    ok.push("version_parse_ok".into());
+
+    for v in &fixture.sample_versions_bad {
+        if let Some(parsed) = parse_semver_prefix(v) {
+            if let Some(min) = &fixture.min_version {
+                if !version_less(&parsed, min) {
+                    return Err(ProfileError::Parse(format!(
+                        "{} bad sample {v} not below min",
+                        profile.id
+                    )));
+                }
+            }
+        }
+    }
+    ok.push("version_gate".into());
+
+    // Structured start prefix
+    if !fixture.structured_start_prefix.is_empty() {
+        let head: Vec<_> = profile
+            .structured_start_args
+            .iter()
+            .take(fixture.structured_start_prefix.len())
+            .cloned()
+            .collect();
+        if head != fixture.structured_start_prefix {
+            return Err(ProfileError::Parse(format!(
+                "{} structured_start_prefix mismatch {:?} != {:?}",
+                profile.id, head, fixture.structured_start_prefix
+            )));
+        }
+        ok.push("structured_start".into());
+    }
+
+    // Preferred interface selection never skips to empty
+    let selected = ProfileRegistry::select_interface(profile, &[]);
+    if !profile.interface_order.contains(&selected) {
+        return Err(ProfileError::Parse(format!(
+            "{} select_interface out of order",
+            profile.id
+        )));
+    }
+    ok.push("best_interface".into());
+
+    // Resume contract
+    if profile.supports_native_resume {
+        if profile.resume_args.is_empty() {
+            return Err(ProfileError::Parse(format!(
+                "{} claims resume but has empty resume_args",
+                profile.id
+            )));
+        }
+        ok.push("native_resume".into());
+    }
+
+    // ACP flag consistency
+    if profile.supports_acp && !profile.interface_order.contains(&InterfacePreference::Acp) {
+        return Err(ProfileError::Parse(format!(
+            "{} supports_acp but Acp not in interface_order",
+            profile.id
+        )));
+    }
+    ok.push("acp_consistency".into());
+
+    Ok(ok)
+}
+
+/// Load fixture JSON from path (for optional external matrices).
+pub fn load_fixture_json(path: &Path) -> ProfileResult<ProfileFixture> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(|e| ProfileError::Parse(e.to_string()))
+}
+
+/// Normalize adapter events into a common OwnMesh shape (minimal).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedEvent {
+    pub kind: String,
+    pub text: Option<String>,
+    pub native_session_id: Option<String>,
+    pub raw_type: String,
+}
+
+/// Best-effort event normalization from JSONL adapter lines.
+pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let raw_type = v
+        .get("type")
+        .or_else(|| v.get("event"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let kind = match raw_type.as_str() {
+        "message" | "assistant" | "text" | "content" => "message",
+        "tool_call" | "tool" | "function_call" => "tool_call",
+        "error" | "failed" => "error",
+        "session" | "session_started" => "session",
+        "done" | "completed" | "result" => "completed",
+        other => other,
+    }
+    .to_string();
+    let text = v
+        .get("text")
+        .or_else(|| v.get("content"))
+        .or_else(|| v.pointer("/message/content"))
+        .and_then(|x| {
+            if x.is_string() {
+                x.as_str().map(str::to_string)
+            } else {
+                Some(x.to_string())
+            }
+        });
+    let native_session_id = v
+        .get("session_id")
+        .or_else(|| v.get("native_session_id"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    Some(NormalizedEvent {
+        kind,
+        text,
+        native_session_id,
+        raw_type,
+    })
 }
 
 #[cfg(test)]
@@ -334,8 +1130,38 @@ mod tests {
         let regs = ProfileRegistry::with_official();
         assert_eq!(regs.list().len(), 9);
         for id in OfficialProfileId::all() {
-            assert!(regs.get(id.as_str()).is_ok());
+            assert!(regs.get(id.as_str()).is_ok(), "{}", id.as_str());
         }
+        // Spec ids
+        for id in [
+            "codex",
+            "claude-code",
+            "kimi-code",
+            "opencode",
+            "pi",
+            "agy",
+            "qwen-code",
+            "hermes-agent",
+            "qoder",
+        ] {
+            assert_eq!(regs.get(id).unwrap().id, id);
+        }
+    }
+
+    #[test]
+    fn legacy_aliases_resolve() {
+        let regs = ProfileRegistry::with_official();
+        assert_eq!(regs.get("codex-cli").unwrap().id, "codex");
+        assert_eq!(regs.get("pi-coding-agent").unwrap().id, "pi");
+        assert_eq!(regs.get("antigravity-cli").unwrap().id, "agy");
+        assert_eq!(regs.get("qoder-cli").unwrap().id, "qoder");
+    }
+
+    #[test]
+    fn qoder_binary_is_qodercli() {
+        let reg = ProfileRegistry::with_official();
+        let p = reg.get("qoder").unwrap();
+        assert_eq!(p.binaries[0], "qodercli");
     }
 
     #[test]
@@ -343,12 +1169,23 @@ mod tests {
         let g = generic_launch("my-cli", vec!["--help".into()], true);
         assert_eq!(g.program, "my-cli");
         assert!(g.use_pty);
+        let plan = generic_to_plan(&g);
+        assert!(plan.profile_id.is_none());
+        assert!(plan.use_pty);
+    }
+
+    #[test]
+    fn generic_interactive_session_no_profile() {
+        let plan = generic_interactive_session("python", vec!["-i".into()], None);
+        assert!(plan.profile_id.is_none());
+        assert_eq!(plan.interface, InterfacePreference::Pty);
+        assert!(plan.use_pty);
+        assert_eq!(plan.program, "python");
     }
 
     #[test]
     fn detect_self_platform_tool() {
         let mut reg = ProfileRegistry::with_official();
-        // inject a profile for a binary that exists on Windows/Linux
         #[cfg(windows)]
         let bin = "cmd.exe";
         #[cfg(not(windows))]
@@ -359,8 +1196,15 @@ mod tests {
             binaries: vec![bin.into()],
             interface_order: vec![InterfacePreference::Pty],
             version_args: vec![],
+            version_regex: None,
             auth_status_args: vec![],
             supports_native_resume: false,
+            supports_structured: false,
+            supports_acp: false,
+            min_version: None,
+            non_interactive_args: vec![],
+            structured_start_args: vec![],
+            resume_args: vec![],
             official: false,
         });
         let st = reg.detect("test-shell").unwrap();
@@ -369,15 +1213,123 @@ mod tests {
     }
 
     #[test]
-    fn custom_toml() {
+    fn custom_toml_schema_shape() {
         let raw = r#"
 id = "my-cli"
 display_name = "My CLI"
-binaries = ["mycli"]
-interface_order = ["pty"]
+commands = ["mycli"]
+interactive = true
+
+[detect]
+version_args = ["--version"]
+
+[non_interactive]
+args = ["--prompt", "{{prompt}}"]
+
+[capabilities]
+resume = false
+structured_output = true
+acp = false
 "#;
         let p = load_custom_profile_toml(raw).unwrap();
         assert_eq!(p.id, "my-cli");
         assert!(!p.official);
+        assert_eq!(p.binaries, vec!["mycli"]);
+        assert!(p.supports_structured);
+        assert!(p.non_interactive_args.contains(&"--prompt".into()));
+    }
+
+    #[test]
+    fn all_nine_fixtures_conform() {
+        let reg = ProfileRegistry::with_official();
+        let fixtures = official_fixtures();
+        assert_eq!(fixtures.len(), 9);
+        for fx in &fixtures {
+            let p = reg.get(&fx.id).expect(&fx.id);
+            let checks = conform_profile(p, fx).unwrap_or_else(|e| panic!("{}: {e}", fx.id));
+            assert!(
+                checks.contains(&"interface_order".into()),
+                "{} missing interface_order check",
+                fx.id
+            );
+            assert!(
+                checks.contains(&"best_interface".into()),
+                "{} missing best_interface",
+                fx.id
+            );
+        }
+    }
+
+    #[test]
+    fn per_profile_conformance_matrix() {
+        let reg = ProfileRegistry::with_official();
+        for id in OfficialProfileId::all() {
+            let p = reg.get(id.as_str()).unwrap();
+            let fx = official_fixtures()
+                .into_iter()
+                .find(|f| f.id == p.id)
+                .unwrap();
+            conform_profile(p, &fx).unwrap();
+
+            // Launch plan (binary may be missing — still builds argv against declared name)
+            let plan = match reg.launch_plan(id.as_str(), Some("hello"), false) {
+                Ok(plan) => plan,
+                Err(ProfileError::UnsupportedVersion(_)) => continue,
+                Err(e) => panic!("{} launch: {e}", id.as_str()),
+            };
+            assert_eq!(plan.profile_id.as_deref(), Some(id.as_str()));
+            // force PTY fallback
+            let pty = reg.launch_plan(id.as_str(), None, true).unwrap();
+            assert!(pty.use_pty);
+            assert_eq!(pty.interface, InterfacePreference::Pty);
+
+            if p.supports_native_resume {
+                let r = reg.resume_plan(id.as_str(), "native_abc").unwrap();
+                assert!(r.args.iter().any(|a| a.contains("native_abc")));
+            }
+        }
+    }
+
+    #[test]
+    fn codex_prefers_app_server_rpc() {
+        let reg = ProfileRegistry::with_official();
+        let p = reg.get("codex").unwrap();
+        assert_eq!(p.interface_order[0], InterfacePreference::StructuredRpc);
+        assert_eq!(p.structured_start_args, vec!["app-server".to_string()]);
+        assert!(p.supports_native_resume);
+    }
+
+    #[test]
+    fn claude_stream_json_and_resume() {
+        let reg = ProfileRegistry::with_official();
+        let p = reg.get("claude-code").unwrap();
+        assert!(p.non_interactive_args.iter().any(|a| a == "stream-json"));
+        assert!(p.supports_native_resume);
+    }
+
+    #[test]
+    fn normalize_events() {
+        let e = normalize_event_json(r#"{"type":"message","text":"hi","session_id":"s1"}"#).unwrap();
+        assert_eq!(e.kind, "message");
+        assert_eq!(e.text.as_deref(), Some("hi"));
+        assert_eq!(e.native_session_id.as_deref(), Some("s1"));
+        let t = normalize_event_json(r#"{"event":"tool_call"}"#).unwrap();
+        assert_eq!(t.kind, "tool_call");
+    }
+
+    #[test]
+    fn parse_semver_prefix_samples() {
+        assert_eq!(parse_semver_prefix("codex-cli 0.25.1").as_deref(), Some("0.25.1"));
+        assert_eq!(parse_semver_prefix("v1.2.3-beta").as_deref(), Some("1.2.3"));
+        assert!(version_less("0.9.0", "1.0.0"));
+        assert!(!version_less("1.0.0", "0.9.9"));
+    }
+
+    #[test]
+    fn fixture_json_roundtrip() {
+        let fx = &official_fixtures()[0];
+        let raw = serde_json::to_string_pretty(fx).unwrap();
+        let back: ProfileFixture = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.id, fx.id);
     }
 }

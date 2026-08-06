@@ -2,39 +2,143 @@
 
 OwnMesh does **not** require a vendor-hosted SaaS. Deploy this Worker to **your** Cloudflare account.
 
-## Prerequisites
+Standard deploy creates **only**:
+
+| Resource | Binding | Purpose |
+|---|---|---|
+| Worker | — | OAuth, MCP `/mcp`, device APIs |
+| D1 | `DB` | tenants, principals, OAuth clients/tokens, devices, grants, audit metadata |
+| Durable Object | `DEVICE_ROOM` | per-device WebSocket room (hibernation) |
+
+**Not** created (fail-closed): R2 buckets, Cloudflare TURN, relay queues.
+
+## One-click deploy
+
+Use Cloudflare’s **Deploy to Cloudflare** button (clones the repo, provisions bindings from `wrangler.jsonc`, builds & deploys):
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Aero123421/OwnMesh&path=packages/control-plane)
+
+Docs: [Deploy to Cloudflare buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/)
+
+> Monorepo note: the button treats `packages/control-plane` as the app root when `path=` is set. Ensure that package is self-contained (it is: own `package.json` + `wrangler.jsonc` + `migrations/`).
+
+## Prerequisites (CLI path)
 
 - Cloudflare account
 - Node 22+ and pnpm 9+
-- `wrangler` (via package devDependency)
+- Logged in: `pnpm exec wrangler login`
 
-## Steps
+## Wrangler deploy (recommended for developers)
 
 ```bash
 cd packages/control-plane
 pnpm install
-# Create D1 database
+
+# 1) Create D1 (once per account)
 pnpm exec wrangler d1 create ownmesh
-# Put the database_id into wrangler.jsonc
-pnpm exec wrangler d1 migrations apply ownmesh --remote
-pnpm exec wrangler deploy
+# Copy the printed database_id into wrangler.jsonc → d1_databases[0].database_id
+
+# 2) Apply SQL migrations (remote)
+# Use the binding name DB so renames stay correct:
+# https://developers.cloudflare.com/workers/platform/deploy-buttons/
+pnpm exec wrangler d1 migrations apply DB --remote
+
+# 3) Deploy Worker + Durable Object
+pnpm run deploy
 ```
 
-Set `OAUTH_ISSUER` to your Worker URL if it differs from the request origin.
+`package.json` `deploy` script runs migrations against binding `DB` then `wrangler deploy`.
 
-## Local dev
+### Local dev
 
 ```bash
 pnpm exec wrangler dev
+# Local D1 migrations:
+pnpm exec wrangler d1 migrations apply DB --local
 curl http://127.0.0.1:8787/health
 ```
+
+### Secrets / vars
+
+| Name | Required | Notes |
+|---|---|---|
+| `OAUTH_ISSUER` | optional | Defaults to request origin. Set to your canonical `https://<worker>.workers.dev` if behind a custom domain. |
+| `SESSION_SECRET` | optional | Reserved for signed cookies; generate with `openssl rand -hex 32`. **Do not commit secrets.** |
+
+Example (do not commit values):
+
+```bash
+pnpm exec wrangler secret put SESSION_SECRET
+```
+
+Reference `.dev.vars.example` in this package for local-only vars.
+
+## What gets provisioned (from wrangler.jsonc)
+
+```jsonc
+d1_databases: [{ binding: "DB", database_name: "ownmesh", migrations_dir: "migrations" }]
+durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
+// no r2_buckets, no turn
+```
+
+- **D1 Worker API**: https://developers.cloudflare.com/d1/worker-api/
+- **DO WebSocket hibernation**: https://developers.cloudflare.com/durable-objects/best-practices/websockets/
+- **Hibernation example**: https://developers.cloudflare.com/durable-objects/examples/websocket-hibernation-server/
+- **Wrangler configuration**: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+## OAuth & device endpoints (server contract)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata (includes `device_authorization_endpoint`) |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata |
+| `POST /oauth/register` | Dynamic Client Registration; `redirect_uri` **exact match** policy |
+| `GET /oauth/authorize` | Auth code + PKCE S256; browser consent page |
+| `POST /oauth/token` | `authorization_code`, `refresh_token` (rotation + reuse detection), `urn:ietf:params:oauth:grant-type:device_code` |
+| `POST /oauth/revoke` | Token revoke |
+| `POST /oauth/device_authorization` | RFC 8628 device code issue |
+| `GET\|POST /oauth/device` | User verification / approve page |
+| `POST /v1/devices/enroll` | Device enrollment + challenge (CLI: `cli-auth-09`) |
+| `POST /v1/devices/enroll/proof` | Challenge signature proof |
+| `GET /v1/devices` | List devices |
+| `POST /v1/devices/revoke` or `DELETE /v1/devices?id=` | Revoke device |
+| `GET /agent/connect?device_id=&role=agent\|client` | WebSocket → `DeviceRoom` DO |
+| `POST /mcp` | Streamable HTTP MCP |
+| `GET /approve` | One-time browser approval page |
+
+### Enrollment response shape (for CLI)
+
+```json
+{
+  "device_id": "dev_...",
+  "enrollment_token": "atk_...",
+  "expires_in": 300,
+  "challenge": {
+    "id": "ech_...",
+    "nonce": "...",
+    "message": "ownmesh-device-challenge:<nonce>:<device_id>",
+    "expires_at": "2026-08-06T00:05:00.000Z"
+  },
+  "connect_path": "/agent/connect"
+}
+```
+
+Proof body: `{ "device_id", "challenge_id", "signature": "<64-byte ed25519 hex>" }`.
 
 ## ChatGPT Personal Plugin / MCP
 
 1. Deploy control plane and note `https://<worker>/mcp`
-2. Configure OAuth client (Dynamic Registration at `/oauth/register` or static client)
+2. Configure OAuth client (`POST /oauth/register` or static client with **exact** redirect URIs)
 3. In ChatGPT, add the MCP connector / Personal Plugin pointing at your `/mcp` URL
 4. Complete OAuth; scopes: `ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access`
-5. Enroll a device with `ownmesh` CLI against your issuer URL
+5. Enroll a device with `ownmesh device enroll` / `ownmesh login` against your issuer URL (CLI ticket **cli-auth-09**)
 
 **Policy note:** ChatGPT tool calls are **not** the authorization boundary. The local `ownmeshd` policy engine is final.
+
+## Health check
+
+```bash
+curl -s https://<worker>/health | jq .
+# expect: status=ok, features includes no-r2-turn, storage=d1 when bound
+curl -s https://<worker>/v1/migrations/status | jq .
+```

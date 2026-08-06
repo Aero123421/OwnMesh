@@ -1,8 +1,10 @@
 //! Command dispatch.
 
 mod approval;
+pub(crate) mod device_cmd;
 mod exec;
 mod ipc_util;
+pub(crate) mod login;
 mod lockdown;
 mod policy_cmd;
 mod privileged;
@@ -24,15 +26,8 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         None => run_tui_launch(cli),
         Some(Commands::Status) => run_status(cli),
         Some(Commands::Setup) => stub(cli, "setup", "Interactive setup arrives in a later chapter."),
-        Some(Commands::Login(args)) => stub(
-            cli,
-            "login",
-            &format!(
-                "OAuth login arrives in chapter 5 (device_flow={}).",
-                args.device
-            ),
-        ),
-        Some(Commands::Logout) => stub(cli, "logout", "Logout arrives with OAuth in chapter 5."),
+        Some(Commands::Login(args)) => login::run_login(cli, args),
+        Some(Commands::Logout) => login::run_logout(cli),
         Some(Commands::Doctor) => stub(cli, "doctor", "Doctor diagnostics expand in later chapters."),
         Some(Commands::Lockdown) => lockdown::run_lockdown(cli),
         Some(Commands::Unlock) => lockdown::run_unlock(cli),
@@ -137,17 +132,7 @@ fn dispatch_instance(cli: &Cli, cmd: &InstanceCmd) -> Result<(), ExitCode> {
 }
 
 fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {
-    match cmd {
-        DeviceCmd::Enroll => stub(cli, "device enroll", "chapter 5"),
-        DeviceCmd::List => stub(cli, "device list", "chapter 5"),
-        DeviceCmd::Show { id } => stub(cli, "device show", id),
-        DeviceCmd::Rename { id, name } => stub(cli, "device rename", &format!("{id} -> {name}")),
-        DeviceCmd::Labels { id, labels } => {
-            stub(cli, "device labels", &format!("{id} {labels:?}"))
-        }
-        DeviceCmd::RotateKey => stub(cli, "device rotate-key", "chapter 5"),
-        DeviceCmd::Revoke { id } => stub(cli, "device revoke", id),
-    }
+    device_cmd::dispatch_device(cli, cmd)
 }
 
 fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode> {

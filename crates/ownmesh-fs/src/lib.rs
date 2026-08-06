@@ -1,7 +1,14 @@
 //! OwnMesh filesystem operations and path safety.
 //!
 //! Workspace-relative resolution, symlink/junction-aware canonicalization,
-//! list/stat/read/write/delete, and hash-checked patch apply.
+//! list/stat/read/write/delete, hash-checked patch apply, and read-only git
+//! status/diff.
+
+mod git;
+
+pub use git::{
+    git_diff, git_status, GitDiffOpts, GitDiffPage, GitStatusEntry, GitStatusOpts, GitStatusPage,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

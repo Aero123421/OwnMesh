@@ -8,6 +8,7 @@
     clippy::must_use_candidate
 )]
 
+mod auth;
 mod cli;
 mod commands;
 

@@ -1892,14 +1892,19 @@ dependencies = [
  "clap",
  "crossterm",
  "ownmesh-config",
+ "ownmesh-diagnostics",
  "ownmesh-domain",
  "ownmesh-ipc",
+ "ownmesh-policy",
+ "ownmesh-profiles",
+ "ownmesh-transfer",
  "ratatui",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

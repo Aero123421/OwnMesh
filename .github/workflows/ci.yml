@@ -161,3 +161,23 @@ jobs:
           else
             echo "No wrangler config yet — skeleton OK"
           fi
+
+  tui-i18n:
+    name: TUI i18n completeness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: translation completeness (en-US / ja-JP / zh-Hans / ru-RU)
+        run: cargo run -p ownmesh-tui -- --check-i18n
+
+      - name: TUI snapshot tests (CJK width, ru overflow, 80x24, wizard)
+        run: cargo test -p ownmesh-tui -- --nocapture

@@ -225,6 +225,60 @@ export interface Page<T> {
   truncated?: boolean;
 }
 
+/** Shared log cursor (provider-local offset). */
+export interface LogCursor {
+  provider: string;
+  offset: number;
+}
+
+export interface LogLine {
+  line_no: number;
+  text: string;
+  cursor_after: LogCursor;
+}
+
+export interface LogPage {
+  lines: LogLine[];
+  next_cursor?: LogCursor;
+  exhausted: boolean;
+}
+
+export type LogProviderId =
+  | "audit"
+  | "file"
+  | "windows_event"
+  | "journald"
+  | "docker"
+  | "process"
+  | (string & {});
+
+export interface GitStatusEntry {
+  code: string;
+  path: string;
+  orig_path?: string;
+}
+
+/** Entry-offset pagination (same idea as log pages). */
+export interface GitStatusPage {
+  repo_root: string;
+  branch?: string;
+  upstream?: string;
+  clean: boolean;
+  entries: GitStatusEntry[];
+  next_cursor?: number;
+  exhausted: boolean;
+}
+
+/** Line-offset unified diff page. */
+export interface GitDiffPage {
+  repo_root: string;
+  staged: boolean;
+  lines: string[];
+  next_cursor?: number;
+  exhausted: boolean;
+  truncated: boolean;
+}
+
 export interface ProtocolEnvelope {
   protocol: string;
   message_id: string;

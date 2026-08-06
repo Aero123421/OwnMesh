@@ -10,10 +10,13 @@ use ownmesh_broker_client::{
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{run_command, CommandKind, IdempotencyJournal, RunRequest, RunResult};
 use ownmesh_fs::{
-    delete_path, list_dir, read_file, stat_path, write_file, WorkspaceRoot,
+    delete_path, git_diff, git_status, list_dir, read_file, stat_path, write_file, GitDiffOpts,
+    GitStatusOpts, WorkspaceRoot,
 };
 use ownmesh_ipc::{app_error, methods, IpcError, IpcResult, MethodHandler};
-use ownmesh_logs::{FileLogProvider, LogCursor, LogRegistry};
+use ownmesh_logs::{
+    register_builtin_providers, BuiltinProviderConfig, LogCursor, LogError, LogRegistry,
+};
 use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
     AccessPreset, Decision, OperationFacts, PolicyDocument, TemporaryGrant,
@@ -45,6 +48,13 @@ pub mod session_methods {
     pub const PUSH_OUTPUT: &str = "session.push_output";
     pub const WRITE: &str = "session.write";
     pub const RESIZE: &str = "session.resize";
+}
+
+/// Extra ops methods (owned here; keeps ownmesh-ipc ms1 method table stable).
+pub mod ops_methods {
+    pub const GIT_STATUS: &str = "ops.git.status";
+    pub const GIT_DIFF: &str = "ops.git.diff";
+    pub const LOGS_LIST_PROVIDERS: &str = "ops.logs.list_providers";
 }
 
 const LOCAL_PRINCIPAL: &str = "prin_local";
@@ -80,6 +90,8 @@ pub enum PendingRequest {
     FsWrite(FsWriteParams),
     FsDelete(FsDeleteParams),
     LogsQuery(LogsQueryParams),
+    GitStatus(GitStatusParams),
+    GitDiff(GitDiffParams),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,10 +171,50 @@ pub struct LogsQueryParams {
     pub limit: Option<usize>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Windows Event Log channel (default Application).
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// journald `--unit` filter.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// Docker/Podman container name or id.
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 fn default_log_provider() -> String {
     "audit".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitStatusParams {
+    /// Workspace-relative path to the repository (default: workspace root).
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub cursor: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitDiffParams {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub pathspec: Option<String>,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub cursor: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +520,8 @@ impl DaemonRuntime {
             PendingRequest::FsWrite(p) => self.execute_fs_write(p),
             PendingRequest::FsDelete(p) => self.execute_fs_delete(p),
             PendingRequest::LogsQuery(p) => self.execute_logs_query(p),
+            PendingRequest::GitStatus(p) => self.execute_git_status(p),
+            PendingRequest::GitDiff(p) => self.execute_git_diff(p),
         }
     }
 
@@ -584,9 +638,40 @@ impl DaemonRuntime {
         Ok(json!({ "path": p.path, "deleted": true }))
     }
 
-    fn execute_logs_query(&self, p: &LogsQueryParams) -> IpcResult<Value> {
+    fn process_log_path(&self) -> PathBuf {
+        self.paths.state_dir.join("logs").join("process.log")
+    }
+
+    fn build_log_registry(&self, p: &LogsQueryParams) -> LogRegistry {
         let mut reg = LogRegistry::new();
-        reg.register(Box::new(FileLogProvider::new("audit", &self.log_path)));
+        let process_log = self.process_log_path();
+        // Ensure process log exists so the provider can page empty results.
+        if let Some(parent) = process_log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !process_log.exists() {
+            let _ = std::fs::write(&process_log, b"");
+        }
+        register_builtin_providers(
+            &mut reg,
+            &BuiltinProviderConfig {
+                file_id: "audit".into(),
+                file_path: self.log_path.clone(),
+                windows_channel: p
+                    .channel
+                    .clone()
+                    .unwrap_or_else(|| "Application".into()),
+                journald_unit: p.unit.clone(),
+                docker_container: p.container.clone(),
+                process_id: "process".into(),
+                process_log_path: Some(process_log),
+            },
+        );
+        reg
+    }
+
+    fn execute_logs_query(&self, p: &LogsQueryParams) -> IpcResult<Value> {
+        let reg = self.build_log_registry(p);
         let provider = reg.get(&p.provider).map_err(|e| IpcError::Remote {
             code: app_error::INVALID_PARAMS,
             message: e.to_string(),
@@ -597,10 +682,53 @@ impl DaemonRuntime {
         });
         let page = provider
             .query(cursor.as_ref(), p.limit.unwrap_or(100))
-            .map_err(|e| IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: e.to_string(),
+            .map_err(|e| match e {
+                LogError::Unavailable(msg) => IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: msg,
+                },
+                other => IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: other.to_string(),
+                },
             })?;
+        serde_json::to_value(page).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })
+    }
+
+    fn execute_git_status(&self, p: &GitStatusParams) -> IpcResult<Value> {
+        let ws = self.workspace()?;
+        let page = git_status(
+            &ws,
+            &GitStatusOpts {
+                path: PathBuf::from(&p.path),
+                cursor: p.cursor,
+                limit: p.limit.unwrap_or(100),
+            },
+        )
+        .map_err(fs_err)?;
+        serde_json::to_value(page).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })
+    }
+
+    fn execute_git_diff(&self, p: &GitDiffParams) -> IpcResult<Value> {
+        let ws = self.workspace()?;
+        let page = git_diff(
+            &ws,
+            &GitDiffOpts {
+                path: PathBuf::from(&p.path),
+                pathspec: p.pathspec.clone(),
+                staged: p.staged,
+                cursor: p.cursor,
+                limit: p.limit.unwrap_or(200),
+                max_bytes: p.max_bytes.unwrap_or(1024 * 1024),
+            },
+        )
+        .map_err(fs_err)?;
         serde_json::to_value(page).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
@@ -711,6 +839,42 @@ impl DaemonRuntime {
             .await
     }
 
+    fn handle_logs_list_providers(&self, params: Option<Value>) -> IpcResult<Value> {
+        let p: LogsQueryParams = parse_params(params.or_else(|| Some(json!({}))))?;
+        let reg = self.build_log_registry(&p);
+        Ok(json!({ "providers": reg.list_ids() }))
+    }
+
+    async fn handle_git_status(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        let p: GitStatusParams = parse_params(params)?;
+        let facts = OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "git".into(),
+            path: Some(p.path.clone()),
+            workspace_relative: true,
+            tags: vec!["git".into(), "status".into()],
+            ..Default::default()
+        };
+        let key = p.idempotency_key.clone();
+        self.gate_and_run(facts, key, PendingRequest::GitStatus(p))
+            .await
+    }
+
+    async fn handle_git_diff(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        let p: GitDiffParams = parse_params(params)?;
+        let facts = OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "git".into(),
+            path: Some(p.path.clone()),
+            workspace_relative: true,
+            tags: vec!["git".into(), "diff".into()],
+            ..Default::default()
+        };
+        let key = p.idempotency_key.clone();
+        self.gate_and_run(facts, key, PendingRequest::GitDiff(p))
+            .await
+    }
+
     fn handle_approval_list(&self) -> IpcResult<Value> {
         let mut list: Vec<&ApprovalRecord> = self.approvals.values().collect();
         list.sort_by(|a, b| b.created_at_unix.cmp(&a.created_at_unix));
@@ -763,6 +927,8 @@ impl DaemonRuntime {
             PendingRequest::FsWrite(x) => x.idempotency_key.clone(),
             PendingRequest::FsDelete(x) => x.idempotency_key.clone(),
             PendingRequest::LogsQuery(x) => x.idempotency_key.clone(),
+            PendingRequest::GitStatus(x) => x.idempotency_key.clone(),
+            PendingRequest::GitDiff(x) => x.idempotency_key.clone(),
         };
 
         rec.state = "approved".into();
@@ -1009,6 +1175,9 @@ impl DaemonRuntime {
             methods::OPS_FS_WRITE => self.handle_fs_write(params).await,
             methods::OPS_FS_DELETE => self.handle_fs_delete(params).await,
             methods::OPS_LOGS_QUERY => self.handle_logs_query(params).await,
+            ops_methods::LOGS_LIST_PROVIDERS => self.handle_logs_list_providers(params),
+            ops_methods::GIT_STATUS => self.handle_git_status(params).await,
+            ops_methods::GIT_DIFF => self.handle_git_diff(params).await,
             methods::APPROVAL_LIST => self.handle_approval_list(),
             methods::APPROVAL_SHOW => self.handle_approval_show(params),
             methods::APPROVAL_APPROVE => self.handle_approval_approve(params).await,

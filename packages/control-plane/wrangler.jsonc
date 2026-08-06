@@ -1,16 +1,22 @@
 {
+  // OwnMesh control plane — user-owned Cloudflare deploy.
+  // Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+  // DO hibernation: https://developers.cloudflare.com/durable-objects/best-practices/websockets/
+  // Intentionally no object-storage or relay bindings (spec §5.1 fail-closed).
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "ownmesh-control-plane",
   "main": "src/index.ts",
   "compatibility_date": "2024-12-01",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
+    // Set to your Worker URL after first deploy if it differs from request origin.
     "OAUTH_ISSUER": ""
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "ownmesh",
+      // Replace via `wrangler d1 create ownmesh` (Deploy to Cloudflare button fills this).
       "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations"
     }
@@ -25,8 +31,10 @@
   },
   "migrations": [
     {
+      // SQLite-backed DO for hibernation-friendly device rooms.
+      // https://developers.cloudflare.com/durable-objects/best-practices/websockets/
       "tag": "v1",
-      "new_classes": ["DeviceRoom"]
+      "new_sqlite_classes": ["DeviceRoom"]
     }
   ]
 }

@@ -8,7 +8,7 @@ OwnMesh is **not** an AI orchestrator. It does not fix ChatGPT above Codex/Claud
 
 ## Status
 
-**v1.0.0** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
+**v1.0.1** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
 ## Components
 
