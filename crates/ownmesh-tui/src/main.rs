@@ -460,9 +460,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ownmesh_ipc::{
-        generate_token, reject_unknown_handler, write_token_file, AuthGate, IpcServer, ServerConfig,
-    };
+    use ownmesh_ipc::{reject_unknown_handler, AuthGate, IpcServer, ServerConfig};
     use ownmesh_policy::{
         full_access_has_no_hidden_restrictive_rules, preset_document, AccessPreset,
     };
@@ -476,11 +474,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
         paths.ensure_layout().unwrap();
-        let token = generate_token();
-        write_token_file(&paths.runtime_dir, &token).unwrap();
         let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
         let server = Arc::new(IpcServer::new(
-            ServerConfig::new(endpoint.clone(), AuthGate::new(token), "ownmeshd", "0.1.0"),
+            ServerConfig::new(
+                endpoint.clone(),
+                AuthGate::local_user(),
+                "ownmeshd",
+                "0.1.0",
+            ),
             reject_unknown_handler(),
         ));
         let serve = Arc::clone(&server);

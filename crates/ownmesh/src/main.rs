@@ -85,7 +85,13 @@ mod tests {
             vec!["ownmesh", "doctor"],
             vec!["ownmesh", "lockdown"],
             vec!["ownmesh", "unlock"],
-            vec!["ownmesh", "tokens", "revoke", "--client", "chatgpt"],
+            vec![
+                "ownmesh",
+                "tokens",
+                "revoke",
+                "--principal",
+                "user:1000:exe:/usr/bin/ownmesh",
+            ],
             vec!["ownmesh", "setup"],
             vec!["ownmesh", "config", "validate"],
             vec!["ownmesh", "config", "get", "lang"],
@@ -166,6 +172,30 @@ mod tests {
                 panic!("failed to parse {args:?}: {err}");
             });
         }
+    }
+
+    #[test]
+    fn token_revoke_help_requires_server_assigned_principal() {
+        let mut cmd = Cli::command();
+        let tokens = cmd.find_subcommand_mut("tokens").expect("tokens");
+        let revoke = tokens.find_subcommand_mut("revoke").expect("revoke");
+        let help = revoke.render_long_help().to_string().to_ascii_lowercase();
+        assert!(help.contains("--principal"), "{help}");
+        assert!(help.contains("server-assigned"), "{help}");
+        assert!(!help.contains("--client"), "{help}");
+        assert!(!help.contains("e.g. chatgpt"), "{help}");
+    }
+
+    #[test]
+    fn token_revoke_rejects_noncanonical_alias_before_ipc() {
+        let cli = Cli {
+            json: false,
+            lang: None,
+            command: Some(cli::Commands::Tokens(cli::TokensCmd::Revoke {
+                principal: " ChatGPT ".into(),
+            })),
+        };
+        assert_eq!(commands::dispatch(&cli), Err(ExitCode::UsageConfig));
     }
 
     #[test]

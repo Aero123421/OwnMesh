@@ -311,8 +311,20 @@ pub async fn refresh_access_token(
 }
 
 /// Best-effort token revocation (RFC 7009).
-pub async fn revoke_token(http: &reqwest::Client, issuer: &str, token: &str) -> Result<()> {
+///
+/// Always performs the revoke POST with [`reqwest::redirect::Policy::none`].
+/// A 3xx response is an error: the token must never be forwarded to `Location`
+/// (open-redirect / token exfiltration). The `http` argument is retained for
+/// call-site compatibility; redirect policy is enforced here regardless.
+pub async fn revoke_token(_http: &reqwest::Client, issuer: &str, token: &str) -> Result<()> {
     let issuer = validate_issuer(issuer)?;
+    // Defense in depth: never follow redirects on revoke, even if the caller
+    // accidentally passed a default (follow-redirects) client.
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build no-redirect revoke client")?;
     let resp = http
         .post(format!("{issuer}/oauth/revoke"))
         .header("content-type", "application/x-www-form-urlencoded")
@@ -320,9 +332,15 @@ pub async fn revoke_token(http: &reqwest::Client, issuer: &str, token: &str) -> 
         .send()
         .await
         .context("revoke endpoint")?;
-    if !(resp.status().is_success() || resp.status().as_u16() == 200) {
+    let status = resp.status();
+    if status.is_redirection() {
+        bail!(
+            "revoke endpoint returned HTTP {status} redirect; refusing to follow (token not sent to Location)"
+        );
+    }
+    if !status.is_success() {
         // RFC 7009: endpoint should return 200 even for unknown tokens; still tolerate.
-        debug!(status = %resp.status(), "revoke returned non-success");
+        debug!(status = %status, "revoke returned non-success");
     }
     Ok(())
 }

@@ -3,8 +3,8 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::paths::OwnMeshPaths;
 use crate::schema::{OwnMeshConfig, PolicyFile, CONFIG_SCHEMA_VERSION};
+use ownmesh_persist::write_atomically;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Load `config.toml`, migrating when needed. Creates a default file when missing.
@@ -102,11 +102,26 @@ pub fn save_policy(paths: &OwnMeshPaths, policy: &PolicyFile) -> ConfigResult<()
     Ok(())
 }
 
-/// Write `data` to `path` using temp file + rename, preserving a `.bak` backup.
+/// Write `data` to `path` using temp file + atomic replace, preserving a `.bak` backup.
+///
+/// ## Atomicity
+///
+/// - The previous file (if any) is written atomically to `path.bak` **before** any replace.
+/// - New bytes are fully written and `sync_all`'d to a per-operation unique sibling temp.
+/// - [`ownmesh_persist::write_atomically`] replaces the target in one rename. On Unix it
+///   prepares/syncs the parent before commit and attempts a second sync after commit.
+/// - **Windows:** the pinned Rust 1.92.0 `std::fs::rename` implementation uses
+///   `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (with a replacing
+///   `SetFileInformationByHandle` fallback), so there is no delete/create window.
+/// - **Unix:** `rename(2)` replaces atomically within the same directory.
+///
+/// The target is never pre-deleted. On replace failure the original target
+/// contents remain intact and `.bak` still holds the pre-write copy.
 ///
 /// # Errors
 ///
-/// Returns IO errors.
+/// Returns IO errors. On any failure after the `.bak` copy, the original
+/// `path` is left unchanged when the platform rename/replace fails.
 pub fn atomic_write(path: &Path, data: &[u8]) -> ConfigResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
@@ -115,54 +130,33 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> ConfigResult<()> {
         })?;
     }
 
-    if path.exists() {
-        let bak = backup_path(path);
-        fs::copy(path, &bak).map_err(|source| ConfigError::Io {
-            path: Some(bak),
-            source,
-        })?;
+    match fs::read(path) {
+        Ok(previous) => {
+            let bak = backup_path(path);
+            write_atomically(&bak, &previous).map_err(|source| ConfigError::Io {
+                path: Some(bak),
+                source,
+            })?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: Some(path.to_path_buf()),
+                source,
+            });
+        }
     }
 
-    let tmp = tmp_path(path);
-    {
-        let mut file = fs::File::create(&tmp).map_err(|source| ConfigError::Io {
-            path: Some(tmp.clone()),
-            source,
-        })?;
-        file.write_all(data).map_err(|source| ConfigError::Io {
-            path: Some(tmp.clone()),
-            source,
-        })?;
-        file.sync_all().map_err(|source| ConfigError::Io {
-            path: Some(tmp.clone()),
-            source,
-        })?;
-    }
-
-    // On Windows, rename over existing may fail — remove target first after backup.
-    if path.exists() {
-        fs::remove_file(path).map_err(|source| ConfigError::Io {
-            path: Some(path.to_path_buf()),
-            source,
-        })?;
-    }
-    fs::rename(&tmp, path).map_err(|source| ConfigError::Io {
+    write_atomically(path, data).map_err(|source| ConfigError::Io {
         path: Some(path.to_path_buf()),
         source,
-    })?;
-    Ok(())
+    })
 }
 
 fn backup_path(path: &Path) -> PathBuf {
     let mut bak = path.as_os_str().to_os_string();
     bak.push(".bak");
     PathBuf::from(bak)
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    PathBuf::from(tmp)
 }
 
 /// Migrate a raw TOML table in place. Returns whether a migration occurred.
@@ -308,5 +302,89 @@ mod tests {
         let mut table = toml::map::Map::new();
         let v = migrate_one(&mut table, CONFIG_SCHEMA_VERSION).unwrap();
         assert_eq!(v, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn atomic_write_replaces_without_deleting_first() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        atomic_write(&path, b"version-one").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "version-one");
+
+        atomic_write(&path, b"version-two").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "version-two");
+
+        // Backup of the pre-replace contents must exist.
+        let bak = backup_path(&path);
+        assert!(bak.is_file());
+        assert_eq!(fs::read_to_string(&bak).unwrap(), "version-one");
+
+        // No per-operation temp may linger after successful rename.
+        let temp_prefix = format!("{}.tmp.", path.file_name().unwrap().to_string_lossy());
+        assert!(!fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&temp_prefix)));
+    }
+
+    #[test]
+    fn atomic_write_failed_replace_keeps_old_contents() {
+        let dir = tempdir().unwrap();
+        let path2 = dir.path().join("stable.json");
+        atomic_write(&path2, b"STABLE-OLD").unwrap();
+
+        // Hold an exclusive lock on Windows so MoveFileExW replace fails while
+        // the original bytes stay readable. On Unix, open+unlink semantics differ,
+        // so we instead make the temp path a directory to fail File::create.
+        #[cfg(windows)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::{Read, Seek, SeekFrom};
+            use std::os::windows::fs::OpenOptionsExt;
+            // share_mode(0) denies FILE_SHARE_DELETE required by replace.
+            let mut guard = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&path2)
+                .expect("exclusive lock");
+            let err = atomic_write(&path2, b"STABLE-NEW");
+            assert!(err.is_err(), "replace must fail under exclusive lock");
+            // Read via the held handle (path open is denied under share_mode 0).
+            guard.seek(SeekFrom::Start(0)).unwrap();
+            let mut got = String::new();
+            guard.read_to_string(&mut got).unwrap();
+            assert_eq!(got, "STABLE-OLD");
+            drop(guard);
+            assert_eq!(fs::read_to_string(&path2).unwrap(), "STABLE-OLD");
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Fault injection must not depend on guessing the helper's unique temp name.
+            // Make the destination a non-empty directory and retain the stable file nearby.
+            let saved = dir.path().join("stable.saved-for-fault-injection");
+            fs::rename(&path2, &saved).unwrap();
+            fs::create_dir(&path2).unwrap();
+            fs::write(path2.join("blocker"), b"1").unwrap();
+            let err = atomic_write(&path2, b"STABLE-NEW");
+            assert!(err.is_err(), "write must fail for a directory destination");
+            assert_eq!(fs::read_to_string(&saved).unwrap(), "STABLE-OLD");
+            fs::remove_dir_all(&path2).unwrap();
+            fs::rename(&saved, &path2).unwrap();
+            assert_eq!(fs::read_to_string(&path2).unwrap(), "STABLE-OLD");
+        }
+
+        // Directory-as-target also fails and must not wipe the stable neighbor.
+        let path = dir.path().join("dir-target.json");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("child"), b"x").unwrap();
+        let err = atomic_write(&path, b"nope");
+        assert!(err.is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read_to_string(&path2).unwrap(), "STABLE-OLD");
     }
 }

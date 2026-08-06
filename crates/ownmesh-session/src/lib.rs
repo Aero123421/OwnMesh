@@ -38,6 +38,8 @@ pub enum SessionError {
     LeaseHeld(String),
     #[error("not controller")]
     NotController,
+    #[error("not a session reader")]
+    NotReader,
     #[error("observer cannot write stdin")]
     ObserverCannotWrite,
     #[error("session closed")]
@@ -93,6 +95,14 @@ pub struct ControllerLease {
     pub expires_unix: i64,
 }
 
+impl ControllerLease {
+    /// `true` when the lease is still valid at `now_unix` (strictly future expiry).
+    #[must_use]
+    pub fn is_active(&self, now_unix: i64) -> bool {
+        self.expires_unix > now_unix
+    }
+}
+
 /// Session snapshot for API/TUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -121,6 +131,14 @@ pub struct SessionInfo {
     /// Working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+impl SessionInfo {
+    /// Active (non-expired) controller lease at `now_unix`, if any.
+    #[must_use]
+    pub fn active_controller(&self, now_unix: i64) -> Option<&ControllerLease> {
+        self.controller.as_ref().filter(|c| c.is_active(now_unix))
+    }
 }
 
 /// In-memory session record.
@@ -230,21 +248,56 @@ impl SessionManager {
         self.sessions.values().map(|s| s.info.clone()).collect()
     }
 
-    /// Attach as observer (no stdin).
-    pub fn attach_observer(&mut self, id: &str, principal: impl Into<String>) -> SessionResult<()> {
+    /// Whether `principal` holds a non-expired controller lease.
+    pub fn is_controller(&self, id: &str, principal: &str, now_unix: i64) -> SessionResult<bool> {
+        let info = self.get(id)?;
+        Ok(matches!(
+            info.active_controller(now_unix),
+            Some(c) if c.principal_id == principal
+        ))
+    }
+
+    /// Fail-closed gate: principal must hold an active controller lease.
+    pub fn authorize_controller(
+        &self,
+        id: &str,
+        principal: &str,
+        now_unix: i64,
+    ) -> SessionResult<()> {
+        if self.is_controller(id, principal, now_unix)? {
+            Ok(())
+        } else {
+            Err(SessionError::NotController)
+        }
+    }
+
+    /// Attach as observer (no stdin). `now_unix` is part of the uniform ACL surface.
+    pub fn attach_observer(
+        &mut self,
+        id: &str,
+        principal: impl Into<String>,
+        now_unix: i64,
+    ) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         if s.info.state == SessionState::Closed {
             return Err(SessionError::Closed);
         }
         let p = principal.into();
-        if !s.info.observers.contains(&p)
-            && s.info
-                .controller
-                .as_ref()
-                .map(|c| c.principal_id != p)
-                .unwrap_or(true)
-        {
-            s.info.observers.push(p);
+        // Do not treat an expired controller as still holding the seat for attach bookkeeping.
+        let active_controller = s
+            .info
+            .active_controller(now_unix)
+            .map(|c| c.principal_id.as_str());
+        if !s.info.observers.contains(&p) && active_controller != Some(p.as_str()) {
+            // If this principal is the expired controller still listed on the lease field,
+            // keep them as observer once demoted; attach is a no-op until expire runs.
+            let is_expired_controller = matches!(
+                &s.info.controller,
+                Some(c) if c.principal_id == p && !c.is_active(now_unix)
+            );
+            if !is_expired_controller {
+                s.info.observers.push(p);
+            }
         }
         Ok(())
     }
@@ -262,7 +315,7 @@ impl SessionManager {
         }
         let principal = principal.into();
         if let Some(cur) = &s.info.controller {
-            if cur.principal_id != principal && cur.expires_unix > now_unix {
+            if cur.principal_id != principal && cur.is_active(now_unix) {
                 return Err(SessionError::LeaseHeld(cur.principal_id.clone()));
             }
         }
@@ -277,7 +330,7 @@ impl SessionManager {
         Ok(lease)
     }
 
-    /// Give controller to another principal.
+    /// Give controller to another principal (requires active lease held by `from`).
     pub fn give_controller(
         &mut self,
         id: &str,
@@ -287,7 +340,9 @@ impl SessionManager {
     ) -> SessionResult<ControllerLease> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         match &s.info.controller {
-            Some(c) if c.principal_id == from => {}
+            Some(c) if c.principal_id == from && c.is_active(now_unix) => {}
+            // Expired former controller loses mutation rights (fail closed).
+            Some(c) if c.principal_id == from => return Err(SessionError::NotController),
             Some(c) => return Err(SessionError::LeaseHeld(c.principal_id.clone())),
             None => return Err(SessionError::NotController),
         }
@@ -306,10 +361,16 @@ impl SessionManager {
     }
 
     /// Release controller (session becomes detached; observers remain).
-    pub fn release_controller(&mut self, id: &str, principal: &str) -> SessionResult<()> {
+    /// Requires an active lease; expired controllers cannot release (fail closed).
+    pub fn release_controller(
+        &mut self,
+        id: &str,
+        principal: &str,
+        now_unix: i64,
+    ) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         match &s.info.controller {
-            Some(c) if c.principal_id == principal => {
+            Some(c) if c.principal_id == principal && c.is_active(now_unix) => {
                 if !s.info.observers.iter().any(|o| o == principal) {
                     s.info.observers.push(principal.to_string());
                 }
@@ -317,6 +378,7 @@ impl SessionManager {
                 s.info.state = SessionState::Detached;
                 Ok(())
             }
+            Some(c) if c.principal_id == principal => Err(SessionError::NotController),
             Some(_) => Err(SessionError::NotController),
             None => Ok(()),
         }
@@ -346,22 +408,54 @@ impl SessionManager {
         Ok(chunk)
     }
 
-    /// Controller-only stdin gate.
+    /// Controller-only stdin gate (active lease required).
     pub fn authorize_stdin(&self, id: &str, principal: &str, now_unix: i64) -> SessionResult<()> {
         let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
         if s.info.state == SessionState::Closed {
             return Err(SessionError::Closed);
         }
         match &s.info.controller {
-            Some(c) if c.principal_id == principal && c.expires_unix > now_unix => Ok(()),
+            Some(c) if c.principal_id == principal && c.is_active(now_unix) => Ok(()),
             Some(c) if c.principal_id == principal => Err(SessionError::NotController),
             Some(_) => Err(SessionError::ObserverCannotWrite),
             None => Err(SessionError::NotController),
         }
     }
 
-    /// Replay from sequence (inclusive).
-    pub fn replay_from(&self, id: &str, from_seq: u64) -> SessionResult<Vec<OutputChunk>> {
+    /// Principals that can read output at `now_unix`.
+    ///
+    /// Includes observers and the controller principal. An expired controller remains a
+    /// reader (logical observer) until [`expire_stale_leases`] demotes them in storage.
+    pub fn readers(&self, id: &str, now_unix: i64) -> SessionResult<HashSet<String>> {
+        let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
+        let mut set: HashSet<String> = s.info.observers.iter().cloned().collect();
+        if let Some(c) = &s.info.controller {
+            // Always retain read access for the controller principal; lease expiry only
+            // strips control/stdin rights (fail closed on mutations), not observation.
+            set.insert(c.principal_id.clone());
+            let _ = c.is_active(now_unix);
+        }
+        Ok(set)
+    }
+
+    /// Fail-closed read ACL.
+    pub fn authorize_reader(&self, id: &str, principal: &str, now_unix: i64) -> SessionResult<()> {
+        if self.readers(id, now_unix)?.contains(principal) {
+            Ok(())
+        } else {
+            Err(SessionError::NotReader)
+        }
+    }
+
+    /// Replay from sequence (inclusive). Requires read ACL at `now_unix`.
+    pub fn replay_from(
+        &self,
+        id: &str,
+        principal: &str,
+        from_seq: u64,
+        now_unix: i64,
+    ) -> SessionResult<Vec<OutputChunk>> {
+        self.authorize_reader(id, principal, now_unix)?;
         let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
         Ok(s.replay
             .iter()
@@ -370,14 +464,31 @@ impl SessionManager {
             .collect())
     }
 
-    pub fn resize(&mut self, id: &str, cols: u16, rows: u16) -> SessionResult<()> {
+    /// Resize terminal; active controller only.
+    pub fn resize(
+        &mut self,
+        id: &str,
+        principal: &str,
+        cols: u16,
+        rows: u16,
+        now_unix: i64,
+    ) -> SessionResult<()> {
+        self.authorize_controller(id, principal, now_unix)?;
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.cols = cols;
         s.info.rows = rows;
         Ok(())
     }
 
-    pub fn set_view_mode(&mut self, id: &str, mode: PtyViewMode) -> SessionResult<()> {
+    /// Set view mode; active controller only.
+    pub fn set_view_mode(
+        &mut self,
+        id: &str,
+        principal: &str,
+        mode: PtyViewMode,
+        now_unix: i64,
+    ) -> SessionResult<()> {
+        self.authorize_controller(id, principal, now_unix)?;
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.view_mode = mode;
         Ok(())
@@ -399,6 +510,22 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Test/recovery helper: overwrite controller lease expiry without extending TTL policy.
+    pub fn set_controller_expires_unix(
+        &mut self,
+        id: &str,
+        expires_unix: i64,
+    ) -> SessionResult<()> {
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        match &mut s.info.controller {
+            Some(c) => {
+                c.expires_unix = expires_unix;
+                Ok(())
+            }
+            None => Err(SessionError::NotController),
+        }
+    }
+
     pub fn close(&mut self, id: &str) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.state = SessionState::Closed;
@@ -418,12 +545,12 @@ impl SessionManager {
         n
     }
 
-    /// Recover stale controller leases.
+    /// Recover stale controller leases: demote expired controllers to observers.
     pub fn expire_stale_leases(&mut self, now_unix: i64) -> usize {
         let mut n = 0;
         for s in self.sessions.values_mut() {
             if let Some(c) = &s.info.controller {
-                if c.expires_unix <= now_unix {
+                if !c.is_active(now_unix) {
                     let p = c.principal_id.clone();
                     s.info.controller = None;
                     s.info.state = SessionState::Detached;
@@ -459,16 +586,6 @@ impl SessionManager {
             }
         }
         n
-    }
-
-    /// Principals that can read output.
-    pub fn readers(&self, id: &str) -> SessionResult<HashSet<String>> {
-        let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
-        let mut set: HashSet<String> = s.info.observers.iter().cloned().collect();
-        if let Some(c) = &s.info.controller {
-            set.insert(c.principal_id.clone());
-        }
-        Ok(set)
     }
 
     /// Persist to JSON path.
@@ -522,7 +639,7 @@ mod tests {
             .give_controller(&ses.id, "chatgpt", "human", now + 1)
             .unwrap();
         assert_eq!(lease.principal_id, "human");
-        let readers = mgr.readers(&ses.id).unwrap();
+        let readers = mgr.readers(&ses.id, now + 1).unwrap();
         assert!(readers.contains("human"));
         assert!(readers.contains("chatgpt"));
 
@@ -532,7 +649,7 @@ mod tests {
         );
         mgr.authorize_stdin(&ses.id, "human", now + 2).unwrap();
 
-        let replay = mgr.replay_from(&ses.id, 1).unwrap();
+        let replay = mgr.replay_from(&ses.id, "human", 1, now + 2).unwrap();
         assert_eq!(replay.len(), 1);
         assert!(replay[0].data.contains("hello from agent"));
     }
@@ -552,7 +669,7 @@ mod tests {
                 .principal_id,
             "b"
         );
-        mgr.release_controller(&ses.id, "b").unwrap();
+        mgr.release_controller(&ses.id, "b", now).unwrap();
         assert!(mgr.get(&ses.id).unwrap().controller.is_none());
         assert_eq!(mgr.get(&ses.id).unwrap().state, SessionState::Detached);
     }
@@ -564,6 +681,70 @@ mod tests {
         let n = mgr.expire_stale_leases(10_000_000);
         assert_eq!(n, 1);
         assert!(mgr.get(&ses.id).unwrap().controller.is_none());
+        assert!(mgr.readers(&ses.id, 10_000_000).unwrap().contains("a"));
+    }
+
+    #[test]
+    fn expired_controller_loses_mutations_and_stdin_fail_closed() {
+        let mut mgr = SessionManager::new();
+        let open_at = 1_000i64;
+        let ses = mgr.open(SessionKind::Pty, "t", "ctrl", open_at, None);
+        mgr.attach_observer(&ses.id, "obs", open_at).unwrap();
+        mgr.push_output(&ses.id, "line\n", StreamKind::Stdout)
+            .unwrap();
+
+        // Force lease into the past without going through expire_stale_leases.
+        mgr.set_controller_expires_unix(&ses.id, open_at + 10)
+            .unwrap();
+        let expired_now = open_at + 11;
+
+        // Control / stdin mutations fail closed.
+        assert_eq!(
+            mgr.authorize_stdin(&ses.id, "ctrl", expired_now),
+            Err(SessionError::NotController)
+        );
+        assert_eq!(
+            mgr.give_controller(&ses.id, "ctrl", "obs", expired_now),
+            Err(SessionError::NotController)
+        );
+        assert_eq!(
+            mgr.release_controller(&ses.id, "ctrl", expired_now),
+            Err(SessionError::NotController)
+        );
+        assert_eq!(
+            mgr.resize(&ses.id, "ctrl", 80, 24, expired_now),
+            Err(SessionError::NotController)
+        );
+        assert_eq!(
+            mgr.set_view_mode(&ses.id, "ctrl", PtyViewMode::Cooked, expired_now),
+            Err(SessionError::NotController)
+        );
+        assert_eq!(
+            mgr.authorize_controller(&ses.id, "ctrl", expired_now),
+            Err(SessionError::NotController)
+        );
+
+        // Read paths still allow former controller + observers.
+        mgr.authorize_reader(&ses.id, "ctrl", expired_now).unwrap();
+        mgr.authorize_reader(&ses.id, "obs", expired_now).unwrap();
+        let replay = mgr.replay_from(&ses.id, "ctrl", 1, expired_now).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert!(mgr.readers(&ses.id, expired_now).unwrap().contains("ctrl"));
+
+        // Stranger cannot read.
+        assert_eq!(
+            mgr.authorize_reader(&ses.id, "stranger", expired_now),
+            Err(SessionError::NotReader)
+        );
+        assert_eq!(
+            mgr.replay_from(&ses.id, "stranger", 1, expired_now),
+            Err(SessionError::NotReader)
+        );
+
+        // Observer may claim the expired seat.
+        let lease = mgr.claim_controller(&ses.id, "obs", expired_now).unwrap();
+        assert_eq!(lease.principal_id, "obs");
+        mgr.authorize_stdin(&ses.id, "obs", expired_now).unwrap();
     }
 
     #[test]
@@ -601,11 +782,13 @@ mod tests {
         assert!(info.observers.iter().any(|o| o == "chatgpt"));
         assert_eq!(info.native_session_id.as_deref(), Some("native_abc"));
 
-        let readers = restored.readers(&ses.id).unwrap();
+        let readers = restored.readers(&ses.id, now + 10).unwrap();
         assert!(readers.contains("chatgpt"));
         assert!(readers.contains("human"));
 
-        let replay = restored.replay_from(&ses.id, 1).unwrap();
+        let replay = restored
+            .replay_from(&ses.id, "chatgpt", 1, now + 10)
+            .unwrap();
         assert!(replay.iter().any(|c| c.data.contains("line-1")));
         assert!(replay.iter().any(|c| c.data.contains("line-2-from-human")));
 
@@ -619,9 +802,11 @@ mod tests {
     #[test]
     fn resize_and_view_mode() {
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(SessionKind::Pty, "t", "a", 1, None);
-        mgr.resize(&ses.id, 120, 40).unwrap();
-        mgr.set_view_mode(&ses.id, PtyViewMode::Cooked).unwrap();
+        let now = 1i64;
+        let ses = mgr.open(SessionKind::Pty, "t", "a", now, None);
+        mgr.resize(&ses.id, "a", 120, 40, now).unwrap();
+        mgr.set_view_mode(&ses.id, "a", PtyViewMode::Cooked, now)
+            .unwrap();
         let info = mgr.get(&ses.id).unwrap();
         assert_eq!(info.cols, 120);
         assert_eq!(info.rows, 40);

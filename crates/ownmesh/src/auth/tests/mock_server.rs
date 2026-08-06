@@ -28,6 +28,12 @@ struct Inner {
     challenges: Mutex<HashMap<String, ChallengeRec>>,
     clients: Mutex<HashMap<String, Vec<String>>>,
     auto_approve_device: AtomicBool,
+    /// When set, `POST /oauth/revoke` returns 302 instead of RFC 7009 200.
+    revoke_redirect: AtomicBool,
+    /// Hits on the synthetic revoke redirect sink (must stay 0 if client refuses 3xx).
+    revoke_redirect_sink_hits: AtomicU64,
+    /// True if the sink observed a body containing `token=`.
+    revoke_redirect_sink_saw_token: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -105,6 +111,9 @@ impl MockControlPlane {
                 m
             }),
             auto_approve_device: AtomicBool::new(false),
+            revoke_redirect: AtomicBool::new(false),
+            revoke_redirect_sink_hits: AtomicU64::new(0),
+            revoke_redirect_sink_saw_token: AtomicBool::new(false),
         });
 
         let inner_clone = inner.clone();
@@ -143,6 +152,21 @@ impl MockControlPlane {
         self.inner.auto_approve_device.store(on, Ordering::SeqCst);
     }
 
+    /// Make `POST /oauth/revoke` answer with HTTP 302 to `/oauth/revoke-sink`.
+    pub fn set_revoke_redirect(&self, on: bool) {
+        self.inner.revoke_redirect.store(on, Ordering::SeqCst);
+    }
+
+    pub fn revoke_redirect_sink_hits(&self) -> u64 {
+        self.inner.revoke_redirect_sink_hits.load(Ordering::SeqCst)
+    }
+
+    pub fn revoke_redirect_sink_saw_token(&self) -> bool {
+        self.inner
+            .revoke_redirect_sink_saw_token
+            .load(Ordering::SeqCst)
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         // Tiny delay so the accept loop notices.
@@ -170,7 +194,26 @@ async fn handle_client(mut stream: TcpStream, inner: Arc<Inner>, base: &str) -> 
         ("POST", "/oauth/register") => handle_register(&inner, &body).await,
         ("GET", "/oauth/authorize") => handle_authorize(&inner, &url).await,
         ("POST", "/oauth/token") => handle_token(&inner, &headers, &body).await,
-        ("POST", "/oauth/revoke") => handle_revoke(&inner, &body).await,
+        ("POST", "/oauth/revoke") => {
+            if inner.revoke_redirect.load(Ordering::SeqCst) {
+                // Deliberate open-redirect style response: client must NOT follow
+                // with the token body to the sink.
+                redirect_response(&format!("{base}/oauth/revoke-sink"))
+            } else {
+                handle_revoke(&inner, &body).await
+            }
+        }
+        ("GET" | "POST", "/oauth/revoke-sink") => {
+            inner
+                .revoke_redirect_sink_hits
+                .fetch_add(1, Ordering::SeqCst);
+            if body.contains("token=") || path_q.contains("token=") {
+                inner
+                    .revoke_redirect_sink_saw_token
+                    .store(true, Ordering::SeqCst);
+            }
+            http_raw(200, "text/plain", b"sink")
+        }
         ("POST", "/oauth/device_authorization") => {
             handle_device_authorization(&inner, base, &body).await
         }

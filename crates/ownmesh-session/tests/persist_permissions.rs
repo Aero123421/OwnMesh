@@ -53,6 +53,47 @@ fn load_unreadable_path_returns_io_error() {
 }
 
 #[test]
+fn load_metadata_failure_does_not_become_empty_manager() {
+    let dir = tempdir().unwrap();
+    // Interior NUL makes both metadata and read fail, but is not a missing-file condition.
+    let path = dir.path().join("invalid\0sessions.json");
+
+    let err = load_manager(&path).expect_err("invalid paths must not be treated as missing");
+    match err {
+        PersistError::Io(msg) => assert!(!msg.is_empty(), "io message present"),
+        other => panic!("expected PersistError::Io, got {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn locked_replace_preserves_previous_session_snapshot() {
+    use ownmesh_session::SessionKind;
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("sessions.json");
+    save_manager(&path, &SessionManager::new()).unwrap();
+
+    let guard = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(&path)
+        .expect("exclusive destination lock");
+    let mut replacement = SessionManager::new();
+    replacement.open(SessionKind::Pty, "new", "owner", 1, None);
+    save_manager(&path, &replacement).expect_err("locked atomic replace must fail");
+    drop(guard);
+
+    assert!(
+        load_manager(&path).unwrap().list().is_empty(),
+        "failed replacement must preserve the previous snapshot"
+    );
+}
+
+#[test]
 fn save_to_unwritable_parent_returns_io_error() {
     let dir = tempdir().unwrap();
     // Nested under a path component that is a regular file → create_dir_all fails.
@@ -77,6 +118,20 @@ mod unix_permissions {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    fn operation_temps(path: &Path) -> Vec<std::path::PathBuf> {
+        let prefix = format!("{}.tmp.", path.file_name().unwrap().to_string_lossy());
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            })
+            .collect()
+    }
+
     #[test]
     fn save_sets_file_0600_and_parent_dir_0700() {
         let dir = tempdir().unwrap();
@@ -90,9 +145,8 @@ mod unix_permissions {
         assert_eq!(mode_of(&path), 0o600, "session file must be 0600");
         assert_eq!(mode_of(&parent), 0o700, "parent dir must be 0700");
 
-        // tmp sibling must not remain after successful rename.
-        let tmp = path.with_extension("tmp");
-        assert!(!tmp.exists(), "tmp file must be renamed away");
+        // No per-operation tmp sibling may remain after successful rename.
+        assert!(operation_temps(&path).is_empty());
     }
 
     #[test]
@@ -135,10 +189,10 @@ mod unix_permissions {
             other => panic!("expected PersistError::Io, got {other:?}"),
         }
 
-        let tmp = path.with_extension("tmp");
-        assert!(tmp.is_file(), "tmp should remain after failed rename");
+        let temps = operation_temps(&path);
+        assert_eq!(temps.len(), 1, "this operation's tmp should remain");
         assert_eq!(
-            mode_of(&tmp),
+            mode_of(&temps[0]),
             0o600,
             "tmp must be 0600 even when rename fails"
         );

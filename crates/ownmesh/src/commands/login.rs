@@ -9,7 +9,7 @@ use crate::cli::{Cli, LoginArgs};
 use ownmesh_domain::ExitCode;
 use serde_json::json;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Run `ownmesh login` (browser PKCE) or `ownmesh login --device`.
 pub fn run_login(cli: &Cli, args: &LoginArgs) -> Result<(), ExitCode> {
@@ -139,10 +139,30 @@ async fn logout_async(cli: &Cli) -> Result<(), ExitCode> {
     let session = session_paths.load_session().unwrap_or_default();
 
     // Best-effort remote revoke of refresh token.
+    // Never follow HTTP redirects: the refresh token must not be forwarded to a
+    // Location target. Revoke failure must not block local secret deletion.
     if !session.issuer.is_empty() {
         if let Ok(Some(rt)) = ownmesh_identity::load_human_refresh_token(&store) {
-            let http = reqwest::Client::new();
-            let _ = revoke_token(&http, &session.issuer, rt.expose()).await;
+            match reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .build()
+            {
+                Ok(http) => {
+                    if let Err(err) = revoke_token(&http, &session.issuer, rt.expose()).await {
+                        warn!(error = %err, "remote token revoke failed; continuing local logout");
+                        eprintln!(
+                            "warning: remote token revoke failed (local logout continues): {err}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "revoke HTTP client build failed; continuing local logout");
+                    eprintln!(
+                        "warning: could not build revoke HTTP client (local logout continues): {err}"
+                    );
+                }
+            }
         }
     }
 

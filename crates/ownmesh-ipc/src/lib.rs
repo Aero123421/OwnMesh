@@ -1,9 +1,11 @@
 //! OwnMesh local IPC transport (Named Pipe on Windows, Unix domain sockets elsewhere).
 //!
-//! Framing is 4-byte big-endian length + UTF-8 JSON-RPC 2.0. Peers authenticate with a
-//! daemon-issued token stored under the user runtime directory (OS ACL + application token).
+//! Framing is 4-byte big-endian length + UTF-8 JSON-RPC 2.0. Peers authenticate via
+//! **OS peer credentials** (Unix `SO_PEERCRED` / Windows named-pipe client PID+SID+exe)
+//! with optional server-managed per-client non-shared credentials. Shared
+//! `daemon.token` authentication is abolished. Self-reported HELLO `client_name`
+//! is never a trusted principal input.
 
-#![forbid(unsafe_code)]
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
@@ -21,8 +23,9 @@ mod server;
 mod transport;
 
 pub use auth::{
-    generate_token, read_token_file, redact_secrets, write_token_file, AuthGate, PeerCredential,
-    AUTH_TOKEN_FILE_NAME,
+    canonicalize_principal_key, current_os_user_id, generate_token, normalize_principal_part,
+    read_token_file, redact_secrets, write_token_file, AuthGate, ClientCredentialRecord,
+    OsPeerIdentity, PeerCredential, AUTH_TOKEN_FILE_NAME,
 };
 pub use client::{ClientIdentity, ClientOptions, IpcClient};
 pub use endpoint::{Endpoint, IpcBus};

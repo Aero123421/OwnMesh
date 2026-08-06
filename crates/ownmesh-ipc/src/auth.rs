@@ -1,21 +1,59 @@
-//! Peer authentication and ACL helpers for local IPC.
+//! Peer authentication and principal mapping for local IPC.
+//!
+//! Shared `daemon.token` authentication is **abolished**. The server authenticates
+//! peers from OS credentials (Unix `SO_PEERCRED` / Windows named-pipe client PID+SID+exe)
+//! and optionally from **server-managed, per-client, non-shared** credentials.
+//! Self-reported HELLO `client_name` is never a trusted principal input.
 
 use crate::error::{IpcError, IpcResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Filename used under the runtime directory for the daemon auth token.
+/// Filename historically used for the shared daemon auth token (legacy; not used for auth).
 pub const AUTH_TOKEN_FILE_NAME: &str = "daemon.token";
 
-/// Material presented by a connecting peer.
+/// OS-attested peer identity captured on the server accept path.
+///
+/// Never accept a client-supplied structure as a substitute for this value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsPeerIdentity {
+    /// Peer process id.
+    pub pid: u32,
+    /// OS user key (Unix uid decimal, or Windows SID / username).
+    pub user_id: String,
+    /// Best-effort absolute peer executable path (normalized).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_path: Option<String>,
+}
+
+impl OsPeerIdentity {
+    /// Build the canonical, stable principal key used for ACL and revocation.
+    ///
+    /// The default principal is the OS user key. Executable paths remain attested
+    /// metadata but are deliberately not identity-bearing: best-effort executable
+    /// lookup must not change authorization identity between reconnects. Process ids
+    /// are transient and likewise never become authorization identities.
+    #[must_use]
+    pub fn principal_key(&self) -> String {
+        canonicalize_principal_key(&format!("user:{}", self.user_id))
+    }
+}
+
+/// Material presented by a connecting peer (legacy shape retained for tests / redaction).
+///
+/// `token` and `client_name` are **not** trusted authentication inputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerCredential {
-    /// Shared secret issued by the daemon.
+    /// Legacy shared secret field — must be empty; non-empty values are rejected.
+    #[serde(default)]
     pub token: String,
-    /// Connecting client label.
+    /// Untrusted client label (ignored for principal mapping).
+    #[serde(default)]
     pub client_name: String,
     /// Optional OS user id when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,63 +61,395 @@ pub struct PeerCredential {
     /// Optional process id of the peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// Optional server-issued per-client credential (non-shared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_credential: Option<String>,
+}
+
+/// Server-side record for a non-shared client credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCredentialRecord {
+    /// Opaque secret presented at HELLO.
+    pub secret: String,
+    /// Principal key bound to this credential (server-assigned).
+    pub principal_key: String,
+    /// OS user id the credential is bound to at issuance.
+    pub bound_user_id: String,
 }
 
 /// Expected ACL material held by the daemon.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AuthGate {
-    expected_token: String,
-    /// When true, empty/missing tokens are rejected (default).
-    require_token: bool,
+    /// When empty, only `own_user_id` is accepted.
+    allowed_user_ids: Vec<String>,
+    /// Daemon process user id.
+    own_user_id: String,
+    /// Server-managed per-client credentials (secret → record).
+    credentials: Arc<RwLock<HashMap<String, ClientCredentialRecord>>>,
 }
 
 impl AuthGate {
-    /// Construct a gate with the expected shared token.
+    /// Construct a gate that accepts the current OS user (and optional allow-list).
     #[must_use]
-    pub fn new(expected_token: impl Into<String>) -> Self {
+    pub fn local_user() -> Self {
         Self {
-            expected_token: expected_token.into(),
-            require_token: true,
+            allowed_user_ids: Vec::new(),
+            own_user_id: current_os_user_id(),
+            credentials: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Validate a peer credential.
+    /// Construct a gate with an explicit own-user id (tests).
+    #[must_use]
+    pub fn for_user(own_user_id: impl Into<String>) -> Self {
+        Self {
+            allowed_user_ids: Vec::new(),
+            own_user_id: normalize_principal_part(&own_user_id.into()),
+            credentials: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Legacy constructor. Shared tokens are **not** used; this only seeds `own_user_id`.
+    ///
+    /// Kept so older call sites compile while migrating off `AuthGate::new(token)`.
+    #[deprecated(note = "shared daemon tokens are abolished; use AuthGate::local_user()")]
+    #[must_use]
+    pub fn new(_ignored_shared_token: impl Into<String>) -> Self {
+        Self::local_user()
+    }
+
+    /// Restrict accepted OS user ids (non-empty replace the default own-user policy).
+    #[must_use]
+    pub fn with_allowed_users(mut self, users: Vec<String>) -> Self {
+        self.allowed_user_ids = users
+            .into_iter()
+            .map(|user| normalize_principal_part(&user))
+            .collect();
+        self
+    }
+
+    /// Borrow the shared credential map (for daemon-side registration / diagnostics).
+    #[must_use]
+    pub fn credentials_handle(&self) -> Arc<RwLock<HashMap<String, ClientCredentialRecord>>> {
+        Arc::clone(&self.credentials)
+    }
+
+    /// Issue a server-managed, non-shared client credential bound to `bound_user_id`.
+    ///
+    /// The returned secret is the only copy the caller receives; it is not a shared daemon token.
+    pub fn issue_client_credential(
+        &self,
+        principal_key: impl Into<String>,
+        bound_user_id: impl Into<String>,
+    ) -> IpcResult<String> {
+        let principal_key = canonicalize_principal_key(&principal_key.into());
+        let bound_user_id = normalize_principal_part(&bound_user_id.into());
+        if principal_key.is_empty() || bound_user_id.is_empty() {
+            return Err(IpcError::Unauthorized(
+                "credential principal and bound OS user must be non-empty".into(),
+            ));
+        }
+        let secret = generate_token();
+        let record = ClientCredentialRecord {
+            secret: secret.clone(),
+            principal_key,
+            bound_user_id,
+        };
+        let mut guard = self
+            .credentials
+            .write()
+            .map_err(|_| IpcError::Unauthorized("credential store lock poisoned".into()))?;
+        guard.insert(secret.clone(), record);
+        Ok(secret)
+    }
+
+    /// Validate OS peer identity (user allow-list / own user).
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::Unauthorized`] when the token does not match.
-    pub fn verify(&self, peer: &PeerCredential) -> IpcResult<()> {
-        if !self.require_token {
-            return Ok(());
-        }
-        if peer.token.is_empty() {
+    /// Returns [`IpcError::Unauthorized`] when the peer user is not permitted.
+    pub fn verify_os_peer(&self, peer: &OsPeerIdentity) -> IpcResult<()> {
+        let peer_user = normalize_principal_part(&peer.user_id);
+        if peer_user.is_empty() {
             return Err(IpcError::Unauthorized(
-                "missing ipc authentication token".into(),
+                "missing OS peer user identity".into(),
             ));
         }
-        if peer.token != self.expected_token {
-            return Err(IpcError::Unauthorized(
-                "ipc authentication token mismatch".into(),
-            ));
-        }
-        if peer.client_name.trim().is_empty() {
-            return Err(IpcError::Unauthorized("missing client_name".into()));
+        let allowed = if self.allowed_user_ids.is_empty() {
+            peer_user == self.own_user_id
+        } else {
+            self.allowed_user_ids.iter().any(|u| u == &peer_user)
+        };
+        if !allowed {
+            return Err(IpcError::Unauthorized(format!(
+                "OS peer user '{}' is not permitted",
+                peer.user_id
+            )));
         }
         Ok(())
     }
 
-    /// Borrow the expected token (for tests / diagnostics; do not log).
+    /// Map an authenticated OS peer (+ optional server-issued credential) to a principal key.
+    ///
+    /// Shared `token` values are rejected. Self-reported `client_name` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::Unauthorized`] on failed OS checks, disabled shared tokens,
+    /// or unknown / mismatched client credentials.
+    pub fn resolve_principal(
+        &self,
+        os_peer: &OsPeerIdentity,
+        presented: &PeerCredential,
+    ) -> IpcResult<String> {
+        self.verify_os_peer(os_peer)?;
+
+        // Shared daemon.token path is explicitly disabled.
+        if !presented.token.trim().is_empty() {
+            return Err(IpcError::Unauthorized(
+                "shared daemon.token authentication is disabled; OS peer credentials are required"
+                    .into(),
+            ));
+        }
+
+        if let Some(secret) = presented
+            .client_credential
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let guard = self
+                .credentials
+                .read()
+                .map_err(|_| IpcError::Unauthorized("credential store lock poisoned".into()))?;
+            let Some(record) = guard.get(secret) else {
+                return Err(IpcError::Unauthorized("unknown client credential".into()));
+            };
+            if normalize_principal_part(&record.bound_user_id)
+                != normalize_principal_part(&os_peer.user_id)
+            {
+                return Err(IpcError::Unauthorized(
+                    "client credential is not bound to this OS peer user".into(),
+                ));
+            }
+            return Ok(canonicalize_principal_key(&record.principal_key));
+        }
+
+        // Default: principal is derived solely from OS peer credentials.
+        Ok(os_peer.principal_key())
+    }
+
+    /// Legacy verify entry used by older unit tests — now enforces token abolition + OS mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns unauthorized when the legacy shared token is present or OS identity is missing.
+    pub fn verify(&self, peer: &PeerCredential) -> IpcResult<()> {
+        if !peer.token.trim().is_empty() {
+            return Err(IpcError::Unauthorized(
+                "shared daemon.token authentication is disabled".into(),
+            ));
+        }
+        let os_peer = OsPeerIdentity {
+            pid: peer.pid.unwrap_or(0),
+            user_id: peer
+                .os_user_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| self.own_user_id.clone()),
+            exe_path: None,
+        };
+        let _ = self.resolve_principal(&os_peer, peer)?;
+        Ok(())
+    }
+
+    /// Own user id used when the allow-list is empty.
     #[must_use]
-    pub fn token(&self) -> &str {
-        &self.expected_token
+    pub fn own_user_id(&self) -> &str {
+        &self.own_user_id
     }
 }
 
-/// Generate a high-entropy auth token (hex).
+/// Normalize a principal key component (case-fold + trim + path separators and aliases).
+#[must_use]
+pub fn normalize_principal_part(raw: &str) -> String {
+    normalize_path_aliases(
+        &raw.trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .replace('\\', "/")
+            .to_ascii_lowercase(),
+    )
+}
+
+/// Canonicalize a complete principal key for issuance, revocation, persistence, and checks.
+///
+/// Legacy process-scoped `user:<id>:exe:<path>` and `user:<id>:pid:<n>` keys collapse
+/// to the stable `user:<id>` principal. Opaque server-issued principal names are still
+/// case-folded and normalized consistently.
+#[must_use]
+pub fn canonicalize_principal_key(raw: &str) -> String {
+    let mut normalized = raw
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    // Whitespace around structural separators is never identity-bearing.
+    while normalized.contains(" :") || normalized.contains(": ") {
+        normalized = normalized.replace(" :", ":").replace(": ", ":");
+    }
+
+    if let Some(rest) = normalized.strip_prefix("user:") {
+        // Migrate every legacy process-scoped spelling to the stable user principal.
+        // Choose the earliest marker so a crafted exe path containing `:pid:` (or vice
+        // versa) cannot preserve a process-scoped alias and bypass a stored revocation.
+        let legacy_suffix = [rest.find(":exe:"), rest.find(":pid:")]
+            .into_iter()
+            .flatten()
+            .min();
+        let user = normalize_principal_part(
+            legacy_suffix.map_or(rest, |suffix_start| &rest[..suffix_start]),
+        );
+        return if user.is_empty() {
+            String::new()
+        } else {
+            format!("user:{user}")
+        };
+    }
+
+    normalize_principal_part(&normalized)
+}
+
+fn normalize_path_aliases(raw: &str) -> String {
+    if raw.is_empty() || !raw.contains('/') {
+        return raw.to_owned();
+    }
+    let drive_root = raw.as_bytes().get(1) == Some(&b':') && raw.as_bytes().get(2) == Some(&b'/');
+    let absolute = raw.starts_with('/') || drive_root;
+    let double_slash = raw.starts_with("//");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                let at_drive_root = drive_root && parts.len() == 1;
+                if !at_drive_root && parts.last().is_some_and(|last| *last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push(part);
+                }
+            }
+            _ => parts.push(part),
+        }
+    }
+    let body = parts.join("/");
+    if double_slash {
+        format!("//{body}")
+    } else if absolute && !drive_root {
+        format!("/{body}")
+    } else {
+        body
+    }
+}
+
+/// Current process OS user key (Unix uid or Windows username).
+#[must_use]
+pub fn current_os_user_id() -> String {
+    #[cfg(unix)]
+    {
+        format!("{}", rustix::process::getuid().as_raw())
+    }
+    #[cfg(windows)]
+    {
+        // Match named-pipe peer attribution exactly. Environment usernames are
+        // self-process configuration, not an OS-attested identity.
+        unsafe { current_windows_user_sid() }.unwrap_or_default()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Unsupported platforms must fail OS-user verification rather than inventing
+        // a reconnect-unstable PID identity.
+        String::new()
+    }
+}
+
+#[cfg(windows)]
+unsafe fn current_windows_user_sid() -> Option<String> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token: HANDLE = ptr::null_mut();
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 || token.is_null() {
+        return None;
+    }
+    let result = (|| {
+        let mut required = 0_u32;
+        let _ = GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut required);
+        let required = usize::try_from(required).ok()?;
+        let element_size = size_of::<TOKEN_USER>();
+        if required < element_size {
+            return None;
+        }
+        let elements = required.checked_add(element_size - 1)? / element_size;
+        // `TOKEN_USER` has pointer alignment. A byte Vec does not guarantee it, so
+        // retain aligned, uninitialized TOKEN_USER slots for the variable-size result.
+        let mut buffer: Vec<MaybeUninit<TOKEN_USER>> = Vec::new();
+        buffer.try_reserve_exact(elements).ok()?;
+        buffer.resize_with(elements, MaybeUninit::uninit);
+        let buffer_bytes = buffer.len().checked_mul(element_size)?;
+        let query_len = u32::try_from(required).ok()?;
+        let mut returned = query_len;
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            query_len,
+            &mut returned,
+        ) == 0
+        {
+            return None;
+        }
+        let returned = usize::try_from(returned).ok()?;
+        if returned < element_size || returned > required || returned > buffer_bytes {
+            return None;
+        }
+        let token_user = buffer.first()?.assume_init_ref();
+        let sid = token_user.User.Sid;
+        if sid.is_null() {
+            return None;
+        }
+        let buffer_start = buffer.as_ptr() as usize;
+        let sid_start = sid as usize;
+        let sid_offset = sid_start.checked_sub(buffer_start)?;
+        // A SID header is 8 bytes before its variable u32 sub-authorities. Check
+        // that header before asking Windows APIs to inspect the returned pointer.
+        let sid_remaining = returned.checked_sub(sid_offset)?;
+        if sid_remaining < 8 {
+            return None;
+        }
+        let sub_authorities = usize::from(*sid.cast::<u8>().add(1));
+        let sid_len = 8_usize.checked_add(sub_authorities.checked_mul(4)?)?;
+        if sid_len > sid_remaining || IsValidSid(sid) == 0 || GetLengthSid(sid) as usize != sid_len
+        {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(sid.cast::<u8>(), sid_len);
+        Some(format!("sid:{}", hex_encode(bytes)))
+    })();
+    let _ = CloseHandle(token);
+    result
+}
+
+/// Generate a high-entropy secret (hex). Used for per-client credentials, not shared tokens.
 #[must_use]
 pub fn generate_token() -> String {
     let mut raw = [0_u8; 32];
-    // Prefer OS randomness via UUID clock + process entropy mix without extra deps.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -92,7 +462,6 @@ pub fn generate_token() -> String {
             .wrapping_add(idx as u128 * 0xA24B_AED4_96E9_23FD);
         *slot = (mix ^ (mix >> 8) ^ (mix >> 16)) as u8;
     }
-    // Overlay with uuid bytes for stronger uniqueness.
     let u = uuid::Uuid::new_v4();
     for (dst, src) in raw.iter_mut().zip(u.as_bytes().iter().cycle()) {
         *dst ^= *src;
@@ -100,7 +469,7 @@ pub fn generate_token() -> String {
     hex_encode(&raw)
 }
 
-/// Persist the daemon token into `runtime_dir/daemon.token` with restrictive permissions.
+/// Persist a legacy token file (disabled auth path). Retained for migration cleanup tests.
 ///
 /// # Errors
 ///
@@ -120,7 +489,7 @@ pub fn write_token_file(runtime_dir: &Path, token: &str) -> IpcResult<PathBuf> {
     Ok(path)
 }
 
-/// Read a previously written token file.
+/// Read a previously written legacy token file.
 ///
 /// # Errors
 ///
@@ -130,7 +499,7 @@ pub fn read_token_file(runtime_dir: &Path) -> IpcResult<String> {
     let raw = fs::read_to_string(&path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             IpcError::Disconnected(format!(
-                "daemon token not found at {} (is ownmeshd running?)",
+                "daemon token not found at {} (shared tokens are disabled; is ownmeshd running?)",
                 path.display()
             ))
         } else {
@@ -144,7 +513,7 @@ pub fn read_token_file(runtime_dir: &Path) -> IpcResult<String> {
     Ok(token)
 }
 
-/// Best-effort restrictive mode for token / socket files.
+/// Best-effort restrictive mode for sensitive files.
 fn restrict_file_mode(path: &Path) -> IpcResult<()> {
     #[cfg(unix)]
     {
@@ -154,8 +523,6 @@ fn restrict_file_mode(path: &Path) -> IpcResult<()> {
     }
     #[cfg(windows)]
     {
-        // Named-pipe ACL is enforced on the pipe itself; the token file inherits the
-        // user profile ACL. No extra chmod equivalent is required here.
         let _ = path;
     }
     Ok(())
@@ -201,15 +568,134 @@ mod tests {
     }
 
     #[test]
-    fn auth_gate_rejects_bad_token() {
-        let gate = AuthGate::new("correct-token");
+    fn auth_gate_rejects_shared_token() {
+        let gate = AuthGate::local_user();
         let bad = PeerCredential {
-            token: "wrong".into(),
+            token: "any-shared-token".into(),
             client_name: "ownmesh".into(),
-            os_user_id: None,
-            pid: None,
+            os_user_id: Some(gate.own_user_id().into()),
+            pid: Some(1),
+            client_credential: None,
         };
         let err = gate.verify(&bad).unwrap_err();
+        assert_eq!(err.code(), "ipc_unauthorized");
+    }
+
+    #[test]
+    fn principal_from_os_peer_ignores_client_name() {
+        let gate = AuthGate::for_user("1000");
+        let os = OsPeerIdentity {
+            pid: 42,
+            user_id: "1000".into(),
+            exe_path: Some("/usr/bin/ownmesh".into()),
+        };
+        let a = PeerCredential {
+            token: String::new(),
+            client_name: "admin".into(),
+            os_user_id: None,
+            pid: None,
+            client_credential: None,
+        };
+        let b = PeerCredential {
+            token: String::new(),
+            client_name: "root".into(),
+            os_user_id: None,
+            pid: None,
+            client_credential: None,
+        };
+        let pa = gate.resolve_principal(&os, &a).unwrap();
+        let pb = gate.resolve_principal(&os, &b).unwrap();
+        assert_eq!(pa, pb);
+        assert_eq!(pa, os.principal_key());
+        assert!(!pa.contains("admin"));
+        assert!(!pa.contains("root"));
+    }
+
+    #[test]
+    fn per_client_credential_maps_principal() {
+        let gate = AuthGate::for_user("alice");
+        let secret = gate
+            .issue_client_credential("  Agent-ChatGPT  ", " ALICE ")
+            .unwrap();
+        let os = OsPeerIdentity {
+            pid: 7,
+            user_id: "alice".into(),
+            exe_path: Some("C:/ownmesh.exe".into()),
+        };
+        let presented = PeerCredential {
+            token: String::new(),
+            client_name: "ignored-label".into(),
+            os_user_id: None,
+            pid: None,
+            client_credential: Some(secret),
+        };
+        let principal = gate.resolve_principal(&os, &presented).unwrap();
+        assert_eq!(principal, "agent-chatgpt");
+    }
+
+    #[test]
+    fn legacy_process_scoped_principals_collapse_to_stable_user() {
+        for legacy in [
+            r#"  USER : ALICE : EXE : "C:\OwnMesh\bin\..\ownmesh.exe"  "#,
+            "user:alice:exe:c:/ownmesh/ownmesh.exe",
+            "USER:Alice:PID:12345",
+            "user:alice:exe:c:/crafted:pid:99",
+            "user:alice:pid:99:exe:c:/crafted",
+        ] {
+            assert_eq!(canonicalize_principal_key(legacy), "user:alice", "{legacy}");
+        }
+    }
+
+    #[test]
+    fn missing_executable_principal_is_stable_and_never_pid_based() {
+        let a = OsPeerIdentity {
+            pid: 10,
+            user_id: " Alice ".into(),
+            exe_path: None,
+        };
+        let b = OsPeerIdentity {
+            pid: 99_999,
+            user_id: "alice".into(),
+            exe_path: Some("   ".into()),
+        };
+        assert_eq!(a.principal_key(), "user:alice");
+        assert_eq!(a.principal_key(), b.principal_key());
+        assert!(!a.principal_key().contains("pid"));
+        assert_eq!(
+            canonicalize_principal_key("USER:Alice:PID:12345"),
+            "user:alice"
+        );
+    }
+
+    #[test]
+    fn credential_rejected_for_other_os_user() {
+        let gate = AuthGate::for_user("alice");
+        let secret = gate
+            .issue_client_credential("agent-chatgpt", "alice")
+            .unwrap();
+        let os = OsPeerIdentity {
+            pid: 7,
+            user_id: "bob".into(),
+            exe_path: None,
+        };
+        let presented = PeerCredential {
+            token: String::new(),
+            client_name: String::new(),
+            os_user_id: None,
+            pid: None,
+            client_credential: Some(secret),
+        };
+        // bob is not allowed by gate either; ensure credential path fails closed.
+        let gate_bob = AuthGate::for_user("bob");
+        // Move credential store is not shared — re-issue on bob gate with alice binding.
+        let secret2 = gate_bob
+            .issue_client_credential("agent-chatgpt", "alice")
+            .unwrap();
+        let presented2 = PeerCredential {
+            client_credential: Some(secret2),
+            ..presented
+        };
+        let err = gate_bob.resolve_principal(&os, &presented2).unwrap_err();
         assert_eq!(err.code(), "ipc_unauthorized");
     }
 

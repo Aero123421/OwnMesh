@@ -54,7 +54,7 @@ pub mod methods {
     pub const DAEMON_LOCKDOWN: &str = "daemon.lockdown";
     /// Lift lockdown.
     pub const DAEMON_UNLOCK: &str = "daemon.unlock";
-    /// Revoke a local token / client label.
+    /// Revoke a principal / client credential mapping.
     pub const TOKEN_REVOKE: &str = "token.revoke";
 }
 
@@ -214,15 +214,24 @@ impl RpcResponse {
 }
 
 /// Parameters for `ipc.hello`.
+///
+/// Self-reported `client_name` is **untrusted** and never becomes the principal.
+/// Shared `token` is rejected when non-empty (path abolished).
+/// Optional `client_credential` is a server-issued, non-shared secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloParams {
-    /// Shared daemon token from the runtime directory.
+    /// Legacy shared daemon token — must be absent/empty (rejected otherwise).
+    #[serde(default)]
     pub token: String,
-    /// Client process label (`ownmesh`, `ownmesh-tui`, …).
+    /// Untrusted client label (ignored for principal mapping / revocation).
+    #[serde(default)]
     pub client_name: String,
     /// Optional client version string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// Optional server-issued per-client credential (non-shared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_credential: Option<String>,
 }
 
 /// Successful hello acknowledgement.
@@ -234,6 +243,9 @@ pub struct HelloResult {
     pub server_version: String,
     /// Authenticated peer accepted.
     pub authenticated: bool,
+    /// Server-assigned principal key (from OS peer / credential mapping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 /// Daemon status payload returned by `daemon.status`.

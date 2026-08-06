@@ -5,9 +5,10 @@ use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
 use ownmesh_identity::{load_or_create_device_key, PreferredSecretStore, DEFAULT_KEYCHAIN_SERVICE};
 use ownmesh_ipc::{
-    generate_token, write_token_file, AuthGate, ClientIdentity, ClientOptions, Endpoint, IpcBus,
-    IpcClient, IpcServer, MethodHandler, ServerConfig,
+    AuthGate, ClientIdentity, ClientOptions, Endpoint, IpcBus, IpcClient, IpcServer, LocalListener,
+    MethodHandler, ServerConfig,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -47,22 +48,36 @@ async fn run_async() -> Result<(), ExitCode> {
     // Public fingerprint only — never log key material.
     tracing::info!(fingerprint = %public.fingerprint, "device identity ready");
 
-    let token = generate_token();
-    write_token_file(&paths.runtime_dir, &token).map_err(|err| {
-        tracing::error!(error = %err, "failed to write daemon token");
-        ExitCode::Internal
-    })?;
+    // Shared daemon.token authentication is abolished. OS peer credentials
+    // (and optional server-managed per-client credentials) authenticate peers.
+    // Remove any legacy token file so it cannot be mistaken for an auth path.
+    let legacy_token = paths.runtime_dir.join(ownmesh_ipc::AUTH_TOKEN_FILE_NAME);
+    match remove_legacy_token(&legacy_token) {
+        Ok(true) => tracing::info!("removed legacy shared daemon.token (auth path disabled)"),
+        Ok(false) => {}
+        Err(err) => {
+            tracing::error!(
+                path = %legacy_token.display(),
+                error = %err,
+                "failed to remove legacy shared daemon.token; refusing startup"
+            );
+            return Err(ExitCode::Internal);
+        }
+    }
 
     let (handler, revoked) = build_handler(&paths).map_err(|err| {
         tracing::error!(error = %err, "runtime bootstrap failed");
         ExitCode::Internal
     })?;
 
-    let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+    let (endpoint, auth) = service_endpoint_and_auth(&paths, &cfg).map_err(|err| {
+        tracing::error!(error = %err, "service socket configuration failed (fail-closed)");
+        ExitCode::UsageConfig
+    })?;
     let server = Arc::new(IpcServer::new(
         ServerConfig::new(
             endpoint.clone(),
-            AuthGate::new(token),
+            auth,
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION"),
         )
@@ -87,12 +102,75 @@ async fn run_async() -> Result<(), ExitCode> {
     Ok(())
 }
 
+fn remove_legacy_token(path: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn build_handler(
     paths: &OwnMeshPaths,
 ) -> Result<(MethodHandler, ownmesh_ipc::RevokedClients), String> {
     let runtime = DaemonRuntime::open(paths)?;
     let revoked = runtime.revoked_clients_handle();
     Ok((runtime_handler(Arc::new(Mutex::new(runtime))), revoked))
+}
+
+/// Resolve the daemon IPC endpoint + AuthGate from `config.service_socket`.
+///
+/// Applies Unix socket owner/group/mode via [`LocalListener::configure_unix_security`]
+/// (fail-closed). `allowed_uids` is enforced both at accept (transport) and AuthGate.
+fn service_endpoint_and_auth(
+    paths: &OwnMeshPaths,
+    cfg: &ownmesh_config::OwnMeshConfig,
+) -> Result<(Endpoint, AuthGate), String> {
+    let sock = &cfg.service_socket;
+    let endpoint = if let Some(path) = sock
+        .path
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let pb = PathBuf::from(path);
+        #[cfg(unix)]
+        {
+            Endpoint::UnixSocket(pb)
+        }
+        #[cfg(windows)]
+        {
+            // Named pipe path override: treat as pipe name when it looks like one.
+            let name = pb.to_string_lossy().into_owned();
+            if name.starts_with(r"\\.\pipe\") || name.starts_with("pipe:") {
+                Endpoint::NamedPipe(name.trim_start_matches("pipe:").to_string())
+            } else {
+                Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon)
+            }
+        }
+    } else {
+        Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon)
+    };
+
+    // Privilege boundary for Unix domain sockets (no-op security clear on Windows).
+    LocalListener::configure_unix_security(
+        sock.owner_uid(),
+        sock.group_gid(),
+        Some(sock.mode_bits()),
+        sock.allowed_uids.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut auth = AuthGate::local_user();
+    if !sock.allowed_uids.is_empty() {
+        auth = auth.with_allowed_users(
+            sock.allowed_uids
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+        );
+    }
+    Ok((endpoint, auth))
 }
 
 fn ensure_device_identity(
@@ -185,8 +263,9 @@ pub async fn start_test_daemon(
     Arc<Mutex<DaemonRuntime>>,
 ) {
     paths.ensure_layout().unwrap();
-    let token = generate_token();
-    write_token_file(&paths.runtime_dir, &token).unwrap();
+    // Remove legacy shared token if a prior test left one behind.
+    let legacy = paths.runtime_dir.join(ownmesh_ipc::AUTH_TOKEN_FILE_NAME);
+    remove_legacy_token(&legacy).expect("legacy daemon.token cleanup must succeed");
     let runtime = DaemonRuntime::open(paths).expect("runtime");
     let revoked = runtime.revoked_clients_handle();
     let runtime = Arc::new(Mutex::new(runtime));
@@ -195,7 +274,7 @@ pub async fn start_test_daemon(
     let server = Arc::new(IpcServer::new(
         ServerConfig::new(
             endpoint.clone(),
-            AuthGate::new(token),
+            AuthGate::local_user(),
             "ownmeshd",
             env!("CARGO_PKG_VERSION"),
         )
@@ -218,16 +297,40 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
+    #[test]
+    fn legacy_token_cleanup_failure_is_reported_fail_closed() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join(ownmesh_ipc::AUTH_TOKEN_FILE_NAME);
+        std::fs::create_dir(&legacy).unwrap();
+        let err = remove_legacy_token(&legacy).expect_err("directory cannot be removed as token");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            legacy.exists(),
+            "failed cleanup artifact must still be visible"
+        );
+    }
+
+    #[test]
+    fn legacy_token_cleanup_reports_absence_without_false_success() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join(ownmesh_ipc::AUTH_TOKEN_FILE_NAME);
+        assert!(!remove_legacy_token(&legacy).unwrap());
+        std::fs::write(&legacy, b"obsolete").unwrap();
+        assert!(remove_legacy_token(&legacy).unwrap());
+        assert!(!legacy.exists());
+    }
+
     fn test_client(endpoint: Endpoint, runtime_dir: impl Into<std::path::PathBuf>) -> IpcClient {
-        named_client(endpoint, runtime_dir, "ownmesh")
+        named_client(endpoint, runtime_dir, "ownmesh", None)
     }
 
     fn named_client(
         endpoint: Endpoint,
         runtime_dir: impl Into<std::path::PathBuf>,
         name: &str,
+        credential: Option<String>,
     ) -> IpcClient {
-        IpcClient::new(
+        let client = IpcClient::new(
             endpoint,
             runtime_dir,
             ClientIdentity::new(name, "0.1.0"),
@@ -236,7 +339,11 @@ mod tests {
                 max_reconnect_attempts: 3,
                 reconnect_base_delay: Duration::from_millis(30),
             },
-        )
+        );
+        match credential {
+            Some(c) => client.with_client_credential(c),
+            None => client,
+        }
     }
 
     #[tokio::test]
@@ -264,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthenticated_process_is_rejected() {
+    async fn shared_token_process_is_rejected() {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
         let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
@@ -300,7 +407,6 @@ mod tests {
         let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
         let client = test_client(endpoint, paths.runtime_dir.clone());
 
-        // Full Access: allow exec without ask.
         {
             let mut g = runtime.lock().await;
             g.set_policy_for_test(preset_document(AccessPreset::FullAccess));
@@ -326,7 +432,6 @@ mod tests {
             .unwrap_or("")
             .contains("policy-allow"));
 
-        // Write + read under Full Access.
         let wrote = client
             .call(
                 methods::OPS_FS_WRITE,
@@ -345,7 +450,6 @@ mod tests {
             .expect("fs read");
         assert_eq!(read["result"]["content"], "hi-fs");
 
-        // Logs readable.
         let logs = client
             .call(
                 methods::OPS_LOGS_QUERY,
@@ -356,7 +460,6 @@ mod tests {
         assert_eq!(logs["approval_required"], false);
         assert!(logs["result"]["lines"].as_array().is_some());
 
-        // Custom deny for command.run
         {
             let mut g = runtime.lock().await;
             g.set_policy_for_test(PolicyDocument {
@@ -393,7 +496,6 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        // Ask on filesystem.write
         {
             let mut g = runtime.lock().await;
             g.set_policy_for_test(PolicyDocument {
@@ -481,7 +583,6 @@ mod tests {
         assert_eq!(approved["result"]["bytes_written"], 13);
         assert!(marker.exists(), "must execute after approval");
 
-        // Temporary grant should allow subsequent write without ask.
         let second = client
             .call(
                 methods::OPS_FS_WRITE,
@@ -551,7 +652,6 @@ mod tests {
             .expect("second");
         assert_eq!(second["replayed"], true);
         assert_eq!(first["result"]["stdout"], second["result"]["stdout"]);
-        // operation_id from first completion is preserved in journal body
         assert_eq!(first["operation_id"], second["operation_id"]);
 
         server.request_shutdown();
@@ -584,8 +684,6 @@ mod tests {
         assert_eq!(validated["ok"], true);
         assert_eq!(validated["full_access_no_hidden_deny"], true);
 
-        // Elevated raw shell is still *policy-allowed* under Full Access (no hidden deny).
-        // Actual elevated execution is fail-closed without a broker (covered separately).
         let elevated = client
             .call(
                 methods::POLICY_EXPLAIN,
@@ -643,7 +741,6 @@ mod tests {
             });
         }
 
-        // Client claims structured, but server must reclassify shell+flag as raw_shell.
         #[cfg(windows)]
         let (program, args) = ("cmd.exe", vec!["/C", "echo disguise"]);
         #[cfg(not(windows))]
@@ -669,7 +766,6 @@ mod tests {
             other => panic!("unexpected error: {other:?}"),
         }
 
-        // Non-shell structured still allowed under the same policy.
         #[cfg(not(windows))]
         {
             let allowed = client
@@ -689,7 +785,6 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // Flag-less non-shell binary stays structured and is allowed.
             let allowed = client
                 .call(
                     methods::OPS_EXEC,
@@ -717,7 +812,6 @@ mod tests {
         let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
         let client = test_client(endpoint, paths.runtime_dir.clone());
 
-        // Policy allows elevated; execution must still fail closed without broker.
         {
             let mut g = runtime.lock().await;
             g.set_policy_for_test(preset_document(AccessPreset::FullAccess));
@@ -760,7 +854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lockdown_unlock_and_token_revoke() {
+    async fn lockdown_unlock_and_principal_revoke() {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
         let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
@@ -789,7 +883,6 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // Local recovery path still works.
         client
             .call(methods::DAEMON_UNLOCK, None)
             .await
@@ -813,16 +906,15 @@ mod tests {
             .expect("after unlock");
         assert_eq!(ok["approval_required"], false);
 
-        // Connect as chatgpt *before* revoke so we can prove mid-connection deny.
-        let chatgpt = IpcClient::new(
+        // Distinct principal via server-managed non-shared credential.
+        let chatgpt_cred = server
+            .issue_client_credential("chatgpt")
+            .expect("issue chatgpt cred");
+        let chatgpt = named_client(
             endpoint.clone(),
             paths.runtime_dir.clone(),
-            ClientIdentity::new("chatgpt", "0.1.0"),
-            ClientOptions {
-                request_timeout: Duration::from_secs(5),
-                max_reconnect_attempts: 0,
-                reconnect_base_delay: Duration::from_millis(10),
-            },
+            "label-chatgpt",
+            Some(chatgpt_cred),
         );
         chatgpt.status().await.expect("chatgpt pre-revoke status");
 
@@ -833,7 +925,6 @@ mod tests {
         assert_eq!(revoked["revoked"], "chatgpt");
         assert_eq!(revoked["ok"], true);
 
-        // Live authenticated connection: subsequent dispatch must be denied.
         let live_err = chatgpt
             .call(methods::POLICY_SHOW, None)
             .await
@@ -843,7 +934,6 @@ mod tests {
             other => panic!("unexpected live err: {other:?}"),
         }
 
-        // Fresh hello after revoke must also fail.
         chatgpt.disconnect().await;
         let hello_err = chatgpt
             .status()
@@ -854,7 +944,6 @@ mod tests {
             other => panic!("unexpected hello err: {other:?}"),
         }
 
-        // Persistence: restart runtime sees the same revoke set.
         drop(chatgpt);
         server.request_shutdown();
         let _ = handle.await;
@@ -874,8 +963,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
         let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
-        let chatgpt = named_client(endpoint.clone(), paths.runtime_dir.clone(), "chatgpt");
-        let human = named_client(endpoint, paths.runtime_dir.clone(), "human");
+
+        let chatgpt_cred = server.issue_client_credential("chatgpt").unwrap();
+        let human_cred = server.issue_client_credential("human").unwrap();
+        let stranger_cred = server.issue_client_credential("stranger").unwrap();
+
+        let chatgpt = named_client(
+            endpoint.clone(),
+            paths.runtime_dir.clone(),
+            "label-chatgpt",
+            Some(chatgpt_cred),
+        );
+        let human = named_client(
+            endpoint.clone(),
+            paths.runtime_dir.clone(),
+            "label-human",
+            Some(human_cred),
+        );
 
         let opened = chatgpt
             .call(
@@ -890,7 +994,6 @@ mod tests {
         let sid = opened["id"].as_str().unwrap().to_owned();
         assert_eq!(opened["controller"]["principal_id"], "chatgpt");
 
-        // Spoofed principal must be rejected.
         let spoof = chatgpt
             .call(
                 session_methods::CLAIM,
@@ -917,7 +1020,6 @@ mod tests {
             .await
             .expect("push");
 
-        // Spoofed from rejected; authenticated from is bound automatically.
         let spoof_from = chatgpt
             .call(
                 session_methods::GIVE,
@@ -949,7 +1051,6 @@ mod tests {
         assert!(readers.iter().any(|r| r == "chatgpt"));
         assert!(readers.iter().any(|r| r == "human"));
 
-        // Observer (chatgpt) can still replay output.
         let replay = chatgpt
             .call(
                 session_methods::REPLAY,
@@ -966,7 +1067,6 @@ mod tests {
             .unwrap_or("")
             .contains("hello from agent")));
 
-        // Observer cannot write stdin.
         let denied = chatgpt
             .call(
                 session_methods::WRITE,
@@ -982,8 +1082,6 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        // Human must attach/claim before controller ops if not yet joined — give already
-        // set controller to human, so human identity can write immediately.
         let wrote = human
             .call(
                 session_methods::WRITE,
@@ -996,11 +1094,11 @@ mod tests {
             .expect("controller write");
         assert_eq!(wrote["accepted"], true);
 
-        // Unrelated client cannot show/list the session.
         let stranger = named_client(
             server.config().endpoint.clone(),
             paths.runtime_dir.clone(),
-            "stranger",
+            "label-stranger",
+            Some(stranger_cred),
         );
         let denied_show = stranger
             .call(session_methods::SHOW, Some(json!({ "id": sid })))
@@ -1022,10 +1120,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
 
-        // Phase 1: live daemon writes session + handoff + output.
         let sid = {
             let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
-            let chatgpt = named_client(endpoint, paths.runtime_dir.clone(), "chatgpt");
+            let chatgpt_cred = server.issue_client_credential("chatgpt").unwrap();
+            let chatgpt = named_client(
+                endpoint,
+                paths.runtime_dir.clone(),
+                "label-chatgpt",
+                Some(chatgpt_cred),
+            );
             let opened = chatgpt
                 .call(
                     session_methods::OPEN,
@@ -1058,8 +1161,6 @@ mod tests {
             sid
         };
 
-        // Phase 2: simulate process restart by constructing a fresh runtime from disk
-        // (avoids Windows named-pipe first-instance races while proving persistence).
         let mut rt = DaemonRuntime::open(&paths).expect("reload runtime");
         let chatgpt_id = ClientIdentity::new("chatgpt", "0.1.0");
         let human_id = ClientIdentity::new("human", "0.1.0");
@@ -1096,7 +1197,6 @@ mod tests {
             .iter()
             .any(|c| c["data"].as_str().unwrap_or("").contains("before-restart")));
 
-        // Controller identity can show too; stranger cannot.
         rt.dispatch(session_methods::SHOW, Some(json!({ "id": sid })), &human_id)
             .await
             .expect("human show");
@@ -1144,12 +1244,10 @@ mod tests {
             g.set_policy_for_test(preset_document(AccessPreset::FullAccess));
         }
 
-        // Seed process log for the process provider.
         let process_log = paths.state_dir.join("logs").join("process.log");
         std::fs::create_dir_all(process_log.parent().unwrap()).unwrap();
         std::fs::write(&process_log, b"proc-line-1\nproc-line-2\n").unwrap();
 
-        // List providers — platform ids must be wired.
         let listed = client
             .call(ops_methods::LOGS_LIST_PROVIDERS, Some(json!({})))
             .await
@@ -1163,7 +1261,6 @@ mod tests {
         #[cfg(windows)]
         assert!(ids.contains(&"windows_event"), "{ids:?}");
 
-        // File (audit) provider still works under the same logs.read contract.
         let audit = client
             .call(
                 methods::OPS_LOGS_QUERY,
@@ -1174,7 +1271,6 @@ mod tests {
         assert_eq!(audit["approval_required"], false);
         assert!(audit["result"]["lines"].as_array().is_some());
 
-        // Process provider pages via shared cursor contract.
         let proc_page = client
             .call(
                 methods::OPS_LOGS_QUERY,
@@ -1212,7 +1308,6 @@ mod tests {
             assert!(elines.len() <= 2);
         }
 
-        // journald is registered; off-Linux query surfaces unavailable/params error.
         let journal = client
             .call(
                 methods::OPS_LOGS_QUERY,
@@ -1221,7 +1316,6 @@ mod tests {
             .await;
         #[cfg(target_os = "linux")]
         {
-            // May succeed or fail depending on journal access; must not be method-missing.
             match journal {
                 Ok(v) => assert_eq!(v["approval_required"], false),
                 Err(IpcError::Remote { code, .. }) => {
@@ -1246,7 +1340,6 @@ mod tests {
             }
         }
 
-        // Git fixture repo inside workspace.
         let ws = paths.state_dir.join("workspace");
         std::fs::create_dir_all(&ws).unwrap();
         assert!(Command::new("git")
@@ -1324,7 +1417,6 @@ mod tests {
             "{joined}"
         );
 
-        // Same contract: file read still works alongside new ops.
         client
             .call(
                 methods::OPS_FS_WRITE,
@@ -1346,8 +1438,6 @@ mod tests {
         let _ = handle.await;
     }
 
-    /// Prompt-injection / model-judgment text in operation payloads must never
-    /// bypass OwnMesh policy. Final enforcement is always the local policy engine.
     #[tokio::test]
     async fn prompt_injection_cannot_bypass_device_policy() {
         let dir = tempdir().unwrap();
@@ -1355,7 +1445,6 @@ mod tests {
         let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
         let client = test_client(endpoint, paths.runtime_dir.clone());
 
-        // Custom deny for command.run — injection text in args/program must not flip this.
         {
             let mut g = runtime.lock().await;
             g.set_policy_for_test(PolicyDocument {
@@ -1395,7 +1484,6 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        // Writes still require ask under Recommended even if content claims allow.
         {
             let mut g = runtime.lock().await;
             g.set_policy_for_test(preset_document(AccessPreset::Recommended));
@@ -1416,7 +1504,6 @@ mod tests {
             "injection content must not auto-allow writes: {ask}"
         );
         assert!(ask["approval_id"].as_str().unwrap().starts_with("apr_"));
-        // File must not exist until human approval.
         assert!(
             !paths
                 .state_dir

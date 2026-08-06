@@ -1,10 +1,19 @@
-//! Privileged broker boundary tests (harden-07 / sec-01).
+//! Privileged broker boundary tests (harden-07 / sec-01 / fix-2).
+
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments,
+    clippy::semicolon_if_nothing_returned,
+    clippy::single_match,
+    clippy::map_unwrap_or
+)]
 
 use ownmesh_broker::{enforce_bind_is_networkless, execute_verified, load_or_create_secret};
 use ownmesh_broker_client::{
     build_request, build_request_with_capability, compute_mac, default_broker_endpoint,
-    resolve_broker_endpoint, verify_request, BrokerEndpoint, BrokerRequest, BrokerSecret,
-    CapabilityToken, ElevatedCommand, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
+    resolve_broker_endpoint, verify_request, verify_request_mac, BrokerEndpoint, BrokerRequest,
+    BrokerSecret, CapabilitySigningKey, CapabilityToken, ElevatedCommand, PeerBind, ReplayCache,
+    ELEVATED_CAPABILITY_SCOPE,
 };
 use std::net::SocketAddr;
 use tempfile::tempdir;
@@ -14,6 +23,19 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn test_peer() -> PeerBind {
+    PeerBind::new(4242, 1000, "/usr/bin/ownmeshd")
+}
+
+fn test_keys() -> (
+    CapabilitySigningKey,
+    ownmesh_broker_client::CapabilityVerifyKey,
+) {
+    let sk = CapabilitySigningKey::generate();
+    let vk = sk.verify_key();
+    (sk, vk)
 }
 
 fn echo_cmd(arg: &str) -> ElevatedCommand {
@@ -36,6 +58,8 @@ fn echo_cmd(arg: &str) -> ElevatedCommand {
 
 fn signed_request(
     secret: &BrokerSecret,
+    sk: &CapabilitySigningKey,
+    peer: &PeerBind,
     caller: &str,
     op: &str,
     cmd: ElevatedCommand,
@@ -48,7 +72,8 @@ fn signed_request(
         op,
         cmd,
         Some(CapabilityToken::issue_for_operation(
-            secret,
+            sk,
+            peer,
             caller,
             ELEVATED_CAPABILITY_SCOPE,
             op,
@@ -104,10 +129,14 @@ fn default_and_resolved_endpoints_are_local_only() {
 }
 
 #[test]
-fn forged_mac_and_wrong_caller_rejected() {
+fn forged_mac_and_peer_mismatch_rejected() {
     let secret = BrokerSecret::generate();
+    let (sk, vk) = test_keys();
+    let peer = test_peer();
     let mut req = signed_request(
         &secret,
+        &sk,
+        &peer,
         "ownmeshd",
         "op_forge",
         echo_cmd("x"),
@@ -115,34 +144,47 @@ fn forged_mac_and_wrong_caller_rejected() {
         60,
     );
     req.mac = "00".repeat(32);
-    assert!(verify_request(&secret, &req, now_unix()).is_err());
+    assert!(verify_request(&secret, &vk, &req, &peer, now_unix()).is_err());
 
+    // Valid MAC + trusted principal label, but capability bound to a different peer.
     let mut replay = ReplayCache::new();
-    let good = signed_request(
+    let other = PeerBind::new(peer.pid + 7, peer.uid, peer.exe_path.clone());
+    let mismatched = signed_request(
         &secret,
-        "not-allowed",
+        &sk,
+        &other,
+        "ownmeshd",
         "op_unauth",
         echo_cmd("nope"),
         now_unix(),
         60,
     );
-    let resp = execute_verified(
+    let err = execute_verified(
         &secret,
+        &sk,
+        &vk,
         &mut replay,
-        &["ownmeshd".into()],
-        &good,
+        &mismatched,
+        &peer,
         now_unix(),
     )
-    .unwrap();
-    assert!(!resp.ok);
-    assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
+    .unwrap_err();
+    assert!(
+        err.to_ascii_lowercase().contains("unauthor")
+            || err.to_ascii_lowercase().contains("signature"),
+        "{err}"
+    );
 }
 
 #[test]
 fn replayed_nonce_rejected_even_with_valid_mac() {
     let secret = BrokerSecret::generate();
+    let (sk, vk) = test_keys();
+    let peer = test_peer();
     let req = signed_request(
         &secret,
+        &sk,
+        &peer,
         "ownmeshd",
         "op_replay",
         echo_cmd("once"),
@@ -150,26 +192,40 @@ fn replayed_nonce_rejected_even_with_valid_mac() {
         60,
     );
     let mut replay = ReplayCache::new();
-    let _first =
-        execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
+    let _first = execute_verified(&secret, &sk, &vk, &mut replay, &req, &peer, now_unix()).unwrap();
     let err =
-        execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap_err();
+        execute_verified(&secret, &sk, &vk, &mut replay, &req, &peer, now_unix()).unwrap_err();
     assert!(err.to_ascii_lowercase().contains("replay"), "{err}");
 }
 
 #[test]
 fn expired_request_rejected() {
     let secret = BrokerSecret::generate();
+    let (sk, vk) = test_keys();
+    let peer = test_peer();
     let past = now_unix().saturating_sub(600);
-    let req = signed_request(&secret, "ownmeshd", "op_exp", echo_cmd("old"), past, 1);
-    assert!(verify_request(&secret, &req, now_unix()).is_err());
+    let req = signed_request(
+        &secret,
+        &sk,
+        &peer,
+        "ownmeshd",
+        "op_exp",
+        echo_cmd("old"),
+        past,
+        1,
+    );
+    assert!(verify_request(&secret, &vk, &req, &peer, now_unix()).is_err());
 }
 
 #[test]
 fn tampered_args_invalidate_mac() {
     let secret = BrokerSecret::generate();
+    let (sk, vk) = test_keys();
+    let peer = test_peer();
     let mut req = signed_request(
         &secret,
+        &sk,
+        &peer,
         "ownmeshd",
         "op_tamper",
         echo_cmd("clean"),
@@ -177,16 +233,18 @@ fn tampered_args_invalidate_mac() {
         60,
     );
     req.command.args.push("--evil".into());
-    assert!(verify_request(&secret, &req, now_unix()).is_err());
+    assert!(verify_request(&secret, &vk, &req, &peer, now_unix()).is_err());
     let mac = compute_mac(&secret, &req);
     req.mac = mac;
-    verify_request(&secret, &req, now_unix()).unwrap();
+    verify_request(&secret, &vk, &req, &peer, now_unix()).unwrap();
 }
 
 #[test]
-fn missing_capability_token_rejected() {
+fn missing_capability_is_never_minted_by_generic_verify_path() {
     let secret = BrokerSecret::generate();
-    let mut req = build_request(
+    let (sk, vk) = test_keys();
+    let peer = test_peer();
+    let req = build_request(
         &secret,
         "ownmeshd",
         "op_nocap",
@@ -194,25 +252,25 @@ fn missing_capability_token_rejected() {
         now_unix(),
         60,
     );
-    req.capability = None;
-    req.mac = compute_mac(&secret, &req);
-    assert!(verify_request(&secret, &req, now_unix()).is_err());
+    assert!(req.capability.is_none());
+    assert!(verify_request(&secret, &vk, &req, &peer, now_unix()).is_err());
+    verify_request_mac(&secret, &req, now_unix()).unwrap();
 
     let mut replay = ReplayCache::new();
-    let err =
-        execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap_err();
-    assert!(
-        err.to_ascii_lowercase().contains("token") || err.to_ascii_lowercase().contains("invalid"),
-        "{err}"
-    );
+    let err = execute_verified(&secret, &sk, &vk, &mut replay, &req, &peer, now_unix())
+        .expect_err("generic path must not mint");
+    assert!(err.to_ascii_lowercase().contains("mint denied"), "{err}");
 }
 
 #[test]
 fn scope_mismatch_rejected() {
     let secret = BrokerSecret::generate();
+    let (sk, vk) = test_keys();
+    let peer = test_peer();
     let now = now_unix();
     let cap = CapabilityToken::issue_for_operation(
-        &secret,
+        &sk,
+        &peer,
         "ownmeshd",
         "not.elevated",
         "op_scope",
@@ -228,15 +286,18 @@ fn scope_mismatch_rejected() {
         now,
         60,
     );
-    assert!(verify_request(&secret, &req, now).is_err());
+    assert!(verify_request(&secret, &vk, &req, &peer, now).is_err());
 }
 
 #[test]
 fn operation_mismatch_rejected() {
     let secret = BrokerSecret::generate();
+    let (sk, vk) = test_keys();
+    let peer = test_peer();
     let now = now_unix();
     let cap = CapabilityToken::issue_for_operation(
-        &secret,
+        &sk,
+        &peer,
         "ownmeshd",
         ELEVATED_CAPABILITY_SCOPE,
         "bound_op",
@@ -252,7 +313,7 @@ fn operation_mismatch_rejected() {
         now,
         60,
     );
-    assert!(verify_request(&secret, &req, now).is_err());
+    assert!(verify_request(&secret, &vk, &req, &peer, now).is_err());
 }
 
 #[test]
@@ -262,6 +323,8 @@ fn secret_file_roundtrip_and_malformed_rejected() {
     let secret = load_or_create_secret(&path).unwrap();
     let again = load_or_create_secret(&path).unwrap();
     assert_eq!(secret.as_bytes(), again.as_bytes());
+    let (_sk, vk) = test_keys();
+    let peer = test_peer();
 
     let bad = BrokerRequest {
         protocol_version: 1,
@@ -280,5 +343,5 @@ fn secret_file_roundtrip_and_malformed_rejected() {
         },
         mac: "dead".into(),
     };
-    assert!(verify_request(&secret, &bad, now_unix()).is_err());
+    assert!(verify_request(&secret, &vk, &bad, &peer, now_unix()).is_err());
 }

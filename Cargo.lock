@@ -1705,9 +1705,11 @@ dependencies = [
 name = "ownmesh-broker-client"
 version = "1.0.1"
 dependencies = [
+ "ed25519-dalek",
  "hex",
  "hmac",
  "ownmesh-domain",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",
@@ -1724,6 +1726,7 @@ name = "ownmesh-config"
 version = "1.0.1"
 dependencies = [
  "ownmesh-domain",
+ "ownmesh-persist",
  "serde",
  "serde_json",
  "tempfile",
@@ -1755,6 +1758,7 @@ version = "1.0.1"
 dependencies = [
  "hex",
  "ownmesh-domain",
+ "ownmesh-persist",
  "serde",
  "serde_json",
  "sha2",
@@ -1788,6 +1792,7 @@ dependencies = [
  "ed25519-dalek",
  "keyring",
  "ownmesh-domain",
+ "ownmesh-persist",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -1802,12 +1807,14 @@ version = "1.0.1"
 dependencies = [
  "bytes",
  "ownmesh-domain",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1818,6 +1825,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "ownmesh-persist"
+version = "1.0.1"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -1859,6 +1873,7 @@ name = "ownmesh-session"
 version = "1.0.1"
 dependencies = [
  "ownmesh-domain",
+ "ownmesh-persist",
  "serde",
  "serde_json",
  "tempfile",

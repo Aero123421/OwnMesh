@@ -4,8 +4,12 @@
 //! - Unix domain socket mode 0600 + `SO_PEERCRED` (uid allow-list / euid)
 //! - Loopback TCP and Named Pipe are **fail-closed** at startup (explicit error)
 //!
+//! Capability tokens are Ed25519-signed by a broker-only key, separate from the
+//! request-MAC [`ownmesh_broker_client::BrokerSecret`]. Peer pid/uid/exe are bound
+//! into capability claims; `caller_principal` alone is never authoritative.
+//!
 //! In-process test helpers may still exercise MAC/capability over loopback TCP
-//! without going through `run_broker` endpoint gating.
+//! without going through `run_broker` endpoint gating (synthetic peer bind).
 //!
 //! Never opens outbound network connections or non-loopback listeners.
 //!
@@ -18,18 +22,40 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::module_name_repetitions,
-    clippy::must_use_candidate
+    clippy::must_use_candidate,
+    clippy::doc_markdown,
+    clippy::struct_excessive_bools,
+    clippy::too_many_lines,
+    clippy::needless_return,
+    clippy::map_unwrap_or,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments,
+    clippy::single_match_else,
+    clippy::unnecessary_wraps
 )]
 
 mod install;
 pub mod peer;
 mod serve;
 
-pub use install::{broker_status, install_broker, uninstall_broker, InstallRecord, InstallStatus};
-pub use peer::{assert_endpoint_peer_verifiable, peer_uid_allowed, PeerCheck};
+pub use install::{
+    broker_status, endpoint_kind_peer_enforceable, install_broker, install_broker_with_config,
+    uninstall_broker, BrokerInstallConfig, InstallRecord, InstallStatus, INSTALL_FILE,
+};
+pub use peer::{
+    assert_endpoint_peer_verifiable, endpoint_supports_peer_cred_enforcement,
+    load_trusted_peer_policy, peer_uid_allowed, PeerCheck, TrustedPeerPolicy,
+};
 pub use serve::{
-    enforce_bind_is_networkless, execute_verified, handle_tcp_conn, load_or_create_secret,
-    run_broker, BrokerServeConfig, BrokerState,
+    default_signing_key_path, default_verify_key_path, enforce_bind_is_networkless,
+    ensure_broker_key_separation, execute_verified, execute_verified_for_process, handle_tcp_conn,
+    load_or_create_capability_keys, load_or_create_request_secret, load_or_create_secret,
+    load_verify_key, run_broker, validate_daemon_dac_policy,
+    validate_daemon_directory_custody_metadata, validate_request_secret_custody_metadata,
+    validate_signing_custody_metadata, validate_signing_key_custody,
+    validate_socket_custody_metadata, validate_verify_key_custody,
+    validate_verify_key_custody_metadata, BrokerServeConfig, BrokerState, CustodyMetadata,
+    SocketCustodyMetadata, UnixSocketSecurity, CAPABILITY_SIGNING_FILE, CAPABILITY_VERIFY_FILE,
 };
 
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;
@@ -65,13 +91,27 @@ pub fn now_unix() -> i64 {
 mod tests {
     use super::*;
     use ownmesh_broker_client::{
-        build_request, connect_and_call, elevate, verify_request, BrokerEndpoint, BrokerRequest,
-        BrokerSecret, ElevatedCommand, ReplayCache,
+        build_request, build_request_with_capability, connect_and_call, elevate, verify_request,
+        BrokerEndpoint, BrokerRequest, BrokerSecret, CapabilitySigningKey, CapabilityToken,
+        ElevatedCommand, PeerBind, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
     };
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex as AsyncMutex;
+
+    fn test_peer() -> PeerBind {
+        PeerBind::new(4242, peer::current_uid(), "ownmeshd-test")
+    }
+
+    fn test_keys() -> (
+        CapabilitySigningKey,
+        ownmesh_broker_client::CapabilityVerifyKey,
+    ) {
+        let sk = CapabilitySigningKey::generate();
+        let vk = sk.verify_key();
+        (sk, vk)
+    }
 
     #[test]
     fn rejects_non_loopback_bind_config() {
@@ -96,13 +136,26 @@ mod tests {
     }
 
     #[test]
-    fn unprivileged_caller_rejected() {
+    fn peer_mismatch_rejected_not_principal_string() {
         let dir = tempdir().unwrap();
         let secret_path = dir.path().join("sec");
         let secret = load_or_create_secret(&secret_path).unwrap();
-        let req = build_request(
+        let (sk, vk) = test_keys();
+        let peer = test_peer();
+        let other = PeerBind::new(peer.pid + 1, peer.uid, peer.exe_path.clone());
+        // Attacker sets caller_principal to a trusted label but wrong peer bind.
+        let cap = CapabilityToken::issue_for_operation(
+            &sk,
+            &other,
+            "ownmeshd",
+            ELEVATED_CAPABILITY_SCOPE,
+            "op",
+            now_unix(),
+            30,
+        );
+        let req = build_request_with_capability(
             &secret,
-            "evil",
+            "ownmeshd",
             "op",
             ElevatedCommand {
                 program: if cfg!(windows) {
@@ -118,20 +171,37 @@ mod tests {
                 cwd: None,
                 env: vec![],
             },
+            Some(cap),
             now_unix(),
             30,
         );
         let mut replay = ReplayCache::new();
-        let resp =
-            execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
-        assert!(!resp.ok);
-        assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
+        let err =
+            execute_verified(&secret, &sk, &vk, &mut replay, &req, &peer, now_unix()).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("unauthor")
+                || err.to_ascii_lowercase().contains("signature")
+                || err.to_ascii_lowercase().contains("peer"),
+            "{err}"
+        );
     }
 
     #[test]
     fn replay_and_nonce_rejected() {
         let secret = BrokerSecret::generate();
-        let req = build_request(
+        let (sk, vk) = test_keys();
+        let peer = test_peer();
+        let now = now_unix();
+        let cap = CapabilityToken::issue_for_operation(
+            &sk,
+            &peer,
+            "ownmeshd",
+            ELEVATED_CAPABILITY_SCOPE,
+            "op",
+            now,
+            60,
+        );
+        let req = build_request_with_capability(
             &secret,
             "ownmeshd",
             "op",
@@ -141,20 +211,22 @@ mod tests {
                 cwd: None,
                 env: vec![],
             },
-            now_unix(),
+            Some(cap),
+            now,
             60,
         );
         let mut replay = ReplayCache::new();
-        let _ =
-            execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
-        let err = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-            .unwrap_err();
+        let _ = execute_verified(&secret, &sk, &vk, &mut replay, &req, &peer, now_unix()).unwrap();
+        let err =
+            execute_verified(&secret, &sk, &vk, &mut replay, &req, &peer, now_unix()).unwrap_err();
         assert!(err.to_lowercase().contains("replay"), "{err}");
     }
 
     #[test]
     fn malformed_request_rejected() {
         let secret = BrokerSecret::generate();
+        let (sk, vk) = test_keys();
+        let peer = test_peer();
         // Missing mac / garbage
         let bad = BrokerRequest {
             protocol_version: 1,
@@ -173,10 +245,10 @@ mod tests {
             },
             mac: "deadbeef".into(),
         };
-        assert!(verify_request(&secret, &bad, now_unix()).is_err());
+        assert!(verify_request(&secret, &vk, &bad, &peer, now_unix()).is_err());
         let mut replay = ReplayCache::new();
-        let err = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &bad, now_unix())
-            .unwrap_err();
+        let err =
+            execute_verified(&secret, &sk, &vk, &mut replay, &bad, &peer, now_unix()).unwrap_err();
         assert!(!err.is_empty());
 
         // Empty program after valid mac path
@@ -195,25 +267,123 @@ mod tests {
         );
         req.command.program.clear();
         req.mac = ownmesh_broker_client::compute_mac(&secret, &req);
-        assert!(verify_request(&secret, &req, now_unix()).is_err());
+        assert!(verify_request(&secret, &vk, &req, &peer, now_unix()).is_err());
     }
 
     #[test]
-    fn install_status_uninstall_roundtrip() {
+    fn install_creates_separate_signing_key() {
         let dir = tempdir().unwrap();
         let base = dir.path();
         let st = broker_status(base).unwrap();
         assert!(!st.installed);
 
-        let rec = install_broker(base, None).unwrap();
-        assert!(rec.installed);
-        let st = broker_status(base).unwrap();
-        assert!(st.installed);
-        assert_eq!(st.endpoint_kind.is_empty(), false);
+        #[cfg(unix)]
+        {
+            let err = install_broker(base, None).expect_err("explicit custody required");
+            assert!(err.contains("explicit"), "{err}");
+        }
 
-        uninstall_broker(base).unwrap();
+        #[cfg(windows)]
+        {
+            // Windows cannot safely enforce Named Pipe peer PID/token/ACL — install
+            // must fail closed without ever returning installed=true.
+            let err = install_broker(base, None).expect_err("windows install unsupported");
+            assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
+            let st = broker_status(base).unwrap();
+            assert!(!st.installed, "must not claim installed on Windows");
+            assert_eq!(st.support, "unsupported");
+            assert!(
+                st.notes
+                    .iter()
+                    .any(|n| n.to_ascii_lowercase().contains("unsupported")
+                        || n.to_ascii_lowercase().contains("fail-closed")),
+                "{st:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_or_named_pipe_never_reports_installed_true() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        // Force a Named Pipe endpoint even on Unix — still unenforceable.
+        let ep = BrokerEndpoint::NamedPipe(r"\\.\pipe\ownmesh-lib-test".into());
+        assert!(!endpoint_supports_peer_cred_enforcement(&ep));
+        let err = install_broker(base, Some(ep)).expect_err("named pipe install");
+        assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
         let st = broker_status(base).unwrap();
         assert!(!st.installed);
+        assert_eq!(st.support, "unsupported");
+    }
+
+    #[test]
+    fn legacy_installed_marker_cleared_without_peer_enforcement() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let broker = base.join("broker");
+        std::fs::create_dir_all(&broker).unwrap();
+        // Simulate a pre-fix marker that falsely claimed success on Named Pipe.
+        let fake = serde_json::json!({
+            "installed": true,
+            "installed_at_unix": 1,
+            "endpoint": r"\\.\pipe\ownmesh",
+            "endpoint_kind": "named_pipe",
+            "unit_path": null,
+            "secret_file": broker.join("broker.secret").display().to_string(),
+            "signing_key_file": "",
+            "verify_key_file": "",
+            "notes": ["legacy"],
+            "support": "supported"
+        });
+        std::fs::write(
+            broker.join("broker-install.json"),
+            serde_json::to_string_pretty(&fake).unwrap(),
+        )
+        .unwrap();
+        let st = broker_status(base).unwrap();
+        assert!(!st.installed, "legacy installed=true must be cleared");
+        assert_eq!(st.support, "unsupported");
+    }
+
+    #[test]
+    fn mac_secret_holder_cannot_mint_under_broker_verify_key() {
+        let secret = BrokerSecret::generate();
+        let (sk, vk) = test_keys();
+        let peer = test_peer();
+        // Derive a signing key from the MAC secret — must not verify under broker key.
+        let evil = CapabilitySigningKey::from_bytes(secret.as_bytes()).unwrap();
+        let forged = CapabilityToken::issue_for_operation(
+            &evil,
+            &peer,
+            "ownmeshd",
+            ELEVATED_CAPABILITY_SCOPE,
+            "op",
+            now_unix(),
+            60,
+        );
+        assert!(forged.verify(&vk, now_unix()).is_err());
+        let req = build_request_with_capability(
+            &secret,
+            "ownmeshd",
+            "op",
+            ElevatedCommand {
+                program: "echo".into(),
+                args: vec!["x".into()],
+                cwd: None,
+                env: vec![],
+            },
+            Some(forged),
+            now_unix(),
+            60,
+        );
+        let mut replay = ReplayCache::new();
+        let err =
+            execute_verified(&secret, &sk, &vk, &mut replay, &req, &peer, now_unix()).unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("signature")
+                || err.to_ascii_lowercase().contains("invalid"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -221,7 +391,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let secret_path = dir.path().join("secret.bin");
         let secret = load_or_create_secret(&secret_path).unwrap();
+        let signing_key = CapabilitySigningKey::generate();
+        let verify_key = signing_key.verify_key();
+        let signing_for_request =
+            CapabilitySigningKey::from_bytes(&signing_key.to_bytes()).unwrap();
         let secret_bytes = secret.as_bytes().to_vec();
+        let peer = test_peer();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -229,15 +404,17 @@ mod tests {
 
         let state = Arc::new(AsyncMutex::new(BrokerState {
             secret: BrokerSecret::from_bytes(secret_bytes.clone()),
+            signing_key,
+            verify_key,
             replay: ReplayCache::new(),
-            allowed_callers: vec!["ownmeshd".into()],
         }));
 
         let st = Arc::clone(&state);
+        let peer_srv = peer.clone();
         let server = tokio::spawn(async move {
-            let (sock, peer) = listener.accept().await.unwrap();
-            assert!(peer.ip().is_loopback());
-            serve::handle_tcp_conn(sock, st).await.unwrap();
+            let (sock, peer_addr) = listener.accept().await.unwrap();
+            assert!(peer_addr.ip().is_loopback());
+            serve::handle_tcp_conn(sock, st, peer_srv).await.unwrap();
         });
 
         let endpoint = BrokerEndpoint::LoopbackTcp(addr);
@@ -266,11 +443,24 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(resp.ok, "{resp:?}");
-        assert!(resp.stdout.contains("broker-ok"), "{resp:?}");
+        assert!(!resp.ok, "synthetic TCP must not mint: {resp:?}");
+        assert!(
+            resp.error.as_deref().unwrap_or("").contains("mint denied"),
+            "{resp:?}"
+        );
 
-        // Same request body replay via connect_and_call must fail at server.
-        let req = build_request(
+        // A genuinely broker-signed capability is accepted once and replayed requests fail.
+        let now = now_unix();
+        let cap = CapabilityToken::issue_for_operation(
+            &signing_for_request,
+            &peer,
+            "ownmeshd",
+            ELEVATED_CAPABILITY_SCOPE,
+            "op_replay",
+            now,
+            60,
+        );
+        let req = build_request_with_capability(
             &secret,
             "ownmeshd",
             "op_replay",
@@ -288,18 +478,20 @@ mod tests {
                 cwd: None,
                 env: vec![],
             },
-            now_unix(),
+            Some(cap),
+            now,
             60,
         );
         // start second accept loop
         let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let st2 = Arc::clone(&state);
+        let peer2 = peer.clone();
         let server2 = tokio::spawn(async move {
             for _ in 0..2 {
                 let (sock, _) = listener2.accept().await.unwrap();
                 let st = Arc::clone(&st2);
-                let _ = serve::handle_tcp_conn(sock, st).await;
+                let _ = serve::handle_tcp_conn(sock, st, peer2.clone()).await;
             }
         });
         let ep2 = BrokerEndpoint::LoopbackTcp(addr2);
@@ -324,26 +516,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unprivileged_over_wire_rejected() {
+    async fn forged_capability_over_wire_rejected() {
         let dir = tempdir().unwrap();
         let secret = load_or_create_secret(&dir.path().join("s")).unwrap();
+        let sk = CapabilitySigningKey::generate();
+        let vk = sk.verify_key();
         let secret_bytes = secret.as_bytes().to_vec();
+        let peer = test_peer();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::new(AsyncMutex::new(BrokerState {
             secret: BrokerSecret::from_bytes(secret_bytes.clone()),
+            signing_key: sk,
+            verify_key: vk,
             replay: ReplayCache::new(),
-            allowed_callers: vec!["ownmeshd".into()],
         }));
         let st = Arc::clone(&state);
+        let peer_srv = peer.clone();
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            serve::handle_tcp_conn(sock, st).await.unwrap();
+            serve::handle_tcp_conn(sock, st, peer_srv).await.unwrap();
         });
         let secret = BrokerSecret::from_bytes(secret_bytes);
-        let req = build_request(
+        // Mint with a key derived from the MAC secret (ownmeshd-equivalent attacker).
+        let evil = CapabilitySigningKey::from_bytes(secret.as_bytes()).unwrap();
+        let forged = CapabilityToken::issue_for_operation(
+            &evil,
+            &peer,
+            "ownmeshd",
+            ELEVATED_CAPABILITY_SCOPE,
+            "op",
+            now_unix(),
+            30,
+        );
+        let req = build_request_with_capability(
             &secret,
-            "not-allowed",
+            "ownmeshd",
             "op",
             ElevatedCommand {
                 program: "echo".into(),
@@ -351,6 +559,7 @@ mod tests {
                 cwd: None,
                 env: vec![],
             },
+            Some(forged),
             now_unix(),
             30,
         );
@@ -358,7 +567,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!resp.ok);
-        assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
+        let err = resp.error.unwrap_or_default().to_ascii_lowercase();
+        assert!(
+            err.contains("signature") || err.contains("invalid") || err.contains("unauthor"),
+            "{err}"
+        );
         let _ = server.await;
     }
 }

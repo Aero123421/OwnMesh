@@ -42,17 +42,17 @@ fn restrict_dir_mode(path: &Path) -> Result<(), PersistError> {
 /// Restrict file to owner-only (`0600`) on Unix.
 ///
 /// On Windows this is a documented no-op (profile ACL inheritance).
-fn restrict_file_mode(path: &Path) -> Result<(), PersistError> {
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
+fn restrict_file_mode(file: &std::fs::File) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms).map_err(|e| PersistError::Io(e.to_string()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
         // Best-effort: rely on user-profile inherited ACL (no chmod equivalent).
-        let _ = path;
+        let _ = file;
     }
     Ok(())
 }
@@ -70,14 +70,12 @@ pub fn save_manager(path: &Path, mgr: &SessionManager) -> Result<(), PersistErro
         }
     }
     let raw = serde_json::to_string_pretty(mgr).map_err(|e| PersistError::Serde(e.to_string()))?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, raw.as_bytes()).map_err(|e| PersistError::Io(e.to_string()))?;
-    restrict_file_mode(&tmp)?;
-    std::fs::rename(&tmp, path).map_err(|e| PersistError::Io(e.to_string()))?;
-    // Re-apply on the final path so a pre-existing looser mode cannot linger
-    // across platforms/filesystems where rename preserves destination metadata.
-    restrict_file_mode(path)?;
-    Ok(())
+    // Permissions are applied to the sibling temp before its contents are
+    // written. Any chmod/write/sync error therefore occurs before commit.
+    // The pinned Rust 1.92 Windows rename replaces in one operation; the
+    // destination is never pre-deleted.
+    ownmesh_persist::write_atomically_with(path, raw.as_bytes(), restrict_file_mode)
+        .map_err(|e| PersistError::Io(e.to_string()))
 }
 
 /// Load manager; missing file yields an empty manager.
@@ -85,9 +83,12 @@ pub fn save_manager(path: &Path, mgr: &SessionManager) -> Result<(), PersistErro
 /// Corrupt JSON or unreadable content returns [`PersistError`] — never silently
 /// replaced with an empty manager.
 pub fn load_manager(path: &Path) -> Result<SessionManager, PersistError> {
-    if !path.exists() {
-        return Ok(SessionManager::new());
-    }
-    let raw = std::fs::read_to_string(path).map_err(|e| PersistError::Io(e.to_string()))?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SessionManager::new());
+        }
+        Err(err) => return Err(PersistError::Io(err.to_string())),
+    };
     serde_json::from_str(&raw).map_err(|e| PersistError::Serde(e.to_string()))
 }

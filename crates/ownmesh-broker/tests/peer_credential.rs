@@ -40,13 +40,10 @@ fn peer_uid_rejects_when_not_own_and_not_allowlisted() {
         uid: 1001,
         gid: 1001,
     };
-    assert!(
-        !peer_uid_allowed(&peer, &[], 1000),
-        "empty list => own uid only"
-    );
+    assert!(!peer_uid_allowed(&peer, &[], 1000), "empty list denies");
     assert!(!peer_uid_allowed(&peer, &[0, 1000], 1000));
     assert!(peer_uid_allowed(&peer, &[1001], 0));
-    assert!(peer_uid_allowed(&peer, &[], 1001));
+    assert!(!peer_uid_allowed(&peer, &[], 1001));
 }
 
 #[tokio::test]
@@ -55,7 +52,14 @@ async fn run_broker_errors_on_loopback_tcp_before_accept() {
     let cfg = BrokerServeConfig {
         endpoint: BrokerEndpoint::LoopbackTcp("127.0.0.1:0".parse().unwrap()),
         secret_file: dir.path().join("secret.bin"),
-        allow_callers: vec!["ownmeshd".into()],
+        signing_key_file: dir.path().join("private").join("broker.cap.signing"),
+        trusted_executable: dir.path().join("ownmeshd"),
+        allowed_uids: vec![1000],
+        socket_security: ownmesh_broker::UnixSocketSecurity {
+            owner_uid: 0,
+            group_gid: 0,
+            mode: 0o600,
+        },
         addr_file: None,
     };
     let err = tokio::time::timeout(Duration::from_secs(5), run_broker(cfg))
@@ -71,7 +75,14 @@ async fn run_broker_errors_on_named_pipe_before_accept() {
     let cfg = BrokerServeConfig {
         endpoint: BrokerEndpoint::NamedPipe(r"\\.\pipe\ownmesh-sec02-test".into()),
         secret_file: dir.path().join("secret.bin"),
-        allow_callers: vec!["ownmeshd".into()],
+        signing_key_file: dir.path().join("private").join("broker.cap.signing"),
+        trusted_executable: dir.path().join("ownmeshd"),
+        allowed_uids: vec![1000],
+        socket_security: ownmesh_broker::UnixSocketSecurity {
+            owner_uid: 0,
+            group_gid: 0,
+            mode: 0o600,
+        },
         addr_file: None,
     };
     let err = tokio::time::timeout(Duration::from_secs(5), run_broker(cfg))
@@ -81,10 +92,11 @@ async fn run_broker_errors_on_named_pipe_before_accept() {
     assert!(err.contains("fail-closed"), "{err}");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod unix_peer {
     use super::*;
     use ownmesh_broker::peer::{authorize_unix_peer, check_unix_peer, current_uid};
+    use ownmesh_broker::TrustedPeerPolicy;
     use std::sync::Arc;
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::Barrier;
@@ -93,7 +105,7 @@ mod unix_peer {
     async fn so_peercred_accepts_same_uid_and_rejects_disallowed_uid() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("peer.sock");
-        let listener = UnixListener::bind(&path).await.unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let b_client = Arc::clone(&barrier);
         let client_path = path.clone();
@@ -106,20 +118,32 @@ mod unix_peer {
         let (server, _) = listener.accept().await.unwrap();
         barrier.wait().await;
 
-        let check = check_unix_peer(&server).expect("SO_PEERCRED must succeed on Unix");
-        let cred = check.cred.expect("cred present");
-        assert_eq!(cred.uid, current_uid());
-        assert_eq!(check.method, "SO_PEERCRED");
+        let check = check_unix_peer(&server).expect("SO_PEERCRED + PID exe must succeed");
+        assert_eq!(check.cred.uid, current_uid());
+        assert!(check.method.contains("SO_PEERCRED"));
 
-        authorize_unix_peer(&server, &[])
-            .expect("same-uid peer must be accepted with default policy");
+        // A merely claimed path/UID policy is insufficient for production minting;
+        // it must have been loaded and pinned from root-controlled executable custody.
+        let unpinned = TrustedPeerPolicy::new(
+            std::path::PathBuf::from(&check.exe_path),
+            vec![current_uid()],
+        )
+        .unwrap();
+        let err = authorize_unix_peer(&server, &unpinned)
+            .expect_err("untrusted executable custody must reject production stream");
+        assert!(
+            err.contains("not pinned") && err.contains("fail-closed"),
+            "{err}"
+        );
 
-        if current_uid() != 0 {
-            let err = authorize_unix_peer(&server, &[0]).expect_err("uid 0-only list");
-            assert!(
-                err.contains("not permitted") && err.contains("fail-closed"),
-                "{err}"
-            );
+        // If the test binary itself happens to be installed under root-controlled
+        // ancestry, exercise the positive production-stream path as well.
+        if let Ok(pinned) = ownmesh_broker::load_trusted_peer_policy(
+            std::path::Path::new(&check.exe_path),
+            vec![current_uid()],
+        ) {
+            authorize_unix_peer(&server, &pinned)
+                .expect("pinned exact executable and UID must be accepted");
         }
 
         drop(client.await.unwrap());
