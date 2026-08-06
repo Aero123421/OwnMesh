@@ -1354,37 +1354,53 @@ export class DeviceRoom {
     requireSessionId?: string;
   }): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
     if (!this.env.DB) {
+      this.storageBroken = true;
       this.failClosedAll("storage unavailable", 1013);
       return { ok: false, error: "storage_unavailable", status: 503 };
     }
-    const store = createStore(this.env);
-    const device = await store.getDevice(this.deviceId);
-    if (!device || device.revoked || device.status !== "active") {
-      this.failClosedAll("device not active", 1008);
-      return { ok: false, error: "device_not_active", status: 403 };
-    }
-    this.devicePublicKey = device.public_key;
-
-    for (const [socket, sid] of [...this.wsSessions]) {
-      const session = this.router.sessions.get(sid);
-      const valid =
-        Boolean(session?.auth_hash) &&
-        (await store.validateDeviceSession(session!.auth_hash!, session!.role, this.deviceId));
-      if (!valid) {
-        try {
-          socket.close(1008, "authorization revoked");
-        } catch {
-          /* closed */
-        }
-        this.router.unregisterSession(sid);
-        this.wsSessions.delete(socket);
+    try {
+      const store = createStore(this.env);
+      const device = await store.getDevice(this.deviceId);
+      if (!device || device.revoked || device.status !== "active") {
+        this.failClosedAll("device not active", 1008);
+        return { ok: false, error: "device_not_active", status: 403 };
       }
-    }
+      this.devicePublicKey = device.public_key;
 
-    if (opts?.requireSessionId && !this.router.sessions.has(opts.requireSessionId)) {
-      return { ok: false, error: "authorization_revoked", status: 401 };
+      for (const [socket, sid] of [...this.wsSessions]) {
+        const session = this.router.sessions.get(sid);
+        let valid = false;
+        try {
+          valid =
+            Boolean(session?.auth_hash) &&
+            (await store.validateDeviceSession(session!.auth_hash!, session!.role, this.deviceId));
+        } catch {
+          // D1/session lookup failure: fail closed for every live socket.
+          this.storageBroken = true;
+          this.failClosedAll("storage unavailable", 1013);
+          return { ok: false, error: "storage_unavailable", status: 503 };
+        }
+        if (!valid) {
+          try {
+            socket.close(1008, "authorization revoked");
+          } catch {
+            /* closed */
+          }
+          this.router.unregisterSession(sid);
+          this.wsSessions.delete(socket);
+        }
+      }
+
+      if (opts?.requireSessionId && !this.router.sessions.has(opts.requireSessionId)) {
+        return { ok: false, error: "authorization_revoked", status: 401 };
+      }
+      return { ok: true };
+    } catch {
+      // store.getDevice / createStore throw must not leak from DO handlers.
+      this.storageBroken = true;
+      this.failClosedAll("storage unavailable", 1013);
+      return { ok: false, error: "storage_unavailable", status: 503 };
     }
-    return { ok: true };
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1442,14 +1458,21 @@ export class DeviceRoom {
       }
       // Binding: principal/tenant on the device must match signed claims when device is known.
       if (this.env.DB) {
-        const storeForBind = createStore(this.env);
-        const boundDevice = await storeForBind.getDevice(this.deviceId);
-        if (
-          boundDevice &&
-          (boundDevice.principal_id !== opCtx.claims.principal_id ||
-            boundDevice.tenant_id !== opCtx.claims.tenant_id)
-        ) {
-          return json({ error: "binding_mismatch" }, { status: 403 });
+        try {
+          const storeForBind = createStore(this.env);
+          const boundDevice = await storeForBind.getDevice(this.deviceId);
+          if (
+            boundDevice &&
+            (boundDevice.principal_id !== opCtx.claims.principal_id ||
+              boundDevice.tenant_id !== opCtx.claims.tenant_id)
+          ) {
+            return json({ error: "binding_mismatch" }, { status: 403 });
+          }
+        } catch {
+          // D1 bind lookup throw: tear down existing WS, refuse op.
+          this.storageBroken = true;
+          this.failClosedAll("storage unavailable", 1013);
+          return json({ error: "storage_unavailable" }, { status: 503 });
         }
       }
       let body: {
@@ -1589,6 +1612,10 @@ export class DeviceRoom {
         },
       );
       if (!wsCtx.ok) return json({ error: wsCtx.error }, { status: wsCtx.status });
+      // WS upgrade requires method+path claims (Worker always mints both).
+      if (!wsCtx.claims.method || !wsCtx.claims.path) {
+        return json({ error: "binding_mismatch" }, { status: 403 });
+      }
       // When claims include method/path, enforce exact match (defense in depth).
       if (wsCtx.claims.method && wsCtx.claims.method.toUpperCase() !== request.method.toUpperCase()) {
         return json({ error: "binding_mismatch" }, { status: 403 });
@@ -1605,29 +1632,51 @@ export class DeviceRoom {
       if (!origin || !allowedOrigins.has(origin)) return json({ error: "origin_not_allowed" }, { status: 403 });
       if (!this.env.DB) {
         // Fail closed: refuse upgrade and tear down any lingering sockets.
+        this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return json({ error: "storage_unavailable" }, { status: 503 });
       }
       const role = (url.searchParams.get("role") || "agent") as SessionRole;
       if (role !== "agent" && role !== "client") return json({ error: "invalid_role" }, { status: 403 });
       const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
-      const store = createStore(this.env);
-      const device = await store.getDevice(this.deviceId);
-      if (!device || device.revoked || device.status !== "active") return json({ error: "device_not_active" }, { status: 403 });
-      if (
-        device.principal_id !== wsCtx.claims.principal_id ||
-        device.tenant_id !== wsCtx.claims.tenant_id
-      ) {
-        return json({ error: "binding_mismatch" }, { status: 403 });
+      // All D1/store reads for upgrade must not leak throws past fetch().
+      let devicePublicKey = "";
+      let clientScope: string | undefined;
+      try {
+        const store = createStore(this.env);
+        const device = await store.getDevice(this.deviceId);
+        if (!device || device.revoked || device.status !== "active") {
+          return json({ error: "device_not_active" }, { status: 403 });
+        }
+        if (
+          device.principal_id !== wsCtx.claims.principal_id ||
+          device.tenant_id !== wsCtx.claims.tenant_id
+        ) {
+          return json({ error: "binding_mismatch" }, { status: 403 });
+        }
+        if (role === "agent") {
+          const credential = token ? await store.getDeviceCredential(token) : null;
+          if (!credential || credential.device_id !== this.deviceId) {
+            return json({ error: "invalid_device_credential" }, { status: 401 });
+          }
+        } else {
+          const access = token ? await store.getAccess(token) : null;
+          if (
+            !access ||
+            access.principal !== device.principal_id ||
+            access.tenant_id !== device.tenant_id
+          ) {
+            return json({ error: "unauthorized" }, { status: 401 });
+          }
+          clientScope = access.scope;
+        }
+        devicePublicKey = device.public_key;
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return json({ error: "storage_unavailable" }, { status: 503 });
       }
-      if (role === "agent") {
-        const credential = token ? await store.getDeviceCredential(token) : null;
-        if (!credential || credential.device_id !== this.deviceId) return json({ error: "invalid_device_credential" }, { status: 401 });
-      } else {
-        const access = token ? await store.getAccess(token) : null;
-        if (!access || access.principal !== device.principal_id || access.tenant_id !== device.tenant_id) return json({ error: "unauthorized" }, { status: 401 });
-      }
-      this.devicePublicKey = device.public_key;
+      this.devicePublicKey = devicePublicKey;
 
       // Reject excess WS before nonce consume / accept — never evict live guards.
       if (!this.router.canAdmitNewGuardSession()) {
@@ -1655,7 +1704,7 @@ export class DeviceRoom {
         connected_at: Date.now(),
         phase: "connected",
         auth_hash: await sha256Hex(token),
-        scope: role === "client" ? (await store.getAccess(token))?.scope : undefined,
+        scope: role === "client" ? clientScope : undefined,
         lastSeq: 0,
       };
       server.serializeAttachment(attachment);
@@ -1803,6 +1852,7 @@ export class DeviceRoom {
     if (result.ok && result.mcp_result) {
       const corr = result.mcp_result.correlation_id;
       if (!this.env.DB) {
+        this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;
       }
@@ -1842,6 +1892,7 @@ export class DeviceRoom {
         }
       } catch {
         // Store write failure: fail closed, no success forward.
+        this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;
       }
@@ -1891,26 +1942,54 @@ export class DeviceRoom {
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     await this.ready;
-    const sessionId = this.wsSessions.get(ws);
-    if (sessionId) {
-      this.router.unregisterSession(sessionId);
-      this.wsSessions.delete(ws);
-      await this.persistNow();
-    }
     try {
-      ws.close(code, reason);
+      const sessionId = this.wsSessions.get(ws);
+      if (sessionId) {
+        this.router.unregisterSession(sessionId);
+        this.wsSessions.delete(ws);
+        try {
+          await this.persistNow();
+        } catch {
+          // persistNow already fail-closed sockets/pending.
+        }
+      }
+      try {
+        ws.close(code, reason);
+      } catch {
+        /* already closed */
+      }
     } catch {
-      /* already closed */
+      // Never leak storage/D1 errors from hibernation close handler.
+      try {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+      } catch {
+        /* ignore secondary failures */
+      }
     }
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
     await this.ready;
-    const sessionId = this.wsSessions.get(ws);
-    if (sessionId) {
-      this.router.unregisterSession(sessionId);
-      this.wsSessions.delete(ws);
-      await this.persistNow();
+    try {
+      const sessionId = this.wsSessions.get(ws);
+      if (sessionId) {
+        this.router.unregisterSession(sessionId);
+        this.wsSessions.delete(ws);
+        try {
+          await this.persistNow();
+        } catch {
+          // persistNow already fail-closed sockets/pending.
+        }
+      }
+    } catch {
+      // Never leak storage/D1 errors from hibernation error handler.
+      try {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+      } catch {
+        /* ignore secondary failures */
+      }
     }
   }
 }
@@ -2026,7 +2105,8 @@ export async function applyMcpOperationResult(
     "device_offline",
     "approval_required",
   ]);
-  const fromStatuses = ["pending", "running", "approval_required"];
+  // Include cancel_requested so a delayed device terminal result still CAS-succeeds.
+  const fromStatuses = ["pending", "running", "approval_required", "cancel_requested"];
   if (!terminal.has(status)) {
     // Non-terminal result: advance pending → running only.
     status = op.status === "pending" ? "running" : op.status;

@@ -49,6 +49,7 @@ export interface Env {
   OWNMESH_DEV_AUTH_BYPASS?: string;
   ALLOW_DYNAMIC_CLIENT_REGISTRATION?: string;
   OWNMESH_ALLOWED_ORIGINS?: string;
+  OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
 }
 
 export { DeviceRoom, MCP_TOOLS };
@@ -192,13 +193,48 @@ async function routeToDeviceRoom(
     path,
     body_sha256: bodySha256,
   });
-  const res = await stub.fetch(
-    new Request(`https://device-room/operation?device_id=${encodeURIComponent(deviceId)}`, {
-      method,
-      headers,
-      body,
-    }),
-  );
+  const configuredTimeout = Number(env.OWNMESH_DEVICE_ROUTE_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+    ? Math.min(60_000, Math.floor(configuredTimeout))
+    : 10_000;
+  const timedOut = Symbol("device_room_fetch_timeout");
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let res: Response;
+  try {
+    const outcome = await Promise.race<Response | typeof timedOut>([
+      stub.fetch(
+        new Request(`https://device-room/operation?device_id=${encodeURIComponent(deviceId)}`, {
+          method,
+          headers,
+          body,
+        }),
+      ),
+      new Promise<typeof timedOut>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(timedOut), timeoutMs);
+      }),
+    ]);
+    if (outcome === timedOut) {
+      return {
+        status: "unavailable",
+        detail: {
+          error: "device_room_fetch_timeout",
+          timeout_ms: timeoutMs,
+        },
+      };
+    }
+    res = outcome;
+  } catch (err) {
+    // Fail closed: never let DO stub/network throws leave MCP ops stuck in running.
+    return {
+      status: "unavailable",
+      detail: {
+        error: "device_room_fetch_failed",
+        message: err instanceof Error ? err.message : String(err),
+      },
+    };
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
 
   // Inspect DO HTTP status: never treat non-2xx / status-less error bodies as routed.
   let parsed: Record<string, unknown> | null = null;
@@ -505,6 +541,9 @@ export default {
       doUrl.pathname = "/ws";
       doUrl.searchParams.set("device_id", deviceId);
       doUrl.searchParams.set("role", role);
+      // Bind HTTP method + DO path into the signed context (WS upgrade is GET /ws).
+      const wsMethod = (request.method || "GET").toUpperCase();
+      const wsBindPath = "/ws";
       const doHeaders = await internalDoHeaders(
         env.SESSION_SECRET,
         {
@@ -513,6 +552,8 @@ export default {
           principal_id: device.principal_id,
           tenant_id: device.tenant_id,
           role,
+          method: wsMethod,
+          path: wsBindPath,
         },
         request.headers,
       );

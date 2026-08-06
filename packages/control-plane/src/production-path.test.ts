@@ -340,6 +340,8 @@ async function connectAgentReady(opts: {
       principal_id: PRINCIPAL_ID,
       tenant_id: TENANT_ID,
       role: "agent",
+      method: "GET",
+      path: "/ws",
     },
     {
       Upgrade: "websocket",

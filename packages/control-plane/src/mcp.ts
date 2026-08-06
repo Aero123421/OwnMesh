@@ -466,6 +466,7 @@ export type OpStatus =
   | "device_offline"
   | "failed"
   | "cancelled"
+  | "cancel_requested"
   | "denied";
 
 export type OwnMeshResultEnvelope = {
@@ -1227,6 +1228,9 @@ export async function handleMcp(
           ? candidate
           : undefined;
       if (tracked && (tracked.status === "pending" || tracked.status === "running" || tracked.status === "approval_required")) {
+        // Device-bound cancel: only patch to cancel_requested AFTER successful route.
+        // Route reject/throw keeps the original store state and returns an error envelope.
+        // No device: cancel locally → cancelled.
         if (tracked.device_id) {
           const cancelDeviceId = tracked.device_id;
           const gate = await store.assertDeviceOperableForMcp(
@@ -1237,14 +1241,97 @@ export async function handleMcp(
           if (!gate.ok) {
             return mcpError(id, -32004, gate.error, { device_id: cancelDeviceId, operation_id: oid });
           }
-          if (router) {
-            await router.routeToDevice(cancelDeviceId, {
+          if (!router) {
+            const env = makeEnvelope({
+              operation_id: oid || operationId,
+              status: "failed",
+              device_id: cancelDeviceId,
+              summary: "cancel route failed: device room unavailable",
+              data: {
+                error: {
+                  code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
+                  message: "DEVICE_ROOM binding is required to route cancel to device",
+                  retryable: true,
+                  operation_id: oid,
+                },
+                previous: tracked,
+              },
+              correlation_id: tracked.correlation_id,
+            });
+            return mcpResult(id, toolContent(env));
+          }
+          let routed: { status: string; detail?: unknown };
+          try {
+            routed = await router.routeToDevice(cancelDeviceId, {
               type: "ownmesh_cancel_operation",
               payload: { operation_id: oid },
               correlation_id: correlation,
             });
+          } catch (err) {
+            // Keep original op state; never pretend cancel succeeded.
+            const env = makeEnvelope({
+              operation_id: oid || operationId,
+              status: "failed",
+              device_id: cancelDeviceId,
+              summary: "cancel route failed",
+              data: {
+                error: {
+                  code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
+                  message: err instanceof Error ? err.message : "cancel route threw",
+                  retryable: true,
+                  operation_id: oid,
+                },
+                previous: tracked,
+              },
+              correlation_id: tracked.correlation_id,
+            });
+            return mcpResult(id, toolContent(env));
           }
+          if (routed.status !== "routed_to_device") {
+            const env = makeEnvelope({
+              operation_id: oid || operationId,
+              status: "failed",
+              device_id: cancelDeviceId,
+              summary: "cancel route rejected",
+              data: {
+                error: {
+                  code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
+                  message: `cancel was not delivered to device (route status=${routed.status})`,
+                  retryable: true,
+                  operation_id: oid,
+                  details: routed.detail ?? { status: routed.status },
+                },
+                previous: tracked,
+                route_status: routed.status,
+              },
+              correlation_id: tracked.correlation_id,
+            });
+            return mcpResult(id, toolContent(env));
+          }
+          const updated = await patchOp(
+            store,
+            tracker,
+            oid,
+            {
+              status: "cancel_requested",
+              summary: "cancel requested on device",
+              approval_required: false,
+            },
+            ["pending", "running", "approval_required"],
+          );
+          if (!updated) {
+            const env = makeEnvelope({
+              operation_id: oid || operationId,
+              status: "failed",
+              summary: "operation not cancellable in current state",
+              data: { previous: tracked },
+            });
+            return mcpResult(id, toolContent(env));
+          }
+          return mcpResult(id, toolContent(updated));
         }
+
+        // No device binding: local cancel is authoritative.
         const updated = await patchOp(
           store,
           tracker,
@@ -1740,6 +1827,7 @@ export async function handleApprove(
 
     // Exclusive pending→delivering claim prevents concurrent routes/duplicate delivery.
     // Stale delivering claims (lease expired) may be reclaimed for retry.
+    // Claim issues owner token+version; only that owner may release/finalize.
     const claimed = await store.claimMcpApprovalOutboxDelivery(outbox.id);
     if (!claimed) {
       const current = await store.getMcpApprovalOutbox(outbox.id);
@@ -1775,6 +1863,9 @@ export async function handleApprove(
 
     // Gate/route/finalize under try/catch/finally so a thrown DO/D1 error never
     // leaks a live delivering claim (release → pending, attempts+1, last_error).
+    // release/finalize require the claim owner credentials issued above.
+    const claimToken = claimed.claim_token ?? "";
+    const claimVersion = Number(claimed.claim_version ?? 0);
     let route: { status: string; detail?: unknown } | undefined;
     let claimSettled = false;
     let releaseError: string | undefined;
@@ -1783,7 +1874,11 @@ export async function handleApprove(
         // A stale lease can outlive a fast device result (or cancellation). The
         // terminal authoritative operation proves there is nothing left to
         // deliver; reconcile the outbox without routing the decision again.
-        const reconciled = await store.finalizeMcpApprovalDelivery(claimed.id);
+        const reconciled = await store.finalizeMcpApprovalDelivery(
+          claimed.id,
+          claimToken,
+          claimVersion,
+        );
         if (reconciled) {
           claimSettled = true;
           return json(
@@ -1810,7 +1905,12 @@ export async function handleApprove(
           principal.tenant_id,
         );
         if (!gate.ok) {
-          await store.releaseMcpApprovalOutboxClaim(claimed.id, gate.error);
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            claimToken,
+            claimVersion,
+            gate.error,
+          );
           claimSettled = true;
           return json(
             {
@@ -1837,6 +1937,8 @@ export async function handleApprove(
         if (route.status !== "routed_to_device") {
           await store.releaseMcpApprovalOutboxClaim(
             claimed.id,
+            claimToken,
+            claimVersion,
             `route_status=${route.status}`,
           );
           claimSettled = true;
@@ -1856,7 +1958,11 @@ export async function handleApprove(
       }
 
       // Authoritative CAS only after successful delivery (or no device route needed).
-      const updated = await store.finalizeMcpApprovalDelivery(claimed.id);
+      const updated = await store.finalizeMcpApprovalDelivery(
+        claimed.id,
+        claimToken,
+        claimVersion,
+      );
       if (!updated) {
         // Lost finalize race — surface authoritative state without claiming success.
         claimSettled = true;
@@ -1932,6 +2038,8 @@ export async function handleApprove(
         try {
           await store.releaseMcpApprovalOutboxClaim(
             claimed.id,
+            claimToken,
+            claimVersion,
             releaseError ?? "delivery_error",
           );
         } catch {

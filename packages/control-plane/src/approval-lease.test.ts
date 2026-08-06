@@ -167,6 +167,8 @@ async function beginAndClaim(store: MemoryStore | SqlStore, label: string) {
   assert.ok(claimed);
   assert.equal(claimed!.delivery_status, "delivering");
   assert.ok(claimed!.claimed_at, "claim must persist claimed_at");
+  assert.ok(claimed!.claim_token, "claim must issue claim_token");
+  assert.ok((claimed!.claim_version ?? 0) >= 1, "claim must increment claim_version");
   return { store, deviceId, opId, txId, csrf, claimed };
 }
 
@@ -212,6 +214,8 @@ test("claim sets claimed_at; live concurrent claims yield a single winner", asyn
     assert.equal(winners.length, 1, "exactly one live claim winner");
     assert.equal(winners[0]!.delivery_status, "delivering");
     assert.ok(winners[0]!.claimed_at);
+    assert.ok(winners[0]!.claim_token);
+    assert.ok((winners[0]!.claim_version ?? 0) >= 1);
 
     // Second claim while lease is live still loses.
     const again = await store.claimMcpApprovalOutboxDelivery(txId);
@@ -228,7 +232,7 @@ test("stale delivering claim can be reclaimed after lease expiry", async () => {
   // Memory: backdate claimed_at directly (no sleep).
   {
     const store = new MemoryStore();
-    const { txId } = await beginAndClaim(store, "mem_stale");
+    const { txId, claimed: first } = await beginAndClaim(store, "mem_stale");
     const row = store.mcpApprovalOutbox.get(txId)!;
     row.claimed_at = new Date(
       Date.now() - MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS - 1_000,
@@ -241,12 +245,19 @@ test("stale delivering claim can be reclaimed after lease expiry", async () => {
     assert.ok(reclaimed!.claimed_at);
     const claimedMs = Date.parse(reclaimed!.claimed_at!);
     assert.ok(Date.now() - claimedMs < 5_000, "claimed_at refreshed on reclaim");
+    assert.ok(reclaimed!.claim_token);
+    assert.notEqual(reclaimed!.claim_token, first.claim_token, "reclaim issues new token");
+    assert.equal(
+      reclaimed!.claim_version,
+      (first.claim_version ?? 0) + 1,
+      "reclaim increments version",
+    );
   }
 
   // SQL: backdate claimed_at via UPDATE.
   {
     const { db, store } = openSql();
-    const { txId } = await beginAndClaim(store, "sql_stale");
+    const { txId, claimed: first } = await beginAndClaim(store, "sql_stale");
     const staleTs = new Date(
       Date.now() - MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS - 1_000,
     ).toISOString();
@@ -259,6 +270,9 @@ test("stale delivering claim can be reclaimed after lease expiry", async () => {
     assert.equal(reclaimed!.delivery_status, "delivering");
     const claimedMs = Date.parse(reclaimed!.claimed_at!);
     assert.ok(Date.now() - claimedMs < 5_000);
+    assert.ok(reclaimed!.claim_token);
+    assert.notEqual(reclaimed!.claim_token, first.claim_token);
+    assert.equal(reclaimed!.claim_version, (first.claim_version ?? 0) + 1);
   }
 });
 

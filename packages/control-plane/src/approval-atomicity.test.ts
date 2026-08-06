@@ -337,8 +337,15 @@ test("pending→delivering claim: only one concurrent route; loser gets authorit
     assert.equal(body.operation_id, opId);
     assert.equal(deliveries.length, 0);
 
-    // Winner finalizes once.
-    const updated = await store.finalizeMcpApprovalDelivery(txId);
+    // Winner finalizes once (must present claim owner token/version).
+    const winner = claims.find(Boolean)!;
+    assert.ok(winner.claim_token);
+    assert.ok((winner.claim_version ?? 0) >= 1);
+    const updated = await store.finalizeMcpApprovalDelivery(
+      txId,
+      winner.claim_token!,
+      winner.claim_version!,
+    );
     assert.ok(updated);
     assert.equal(updated!.status, "pending");
     const box = await store.getMcpApprovalOutbox(txId);
@@ -493,6 +500,8 @@ test("finalize does not overwrite fast terminal op result", async () => {
     assert.ok(started);
     const claimed = await store.claimMcpApprovalOutboxDelivery(txId);
     assert.ok(claimed);
+    assert.ok(claimed!.claim_token);
+    assert.ok((claimed!.claim_version ?? 0) >= 1);
 
     // Fast device result lands before finalize.
     const terminal = await store.updateMcpOperation(
@@ -507,7 +516,11 @@ test("finalize does not overwrite fast terminal op result", async () => {
     );
     assert.equal(terminal?.status, "success");
 
-    const finalized = await store.finalizeMcpApprovalDelivery(txId);
+    const finalized = await store.finalizeMcpApprovalDelivery(
+      txId,
+      claimed!.claim_token!,
+      claimed!.claim_version!,
+    );
     assert.ok(finalized);
     assert.equal(finalized!.status, "success", "must keep fast terminal status");
     assert.equal(finalized!.summary, "device finished early");

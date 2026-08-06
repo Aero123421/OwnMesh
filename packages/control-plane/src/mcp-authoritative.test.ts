@@ -820,8 +820,9 @@ test("cancel owner path updates store and is CAS-safe", async () => {
     { tracker: new OperationTracker() },
   );
   const body = (await res.json()) as { result: { structuredContent: { status: string } } };
-  assert.equal(body.result.structuredContent.status, "cancelled");
-  assert.equal((await store.getMcpOperation(opId))?.status, "cancelled");
+  // Device-bound cancel only advances to cancel_requested after successful route.
+  assert.equal(body.result.structuredContent.status, "cancel_requested");
+  assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
   assert.ok(routed[0]?.includes("ownmesh_cancel_operation"));
 
   // Second cancel: not cancellable

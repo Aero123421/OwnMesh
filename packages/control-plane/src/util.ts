@@ -188,27 +188,27 @@ export const INTERNAL_CONTEXT_TTL_MS = 30_000;
 export const INTERNAL_CONTEXT_REPLAY_MAX = 4096;
 
 /**
- * Drop expired nonce→expMs entries and enforce max size (insertion-order FIFO).
+ * Drop expired nonce→expMs entries only (TTL prune).
+ * Does not evict live entries for capacity — callers must reject inserts when full.
  * Shared by process-local InternalContextReplayGuard and Durable Object room state.
+ *
+ * `max` is retained for call-site compatibility and is intentionally unused:
+ * capacity is enforced by refusing new nonces in rememberNonceInMap, not by FIFO eviction.
  */
 export function pruneNonceExpMap(
   seen: Map<string, number>,
   nowMs: number = Date.now(),
-  max: number = INTERNAL_CONTEXT_REPLAY_MAX,
+  _max: number = INTERNAL_CONTEXT_REPLAY_MAX,
 ): void {
   for (const [nonce, exp] of seen) {
     if (exp < nowMs) seen.delete(nonce);
   }
-  while (seen.size > max) {
-    const oldest = seen.keys().next().value;
-    if (oldest === undefined) break;
-    seen.delete(oldest);
-  }
 }
 
 /**
- * Record nonce if unseen. Returns true when fresh; false on replay.
- * Prunes expired entries first and enforces `max`.
+ * Record nonce if unseen. Returns true when fresh; false on replay or when at capacity.
+ * Prunes expired entries first. When still at/over `max`, rejects the new nonce
+ * without deleting any live (unexpired) entries — never opens a replay window via eviction.
  */
 export function rememberNonceInMap(
   seen: Map<string, number>,
@@ -219,10 +219,7 @@ export function rememberNonceInMap(
 ): boolean {
   pruneNonceExpMap(seen, nowMs, max);
   if (seen.has(nonce)) return false;
-  if (seen.size >= max) {
-    const oldest = seen.keys().next().value;
-    if (oldest !== undefined) seen.delete(oldest);
-  }
+  if (seen.size >= max) return false;
   seen.set(nonce, expMs);
   return true;
 }
@@ -247,14 +244,15 @@ export class InternalContextReplayGuard {
     this.seen.clear();
   }
 
-  /** Drop entries whose exp has passed. */
+  /** Drop entries whose exp has passed (no live-entry eviction). */
   prune(nowMs: number = Date.now()): void {
     pruneNonceExpMap(this.seen, nowMs, INTERNAL_CONTEXT_REPLAY_MAX);
   }
 
   /**
-   * Record nonce if unseen. Returns true when fresh; false on replay.
-   * Prunes expired entries first and enforces INTERNAL_CONTEXT_REPLAY_MAX.
+   * Record nonce if unseen. Returns true when fresh; false on replay or capacity.
+   * Prunes expired entries first; rejects new nonces at INTERNAL_CONTEXT_REPLAY_MAX
+   * without evicting live entries.
    */
   remember(nonce: string, expMs: number, nowMs: number = Date.now()): boolean {
     return rememberNonceInMap(this.seen, nonce, expMs, nowMs, INTERNAL_CONTEXT_REPLAY_MAX);

@@ -219,6 +219,10 @@ export type McpApprovalOutbox = {
   delivered_at?: string | null;
   /** ISO timestamp when exclusive delivering claim was taken (lease start). */
   claimed_at?: string | null;
+  /** Opaque owner token issued on each successful claim/reclaim. */
+  claim_token?: string | null;
+  /** Monotonic claim generation; increments on each claim/reclaim. */
+  claim_version?: number;
 };
 
 export type BeginMcpApprovalOutboxResult =
@@ -360,18 +364,26 @@ export interface ControlPlaneStore {
   getMcpApprovalOutbox(id: string): Promise<McpApprovalOutbox | null>;
 
   /**
-   * Exclusive claim: pending → delivering (sets claimed_at). Only the claim winner
-   * may route to device. Also allows reclaim when delivery_status=delivering AND
-   * the claim lease (MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS) has expired.
+   * Exclusive claim: pending → delivering (sets claimed_at + claim_token/version).
+   * Only the claim winner may route to device. Also allows reclaim when
+   * delivery_status=delivering AND the claim lease
+   * (MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS) has expired. Each claim/reclaim issues
+   * a fresh random claim_token and increments claim_version (invalidates prior owner).
    * Returns null when missing, live-claimed, delivered, or lost the CAS race.
    */
   claimMcpApprovalOutboxDelivery(id: string): Promise<McpApprovalOutbox | null>;
 
   /**
    * Release exclusive claim after failed route: delivering → pending (retryable).
-   * No-op when not currently delivering.
+   * Requires claim_token + claim_version match (claim owner only).
+   * No-op on mismatch/missing credentials or when not currently delivering.
    */
-  releaseMcpApprovalOutboxClaim(id: string, error?: string): Promise<void>;
+  releaseMcpApprovalOutboxClaim(
+    id: string,
+    claimToken: string,
+    claimVersion: number,
+    error?: string,
+  ): Promise<void>;
 
   /** Record a failed delivery attempt; leaves outbox pending for retry. */
   recordMcpApprovalOutboxAttempt(id: string, error?: string): Promise<void>;
@@ -379,9 +391,14 @@ export interface ControlPlaneStore {
   /**
    * After successful device delivery: CAS operation out of approval_required
    * (never overwrite fast terminal results) and mark outbox delivered.
-   * Requires delivery_status=delivering (post-claim). Exactly-once transition.
+   * Requires delivery_status=delivering and claim owner (token+version match).
+   * Exactly-once transition.
    */
-  finalizeMcpApprovalDelivery(id: string): Promise<McpOperationRecord | null>;
+  finalizeMcpApprovalDelivery(
+    id: string,
+    claimToken: string,
+    claimVersion: number,
+  ): Promise<McpOperationRecord | null>;
 
   /**
    * Fail-closed device gate for MCP create/poll/cancel.
@@ -405,26 +422,90 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required control-plane tables/columns (0003+0004+0005). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0007). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
+    /** 0002 OAuth/device enrollment + migration ledger */
+    oauth_auth_codes: boolean;
+    device_codes: boolean;
+    used_refresh_tokens: boolean;
+    enrollment_challenges: boolean;
+    schema_migrations: boolean;
+    /** 0003 P0 hardening */
     devices_status: boolean;
     revoked_refresh_families: boolean;
     device_credentials: boolean;
     device_verification_transactions: boolean;
+    /** 0004 authorize consent transactions */
     authorize_transactions: boolean;
+    /** 0005 MCP ops + 0006 claimed_at + 0007 claim ownership */
     mcp_operations: boolean;
     mcp_approval_transactions: boolean;
     mcp_approval_outbox: boolean;
   };
 };
 
-/** 0003/0004/0005 objects probed by schemaReadiness (table → required columns). */
+/** Objects probed by schemaReadiness (table → required columns + indexes). */
 const SCHEMA_READINESS_OBJECTS: Record<
   keyof SchemaReadiness["checks"],
-  { table: string; columns: string[] }
+  { table: string; columns: string[]; indexes?: string[] }
 > = {
+  oauth_auth_codes: {
+    table: "oauth_auth_codes",
+    columns: [
+      "code_hash",
+      "client_id",
+      "principal_id",
+      "redirect_uri",
+      "scope",
+      "code_challenge",
+      "code_challenge_method",
+      "expires_at",
+      "used",
+      "created_at",
+    ],
+    indexes: ["idx_auth_codes_client"],
+  },
+  device_codes: {
+    table: "device_codes",
+    columns: [
+      "device_code_hash",
+      "user_code",
+      "client_id",
+      "scope",
+      "verification_uri",
+      "interval_sec",
+      "expires_at",
+      "status",
+      "principal_id",
+      "last_polled_at",
+      "created_at",
+    ],
+    indexes: ["idx_device_codes_user"],
+  },
+  used_refresh_tokens: {
+    table: "used_refresh_tokens",
+    columns: ["refresh_token_hash", "refresh_family", "used_at"],
+    indexes: ["idx_used_refresh_family"],
+  },
+  enrollment_challenges: {
+    table: "enrollment_challenges",
+    columns: [
+      "id",
+      "device_id",
+      "nonce",
+      "message",
+      "expires_at",
+      "consumed",
+      "created_at",
+    ],
+    indexes: ["idx_enroll_device"],
+  },
+  schema_migrations: {
+    table: "schema_migrations",
+    columns: ["id", "applied_at"],
+  },
   devices_status: { table: "devices", columns: ["status"] },
   revoked_refresh_families: {
     table: "revoked_refresh_families",
@@ -442,6 +523,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "revoked",
       "created_at",
     ],
+    indexes: ["idx_device_credentials_device"],
   },
   device_verification_transactions: {
     table: "device_verification_transactions",
@@ -456,6 +538,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "consumed",
       "created_at",
     ],
+    indexes: ["idx_device_verification_user"],
   },
   authorize_transactions: {
     table: "authorize_transactions",
@@ -474,6 +557,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "consumed",
       "created_at",
     ],
+    indexes: ["idx_authorize_tx_principal", "idx_authorize_tx_expires"],
   },
   mcp_operations: {
     table: "mcp_operations",
@@ -497,6 +581,12 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "created_at",
       "updated_at",
     ],
+    indexes: [
+      "idx_mcp_ops_principal_tenant",
+      "idx_mcp_ops_device",
+      "idx_mcp_ops_correlation",
+      "idx_mcp_ops_updated",
+    ],
   },
   mcp_approval_transactions: {
     table: "mcp_approval_transactions",
@@ -512,6 +602,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "decision",
       "created_at",
     ],
+    indexes: ["idx_mcp_apr_op", "idx_mcp_apr_principal", "idx_mcp_apr_expires"],
   },
   mcp_approval_outbox: {
     table: "mcp_approval_outbox",
@@ -529,7 +620,10 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "created_at",
       "delivered_at",
       "claimed_at",
+      "claim_token",
+      "claim_version",
     ],
+    indexes: ["idx_mcp_outbox_op", "idx_mcp_outbox_status"],
   },
 };
 
@@ -1095,6 +1189,8 @@ export class MemoryStore implements ControlPlaneStore {
       created_at: nowIso(),
       delivered_at: null,
       claimed_at: null,
+      claim_token: null,
+      claim_version: 0,
     };
     this.mcpApprovalOutbox.set(id, outbox);
     return { status: "created", outbox: { ...outbox }, tx: { ...tx } };
@@ -1114,11 +1210,16 @@ export class MemoryStore implements ControlPlaneStore {
     if (!row || !isValidOutboxDecision(row.decision)) return null;
     const now = Date.now();
     const claimTs = nowIso();
-    if (row.delivery_status === "pending") {
+    const issueClaim = () => {
       row.delivery_status = "delivering";
       row.claimed_at = claimTs;
+      row.claim_token = randomToken("clm_");
+      row.claim_version = (Number(row.claim_version) || 0) + 1;
       this.mcpApprovalOutbox.set(id, row);
       return { ...row };
+    };
+    if (row.delivery_status === "pending") {
+      return issueClaim();
     }
     if (row.delivery_status === "delivering") {
       // Stale reclaim only when lease expired (or claimed_at missing/unparseable).
@@ -1127,39 +1228,49 @@ export class MemoryStore implements ControlPlaneStore {
         !Number.isFinite(claimedMs) ||
         now - claimedMs >= MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS;
       if (!leaseExpired) return null;
-      row.claimed_at = claimTs;
-      this.mcpApprovalOutbox.set(id, row);
-      return { ...row };
+      return issueClaim();
     }
     return null;
   }
 
-  async releaseMcpApprovalOutboxClaim(id: string, error?: string): Promise<void> {
+  async releaseMcpApprovalOutboxClaim(
+    id: string,
+    claimToken: string,
+    claimVersion: number,
+    error?: string,
+  ): Promise<void> {
     const row = this.mcpApprovalOutbox.get(id);
     if (!row || row.delivery_status !== "delivering") return;
+    if (!claimToken || row.claim_token !== claimToken) return;
+    if (Number(row.claim_version) !== Number(claimVersion)) return;
     row.delivery_status = "pending";
     row.attempts += 1;
     row.last_error = error ?? row.last_error ?? null;
     row.claimed_at = null;
+    row.claim_token = null;
     this.mcpApprovalOutbox.set(id, row);
   }
 
   async recordMcpApprovalOutboxAttempt(id: string, error?: string): Promise<void> {
     const row = this.mcpApprovalOutbox.get(id);
     if (!row) return;
-    if (row.delivery_status === "delivering") {
-      await this.releaseMcpApprovalOutboxClaim(id, error);
-      return;
-    }
+    // Delivering claims must be released via releaseMcpApprovalOutboxClaim (owner token).
+    if (row.delivery_status === "delivering") return;
     if (row.delivery_status !== "pending") return;
     row.attempts += 1;
     row.last_error = error ?? row.last_error ?? null;
     this.mcpApprovalOutbox.set(id, row);
   }
 
-  async finalizeMcpApprovalDelivery(id: string): Promise<McpOperationRecord | null> {
+  async finalizeMcpApprovalDelivery(
+    id: string,
+    claimToken: string,
+    claimVersion: number,
+  ): Promise<McpOperationRecord | null> {
     const outbox = this.mcpApprovalOutbox.get(id);
     if (!outbox || outbox.delivery_status !== "delivering") return null;
+    if (!claimToken || outbox.claim_token !== claimToken) return null;
+    if (Number(outbox.claim_version) !== Number(claimVersion)) return null;
     if (!isValidOutboxDecision(outbox.decision)) return null;
 
     const nextStatus = outbox.decision === "approve" ? "pending" : "denied";
@@ -1237,17 +1348,10 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async schemaReadiness(): Promise<SchemaReadiness> {
-    // In-memory store always carries the full logical 0003+0004+0005 schema.
-    const checks: SchemaReadiness["checks"] = {
-      devices_status: true,
-      revoked_refresh_families: true,
-      device_credentials: true,
-      device_verification_transactions: true,
-      authorize_transactions: true,
-      mcp_operations: true,
-      mcp_approval_transactions: true,
-      mcp_approval_outbox: true,
-    };
+    // In-memory store always carries the full logical 0002–0007 schema.
+    const checks = Object.fromEntries(
+      Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, true]),
+    ) as SchemaReadiness["checks"];
     return { schema_ready: true, checks };
   }
 }
@@ -2575,7 +2679,7 @@ export class SqlStore implements ControlPlaneStore {
         .prepare(
           `SELECT id, operation_id, principal_id, tenant_id, device_id, decision,
                   correlation_id, delivery_status, attempts, last_error,
-                  created_at, delivered_at, claimed_at
+                  created_at, delivered_at, claimed_at, claim_token, claim_version
            FROM mcp_approval_outbox WHERE id = ?`,
         )
         .bind(id)
@@ -2776,15 +2880,19 @@ export class SqlStore implements ControlPlaneStore {
 
   async claimMcpApprovalOutboxDelivery(id: string): Promise<McpApprovalOutbox | null> {
     const claimTs = nowIso();
+    const claimToken = randomToken("clm_");
     const leaseCutoff = new Date(
       Date.now() - MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS,
     ).toISOString();
     // pending → delivering, or stale delivering (lease expired / missing claimed_at).
+    // Fresh claim_token + claim_version++ invalidates any prior owner.
     const result = await this.db
       .prepare(
         `UPDATE mcp_approval_outbox
          SET delivery_status = 'delivering',
-             claimed_at = ?
+             claimed_at = ?,
+             claim_token = ?,
+             claim_version = COALESCE(claim_version, 0) + 1
          WHERE id = ?
            AND decision IN ('approve', 'deny')
            AND (
@@ -2795,39 +2903,36 @@ export class SqlStore implements ControlPlaneStore {
              )
            )`,
       )
-      .bind(claimTs, id, leaseCutoff)
+      .bind(claimTs, claimToken, id, leaseCutoff)
       .run();
     if (sqlChanges(result) < 1) return null;
     return this.getMcpApprovalOutbox(id);
   }
 
-  async releaseMcpApprovalOutboxClaim(id: string, error?: string): Promise<void> {
+  async releaseMcpApprovalOutboxClaim(
+    id: string,
+    claimToken: string,
+    claimVersion: number,
+    error?: string,
+  ): Promise<void> {
+    if (!claimToken || !Number.isFinite(Number(claimVersion))) return;
     await this.db
       .prepare(
         `UPDATE mcp_approval_outbox
          SET delivery_status = 'pending',
              attempts = attempts + 1,
              last_error = ?,
-             claimed_at = NULL
-         WHERE id = ? AND delivery_status = 'delivering'`,
+             claimed_at = NULL,
+             claim_token = NULL
+         WHERE id = ? AND delivery_status = 'delivering'
+           AND claim_token = ? AND claim_version = ?`,
       )
-      .bind(error ?? null, id)
+      .bind(error ?? null, id, claimToken, Number(claimVersion))
       .run();
   }
 
   async recordMcpApprovalOutboxAttempt(id: string, error?: string): Promise<void> {
-    const release = await this.db
-      .prepare(
-        `UPDATE mcp_approval_outbox
-         SET delivery_status = 'pending',
-             attempts = attempts + 1,
-             last_error = ?,
-             claimed_at = NULL
-         WHERE id = ? AND delivery_status = 'delivering'`,
-      )
-      .bind(error ?? null, id)
-      .run();
-    if (sqlChanges(release) > 0) return;
+    // Delivering claims must be released via releaseMcpApprovalOutboxClaim (owner token).
     await this.db
       .prepare(
         `UPDATE mcp_approval_outbox
@@ -2838,9 +2943,16 @@ export class SqlStore implements ControlPlaneStore {
       .run();
   }
 
-  async finalizeMcpApprovalDelivery(id: string): Promise<McpOperationRecord | null> {
+  async finalizeMcpApprovalDelivery(
+    id: string,
+    claimToken: string,
+    claimVersion: number,
+  ): Promise<McpOperationRecord | null> {
+    if (!claimToken || !Number.isFinite(Number(claimVersion))) return null;
     const outbox = await this.getMcpApprovalOutbox(id);
     if (!outbox || outbox.delivery_status !== "delivering") return null;
+    if (outbox.claim_token !== claimToken) return null;
+    if (Number(outbox.claim_version) !== Number(claimVersion)) return null;
 
     const nextStatus = outbox.decision === "approve" ? "pending" : "denied";
     const op = await this.getMcpOperation(outbox.operation_id);
@@ -2863,24 +2975,41 @@ export class SqlStore implements ControlPlaneStore {
 
     type BatchResult = { meta?: { changes?: number }; success?: boolean };
 
-    // Transactional finalize: conditional op CAS + outbox mark (never clobber terminal).
+    // Transactional finalize: owner-gated outbox mark + conditional op CAS.
+    // Op CAS is gated on current claim ownership so mismatch leaves no state change.
     const batchResults = await this.db.batch<BatchResult>([
       this.db
         .prepare(
           `UPDATE mcp_operations SET
              status = ?, summary = ?, data_json = ?, approval_required = 0,
              approval_id = ?, updated_at = ?
-           WHERE operation_id = ? AND status = 'approval_required'`,
+           WHERE operation_id = ? AND status = 'approval_required'
+             AND EXISTS (
+               SELECT 1 FROM mcp_approval_outbox o
+               WHERE o.id = ? AND o.delivery_status = 'delivering'
+                 AND o.claim_token = ? AND o.claim_version = ?
+             )`,
         )
-        .bind(nextStatus, summary, JSON.stringify(nextData), outbox.id, ts, outbox.operation_id),
+        .bind(
+          nextStatus,
+          summary,
+          JSON.stringify(nextData),
+          outbox.id,
+          ts,
+          outbox.operation_id,
+          id,
+          claimToken,
+          Number(claimVersion),
+        ),
       this.db
         .prepare(
           `UPDATE mcp_approval_outbox
            SET delivery_status = 'delivered', delivered_at = ?, attempts = attempts + 1,
                last_error = NULL
-           WHERE id = ? AND delivery_status = 'delivering'`,
+           WHERE id = ? AND delivery_status = 'delivering'
+             AND claim_token = ? AND claim_version = ?`,
         )
-        .bind(ts, id),
+        .bind(ts, id, claimToken, Number(claimVersion)),
     ]);
 
     if (sqlChanges(batchResults[1]) < 1) {
@@ -2949,11 +3078,14 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Probe 0003+0004+0005 tables and all required columns via SELECT projections.
-   * Compatible with D1 (no PRAGMA dependency).
+   * Probe 0002–0007 tables, required columns (SELECT projections), and indexes
+   * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {
-    const probe = async (table: string, columns: string[]): Promise<boolean> => {
+    const probeTable = async (
+      table: string,
+      columns: string[],
+    ): Promise<boolean> => {
       try {
         // Throws when the table is missing or any listed column is absent.
         await this.db
@@ -2965,21 +3097,43 @@ export class SqlStore implements ControlPlaneStore {
       }
     };
 
-    const checks = {
-      devices_status: false,
-      revoked_refresh_families: false,
-      device_credentials: false,
-      device_verification_transactions: false,
-      authorize_transactions: false,
-      mcp_operations: false,
-      mcp_approval_transactions: false,
-      mcp_approval_outbox: false,
-    } as SchemaReadiness["checks"];
+    const probeIndex = async (indexName: string): Promise<boolean> => {
+      try {
+        const row = await this.db
+          .prepare(
+            `SELECT 1 AS ok FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1`,
+          )
+          .bind(indexName)
+          .first<{ ok: number }>();
+        return row != null;
+      } catch {
+        return false;
+      }
+    };
+
+    const checks = Object.fromEntries(
+      Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, false]),
+    ) as SchemaReadiness["checks"];
 
     for (const [key, spec] of Object.entries(SCHEMA_READINESS_OBJECTS) as Array<
-      [keyof SchemaReadiness["checks"], { table: string; columns: string[] }]
+      [
+        keyof SchemaReadiness["checks"],
+        { table: string; columns: string[]; indexes?: string[] },
+      ]
     >) {
-      checks[key] = await probe(spec.table, spec.columns);
+      const tableOk = await probeTable(spec.table, spec.columns);
+      if (!tableOk) {
+        checks[key] = false;
+        continue;
+      }
+      let indexesOk = true;
+      for (const idx of spec.indexes ?? []) {
+        if (!(await probeIndex(idx))) {
+          indexesOk = false;
+          break;
+        }
+      }
+      checks[key] = indexesOk;
     }
 
     return {
@@ -3025,6 +3179,8 @@ function rowToMcpApprovalOutbox(row: Record<string, unknown>): McpApprovalOutbox
     created_at: String(row.created_at),
     delivered_at: row.delivered_at == null ? null : String(row.delivered_at),
     claimed_at: row.claimed_at == null ? null : String(row.claimed_at),
+    claim_token: row.claim_token == null ? null : String(row.claim_token),
+    claim_version: Number(row.claim_version || 0),
   };
 }
 
