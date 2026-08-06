@@ -16,15 +16,19 @@ pub fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {
         DeviceCmd::Enroll => run_enroll(cli),
         DeviceCmd::List => run_list(cli),
         DeviceCmd::Show { id } => run_show(cli, id),
-        DeviceCmd::Rename { id, name } => unsupported(
+        DeviceCmd::Rename { id, name } => super::unsupported(
             cli,
-            "device_rename_not_supported",
-            &format!("rename of {id} -> {name} is not exposed by the control plane yet"),
+            "device rename",
+            &format!(
+                "device_rename_not_supported: rename of {id} -> {name} is not exposed by the control plane yet"
+            ),
         ),
-        DeviceCmd::Labels { id, labels } => unsupported(
+        DeviceCmd::Labels { id, labels } => super::unsupported(
             cli,
-            "device_labels_not_supported",
-            &format!("labels for {id}: {labels:?} not exposed by control plane yet"),
+            "device labels",
+            &format!(
+                "device_labels_not_supported: labels for {id}: {labels:?} not exposed by control plane yet"
+            ),
         ),
         DeviceCmd::RotateKey => run_rotate_key(cli),
         DeviceCmd::Revoke { id } => run_revoke(cli, id),
@@ -316,21 +320,4 @@ fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
             eprintln!("failed to start async runtime: {err}");
             ExitCode::Internal
         })
-}
-
-fn unsupported(cli: &Cli, code: &str, message: &str) -> Result<(), ExitCode> {
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "error": code,
-                "message": message,
-            })
-        );
-    } else {
-        eprintln!("ownmesh: {message}");
-    }
-    Err(ExitCode::ProfileUnavailable)
 }

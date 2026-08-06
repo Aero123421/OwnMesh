@@ -11,6 +11,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ERRORS: list[str] = []
 
+# Step list form (`- uses:`) and mapping form (`uses:` under a named step).
+# Local reusable workflow / action refs start with ./ and are exempt from SHA pins.
+_USES_LINE_RE = re.compile(r"(?m)^[ \t]*(?:-\s+)?uses:\s*([^\s#]+)")
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 
 def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
@@ -34,7 +39,46 @@ def job_block(workflow: str, job_id: str) -> str:
     return match.group(1) if match else ""
 
 
+def find_action_uses(workflow_text: str) -> list[str]:
+    """Return every `uses:` ref in workflow YAML (step- and job-level)."""
+    return _USES_LINE_RE.findall(workflow_text)
+
+
+def rust_string_registry(source: str, const_name: str) -> list[str] | None:
+    """Extract an ordered Rust ``&[&str]`` registry by constant name."""
+    match = re.search(
+        rf"pub const {re.escape(const_name)}: &\[&str\] = &\[(.*?)\];",
+        source,
+        re.DOTALL,
+    )
+    if match is None:
+        return None
+    return re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', match.group(1))
+
+
+def find_mutable_action_pins(workflow_text: str) -> list[str]:
+    """Return external action refs not pinned to a full 40-char lowercase commit SHA.
+
+    Local refs (starting with ``./``) are excluded. Everything else must be
+    ``owner/name[@/path]@<40-hex-sha>`` — tags, branches, short SHAs, and bare
+    action names are rejected.
+    """
+    mutable: list[str] = []
+    for ref in find_action_uses(workflow_text):
+        if ref.startswith("./"):
+            continue
+        if "@" not in ref:
+            mutable.append(ref)
+            continue
+        _action, pin = ref.rsplit("@", 1)
+        if not _FULL_SHA_RE.fullmatch(pin):
+            mutable.append(ref)
+    return mutable
+
+
 def main() -> int:
+    ERRORS.clear()
+
     manifest = json.loads(read("release/SUPPORTED_SURFACES.json"))
     surfaces = manifest.get("explicit_unsupported_surfaces", [])
     expected = manifest.get("explicit_unsupported_count")
@@ -49,20 +93,24 @@ def main() -> int:
     )
 
     commands = read("crates/ownmesh/src/commands/mod.rs")
-    registry_match = re.search(
-        r"pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &\[&str\] = &\[(.*?)\];",
-        commands,
-        re.DOTALL,
-    )
-    require(registry_match is not None, "canonical Rust unsupported-surface registry is missing")
-    registry = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', registry_match.group(1)) if registry_match else []
+    registry = rust_string_registry(commands, "EXPLICIT_UNSUPPORTED_CLI_SURFACES")
+    additional_registry = rust_string_registry(commands, "ADDITIONAL_UNSUPPORTED_CLI_SURFACES")
+    require(registry is not None, "canonical Rust explicit unsupported-surface registry is missing")
+    require(additional_registry is not None, "canonical Rust additional unsupported-surface registry is missing")
+    registry = registry or []
+    additional_registry = additional_registry or []
     require(
         registry == surfaces,
         "manifest explicit unsupported surfaces must exactly match the ordered Rust registry",
     )
     require(
-        "EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands,
-        "runtime unsupported helper must validate commands against the canonical registry",
+        additional_registry == additional,
+        "manifest additional unsupported surfaces must exactly match the ordered Rust registry",
+    )
+    require(
+        "EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands
+        and "ADDITIONAL_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands,
+        "runtime unsupported helper must validate commands against both canonical registries",
     )
     approval_source = read("crates/ownmesh/src/commands/approval.rs")
     dispatched = re.findall(r'\bstub\(\s*cli,\s*"([^"]+)"', commands)
@@ -74,7 +122,21 @@ def main() -> int:
         "every canonical unsupported surface must have exactly one literal dispatch call",
     )
 
+    device_source = read("crates/ownmesh/src/commands/device_cmd.rs")
     exec_source = read("crates/ownmesh/src/commands/exec.rs")
+    session_source = read("crates/ownmesh/src/commands/session_cmd.rs")
+    policy_source = read("crates/ownmesh/src/commands/policy_cmd.rs")
+    broker_cli = read("crates/ownmesh/src/commands/privileged.rs")
+    additional_dispatched = re.findall(
+        r'\bsuper::unsupported\(\s*cli,\s*"([^"]+)"', device_source
+    )
+    for source in (exec_source, session_source, policy_source, broker_cli):
+        additional_dispatched += re.findall(r'\bsuper::unsupported_exit\("([^"]+)"\)', source)
+    require(
+        set(additional_dispatched) == set(additional_registry),
+        "every additional registry surface must map to a real hard-error handler, and no arbitrary string may pass",
+    )
+
     device_guard = exec_source.find("if let Some(device) = &args.device")
     daemon_call = exec_source.find("let value = call_local_daemon")
     require(0 <= device_guard < daemon_call, "exec --device must be rejected before local IPC")
@@ -83,7 +145,6 @@ def main() -> int:
     require("using local daemon" not in exec_source, "exec --device still advertises local fallback")
 
     broker_install = read("crates/ownmesh-broker/src/install.rs")
-    broker_cli = read("crates/ownmesh/src/commands/privileged.rs")
     require_text(broker_install, 'installed: false', "broker install fail-closed marker")
     require_text(broker_install, "no native service was activated or verified", "broker install hard error")
     require_text(broker_install, "native service absence cannot be verified", "broker uninstall hard error")
@@ -91,33 +152,32 @@ def main() -> int:
     require('"installed": true' not in broker_cli, "CLI must not synthesize installed=true")
     require_text(broker_cli, "native service absence is not independently verified", "broker CLI uninstall hard error")
 
-    device_source = read("crates/ownmesh/src/commands/device_cmd.rs")
     require_text(device_source, "device_rename_not_supported", "device rename contract")
     require_text(device_source, "device_labels_not_supported", "device labels contract")
-    policy_source = read("crates/ownmesh/src/commands/policy_cmd.rs")
     policy_rule = policy_source[policy_source.find("PolicyCmd::Rule"):policy_source.find("PolicyCmd::Validate")]
     require_text(policy_rule, '"status": "not_implemented"', "policy mutation JSON contract")
-    require_text(policy_rule, "Err(ExitCode::ProfileUnavailable)", "policy mutation hard-error contract")
+    require_text(policy_rule, 'super::unsupported_exit("policy rule mutation")', "policy mutation hard-error contract")
     approval_watch = approval_source[approval_source.find("ApprovalCmd::Watch"):]
     require_text(approval_watch, '"approval watch"', "approval watch contract")
     require_text(approval_watch, "super::unsupported", "approval watch hard-error contract")
     require("call_daemon" not in approval_watch, "approval watch must not silently perform a one-shot list")
 
-    session_source = read("crates/ownmesh/src/commands/session_cmd.rs")
     session_guard = session_source.find("device: Some(device)")
     session_call = session_source.find('call_local_daemon(\n                "session.open"')
     require(0 <= session_guard < session_call, "remote session target must fail before local IPC")
-    require("Err(ExitCode::ProfileUnavailable)" in session_source[session_guard:session_call],
-            "remote session target must return a hard error")
+    require('super::unsupported_exit("session open <device>")' in session_source[session_guard:session_call],
+            "remote session target must return a registry-backed hard error")
 
     ci = read(".github/workflows/ci.yml")
     security = read(".github/workflows/security.yml")
     release = read(".github/workflows/release.yml")
-    workflows = ci + security + release
+    workflow_dir = ROOT / ".github/workflows"
+    workflow_paths = sorted([*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")])
+    workflows = "\n".join(path.read_text(encoding="utf-8") for path in workflow_paths)
     require("1.85" not in workflows, "workflow toolchains must not reference Rust 1.85")
     require("continue-on-error" not in workflows, "required workflow jobs cannot continue on error")
     require("|| true" not in workflows, "workflow validation cannot discard failures")
-    mutable_uses = re.findall(r"(?m)^\s*uses:\s*([^\s]+)@(?![0-9a-f]{40}(?:\s|$))([^\s#]+)", workflows)
+    mutable_uses = find_mutable_action_pins(workflows)
     require(not mutable_uses, f"all external Actions must use immutable commit SHAs: {mutable_uses}")
     require("@master" not in workflows and "@main" not in workflows, "mutable action branches are forbidden")
     require("pnpm dlx @cyclonedx/cdxgen@11.0.1" in security, "cdxgen must be version-pinned")
@@ -172,6 +232,47 @@ def main() -> int:
             f'grep -Fxq "ownmesh-${{GITHUB_REF_NAME}}-${{platform}}/{packaged_file}"',
             "Published archive metadata validation",
         )
+    # Checkout must drop credentials; every build/publish checkout needs the flag.
+    release_jobs = build_job + "\n" + publish_job
+    checkout_count = len(re.findall(r"(?m)^\s*- uses:\s*actions/checkout@[0-9a-f]{40}", release_jobs))
+    secure_checkout_count = len(
+        re.findall(
+            r"(?m)^(?P<i>\s*)- uses:\s*actions/checkout@[0-9a-f]{40}[^\n]*\n"
+            r"(?P=i)  with:\n(?P=i)    persist-credentials:\s*false\s*$",
+            release_jobs,
+        )
+    )
+    require(checkout_count >= 2, "Release build/publish must checkout the repository")
+    require(
+        secure_checkout_count == checkout_count,
+        "Every release build/publish checkout must set persist-credentials: false",
+    )
+    # Publish permissions stay narrowly scoped (no expansion beyond the three writes).
+    require_text(publish_job, "contents: write", "Release publish permissions")
+    require_text(publish_job, "attestations: write", "Release publish permissions")
+    require_text(publish_job, "id-token: write", "Release publish permissions")
+    pub_perm_match = re.search(r"(?ms)^    permissions:\n((?:      \S[^\n]*\n)+)", publish_job)
+    require(pub_perm_match is not None, "Release publish must declare explicit permissions")
+    if pub_perm_match is not None:
+        perm_keys = set(re.findall(r"^      ([a-z-]+):", pub_perm_match.group(1), re.MULTILINE))
+        require(
+            perm_keys == {"contents", "attestations", "id-token"},
+            "Release publish permissions must stay exactly "
+            f"contents/attestations/id-token, got {sorted(perm_keys)}",
+        )
+    # Publish must verify the five required binaries inside each platform archive.
+    require_text(
+        publish_job,
+        "for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do",
+        "Published archive binary validation",
+    )
+    require_text(
+        publish_job,
+        'grep -Fxq "ownmesh-${GITHUB_REF_NAME}-${platform}/${binary}${ext}" "${listing}"',
+        "Published archive binary validation",
+    )
+    require_text(publish_job, 'ext=".exe"', "Published archive Windows binary extension")
+    require_text(build_job, "binary_extension: .exe", "Release Windows binary extension")
     require_text(
         publish_job,
         "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",

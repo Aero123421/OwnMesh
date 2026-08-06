@@ -34,7 +34,7 @@ fn run_exec_with(
         } else {
             eprintln!("exec: --device routing is not implemented; refusing local execution");
         }
-        return Err(ExitCode::ProfileUnavailable);
+        return Err(super::unsupported_exit("exec --device"));
     }
     let program = args.command[0].clone();
     let rest = args.command[1..].to_vec();

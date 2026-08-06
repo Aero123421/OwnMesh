@@ -2,5 +2,8 @@ OwnMesh
 Copyright 2025-2026 OwnMesh contributors
 
 This product is licensed under the Apache License, Version 2.0.
-Third-party dependency licensing information is available from the CycloneDX
-software bill of materials distributed with each release.
+
+Release artifacts may include CycloneDX 1.5 software bills of materials that
+enumerate a non-empty list of components (each with type and name). Those SBOMs
+are component inventories only; the release SBOM gate does not verify third-party
+license fields or license texts.

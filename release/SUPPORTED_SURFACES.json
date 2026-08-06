@@ -64,12 +64,12 @@
   "additional_unsupported": [
     "device rename",
     "device labels",
-    "exec --device <id> (hard error; never falls back to local)",
-    "session open <device> (hard error; never falls back to local)",
+    "exec --device",
+    "session open <device>",
     "policy rule mutation",
-    "privileged broker install (template preparation cannot claim native service installation)",
-    "privileged broker uninstall (template cleanup cannot claim native service removal)"
+    "privileged broker install",
+    "privileged broker uninstall"
   ],
   "total_unsupported_surfaces": 51,
-  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES registry is authoritative for explicit unsupported dispatch. Every unsupported entry returns a machine-visible hard error. Parser presence, a marker file, or a generated service template is not treated as implementation."
+  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Every unsupported entry returns a machine-visible hard error; unregistered command strings are rejected at runtime. Parser presence, a marker file, or a generated service template is not treated as implementation. Additional surface notes: exec --device never falls back to local; session open <device> never falls back to local; privileged broker install only prepares templates and cannot claim native service installation; privileged broker uninstall only performs template cleanup and cannot claim native service removal."
 }

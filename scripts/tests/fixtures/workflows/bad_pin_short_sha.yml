@@ -1,0 +1,10 @@
+name: bad-pin-short-sha
+on: push
+jobs:
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      # 39 hex chars — one short of a full commit SHA
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af67726
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b

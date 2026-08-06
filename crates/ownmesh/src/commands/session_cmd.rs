@@ -28,17 +28,17 @@ fn dispatch_session_with(
                     json!({
                         "schema_version": 1,
                         "status": "not_implemented",
-                        "command": "session open --device",
+                        "command": "session open <device>",
                         "device": device,
                         "message": "remote session routing is unsupported; local execution refused",
                     })
                 );
             } else {
                 eprintln!(
-                    "session open: remote device {device} is unsupported; refusing local execution"
+                    "session open <device>: remote device {device} is unsupported; refusing local execution"
                 );
             }
-            Err(ExitCode::ProfileUnavailable)
+            Err(super::unsupported_exit("session open <device>"))
         }
         SessionCmd::Open {
             device: None,

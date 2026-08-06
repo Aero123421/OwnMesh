@@ -102,6 +102,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify release surfaces and fail-closed publish graph
         run: python scripts/check_release_quality.py
+      - name: Release-quality checker fixtures and mutation tests
+        run: python scripts/tests/run_release_quality_tests.py
 
   tui-i18n:
     name: TUI i18n completeness

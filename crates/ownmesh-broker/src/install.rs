@@ -4,6 +4,7 @@ use ownmesh_broker_client::{
     broker_endpoint_display, default_broker_endpoint, BrokerEndpoint, TransportKind,
 };
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::{Path, PathBuf};
 
 const INSTALL_FILE: &str = "broker-install.json";
@@ -48,6 +49,76 @@ fn kind_name(k: TransportKind) -> &'static str {
     }
 }
 
+/// Restrict secret file mode to owner read/write only (Unix). Failure must fail install.
+#[cfg(unix)]
+fn apply_secret_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        format!(
+            "failed to set broker secret permissions (0o600) on {}: {e}",
+            path.display()
+        )
+    })
+}
+
+/// Write a newly generated secret and apply restrictive permissions. Permission
+/// failures propagate and abort install (never discarded).
+fn write_new_secret_file(secret_file: &Path) -> Result<(), String> {
+    write_new_secret_file_with(secret_file, |path| {
+        // POSIX mode bits only exist on Unix; non-Unix relies on OS ACLs.
+        #[cfg(unix)]
+        apply_secret_permissions(path)?;
+        #[cfg(not(unix))]
+        let _ = path;
+        Ok(())
+    })
+}
+
+fn write_new_secret_file_with(
+    secret_file: &Path,
+    apply_permissions: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let secret = ownmesh_broker_client::BrokerSecret::generate();
+    std::fs::write(secret_file, secret.as_bytes()).map_err(|e| e.to_string())?;
+    if let Err(permission_error) = apply_permissions(secret_file) {
+        // Do not leave a newly generated secret behind with unverified permissions.
+        return match std::fs::remove_file(secret_file) {
+            Ok(()) => Err(permission_error),
+            Err(cleanup_error) => Err(format!(
+                "{permission_error}; additionally failed to remove insecure secret {}: {cleanup_error}",
+                secret_file.display()
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// Remove a path for template cleanup. Missing files are success; other IO errors are reported.
+fn remove_template_file(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    }
+}
+
+fn push_cleanup_error(errors: &mut Vec<String>, result: Result<(), String>) {
+    if let Err(e) = result {
+        errors.push(e);
+    }
+}
+
+fn format_uninstall_error(cleanup_errors: &[String]) -> String {
+    let mut msg = String::from(
+        "broker service uninstall is unsupported: template cleanup completed, but native service absence cannot be verified",
+    );
+    if !cleanup_errors.is_empty() {
+        msg.push_str("; cleanup errors: ");
+        msg.push_str(&cleanup_errors.join("; "));
+    }
+    msg
+}
+
 /// Install broker metadata + OS unit/service template under `base` (state dir).
 pub fn install_broker(
     base: &Path,
@@ -60,13 +131,7 @@ pub fn install_broker(
     let endpoint = endpoint_override.unwrap_or_else(|| default_broker_endpoint(&runtime));
     let secret_file = dir.join("broker.secret");
     if !secret_file.exists() {
-        let secret = ownmesh_broker_client::BrokerSecret::generate();
-        std::fs::write(&secret_file, secret.as_bytes()).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&secret_file, std::fs::Permissions::from_mode(0o600));
-        }
+        write_new_secret_file(&secret_file)?;
     }
 
     let mut notes = vec![
@@ -94,18 +159,27 @@ pub fn install_broker(
 }
 
 /// Remove install marker and unit templates (does not kill a running broker).
+///
+/// Missing template files are tolerated. Other cleanup IO errors are aggregated into the
+/// returned error message (never silently discarded).
 pub fn uninstall_broker(base: &Path) -> Result<(), String> {
     let dir = broker_dir(base);
-    let _ = std::fs::remove_file(install_path(base));
+    let mut cleanup_errors: Vec<String> = Vec::new();
+
+    push_cleanup_error(
+        &mut cleanup_errors,
+        remove_template_file(&install_path(base)),
+    );
     for name in [
         "ownmesh-broker.service",
         "com.ownmesh.broker.plist",
         "ownmesh-broker-service.xml",
         "README-INSTALL.txt",
     ] {
-        let _ = std::fs::remove_file(dir.join(name));
+        push_cleanup_error(&mut cleanup_errors, remove_template_file(&dir.join(name)));
     }
-    // Keep secret unless explicitly purged — write uninstalled marker.
+
+    // Keep secret unless explicitly purged; write an uninstalled marker.
     let rec = InstallRecord {
         installed: false,
         installed_at_unix: crate::now_unix(),
@@ -115,10 +189,21 @@ pub fn uninstall_broker(base: &Path) -> Result<(), String> {
         secret_file: dir.join("broker.secret").display().to_string(),
         notes: vec!["uninstalled".into()],
     };
-    let _ = std::fs::create_dir_all(&dir);
-    let raw = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
-    std::fs::write(install_path(base), raw).map_err(|e| e.to_string())?;
-    Err("broker service uninstall is unsupported: template cleanup completed, but native service absence cannot be verified".into())
+
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => {
+            let raw = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
+            let marker = install_path(base);
+            if let Err(e) = std::fs::write(&marker, raw) {
+                cleanup_errors.push(format!("write install marker {}: {e}", marker.display()));
+            }
+        }
+        Err(e) => {
+            cleanup_errors.push(format!("create_dir_all {}: {e}", dir.display()));
+        }
+    }
+
+    Err(format_uninstall_error(&cleanup_errors))
 }
 
 /// Read install status.
@@ -293,4 +378,116 @@ fn write_platform_unit_template(
     _notes: &mut Vec<String>,
 ) -> Result<Option<PathBuf>, String> {
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn uninstall_tolerates_missing_templates_without_cleanup_errors() {
+        let dir = tempdir().unwrap();
+        let err = uninstall_broker(dir.path()).unwrap_err();
+        assert!(
+            err.contains("native service absence cannot be verified"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("cleanup errors:"),
+            "missing files must not be reported as cleanup errors: {err}"
+        );
+        // Marker written as uninstalled.
+        assert!(install_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn uninstall_aggregates_cleanup_io_errors() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let broker = broker_dir(base);
+        fs::create_dir_all(&broker).unwrap();
+
+        // remove_file fails with an IO error (not NotFound) when the path is a directory.
+        let blocking = broker.join("ownmesh-broker.service");
+        fs::create_dir_all(&blocking).unwrap();
+        fs::write(blocking.join("keep"), b"x").unwrap();
+
+        let blocking_plist = broker.join("com.ownmesh.broker.plist");
+        fs::create_dir_all(&blocking_plist).unwrap();
+        fs::write(blocking_plist.join("keep"), b"y").unwrap();
+
+        let err = uninstall_broker(base).unwrap_err();
+        assert!(
+            err.contains("native service absence cannot be verified"),
+            "{err}"
+        );
+        assert!(err.contains("cleanup errors:"), "{err}");
+        assert!(err.contains("ownmesh-broker.service"), "{err}");
+        assert!(err.contains("com.ownmesh.broker.plist"), "{err}");
+    }
+
+    #[test]
+    fn write_new_secret_propagates_permission_errors() {
+        let dir = tempdir().unwrap();
+        // A missing parent makes the write fail, and that failure must surface.
+        let missing_parent = dir.path().join("nope").join("broker.secret");
+        let err = write_new_secret_file(&missing_parent).unwrap_err();
+        assert!(!err.is_empty(), "{err}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // chmod helper must surface failures (install uses `?` via write_new_secret_file).
+            let missing = Path::new("/no/such/ownmesh/broker.secret");
+            let err = apply_secret_permissions(missing).unwrap_err();
+            assert!(err.contains("0o600"), "{err}");
+            assert!(err.contains("broker secret permissions"), "{err}");
+
+            // Happy-path: secret is 0o600, install still fail-closes on native verification.
+            let base = tempdir().unwrap();
+            let install_err = install_broker(base.path(), None).unwrap_err();
+            assert!(
+                install_err.contains("no native service was activated or verified"),
+                "{install_err}"
+            );
+            let secret = broker_dir(base.path()).join("broker.secret");
+            assert!(secret.is_file());
+            let mode = fs::metadata(&secret).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "secret mode must be 0o600, got {mode:#o}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_new_secret_propagates_chmod_failure_and_removes_secret() {
+        let dir = tempdir().unwrap();
+        let secret = dir.path().join("broker.secret");
+        let err = write_new_secret_file_with(&secret, |_| Err("chmod denied".into())).unwrap_err();
+        assert!(err.contains("chmod denied"), "{err}");
+        assert!(
+            !secret.exists(),
+            "a secret with unverified permissions must be removed"
+        );
+    }
+
+    #[test]
+    fn format_uninstall_error_includes_aggregated_cleanup() {
+        let msg = format_uninstall_error(&[
+            "remove a: access denied".into(),
+            "remove b: is a directory".into(),
+        ]);
+        assert!(
+            msg.contains("native service absence cannot be verified"),
+            "{msg}"
+        );
+        assert!(msg.contains("cleanup errors:"), "{msg}");
+        assert!(msg.contains("remove a: access denied"), "{msg}");
+        assert!(msg.contains("remove b: is a directory"), "{msg}");
+    }
 }

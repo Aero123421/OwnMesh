@@ -71,6 +71,21 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "mcp serve",
 ];
 
+/// Additional hard-error unsupported surfaces beyond the explicit stub registry.
+///
+/// Each entry is paired with a real dispatch/handler hard-error path (not a
+/// soft fallback). Canonical names only — descriptive notes live in the
+/// release manifest.
+pub const ADDITIONAL_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
+    "device rename",
+    "device labels",
+    "exec --device",
+    "session open <device>",
+    "policy rule mutation",
+    "privileged broker install",
+    "privileged broker uninstall",
+];
+
 /// Dispatch a parsed CLI invocation.
 pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
     match &cli.command {
@@ -267,11 +282,25 @@ fn stub(cli: &Cli, command: &str, detail: &str) -> Result<(), ExitCode> {
     unsupported(cli, command, detail)
 }
 
+pub(crate) fn unsupported_exit(command: &str) -> ExitCode {
+    // Registry membership is enforced in every build (not debug_assert-only).
+    let registered = EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command)
+        || ADDITIONAL_UNSUPPORTED_CLI_SURFACES.contains(&command);
+    if registered {
+        ExitCode::ProfileUnavailable
+    } else {
+        eprintln!(
+            "internal error: unsupported CLI surface is absent from the canonical registry: {command}"
+        );
+        ExitCode::Internal
+    }
+}
+
 pub(crate) fn unsupported(cli: &Cli, command: &str, detail: &str) -> Result<(), ExitCode> {
-    debug_assert!(
-        EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command),
-        "unsupported CLI surface is absent from the canonical registry: {command}"
-    );
+    let exit = unsupported_exit(command);
+    if exit == ExitCode::Internal {
+        return Err(exit);
+    }
     if cli.json {
         println!(
             "{}",
@@ -285,7 +314,7 @@ pub(crate) fn unsupported(cli: &Cli, command: &str, detail: &str) -> Result<(), 
     } else {
         eprintln!("ownmesh {command}: not implemented yet — {detail}");
     }
-    Err(ExitCode::ProfileUnavailable)
+    Err(exit)
 }
 
 fn looks_secret(value: &str) -> bool {
@@ -294,4 +323,113 @@ fn looks_secret(value: &str) -> bool {
         || lower.contains("secret")
         || lower.contains("password")
         || lower.contains("private")
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::{
+        unsupported, unsupported_exit, ADDITIONAL_UNSUPPORTED_CLI_SURFACES,
+        EXPLICIT_UNSUPPORTED_CLI_SURFACES,
+    };
+    use crate::cli::Cli;
+    use clap::Parser;
+    use ownmesh_domain::ExitCode;
+    use serde_json::Value;
+    use std::collections::HashSet;
+
+    fn manifest() -> Value {
+        let raw = include_str!("../../../../release/SUPPORTED_SURFACES.json");
+        serde_json::from_str(raw).expect("SUPPORTED_SURFACES.json must parse")
+    }
+
+    fn string_list<'a>(value: &'a Value, key: &str) -> Vec<&'a str> {
+        value[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} must be an array"))
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .unwrap_or_else(|| panic!("{key} entries must be strings"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn registries_match_supported_surfaces_manifest() {
+        let manifest = manifest();
+        let explicit = string_list(&manifest, "explicit_unsupported_surfaces");
+        let additional = string_list(&manifest, "additional_unsupported");
+
+        assert_eq!(
+            manifest["explicit_unsupported_count"].as_u64(),
+            Some(explicit.len() as u64)
+        );
+        assert_eq!(explicit.len(), 44, "explicit unsupported count must be 44");
+        assert_eq!(
+            additional.len(),
+            7,
+            "additional unsupported count must be 7"
+        );
+        assert_eq!(
+            manifest["total_unsupported_surfaces"].as_u64(),
+            Some((explicit.len() + additional.len()) as u64)
+        );
+        assert_eq!(
+            manifest["total_unsupported_surfaces"].as_u64(),
+            Some(51),
+            "total unsupported count must be 51"
+        );
+
+        assert_eq!(
+            EXPLICIT_UNSUPPORTED_CLI_SURFACES,
+            explicit.as_slice(),
+            "explicit registry must match manifest order and contents exactly"
+        );
+        assert_eq!(
+            ADDITIONAL_UNSUPPORTED_CLI_SURFACES,
+            additional.as_slice(),
+            "additional registry must match manifest order and contents exactly"
+        );
+
+        let explicit_set: HashSet<_> = EXPLICIT_UNSUPPORTED_CLI_SURFACES.iter().copied().collect();
+        let additional_set: HashSet<_> = ADDITIONAL_UNSUPPORTED_CLI_SURFACES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            explicit_set.len(),
+            EXPLICIT_UNSUPPORTED_CLI_SURFACES.len(),
+            "explicit registry must not contain duplicates"
+        );
+        assert_eq!(
+            additional_set.len(),
+            ADDITIONAL_UNSUPPORTED_CLI_SURFACES.len(),
+            "additional registry must not contain duplicates"
+        );
+        assert!(
+            explicit_set.is_disjoint(&additional_set),
+            "explicit and additional registries must not overlap"
+        );
+    }
+
+    #[test]
+    fn unregistered_unsupported_command_is_hard_error() {
+        let cli = Cli::try_parse_from(["ownmesh", "status"]).expect("status parses");
+        let err = unsupported(&cli, "not a registered surface", "should fail")
+            .expect_err("unregistered surface must hard-error");
+        assert_eq!(err, ExitCode::Internal);
+        assert_eq!(
+            unsupported_exit("an arbitrary string"),
+            ExitCode::Internal,
+            "custom hard-error handlers must also reject unregistered strings"
+        );
+    }
+
+    #[test]
+    fn registered_additional_surface_is_not_internal_error() {
+        let cli = Cli::try_parse_from(["ownmesh", "status"]).expect("status parses");
+        let err = unsupported(&cli, "device rename", "rename unavailable")
+            .expect_err("registered additional surface still returns not-implemented");
+        assert_eq!(err, ExitCode::ProfileUnavailable);
+    }
 }

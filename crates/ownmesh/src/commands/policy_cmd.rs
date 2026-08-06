@@ -49,14 +49,14 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                     json!({
                         "schema_version": 1,
                         "status": "not_implemented",
-                        "command": "policy rule",
+                        "command": "policy rule mutation",
                         "message": "policy rule mutation via DSL is unsupported",
                     })
                 );
             } else {
                 eprintln!("policy rule mutation via DSL is not implemented yet ({spec})");
             }
-            Err(ExitCode::ProfileUnavailable)
+            Err(super::unsupported_exit("policy rule mutation"))
         }
         PolicyCmd::Validate => match call_daemon(methods::POLICY_VALIDATE, None) {
             Ok(value) => {
