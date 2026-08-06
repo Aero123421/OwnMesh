@@ -26,18 +26,17 @@ pub fn load_config(paths: &OwnMeshPaths) -> ConfigResult<OwnMeshConfig> {
         path: Some(path.clone()),
         source,
     })?;
-    let mut value: toml::Value = raw.parse().map_err(|err| ConfigError::Parse {
+    let mut value: toml::Value = raw
+        .parse::<toml::Value>()
+        .map_err(|err: toml::de::Error| ConfigError::Parse {
+            path: path.clone(),
+            message: err.to_string(),
+        })?;
+    let migrated = migrate_config_value(&mut value)?;
+    let cfg: OwnMeshConfig = value.try_into().map_err(|err: toml::de::Error| ConfigError::Parse {
         path: path.clone(),
         message: err.to_string(),
     })?;
-    let migrated = migrate_config_value(&mut value)?;
-    let cfg: OwnMeshConfig =
-        value
-            .try_into()
-            .map_err(|err| ConfigError::Parse {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
     cfg.validate()?;
     if migrated {
         save_config(paths, &cfg)?;

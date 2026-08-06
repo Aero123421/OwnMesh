@@ -64,7 +64,7 @@ impl Timestamp {
     pub fn to_rfc3339(self) -> String {
         let dt = self.0;
         if dt.nanosecond() == 0 {
-            format(
+            format!(
                 "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
                 dt.year(),
                 u8::from(dt.month()),
