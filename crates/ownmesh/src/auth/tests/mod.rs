@@ -97,7 +97,9 @@ async fn pkce_login_stores_refresh_in_keychain_not_plaintext() {
     let session_raw = std::fs::read_to_string(&sp.session_file).unwrap();
     assert!(!session_raw.contains(tokens.refresh_token.as_ref().unwrap()));
     assert!(!session_raw.contains(&tokens.access_token));
-    assert!(!session_raw.to_ascii_lowercase().contains("\"refresh_token\""));
+    assert!(!session_raw
+        .to_ascii_lowercase()
+        .contains("\"refresh_token\""));
 
     if sp.paths.config_file().exists() {
         let cfg = std::fs::read_to_string(sp.paths.config_file()).unwrap();
@@ -220,7 +222,9 @@ async fn no_stub_paths_for_login_device_enroll() {
     );
 
     // Runtime: handlers are wired (compile-time linkage).
-    let _ = std::any::type_name::<fn(&crate::cli::Cli, &crate::cli::LoginArgs) -> Result<(), ownmesh_domain::ExitCode>>();
+    let _ = std::any::type_name::<
+        fn(&crate::cli::Cli, &crate::cli::LoginArgs) -> Result<(), ownmesh_domain::ExitCode>,
+    >();
     let login_name = std::any::type_name_of_val(&crate::commands::login::run_login);
     let enroll_name = std::any::type_name_of_val(&crate::commands::device_cmd::run_enroll);
     assert!(login_name.contains("login"));

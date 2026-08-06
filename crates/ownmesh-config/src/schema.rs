@@ -171,14 +171,7 @@ impl InstanceConfig {
                 message: "instance.id must not be empty".into(),
             });
         }
-        if !(self.base_url.starts_with("https://") || self.base_url.starts_with("http://")) {
-            return Err(ConfigError::Validation {
-                message: format!(
-                    "instance `{}` base_url must start with http:// or https://",
-                    self.id
-                ),
-            });
-        }
+        validate_instance_base_url(&self.id, &self.base_url)?;
         // Guard against accidental secret embedding in URL userinfo for config dumps.
         if self.base_url.contains('@') && self.base_url.contains("token") {
             return Err(ConfigError::Validation {
@@ -186,6 +179,83 @@ impl InstanceConfig {
             });
         }
         Ok(())
+    }
+}
+
+/// Validate a control-plane base URL / issuer.
+///
+/// `https://` is always accepted. `http://` is accepted only for loopback hosts
+/// (`127.0.0.0/8`, `::1`, `localhost`) so local mock servers keep working while
+/// non-loopback cleartext issuers are fail-closed.
+///
+/// Returns the trimmed URL (no trailing `/`) on success.
+pub fn validate_control_plane_base_url(base_url: &str) -> ConfigResult<String> {
+    validate_instance_base_url("<issuer>", base_url)?;
+    Ok(base_url.trim().trim_end_matches('/').to_owned())
+}
+
+fn validate_instance_base_url(id: &str, base_url: &str) -> ConfigResult<()> {
+    let raw = base_url.trim().trim_end_matches('/');
+    if raw.is_empty() {
+        return Err(ConfigError::Validation {
+            message: format!("instance `{id}` base_url must not be empty"),
+        });
+    }
+
+    if let Some(rest) = raw.strip_prefix("https://") {
+        if host_from_authority(rest).is_empty() {
+            return Err(ConfigError::Validation {
+                message: format!("instance `{id}` base_url must include a host"),
+            });
+        }
+        return Ok(());
+    }
+
+    if let Some(rest) = raw.strip_prefix("http://") {
+        let host = host_from_authority(rest);
+        if host.is_empty() {
+            return Err(ConfigError::Validation {
+                message: format!("instance `{id}` base_url must include a host"),
+            });
+        }
+        if is_loopback_host(host) {
+            return Ok(());
+        }
+        return Err(ConfigError::Validation {
+            message: format!(
+                "instance `{id}` base_url refuses non-loopback http:// (`{raw}`); use https:// or a loopback host (127.0.0.1, ::1, localhost)"
+            ),
+        });
+    }
+
+    Err(ConfigError::Validation {
+        message: format!(
+            "instance `{id}` base_url must start with https:// (or http:// on loopback only)"
+        ),
+    })
+}
+
+/// Extract host from the authority+path portion after `scheme://`.
+fn host_from_authority(after_scheme: &str) -> &str {
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop userinfo if present.
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, hostport)| hostport);
+    if let Some(inner) = authority.strip_prefix('[') {
+        // IPv6 literal: [2001:db8::1]:443
+        return inner.split(']').next().unwrap_or("");
+    }
+    authority.split(':').next().unwrap_or("")
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
     }
 }
 
@@ -253,5 +323,39 @@ mod tests {
                 "config dump unexpectedly contains {needle}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn instance_allows_loopback_http_and_https() {
+        for url in [
+            "http://127.0.0.1:9",
+            "http://127.0.0.1",
+            "http://[::1]:8080",
+            "http://localhost:8750",
+            "https://example.test",
+        ] {
+            let inst = InstanceConfig {
+                id: "local".into(),
+                base_url: url.into(),
+                display_name: None,
+            };
+            inst.validate()
+                .unwrap_or_else(|e| panic!("expected {url} ok, got {e}"));
+        }
+    }
+
+    #[test]
+    fn instance_rejects_non_loopback_http() {
+        let inst = InstanceConfig {
+            id: "remote".into(),
+            base_url: "http://example.test".into(),
+            display_name: None,
+        };
+        let err = inst.validate().expect_err("non-loopback http must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-loopback"),
+            "expected explicit non-loopback error, got: {msg}"
+        );
     }
 }

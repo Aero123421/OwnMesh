@@ -8,12 +8,16 @@ use ownmesh_broker_client::{
     default_broker_endpoint, elevate, BrokerEndpoint, BrokerSecret, ElevatedCommand,
 };
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
-use ownmesh_exec::{run_command, CommandKind, IdempotencyJournal, RunRequest, RunResult};
+use ownmesh_exec::{
+    classify_from_request, run_command, CommandKind, IdempotencyJournal, RunRequest, RunResult,
+};
 use ownmesh_fs::{
     delete_path, git_diff, git_status, list_dir, read_file, stat_path, write_file, GitDiffOpts,
     GitStatusOpts, WorkspaceRoot,
 };
-use ownmesh_ipc::{app_error, methods, IpcError, IpcResult, MethodHandler};
+use ownmesh_ipc::{
+    app_error, methods, ClientIdentity, IpcError, IpcResult, MethodHandler, RevokedClients,
+};
 use ownmesh_logs::{
     register_builtin_providers, BuiltinProviderConfig, LogCursor, LogError, LogRegistry,
 };
@@ -21,14 +25,12 @@ use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
     AccessPreset, Decision, OperationFacts, PolicyDocument, TemporaryGrant,
 };
-use ownmesh_session::{
-    SessionKind, SessionManager, StreamKind as SessionStreamKind,
-};
+use ownmesh_session::{SessionKind, SessionManager, StreamKind as SessionStreamKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -238,7 +240,7 @@ pub struct DaemonRuntime {
     op_journal: HashMap<String, Value>,
     exec_journal: IdempotencyJournal,
     lockdown: bool,
-    revoked_clients: HashSet<String>,
+    revoked_clients: RevokedClients,
     audit: Vec<AuditEntry>,
     workspace_root: PathBuf,
     enforce_workspace: bool,
@@ -254,8 +256,7 @@ impl DaemonRuntime {
     pub fn open(paths: &OwnMeshPaths) -> Result<Self, String> {
         paths.ensure_layout().map_err(|e| e.to_string())?;
         let journal_path = paths.state_dir.join("idempotency-journal.json");
-        let exec_journal =
-            IdempotencyJournal::open(&journal_path).map_err(|e| e.to_string())?;
+        let exec_journal = IdempotencyJournal::open(&journal_path).map_err(|e| e.to_string())?;
         let policy_file = load_policy(paths).unwrap_or_default();
         let policy = policy_from_file(&policy_file);
         let enforce_workspace = matches!(
@@ -274,10 +275,16 @@ impl DaemonRuntime {
         let op_journal = load_json_map(&paths.state_dir.join("op-journal.json"));
         let grants = load_grants(&paths.state_dir.join("grants.json"));
         let lockdown = paths.state_dir.join("lockdown.flag").exists();
-        let revoked_clients = load_revoked(&paths.state_dir.join("revoked-clients.json"));
+        let revoked_clients = Arc::new(RwLock::new(load_revoked(
+            &paths.state_dir.join("revoked-clients.json"),
+        )?));
         let sessions_path = paths.state_dir.join("sessions").join("sessions.json");
-        let mut sessions =
-            SessionManager::load_from_path(&sessions_path).unwrap_or_else(|_| SessionManager::new());
+        let mut sessions = SessionManager::load_from_path(&sessions_path).map_err(|e| {
+            format!(
+                "failed to load sessions from {}: {e}",
+                sessions_path.display()
+            )
+        })?;
         let _ = sessions.mark_hosts_detached_after_restart();
         let (broker_endpoint, broker_secret) = load_broker_client(paths);
         Ok(Self {
@@ -300,12 +307,34 @@ impl DaemonRuntime {
         })
     }
 
-    fn persist_sessions(&self) {
-        let _ = self.sessions.save_to_path(&self.sessions_path);
+    /// Shared handle used by the IPC server for hello/dispatch revocation checks.
+    #[must_use]
+    pub fn revoked_clients_handle(&self) -> RevokedClients {
+        Arc::clone(&self.revoked_clients)
+    }
+
+    fn is_client_revoked(&self, client_name: &str) -> bool {
+        self.revoked_clients
+            .read()
+            .map(|g| g.contains(client_name))
+            // A poisoned revocation lock must never re-enable a revoked client.
+            .unwrap_or(true)
+    }
+
+    fn persist_sessions(&self) -> IpcResult<()> {
+        self.sessions
+            .save_to_path(&self.sessions_path)
+            .map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("session persist failed: {e}"),
+            })
     }
 
     fn persist_op_journal(&self) {
-        let _ = write_json(&self.paths.state_dir.join("op-journal.json"), &self.op_journal);
+        let _ = write_json(
+            &self.paths.state_dir.join("op-journal.json"),
+            &self.op_journal,
+        );
     }
 
     fn persist_grants(&self) {
@@ -321,9 +350,24 @@ impl DaemonRuntime {
         }
     }
 
-    fn persist_revoked(&self) {
-        let list: Vec<&String> = self.revoked_clients.iter().collect();
-        let _ = write_json(&self.paths.state_dir.join("revoked-clients.json"), &list);
+    fn persist_revoked(&self) -> IpcResult<()> {
+        let mut list: Vec<String> = self
+            .revoked_clients
+            .read()
+            .map_err(|_| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "revoked clients lock poisoned".into(),
+            })?
+            .iter()
+            .cloned()
+            .collect();
+        list.sort();
+        write_json(&self.paths.state_dir.join("revoked-clients.json"), &list).map_err(|e| {
+            IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("failed to persist revoked clients: {e}"),
+            }
+        })
     }
 
     fn now() -> i64 {
@@ -526,16 +570,13 @@ impl DaemonRuntime {
     }
 
     async fn execute_exec(&mut self, p: &ExecParams) -> IpcResult<Value> {
+        // elevated=true is fail-closed: broker must succeed. Never fall back to local exec.
         if p.elevated {
-            if let Some(value) = self.try_broker_elevated(p).await? {
-                return Ok(value);
-            }
-            // Broker unavailable: fall back to local structured exec (ms1 behavior).
+            return self.try_broker_elevated(p).await;
         }
-        let kind = match p.kind.as_deref() {
-            Some("raw_shell") | Some("raw") => CommandKind::RawShell,
-            _ => CommandKind::Structured,
-        };
+        // Spawn mode follows the client request shape (argv vs shell-string).
+        // Policy already used server-side classify_from_request in handle_exec.
+        let kind = CommandKind::parse_requested(p.kind.as_deref());
         let req = RunRequest {
             kind,
             program: p.program.clone(),
@@ -559,9 +600,13 @@ impl DaemonRuntime {
         })
     }
 
-    async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Option<Value>> {
+    async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
         let (Some(endpoint), Some(secret)) = (&self.broker_endpoint, &self.broker_secret) else {
-            return Ok(None);
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "elevated execution requires broker; broker unavailable (not configured)"
+                    .into(),
+            });
         };
         let cmd = ElevatedCommand {
             program: p.program.clone(),
@@ -582,7 +627,7 @@ impl DaemonRuntime {
         )
         .await
         {
-            Ok(resp) => Ok(Some(json!({
+            Ok(resp) if resp.ok => Ok(json!({
                 "exit_code": resp.exit_code,
                 "stdout": resp.stdout,
                 "stderr": resp.stderr,
@@ -591,22 +636,27 @@ impl DaemonRuntime {
                 "truncated": false,
                 "replayed": false,
                 "elevated_via": "broker",
-                "broker_ok": resp.ok,
-                "broker_error": resp.error,
-            }))),
-            Err(_) => Ok(None),
+                "broker_ok": true,
+            })),
+            Ok(resp) => Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!(
+                    "elevated broker error: {}",
+                    resp.error
+                        .unwrap_or_else(|| "unknown broker failure".into())
+                ),
+            }),
+            Err(err) => Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("elevated broker unavailable: {err}"),
+            }),
         }
     }
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        let entries = list_dir(
-            &ws,
-            &p.path,
-            p.recursive,
-            p.max_entries.unwrap_or(1000),
-        )
-        .map_err(fs_err)?;
+        let entries =
+            list_dir(&ws, &p.path, p.recursive, p.max_entries.unwrap_or(1000)).map_err(fs_err)?;
         Ok(json!({ "entries": entries }))
     }
 
@@ -657,10 +707,7 @@ impl DaemonRuntime {
             &BuiltinProviderConfig {
                 file_id: "audit".into(),
                 file_path: self.log_path.clone(),
-                windows_channel: p
-                    .channel
-                    .clone()
-                    .unwrap_or_else(|| "Application".into()),
+                windows_channel: p.channel.clone().unwrap_or_else(|| "Application".into()),
                 journald_unit: p.unit.clone(),
                 docker_container: p.container.clone(),
                 process_id: "process".into(),
@@ -743,10 +790,11 @@ impl DaemonRuntime {
                 message: "program is required".into(),
             });
         }
-        let kind = p.kind.clone().unwrap_or_else(|| "structured".into());
+        // Reclassify on the server so kind=structured + `sh -c` cannot bypass raw_shell rules.
+        let kind = classify_from_request(p.kind.as_deref(), &p.program, &p.args);
         let facts = OperationFacts {
             capability: "command.run".into(),
-            kind: kind.clone(),
+            kind: kind.as_str().to_string(),
             program: Some(p.program.clone()),
             elevated: p.elevated,
             path: p.cwd.clone(),
@@ -1152,8 +1200,14 @@ impl DaemonRuntime {
                 message: "client is required".into(),
             });
         }
-        self.revoked_clients.insert(p.client.clone());
-        self.persist_revoked();
+        {
+            let mut guard = self.revoked_clients.write().map_err(|_| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "revoked clients lock poisoned".into(),
+            })?;
+            guard.insert(p.client.clone());
+        }
+        self.persist_revoked()?;
         self.append_audit(
             "token.revoke",
             None,
@@ -1164,8 +1218,19 @@ impl DaemonRuntime {
         Ok(json!({ "revoked": p.client, "ok": true }))
     }
 
-    /// Dispatch one authenticated RPC method.
-    pub async fn dispatch(&mut self, method: &str, params: Option<Value>) -> IpcResult<Value> {
+    /// Dispatch one authenticated RPC method bound to `client` identity.
+    pub async fn dispatch(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        if self.is_client_revoked(&client.client_name) {
+            return Err(IpcError::Remote {
+                code: app_error::TOKEN_REVOKED,
+                message: format!("client {} is revoked", client.client_name),
+            });
+        }
         self.check_lockdown(method)?;
         match method {
             methods::OPS_EXEC => self.handle_exec(params).await,
@@ -1189,19 +1254,19 @@ impl DaemonRuntime {
             methods::DAEMON_LOCKDOWN => self.handle_lockdown(),
             methods::DAEMON_UNLOCK => self.handle_unlock(),
             methods::TOKEN_REVOKE => self.handle_token_revoke(params),
-            session_methods::OPEN => self.handle_session_open(params),
-            session_methods::LIST => self.handle_session_list(),
-            session_methods::SHOW => self.handle_session_show(params),
-            session_methods::ATTACH => self.handle_session_attach(params),
-            session_methods::CLAIM => self.handle_session_claim(params),
-            session_methods::RELEASE => self.handle_session_release(params),
-            session_methods::GIVE => self.handle_session_give(params),
-            session_methods::CLOSE => self.handle_session_close(params),
-            session_methods::TERMINATE => self.handle_session_terminate(params),
-            session_methods::REPLAY => self.handle_session_replay(params),
-            session_methods::PUSH_OUTPUT => self.handle_session_push_output(params),
-            session_methods::WRITE => self.handle_session_write(params),
-            session_methods::RESIZE => self.handle_session_resize(params),
+            session_methods::OPEN => self.handle_session_open(params, client),
+            session_methods::LIST => self.handle_session_list(client),
+            session_methods::SHOW => self.handle_session_show(params, client),
+            session_methods::ATTACH => self.handle_session_attach(params, client),
+            session_methods::CLAIM => self.handle_session_claim(params, client),
+            session_methods::RELEASE => self.handle_session_release(params, client),
+            session_methods::GIVE => self.handle_session_give(params, client),
+            session_methods::CLOSE => self.handle_session_close(params, client),
+            session_methods::TERMINATE => self.handle_session_terminate(params, client),
+            session_methods::REPLAY => self.handle_session_replay(params, client),
+            session_methods::PUSH_OUTPUT => self.handle_session_push_output(params, client),
+            session_methods::WRITE => self.handle_session_write(params, client),
+            session_methods::RESIZE => self.handle_session_resize(params, client),
             other => Err(IpcError::Remote {
                 code: app_error::METHOD_NOT_FOUND,
                 message: format!("method not found: {other}"),
@@ -1209,11 +1274,16 @@ impl DaemonRuntime {
         }
     }
 
-    fn handle_session_open(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_open(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             #[serde(default)]
             title: Option<String>,
+            /// Ignored: principal is bound to authenticated client identity.
             #[serde(default)]
             principal: Option<String>,
             #[serde(default)]
@@ -1226,12 +1296,13 @@ impl DaemonRuntime {
             cwd: Option<String>,
         }
         let p: P = parse_params(params)?;
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
         let kind = match p.kind.as_deref() {
             Some("process") => SessionKind::Process,
             Some("profile_agent") | Some("profile") => SessionKind::ProfileAgent,
             _ => SessionKind::Pty,
         };
-        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
         let info = self.sessions.open_with(
             kind,
@@ -1244,19 +1315,36 @@ impl DaemonRuntime {
             p.cwd,
             None,
         );
-        self.persist_sessions();
+        self.persist_sessions()?;
         serde_json::to_value(info).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
         })
     }
 
-    fn handle_session_list(&self) -> IpcResult<Value> {
-        Ok(json!({ "sessions": self.sessions.list() }))
+    fn handle_session_list(&self, client: &ClientIdentity) -> IpcResult<Value> {
+        let principal = &client.client_name;
+        let sessions: Vec<_> = self
+            .sessions
+            .list()
+            .into_iter()
+            .filter(|info| {
+                self.sessions
+                    .readers(&info.id)
+                    .map(|r| r.contains(principal))
+                    .unwrap_or(false)
+            })
+            .collect();
+        Ok(json!({ "sessions": sessions }))
     }
 
-    fn handle_session_show(&self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_show(
+        &self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let id = require_id(params, "id")?;
+        self.require_reader(&id, &client.client_name)?;
         let info = self.sessions.get(&id).map_err(session_err)?;
         serde_json::to_value(info).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
@@ -1264,7 +1352,11 @@ impl DaemonRuntime {
         })
     }
 
-    fn handle_session_attach(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_attach(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1274,7 +1366,11 @@ impl DaemonRuntime {
             read_only: bool,
         }
         let p: P = parse_params(params)?;
-        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        // Session IDs are identifiers, not bearer capabilities. Attaching cannot
+        // grant a new principal access; delegation must happen through session.give.
+        self.require_reader(&p.id, &client.client_name)?;
+        let principal = client.client_name.clone();
         if p.read_only {
             self.sessions
                 .attach_observer(&p.id, principal.clone())
@@ -1285,7 +1381,7 @@ impl DaemonRuntime {
                 .claim_controller(&p.id, principal.clone(), Self::now())
                 .map_err(session_err)?;
         }
-        self.persist_sessions();
+        self.persist_sessions()?;
         let info = self.sessions.get(&p.id).map_err(session_err)?;
         Ok(json!({
             "session": info,
@@ -1295,7 +1391,11 @@ impl DaemonRuntime {
         }))
     }
 
-    fn handle_session_claim(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_claim(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1303,16 +1403,23 @@ impl DaemonRuntime {
             principal: Option<String>,
         }
         let p: P = parse_params(params)?;
-        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        // Only an existing reader may claim a released/expired controller lease.
+        self.require_reader(&p.id, &client.client_name)?;
+        let principal = client.client_name.clone();
         let lease = self
             .sessions
             .claim_controller(&p.id, principal, Self::now())
             .map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         Ok(json!({ "lease": lease, "session_id": p.id }))
     }
 
-    fn handle_session_release(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_release(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1320,15 +1427,20 @@ impl DaemonRuntime {
             principal: Option<String>,
         }
         let p: P = parse_params(params)?;
-        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        let principal = client.client_name.clone();
         self.sessions
             .release_controller(&p.id, &principal)
             .map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         Ok(json!({ "released": true, "session_id": p.id }))
     }
 
-    fn handle_session_give(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_give(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1337,12 +1449,24 @@ impl DaemonRuntime {
             from: Option<String>,
         }
         let p: P = parse_params(params)?;
-        let from = p.from.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        // give requires from == authenticated identity (spoofed from is rejected).
+        if let Some(from) = p.from.as_deref() {
+            if from != client.client_name {
+                return Err(IpcError::Remote {
+                    code: app_error::UNAUTHORIZED,
+                    message: format!(
+                        "session.give from must be authenticated client (got '{from}', auth is '{}')",
+                        client.client_name
+                    ),
+                });
+            }
+        }
+        let from = client.client_name.clone();
         let lease = self
             .sessions
             .give_controller(&p.id, &from, p.to, Self::now())
             .map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         let readers: Vec<String> = self
             .sessions
             .readers(&p.id)
@@ -1352,14 +1476,23 @@ impl DaemonRuntime {
         Ok(json!({ "lease": lease, "readers": readers }))
     }
 
-    fn handle_session_close(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_close(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let id = require_id(params, "id")?;
+        self.require_controller(&id, &client.client_name)?;
         self.sessions.close(&id).map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         Ok(json!({ "closed": true, "session_id": id }))
     }
 
-    fn handle_session_terminate(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_terminate(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             #[serde(default)]
@@ -1369,38 +1502,54 @@ impl DaemonRuntime {
         }
         let p: P = parse_params(params)?;
         if p.all {
-            let n = self.sessions.terminate_all();
-            self.persist_sessions();
+            // Only sessions this principal controls may be mass-terminated.
+            let controlled: Vec<String> = self
+                .sessions
+                .list()
+                .into_iter()
+                .filter(|info| {
+                    info.controller
+                        .as_ref()
+                        .map(|c| c.principal_id == client.client_name)
+                        .unwrap_or(false)
+                })
+                .map(|info| info.id)
+                .collect();
+            let mut n = 0usize;
+            for id in controlled {
+                self.sessions.terminate(&id).map_err(session_err)?;
+                n += 1;
+            }
+            self.persist_sessions()?;
             return Ok(json!({ "terminated": n, "all": true }));
         }
         let id = p.id.ok_or_else(|| IpcError::Remote {
             code: app_error::INVALID_PARAMS,
             message: "id or all required".into(),
         })?;
+        self.require_controller(&id, &client.client_name)?;
         self.sessions.terminate(&id).map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         Ok(json!({ "terminated": 1, "session_id": id }))
     }
 
-    fn handle_session_replay(&self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_replay(
+        &self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
             #[serde(default)]
             from_seq: Option<u64>,
+            /// Ignored: read ACL uses authenticated client identity.
             #[serde(default)]
             principal: Option<String>,
         }
         let p: P = parse_params(params)?;
-        if let Some(prin) = p.principal {
-            let readers = self.sessions.readers(&p.id).map_err(session_err)?;
-            if !readers.contains(&prin) {
-                return Err(IpcError::Remote {
-                    code: app_error::POLICY_DENIED,
-                    message: format!("principal {prin} cannot read session {}", p.id),
-                });
-            }
-        }
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        self.require_reader(&p.id, &client.client_name)?;
         let chunks = self
             .sessions
             .replay_from(&p.id, p.from_seq.unwrap_or(1))
@@ -1408,7 +1557,11 @@ impl DaemonRuntime {
         Ok(json!({ "chunks": chunks, "session_id": p.id }))
     }
 
-    fn handle_session_push_output(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_push_output(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1417,6 +1570,7 @@ impl DaemonRuntime {
             stream: Option<String>,
         }
         let p: P = parse_params(params)?;
+        self.require_controller(&p.id, &client.client_name)?;
         let stream = match p.stream.as_deref() {
             Some("stderr") => SessionStreamKind::Stderr,
             Some("system") => SessionStreamKind::System,
@@ -1426,11 +1580,15 @@ impl DaemonRuntime {
             .sessions
             .push_output(&p.id, p.data, stream)
             .map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         Ok(json!({ "chunk": chunk }))
     }
 
-    fn handle_session_write(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_write(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1439,7 +1597,8 @@ impl DaemonRuntime {
             principal: Option<String>,
         }
         let p: P = parse_params(params)?;
-        let principal = p.principal.unwrap_or_else(|| LOCAL_PRINCIPAL.into());
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        let principal = client.client_name.clone();
         self.sessions
             .authorize_stdin(&p.id, &principal, Self::now())
             .map_err(session_err)?;
@@ -1452,11 +1611,15 @@ impl DaemonRuntime {
                 SessionStreamKind::System,
             )
             .map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         Ok(json!({ "accepted": true, "chunk": chunk }))
     }
 
-    fn handle_session_resize(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_session_resize(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1464,11 +1627,35 @@ impl DaemonRuntime {
             rows: u16,
         }
         let p: P = parse_params(params)?;
+        self.require_controller(&p.id, &client.client_name)?;
         self.sessions
             .resize(&p.id, p.cols, p.rows)
             .map_err(session_err)?;
-        self.persist_sessions();
+        self.persist_sessions()?;
         Ok(json!({ "resized": true, "cols": p.cols, "rows": p.rows }))
+    }
+
+    fn require_reader(&self, session_id: &str, principal: &str) -> IpcResult<()> {
+        let readers = self.sessions.readers(session_id).map_err(session_err)?;
+        if readers.contains(principal) {
+            Ok(())
+        } else {
+            Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!("principal {principal} cannot read session {session_id}"),
+            })
+        }
+    }
+
+    fn require_controller(&self, session_id: &str, principal: &str) -> IpcResult<()> {
+        let info = self.sessions.get(session_id).map_err(session_err)?;
+        match &info.controller {
+            Some(c) if c.principal_id == principal => Ok(()),
+            Some(_) | None => Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!("principal {principal} is not controller of session {session_id}"),
+            }),
+        }
     }
 
     /// Test helper: set policy in-memory without touching disk preset file optionally.
@@ -1489,13 +1676,28 @@ impl DaemonRuntime {
 
 /// Build the IPC method handler backed by shared runtime state.
 pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
-    Arc::new(move |method, params| {
+    Arc::new(move |method, params, client| {
         let runtime = Arc::clone(&runtime);
         Box::pin(async move {
             let mut guard = runtime.lock().await;
-            guard.dispatch(&method, params).await
+            guard.dispatch(&method, params, &client).await
         })
     })
+}
+
+/// Reject request-declared principal when it disagrees with authenticated identity.
+fn reject_spoofed_principal(claimed: Option<&str>, authenticated: &str) -> IpcResult<()> {
+    if let Some(claimed) = claimed {
+        if claimed != authenticated {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: format!(
+                    "self-reported principal '{claimed}' does not match authenticated client '{authenticated}'"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> IpcResult<T> {
@@ -1622,12 +1824,21 @@ fn load_grants(path: &Path) -> Vec<TemporaryGrant> {
         .unwrap_or_default()
 }
 
-fn load_revoked(path: &Path) -> HashSet<String> {
-    let list: Vec<String> = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
-    list.into_iter().collect()
+fn load_revoked(path: &Path) -> Result<HashSet<String>, String> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let list: Vec<String> = serde_json::from_str(&raw)
+        .map_err(|e| format!("corrupt revoked client state {}: {e}", path.display()))?;
+    if list.iter().any(|client| client.trim().is_empty()) {
+        return Err(format!(
+            "corrupt revoked client state {}: empty client identity",
+            path.display()
+        ));
+    }
+    Ok(list.into_iter().collect())
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {

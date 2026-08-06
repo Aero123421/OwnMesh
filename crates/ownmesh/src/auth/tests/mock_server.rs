@@ -114,11 +114,9 @@ impl MockControlPlane {
                 if shutdown_clone.load(Ordering::SeqCst) {
                     break;
                 }
-                let accept = tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
-                    listener.accept(),
-                )
-                .await;
+                let accept =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                        .await;
                 let Ok(Ok((stream, _))) = accept else {
                     continue;
                 };
@@ -142,9 +140,7 @@ impl MockControlPlane {
     }
 
     pub fn set_auto_approve_device(&self, on: bool) {
-        self.inner
-            .auto_approve_device
-            .store(on, Ordering::SeqCst);
+        self.inner.auto_approve_device.store(on, Ordering::SeqCst);
     }
 
     pub async fn shutdown(&self) {
@@ -429,12 +425,7 @@ async fn handle_device_authorization(inner: &Inner, base: &str, body: &str) -> V
     )
 }
 
-async fn handle_device_verify(
-    inner: &Inner,
-    method: &str,
-    body: &str,
-    url: &str,
-) -> Vec<u8> {
+async fn handle_device_verify(inner: &Inner, method: &str, body: &str, url: &str) -> Vec<u8> {
     if method == "GET" {
         return html_response(200, "<html><body>device login</body></html>");
     }
@@ -703,7 +694,9 @@ fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
 
 fn bearer(headers: &HashMap<String, String>) -> Option<String> {
     let h = headers.get("authorization")?;
-    let rest = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer "))?;
+    let rest = h
+        .strip_prefix("Bearer ")
+        .or_else(|| h.strip_prefix("bearer "))?;
     Some(rest.trim().to_owned())
 }
 
@@ -801,5 +794,3 @@ fn http_raw(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(body);
     out
 }
-
-

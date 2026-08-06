@@ -54,6 +54,129 @@ pub enum CommandKind {
     RawShell,
 }
 
+impl CommandKind {
+    /// Stable policy / facts string (`structured` | `raw_shell`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Structured => "structured",
+            Self::RawShell => "raw_shell",
+        }
+    }
+
+    /// Parse a client-supplied kind string (unknown → structured).
+    #[must_use]
+    pub fn parse_requested(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some(s) if s.eq_ignore_ascii_case("raw_shell") || s.eq_ignore_ascii_case("raw") => {
+                Self::RawShell
+            }
+            _ => Self::Structured,
+        }
+    }
+}
+
+/// Known shell program basenames (matched case-insensitively).
+const SHELL_BINARIES: &[&str] = &[
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "ksh",
+    "fish",
+    "cmd",
+    "cmd.exe",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+];
+
+/// Flags that turn a shell binary into an arbitrary command interpreter.
+const SHELL_EXEC_FLAGS: &[&str] = &["-c", "/c", "/k", "-command", "-encodedcommand", "-enc"];
+
+/// Basename of a program path (`/bin/bash`, `C:\\Windows\\System32\\cmd.exe` → `bash` / `cmd.exe`).
+#[must_use]
+pub fn program_basename(program: &str) -> &str {
+    let trimmed = program.trim().trim_matches('"').trim_matches('\'');
+    let bytes = trimmed.as_bytes();
+    let mut last = 0usize;
+    for (i, b) in bytes.iter().copied().enumerate() {
+        if b == b'/' || b == b'\\' {
+            last = i + 1;
+        }
+    }
+    &trimmed[last..]
+}
+
+/// True when `program` is a known shell binary (path or basename, case-insensitive).
+#[must_use]
+pub fn is_shell_binary(program: &str) -> bool {
+    let base = program_basename(program);
+    if base.is_empty() {
+        return false;
+    }
+    SHELL_BINARIES
+        .iter()
+        .any(|name| base.eq_ignore_ascii_case(name))
+}
+
+fn flag_basename(flag: &str) -> &str {
+    // PowerShell accepts `-Command:value` and `/Command` forms.
+    let f = flag.trim().trim_start_matches(['-', '/']);
+    f.split_once([':', '=']).map(|(h, _)| h).unwrap_or(f)
+}
+
+/// True when argv contains a shell command-execution flag (`-c`, `/C`, `-Command`, …).
+#[must_use]
+pub fn args_have_shell_exec_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let raw = arg.trim();
+        if raw.is_empty() {
+            return false;
+        }
+        // Exact forms first (preserve leading - or / for short flags).
+        if SHELL_EXEC_FLAGS.iter().any(|f| raw.eq_ignore_ascii_case(f)) {
+            return true;
+        }
+        // `-Command`, `-EncodedCommand`, `/C`, and joined forms like `-Command:Get-Process`.
+        if !(raw.starts_with('-') || raw.starts_with('/')) {
+            return false;
+        }
+        let name = flag_basename(raw);
+        name.eq_ignore_ascii_case("c")
+            || name.eq_ignore_ascii_case("k")
+            || name.eq_ignore_ascii_case("command")
+            || name.eq_ignore_ascii_case("encodedcommand")
+            || name.eq_ignore_ascii_case("enc")
+    })
+}
+
+/// Server-side classification: never trust client `kind` alone.
+///
+/// A request that invokes a shell binary with an execution flag is always
+/// treated as [`CommandKind::RawShell`], even when the client claims `structured`.
+#[must_use]
+pub fn classify_command_kind(
+    requested: CommandKind,
+    program: &str,
+    args: &[String],
+) -> CommandKind {
+    if matches!(requested, CommandKind::RawShell) {
+        return CommandKind::RawShell;
+    }
+    if is_shell_binary(program) && args_have_shell_exec_flag(args) {
+        return CommandKind::RawShell;
+    }
+    CommandKind::Structured
+}
+
+/// Classify from the optional client-supplied kind string + argv.
+#[must_use]
+pub fn classify_from_request(kind: Option<&str>, program: &str, args: &[String]) -> CommandKind {
+    classify_command_kind(CommandKind::parse_requested(kind), program, args)
+}
+
 /// Request to run a command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRequest {
@@ -161,6 +284,9 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     if req.program.trim().is_empty() && matches!(req.kind, CommandKind::Structured) {
         return Err(ExecError::EmptyProgram);
     }
+    // Spawn mode is separate from policy classification (classify_command_kind).
+    // Structured argv `sh -c …` must spawn as argv after policy reclassification;
+    // RawShell string-wrapping here would double-wrap and change semantics.
     let mut cmd = match req.kind {
         CommandKind::Structured => {
             let mut c = Command::new(&req.program);
@@ -280,7 +406,10 @@ pub async fn run_command(
 }
 
 /// Synchronous helper for simple tests (blocks on current runtime or creates one).
-pub fn run_command_blocking(req: &RunRequest, journal_path: Option<&Path>) -> ExecResult<RunResult> {
+pub fn run_command_blocking(
+    req: &RunRequest,
+    journal_path: Option<&Path>,
+) -> ExecResult<RunResult> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -381,5 +510,64 @@ mod tests {
             idempotency_key: None,
         };
         assert_eq!(request_fingerprint(&req), request_fingerprint(&req));
+    }
+
+    #[test]
+    fn classify_shell_binary_with_exec_flag_is_raw_shell() {
+        let cases: &[(&str, &[&str])] = &[
+            ("/bin/sh", &["-c", "id"]),
+            ("/bin/bash", &["-c", "whoami"]),
+            ("bash", &["-c", "echo hi"]),
+            ("DASH", &["-c", "true"]),
+            ("/usr/bin/zsh", &["-c", "echo z"]),
+            ("ksh", &["-c", "echo k"]),
+            ("C:\\Windows\\System32\\cmd.exe", &["/C", "echo hi"]),
+            ("cmd", &["/k", "dir"]),
+            ("CMD.EXE", &["/c", "ver"]),
+            ("powershell", &["-Command", "Get-Host"]),
+            ("powershell.exe", &["-EncodedCommand", "QQA="]),
+            ("pwsh", &["-c", "1+1"]),
+            ("/usr/bin/pwsh", &["-Command:Get-Process"]),
+        ];
+        for (program, args) in cases {
+            let argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            let kind = classify_from_request(Some("structured"), program, &argv);
+            assert_eq!(
+                kind,
+                CommandKind::RawShell,
+                "expected raw_shell for {program:?} {args:?}"
+            );
+            assert_eq!(kind.as_str(), "raw_shell");
+        }
+    }
+
+    #[test]
+    fn classify_non_shell_or_flagless_stays_structured() {
+        let echo = classify_from_request(Some("structured"), "echo", &["hi".into()]);
+        assert_eq!(echo, CommandKind::Structured);
+
+        // Shell binary without an exec flag remains structured (e.g. version probes).
+        let bash_ver = classify_from_request(Some("structured"), "bash", &["--version".into()]);
+        assert_eq!(bash_ver, CommandKind::Structured);
+
+        let cmd_help = classify_from_request(Some("structured"), "cmd.exe", &["/?".into()]);
+        assert_eq!(cmd_help, CommandKind::Structured);
+    }
+
+    #[test]
+    fn classify_explicit_raw_stays_raw() {
+        let kind = classify_from_request(Some("raw_shell"), "echo", &["x".into()]);
+        assert_eq!(kind, CommandKind::RawShell);
+    }
+
+    #[test]
+    fn program_basename_handles_paths() {
+        assert_eq!(program_basename("/bin/bash"), "bash");
+        assert_eq!(
+            program_basename("C:\\Windows\\System32\\cmd.exe"),
+            "cmd.exe"
+        );
+        assert_eq!(program_basename("powershell"), "powershell");
+        assert_eq!(program_basename("\"/bin/sh\""), "sh");
     }
 }

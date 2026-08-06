@@ -383,7 +383,10 @@ mod tests {
     #[test]
     fn device_offline_is_retryable() {
         assert!(ErrorCode::DeviceOffline.retryable());
-        assert_eq!(ErrorCode::DeviceOffline.exit_code(), ExitCode::DeviceOffline);
+        assert_eq!(
+            ErrorCode::DeviceOffline.exit_code(),
+            ExitCode::DeviceOffline
+        );
     }
 
     #[test]

@@ -1,6 +1,10 @@
 //! Broker accept loop and elevated execution.
 
 use crate::now_unix;
+use crate::peer::{
+    assert_endpoint_peer_verifiable, loopback_tcp_peer_unverifiable_error,
+    named_pipe_peer_unverifiable_error,
+};
 use ownmesh_broker_client::{
     verify_request, BrokerEndpoint, BrokerRequest, BrokerResponse, BrokerSecret, ElevatedCommand,
     ReplayCache,
@@ -17,8 +21,6 @@ pub struct BrokerState {
     pub secret: BrokerSecret,
     pub replay: ReplayCache,
     pub allowed_callers: Vec<String>,
-    /// When true, requests must carry a valid capability token.
-    pub require_capability: bool,
 }
 
 /// Serve configuration.
@@ -27,7 +29,6 @@ pub struct BrokerServeConfig {
     pub endpoint: BrokerEndpoint,
     pub secret_file: PathBuf,
     pub allow_callers: Vec<String>,
-    pub require_capability: bool,
     /// Optional path to write the bound TCP address (tests).
     pub addr_file: Option<PathBuf>,
 }
@@ -128,112 +129,75 @@ fn run_elevated(request_id: &str, command: &ElevatedCommand) -> BrokerResponse {
 }
 
 /// Run the broker accept loop until cancelled / error.
+///
+/// Production start is fail-closed unless the endpoint supports OS peer
+/// credential verification (Unix domain socket + SO_PEERCRED). Loopback TCP and
+/// Named Pipe are refused with an explicit error.
 pub async fn run_broker(cfg: BrokerServeConfig) -> Result<(), String> {
+    // Peer-cred gate before bind / secret side effects that imply a live broker.
+    assert_endpoint_peer_verifiable(&cfg.endpoint)?;
+
+    match &cfg.endpoint {
+        BrokerEndpoint::LoopbackTcp(_) => {
+            // Double-check: never bind an unverifiable privileged endpoint.
+            Err(loopback_tcp_peer_unverifiable_error())
+        }
+        BrokerEndpoint::NamedPipe(_name) => {
+            // Safe peer identity is not available without large/unsafe OS API surface.
+            Err(named_pipe_peer_unverifiable_error())
+        }
+        #[cfg(unix)]
+        BrokerEndpoint::UnixSocket(path) => run_unix_broker(path, &cfg).await,
+        #[cfg(not(unix))]
+        BrokerEndpoint::UnixSocket(path) => Err(format!(
+            "unix socket {} not supported on this OS (fail-closed)",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(unix)]
+async fn run_unix_broker(path: &Path, cfg: &BrokerServeConfig) -> Result<(), String> {
+    use crate::peer::allowed_peer_uids_from_env;
+
     let secret = load_or_create_secret(&cfg.secret_file)?;
     let state = Arc::new(AsyncMutex::new(BrokerState {
         secret,
         replay: ReplayCache::new(),
         allowed_callers: cfg.allow_callers.clone(),
-        require_capability: cfg.require_capability,
     }));
 
-    match &cfg.endpoint {
-        BrokerEndpoint::LoopbackTcp(addr) => {
-            enforce_bind_is_networkless(*addr)?;
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(|e| format!("bind failed: {e}"))?;
-            let local = listener
-                .local_addr()
-                .map_err(|e| format!("local_addr: {e}"))?;
-            enforce_bind_is_networkless(local)?;
-            if let Some(path) = &cfg.addr_file {
-                std::fs::write(path, local.to_string()).map_err(|e| e.to_string())?;
-            }
-            eprintln!("ownmesh-broker listening on {local} (loopback TCP fallback)");
-            loop {
-                let (sock, peer) = listener.accept().await.map_err(|e| e.to_string())?;
-                if !peer.ip().is_loopback() {
-                    // Drop non-loopback peers — networkless enforcement.
-                    continue;
-                }
-                let st = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_tcp_conn(sock, st).await {
-                        eprintln!("conn error: {e}");
-                    }
-                });
-            }
-        }
-        #[cfg(windows)]
-        BrokerEndpoint::NamedPipe(name) => {
-            // Named pipes are OS-local IPC. Default SD grants creator owner / admins /
-            // LocalSystem full control (Microsoft Named Pipe Security docs). Production
-            // service install tightens ACL to the registered user + ownmeshd.
-            use tokio::net::windows::named_pipe::ServerOptions;
-            eprintln!("ownmesh-broker listening on named pipe {name}");
-            if let Some(path) = &cfg.addr_file {
-                std::fs::write(path, name).map_err(|e| e.to_string())?;
-            }
-            // First instance.
-            let mut server = ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(name)
-                .map_err(|e| format!("CreateNamedPipe failed: {e}"))?;
-            loop {
-                server
-                    .connect()
-                    .await
-                    .map_err(|e| format!("pipe connect: {e}"))?;
-                let connected = server;
-                // Prepare next instance before handling.
-                server = ServerOptions::new()
-                    .create(name)
-                    .map_err(|e| format!("CreateNamedPipe next: {e}"))?;
-                let st = Arc::clone(&state);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_stream(connected, st).await {
-                        eprintln!("pipe conn error: {e}");
-                    }
-                });
-            }
-        }
-        #[cfg(not(windows))]
-        BrokerEndpoint::NamedPipe(name) => {
-            Err(format!("named pipe {name} not supported on this OS"))?
-        }
-        #[cfg(unix)]
-        BrokerEndpoint::UnixSocket(path) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
-            let listener = tokio::net::UnixListener::bind(path)
-                .await
-                .map_err(|e| format!("unix bind: {e}"))?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-            }
-            eprintln!(
-                "ownmesh-broker listening on unix socket {} (mode 0600)",
-                path.display()
-            );
-            if let Some(af) = &cfg.addr_file {
-                std::fs::write(af, path.display().to_string()).map_err(|e| e.to_string())?;
-            }
-            loop {
-                let (sock, _addr) = listener.accept().await.map_err(|e| e.to_string())?;
-                // Local unix peer probe (mode 0600 + MAC; SO_PEERCRED documented in peer.rs).
-                match crate::peer::check_unix_peer(&sock) {
-                    Ok(check) => {
-                        if std::env::var_os("OWNMESH_BROKER_DEBUG").is_some() {
-                            eprintln!("peer check method={}", check.method);
-                        }
-                    }
-                    Err(e) => eprintln!("peer check warning: {e}"),
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .await
+        .map_err(|e| format!("unix bind: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    eprintln!(
+        "ownmesh-broker listening on unix socket {} (mode 0600, SO_PEERCRED required)",
+        path.display()
+    );
+    if let Some(af) = &cfg.addr_file {
+        std::fs::write(af, path.display().to_string()).map_err(|e| e.to_string())?;
+    }
+    let allowed_uids = allowed_peer_uids_from_env();
+    loop {
+        let (sock, _addr) = listener.accept().await.map_err(|e| e.to_string())?;
+        // Fail-closed: drop connections that fail peer-cred retrieval or uid check.
+        match crate::peer::authorize_unix_peer(&sock, &allowed_uids) {
+            Ok(check) => {
+                if std::env::var_os("OWNMESH_BROKER_DEBUG").is_some() {
+                    eprintln!(
+                        "peer check ok method={} cred={:?}",
+                        check.method, check.cred
+                    );
                 }
                 let st = Arc::clone(&state);
                 tokio::spawn(async move {
@@ -242,16 +206,18 @@ pub async fn run_broker(cfg: BrokerServeConfig) -> Result<(), String> {
                     }
                 });
             }
+            Err(e) => {
+                eprintln!("ownmesh-broker: rejecting peer (fail-closed): {e}");
+                // sock dropped — connection not served
+            }
         }
-        #[cfg(not(unix))]
-        BrokerEndpoint::UnixSocket(path) => Err(format!(
-            "unix socket {} not supported on this OS",
-            path.display()
-        ))?,
     }
 }
 
-/// Handle a TCP connection (public for tests).
+/// Handle a TCP connection (public for tests of MAC/capability path only).
+///
+/// Production `run_broker` refuses LoopbackTcp endpoints; this helper remains for
+/// in-process unit tests that exercise request auth without OS peer credentials.
 pub async fn handle_tcp_conn(
     sock: tokio::net::TcpStream,
     state: Arc<AsyncMutex<BrokerState>>,
@@ -286,7 +252,8 @@ where
     let now = now_unix();
     let resp = {
         let mut st = state.lock().await;
-        if st.require_capability && req.capability.is_none() {
+        // Capability is mandatory on every request.
+        if req.capability.is_none() {
             BrokerResponse {
                 request_id: req.request_id.clone(),
                 ok: false,

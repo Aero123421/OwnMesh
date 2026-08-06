@@ -171,9 +171,7 @@ pub fn store_human_refresh_token(
 /// # Errors
 ///
 /// Returns store errors.
-pub fn load_human_refresh_token(
-    store: &dyn SecretStore,
-) -> IdentityResult<Option<SecretString>> {
+pub fn load_human_refresh_token(store: &dyn SecretStore) -> IdentityResult<Option<SecretString>> {
     Ok(store
         .load(SecretPurpose::HumanRefreshToken)?
         .map(|b| SecretString::new(String::from_utf8_lossy(b.expose()).into_owned())))

@@ -1,9 +1,11 @@
 //! OwnMesh networkless privileged broker library.
 //!
-//! Listens only on local IPC:
-//! - Windows Named Pipe (default ACL grants creator/admin/LocalSystem; see Microsoft docs)
-//! - Unix domain socket mode 0600 + Linux `SO_PEERCRED` peer checks
-//! - Loopback TCP fallback for portable tests (`127.0.0.1` / `::1` only)
+//! Production privileged serve requires OS peer credential verification:
+//! - Unix domain socket mode 0600 + `SO_PEERCRED` (uid allow-list / euid)
+//! - Loopback TCP and Named Pipe are **fail-closed** at startup (explicit error)
+//!
+//! In-process test helpers may still exercise MAC/capability over loopback TCP
+//! without going through `run_broker` endpoint gating.
 //!
 //! Never opens outbound network connections or non-loopback listeners.
 //!
@@ -20,15 +22,14 @@
 )]
 
 mod install;
-mod peer;
+pub mod peer;
 mod serve;
 
-pub use install::{
-    install_broker, broker_status, uninstall_broker, InstallRecord, InstallStatus,
-};
+pub use install::{broker_status, install_broker, uninstall_broker, InstallRecord, InstallStatus};
+pub use peer::{assert_endpoint_peer_verifiable, peer_uid_allowed, PeerCheck};
 pub use serve::{
-    enforce_bind_is_networkless, execute_verified, load_or_create_secret, run_broker,
-    BrokerServeConfig, BrokerState,
+    enforce_bind_is_networkless, execute_verified, handle_tcp_conn, load_or_create_secret,
+    run_broker, BrokerServeConfig, BrokerState,
 };
 
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;
@@ -121,8 +122,8 @@ mod tests {
             30,
         );
         let mut replay = ReplayCache::new();
-        let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-            .unwrap();
+        let resp =
+            execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
     }
@@ -144,8 +145,8 @@ mod tests {
             60,
         );
         let mut replay = ReplayCache::new();
-        let _ = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-            .unwrap();
+        let _ =
+            execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
         let err = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
             .unwrap_err();
         assert!(err.to_lowercase().contains("replay"), "{err}");
@@ -230,7 +231,6 @@ mod tests {
             secret: BrokerSecret::from_bytes(secret_bytes.clone()),
             replay: ReplayCache::new(),
             allowed_callers: vec!["ownmeshd".into()],
-            require_capability: false,
         }));
 
         let st = Arc::clone(&state);
@@ -304,7 +304,10 @@ mod tests {
         });
         let ep2 = BrokerEndpoint::LoopbackTcp(addr2);
         let r1 = connect_and_call(&ep2, &req).await.unwrap();
-        assert!(r1.ok || r1.error.is_none() || r1.exit_code.is_some(), "{r1:?}");
+        assert!(
+            r1.ok || r1.error.is_none() || r1.exit_code.is_some(),
+            "{r1:?}"
+        );
         let r2 = connect_and_call(&ep2, &req).await.unwrap();
         assert!(!r2.ok);
         assert!(
@@ -331,7 +334,6 @@ mod tests {
             secret: BrokerSecret::from_bytes(secret_bytes.clone()),
             replay: ReplayCache::new(),
             allowed_callers: vec!["ownmeshd".into()],
-            require_capability: false,
         }));
         let st = Arc::clone(&state);
         let server = tokio::spawn(async move {

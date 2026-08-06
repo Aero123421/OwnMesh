@@ -1,9 +1,10 @@
-//! Privileged broker boundary tests (harden-07).
+//! Privileged broker boundary tests (harden-07 / sec-01).
 
 use ownmesh_broker::{enforce_bind_is_networkless, execute_verified, load_or_create_secret};
 use ownmesh_broker_client::{
-    build_request, compute_mac, default_broker_endpoint, resolve_broker_endpoint, verify_request,
-    BrokerEndpoint, BrokerRequest, BrokerSecret, ElevatedCommand, ReplayCache,
+    build_request, build_request_with_capability, compute_mac, default_broker_endpoint,
+    resolve_broker_endpoint, verify_request, BrokerEndpoint, BrokerRequest, BrokerSecret,
+    CapabilityToken, ElevatedCommand, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
 };
 use std::net::SocketAddr;
 use tempfile::tempdir;
@@ -31,6 +32,32 @@ fn echo_cmd(arg: &str) -> ElevatedCommand {
             env: vec![],
         }
     }
+}
+
+fn signed_request(
+    secret: &BrokerSecret,
+    caller: &str,
+    op: &str,
+    cmd: ElevatedCommand,
+    now: i64,
+    ttl: i64,
+) -> ownmesh_broker_client::BrokerRequest {
+    build_request_with_capability(
+        secret,
+        caller,
+        op,
+        cmd,
+        Some(CapabilityToken::issue_for_operation(
+            secret,
+            caller,
+            ELEVATED_CAPABILITY_SCOPE,
+            op,
+            now,
+            ttl.max(60),
+        )),
+        now,
+        ttl,
+    )
 }
 
 #[test]
@@ -63,7 +90,9 @@ fn default_and_resolved_endpoints_are_local_only() {
     let ep = default_broker_endpoint(dir.path());
     match &ep {
         BrokerEndpoint::LoopbackTcp(addr) => assert!(addr.ip().is_loopback()),
-        BrokerEndpoint::UnixSocket(path) => assert!(path.is_absolute() || path.starts_with(dir.path())),
+        BrokerEndpoint::UnixSocket(path) => {
+            assert!(path.is_absolute() || path.starts_with(dir.path()))
+        }
         BrokerEndpoint::NamedPipe(name) => assert!(!name.contains("://")),
     }
     ep.enforce_networkless().unwrap();
@@ -77,7 +106,7 @@ fn default_and_resolved_endpoints_are_local_only() {
 #[test]
 fn forged_mac_and_wrong_caller_rejected() {
     let secret = BrokerSecret::generate();
-    let mut req = build_request(
+    let mut req = signed_request(
         &secret,
         "ownmeshd",
         "op_forge",
@@ -89,7 +118,7 @@ fn forged_mac_and_wrong_caller_rejected() {
     assert!(verify_request(&secret, &req, now_unix()).is_err());
 
     let mut replay = ReplayCache::new();
-    let good = build_request(
+    let good = signed_request(
         &secret,
         "not-allowed",
         "op_unauth",
@@ -97,8 +126,14 @@ fn forged_mac_and_wrong_caller_rejected() {
         now_unix(),
         60,
     );
-    let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &good, now_unix())
-        .unwrap();
+    let resp = execute_verified(
+        &secret,
+        &mut replay,
+        &["ownmeshd".into()],
+        &good,
+        now_unix(),
+    )
+    .unwrap();
     assert!(!resp.ok);
     assert_eq!(resp.error.as_deref(), Some("unauthorized caller"));
 }
@@ -106,7 +141,7 @@ fn forged_mac_and_wrong_caller_rejected() {
 #[test]
 fn replayed_nonce_rejected_even_with_valid_mac() {
     let secret = BrokerSecret::generate();
-    let req = build_request(
+    let req = signed_request(
         &secret,
         "ownmeshd",
         "op_replay",
@@ -117,8 +152,8 @@ fn replayed_nonce_rejected_even_with_valid_mac() {
     let mut replay = ReplayCache::new();
     let _first =
         execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap();
-    let err = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix())
-        .unwrap_err();
+    let err =
+        execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap_err();
     assert!(err.to_ascii_lowercase().contains("replay"), "{err}");
 }
 
@@ -126,14 +161,14 @@ fn replayed_nonce_rejected_even_with_valid_mac() {
 fn expired_request_rejected() {
     let secret = BrokerSecret::generate();
     let past = now_unix().saturating_sub(600);
-    let req = build_request(&secret, "ownmeshd", "op_exp", echo_cmd("old"), past, 1);
+    let req = signed_request(&secret, "ownmeshd", "op_exp", echo_cmd("old"), past, 1);
     assert!(verify_request(&secret, &req, now_unix()).is_err());
 }
 
 #[test]
 fn tampered_args_invalidate_mac() {
     let secret = BrokerSecret::generate();
-    let mut req = build_request(
+    let mut req = signed_request(
         &secret,
         "ownmeshd",
         "op_tamper",
@@ -146,6 +181,78 @@ fn tampered_args_invalidate_mac() {
     let mac = compute_mac(&secret, &req);
     req.mac = mac;
     verify_request(&secret, &req, now_unix()).unwrap();
+}
+
+#[test]
+fn missing_capability_token_rejected() {
+    let secret = BrokerSecret::generate();
+    let mut req = build_request(
+        &secret,
+        "ownmeshd",
+        "op_nocap",
+        echo_cmd("x"),
+        now_unix(),
+        60,
+    );
+    req.capability = None;
+    req.mac = compute_mac(&secret, &req);
+    assert!(verify_request(&secret, &req, now_unix()).is_err());
+
+    let mut replay = ReplayCache::new();
+    let err =
+        execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now_unix()).unwrap_err();
+    assert!(
+        err.to_ascii_lowercase().contains("token") || err.to_ascii_lowercase().contains("invalid"),
+        "{err}"
+    );
+}
+
+#[test]
+fn scope_mismatch_rejected() {
+    let secret = BrokerSecret::generate();
+    let now = now_unix();
+    let cap = CapabilityToken::issue_for_operation(
+        &secret,
+        "ownmeshd",
+        "not.elevated",
+        "op_scope",
+        now,
+        120,
+    );
+    let req = build_request_with_capability(
+        &secret,
+        "ownmeshd",
+        "op_scope",
+        echo_cmd("x"),
+        Some(cap),
+        now,
+        60,
+    );
+    assert!(verify_request(&secret, &req, now).is_err());
+}
+
+#[test]
+fn operation_mismatch_rejected() {
+    let secret = BrokerSecret::generate();
+    let now = now_unix();
+    let cap = CapabilityToken::issue_for_operation(
+        &secret,
+        "ownmeshd",
+        ELEVATED_CAPABILITY_SCOPE,
+        "bound_op",
+        now,
+        120,
+    );
+    let req = build_request_with_capability(
+        &secret,
+        "ownmeshd",
+        "different_op",
+        echo_cmd("x"),
+        Some(cap),
+        now,
+        60,
+    );
+    assert!(verify_request(&secret, &req, now).is_err());
 }
 
 #[test]

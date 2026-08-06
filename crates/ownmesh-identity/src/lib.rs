@@ -53,32 +53,58 @@ mod tests {
     }
 
     #[test]
-    fn preferred_store_persists_across_restart() {
+    fn preferred_store_persists_across_restart_without_fallback_mirror() {
+        // Use durable file backends so this test does not depend on a working OS keychain.
+        // When primary store succeeds, fallback must not receive a mirror copy (req 8).
         let dir = tempdir().unwrap();
-        let service = format!(
-            "dev.ownmesh.test.{}",
-            dir.path()
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("x")
+        let primary_dir = dir.path().join("primary");
+        let fallback_dir = dir.path().join("fallback");
+        let pass = b"test-passphrase-for-preferred-ci";
+
+        let store = PreferredSecretStore::from_backends(
+            EncryptedFileKeystore::new(&primary_dir, pass),
+            EncryptedFileKeystore::new(&fallback_dir, pass),
         );
-        let store = PreferredSecretStore::open(&service, dir.path()).unwrap();
         let key = load_or_create_device_key(&store).unwrap();
         store_human_refresh_token(&store, &SecretString::new("rt_test_value_do_not_log")).unwrap();
         let fp = key.public_identity().fingerprint;
 
+        // No mirror: fallback directory must not contain purpose `.oms` files.
+        let fallback_entries = std::fs::read_dir(&fallback_dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .filter(|e| {
+                        e.path()
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .is_some_and(|ext| ext == "oms")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            fallback_entries, 0,
+            "primary success must not mirror secrets into fallback"
+        );
+
         drop(store);
-        let store2 = PreferredSecretStore::open(&service, dir.path()).unwrap();
+
+        let store2 = PreferredSecretStore::from_backends(
+            EncryptedFileKeystore::new(&primary_dir, pass),
+            EncryptedFileKeystore::new(&fallback_dir, pass),
+        );
         let key2 = load_or_create_device_key(&store2).unwrap();
         assert_eq!(key2.public_identity().fingerprint, fp);
         let token = load_human_refresh_token(&store2).unwrap().unwrap();
         assert_eq!(token.expose(), "rt_test_value_do_not_log");
         assert!(!format!("{token:?}").contains("rt_test_value"));
 
-        // Best-effort cleanup so developer keychains are not polluted.
-        let _ = store2.delete(SecretPurpose::DevicePrivateKey);
-        let _ = store2.delete(SecretPurpose::HumanRefreshToken);
-        let _ = service; // keep service name tied to the temp dir lifetime
+        store2
+            .delete(SecretPurpose::DevicePrivateKey)
+            .expect("delete device key");
+        store2
+            .delete(SecretPurpose::HumanRefreshToken)
+            .expect("delete refresh token");
         let _ = DEFAULT_KEYCHAIN_SERVICE;
     }
 }

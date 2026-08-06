@@ -389,12 +389,7 @@ mod tests {
         write_token_file(&paths.runtime_dir, &token).unwrap();
         let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
         let server = Arc::new(IpcServer::new(
-            ServerConfig {
-                endpoint: endpoint.clone(),
-                auth: AuthGate::new(token),
-                server_name: "ownmeshd".into(),
-                server_version: "0.1.0".into(),
-            },
+            ServerConfig::new(endpoint.clone(), AuthGate::new(token), "ownmeshd", "0.1.0"),
             reject_unknown_handler(),
         ));
         let serve = Arc::clone(&server);

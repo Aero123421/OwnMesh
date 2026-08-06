@@ -180,9 +180,7 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
             let mut g = output.lock().map_err(|e| e.to_string())?;
             Ok(g.take().unwrap_or_default())
         }
-        SessionKindInner::Pty {
-            reader, child, ..
-        } => {
+        SessionKindInner::Pty { reader, child, .. } => {
             let max = if max_ms == 0 { 5_000 } else { max_ms };
             // Take reader into a background thread so blocking reads cannot hang the caller.
             let mut reader_opt = reader.lock().map_err(|e| e.to_string())?;

@@ -61,7 +61,9 @@ impl Endpoint {
                 // Fallback: simple polynomial fingerprint of the full path bytes.
                 let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
                 for b in raw.as_bytes() {
-                    acc = acc.wrapping_mul(0x0100_0000_01b3).wrapping_add(u64::from(*b));
+                    acc = acc
+                        .wrapping_mul(0x0100_0000_01b3)
+                        .wrapping_add(u64::from(*b));
                 }
                 key = format!("{acc:016x}");
             }

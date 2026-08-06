@@ -111,10 +111,7 @@ pub fn verify_checksum(data: &[u8], expected_hex: &str) -> UpdateResult<()> {
 
 /// Demo signature: sha256(secret || payload). Production uses real signing keys (see ADR).
 pub fn sign_manifest_payload(secret: &[u8], manifest: &UpdateManifest) -> String {
-    let payload = format!(
-        "{}|{}|{}",
-        manifest.version, manifest.url, manifest.sha256
-    );
+    let payload = format!("{}|{}|{}", manifest.version, manifest.url, manifest.sha256);
     let mut h = Sha256::new();
     h.update(secret);
     h.update(payload.as_bytes());
@@ -148,7 +145,9 @@ pub fn network_check_allowed(settings: &UpdateSettings) -> bool {
 /// Privacy guarantees for tests.
 #[must_use]
 pub fn default_sends_nothing_to_vendor(settings: &UpdateSettings) -> bool {
-    !settings.telemetry_enabled && !settings.crash_reports_opt_in && settings.mode == UpdateMode::Off
+    !settings.telemetry_enabled
+        && !settings.crash_reports_opt_in
+        && settings.mode == UpdateMode::Off
 }
 
 #[cfg(test)]

@@ -2,9 +2,7 @@
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::paths::OwnMeshPaths;
-use crate::schema::{
-    OwnMeshConfig, PolicyFile, CONFIG_SCHEMA_VERSION,
-};
+use crate::schema::{OwnMeshConfig, PolicyFile, CONFIG_SCHEMA_VERSION};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,17 +24,20 @@ pub fn load_config(paths: &OwnMeshPaths) -> ConfigResult<OwnMeshConfig> {
         path: Some(path.clone()),
         source,
     })?;
-    let mut value: toml::Value = raw
-        .parse::<toml::Value>()
-        .map_err(|err: toml::de::Error| ConfigError::Parse {
-            path: path.clone(),
-            message: err.to_string(),
-        })?;
+    let mut value: toml::Value =
+        raw.parse::<toml::Value>()
+            .map_err(|err: toml::de::Error| ConfigError::Parse {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
     let migrated = migrate_config_value(&mut value)?;
-    let cfg: OwnMeshConfig = value.try_into().map_err(|err: toml::de::Error| ConfigError::Parse {
-        path: path.clone(),
-        message: err.to_string(),
-    })?;
+    let cfg: OwnMeshConfig =
+        value
+            .try_into()
+            .map_err(|err: toml::de::Error| ConfigError::Parse {
+                path: path.clone(),
+                message: err.to_string(),
+            })?;
     cfg.validate()?;
     if migrated {
         save_config(paths, &cfg)?;
@@ -53,7 +54,8 @@ pub fn save_config(paths: &OwnMeshPaths, cfg: &OwnMeshConfig) -> ConfigResult<()
     cfg.validate()?;
     paths.ensure_layout()?;
     let path = paths.config_file();
-    let rendered = toml::to_string_pretty(cfg).map_err(|err| ConfigError::Other(err.to_string()))?;
+    let rendered =
+        toml::to_string_pretty(cfg).map_err(|err| ConfigError::Other(err.to_string()))?;
     // Defense in depth: refuse to write if secrets somehow appear.
     assert_no_plaintext_secrets(&rendered)?;
     atomic_write(&path, rendered.as_bytes())?;
@@ -212,10 +214,7 @@ fn migrate_config_value(value: &mut toml::Value) -> ConfigResult<bool> {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn migrate_one(
-    table: &mut toml::map::Map<String, toml::Value>,
-    from: u32,
-) -> ConfigResult<u32> {
+fn migrate_one(table: &mut toml::map::Map<String, toml::Value>, from: u32) -> ConfigResult<u32> {
     // Future migrations (1 -> 2, …) land here. Touch `table` so the signature stays honest.
     let _ = table;
     match from {
@@ -269,12 +268,14 @@ mod tests {
 
         cfg.lang = "en-US".into();
         save_config(&paths, &cfg).unwrap();
-        assert!(paths.config_file().with_extension("toml.bak").exists() || {
-            // backup_path appends .bak to full file name
-            let mut p = paths.config_file().into_os_string();
-            p.push(".bak");
-            PathBuf::from(p).exists()
-        });
+        assert!(
+            paths.config_file().with_extension("toml.bak").exists() || {
+                // backup_path appends .bak to full file name
+                let mut p = paths.config_file().into_os_string();
+                p.push(".bak");
+                PathBuf::from(p).exists()
+            }
+        );
 
         let loaded = load_config(&paths).unwrap();
         assert_eq!(loaded.lang, "en-US");
@@ -285,11 +286,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
         paths.ensure_layout().unwrap();
-        fs::write(
-            paths.config_file(),
-            "lang = \"zh-Hans\"\n",
-        )
-        .unwrap();
+        fs::write(paths.config_file(), "lang = \"zh-Hans\"\n").unwrap();
         let cfg = load_config(&paths).unwrap();
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(cfg.lang, "zh-Hans");

@@ -165,15 +165,7 @@ impl SessionManager {
         profile_id: Option<String>,
     ) -> SessionInfo {
         self.open_with(
-            kind,
-            title,
-            creator,
-            now_unix,
-            profile_id,
-            None,
-            None,
-            None,
-            None,
+            kind, title, creator, now_unix, profile_id, None, None, None, None,
         )
     }
 

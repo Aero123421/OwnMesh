@@ -7,7 +7,7 @@ use ownmesh_identity::{
 use serde::Deserialize;
 use serde_json::json;
 
-use super::session::SessionPaths;
+use super::session::{validate_issuer, SessionPaths};
 
 /// Public device record returned by the control plane.
 #[derive(Debug, Clone, Deserialize)]
@@ -74,17 +74,15 @@ pub async fn enroll_device(
     session_paths: &SessionPaths,
     name: Option<&str>,
 ) -> Result<EnrollResult> {
-    let issuer = issuer.trim().trim_end_matches('/');
-    let key = load_or_create_device_key(store)
-        .map_err(|err| anyhow!("load/create device key: {err}"))?;
+    let issuer = validate_issuer(issuer)?;
+    let key =
+        load_or_create_device_key(store).map_err(|err| anyhow!("load/create device key: {err}"))?;
     let public = key.public_identity();
 
     let hostname = hostname_string();
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let display = name
-        .map(str::to_owned)
-        .unwrap_or_else(|| hostname.clone());
+    let display = name.map(str::to_owned).unwrap_or_else(|| hostname.clone());
 
     let enroll_resp = http
         .post(format!("{issuer}/v1/devices/enroll"))
@@ -113,10 +111,7 @@ pub async fn enroll_device(
     let sig = key.sign(enroll.challenge.message.as_bytes());
     let signature_hex = hex_encode(sig.expose());
 
-    let proof_token = enroll
-        .enrollment_token
-        .as_deref()
-        .unwrap_or(access_token);
+    let proof_token = enroll.enrollment_token.as_deref().unwrap_or(access_token);
 
     let proof_resp = http
         .post(format!("{issuer}/v1/devices/enroll/proof"))
@@ -165,7 +160,7 @@ pub async fn list_devices(
     issuer: &str,
     access_token: &str,
 ) -> Result<Vec<DeviceInfo>> {
-    let issuer = issuer.trim().trim_end_matches('/');
+    let issuer = validate_issuer(issuer)?;
     let resp = http
         .get(format!("{issuer}/v1/devices"))
         .bearer_auth(access_token)
@@ -193,7 +188,7 @@ pub async fn revoke_device(
     device_id: &str,
     session_paths: &SessionPaths,
 ) -> Result<bool> {
-    let issuer = issuer.trim().trim_end_matches('/');
+    let issuer = validate_issuer(issuer)?;
     let resp = http
         .post(format!("{issuer}/v1/devices/revoke"))
         .bearer_auth(access_token)

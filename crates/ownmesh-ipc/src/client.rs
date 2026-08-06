@@ -157,6 +157,11 @@ impl IpcClient {
             {
                 return Err(IpcError::Unauthorized(message));
             }
+            Err(IpcError::Remote { code, message })
+                if code == crate::rpc::app_error::TOKEN_REVOKED =>
+            {
+                return Err(IpcError::Remote { code, message });
+            }
             Err(err) => return Err(err),
         };
         let hello_result: HelloResult = serde_json::from_value(value)?;
@@ -197,19 +202,14 @@ impl IpcClient {
         loop {
             attempts = attempts.saturating_add(1);
             self.ensure_connected().await?;
-            let result = self
-                .call_once(method, params.clone(), cancel)
-                .await;
+            let result = self.call_once(method, params.clone(), cancel).await;
             match result {
                 Ok(value) => return Ok(value),
                 Err(IpcError::Disconnected(_)) | Err(IpcError::Io(_))
                     if attempts <= self.options.max_reconnect_attempts =>
                 {
                     self.disconnect().await;
-                    let delay = self
-                        .options
-                        .reconnect_base_delay
-                        .saturating_mul(attempts);
+                    let delay = self.options.reconnect_base_delay.saturating_mul(attempts);
                     tokio::time::sleep(delay).await;
                 }
                 Err(err) => return Err(err),
@@ -322,17 +322,22 @@ mod tests {
 
     async fn start_test_server(
         runtime: &Path,
-    ) -> (Arc<IpcServer>, Endpoint, String, tokio::task::JoinHandle<()>) {
+    ) -> (
+        Arc<IpcServer>,
+        Endpoint,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
         let token = generate_token();
         write_token_file(runtime, &token).unwrap();
         let endpoint = Endpoint::default_for(runtime, IpcBus::Daemon);
         let server = Arc::new(IpcServer::new(
-            ServerConfig {
-                endpoint: endpoint.clone(),
-                auth: AuthGate::new(token.clone()),
-                server_name: "ownmeshd-test".into(),
-                server_version: "0.1.0-test".into(),
-            },
+            ServerConfig::new(
+                endpoint.clone(),
+                AuthGate::new(token.clone()),
+                "ownmeshd-test",
+                "0.1.0-test",
+            ),
             reject_unknown_handler(),
         ));
         let serve = Arc::clone(&server);
@@ -400,7 +405,10 @@ mod tests {
 
         let err = client.status().await.expect_err("must reject");
         assert!(
-            matches!(err, IpcError::Unauthorized(_) | IpcError::Remote { .. } | IpcError::Disconnected(_)),
+            matches!(
+                err,
+                IpcError::Unauthorized(_) | IpcError::Remote { .. } | IpcError::Disconnected(_)
+            ),
             "unexpected error: {err:?}"
         );
         assert!(

@@ -1,8 +1,6 @@
 //! Command-argument injection + idempotency/replay security tests (harden-07).
 
-use ownmesh_exec::{
-    request_fingerprint, run_command, CommandKind, IdempotencyJournal, RunRequest,
-};
+use ownmesh_exec::{request_fingerprint, run_command, CommandKind, IdempotencyJournal, RunRequest};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
@@ -27,10 +25,7 @@ async fn structured_args_are_not_shell_expanded() {
         let marker = "OWNMESH_INJECT_OK";
         let req = structured(
             "cmd.exe",
-            vec![
-                "/C".into(),
-                format!("echo {marker}&echo SHOULD_NOT_SPLIT"),
-            ],
+            vec!["/C".into(), format!("echo {marker}&echo SHOULD_NOT_SPLIT")],
         );
         assert_eq!(req.kind, CommandKind::Structured);
         assert_eq!(req.args.len(), 2);
@@ -44,12 +39,12 @@ async fn structured_args_are_not_shell_expanded() {
         let res = run_command(&req, None).await.unwrap();
         assert_eq!(res.exit_code, Some(0));
         assert!(res.stdout.contains(payload) || res.stdout.contains("; echo PWNED"));
-        let pwn_lines = res
-            .stdout
-            .lines()
-            .filter(|l| l.trim() == "PWNED")
-            .count();
-        assert_eq!(pwn_lines, 0, "shell evaluated metacharacters: {}", res.stdout);
+        let pwn_lines = res.stdout.lines().filter(|l| l.trim() == "PWNED").count();
+        assert_eq!(
+            pwn_lines, 0,
+            "shell evaluated metacharacters: {}",
+            res.stdout
+        );
     }
 }
 
@@ -74,10 +69,7 @@ async fn idempotency_key_replays_without_rerun() {
     let mut journal = IdempotencyJournal::open(dir.path().join("j.json")).unwrap();
 
     #[cfg(windows)]
-    let mut req = structured(
-        "cmd.exe",
-        vec!["/C".into(), "echo replay-once".into()],
-    );
+    let mut req = structured("cmd.exe", vec!["/C".into(), "echo replay-once".into()]);
     #[cfg(not(windows))]
     let mut req = structured("echo", vec!["replay-once".into()]);
     req.idempotency_key = Some("harden-op-1".into());

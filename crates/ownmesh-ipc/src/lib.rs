@@ -32,7 +32,7 @@ pub use rpc::{
     app_error, methods, DaemonStatus, HelloParams, HelloResult, RequestId, RpcErrorObject,
     RpcRequest, RpcResponse, JSONRPC_VERSION,
 };
-pub use server::{reject_unknown_handler, IpcServer, MethodHandler, ServerConfig};
+pub use server::{reject_unknown_handler, IpcServer, MethodHandler, RevokedClients, ServerConfig};
 pub use transport::{connect, ClientConnection, LocalListener, ServerConnection};
 
 /// Stable crate name used by diagnostics and tests.

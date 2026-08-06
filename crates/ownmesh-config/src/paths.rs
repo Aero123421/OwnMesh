@@ -101,7 +101,9 @@ impl OwnMeshPaths {
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
-    env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
+    env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 fn home_dir() -> ConfigResult<PathBuf> {

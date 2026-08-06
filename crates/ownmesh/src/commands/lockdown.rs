@@ -26,13 +26,9 @@ pub fn run_unlock(cli: &Cli) -> Result<(), ExitCode> {
 pub fn dispatch_tokens(cli: &Cli, cmd: &TokensCmd) -> Result<(), ExitCode> {
     match cmd {
         TokensCmd::Revoke { client } => {
-            let value =
-                call_daemon(methods::TOKEN_REVOKE, Some(json!({ "client": client })))?;
+            let value = call_daemon(methods::TOKEN_REVOKE, Some(json!({ "client": client })))?;
             print_value(cli.json, &value, |v| {
-                println!(
-                    "revoked client {}",
-                    v["revoked"].as_str().unwrap_or(client)
-                );
+                println!("revoked client {}", v["revoked"].as_str().unwrap_or(client));
             });
             Ok(())
         }

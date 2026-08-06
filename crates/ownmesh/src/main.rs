@@ -60,7 +60,10 @@ mod tests {
             "unlock",
             "tokens",
         ] {
-            assert!(help.contains(needle), "missing {needle} in help/registration");
+            assert!(
+                help.contains(needle),
+                "missing {needle} in help/registration"
+            );
         }
         let approval_help = cmd
             .find_subcommand_mut("approval")

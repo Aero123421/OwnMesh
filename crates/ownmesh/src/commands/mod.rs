@@ -4,8 +4,8 @@ mod approval;
 pub(crate) mod device_cmd;
 mod exec;
 mod ipc_util;
-pub(crate) mod login;
 mod lockdown;
+pub(crate) mod login;
 mod policy_cmd;
 mod privileged;
 mod session_cmd;
@@ -25,10 +25,18 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
     match &cli.command {
         None => run_tui_launch(cli),
         Some(Commands::Status) => run_status(cli),
-        Some(Commands::Setup) => stub(cli, "setup", "Interactive setup arrives in a later chapter."),
+        Some(Commands::Setup) => stub(
+            cli,
+            "setup",
+            "Interactive setup arrives in a later chapter.",
+        ),
         Some(Commands::Login(args)) => login::run_login(cli, args),
         Some(Commands::Logout) => login::run_logout(cli),
-        Some(Commands::Doctor) => stub(cli, "doctor", "Doctor diagnostics expand in later chapters."),
+        Some(Commands::Doctor) => stub(
+            cli,
+            "doctor",
+            "Doctor diagnostics expand in later chapters.",
+        ),
         Some(Commands::Lockdown) => lockdown::run_lockdown(cli),
         Some(Commands::Unlock) => lockdown::run_unlock(cli),
         Some(Commands::Tokens(cmd)) => lockdown::dispatch_tokens(cli, cmd),
@@ -122,13 +130,76 @@ fn dispatch_config(cli: &Cli, cmd: &ConfigCmd) -> Result<(), ExitCode> {
 
 fn dispatch_instance(cli: &Cli, cmd: &InstanceCmd) -> Result<(), ExitCode> {
     match cmd {
-        InstanceCmd::Add { id, base_url } => {
-            stub(cli, "instance add", &format!("{id} -> {base_url}"))
-        }
+        InstanceCmd::Add { id, base_url } => add_instance(cli, id, base_url),
         InstanceCmd::List => stub(cli, "instance list", "chapter 5"),
         InstanceCmd::Use { id } => stub(cli, "instance use", id),
         InstanceCmd::Remove { id } => stub(cli, "instance remove", id),
     }
+}
+
+/// Add (or update) a control-plane instance after validating the issuer URL.
+///
+/// Non-loopback `http://` base URLs are rejected (req 9 / sec-07).
+fn add_instance(cli: &Cli, id: &str, base_url: &str) -> Result<(), ExitCode> {
+    use ownmesh_config::{
+        load_config, save_config, validate_control_plane_base_url, InstanceConfig, OwnMeshPaths,
+    };
+
+    let id = id.trim();
+    if id.is_empty() {
+        eprintln!("instance id must not be empty");
+        return Err(ExitCode::UsageConfig);
+    }
+    // Same issuer policy as auth::session::validate_issuer (req 9 / sec-07).
+    let base_url = match validate_control_plane_base_url(base_url) {
+        Ok(url) => url,
+        Err(err) => {
+            eprintln!("instance add: {err}");
+            return Err(ExitCode::UsageConfig);
+        }
+    };
+
+    let paths = OwnMeshPaths::discover().map_err(|err| {
+        eprintln!("paths: {err}");
+        ExitCode::UsageConfig
+    })?;
+    paths.ensure_layout().map_err(|err| {
+        eprintln!("layout: {err}");
+        ExitCode::UsageConfig
+    })?;
+
+    let mut cfg = load_config(&paths).unwrap_or_default();
+    if let Some(existing) = cfg.instances.iter_mut().find(|i| i.id == id) {
+        existing.base_url = base_url.clone();
+    } else {
+        cfg.instances.push(InstanceConfig {
+            id: id.to_owned(),
+            base_url: base_url.clone(),
+            display_name: None,
+        });
+    }
+    if cfg.active_instance.is_none() {
+        cfg.active_instance = Some(id.to_owned());
+    }
+    save_config(&paths, &cfg).map_err(|err| {
+        eprintln!("save config: {err}");
+        ExitCode::UsageConfig
+    })?;
+
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "ok": true,
+                "id": id,
+                "base_url": base_url,
+            })
+        );
+    } else {
+        println!("instance added: {id} -> {base_url}");
+    }
+    Ok(())
 }
 
 fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {

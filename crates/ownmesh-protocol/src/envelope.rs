@@ -1,8 +1,6 @@
 //! Device protocol envelope (specification §21.3).
 
-use ownmesh_domain::{
-    DomainError, ErrorCode, Expiry, MessageId, Timestamp, DEFAULT_CLOCK_SKEW,
-};
+use ownmesh_domain::{DomainError, ErrorCode, Expiry, MessageId, Timestamp, DEFAULT_CLOCK_SKEW};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -106,11 +104,7 @@ impl Envelope {
     }
 
     /// Validate `expires_at` against `now` with the given skew.
-    pub fn validate_expiry_at(
-        &self,
-        now: Timestamp,
-        skew: Duration,
-    ) -> Result<(), DomainError> {
+    pub fn validate_expiry_at(&self, now: Timestamp, skew: Duration) -> Result<(), DomainError> {
         if let Some(exp) = self.expires_at {
             exp.check_at(now, skew).map_err(|e| {
                 DomainError::new(

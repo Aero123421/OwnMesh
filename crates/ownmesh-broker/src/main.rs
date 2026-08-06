@@ -47,9 +47,6 @@ enum Commands {
         /// Allowed caller principal ids (comma-separated).
         #[arg(long, default_value = "ownmeshd")]
         allow_callers: String,
-        /// Require capability token on every request.
-        #[arg(long, default_value_t = false)]
-        require_capability: bool,
         /// Runtime dir used when resolving default endpoint.
         #[arg(long)]
         runtime_dir: Option<PathBuf>,
@@ -113,11 +110,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let st = broker_status(&base)?;
             println!(
                 "status={} network={} endpoint={} kind={} secret={}",
-                if st.installed {
-                    "installed"
-                } else {
-                    "idle"
-                },
+                if st.installed { "installed" } else { "idle" },
                 st.network,
                 st.endpoint.as_deref().unwrap_or("-"),
                 st.endpoint_kind,
@@ -130,11 +123,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             endpoint,
         } => {
             let ep = match endpoint {
-                Some(s) => Some(resolve_broker_endpoint(
-                    &state_dir.join("runtime"),
-                    Some(&s),
-                )
-                .map_err(|e| e.to_string())?),
+                Some(s) => Some(
+                    resolve_broker_endpoint(&state_dir.join("runtime"), Some(&s))
+                        .map_err(|e| e.to_string())?,
+                ),
                 None => None,
             };
             let rec = install_broker(&state_dir, ep)?;
@@ -155,7 +147,6 @@ async fn run(cli: Cli) -> Result<(), String> {
             secret_file,
             addr_file,
             allow_callers,
-            require_capability,
             runtime_dir,
         } => {
             let runtime = runtime_dir.unwrap_or_else(|| {
@@ -171,8 +162,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 enforce_bind_is_networkless(addr)?;
                 BrokerEndpoint::LoopbackTcp(addr)
             } else {
-                resolve_broker_endpoint(&runtime, endpoint.as_deref())
-                    .map_err(|e| e.to_string())?
+                resolve_broker_endpoint(&runtime, endpoint.as_deref()).map_err(|e| e.to_string())?
             };
             ep.enforce_networkless().map_err(|e| e.to_string())?;
             let allowed: Vec<String> = allow_callers
@@ -188,7 +178,6 @@ async fn run(cli: Cli) -> Result<(), String> {
                 endpoint: ep,
                 secret_file,
                 allow_callers: allowed,
-                require_capability,
                 addr_file,
             })
             .await

@@ -8,13 +8,13 @@ use serde_json::json;
 pub fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
     match cmd {
         SessionCmd::Open { device: _, command } => {
+            // Principal is bound server-side to the authenticated IPC client identity.
             let value = call_daemon(
                 "session.open",
                 Some(json!({
                     "title": "cli",
                     "kind": "pty",
                     "command": command,
-                    "principal": "prin_local",
                 })),
             )?;
             print_value(cli.json, &value, |v| {
@@ -38,9 +38,7 @@ pub fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
                             "{}  {}  controller={}",
                             s["id"].as_str().unwrap_or("?"),
                             s["state"].as_str().unwrap_or("?"),
-                            s["controller"]["principal_id"]
-                                .as_str()
-                                .unwrap_or("-")
+                            s["controller"]["principal_id"].as_str().unwrap_or("-")
                         );
                     }
                 }
@@ -60,7 +58,6 @@ pub fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
                 Some(json!({
                     "id": id,
                     "read_only": read_only,
-                    "principal": "prin_local",
                 })),
             )?;
             print_value(cli.json, &value, |v| {
@@ -73,10 +70,7 @@ pub fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
             Ok(())
         }
         SessionCmd::Claim { id } => {
-            let value = call_daemon(
-                "session.claim",
-                Some(json!({ "id": id, "principal": "prin_local" })),
-            )?;
+            let value = call_daemon("session.claim", Some(json!({ "id": id })))?;
             print_value(cli.json, &value, |v| {
                 println!(
                     "claimed lease={}",
@@ -86,20 +80,17 @@ pub fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
             Ok(())
         }
         SessionCmd::Release { id } => {
-            let value = call_daemon(
-                "session.release",
-                Some(json!({ "id": id, "principal": "prin_local" })),
-            )?;
+            let value = call_daemon("session.release", Some(json!({ "id": id })))?;
             print_value(cli.json, &value, |_| println!("released {id}"));
             Ok(())
         }
         SessionCmd::Give { id, to } => {
+            // `from` is bound server-side to the authenticated IPC client identity.
             let value = call_daemon(
                 "session.give",
                 Some(json!({
                     "id": id,
                     "to": to,
-                    "from": "prin_local",
                 })),
             )?;
             print_value(cli.json, &value, |v| {
