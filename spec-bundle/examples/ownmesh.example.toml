@@ -1,0 +1,36 @@
+# OwnMesh local configuration example
+# Copy toward the OS-specific config path documented in the specification §23.1
+# and adjust for your control plane URL and workspaces.
+#
+# Secrets (refresh tokens, device private keys) MUST NOT appear in this file.
+
+locale = "en-US"
+
+[control_plane]
+base_url = "https://ownmesh.example.workers.dev"
+tenant_id = "ten_example"
+
+[device]
+display_name = "dev-laptop"
+labels = ["personal", "windows"]
+
+[agent]
+auto_start = true
+log_level = "info"
+
+[update]
+mode = "notify"
+channel = "stable"
+
+[telemetry]
+project_telemetry = false
+crash_upload = false
+usage_analytics = false
+
+[transfer]
+cloud_file_relay = false
+
+[[workspaces]]
+id = "ws_app"
+path = "D:/src/my-app"
+display_name = "My App"

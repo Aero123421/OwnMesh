@@ -1,0 +1,63 @@
+# OwnMesh Recommended preset — general user operations allowed;
+# elevation, sensitive paths, external transfer, and major OS changes ask.
+
+preset = "recommended"
+default_decision = "allow"
+
+sensitive_path_globs = [
+  "**/.env",
+  "**/.env.*",
+  "**/id_rsa",
+  "**/id_ed25519",
+  "**/*.pem",
+  "**/*credentials*",
+  "**/AppData/Roaming/**/*token*",
+]
+
+[[rules]]
+id = "deny-nothing-by-default"
+priority = 0
+decision = "allow"
+description = "Recommended baseline allows ordinary user-scoped work."
+
+[[rules]]
+id = "ask-elevated"
+priority = 100
+decision = "ask"
+elevated = true
+operation_classes = ["elevated"]
+description = "Administrator/root operations require explicit approval."
+
+[[rules]]
+id = "ask-raw-shell"
+priority = 90
+decision = "ask"
+raw_shell = true
+operation_classes = ["raw_shell"]
+description = "Raw shell is higher risk than structured commands."
+
+[[rules]]
+id = "ask-external-transfer"
+priority = 90
+decision = "ask"
+operation_classes = ["external_data_transfer"]
+description = "Device-to-device or open-world transfers need confirmation."
+
+[[rules]]
+id = "ask-sensitive-reads"
+priority = 80
+decision = "ask"
+operation_classes = ["reads_sensitive_location", "writes_sensitive_location"]
+description = "Credential and secret locations prompt by default."
+
+[[rules]]
+id = "ask-system-changes"
+priority = 100
+decision = "ask"
+operation_classes = [
+  "system_persistence_change",
+  "package_install",
+  "service_change",
+  "user_account_change",
+]
+description = "Persistence and account changes always ask under Recommended."

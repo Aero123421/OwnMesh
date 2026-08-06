@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/protocol-envelope.schema.json",
+  "title": "OwnMesh device protocol envelope",
+  "description": "WebSocket JSON envelope between Agent and Control Plane. Extracted from OWNMESH_SPECIFICATION.ja.md §21.3.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "message_id",
+    "type",
+    "device_id",
+    "seq",
+    "sent_at",
+    "payload"
+  ],
+  "properties": {
+    "protocol": {
+      "type": "string",
+      "const": "ownmesh.device/1.0"
+    },
+    "message_id": {
+      "type": "string",
+      "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "minLength": 5,
+      "maxLength": 128
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Message type, e.g. operation.request, session.event."
+    },
+    "device_id": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "correlation_id": {
+      "type": ["string", "null"],
+      "description": "Often an operation_id (op_...)."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Per-connection monotonic sequence."
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}

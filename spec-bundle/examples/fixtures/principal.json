@@ -1,0 +1,9 @@
+{
+  "id": "prin_owner1",
+  "tenant_id": "ten_example",
+  "type": "human",
+  "external_subject": "user:cfx|abc123",
+  "display_name": "Owner",
+  "status": "active",
+  "created_at": "2026-08-06T00:00:00Z"
+}

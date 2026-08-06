@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ownmesh-domain",
+    "crates/ownmesh-protocol",
+    "crates/ownmesh-ipc",
+    "crates/ownmesh-config",
+    "crates/ownmesh-identity",
+    "crates/ownmesh-exec",
+    "crates/ownmesh-fs",
+    "crates/ownmesh-logs",
+    "crates/ownmesh-policy",
+    "crates/ownmesh-session",
+    "crates/ownmesh-broker-client",
+    "crates/ownmesh-profiles",
+    "crates/ownmesh-transfer",
+    "crates/ownmesh-update",
+    "crates/ownmesh-diagnostics",
+    "crates/ownmesh",
+    "crates/ownmesh-tui",
+    "crates/ownmeshd",
+    "crates/ownmesh-session-host",
+    "crates/ownmesh-broker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Aero123421/OwnMesh"
+homepage = "https://github.com/Aero123421/OwnMesh"
+authors = ["OwnMesh Contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

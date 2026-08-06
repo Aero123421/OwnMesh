@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "OWNMESH_E_DEVICE_OFFLINE",
+    "message": "The selected device is offline.",
+    "retryable": true,
+    "operation_id": "op_01SAMPLE",
+    "details": {}
+  }
+}

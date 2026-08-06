@@ -1,0 +1,14 @@
+{
+  "protocol": "ownmesh.device/1.0",
+  "message_id": "msg_01SAMPLE",
+  "type": "operation.request",
+  "device_id": "dev_windows-01",
+  "correlation_id": "op_01SAMPLE",
+  "seq": 123,
+  "sent_at": "2026-08-06T00:00:00Z",
+  "expires_at": "2026-08-06T00:01:00Z",
+  "payload": {
+    "capability": "fs.read",
+    "path": "README.md"
+  }
+}

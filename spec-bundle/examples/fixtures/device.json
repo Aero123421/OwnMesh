@@ -1,0 +1,16 @@
+{
+  "id": "dev_windows-01",
+  "tenant_id": "ten_example",
+  "owner_principal_id": "prin_owner1",
+  "name": "dev-windows",
+  "hostname": "DESKTOP-OWNMESH",
+  "os": "windows",
+  "arch": "x64",
+  "agent_version": "1.0.0",
+  "protocol_version": "ownmesh.device/1.0",
+  "public_key": "owm1pub_test_not_a_secret_fingerprint",
+  "labels": ["personal", "windows"],
+  "status": "active",
+  "last_seen_at": "2026-08-06T00:00:00Z",
+  "created_at": "2026-08-06T00:00:00Z"
+}

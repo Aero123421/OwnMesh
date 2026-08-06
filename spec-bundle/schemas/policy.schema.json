@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/policy.schema.json",
+  "title": "OwnMesh policy",
+  "description": "Schema for OwnMesh policy.toml (allow/ask/deny). Extracted from OWNMESH_SPECIFICATION.ja.md §7.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["preset"],
+  "properties": {
+    "preset": {
+      "type": "string",
+      "enum": [
+        "recommended",
+        "workspace_only",
+        "full_user_access",
+        "full_access",
+        "custom"
+      ]
+    },
+    "default_decision": {
+      "type": "string",
+      "enum": ["allow", "ask", "deny"],
+      "description": "Fallback when no rule matches (preset may override)."
+    },
+    "rules": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rule" }
+    },
+    "sensitive_path_globs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths that Recommended/Custom presets may treat as ask."
+    }
+  },
+  "$defs": {
+    "decision": {
+      "type": "string",
+      "enum": ["allow", "ask", "deny"]
+    },
+    "operation_class": {
+      "type": "string",
+      "enum": [
+        "elevated",
+        "writes_outside_workspace",
+        "reads_sensitive_location",
+        "writes_sensitive_location",
+        "external_data_transfer",
+        "raw_shell",
+        "system_persistence_change",
+        "package_install",
+        "service_change",
+        "user_account_change",
+        "destructive_file_change",
+        "public_or_open_world_effect"
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision"],
+      "properties": {
+        "id": { "type": "string" },
+        "priority": { "type": "integer" },
+        "decision": { "$ref": "#/$defs/decision" },
+        "principal_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "device_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "workspace_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "path_globs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "executables": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "elevated": { "type": "boolean" },
+        "raw_shell": { "type": "boolean" },
+        "operation_classes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/operation_class" }
+        },
+        "description": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "id": "rule_deny_raw_shell",
+  "policy_id": "pol_recommended",
+  "priority": 100,
+  "decision": "ask",
+  "capabilities": ["exec.raw_shell"],
+  "raw_shell": true,
+  "operation_classes": ["raw_shell"],
+  "description": "Ask before raw shell"
+}

@@ -1,0 +1,23 @@
+[package]
+name = "ownmesh-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "OwnMesh device protocol envelopes and version negotiation"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+ownmesh-domain = { path = "../ownmesh-domain" }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+
+[dev-dependencies]
+jsonschema = "0.28.1"
+serde_json = "1.0.135"

@@ -1,0 +1,18 @@
+# Example custom CLI profile — optional helpers for detect/launch/resume.
+# Any CLI can still run via `ownmesh exec` / `ownmesh session open` without a profile.
+
+id = "example"
+display_name = "Example Agent"
+commands = ["example"]
+interactive = true
+
+[detect]
+version_args = ["--version"]
+
+[non_interactive]
+args = ["--prompt", "{{prompt}}"]
+
+[capabilities]
+resume = false
+structured_output = false
+acp = false

@@ -1,0 +1,451 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/domain-entities.schema.json",
+  "title": "OwnMesh domain entities",
+  "description": "JSON Schema for OwnMesh domain entities (specification §7, §12, §20).",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "tenant_id": {
+      "type": "string",
+      "pattern": "^ten_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "principal_id": {
+      "type": "string",
+      "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "membership_id": {
+      "type": "string",
+      "pattern": "^mem_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "device_id": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "workspace_id": {
+      "type": "string",
+      "pattern": "^ws_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "capability_grant_id": {
+      "type": "string",
+      "pattern": "^grant_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "policy_rule_id": {
+      "type": "string",
+      "pattern": "^rule_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "policy_id": {
+      "type": "string",
+      "pattern": "^pol_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "approval_id": {
+      "type": "string",
+      "pattern": "^apr_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^op_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^sess_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "audit_event_id": {
+      "type": "string",
+      "pattern": "^aud_[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "entity_status": {
+      "type": "string",
+      "enum": ["active", "disabled", "pending", "revoked"]
+    },
+    "auth_mode": {
+      "type": "string",
+      "enum": ["cloudflare_access", "generic_oidc", "development"]
+    },
+    "principal_type": {
+      "type": "string",
+      "enum": ["human", "oauth_client", "device", "local_ipc", "service"]
+    },
+    "membership_role": {
+      "type": "string",
+      "enum": ["owner", "admin", "member", "auditor"]
+    },
+    "device_os": {
+      "type": "string",
+      "enum": ["windows", "macos", "linux", "unknown"]
+    },
+    "workspace_mode": {
+      "type": "string",
+      "enum": ["read_write", "read_only"]
+    },
+    "policy_decision": {
+      "type": "string",
+      "enum": ["allow", "ask", "deny"]
+    },
+    "operation_class": {
+      "type": "string",
+      "enum": [
+        "elevated",
+        "writes_outside_workspace",
+        "reads_sensitive_location",
+        "writes_sensitive_location",
+        "external_data_transfer",
+        "raw_shell",
+        "system_persistence_change",
+        "package_install",
+        "service_change",
+        "user_account_change",
+        "destructive_file_change",
+        "public_or_open_world_effect"
+      ]
+    },
+    "approval_state": {
+      "type": "string",
+      "enum": ["pending", "approved", "denied", "expired", "cancelled"]
+    },
+    "approval_scope": {
+      "type": "string",
+      "enum": [
+        "once",
+        "operation_retry",
+        "session",
+        "workspace",
+        "device",
+        "principal",
+        "always",
+        "deny_once",
+        "deny_always"
+      ]
+    },
+    "operation_status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "pending_approval",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "timed_out"
+      ]
+    },
+    "session_type": {
+      "type": "string",
+      "enum": ["process", "terminal", "profile", "local_shell"]
+    },
+    "session_state": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "waiting_input",
+        "waiting_approval",
+        "completed",
+        "failed",
+        "cancelled",
+        "detached",
+        "orphaned",
+        "unreachable"
+      ]
+    },
+    "tenant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "slug", "status", "created_at", "auth_mode"],
+      "properties": {
+        "id": { "$ref": "#/$defs/tenant_id" },
+        "name": { "type": "string", "minLength": 1 },
+        "slug": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/entity_status" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "default_policy_id": { "$ref": "#/$defs/policy_id" },
+        "auth_mode": { "$ref": "#/$defs/auth_mode" }
+      }
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "tenant_id", "type", "display_name", "status", "created_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/principal_id" },
+        "tenant_id": { "$ref": "#/$defs/tenant_id" },
+        "type": { "$ref": "#/$defs/principal_type" },
+        "external_subject": { "type": "string" },
+        "display_name": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/entity_status" },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "membership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "tenant_id", "principal_id", "role", "status", "created_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/membership_id" },
+        "tenant_id": { "$ref": "#/$defs/tenant_id" },
+        "principal_id": { "$ref": "#/$defs/principal_id" },
+        "role": { "$ref": "#/$defs/membership_role" },
+        "status": { "$ref": "#/$defs/entity_status" },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tenant_id",
+        "owner_principal_id",
+        "name",
+        "hostname",
+        "os",
+        "arch",
+        "agent_version",
+        "protocol_version",
+        "public_key",
+        "status",
+        "created_at"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/device_id" },
+        "tenant_id": { "$ref": "#/$defs/tenant_id" },
+        "owner_principal_id": { "$ref": "#/$defs/principal_id" },
+        "name": { "type": "string", "minLength": 1 },
+        "hostname": { "type": "string" },
+        "os": { "$ref": "#/$defs/device_os" },
+        "arch": { "type": "string" },
+        "agent_version": { "type": "string" },
+        "protocol_version": { "type": "string" },
+        "public_key": { "type": "string" },
+        "labels": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "status": { "$ref": "#/$defs/entity_status" },
+        "last_seen_at": { "$ref": "#/$defs/timestamp" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "revoked_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "device_id", "name", "canonical_path", "mode", "created_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/workspace_id" },
+        "device_id": { "$ref": "#/$defs/device_id" },
+        "name": { "type": "string", "minLength": 1 },
+        "canonical_path": { "type": "string", "minLength": 1 },
+        "mode": { "$ref": "#/$defs/workspace_mode" },
+        "policy_id": { "$ref": "#/$defs/policy_id" },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "capability_grant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tenant_id",
+        "principal_id",
+        "capability",
+        "status",
+        "created_at",
+        "created_by"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/capability_grant_id" },
+        "tenant_id": { "$ref": "#/$defs/tenant_id" },
+        "principal_id": { "$ref": "#/$defs/principal_id" },
+        "capability": { "type": "string", "minLength": 1 },
+        "device_id": { "$ref": "#/$defs/device_id" },
+        "workspace_id": { "$ref": "#/$defs/workspace_id" },
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "status": { "$ref": "#/$defs/entity_status" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "created_by": { "$ref": "#/$defs/principal_id" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "note": { "type": "string" }
+      }
+    },
+    "policy_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "priority", "decision"],
+      "properties": {
+        "id": { "$ref": "#/$defs/policy_rule_id" },
+        "policy_id": { "$ref": "#/$defs/policy_id" },
+        "priority": { "type": "integer" },
+        "decision": { "$ref": "#/$defs/policy_decision" },
+        "principal_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/principal_id" }
+        },
+        "device_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/device_id" }
+        },
+        "workspace_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/workspace_id" }
+        },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "path_globs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "executables": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "elevated": { "type": "boolean" },
+        "raw_shell": { "type": "boolean" },
+        "operation_classes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/operation_class" }
+        },
+        "description": { "type": "string" },
+        "expires_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tenant_id",
+        "operation_id",
+        "requester_principal_id",
+        "state",
+        "created_at"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/approval_id" },
+        "tenant_id": { "$ref": "#/$defs/tenant_id" },
+        "operation_id": { "$ref": "#/$defs/operation_id" },
+        "requester_principal_id": { "$ref": "#/$defs/principal_id" },
+        "approver_principal_id": { "$ref": "#/$defs/principal_id" },
+        "state": { "$ref": "#/$defs/approval_state" },
+        "scope": { "$ref": "#/$defs/approval_scope" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "decided_at": { "$ref": "#/$defs/timestamp" },
+        "expires_at": { "$ref": "#/$defs/timestamp" },
+        "note": { "type": "string" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tenant_id",
+        "requester_principal_id",
+        "device_id",
+        "capability",
+        "status",
+        "approval_state",
+        "created_at"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/operation_id" },
+        "tenant_id": { "$ref": "#/$defs/tenant_id" },
+        "requester_principal_id": { "$ref": "#/$defs/principal_id" },
+        "device_id": { "$ref": "#/$defs/device_id" },
+        "workspace_id": { "$ref": "#/$defs/workspace_id" },
+        "capability": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/operation_status" },
+        "idempotency_key": { "type": "string" },
+        "approval_state": { "$ref": "#/$defs/approval_state" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "finished_at": { "$ref": "#/$defs/timestamp" },
+        "result_summary": { "type": "object" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "session_type",
+        "device_id",
+        "state",
+        "created_by",
+        "created_at"
+      ],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "session_type": { "$ref": "#/$defs/session_type" },
+        "device_id": { "$ref": "#/$defs/device_id" },
+        "workspace_id": { "$ref": "#/$defs/workspace_id" },
+        "profile_id": { "type": "string" },
+        "state": { "$ref": "#/$defs/session_state" },
+        "created_by": { "$ref": "#/$defs/principal_id" },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "controller_principal": { "$ref": "#/$defs/principal_id" },
+        "controller_lease_version": { "type": "integer", "minimum": 0 },
+        "controller_lease_expires_at": { "$ref": "#/$defs/timestamp" },
+        "last_event_seq": { "type": "integer", "minimum": 0 },
+        "native_session_id": { "type": "string" },
+        "process_id": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "audit_event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "tenant_id", "event_type", "created_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/audit_event_id" },
+        "tenant_id": { "$ref": "#/$defs/tenant_id" },
+        "event_type": { "type": "string", "minLength": 1 },
+        "created_at": { "$ref": "#/$defs/timestamp" },
+        "actor_principal_id": { "$ref": "#/$defs/principal_id" },
+        "device_id": { "$ref": "#/$defs/device_id" },
+        "operation_id": { "$ref": "#/$defs/operation_id" },
+        "session_id": { "$ref": "#/$defs/session_id" },
+        "payload_hash": { "type": "string" },
+        "metadata": { "type": "object" }
+      }
+    },
+    "error_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "retryable"],
+          "properties": {
+            "code": {
+              "type": "string",
+              "pattern": "^OWNMESH_E_[A-Z0-9_]+$"
+            },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" },
+            "operation_id": { "type": "string" },
+            "details": { "type": "object" }
+          }
+        }
+      }
+    },
+    "page_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": "string",
+          "pattern": "^cur_[A-Za-z0-9][A-Za-z0-9._-]*$"
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    }
+  }
+}

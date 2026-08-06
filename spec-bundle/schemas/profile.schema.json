@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/profile.schema.json",
+  "title": "OwnMesh CLI profile",
+  "description": "Schema for OwnMesh CLI profile TOML. Extracted from OWNMESH_SPECIFICATION.ja.md §13.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "display_name", "commands"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "display_name": { "type": "string", "minLength": 1 },
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Candidate executable names on PATH."
+    },
+    "interactive": { "type": "boolean", "default": true },
+    "detect": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version_args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["--version"]
+        },
+        "version_regex": { "type": "string" }
+      }
+    },
+    "non_interactive": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Args template; may include {{prompt}}."
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resume": { "type": "boolean", "default": false },
+        "structured_output": { "type": "boolean", "default": false },
+        "acp": { "type": "boolean", "default": false }
+      }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "working_directory": {
+      "type": "string",
+      "description": "Optional default cwd relative to workspace."
+    }
+  }
+}

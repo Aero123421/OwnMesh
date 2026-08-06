@@ -1,0 +1,43 @@
+[package]
+name = "ownmesh-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "OwnMesh local IPC transport (named pipes / unix sockets)"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1.9.0"
+ownmesh-domain = { path = "../ownmesh-domain" }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+tokio = { version = "1.43.0", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tracing = "0.1.41"
+uuid = { version = "1.12.1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3.15.0"
+tokio = { version = "1.43.0", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }

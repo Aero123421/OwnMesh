@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/domain-ids.schema.json",
+  "title": "OwnMesh stable identifiers",
+  "description": "Stable ID patterns: {prefix}_{body} with body [A-Za-z0-9][A-Za-z0-9._-]*. From OWNMESH_SPECIFICATION.ja.md and protocol-envelope patterns.",
+  "$defs": {
+    "tenant_id": {
+      "type": "string",
+      "pattern": "^ten_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "principal_id": {
+      "type": "string",
+      "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "membership_id": {
+      "type": "string",
+      "pattern": "^mem_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "device_id": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "workspace_id": {
+      "type": "string",
+      "pattern": "^ws_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "capability_grant_id": {
+      "type": "string",
+      "pattern": "^grant_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "policy_rule_id": {
+      "type": "string",
+      "pattern": "^rule_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "policy_id": {
+      "type": "string",
+      "pattern": "^pol_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "approval_id": {
+      "type": "string",
+      "pattern": "^apr_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^op_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^sess_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "audit_event_id": {
+      "type": "string",
+      "pattern": "^aud_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "message_id": {
+      "type": "string",
+      "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "cursor": {
+      "type": "string",
+      "pattern": "^cur_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "error_code": {
+      "type": "string",
+      "pattern": "^OWNMESH_E_[A-Z0-9_]+$"
+    }
+  }
+}

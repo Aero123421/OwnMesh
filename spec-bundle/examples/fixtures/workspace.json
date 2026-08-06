@@ -1,0 +1,9 @@
+{
+  "id": "ws_app",
+  "device_id": "dev_windows-01",
+  "name": "My App",
+  "canonical_path": "D:/src/my-app",
+  "mode": "read_write",
+  "policy_id": "pol_recommended",
+  "created_at": "2026-08-06T00:00:00Z"
+}

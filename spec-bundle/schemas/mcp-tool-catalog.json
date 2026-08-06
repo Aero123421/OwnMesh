@@ -1,0 +1,390 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/mcp-tool-catalog.json",
+  "title": "OwnMesh MCP tool catalog",
+  "description": "Initial MCP tool catalog for OwnMesh 1.0. Extracted from OWNMESH_SPECIFICATION.ja.md §14.3–14.5.",
+  "version": "0.1.0",
+  "result_envelope": {
+    "operation_id": "op_...",
+    "status": "completed",
+    "device_id": "dev_...",
+    "summary": "...",
+    "data": {},
+    "truncated": false,
+    "next_cursor": null,
+    "approval_required": false,
+    "session_id": null,
+    "warnings": []
+  },
+  "error_envelope": {
+    "error": {
+      "code": "OWNMESH_E_DEVICE_OFFLINE",
+      "message": "The selected device is offline.",
+      "retryable": true,
+      "operation_id": "op_...",
+      "details": {}
+    }
+  },
+  "tools": [
+    {
+      "name": "ownmesh_list_devices",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_device",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_list_workspaces",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_list_profiles",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_profile",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_list_sessions",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_session",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_read_session_output",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_list_files",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_stat_file",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_search_files",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_read_file",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_query_logs",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_git_status",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_git_diff",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_get_operation",
+      "group": "discovery_read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_apply_patch",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_write_file",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_delete_path",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_run_command",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_run_shell",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_run_elevated_command",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_start_process",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_stop_process",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_open_session",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_send_session_input",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_resize_session",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_claim_session",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_release_session",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_close_session",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_start_profile",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_resume_profile",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_cancel_operation",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": false,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_plan_transfer",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    },
+    {
+      "name": "ownmesh_start_transfer",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": false
+      }
+    },
+    {
+      "name": "ownmesh_cancel_transfer",
+      "group": "write_execute",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "openWorldHint": true,
+        "idempotentHint": true
+      }
+    }
+  ]
+}

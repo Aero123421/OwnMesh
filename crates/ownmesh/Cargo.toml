@@ -1,0 +1,72 @@
+[package]
+name = "ownmesh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "OwnMesh command-line interface"
+readme = "README.md"
+
+[[bin]]
+name = "ownmesh"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.95"
+clap = { version = "4.5.27", features = ["derive", "env", "wrap_help", "string"] }
+ownmesh-config = { path = "../ownmesh-config" }
+ownmesh-domain = { path = "../ownmesh-domain" }
+ownmesh-identity = { path = "../ownmesh-identity" }
+ownmesh-ipc = { path = "../ownmesh-ipc" }
+ownmesh-protocol = { path = "../ownmesh-protocol" }
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.135"
+tokio = { version = "1.43.0", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+# Forward-declared dependencies for om-04+ (auth / HTTP / OAuth). Modules land later;
+# the command registration table is owned by this ticket.
+base64 = "0.22.1"
+dirs = "6.0.0"
+oauth2 = { version = "5.0.0", default-features = false }
+rand = "0.8.5"
+reqwest = { version = "0.12.12", default-features = false, features = [
+    "gzip",
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+sha2 = "0.10.8"
+thiserror = "2.0.11"
+toml = "0.8.19"
+url = "2.5.4"
+uuid = { version = "1.12.1", features = ["v4"] }
+webbrowser = "1.0.3"
+
+[dev-dependencies]
+tempfile = "3.15.0"
+tokio = { version = "1.43.0", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/errors.schema.json",
+  "title": "OwnMesh error taxonomy",
+  "description": "Error envelope and exit codes (specification §14.7 / §16.3).",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "OWNMESH_E_INVALID_ID",
+        "OWNMESH_E_INVALID_ARGUMENT",
+        "OWNMESH_E_SCHEMA_VALIDATION",
+        "OWNMESH_E_BAD_ENVELOPE",
+        "OWNMESH_E_UNSUPPORTED_PROTOCOL",
+        "OWNMESH_E_CONFIG",
+        "OWNMESH_E_AUTHENTICATION",
+        "OWNMESH_E_AUTHORIZATION",
+        "OWNMESH_E_POLICY_DENIED",
+        "OWNMESH_E_DEVICE_OFFLINE",
+        "OWNMESH_E_TIMEOUT",
+        "OWNMESH_E_CANCELLED",
+        "OWNMESH_E_EXPIRED",
+        "OWNMESH_E_CONFLICT",
+        "OWNMESH_E_STALE_SNAPSHOT",
+        "OWNMESH_E_CONTROLLER_CONFLICT",
+        "OWNMESH_E_SESSION_NOT_CONTROLLER",
+        "OWNMESH_E_PROFILE_UNAVAILABLE",
+        "OWNMESH_E_INTERNAL"
+      ]
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [0, 2, 3, 4, 5, 6, 7, 8, 9]
+    },
+    "error_body": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": { "$ref": "#/$defs/error_code" },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "operation_id": { "type": "string" },
+        "details": { "type": "object" }
+      }
+    },
+    "error_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": { "$ref": "#/$defs/error_body" }
+      }
+    },
+    "exit_code_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "meaning"],
+      "properties": {
+        "code": { "$ref": "#/$defs/exit_code" },
+        "meaning": { "type": "string" }
+      }
+    }
+  },
+  "$ref": "#/$defs/error_envelope"
+}

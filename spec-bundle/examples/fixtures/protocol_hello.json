@@ -1,0 +1,5 @@
+{
+  "offered": ["ownmesh.device/1.0"],
+  "supported": ["ownmesh.device/1.0"],
+  "selected": "ownmesh.device/1.0"
+}

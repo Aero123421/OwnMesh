@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/config.schema.json",
+  "title": "OwnMesh local config",
+  "description": "Schema for OwnMesh config.toml (mapped to JSON for validation). Extracted from OWNMESH_SPECIFICATION.ja.md §23.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "control_plane": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "User-owned control plane base URL (HTTPS)."
+        },
+        "tenant_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "display_name": { "type": "string" },
+        "labels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_start": { "type": "boolean", "default": true },
+        "log_level": {
+          "type": "string",
+          "enum": ["trace", "debug", "info", "warn", "error"],
+          "default": "info"
+        }
+      }
+    },
+    "update": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["off", "check", "notify", "download", "auto"],
+          "default": "notify"
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["stable", "beta", "nightly"],
+          "default": "stable"
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "project_telemetry": { "type": "boolean", "default": false },
+        "crash_upload": { "type": "boolean", "default": false },
+        "usage_analytics": { "type": "boolean", "default": false }
+      }
+    },
+    "transfer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cloud_file_relay": { "type": "boolean", "default": false }
+      }
+    },
+    "workspaces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "path"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+          },
+          "path": { "type": "string", "minLength": 1 },
+          "display_name": { "type": "string" }
+        }
+      }
+    },
+    "locale": {
+      "type": "string",
+      "enum": ["en-US", "ja-JP", "zh-Hans", "ru-RU"],
+      "default": "en-US"
+    }
+  }
+}

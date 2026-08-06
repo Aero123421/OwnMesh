@@ -1,0 +1,12 @@
+{
+  // OwnMesh control plane — Cloudflare Workers skeleton (chapter 0).
+  // D1, Durable Objects, routes, and secrets are wired in later chapters.
+  "name": "ownmesh-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-12-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  }
+}

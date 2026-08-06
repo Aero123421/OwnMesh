@@ -1,0 +1,16 @@
+[package]
+name = "ownmesh-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "OwnMesh allow/ask/deny policy evaluation and presets"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
