@@ -12,8 +12,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import worker, { __setTestStore } from "./index.ts";
+import {
+  DeviceRoom,
+  PROTOCOL,
+  type DeviceEnvelope,
+  type SessionAttachment,
+} from "./device-room.ts";
 import { SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
-import { sha256Hex } from "./util.ts";
+import { internalDoHeaders, randomId, sha256Hex } from "./util.ts";
 
 const ctx = {} as ExecutionContext;
 const ISSUER = "https://cp.test";
@@ -21,12 +27,13 @@ const REDIRECT = "http://127.0.0.1:8750/callback";
 const CLIENT = "client_ownmesh_cli";
 const PRINCIPAL_ID = "prin_dev";
 const TENANT_ID = "ten_default";
+const SESSION_SECRET = "test-session-secret-production-path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, "..", "migrations");
 
 /** Transaction-capable node:sqlite adapter (BEGIN IMMEDIATE + serialized batch). */
-function openSqlStore(): SqlStore {
+function openSqlBackend(): { store: SqlStore; adapter: SqlDatabase } {
   const db = new DatabaseSync(":memory:");
   // Match D1 foreign-key enforcement so unprovisioned tenant INSERTs fail closed.
   db.exec("PRAGMA foreign_keys = ON");
@@ -79,7 +86,11 @@ function openSqlStore(): SqlStore {
       return result;
     },
   };
-  return new SqlStore(adapter, "sqlite");
+  return { store: new SqlStore(adapter, "sqlite"), adapter };
+}
+
+function openSqlStore(): SqlStore {
+  return openSqlBackend().store;
 }
 
 function authProvider(
@@ -110,6 +121,19 @@ async function withStore<T>(fn: (store: SqlStore) => Promise<T>): Promise<T> {
   __setTestStore(store);
   try {
     return await fn(store);
+  } finally {
+    __setTestStore(null);
+  }
+}
+
+async function withStoreAndAdapter<T>(
+  fn: (store: SqlStore, adapter: SqlDatabase) => Promise<T>,
+): Promise<T> {
+  const { store, adapter } = openSqlBackend();
+  await store.ensureBootstrap();
+  __setTestStore(store);
+  try {
+    return await fn(store, adapter);
   } finally {
     __setTestStore(null);
   }
@@ -150,6 +174,356 @@ async function signHex(privateKey: CryptoKey, message: string): Promise<string> 
     await crypto.subtle.sign("Ed25519", privateKey, new TextEncoder().encode(message)),
   );
   return [...signatureBytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Real DeviceRoom DO test doubles (mock DurableObjectState + WebSocketPair)
+// ---------------------------------------------------------------------------
+
+type MockSocket = {
+  attachment: SessionAttachment | null;
+  closed: { code: number; reason: string } | null;
+  sent: string[];
+  readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  serializeAttachment(att: unknown): void;
+  deserializeAttachment(): SessionAttachment | null;
+  accept?(): void;
+};
+
+function mockSocket(att: SessionAttachment | null = null): MockSocket {
+  const s: MockSocket = {
+    attachment: att,
+    closed: null,
+    sent: [],
+    readyState: 1,
+    send(data: string) {
+      if (s.closed) throw new Error("closed");
+      s.sent.push(data);
+    },
+    close(code = 1000, reason = "") {
+      s.closed = { code, reason };
+      s.readyState = 3;
+    },
+    serializeAttachment(attValue: unknown) {
+      s.attachment = attValue as SessionAttachment;
+    },
+    deserializeAttachment() {
+      return s.attachment;
+    },
+    accept() {
+      /* no-op for tests */
+    },
+  };
+  return s;
+}
+
+function mockDOState(opts?: {
+  sockets?: MockSocket[];
+  storage?: Map<string, unknown>;
+}): DurableObjectState {
+  const map = opts?.storage || new Map<string, unknown>();
+  const sockets = opts?.sockets || [];
+  return {
+    id: { toString: () => "do_test", equals: () => false, name: undefined } as DurableObjectId,
+    storage: {
+      get: async (key: string) => map.get(key),
+      put: async (key: string, value: unknown) => {
+        map.set(key, structuredClone(value));
+      },
+      delete: async (key: string) => map.delete(key),
+      list: async () => new Map(map),
+      deleteAll: async () => {
+        map.clear();
+      },
+      transaction: async (fn: (txn: unknown) => Promise<unknown>) => fn({}),
+      getAlarm: async () => null,
+      setAlarm: async () => undefined,
+      deleteAlarm: async () => undefined,
+      sync: async () => undefined,
+      sql: undefined,
+    },
+    getWebSockets: () => sockets as unknown as WebSocket[],
+    acceptWebSocket: (ws: WebSocket) => {
+      sockets.push(ws as unknown as MockSocket);
+    },
+    setWebSocketAutoResponse: () => undefined,
+    getWebSocketAutoResponse: () => null,
+    getWebSocketAutoResponseTimestamp: () => null,
+    setHibernatableWebSocketEventTimeout: () => undefined,
+    getHibernatableWebSocketEventTimeout: () => null,
+    getTags: () => [],
+    abort: () => undefined,
+    waitUntil: () => undefined,
+    blockConcurrencyWhile: async <T>(fn: () => Promise<T>) => fn(),
+  } as unknown as DurableObjectState;
+}
+
+/** Minimal WebSocketPair so DeviceRoom WS upgrade works outside workerd. */
+function installWebSocketPairGlobal(): void {
+  const g = globalThis as typeof globalThis & {
+    WebSocketPair?: new () => { 0: MockSocket; 1: MockSocket };
+    WebSocketRequestResponsePair?: new (req: string, res: string) => unknown;
+  };
+  if (!g.WebSocketPair) {
+    g.WebSocketPair = class WebSocketPair {
+      0: MockSocket;
+      1: MockSocket;
+      constructor() {
+        this[0] = mockSocket();
+        this[1] = mockSocket();
+      }
+    };
+  }
+  if (!g.WebSocketRequestResponsePair) {
+    g.WebSocketRequestResponsePair = class WebSocketRequestResponsePair {
+      constructor(_req: string, _res: string) {
+        /* no-op */
+      }
+    };
+  }
+}
+
+/** DEVICE_ROOM namespace that resolves every id to one real DeviceRoom instance. */
+function deviceRoomNamespace(room: DeviceRoom): DurableObjectNamespace {
+  return {
+    idFromName: (name: string) =>
+      ({
+        toString: () => name,
+        equals: () => false,
+        name,
+      }) as DurableObjectId,
+    get: () => room as unknown as DurableObjectStub,
+  } as unknown as DurableObjectNamespace;
+}
+
+function workerEnv(
+  adapter: SqlDatabase,
+  room: DeviceRoom,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    AUTH_PROVIDER: authProvider(),
+    OAUTH_ISSUER: ISSUER,
+    SESSION_SECRET,
+    DB: adapter as unknown as D1Database,
+    DEVICE_ROOM: deviceRoomNamespace(room),
+    ...extra,
+  };
+}
+
+function drainSocket(sock: MockSocket): DeviceEnvelope[] {
+  const out = sock.sent.map((s) => JSON.parse(s) as DeviceEnvelope);
+  sock.sent.length = 0;
+  return out;
+}
+
+/**
+ * Upgrade via real DeviceRoom.fetch, then drive hello→challenge→proof→ready
+ * through webSocketMessage. Never mutates session.phase directly.
+ */
+async function connectAgentReady(opts: {
+  room: DeviceRoom;
+  deviceId: string;
+  deviceCredential: string;
+  privateKey: CryptoKey;
+}): Promise<{ agentWs: MockSocket; agentSessionId: string; nextSeq: () => number }> {
+  installWebSocketPairGlobal();
+  const { room, deviceId, deviceCredential, privateKey } = opts;
+
+  const headers = await internalDoHeaders(
+    SESSION_SECRET,
+    {
+      op: "ws",
+      device_id: deviceId,
+      principal_id: PRINCIPAL_ID,
+      tenant_id: TENANT_ID,
+      role: "agent",
+    },
+    {
+      Upgrade: "websocket",
+      origin: ISSUER,
+      authorization: `Bearer ${deviceCredential}`,
+      "x-ownmesh-allowed-origin": ISSUER,
+    },
+  );
+  // Node's undici Response rejects status 101; workerd allows it for WS upgrade.
+  // DeviceRoom.acceptWebSocket + session registration run before Response is built,
+  // so a 101 construction error still leaves a live hibernation socket to drive.
+  let upgradeStatus: number | null = null;
+  try {
+    const upgrade = await room.fetch(
+      new Request(`https://device-room/ws?device_id=${encodeURIComponent(deviceId)}&role=agent`, {
+        headers,
+      }),
+    );
+    upgradeStatus = upgrade.status;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/status.*101|range of 200 to 599/i.test(msg)) throw err;
+    upgradeStatus = 101;
+  }
+  assert.equal(upgradeStatus, 101, "WS upgrade must complete (101)");
+
+  const agentWs = [...room.wsSessions.keys()][0] as unknown as MockSocket;
+  assert.ok(agentWs, "DeviceRoom must accept hibernation websocket");
+  const agentSessionId = room.wsSessions.get(agentWs as unknown as WebSocket);
+  assert.ok(agentSessionId);
+  assert.equal(room.router.sessions.get(agentSessionId)?.phase, "connected");
+
+  let seq = 0;
+  const nextSeq = () => {
+    seq += 1;
+    return seq;
+  };
+  const frame = (
+    type: string,
+    payload: Record<string, unknown> = {},
+    correlation?: string,
+  ): DeviceEnvelope => {
+    const envl: DeviceEnvelope = {
+      protocol: PROTOCOL,
+      message_id: randomId("msg_"),
+      type,
+      device_id: deviceId,
+      seq: nextSeq(),
+      sent_at: new Date().toISOString(),
+      payload,
+    };
+    if (correlation) envl.correlation_id = correlation;
+    return envl;
+  };
+
+  await room.webSocketMessage(
+    agentWs as unknown as WebSocket,
+    JSON.stringify(frame("hello", { protocols: [PROTOCOL] })),
+  );
+  const challengeMsgs = drainSocket(agentWs);
+  assert.equal(challengeMsgs[0]?.type, "challenge");
+  const challengeMessage = String(challengeMsgs[0]?.payload.message || "");
+  assert.match(challengeMessage, /ownmesh-device-challenge/);
+  assert.equal(room.router.sessions.get(agentSessionId)?.phase, "challenged");
+
+  const signature = await signHex(privateKey, challengeMessage);
+  await room.webSocketMessage(
+    agentWs as unknown as WebSocket,
+    JSON.stringify(
+      frame("proof", {
+        signature,
+        connection_id: challengeMsgs[0]?.payload.connection_id,
+      }),
+    ),
+  );
+  assert.equal(drainSocket(agentWs)[0]?.type, "accepted");
+  assert.equal(room.router.sessions.get(agentSessionId)?.phase, "proven");
+
+  await room.webSocketMessage(
+    agentWs as unknown as WebSocket,
+    JSON.stringify(frame("ready", { capabilities: ["fs", "exec"] })),
+  );
+  assert.equal(drainSocket(agentWs)[0]?.type, "ready.ack");
+  // Phase ready only via handshake above — never assigned in the test.
+  assert.equal(room.router.sessions.get(agentSessionId)?.phase, "ready");
+
+  return { agentWs, agentSessionId, nextSeq };
+}
+
+async function enrollActivatedDevice(
+  store: SqlStore,
+  adapter: SqlDatabase,
+  privateKey: CryptoKey,
+  publicKeyHex: string,
+  name: string,
+): Promise<{ deviceId: string; deviceCredential: string; accessToken: string; room: DeviceRoom }> {
+  const human = await store.issueTokens(
+    CLIENT,
+    PRINCIPAL_ID,
+    "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device",
+  );
+  const e = env(store);
+  const enrollRes = await worker.fetch(
+    new Request(`${ISSUER}/v1/devices/enroll`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${human.access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name,
+        hostname: `${name}.local`,
+        os: "linux",
+        arch: "x64",
+        agent_version: "1.0.1",
+        protocol_version: "ownmesh.device/1.0",
+        public_key: publicKeyHex,
+      }),
+    }),
+    e,
+    ctx,
+  );
+  assert.equal(enrollRes.status, 201);
+  const enrolled = (await enrollRes.json()) as {
+    device_id: string;
+    challenge: { id: string; message: string };
+  };
+  const enrollSig = await signHex(privateKey, enrolled.challenge.message);
+  const proofRes = await worker.fetch(
+    new Request(`${ISSUER}/v1/devices/enroll/proof`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${human.access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        device_id: enrolled.device_id,
+        challenge_id: enrolled.challenge.id,
+        signature: enrollSig,
+      }),
+    }),
+    e,
+    ctx,
+  );
+  assert.equal(proofRes.status, 200);
+  const proof = (await proofRes.json()) as { device_credential: string; status: string };
+  assert.equal(proof.status, "active");
+  assert.ok(proof.device_credential.startsWith("dcred_"));
+
+  installWebSocketPairGlobal();
+  const room = new DeviceRoom(mockDOState({ storage: new Map() }), {
+    DB: adapter as unknown as D1Database,
+    SESSION_SECRET,
+    OAUTH_ISSUER: ISSUER,
+  });
+  await room.ready;
+
+  return {
+    deviceId: enrolled.device_id,
+    deviceCredential: proof.device_credential,
+    accessToken: human.access_token,
+    room,
+  };
+}
+
+function mcpRpc(
+  name: string,
+  args: Record<string, unknown>,
+  token: string,
+): Request {
+  return new Request(`${ISSUER}/mcp`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${token}`,
+      origin: ISSUER,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args },
+    }),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -783,14 +1157,9 @@ test("production-path negatives: revoked device credential rejected on agent con
       false,
     );
 
-    // Agent connect must fail closed for revoked device
-    const room = {
-      idFromName: () => ({}) as DurableObjectId,
-      get: () =>
-        ({
-          fetch: async () => new Response(null, { status: 204 }),
-        }) as unknown as DurableObjectStub,
-    } as unknown as DurableObjectNamespace;
+    // Agent connect must fail closed for revoked device BEFORE any DO hop.
+    // No always-204 DEVICE_ROOM stub: omit binding entirely so a leak past
+    // auth would surface as 503 (device_room_unbound), not a silent 204.
     const connect = await worker.fetch(
       new Request(
         `${ISSUER}/agent/connect?device_id=${enrolled.device_id}&role=agent`,
@@ -802,9 +1171,499 @@ test("production-path negatives: revoked device credential rejected on agent con
           },
         },
       ),
-      { ...e, DEVICE_ROOM: room },
+      e,
       ctx,
     );
-    assert.ok(connect.status === 403 || connect.status === 401);
+    assert.ok(
+      connect.status === 403 || connect.status === 401,
+      `revoked device must be rejected at auth, got ${connect.status}`,
+    );
+    assert.notEqual(connect.status, 204);
+    assert.notEqual(connect.status, 101);
+    assert.notEqual(connect.status, 426);
+    const connectBody = (await connect.json()) as { error?: string };
+    assert.ok(
+      connectBody.error === "device_not_active" ||
+        connectBody.error === "invalid_device_credential",
+      `expected device_not_active|invalid_device_credential, got ${connectBody.error}`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Real DeviceRoom + MCP operation.result + /approve production path
+// (no phase 直書き, no tracker.update, no always-204 stubs)
+// ---------------------------------------------------------------------------
+
+test("production-path: DEVICE_ROOM missing fails closed 503 on agent connect (valid device)", async () => {
+  await withStore(async (store) => {
+    const e = env(store);
+    const human = await store.issueTokens(CLIENT, PRINCIPAL_ID, "ownmesh.device ownmesh.read");
+    const { publicKeyHex, privateKey } = await ed25519Keypair();
+
+    const enrollRes = await worker.fetch(
+      new Request(`${ISSUER}/v1/devices/enroll`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${human.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          name: "no-do-agent",
+          hostname: "nodo.local",
+          os: "linux",
+          arch: "x64",
+          agent_version: "1.0.1",
+          protocol_version: "ownmesh.device/1.0",
+          public_key: publicKeyHex,
+        }),
+      }),
+      e,
+      ctx,
+    );
+    assert.equal(enrollRes.status, 201);
+    const enrolled = (await enrollRes.json()) as {
+      device_id: string;
+      challenge: { id: string; message: string };
+    };
+    const signature = await signHex(privateKey, enrolled.challenge.message);
+    const proofRes = await worker.fetch(
+      new Request(`${ISSUER}/v1/devices/enroll/proof`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${human.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          device_id: enrolled.device_id,
+          challenge_id: enrolled.challenge.id,
+          signature,
+        }),
+      }),
+      e,
+      ctx,
+    );
+    assert.equal(proofRes.status, 200);
+    const proof = (await proofRes.json()) as { device_credential: string };
+    assert.ok(proof.device_credential.startsWith("dcred_"));
+
+    // Valid device + credential, but no DEVICE_ROOM binding → explicit 503.
+    const connect = await worker.fetch(
+      new Request(
+        `${ISSUER}/agent/connect?device_id=${enrolled.device_id}&role=agent`,
+        {
+          headers: {
+            upgrade: "websocket",
+            origin: ISSUER,
+            authorization: `Bearer ${proof.device_credential}`,
+          },
+        },
+      ),
+      e,
+      ctx,
+    );
+    assert.equal(connect.status, 503);
+    const body = (await connect.json()) as { error?: string };
+    assert.equal(body.error, "device_room_unbound");
+  });
+});
+
+test("production-path: DeviceRoom handshake → MCP inject → operation.result updates store → poll", async () => {
+  await withStoreAndAdapter(async (store, adapter) => {
+    const { publicKeyHex, privateKey } = await ed25519Keypair();
+    const { deviceId, deviceCredential, accessToken, room } = await enrollActivatedDevice(
+      store,
+      adapter,
+      privateKey,
+      publicKeyHex,
+      "prod-do-agent",
+    );
+
+    const { agentWs, nextSeq } = await connectAgentReady({
+      room,
+      deviceId,
+      deviceCredential,
+      privateKey,
+    });
+
+    // worker.fetch /mcp → signed internal /operation on real DeviceRoom (no harness).
+    const wenv = workerEnv(adapter, room);
+    const createRes = await worker.fetch(
+      mcpRpc(
+        "ownmesh_fs_list",
+        { device_id: deviceId, path: "/workspace", async: true },
+        accessToken,
+      ),
+      wenv,
+      ctx,
+    );
+    assert.equal(createRes.status, 200, await createRes.clone().text());
+    const created = (await createRes.json()) as {
+      result?: {
+        structuredContent?: {
+          operation_id?: string;
+          status?: string;
+          correlation_id?: string;
+        };
+      };
+      error?: unknown;
+    };
+    assert.equal(created.error, undefined);
+    const opId = created.result?.structuredContent?.operation_id;
+    assert.ok(opId, "operation_id required");
+    assert.ok(
+      created.result?.structuredContent?.status === "pending" ||
+        created.result?.structuredContent?.status === "running",
+    );
+
+    const storedPending = await store.getMcpOperation(opId!);
+    assert.ok(storedPending);
+    assert.equal(storedPending!.device_id, deviceId);
+    const correlation =
+      storedPending!.correlation_id ||
+      created.result?.structuredContent?.correlation_id;
+    assert.ok(correlation);
+    assert.ok(room.router.pending.has(correlation!), "DO pending must hold correlation");
+
+    // Agent receives operation.request delivered by real DeviceRoom /operation inject.
+    const agentInbox = drainSocket(agentWs);
+    assert.ok(
+      agentInbox.some((m) => m.type === "operation.request"),
+      `agent must receive operation.request, got ${JSON.stringify(agentInbox.map((m) => m.type))}`,
+    );
+    const reqMsg = agentInbox.find((m) => m.type === "operation.request")!;
+    assert.equal(reqMsg.correlation_id, correlation);
+
+    // Agent completes via real DO webSocketMessage → applyMcpOperationResult runtime path.
+    const resultFrame: DeviceEnvelope = {
+      protocol: PROTOCOL,
+      message_id: randomId("msg_"),
+      type: "operation.result",
+      device_id: deviceId,
+      seq: nextSeq(),
+      sent_at: new Date().toISOString(),
+      correlation_id: correlation!,
+      payload: {
+        status: "completed",
+        operation_id: opId,
+        summary: "listed",
+        result: { entries: ["README.md", "src/"] },
+      },
+    };
+    await room.webSocketMessage(
+      agentWs as unknown as WebSocket,
+      JSON.stringify(resultFrame),
+    );
+
+    // D1/SqlStore row updated only via DeviceRoom runtime path (no manual apply helper).
+    const completed = await store.getMcpOperation(opId!);
+    assert.equal(completed?.status, "completed");
+    assert.deepEqual(completed?.data, { entries: ["README.md", "src/"] });
+    assert.equal(
+      room.router.pending.has(correlation!),
+      false,
+      "pending cleared only after authoritative CAS",
+    );
+
+    // Poll through worker /mcp — store is sole authority (fresh process has no tracker state).
+    const pollRes = await worker.fetch(
+      mcpRpc("ownmesh_get_operation", { operation_id: opId }, accessToken),
+      wenv,
+      ctx,
+    );
+    assert.equal(pollRes.status, 200);
+    const polled = (await pollRes.json()) as {
+      result?: {
+        structuredContent?: {
+          status?: string;
+          operation_id?: string;
+          data?: { entries?: string[] };
+        };
+      };
+    };
+    assert.equal(polled.result?.structuredContent?.operation_id, opId);
+    assert.equal(polled.result?.structuredContent?.status, "completed");
+    assert.deepEqual(polled.result?.structuredContent?.data?.entries, ["README.md", "src/"]);
+  });
+});
+
+test("production-path: /approve auth+CSRF+one-time delivers decision via real DeviceRoom", async () => {
+  await withStoreAndAdapter(async (store, adapter) => {
+    const { publicKeyHex, privateKey } = await ed25519Keypair();
+    const { deviceId, deviceCredential, accessToken, room } = await enrollActivatedDevice(
+      store,
+      adapter,
+      privateKey,
+      publicKeyHex,
+      "prod-approve-agent",
+    );
+    const { agentWs } = await connectAgentReady({
+      room,
+      deviceId,
+      deviceCredential,
+      privateKey,
+    });
+    const wenv = workerEnv(adapter, room);
+
+    const opId = randomId("op_");
+    const corr = randomId("cor_");
+    await store.putMcpOperation({
+      operation_id: opId,
+      tenant_id: TENANT_ID,
+      principal_id: PRINCIPAL_ID,
+      device_id: deviceId,
+      tool: "ownmesh_fs_write",
+      status: "approval_required",
+      summary: "needs human",
+      data: { tool: "ownmesh_fs_write", path: "secret.txt" },
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_url: `${ISSUER}/approve?operation_id=${opId}`,
+      warnings: [],
+      correlation_id: corr,
+      policy_authority: "ownmesh_device",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+
+    // Wrong principal via worker.fetch → not found (no leak).
+    const other = await store.issueTokens(CLIENT, "prin_other", "ownmesh.read ownmesh.exec");
+    // prin_other may not exist as tenant principal — still must not leak op details.
+    const wrongPrin = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId}`, {
+        headers: { authorization: `Bearer ${other.access_token}` },
+      }),
+      wenv,
+      ctx,
+    );
+    assert.ok(
+      wrongPrin.status === 404 || wrongPrin.status === 403,
+      `foreign principal must not see op, got ${wrongPrin.status}`,
+    );
+
+    // GET approval page through worker (auth required).
+    const getRes = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId}`, {
+        headers: { authorization: `Bearer ${accessToken}` },
+      }),
+      wenv,
+      ctx,
+    );
+    assert.equal(getRes.status, 200, await getRes.clone().text());
+    const html = await getRes.text();
+    const tx = /name="transaction_id" value="([^"]+)"/.exec(html)?.[1];
+    const csrf = /name="csrf_token" value="([^"]+)"/.exec(html)?.[1];
+    assert.ok(tx && csrf, "approval form must include transaction_id and csrf_token");
+
+    const postBody = {
+      decision: "approve",
+      transaction_id: tx!,
+      csrf_token: csrf!,
+      operation_id: opId,
+    };
+    const postOnce = () =>
+      worker.fetch(
+        new Request(`${ISSUER}/approve?operation_id=${opId}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json",
+            authorization: `Bearer ${accessToken}`,
+            origin: ISSUER,
+          },
+          body: JSON.stringify(postBody),
+        }),
+        wenv,
+        ctx,
+      );
+
+    const first = await postOnce();
+    assert.equal(first.status, 200, await first.clone().text());
+    const firstBody = (await first.json()) as {
+      ok: boolean;
+      decision: string;
+      status: string;
+      route?: { status: string };
+    };
+    assert.equal(firstBody.ok, true);
+    assert.equal(firstBody.decision, "approve");
+    assert.equal(firstBody.status, "pending");
+    assert.equal(firstBody.route?.status, "routed_to_device");
+
+    // Real DeviceRoom delivered approval.decision to the agent frame.
+    const agentInbox = drainSocket(agentWs);
+    assert.ok(
+      agentInbox.some(
+        (m) =>
+          m.type === "operation.request" &&
+          (m.payload.op === "approval.decision" || m.payload.decision === "approve"),
+      ),
+      `agent must receive approval.decision, got ${JSON.stringify(agentInbox.map((m) => m.type + ":" + m.payload.op))}`,
+    );
+
+    // Authoritative transition only after successful delivery.
+    assert.equal((await store.getMcpOperation(opId))?.status, "pending");
+    assert.equal((await store.getMcpOperation(opId))?.approval_required, false);
+
+    // One-time: same transaction rejected.
+    const second = await postOnce();
+    assert.equal(second.status, 400);
+
+    // CSRF forgery on a fresh approval_required op is rejected.
+    const opId2 = randomId("op_");
+    await store.putMcpOperation({
+      operation_id: opId2,
+      tenant_id: TENANT_ID,
+      principal_id: PRINCIPAL_ID,
+      device_id: deviceId,
+      tool: "ownmesh_fs_write",
+      status: "approval_required",
+      summary: "needs human again",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_url: `${ISSUER}/approve?operation_id=${opId2}`,
+      warnings: [],
+      correlation_id: randomId("cor_"),
+      policy_authority: "ownmesh_device",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    const get2 = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId2}`, {
+        headers: { authorization: `Bearer ${accessToken}` },
+      }),
+      wenv,
+      ctx,
+    );
+    assert.equal(get2.status, 200);
+    const html2 = await get2.text();
+    const tx2 = /name="transaction_id" value="([^"]+)"/.exec(html2)?.[1];
+    assert.ok(tx2);
+    const forged = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId2}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          authorization: `Bearer ${accessToken}`,
+          origin: ISSUER,
+        },
+        body: JSON.stringify({
+          decision: "approve",
+          transaction_id: tx2,
+          csrf_token: "csrf_forged_token_value",
+          operation_id: opId2,
+        }),
+      }),
+      wenv,
+      ctx,
+    );
+    assert.equal(forged.status, 400);
+    assert.equal((await store.getMcpOperation(opId2))?.status, "approval_required");
+
+    // Delivery-failure: device offline → retryable non-success; op stays approval_required.
+    const offlineRoom = new DeviceRoom(mockDOState({ storage: new Map() }), {
+      DB: adapter as unknown as D1Database,
+      SESSION_SECRET,
+      OAUTH_ISSUER: ISSUER,
+    });
+    await offlineRoom.ready;
+    const offlineEnv = workerEnv(adapter, offlineRoom);
+    const opId3 = randomId("op_");
+    await store.putMcpOperation({
+      operation_id: opId3,
+      tenant_id: TENANT_ID,
+      principal_id: PRINCIPAL_ID,
+      device_id: deviceId,
+      tool: "ownmesh_fs_write",
+      status: "approval_required",
+      summary: "offline delivery",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_url: `${ISSUER}/approve?operation_id=${opId3}`,
+      warnings: [],
+      correlation_id: randomId("cor_"),
+      policy_authority: "ownmesh_device",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    const get3 = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId3}`, {
+        headers: { authorization: `Bearer ${accessToken}` },
+      }),
+      offlineEnv,
+      ctx,
+    );
+    assert.equal(get3.status, 200);
+    const html3 = await get3.text();
+    const tx3 = /name="transaction_id" value="([^"]+)"/.exec(html3)?.[1];
+    const csrf3 = /name="csrf_token" value="([^"]+)"/.exec(html3)?.[1];
+    assert.ok(tx3 && csrf3);
+    const failDelivery = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId3}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          authorization: `Bearer ${accessToken}`,
+          origin: ISSUER,
+        },
+        body: JSON.stringify({
+          decision: "approve",
+          transaction_id: tx3,
+          csrf_token: csrf3,
+          operation_id: opId3,
+        }),
+      }),
+      offlineEnv,
+      ctx,
+    );
+    assert.equal(failDelivery.status, 503, await failDelivery.clone().text());
+    const failBody = (await failDelivery.json()) as {
+      ok?: boolean;
+      error?: string;
+      retryable?: boolean;
+      delivery_status?: string;
+      route?: { status?: string };
+    };
+    assert.notEqual(failBody.ok, true);
+    assert.equal(failBody.error, "delivery_failed");
+    assert.equal(failBody.retryable, true);
+    assert.equal(failBody.delivery_status, "pending");
+    assert.equal(failBody.route?.status, "device_offline");
+    // Authoritative transition must NOT have run on delivery failure.
+    assert.equal((await store.getMcpOperation(opId3))?.status, "approval_required");
+    assert.equal((await store.getMcpOperation(opId3))?.approval_required, true);
+  });
+});
+
+test("production-path: worker /approve is implemented (auth required, not 501)", async () => {
+  await withStore(async (store) => {
+    const human = await store.issueTokens(CLIENT, PRINCIPAL_ID, "ownmesh.read ownmesh.exec");
+
+    // No bearer and no AUTH_PROVIDER → unauthorized (not a 501 stub).
+    const unauth = await worker.fetch(
+      new Request(`${ISSUER}/approve`),
+      { OAUTH_ISSUER: ISSUER },
+      ctx,
+    );
+    assert.equal(unauth.status, 401);
+    assert.notEqual(unauth.status, 501);
+
+    // Authenticated but missing operation_id → 400 (handler is live).
+    const authNoOp = await worker.fetch(
+      new Request(`${ISSUER}/approve`, {
+        headers: { authorization: `Bearer ${human.access_token}` },
+      }),
+      env(store),
+      ctx,
+    );
+    assert.equal(authNoOp.status, 400);
+    assert.notEqual(authNoOp.status, 501);
   });
 });

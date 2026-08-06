@@ -16,8 +16,15 @@
  * Prompt-injection / model judgment MUST NOT bypass (2)/(3).
  */
 
-import type { ControlPlaneStore } from "./store.ts";
-import { bearer, json, requireScope } from "./util.ts";
+import type { ControlPlaneStore, McpOperationRecord } from "./store.ts";
+import {
+  bearer,
+  html,
+  json,
+  randomToken,
+  requireScope,
+  sha256Hex,
+} from "./util.ts";
 import { SERVICE_NAME, SERVICE_VERSION } from "./util.ts";
 import { randomId, nowIso } from "./store.ts";
 
@@ -487,7 +494,11 @@ export type TrackedOperation = OwnMeshResultEnvelope & {
   updated_at: string;
 };
 
-/** In-memory async operation registry (Worker isolate / test process). */
+/**
+ * In-memory cache for MCP operations (Worker isolate / test process).
+ * NOT authoritative — D1/MemoryStore mcp_operations is the source of truth.
+ * Surviving isolate restarts requires store persistence.
+ */
 export class OperationTracker {
   private ops = new Map<string, TrackedOperation>();
 
@@ -512,7 +523,150 @@ export class OperationTracker {
   }
 }
 
+/** Process-local cache only — never treat as durable authority. */
 export const defaultOpTracker = new OperationTracker();
+
+function trackedFromRecord(rec: McpOperationRecord): TrackedOperation {
+  return {
+    operation_id: rec.operation_id,
+    status: rec.status as OpStatus,
+    device_id: rec.device_id,
+    summary: rec.summary,
+    data: rec.data || {},
+    truncated: rec.truncated,
+    next_cursor: rec.next_cursor,
+    approval_required: rec.approval_required,
+    approval_url: rec.approval_url,
+    approval_id: rec.approval_id,
+    session_id: rec.session_id ?? null,
+    warnings: rec.warnings || [],
+    correlation_id: rec.correlation_id,
+    policy_authority: "ownmesh_device",
+    tool: rec.tool,
+    principal: rec.principal_id,
+    tenant_id: rec.tenant_id,
+    created_at: rec.created_at,
+    updated_at: rec.updated_at,
+  };
+}
+
+function recordFromTracked(op: TrackedOperation): McpOperationRecord {
+  return {
+    operation_id: op.operation_id,
+    tenant_id: op.tenant_id,
+    principal_id: op.principal,
+    device_id: op.device_id,
+    tool: op.tool,
+    status: op.status,
+    summary: op.summary,
+    data: op.data || {},
+    truncated: op.truncated,
+    next_cursor: op.next_cursor ?? null,
+    approval_required: op.approval_required,
+    approval_url: op.approval_url,
+    approval_id: op.approval_id,
+    session_id: op.session_id ?? null,
+    warnings: op.warnings || [],
+    correlation_id: op.correlation_id,
+    policy_authority: "ownmesh_device",
+    created_at: op.created_at,
+    updated_at: op.updated_at,
+  };
+}
+
+/**
+ * Create-only write-through. Store put is INSERT-only; on conflict re-read the
+ * authoritative row (never REPLACE/overwrite a faster concurrent writer).
+ */
+async function persistOp(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  op: TrackedOperation,
+): Promise<TrackedOperation> {
+  const stamped = { ...op, updated_at: op.updated_at || nowIso() };
+  try {
+    await store.putMcpOperation(recordFromTracked(stamped));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.startsWith("mcp_operation_exists:") || /unique|constraint/i.test(msg)) {
+      const existing = await loadOp(store, tracker, stamped.operation_id);
+      if (existing) return existing;
+    }
+    throw err;
+  }
+  tracker.put(stamped);
+  return stamped;
+}
+
+/**
+ * Read store first (sole authority). Tracker is cache-only AFTER a successful read.
+ * No tracker fallback / resurrection of missing store rows.
+ */
+async function loadOp(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  operationId: string,
+): Promise<TrackedOperation | undefined> {
+  const rec = await store.getMcpOperation(operationId);
+  if (!rec) return undefined;
+  const tracked = trackedFromRecord(rec);
+  tracker.put(tracked);
+  return tracked;
+}
+
+/**
+ * Patch via store CAS only. Tracker is updated only after a successful store write.
+ * No tracker-only path, write-back, or resurrection of missing rows.
+ */
+async function patchOp(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  operationId: string,
+  patch: Partial<TrackedOperation>,
+  fromStatuses?: string[],
+): Promise<TrackedOperation | undefined> {
+  const storePatch: Partial<McpOperationRecord> = { updated_at: nowIso() };
+  if (patch.status !== undefined) storePatch.status = patch.status;
+  if (patch.summary !== undefined) storePatch.summary = patch.summary;
+  if (patch.data !== undefined) storePatch.data = patch.data;
+  if (patch.truncated !== undefined) storePatch.truncated = patch.truncated;
+  if (patch.next_cursor !== undefined) storePatch.next_cursor = patch.next_cursor;
+  if (patch.approval_required !== undefined) storePatch.approval_required = patch.approval_required;
+  if (patch.approval_url !== undefined) storePatch.approval_url = patch.approval_url;
+  if (patch.approval_id !== undefined) storePatch.approval_id = patch.approval_id;
+  if (patch.session_id !== undefined) storePatch.session_id = patch.session_id;
+  if (patch.warnings !== undefined) storePatch.warnings = patch.warnings;
+  if (patch.correlation_id !== undefined) storePatch.correlation_id = patch.correlation_id;
+  if (patch.device_id !== undefined) storePatch.device_id = patch.device_id;
+  if (patch.tool !== undefined) storePatch.tool = patch.tool;
+  if (patch.principal !== undefined) storePatch.principal_id = patch.principal;
+  if (patch.tenant_id !== undefined) storePatch.tenant_id = patch.tenant_id;
+  const updated = await store.updateMcpOperation(operationId, storePatch, fromStatuses);
+  if (!updated) return undefined;
+  const tracked = trackedFromRecord(updated);
+  tracker.put(tracked);
+  return tracked;
+}
+
+/**
+ * Post-create operation state change via conditional CAS only.
+ * Never put/INSERT OR REPLACE after the initial create. On CAS loss, read and
+ * return the authoritative current record (e.g. a fast DO terminal result).
+ */
+async function finalizeRoutedOp(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  operationId: string,
+  patch: Partial<TrackedOperation>,
+  fromStatuses: string[] = ["pending", "running"],
+): Promise<TrackedOperation> {
+  const updated = await patchOp(store, tracker, operationId, patch, fromStatuses);
+  if (updated) return updated;
+  const current = await loadOp(store, tracker, operationId);
+  if (current) return current;
+  // Fail closed: create succeeded earlier; missing row is a hard fault.
+  throw new Error(`mcp_operation_missing_after_cas:${operationId}`);
+}
 
 export function makeEnvelope(
   partial: Omit<OwnMeshResultEnvelope, "policy_authority" | "warnings" | "truncated" | "next_cursor" | "data" | "approval_required"> &
@@ -940,7 +1094,7 @@ export async function handleMcp(
         next_cursor,
         warnings: injectWarnings,
       });
-      tracker.put({
+      await persistOp(store, tracker, {
         ...env,
         tool: name,
         principal: rec.principal,
@@ -954,10 +1108,12 @@ export async function handleMcp(
     if (name === "ownmesh_get_device") {
       const d = await store.getDevice(deviceId);
       if (!d || d.principal_id !== rec.principal || d.tenant_id !== rec.tenant_id) {
+        // Leave envelope.device_id unset so get_operation remains pollable for a
+        // never-enrolled id (operable-gate would otherwise return -32004).
+        // Requested id is retained in the error payload.
         const env = makeEnvelope({
           operation_id: operationId,
           status: "failed",
-          device_id: deviceId,
           summary: "device not found",
           data: {
             error: {
@@ -965,9 +1121,18 @@ export async function handleMcp(
               message: "device not found",
               retryable: false,
               operation_id: operationId,
+              device_id: deviceId || undefined,
             },
           },
           warnings: injectWarnings,
+        });
+        await persistOp(store, tracker, {
+          ...env,
+          tool: name,
+          principal: rec.principal,
+          tenant_id: rec.tenant_id,
+          created_at: nowIso(),
+          updated_at: nowIso(),
         });
         return mcpResult(id, toolContent(env));
       }
@@ -978,6 +1143,14 @@ export async function handleMcp(
         summary: `device ${d.name}`,
         data: { device: d },
         warnings: injectWarnings,
+      });
+      await persistOp(store, tracker, {
+        ...env,
+        tool: name,
+        principal: rec.principal,
+        tenant_id: rec.tenant_id,
+        created_at: nowIso(),
+        updated_at: nowIso(),
       });
       return mcpResult(id, toolContent(env));
     }
@@ -1001,12 +1174,21 @@ export async function handleMcp(
         next_cursor,
         warnings: injectWarnings,
       });
+      await persistOp(store, tracker, {
+        ...env,
+        tool: name,
+        principal: rec.principal,
+        tenant_id: rec.tenant_id,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
       return mcpResult(id, toolContent(env));
     }
 
     if (name === "ownmesh_get_operation") {
       const oid = String(args.operation_id || "");
-      const tracked = tracker.get(oid);
+      const tracked = await loadOp(store, tracker, oid);
+      // Owner check: principal + tenant; never leak foreign ops.
       if (!tracked || tracked.principal !== rec.principal || tracked.tenant_id !== rec.tenant_id) {
         const env = makeEnvelope({
           operation_id: oid || operationId,
@@ -1023,31 +1205,66 @@ export async function handleMcp(
         });
         return mcpResult(id, toolContent(env));
       }
+      // Fail closed: re-validate device + credentials on every poll.
+      if (tracked.device_id) {
+        const gate = await store.assertDeviceOperableForMcp(
+          tracked.device_id,
+          rec.principal,
+          rec.tenant_id,
+        );
+        if (!gate.ok) {
+          return mcpError(id, -32004, gate.error, { device_id: tracked.device_id, operation_id: oid });
+        }
+      }
       return mcpResult(id, toolContent(tracked));
     }
 
     if (name === "ownmesh_cancel_operation") {
       const oid = String(args.operation_id || "");
-      const candidate = tracker.get(oid);
-      const tracked = candidate?.principal === rec.principal && candidate.tenant_id === rec.tenant_id ? candidate : undefined;
+      const candidate = await loadOp(store, tracker, oid);
+      const tracked =
+        candidate?.principal === rec.principal && candidate.tenant_id === rec.tenant_id
+          ? candidate
+          : undefined;
       if (tracked && (tracked.status === "pending" || tracked.status === "running" || tracked.status === "approval_required")) {
-        if (router && tracked.device_id) {
+        if (tracked.device_id) {
           const cancelDeviceId = tracked.device_id;
-          const cancelDevice = await store.getDevice(cancelDeviceId);
-          if (!cancelDevice || cancelDevice.principal_id !== rec.principal || cancelDevice.tenant_id !== rec.tenant_id || cancelDevice.revoked || cancelDevice.status !== "active") {
-            return mcpError(id, -32004, "device_not_available", { device_id: cancelDeviceId });
+          const gate = await store.assertDeviceOperableForMcp(
+            cancelDeviceId,
+            rec.principal,
+            rec.tenant_id,
+          );
+          if (!gate.ok) {
+            return mcpError(id, -32004, gate.error, { device_id: cancelDeviceId, operation_id: oid });
           }
-          await router.routeToDevice(cancelDeviceId, {
-            type: "ownmesh_cancel_operation",
-            payload: { operation_id: oid },
-            correlation_id: correlation,
-          });
+          if (router) {
+            await router.routeToDevice(cancelDeviceId, {
+              type: "ownmesh_cancel_operation",
+              payload: { operation_id: oid },
+              correlation_id: correlation,
+            });
+          }
         }
-        const updated = tracker.update(oid, {
-          status: "cancelled",
-          summary: "cancelled by client",
-          approval_required: false,
-        })!;
+        const updated = await patchOp(
+          store,
+          tracker,
+          oid,
+          {
+            status: "cancelled",
+            summary: "cancelled by client",
+            approval_required: false,
+          },
+          ["pending", "running", "approval_required"],
+        );
+        if (!updated) {
+          const env = makeEnvelope({
+            operation_id: oid || operationId,
+            status: "failed",
+            summary: "operation not cancellable in current state",
+            data: { previous: tracked },
+          });
+          return mcpResult(id, toolContent(env));
+        }
         return mcpResult(id, toolContent(updated));
       }
       const env = makeEnvelope({
@@ -1064,9 +1281,10 @@ export async function handleMcp(
       return mcpError(id, -32602, "device_id required", { tool: name });
     }
 
-    const targetDevice = await store.getDevice(deviceId);
-    if (!targetDevice || targetDevice.principal_id !== rec.principal || targetDevice.tenant_id !== rec.tenant_id || targetDevice.revoked || targetDevice.status !== "active") {
-      return mcpError(id, -32004, "device_not_available", { device_id: deviceId });
+    // Store re-validation of device ownership + credential expiry/revoke (fail closed).
+    const operable = await store.assertDeviceOperableForMcp(deviceId, rec.principal, rec.tenant_id);
+    if (!operable.ok) {
+      return mcpError(id, -32004, operable.error, { device_id: deviceId });
     }
 
     const wantAsync = args.async === true;
@@ -1108,7 +1326,7 @@ export async function handleMcp(
       created_at: nowIso(),
       updated_at: nowIso(),
     };
-    tracker.put(trackBase);
+    await persistOp(store, tracker, trackBase);
 
     if (!router) {
       // Fail closed: no router means DEVICE_ROOM is unbound / unavailable.
@@ -1129,8 +1347,21 @@ export async function handleMcp(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
-      return mcpResult(id, toolContent(env));
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: env.approval_required,
+        approval_url: env.approval_url,
+        approval_id: env.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
     }
 
     const routed = await router.routeToDevice(deviceId, {
@@ -1141,6 +1372,7 @@ export async function handleMcp(
 
     if (
       routed.status === "unavailable" ||
+      routed.status === "rejected" ||
       routed.status === "error" ||
       routed.status === "device_room_unbound"
     ) {
@@ -1161,8 +1393,21 @@ export async function handleMcp(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
-      return mcpResult(id, toolContent(env));
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: env.approval_required,
+        approval_url: env.approval_url,
+        approval_id: env.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
     }
 
     if (routed.status === "device_offline") {
@@ -1183,8 +1428,21 @@ export async function handleMcp(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
-      return mcpResult(id, toolContent(env));
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: env.approval_required,
+        approval_url: env.approval_url,
+        approval_id: env.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
     }
 
     // Device returned structured detail (harness / DO that waits)
@@ -1200,8 +1458,21 @@ export async function handleMcp(
         reason: detail.reason ? String(detail.reason) : undefined,
         warnings: injectWarnings,
       });
-      tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
-      return mcpResult(id, toolContent(env));
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: env.approval_required,
+        approval_url: env.approval_url,
+        approval_id: env.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
     }
 
     if (detail.status === "denied" || detail.decision === "deny") {
@@ -1222,8 +1493,21 @@ export async function handleMcp(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
-      return mcpResult(id, toolContent(env));
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: env.approval_required,
+        approval_url: env.approval_url,
+        approval_id: env.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
     }
 
     if (detail.status === "completed" || detail.result !== undefined) {
@@ -1262,8 +1546,21 @@ export async function handleMcp(
         correlation_id: correlation,
         warnings: injectWarnings,
       });
-      tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
-      return mcpResult(id, toolContent(env));
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: env.approval_required,
+        approval_url: env.approval_url,
+        approval_id: env.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
     }
 
     // Default: accepted / routed — async pattern
@@ -1294,14 +1591,418 @@ export async function handleMcp(
         correlationId: correlation,
         warnings: injectWarnings,
       });
-      tracker.put({ ...trackBase, ...apr, updated_at: nowIso() });
-      return mcpResult(id, toolContent(apr));
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: apr.status,
+        summary: apr.summary,
+        data: apr.data,
+        truncated: apr.truncated,
+        next_cursor: apr.next_cursor,
+        session_id: apr.session_id,
+        device_id: apr.device_id,
+        correlation_id: apr.correlation_id,
+        warnings: apr.warnings,
+        approval_required: apr.approval_required,
+        approval_url: apr.approval_url,
+        approval_id: apr.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
     }
-    tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
-    return mcpResult(id, toolContent(env));
+    const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+      status: env.status,
+      summary: env.summary,
+      data: env.data,
+      truncated: env.truncated,
+      next_cursor: env.next_cursor,
+      session_id: env.session_id,
+      device_id: env.device_id,
+      correlation_id: env.correlation_id,
+      warnings: env.warnings,
+      approval_required: env.approval_required,
+      approval_url: env.approval_url,
+      approval_id: env.approval_id,
+    });
+    return mcpResult(id, toolContent(finalOp));
   }
 
   return mcpError(id, -32601, `method not found: ${method}`);
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+export type ApproveHandleOptions = {
+  issuer?: string;
+  /** Authenticated principal (browser session or bearer owner). */
+  principal: { id: string; tenant_id: string };
+  /** Deliver approval decision into DeviceRoom. */
+  routeToDevice?: OperationRouter["routeToDevice"];
+  /** Origin allowed for state-changing POST (CSRF defense in depth). */
+  originAllowed?: boolean;
+};
+
+/**
+ * Human approval page + one-time CSRF decision delivery for MCP operations.
+ * GET: mint approval transaction + form. POST: consume once and route decision.
+ */
+export async function handleApprove(
+  req: Request,
+  store: ControlPlaneStore,
+  opts: ApproveHandleOptions,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const issuer = (opts.issuer || url.origin).replace(/\/$/, "");
+  const principal = opts.principal;
+
+  if (req.method === "POST") {
+    if (opts.originAllowed === false) {
+      return json({ error: "origin_not_allowed" }, { status: 403 });
+    }
+    const ct = req.headers.get("content-type") || "";
+    let decision = "";
+    let transactionId = "";
+    let csrfToken = "";
+    let operationId = url.searchParams.get("operation_id") || "";
+    if (ct.includes("application/json")) {
+      const body = (await req.json()) as Record<string, unknown>;
+      decision = String(body.decision || "");
+      transactionId = String(body.transaction_id || "");
+      csrfToken = String(body.csrf_token || "");
+      if (body.operation_id) operationId = String(body.operation_id);
+    } else {
+      const form = await req.formData();
+      decision = String(form.get("decision") || "");
+      transactionId = String(form.get("transaction_id") || "");
+      csrfToken = String(form.get("csrf_token") || "");
+      if (form.get("operation_id")) operationId = String(form.get("operation_id"));
+    }
+    if (decision !== "approve" && decision !== "deny") {
+      return json({ error: "invalid_request", error_description: "decision must be approve or deny" }, { status: 400 });
+    }
+    if (!transactionId || !csrfToken) {
+      return json({ error: "invalid_request", error_description: "missing approval transaction" }, { status: 400 });
+    }
+
+    // Durable one-time decision: atomic consume+outbox → claim → deliver → finalize.
+    // Never report ok:true before successful delivery + authoritative transition.
+    const started = await store.beginMcpApprovalOutbox(
+      transactionId,
+      await sha256Hex(csrfToken),
+      principal.id,
+      decision,
+    );
+    if (!started) {
+      return json(
+        { error: "invalid_request", error_description: "invalid, expired, or already used approval transaction" },
+        { status: 400 },
+      );
+    }
+    if (started.status === "already_delivered") {
+      // Duplicate path: return authoritative state without re-delivery.
+      const doneOp = await store.getMcpOperation(started.outbox.operation_id);
+      return json(
+        {
+          error: "invalid_request",
+          error_description: "invalid, expired, or already used approval transaction",
+          authoritative: true,
+          operation_id: started.outbox.operation_id,
+          decision: started.outbox.decision,
+          status: doneOp?.status,
+          delivery_status: started.outbox.delivery_status,
+        },
+        { status: 400 },
+      );
+    }
+
+    const { outbox, tx } = started;
+    if (tx.tenant_id !== principal.tenant_id || outbox.tenant_id !== principal.tenant_id) {
+      return json({ error: "forbidden" }, { status: 403 });
+    }
+
+    const op = await store.getMcpOperation(outbox.operation_id);
+    if (!op || op.principal_id !== principal.id || op.tenant_id !== principal.tenant_id) {
+      return json({ error: "not_found", error_description: "operation not found" }, { status: 404 });
+    }
+    if (operationId && operationId !== op.operation_id) {
+      return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
+    }
+    // Delivery retry keeps op in approval_required until finalize succeeds.
+    if (op.status !== "approval_required" && started.status === "created") {
+      return json(
+        { error: "conflict", error_description: "operation already decided" },
+        { status: 409 },
+      );
+    }
+
+    // Exclusive pending→delivering claim prevents concurrent routes/duplicate delivery.
+    // Stale delivering claims (lease expired) may be reclaimed for retry.
+    const claimed = await store.claimMcpApprovalOutboxDelivery(outbox.id);
+    if (!claimed) {
+      const current = await store.getMcpApprovalOutbox(outbox.id);
+      const opNow = await store.getMcpOperation(outbox.operation_id);
+      if (current?.delivery_status === "delivered") {
+        return json(
+          {
+            error: "invalid_request",
+            error_description: "invalid, expired, or already used approval transaction",
+            authoritative: true,
+            operation_id: outbox.operation_id,
+            decision: current.decision,
+            status: opNow?.status,
+            delivery_status: "delivered",
+          },
+          { status: 400 },
+        );
+      }
+      return json(
+        {
+          error: "conflict",
+          error_description: "approval delivery already in progress or completed",
+          authoritative: true,
+          operation_id: outbox.operation_id,
+          decision: current?.decision ?? outbox.decision,
+          status: opNow?.status,
+          delivery_status: current?.delivery_status ?? "delivering",
+          retryable: current?.delivery_status === "pending",
+        },
+        { status: 409 },
+      );
+    }
+
+    // Gate/route/finalize under try/catch/finally so a thrown DO/D1 error never
+    // leaks a live delivering claim (release → pending, attempts+1, last_error).
+    let route: { status: string; detail?: unknown } | undefined;
+    let claimSettled = false;
+    let releaseError: string | undefined;
+    try {
+      if (op.status !== "approval_required") {
+        // A stale lease can outlive a fast device result (or cancellation). The
+        // terminal authoritative operation proves there is nothing left to
+        // deliver; reconcile the outbox without routing the decision again.
+        const reconciled = await store.finalizeMcpApprovalDelivery(claimed.id);
+        if (reconciled) {
+          claimSettled = true;
+          return json(
+            {
+              error: "conflict",
+              error_description: "operation already decided",
+              authoritative: true,
+              operation_id: reconciled.operation_id,
+              status: reconciled.status,
+              decision: claimed.decision,
+              delivery_status: "delivered",
+            },
+            { status: 409 },
+          );
+        }
+        throw new Error("approval_reconciliation_failed");
+      }
+
+      const deviceId = claimed.device_id || op.device_id;
+      if (deviceId && opts.routeToDevice) {
+        const gate = await store.assertDeviceOperableForMcp(
+          deviceId,
+          principal.id,
+          principal.tenant_id,
+        );
+        if (!gate.ok) {
+          await store.releaseMcpApprovalOutboxClaim(claimed.id, gate.error);
+          claimSettled = true;
+          return json(
+            {
+              error: gate.error,
+              error_description: "device not operable for approval delivery",
+              retryable: true,
+              operation_id: op.operation_id,
+              delivery_status: "pending",
+            },
+            { status: 403 },
+          );
+        }
+        route = await opts.routeToDevice(deviceId, {
+          type: "approval.decision",
+          payload: {
+            operation_id: op.operation_id,
+            decision,
+            approval_id: claimed.id,
+            tool: op.tool,
+          },
+          // Stable outbox correlation for exactly-once external dedupe.
+          correlation_id: claimed.correlation_id || op.correlation_id || randomId("cor_"),
+        });
+        if (route.status !== "routed_to_device") {
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            `route_status=${route.status}`,
+          );
+          claimSettled = true;
+          // Decision remains durable in outbox; op stays approval_required for retry.
+          return json(
+            {
+              error: "delivery_failed",
+              error_description: "approval decision not delivered to device",
+              retryable: true,
+              operation_id: op.operation_id,
+              delivery_status: "pending",
+              route,
+            },
+            { status: 503 },
+          );
+        }
+      }
+
+      // Authoritative CAS only after successful delivery (or no device route needed).
+      const updated = await store.finalizeMcpApprovalDelivery(claimed.id);
+      if (!updated) {
+        // Lost finalize race — surface authoritative state without claiming success.
+        claimSettled = true;
+        const opNow = await store.getMcpOperation(outbox.operation_id);
+        const boxNow = await store.getMcpApprovalOutbox(claimed.id);
+        return json(
+          {
+            error: "conflict",
+            error_description: "operation already decided or outbox not delivering",
+            authoritative: true,
+            retryable: boxNow?.delivery_status === "pending",
+            operation_id: op.operation_id,
+            status: opNow?.status,
+            decision: boxNow?.decision ?? claimed.decision,
+            delivery_status: boxNow?.delivery_status,
+          },
+          { status: 409 },
+        );
+      }
+
+      // Delivered — claim is no longer live.
+      claimSettled = true;
+
+      await store.appendAudit({
+        id: randomId("aud_"),
+        tenant_id: principal.tenant_id,
+        principal_id: principal.id,
+        device_id: updated.device_id,
+        kind: "mcp.approval",
+        summary: `decision=${decision}`,
+        created_at: nowIso(),
+        meta: {
+          operation_id: updated.operation_id,
+          decision,
+          transaction_id: tx.id,
+          outbox_id: outbox.id,
+          route_status: route?.status,
+          retry: started.status === "pending_retry",
+        },
+      });
+
+      const accept = req.headers.get("accept") || "";
+      if (accept.includes("application/json") || ct.includes("application/json")) {
+        return json({
+          ok: true,
+          operation_id: updated.operation_id,
+          decision,
+          status: updated.status,
+          route,
+        });
+      }
+      return html(
+        `<!doctype html><html><body><h1>${decision === "approve" ? "Approved" : "Denied"}</h1>
+         <p>Operation <code>${escapeHtml(updated.operation_id)}</code> recorded.</p></body></html>`,
+        { noStore: true },
+      );
+    } catch (err) {
+      releaseError =
+        err instanceof Error ? err.message.slice(0, 500) : "delivery_error";
+      // No success response on thrown DO/D1 failure.
+      return json(
+        {
+          error: "delivery_failed",
+          error_description: "approval decision not delivered to device",
+          retryable: true,
+          operation_id: op.operation_id,
+          delivery_status: "pending",
+        },
+        { status: 503 },
+      );
+    } finally {
+      if (!claimSettled) {
+        try {
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            releaseError ?? "delivery_error",
+          );
+        } catch {
+          // Best-effort release; avoid masking the original failure.
+        }
+      }
+    }
+  }
+
+  if (req.method !== "GET") {
+    return json({ error: "method_not_allowed" }, { status: 405 });
+  }
+
+  const operationId = url.searchParams.get("operation_id") || "";
+  if (!operationId) {
+    return json({ error: "invalid_request", error_description: "operation_id required" }, { status: 400 });
+  }
+
+  const op = await store.getMcpOperation(operationId);
+  if (!op || op.principal_id !== principal.id || op.tenant_id !== principal.tenant_id) {
+    return json({ error: "not_found" }, { status: 404 });
+  }
+  if (op.status !== "approval_required") {
+    return json(
+      {
+        error: "conflict",
+        error_description: "operation is not awaiting approval",
+        status: op.status,
+        operation_id: op.operation_id,
+      },
+      { status: 409 },
+    );
+  }
+
+  if (op.device_id) {
+    const gate = await store.assertDeviceOperableForMcp(op.device_id, principal.id, principal.tenant_id);
+    if (!gate.ok) {
+      return json({ error: gate.error, device_id: op.device_id }, { status: 403 });
+    }
+  }
+
+  const csrf = randomToken("csrf_");
+  const txId = randomId("apr_");
+  await store.putMcpApprovalTransaction({
+    id: txId,
+    csrf_hash: await sha256Hex(csrf),
+    operation_id: op.operation_id,
+    principal_id: principal.id,
+    tenant_id: principal.tenant_id,
+    device_id: op.device_id,
+    expires_at: Date.now() + 15 * 60 * 1000,
+    consumed: false,
+    created_at: nowIso(),
+  });
+
+  const page = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Approve</title></head>
+<body><h1>OwnMesh operation approval</h1>
+<p>Operation <code>${escapeHtml(op.operation_id)}</code></p>
+<p>Tool: <code>${escapeHtml(op.tool || "")}</code></p>
+<p>Device: <code>${escapeHtml(op.device_id || "")}</code></p>
+<p>${escapeHtml(op.summary || "")}</p>
+<form method="post" action="/approve?operation_id=${encodeURIComponent(op.operation_id)}">
+<input type="hidden" name="transaction_id" value="${escapeHtml(txId)}"/>
+<input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"/>
+<input type="hidden" name="operation_id" value="${escapeHtml(op.operation_id)}"/>
+<button name="decision" value="approve">Approve</button>
+<button name="decision" value="deny">Deny</button>
+</form>
+<p><small>Issuer ${escapeHtml(issuer)}. ChatGPT confirmation is not a substitute for OwnMesh local policy.</small></p>
+</body></html>`;
+  return html(page, { status: 200, noStore: true });
 }
 
 /**

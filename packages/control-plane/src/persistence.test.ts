@@ -228,3 +228,18 @@ test("sql store refresh rotation + reuse detection persists", async () => {
   if (!reuse.ok) assert.equal(reuse.error, "reuse");
   assert.equal(await store.getAccess(rotated.token.access_token), null);
 });
+
+test("sql store expired refresh is invalid_grant", async () => {
+  const { store, db } = openSqliteStore();
+  await store.ensureBootstrap();
+  const first = await store.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
+  const { sha256Hex } = await import("./util.ts");
+  const hash = await sha256Hex(first.refresh_token);
+  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+    new Date(Date.now() - 5_000).toISOString(),
+    hash,
+  );
+  const expired = await store.rotateRefresh(first.refresh_token);
+  assert.equal(expired.ok, false);
+  if (!expired.ok) assert.equal(expired.error, "invalid_grant");
+});

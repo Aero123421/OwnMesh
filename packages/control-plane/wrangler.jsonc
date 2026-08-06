@@ -17,6 +17,7 @@
     "ALLOW_DYNAMIC_CLIENT_REGISTRATION": "false",
     // Optional comma-separated WebSocket origins in addition to OAUTH_ISSUER.
     "OWNMESH_ALLOWED_ORIGINS": ""
+    // SESSION_SECRET must be provided via wrangler secret / .dev.vars (never commit real values).
   },
   "d1_databases": [
     {

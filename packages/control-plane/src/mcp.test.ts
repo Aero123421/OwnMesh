@@ -419,21 +419,24 @@ test("approval round-trip: ask → human approve metadata → completed result",
     tracker,
   );
   assert.equal(first.body.result!.structuredContent!.status, "approval_required");
+  const opId = String(first.body.result!.structuredContent!.operation_id);
 
-  // Simulate human approval via browser page recording + device grant
+  // Authoritative store update (simulates /approve + device completion)
   approved = true;
-  tracker.update(String(first.body.result!.structuredContent!.operation_id), {
+  await store.updateMcpOperation(opId, {
     status: "completed",
     approval_required: false,
     summary: "approved and executed",
     data: { bytes_written: 4, path: "ok.txt" },
   });
+  // Cache may lag; poll must read store authority
+  tracker.clear();
 
   const second = await callTool(
     store,
     token,
     "ownmesh_get_operation",
-    { operation_id: first.body.result!.structuredContent!.operation_id as string },
+    { operation_id: opId },
     router,
     tracker,
   );
@@ -779,19 +782,23 @@ test("local tools still work without router (list_devices/get_device/list_profil
   const profiles = await callTool(store, token, "ownmesh_list_profiles", {});
   assert.equal(profiles.body.result!.structuredContent!.status, "completed");
 
-  // Seed a tracked op then fetch via get_operation (local tracker path)
+  // Seed op in authoritative store (tracker is cache-only; no tracker fallback).
   const tracker = new OperationTracker();
   const opId = "op_local_get_01";
-  tracker.put({
-    ...makeEnvelope({
-      operation_id: opId,
-      status: "completed",
-      summary: "seed",
-      data: { ok: true },
-    }),
-    tool: "ownmesh_fs_list",
-    principal: "prin_dev",
+  await store.putMcpOperation({
+    operation_id: opId,
     tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_list",
+    status: "completed",
+    summary: "seed",
+    data: { ok: true },
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    policy_authority: "ownmesh_device",
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
@@ -805,4 +812,31 @@ test("local tools still work without router (list_devices/get_device/list_profil
   );
   assert.equal(op.body.result!.structuredContent!.status, "completed");
   assert.equal(op.body.result!.structuredContent!.operation_id, opId);
+  // Tracker-only seed must NOT resurrect after store-backed authority.
+  const trackerOnly = new OperationTracker();
+  trackerOnly.put({
+    ...makeEnvelope({
+      operation_id: "op_tracker_only_ghost",
+      status: "completed",
+      summary: "ghost",
+      data: { ok: true },
+    }),
+    tool: "ownmesh_fs_list",
+    principal: "prin_dev",
+    tenant_id: "ten_default",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const ghost = await callTool(
+    store,
+    token,
+    "ownmesh_get_operation",
+    { operation_id: "op_tracker_only_ghost" },
+    undefined,
+    trackerOnly,
+  );
+  assert.match(
+    JSON.stringify(ghost.body),
+    /unknown operation|not found/i,
+  );
 });

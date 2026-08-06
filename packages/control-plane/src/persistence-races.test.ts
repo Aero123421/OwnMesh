@@ -209,6 +209,32 @@ test("SQL store fails closed when db.batch is absent for atomic device paths", a
   );
 });
 
+test("SQL expired refresh is invalid_grant and never reuse", async () => {
+  const { store: s, db } = openStore(); await s.ensureBootstrap();
+  const initial = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
+  const hash = await sha256Hex(initial.refresh_token);
+  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+    new Date(Date.now() - 1_000).toISOString(),
+    hash,
+  );
+  const expired = await s.rotateRefresh(initial.refresh_token);
+  assert.equal(expired.ok, false);
+  if (!expired.ok) assert.equal(expired.error, "invalid_grant");
+
+  // Rotate a live token, expire the used row, replay → still invalid_grant (not reuse).
+  const live = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
+  const rotated = await s.rotateRefresh(live.refresh_token);
+  assert.equal(rotated.ok, true);
+  const usedHash = await sha256Hex(live.refresh_token);
+  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+    new Date(Date.now() - 1_000).toISOString(),
+    usedHash,
+  );
+  const replay = await s.rotateRefresh(live.refresh_token);
+  assert.equal(replay.ok, false);
+  if (!replay.ok) assert.equal(replay.error, "invalid_grant");
+});
+
 test("SQL refresh rotation batch is atomic: CAS winner only, single successor", async () => {
   const { store: s, db } = openStore(); await s.ensureBootstrap();
   const initial = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");

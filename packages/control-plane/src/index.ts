@@ -27,9 +27,18 @@ import {
   protectedResourceMetadata,
   type AuthenticatedPrincipal,
 } from "./oauth.ts";
-import { handleMcp, MCP_TOOLS } from "./mcp.ts";
+import { handleApprove, handleMcp, MCP_TOOLS } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
-import { json, SERVICE_NAME, SERVICE_VERSION } from "./util.ts";
+import {
+  internalContextHeaderName,
+  internalDoHeaders,
+  json,
+  requireScope,
+  SERVICE_NAME,
+  SERVICE_VERSION,
+  sha256Hex,
+  signInternalContext,
+} from "./util.ts";
 
 export interface Env {
   DB?: D1Database;
@@ -125,6 +134,7 @@ async function routeToDeviceRoom(
     payload: Record<string, unknown>;
     correlation_id: string;
   },
+  bind?: { principal_id?: string; tenant_id?: string },
 ): Promise<{ status: string; detail?: unknown }> {
   if (!env.DEVICE_ROOM) {
     // Fail closed: never pretends routing succeeded without a DO binding.
@@ -136,16 +146,115 @@ async function routeToDeviceRoom(
       },
     };
   }
+  if (!env.SESSION_SECRET) {
+    return {
+      status: "unavailable",
+      detail: {
+        error: "session_secret_unbound",
+        note: "SESSION_SECRET is required to authorize internal DeviceRoom calls",
+      },
+    };
+  }
+  // Bind principal/tenant from caller or authoritative device record.
+  let principalId = bind?.principal_id || "";
+  let tenantId = bind?.tenant_id || "";
+  if (!principalId || !tenantId) {
+    try {
+      const device = await storeFor(env).getDevice(deviceId);
+      if (device) {
+        principalId = principalId || device.principal_id;
+        tenantId = tenantId || device.tenant_id;
+      }
+    } catch {
+      /* store may be unavailable in unit stubs; claims still require non-empty bind below */
+    }
+  }
+  if (!principalId || !tenantId) {
+    return {
+      status: "rejected",
+      detail: { error: "device_bind_unavailable" },
+    };
+  }
   const id = env.DEVICE_ROOM.idFromName(deviceId);
   const stub = env.DEVICE_ROOM.get(id);
+  // Single serialization source: body bytes hashed and sent are identical.
+  const body = JSON.stringify(operation);
+  const bodySha256 = await sha256Hex(body);
+  const method = "POST";
+  const path = "/operation";
+  const headers = await internalDoHeaders(env.SESSION_SECRET, {
+    op: "operation",
+    device_id: deviceId,
+    principal_id: principalId,
+    tenant_id: tenantId,
+    correlation_id: operation.correlation_id,
+    method,
+    path,
+    body_sha256: bodySha256,
+  });
   const res = await stub.fetch(
     new Request(`https://device-room/operation?device_id=${encodeURIComponent(deviceId)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-ownmesh-edge-authorized": "1" },
-      body: JSON.stringify(operation),
+      method,
+      headers,
+      body,
     }),
   );
-  return (await res.json()) as { status: string; detail?: unknown };
+
+  // Inspect DO HTTP status: never treat non-2xx / status-less error bodies as routed.
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    const raw: unknown = await res.json();
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      parsed = raw as Record<string, unknown>;
+    }
+  } catch {
+    parsed = null;
+  }
+
+  const httpOk = res.status >= 200 && res.status < 300;
+  if (httpOk) {
+    // 2xx with explicit status: unchanged success path.
+    if (parsed && typeof parsed.status === "string") {
+      return parsed as { status: string; detail?: unknown };
+    }
+    // 2xx unparseable or status-less (especially error-shaped) → unavailable.
+    return {
+      status: "unavailable",
+      detail: {
+        http_status: res.status,
+        error:
+          (parsed && typeof parsed.error === "string" && parsed.error) ||
+          "unparseable_or_status_less_body",
+        upstream: parsed ?? undefined,
+      },
+    };
+  }
+
+  const upstreamError =
+    (parsed && typeof parsed.error === "string" && parsed.error) ||
+    (parsed && typeof parsed.status === "string" && parsed.status) ||
+    "upstream_http_error";
+  const detail: Record<string, unknown> = {
+    http_status: res.status,
+    error: upstreamError,
+    upstream: parsed ?? undefined,
+  };
+  if (parsed && parsed.detail !== undefined) {
+    detail.upstream_detail = parsed.detail;
+  }
+
+  // Preserve explicit device_offline (DO uses 503) — never upgrade to routed/pending.
+  if (parsed && parsed.status === "device_offline") {
+    return parsed as { status: string; detail?: unknown };
+  }
+
+  // 403 (device_not_active / binding_mismatch) → explicit rejected.
+  // 429 / 503 / other non-2xx → unavailable (never routed/pending).
+  // Ignore any success-shaped body.status on non-2xx responses.
+  if (res.status === 403) {
+    return { status: "rejected", detail };
+  }
+  return { status: "unavailable", detail };
 }
 
 export default {
@@ -177,14 +286,18 @@ export default {
         const store = storeFor(env);
         const readiness = await store.schemaReadiness();
         const storage = env.DB ? "d1" : store.kind;
-        // Ready only when schema is migrated AND DeviceRoom DO is bound.
-        const ready = readiness.schema_ready && Boolean(env.DEVICE_ROOM);
+        const sessionSecretBound = Boolean(env.SESSION_SECRET);
+        // Ready only when schema is migrated, DeviceRoom DO is bound, and SESSION_SECRET is set.
+        const ready =
+          readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound;
         return json({
           ...base,
           status: ready ? "ok" : "not_ready",
           storage,
           schema_ready: readiness.schema_ready,
           schema_checks: readiness.checks,
+          session_secret_bound: sessionSecretBound,
+          durable_objects: Boolean(env.DEVICE_ROOM),
         }, { status: ready ? 200 : 503 });
       } catch (error) {
         if (error instanceof MissingD1Error) {
@@ -193,6 +306,8 @@ export default {
             status: "not_ready",
             storage: "unavailable",
             schema_ready: false,
+            session_secret_bound: Boolean(env.SESSION_SECRET),
+            durable_objects: Boolean(env.DEVICE_ROOM),
           }, { status: 503 });
         }
         throw error;
@@ -259,33 +374,83 @@ export default {
       return handleDeviceVerification(request, store, { principal: principal || undefined, allowDevBypass: bypass });
     }
 
-    // Approval persistence is not implemented yet. Authenticate first, then fail
-    // closed rather than recording a meaningless success response.
+    // Human approval for MCP approval_required ops: auth + CSRF + one-time tx,
+    // then deliver decision into DeviceRoom (never a success stub).
     if (url.pathname === "/approve") {
       const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
       const access = token ? await store.getAccess(token) : null;
-      if (!access) return json({ error: "unauthorized" }, { status: 401 });
-      return json({ error: "approval_not_implemented" }, { status: 501 });
+      let principal: AuthenticatedPrincipal | null = access
+        ? { id: access.principal, tenant_id: access.tenant_id, display_name: access.principal }
+        : null;
+      if (!principal) {
+        principal = await browserPrincipal(request, env);
+      }
+      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+
+      // Deciding a high-risk op requires write or exec scope on the bearer.
+      // Read-only / scope-less bearer tokens are rejected on POST.
+      // Browser session (no bearer) remains allowed for human HTML form flow.
+      if (request.method === "POST" && access) {
+        const canDecide =
+          requireScope(access.scope, "ownmesh.write") ||
+          requireScope(access.scope, "ownmesh.exec");
+        if (!canDecide) {
+          return json(
+            {
+              error: "insufficient_scope",
+              error_description: "ownmesh.write or ownmesh.exec required to decide approval",
+              required: ["ownmesh.write", "ownmesh.exec"],
+            },
+            { status: 403 },
+          );
+        }
+      }
+
+      const postOriginOk =
+        request.method !== "POST" ||
+        originAllowed(request, env, issuer) ||
+        // Non-browser JSON clients may omit Origin; require bearer in that case.
+        (!request.headers.get("origin") && Boolean(access));
+
+      return handleApprove(request, store, {
+        issuer,
+        principal: { id: principal.id, tenant_id: principal.tenant_id },
+        originAllowed: postOriginOk,
+        routeToDevice: (deviceId, operation) =>
+          routeToDeviceRoom(env, deviceId, operation, {
+            principal_id: principal!.id,
+            tenant_id: principal!.tenant_id,
+          }),
+      });
     }
 
     if (url.pathname === "/mcp") {
+      // Browser MCP clients send Origin — reject anything outside the allowlist.
+      // Non-browser clients omit Origin and authenticate via bearer token instead.
+      const mcpOrigin = request.headers.get("origin");
+      if (mcpOrigin && !originAllowed(request, env, issuer)) {
+        return json({ error: "origin_not_allowed" }, { status: 403 });
+      }
+      // Bind principal/tenant from the bearer at route time (store re-checks device).
+      const mcpToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+      const mcpAccess = mcpToken ? await store.getAccess(mcpToken) : null;
       return handleMcp(
         request,
         store,
         url,
         {
           routeToDevice: (deviceId, operation) =>
-            routeToDeviceRoom(env, deviceId, operation),
+            routeToDeviceRoom(env, deviceId, operation, mcpAccess
+              ? { principal_id: mcpAccess.principal, tenant_id: mcpAccess.tenant_id }
+              : undefined),
         },
         { issuer },
       );
     }
 
-    if (url.pathname.startsWith("/v1/devices")) {
-      return handleDevices(request, store, url);
-    }
-
     // Agent / client WebSocket connect → DeviceRoom DO
+    // MUST be registered before the broad /v1/devices/* handler so
+    // GET /v1/devices/:id/ws is not swallowed by device REST routes.
     // Spec §21 + §6.4 step 5: /agent/connect
     if (
       url.pathname === "/agent/connect" ||
@@ -319,6 +484,12 @@ export default {
           { status: 503 },
         );
       }
+      if (!env.SESSION_SECRET) {
+        return json(
+          { error: "session_secret_unbound", device_id: deviceId },
+          { status: 503 },
+        );
+      }
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         return json(
           {
@@ -334,10 +505,25 @@ export default {
       doUrl.pathname = "/ws";
       doUrl.searchParams.set("device_id", deviceId);
       doUrl.searchParams.set("role", role);
-      const doHeaders = new Headers(request.headers);
-      doHeaders.set("x-ownmesh-edge-authorized", "1");
+      const doHeaders = await internalDoHeaders(
+        env.SESSION_SECRET,
+        {
+          op: "ws",
+          device_id: deviceId,
+          principal_id: device.principal_id,
+          tenant_id: device.tenant_id,
+          role,
+        },
+        request.headers,
+      );
       doHeaders.set("x-ownmesh-allowed-origin", new URL(issuer).origin);
+      // Strip any client-supplied legacy constant — never forward as authority.
+      doHeaders.delete("x-ownmesh-edge-authorized");
       return stub.fetch(new Request(doUrl.toString(), { method: request.method, headers: doHeaders }));
+    }
+
+    if (url.pathname.startsWith("/v1/devices")) {
+      return handleDevices(request, store, url);
     }
 
     if (url.pathname === "/v1/migrations/status" && request.method === "GET") {
@@ -374,7 +560,6 @@ import {
   handleToken as oauthHandleToken,
   handleRevoke as oauthHandleRevoke,
 } from "./oauth.ts";
-import { requireScope } from "./util.ts";
 
 const legacyMem = new MemoryStore();
 
@@ -384,6 +569,8 @@ export const __test = {
   MCP_TOOLS,
   requireScope,
   routeToDeviceRoom,
+  signInternalContext,
+  internalContextHeaderName,
   get store() {
     return testStore || legacyMem;
   },

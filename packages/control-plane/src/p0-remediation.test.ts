@@ -130,15 +130,15 @@ test("agent connect enforces Origin, active registration, role, and device crede
   __setTestStore(store);
   const room = { idFromName: () => ({}) as DurableObjectId, get: () => ({ fetch: async () => new Response(null, { status: 204 }) }) as unknown as DurableObjectStub } as unknown as DurableObjectNamespace;
   const base = "https://cp.test/agent/connect?device_id=dev_connect&role=agent";
-  const noOrigin = await worker.fetch(new Request(base, { headers: { upgrade: "websocket", authorization: `Bearer ${credential.token}` } }), { DEVICE_ROOM: room }, ctx);
+  const noOrigin = await worker.fetch(new Request(base, { headers: { upgrade: "websocket", authorization: `Bearer ${credential.token}` } }), { DEVICE_ROOM: room, SESSION_SECRET: "test-session-secret-p0", OAUTH_ISSUER: "https://cp.test" }, ctx);
   assert.equal(noOrigin.status, 403);
-  const badCredential = await worker.fetch(new Request(base, { headers: { upgrade: "websocket", origin: "https://cp.test", authorization: "Bearer bad" } }), { DEVICE_ROOM: room }, ctx);
+  const badCredential = await worker.fetch(new Request(base, { headers: { upgrade: "websocket", origin: "https://cp.test", authorization: "Bearer bad" } }), { DEVICE_ROOM: room, SESSION_SECRET: "test-session-secret-p0", OAUTH_ISSUER: "https://cp.test" }, ctx);
   assert.equal(badCredential.status, 401);
-  const badRole = await worker.fetch(new Request(base.replace("role=agent", "role=admin"), { headers: { upgrade: "websocket", origin: "https://cp.test", authorization: `Bearer ${credential.token}` } }), { DEVICE_ROOM: room }, ctx);
+  const badRole = await worker.fetch(new Request(base.replace("role=agent", "role=admin"), { headers: { upgrade: "websocket", origin: "https://cp.test", authorization: `Bearer ${credential.token}` } }), { DEVICE_ROOM: room, SESSION_SECRET: "test-session-secret-p0", OAUTH_ISSUER: "https://cp.test" }, ctx);
   assert.equal(badRole.status, 403);
   await store.revokeDevice(device.id, device.principal_id);
   assert.equal(await store.validateDeviceSession(await sha256Hex(credential.token), "agent", device.id), false);
-  const revokedReconnect = await worker.fetch(new Request(base, { headers: { upgrade: "websocket", origin: "https://cp.test", authorization: `Bearer ${credential.token}` } }), { DEVICE_ROOM: room }, ctx);
+  const revokedReconnect = await worker.fetch(new Request(base, { headers: { upgrade: "websocket", origin: "https://cp.test", authorization: `Bearer ${credential.token}` } }), { DEVICE_ROOM: room, SESSION_SECRET: "test-session-secret-p0", OAUTH_ISSUER: "https://cp.test" }, ctx);
   assert.equal(revokedReconnect.status, 403);
   __setTestStore(null);
 });
@@ -190,7 +190,7 @@ test("operation lookup/cancel is principal-bound", async () => {
   assert.ok(owner.access_token);
 });
 
-test("audit and approval routes authenticate and approval fails closed", async () => {
+test("audit and approval routes authenticate and approval handler is live", async () => {
   const { store, token } = await tokenStore();
   __setTestStore(store);
   assert.equal((await worker.fetch(new Request("https://cp.test/v1/audit"), {}, ctx)).status, 401);
@@ -198,7 +198,11 @@ test("audit and approval routes authenticate and approval fails closed", async (
   assert.equal(audit.status, 200);
   assert.equal((await worker.fetch(new Request("https://cp.test/approve"), {}, ctx)).status, 401);
   const approval = await worker.fetch(new Request("https://cp.test/approve", { headers: { authorization: `Bearer ${token.access_token}` } }), {}, ctx);
-  assert.equal(approval.status, 501);
+  assert.equal(approval.status, 400);
+  assert.deepEqual(await approval.json(), {
+    error: "invalid_request",
+    error_description: "operation_id required",
+  });
   __setTestStore(null);
 });
 

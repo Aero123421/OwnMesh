@@ -76,7 +76,8 @@ export function oauthMetadata(issuer: string) {
       "urn:ietf:params:oauth:grant-type:device_code",
     ],
     code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+    // Public clients + PKCE only. client_secret_post is neither advertised nor accepted.
+    token_endpoint_auth_methods_supported: ["none"],
   };
 }
 
@@ -152,6 +153,18 @@ export async function handleRegister(
     redirect_uris?: string[];
     token_endpoint_auth_method?: string;
   };
+  // Only public clients (auth method "none") are supported. Reject client_secret_*.
+  const authMethod = body.token_endpoint_auth_method || "none";
+  if (authMethod !== "none") {
+    return json(
+      {
+        error: "invalid_client_metadata",
+        error_description:
+          "only token_endpoint_auth_method=none (public client + PKCE) is supported",
+      },
+      { status: 400 },
+    );
+  }
   const redirectUris = body.redirect_uris || [];
   for (const u of redirectUris) {
     if (!isAllowedDcrRedirectUri(u)) {
@@ -173,7 +186,7 @@ export async function handleRegister(
       client_id: clientId,
       client_name: clientName,
       redirect_uris: redirectUris,
-      token_endpoint_auth_method: body.token_endpoint_auth_method || "none",
+      token_endpoint_auth_method: "none",
       grant_types: [
         "authorization_code",
         "refresh_token",
@@ -338,6 +351,9 @@ export async function handleAuthorize(
   const transactionId = randomId("atz_");
   const csrf = randomToken("csrf_");
   const txTtlMs = 5 * 60 * 1000;
+  // Anchor expiry before hashing/persistence so slow crypto cannot extend the
+  // externally promised five-minute consent window.
+  const transactionIssuedAt = Date.now();
   await store.putAuthorizeTransaction({
     id: transactionId,
     csrf_hash: await sha256Hex(csrf),
@@ -349,7 +365,7 @@ export async function handleAuthorize(
     state,
     code_challenge: challenge,
     code_challenge_method: method,
-    expires_at: Date.now() + txTtlMs,
+    expires_at: transactionIssuedAt + txTtlMs,
     consumed: false,
   });
 
@@ -377,6 +393,43 @@ export async function handleToken(
   const body = await readBody(req);
   const grant = body.grant_type;
   await store.ensureBootstrap();
+
+  // Reject confidential-client auth. We only support public clients + PKCE (none).
+  // Presence of client_secret (including empty string) is client_secret_post — fail closed.
+  // HTTP Basic is client_secret_basic — reject the Authorization scheme entirely.
+  const authorization = req.headers.get("authorization");
+  if (authorization != null && /^Basic\s+/i.test(authorization.trim())) {
+    return json(
+      {
+        error: "invalid_client",
+        error_description: "client_secret_basic is not supported; use public client + PKCE",
+      },
+      { status: 401 },
+    );
+  }
+  if (body.client_secret != null) {
+    return json(
+      {
+        error: "invalid_client",
+        error_description: "client_secret_post is not supported; use public client + PKCE",
+      },
+      { status: 401 },
+    );
+  }
+  const tokenAuthMethod = body.token_endpoint_auth_method;
+  if (
+    tokenAuthMethod != null &&
+    String(tokenAuthMethod).length > 0 &&
+    String(tokenAuthMethod) !== "none"
+  ) {
+    return json(
+      {
+        error: "invalid_client",
+        error_description: "only token_endpoint_auth_method=none is supported",
+      },
+      { status: 401 },
+    );
+  }
 
   if (grant === "authorization_code") {
     if (!body.code || !body.code_verifier || !body.redirect_uri) {
