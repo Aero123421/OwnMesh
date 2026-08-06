@@ -17,8 +17,10 @@ mod secret;
 mod store;
 
 pub use device_key::{
+    delete_device_credential, load_device_credential, load_device_credential_for,
     load_human_refresh_token, load_or_create_device_key, rotate_device_key,
-    store_human_refresh_token, DeviceKeyPair, DevicePublicIdentity,
+    store_device_credential, store_human_refresh_token, verify_from_public_key_hex,
+    DeviceCredentialEnvelope, DeviceKeyPair, DevicePublicIdentity,
 };
 pub use error::{IdentityError, IdentityResult};
 pub use secret::{SecretBytes, SecretPurpose, SecretString};

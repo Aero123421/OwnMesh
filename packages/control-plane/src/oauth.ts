@@ -19,13 +19,39 @@ import {
   type DeviceRecord,
 } from "./store.ts";
 import {
+  applyNoStore,
   bearer,
-  json,
+  html,
+  json as jsonBase,
   nowIso,
   readBody,
   requireScope,
   verifyPkceS256,
+  sha256Hex,
+  verifyEd25519Hex,
+  type JsonInit,
 } from "./util.ts";
+
+/** All OAuth/device JSON responses default to Cache-Control: no-store, no-cache. */
+function json(data: unknown, init: JsonInit = {}): Response {
+  return jsonBase(data, { ...init, noStore: true });
+}
+
+export type AuthenticatedPrincipal = { id: string; tenant_id: string; display_name?: string };
+export type OAuthRequestSecurity = {
+  principal?: AuthenticatedPrincipal;
+  allowDevBypass?: boolean;
+  allowDynamicRegistration?: boolean;
+};
+
+const SUPPORTED_SCOPES = new Set([
+  "ownmesh.read", "ownmesh.write", "ownmesh.exec", "ownmesh.session", "ownmesh.device", "offline_access",
+]);
+const DEFAULT_SCOPE = "ownmesh.read ownmesh.device";
+function validScope(scope: string): boolean {
+  const values = scope.split(/\s+/).filter(Boolean);
+  return values.length > 0 && values.every((s) => SUPPORTED_SCOPES.has(s));
+}
 
 export function oauthMetadata(issuer: string) {
   return {
@@ -69,10 +95,58 @@ export function protectedResourceMetadata(resource: string) {
   };
 }
 
+/** Loopback hosts allowed for http:// redirect_uris (RFC 8252 §7.3). */
+function isLoopbackRedirectHost(hostname: string): boolean {
+  let h = hostname.toLowerCase();
+  if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+/**
+ * DCR redirect_uri policy: https:// anywhere, or http:// only on loopback
+ * (127.0.0.1 / ::1 / localhost). Custom schemes and remote http are rejected.
+ */
+export function isAllowedDcrRedirectUri(uri: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol === "http:" && isLoopbackRedirectHost(parsed.hostname)) return true;
+  return false;
+}
+
+/**
+ * RFC 7591 Dynamic Client Registration.
+ *
+ * Security contract:
+ * - Disabled unless allowDynamicRegistration is explicitly true (flag).
+ * - Always requires a Bearer access token with ownmesh.device scope.
+ * - New clients bind to the token's tenant_id (never implicit DEFAULT_TENANT).
+ * - redirect_uris must be https:// or loopback http:// only.
+ */
 export async function handleRegister(
   req: Request,
   store: ControlPlaneStore,
+  security: OAuthRequestSecurity = {},
 ): Promise<Response> {
+  if (!security.allowDynamicRegistration) {
+    return json({ error: "registration_disabled" }, { status: 403 });
+  }
+
+  const token = bearer(req);
+  if (!token) return json({ error: "unauthorized" }, { status: 401 });
+  const rec = await store.getAccess(token);
+  if (!rec) return json({ error: "invalid_token" }, { status: 401 });
+  if (!requireScope(rec.scope, "ownmesh.device")) {
+    return json({ error: "insufficient_scope" }, { status: 403 });
+  }
+  if (!rec.tenant_id) {
+    return json({ error: "invalid_token", error_description: "missing tenant" }, { status: 401 });
+  }
+
   const body = (await req.json()) as {
     client_name?: string;
     redirect_uris?: string[];
@@ -80,25 +154,24 @@ export async function handleRegister(
   };
   const redirectUris = body.redirect_uris || [];
   for (const u of redirectUris) {
-    try {
-      new URL(u);
-    } catch {
+    if (!isAllowedDcrRedirectUri(u)) {
       return json({ error: "invalid_redirect_uri", uri: u }, { status: 400 });
     }
   }
   const clientId = randomToken("client_").slice(0, 24);
+  const clientName = body.client_name || "ownmesh-client";
   await store.ensureBootstrap();
   await store.putClient({
     client_id: clientId,
-    tenant_id: DEFAULT_TENANT,
-    client_name: body.client_name || "ownmesh-client",
+    tenant_id: rec.tenant_id,
+    client_name: clientName,
     redirect_uris: redirectUris,
     created_at: nowIso(),
   });
   return json(
     {
       client_id: clientId,
-      client_name: body.client_name || "ownmesh-client",
+      client_name: clientName,
       redirect_uris: redirectUris,
       token_endpoint_auth_method: body.token_endpoint_auth_method || "none",
       grant_types: [
@@ -123,14 +196,70 @@ export async function handleAuthorize(
   req: Request,
   store: ControlPlaneStore,
   issuer: string,
+  security: OAuthRequestSecurity = {},
 ): Promise<Response> {
+  void issuer;
   const url = new URL(req.url);
+
+  // POST consent decision first: consume one-time transaction and issue code
+  // solely from the stored snapshot (ignore any resubmitted/altered OAuth params).
+  // index.ts merges form fields into url.searchParams before calling us.
+  if (req.method === "POST" && url.searchParams.has("decision")) {
+    await store.ensureBootstrap();
+    let postPrincipal = security.principal;
+    if (!postPrincipal && security.allowDevBypass) {
+      postPrincipal = { id: "prin_dev", tenant_id: DEFAULT_TENANT, display_name: "prin_dev" };
+    }
+    if (!postPrincipal) return json({ error: "authentication_required" }, { status: 401 });
+
+    const decision = url.searchParams.get("decision") || "";
+    const transactionId = url.searchParams.get("transaction_id") || "";
+    const csrfToken = url.searchParams.get("csrf_token") || "";
+    if (!transactionId || !csrfToken) {
+      return json({ error: "invalid_request", error_description: "missing consent transaction" }, { status: 400 });
+    }
+
+    const tx = await store.consumeAuthorizeTransaction(
+      transactionId,
+      await sha256Hex(csrfToken),
+      postPrincipal.id,
+    );
+    if (!tx || tx.tenant_id !== postPrincipal.tenant_id) {
+      return json(
+        { error: "invalid_request", error_description: "invalid, expired, or used transaction" },
+        { status: 400 },
+      );
+    }
+
+    if (decision !== "approve") {
+      const dest = new URL(tx.redirect_uri);
+      dest.searchParams.set("error", "access_denied");
+      if (tx.state) dest.searchParams.set("state", tx.state);
+      return Response.redirect(dest.toString(), 302);
+    }
+
+    const code = randomToken("ac_");
+    await store.putAuthCode({
+      code,
+      client_id: tx.client_id,
+      principal_id: tx.principal_id,
+      redirect_uri: tx.redirect_uri,
+      scope: tx.scope,
+      code_challenge: tx.code_challenge,
+      code_challenge_method: tx.code_challenge_method,
+      expires_at: Date.now() + 10 * 60 * 1000,
+      used: false,
+    });
+    const dest = new URL(tx.redirect_uri);
+    dest.searchParams.set("code", code);
+    if (tx.state) dest.searchParams.set("state", tx.state);
+    return Response.redirect(dest.toString(), 302);
+  }
+
   const redirect = url.searchParams.get("redirect_uri");
   const state = url.searchParams.get("state") || "";
   const clientId = url.searchParams.get("client_id") || "";
-  const scope =
-    url.searchParams.get("scope") ||
-    "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access";
+  const scope = url.searchParams.get("scope") || DEFAULT_SCOPE;
   const challenge = url.searchParams.get("code_challenge") || "";
   const method = url.searchParams.get("code_challenge_method") || "S256";
   const responseType = url.searchParams.get("response_type") || "code";
@@ -141,6 +270,7 @@ export async function handleAuthorize(
   if (responseType !== "code") {
     return json({ error: "unsupported_response_type" }, { status: 400 });
   }
+  if (!validScope(scope)) return json({ error: "invalid_scope" }, { status: 400 });
   if (method !== "S256" || !challenge) {
     return json(
       { error: "invalid_request", error_description: "PKCE S256 required" },
@@ -149,17 +279,9 @@ export async function handleAuthorize(
   }
 
   await store.ensureBootstrap();
-  let client = await store.getClient(clientId);
+  const client = await store.getClient(clientId);
   if (!client) {
-    // Dev convenience: auto-register unknown clients with the exact redirect only.
-    client = {
-      client_id: clientId,
-      tenant_id: DEFAULT_TENANT,
-      client_name: clientId,
-      redirect_uris: [redirect],
-      created_at: nowIso(),
-    };
-    await store.putClient(client);
+    return json({ error: "unauthorized_client", error_description: "unknown client" }, { status: 401 });
   }
 
   // OAuth 2.1: redirect_uri MUST exactly match a pre-registered URI.
@@ -173,54 +295,71 @@ export async function handleAuthorize(
     );
   }
 
-  const principal = url.searchParams.get("login_hint") || "prin_dev";
-  await store.ensurePrincipal(principal, principal);
+  let authenticated = security.principal;
+  if (!authenticated && security.allowDevBypass) {
+    const id = url.searchParams.get("login_hint") || "prin_dev";
+    authenticated = { id, tenant_id: DEFAULT_TENANT, display_name: id };
+  }
+  if (!authenticated) return json({ error: "authentication_required" }, { status: 401 });
+  // Fail closed for AUTH_PROVIDER (or any) principal whose tenant is not provisioned.
+  // Prevents principals INSERT FK violation (500) on SqlStore/D1.
+  if (!(await store.tenantExists(authenticated.tenant_id))) {
+    return json(
+      { error: "unknown_tenant", error_description: "tenant is not provisioned" },
+      { status: 403 },
+    );
+  }
+  if (authenticated.tenant_id !== client.tenant_id) return json({ error: "unauthorized_client" }, { status: 403 });
+  const principal = authenticated.id;
+  await store.ensurePrincipal(principal, authenticated.display_name || principal, "human", authenticated.tenant_id);
 
-  const code = randomToken("ac_");
-  await store.putAuthCode({
-    code,
-    client_id: clientId,
-    principal_id: principal,
-    redirect_uri: redirect,
-    scope,
-    code_challenge: challenge,
-    code_challenge_method: method,
-    expires_at: Date.now() + 10 * 60 * 1000,
-    used: false,
-  });
-
-  // Optional HTML consent for browser; if `prompt=none` or Accept prefers redirect, bounce.
-  const accept = req.headers.get("accept") || "";
-  if (accept.includes("text/html") && url.searchParams.get("auto") !== "1") {
-    const approveUrl = new URL(req.url);
-    approveUrl.searchParams.set("auto", "1");
-    const html = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Authorize</title>
-<style>body{font-family:system-ui;max-width:32rem;margin:3rem auto;padding:0 1rem}
-button{padding:.6rem 1rem;font-size:1rem;cursor:pointer}</style></head>
-<body><h1>OwnMesh</h1>
-<p>Client <code>${escapeHtml(clientId)}</code> requests scopes:</p>
-<pre>${escapeHtml(scope)}</pre>
-<form method="get" action="${escapeHtml(approveUrl.pathname)}">
-${[...approveUrl.searchParams.entries()]
-  .map(
-    ([k, v]) =>
-      `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}"/>`,
-  )
-  .join("\n")}
-<button type="submit">Approve</button>
-</form>
-<p style="color:#666;font-size:.85rem">Issuer: ${escapeHtml(issuer)}</p>
-</body></html>`;
-    return new Response(html, {
-      status: 200,
-      headers: { "content-type": "text/html; charset=utf-8" },
+  // Dev-only auto-approve shortcut (auto=1 + allowDevBypass). Production never sets the flag.
+  const devAuto = security.allowDevBypass && url.searchParams.get("auto") === "1";
+  if (devAuto) {
+    const code = randomToken("ac_");
+    await store.putAuthCode({
+      code,
+      client_id: clientId,
+      principal_id: principal,
+      redirect_uri: redirect,
+      scope,
+      code_challenge: challenge,
+      code_challenge_method: method,
+      expires_at: Date.now() + 10 * 60 * 1000,
+      used: false,
     });
+    const dest = new URL(redirect);
+    dest.searchParams.set("code", code);
+    if (state) dest.searchParams.set("state", state);
+    return Response.redirect(dest.toString(), 302);
   }
 
-  const dest = new URL(redirect);
-  dest.searchParams.set("code", code);
-  if (state) dest.searchParams.set("state", state);
-  return Response.redirect(dest.toString(), 302);
+  // Consent GET: issue a short-lived one-time transaction bound to the full snapshot.
+  const transactionId = randomId("atz_");
+  const csrf = randomToken("csrf_");
+  const txTtlMs = 5 * 60 * 1000;
+  await store.putAuthorizeTransaction({
+    id: transactionId,
+    csrf_hash: await sha256Hex(csrf),
+    principal_id: principal,
+    tenant_id: authenticated.tenant_id,
+    client_id: clientId,
+    redirect_uri: redirect,
+    scope,
+    state,
+    code_challenge: challenge,
+    code_challenge_method: method,
+    expires_at: Date.now() + txTtlMs,
+    consumed: false,
+  });
+
+  const page = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Authorize</title></head>
+<body><h1>OwnMesh</h1><p>Client <code>${escapeHtml(clientId)}</code> requests:</p><pre>${escapeHtml(scope)}</pre>
+<form method="post" action="/oauth/authorize">
+<input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"/>
+<input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"/>
+<button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form></body></html>`;
+  return html(page, { status: 200, noStore: true });
 }
 
 function escapeHtml(s: string): string {
@@ -271,7 +410,7 @@ export async function handleToken(
     );
     await store.appendAudit({
       id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: tok.tenant_id,
       principal_id: auth.principal_id,
       kind: "oauth.token_issued",
       summary: "authorization_code exchange",
@@ -280,7 +419,7 @@ export async function handleToken(
     });
     return json({
       access_token: tok.access_token,
-      refresh_token: tok.refresh_token,
+      ...(requireScope(tok.scope, "offline_access") ? { refresh_token: tok.refresh_token } : {}),
       token_type: "bearer",
       expires_in: 900,
       scope: tok.scope,
@@ -305,7 +444,7 @@ export async function handleToken(
     }
     await store.appendAudit({
       id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: result.token.tenant_id,
       principal_id: result.token.principal,
       kind: "oauth.refresh_rotated",
       summary: "refresh token rotated",
@@ -345,12 +484,18 @@ export async function handleToken(
       }
       return json({ error: "authorization_pending" }, { status: 400 });
     }
-    // approved
-    const principal = rec.principal_id || "prin_dev";
-    const tok = await store.issueTokens(rec.client_id, principal, rec.scope);
+    // Atomic approved -> consumed transition prevents concurrent/replayed exchange.
+    const requestedClient = body.client_id || "";
+    if (!requestedClient || requestedClient !== rec.client_id) {
+      return json({ error: "invalid_grant" }, { status: 400 });
+    }
+    const consumed = await store.consumeApprovedDeviceCode(deviceCode, requestedClient);
+    if (!consumed) return json({ error: "invalid_grant" }, { status: 400 });
+    const principal = consumed.principal_id!;
+    const tok = await store.issueTokens(consumed.client_id, principal, consumed.scope);
     await store.appendAudit({
       id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: tok.tenant_id,
       principal_id: principal,
       kind: "oauth.device_code_token",
       summary: "device_code exchanged",
@@ -358,7 +503,7 @@ export async function handleToken(
     });
     return json({
       access_token: tok.access_token,
-      refresh_token: tok.refresh_token,
+      ...(requireScope(tok.scope, "offline_access") ? { refresh_token: tok.refresh_token } : {}),
       token_type: "bearer",
       expires_in: 900,
       scope: tok.scope,
@@ -375,17 +520,23 @@ export async function handleRevoke(
   const body = await readBody(req);
   const token = body.token || "";
   if (token) {
+    // RFC 7009: always 200. Audit only when the token matches a real issued record,
+    // attributed to that token's tenant/principal (never a blanket DEFAULT_TENANT).
+    const meta = await store.lookupRevocableToken(token);
     await store.revokeToken(token);
-    await store.appendAudit({
-      id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
-      kind: "oauth.revoke",
-      summary: "token revoked",
-      created_at: nowIso(),
-      meta: { token_prefix: token.slice(0, 8) },
-    });
+    if (meta) {
+      await store.appendAudit({
+        id: randomId("aud_"),
+        tenant_id: meta.tenant_id,
+        principal_id: meta.principal_id,
+        kind: "oauth.revoke",
+        summary: "token revoked",
+        created_at: nowIso(),
+        meta: { token_prefix: token.slice(0, 8), client_id: meta.client_id },
+      });
+    }
   }
-  return new Response(null, { status: 200 });
+  return new Response(null, { status: 200, headers: applyNoStore() });
 }
 
 /** RFC 8628 device authorization endpoint. */
@@ -395,11 +546,13 @@ export async function handleDeviceAuthorization(
   issuer: string,
 ): Promise<Response> {
   const body = await readBody(req);
-  const clientId = body.client_id || "client_ownmesh_cli";
-  const scope =
-    body.scope ||
-    "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access";
+  const clientId = body.client_id || "";
+  const scope = body.scope || DEFAULT_SCOPE;
   await store.ensureBootstrap();
+  if (!clientId || !(await store.getClient(clientId))) {
+    return json({ error: "unauthorized_client" }, { status: 401 });
+  }
+  if (!validScope(scope)) return json({ error: "invalid_scope" }, { status: 400 });
 
   const deviceCode = randomToken("dcode_");
   const userCode = generateUserCode();
@@ -430,43 +583,57 @@ export async function handleDeviceAuthorization(
 export async function handleDeviceVerification(
   req: Request,
   store: ControlPlaneStore,
+  security: OAuthRequestSecurity = {},
 ): Promise<Response> {
   await store.ensureBootstrap();
+  let principal = security.principal;
+  if (!principal && security.allowDevBypass) principal = { id: "prin_dev", tenant_id: DEFAULT_TENANT };
+  if (!principal) return json({ error: "authentication_required" }, { status: 401 });
+  // Fail closed before principals INSERT when AUTH_PROVIDER tenant is unknown.
+  if (!(await store.tenantExists(principal.tenant_id))) {
+    return json(
+      { error: "unknown_tenant", error_description: "tenant is not provisioned" },
+      { status: 403 },
+    );
+  }
+  await store.ensurePrincipal(principal.id, principal.display_name || principal.id, "human", principal.tenant_id);
+
   if (req.method === "GET") {
     const url = new URL(req.url);
-    const preset = url.searchParams.get("user_code") || "";
-    const html = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Device Login</title>
-<style>body{font-family:system-ui;max-width:28rem;margin:3rem auto;padding:0 1rem}
-input,button{font-size:1rem;padding:.5rem;margin:.25rem 0;width:100%;box-sizing:border-box}
-button{cursor:pointer}</style></head>
-<body><h1>OwnMesh device login</h1>
-<p>Enter the code shown in your CLI (<code>ownmesh login --device</code>).</p>
-<form method="post" action="/oauth/device">
-<label>User code<br/><input name="user_code" value="${escapeHtml(preset)}" autocomplete="one-time-code" required/></label>
-<label>Principal id (dev)<br/><input name="principal_id" value="prin_dev"/></label>
-<button type="submit">Approve</button>
-</form></body></html>`;
-    return new Response(html, {
-      headers: { "content-type": "text/html; charset=utf-8" },
+    const userCode = (url.searchParams.get("user_code") || "").trim().toUpperCase();
+    if (!userCode) {
+      return html(`<!doctype html><html><body><h1>OwnMesh device login</h1>
+<form method="get" action="/oauth/device"><label>User code <input name="user_code" autocomplete="one-time-code" required/></label>
+<button type="submit">Continue</button></form></body></html>`, { noStore: true });
+    }
+    const dc = await store.getDeviceCodeByUserCode(userCode);
+    const client = dc ? await store.getClient(dc.client_id) : null;
+    if (!dc || !client || client.tenant_id !== principal.tenant_id || dc.status !== "pending" || Date.now() > dc.expires_at) {
+      return json({ error: "invalid_request", error_description: "unknown or expired code" }, { status: 400 });
+    }
+    const transactionId = randomId("dvt_");
+    const csrf = randomToken("csrf_");
+    await store.putDeviceVerificationTransaction({
+      id: transactionId, csrf_hash: await sha256Hex(csrf), user_code: userCode,
+      principal_id: principal.id, client_id: dc.client_id, scope: dc.scope,
+      expires_at: Math.min(dc.expires_at, Date.now() + 5 * 60 * 1000), consumed: false,
     });
+    const page = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Device Login</title></head>
+<body><h1>Authorize device</h1><p>Client <code>${escapeHtml(dc.client_id)}</code> requests:</p><pre>${escapeHtml(dc.scope)}</pre>
+<form method="post" action="/oauth/device"><input type="hidden" name="transaction_id" value="${transactionId}"/>
+<input type="hidden" name="csrf_token" value="${csrf}"/><button name="decision" value="approve">Approve</button></form></body></html>`;
+    return html(page, { noStore: true });
   }
   if (req.method === "POST") {
     const body = await readBody(req);
-    const userCode = (body.user_code || "").trim().toUpperCase();
-    const principal = body.principal_id || "prin_dev";
-    await store.ensurePrincipal(principal, principal);
-    const ok = await store.approveDeviceCode(userCode, principal);
-    if (!ok) {
-      return json(
-        { error: "invalid_request", error_description: "unknown or used code" },
-        { status: 400 },
-      );
+    if (body.decision !== "approve" || !body.transaction_id || !body.csrf_token) {
+      return json({ error: "invalid_request" }, { status: 400 });
     }
-    const html = `<!doctype html><html><body style="font-family:system-ui;margin:3rem auto;max-width:28rem">
-<h1>Approved</h1><p>You can return to the CLI. This window may be closed.</p></body></html>`;
-    return new Response(html, {
-      headers: { "content-type": "text/html; charset=utf-8" },
-    });
+    const tx = await store.consumeDeviceVerificationTransaction(
+      body.transaction_id, await sha256Hex(body.csrf_token), principal.id,
+    );
+    if (!tx) return json({ error: "invalid_request", error_description: "invalid, expired, or used transaction" }, { status: 400 });
+    return html(`<!doctype html><html><body><h1>Approved</h1></body></html>`, { noStore: true });
   }
   return json({ error: "method_not_allowed" }, { status: 405 });
 }
@@ -521,9 +688,12 @@ export async function handleDevices(
   if (!token) return json({ error: "unauthorized" }, { status: 401 });
   const rec = await store.getAccess(token);
   if (!rec) return json({ error: "invalid_token" }, { status: 401 });
+  if (!requireScope(rec.scope, "ownmesh.device")) {
+    return json({ error: "insufficient_scope" }, { status: 403 });
+  }
 
   if (url.pathname === "/v1/devices/enroll" && req.method === "POST") {
-    if (!requireScope(rec.scope, "ownmesh.device") && !requireScope(rec.scope, "ownmesh.write")) {
+    if (!requireScope(rec.scope, "ownmesh.device")) {
       return json({ error: "insufficient_scope" }, { status: 403 });
     }
     const body = (await req.json()) as {
@@ -536,14 +706,14 @@ export async function handleDevices(
       public_key?: string;
       labels?: string[];
     };
-    if (!body.public_key) {
+    if (!body.public_key || !/^[0-9a-fA-F]{64}$/.test(body.public_key)) {
       return json({ error: "invalid_request", field: "public_key" }, { status: 400 });
     }
     const deviceId = randomId("dev_");
     const created = nowIso();
     const device: DeviceRecord = {
       id: deviceId,
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: rec.tenant_id,
       principal_id: rec.principal,
       name: body.name || body.hostname || deviceId,
       hostname: body.hostname || body.name || "unknown",
@@ -554,6 +724,7 @@ export async function handleDevices(
       public_key: body.public_key,
       revoked: false,
       created_at: created,
+      status: "pending",
     };
     // Persist with metadata envelope for SQL store compatibility.
     const toStore: DeviceRecord = {
@@ -575,7 +746,7 @@ export async function handleDevices(
     });
     await store.appendAudit({
       id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: rec.tenant_id,
       principal_id: rec.principal,
       device_id: deviceId,
       kind: "device.enroll_started",
@@ -587,6 +758,8 @@ export async function handleDevices(
       rec.client_id,
       rec.principal,
       "ownmesh.device",
+      undefined,
+      5 * 60 * 1000,
     );
     return json(
       {
@@ -616,7 +789,7 @@ export async function handleDevices(
       return json({ error: "invalid_request" }, { status: 400 });
     }
     const device = await store.getDevice(body.device_id);
-    if (!device || device.principal_id !== rec.principal) {
+    if (!device || device.principal_id !== rec.principal || device.tenant_id !== rec.tenant_id) {
       return json({ error: "not_found" }, { status: 404 });
     }
     if (device.revoked) return json({ error: "device_revoked" }, { status: 403 });
@@ -624,25 +797,17 @@ export async function handleDevices(
     if (!ch || ch.device_id !== body.device_id) {
       return json({ error: "invalid_challenge" }, { status: 400 });
     }
-    // Server accepts non-empty hex signature; cryptographic verify is done by agent
-    // identity crate on the client and optionally re-checked here when WebCrypto
-    // ed25519 is available. For 1.0.1 we require well-formed hex + consume once.
-    if (!/^[0-9a-fA-F]{128}$/.test(body.signature)) {
-      return json(
-        {
-          error: "invalid_proof",
-          error_description: "signature must be 64-byte ed25519 hex",
-        },
-        { status: 400 },
-      );
+    if (device.status !== "pending") return json({ error: "invalid_device_state" }, { status: 409 });
+    if (!(await verifyEd25519Hex(device.public_key, ch.message, body.signature))) {
+      return json({ error: "invalid_proof" }, { status: 400 });
     }
-    const consumed = await store.consumeEnrollmentChallenge(body.challenge_id);
-    if (!consumed) {
-      return json({ error: "challenge_consumed_or_expired" }, { status: 400 });
-    }
+    const credential = await store.activateDeviceAndIssueCredential(body.device_id, body.challenge_id);
+    if (!credential) return json({ error: "challenge_consumed_or_expired" }, { status: 400 });
+    const activeDevice = await store.getDevice(body.device_id);
+    if (!activeDevice) return json({ error: "not_found" }, { status: 404 });
     await store.appendAudit({
       id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: rec.tenant_id,
       principal_id: rec.principal,
       device_id: body.device_id,
       kind: "device.enroll_proof",
@@ -653,7 +818,9 @@ export async function handleDevices(
     return json({
       ok: true,
       status: "active",
-      device: { ...device, public_key: device.public_key },
+      device: activeDevice,
+      device_credential: credential.token,
+      credential_expires_at: nowIso(credential.expires_at),
       connect_path: "/agent/connect",
     });
   }
@@ -671,7 +838,7 @@ export async function handleDevices(
     const ok = await store.revokeDevice(id, rec.principal);
     await store.appendAudit({
       id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: rec.tenant_id,
       principal_id: rec.principal,
       device_id: id,
       kind: "device.revoke",
@@ -686,35 +853,10 @@ export async function handleDevices(
     return json({ devices });
   }
 
-  // Legacy POST /v1/devices {id, name, proof} — kept for older clients.
+  // The legacy direct-create endpoint bypassed key proof and is intentionally
+  // retired. Callers must use /enroll followed by /enroll/proof.
   if (url.pathname === "/v1/devices" && req.method === "POST") {
-    const body = (await req.json()) as {
-      id?: string;
-      name?: string;
-      proof?: string;
-      public_key?: string;
-    };
-    if (!body.id || !body.proof) {
-      return json({ error: "invalid_request" }, { status: 400 });
-    }
-    const device: DeviceRecord = {
-      id: body.id,
-      tenant_id: DEFAULT_TENANT,
-      principal_id: rec.principal,
-      name: body.name || body.id,
-      hostname: body.name || body.id,
-      os: "unknown",
-      arch: "unknown",
-      agent_version: "0",
-      protocol_version: "ownmesh.device/1.0",
-      public_key: encodeDevicePublicKey(body.public_key || "legacy", {
-        hostname: body.name || body.id,
-      }),
-      revoked: false,
-      created_at: nowIso(),
-    };
-    await store.putDevice(device);
-    return json({ ok: true, device: await store.getDevice(body.id) }, { status: 201 });
+    return json({ error: "proof_required", enroll: "/v1/devices/enroll" }, { status: 410 });
   }
 
   return json({ error: "not_found", path: url.pathname }, { status: 404 });

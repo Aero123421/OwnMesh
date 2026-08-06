@@ -6,7 +6,8 @@ use super::*;
 use mock_server::MockControlPlane;
 use ownmesh_config::OwnMeshPaths;
 use ownmesh_identity::{
-    load_human_refresh_token, load_or_create_device_key, MemorySecretStore, SecretString,
+    load_device_credential, load_device_credential_for, load_human_refresh_token,
+    load_or_create_device_key, MemorySecretStore, SecretPurpose, SecretStore, SecretString,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,6 +167,47 @@ async fn enroll_challenge_proof_revoke_and_key_rotation() {
     assert_eq!(enrolled.status, "active");
     assert_eq!(enrolled.public.fingerprint, fp_before);
 
+    // Long-lived credential lives under DeviceCredential (issuer+device bound), not legacy purpose.
+    assert!(store
+        .load(SecretPurpose::DeviceEnrollmentProof)
+        .unwrap()
+        .is_none());
+    let envelope = load_device_credential(&store)
+        .unwrap()
+        .expect("device credential stored under DeviceCredential");
+    assert!(envelope.matches(&issuer, &enrolled.device_id));
+    let device_credential = load_device_credential_for(&store, &issuer, &enrolled.device_id)
+        .unwrap()
+        .expect("bound credential load");
+    assert!(device_credential.expose().starts_with("dcred_"));
+    assert!(!format!("{device_credential:?}").contains(device_credential.expose()));
+    let session_raw = std::fs::read_to_string(&sp.session_file).unwrap();
+    assert!(!session_raw.contains(device_credential.expose()));
+
+    // /agent/connect accepts only the issued device credential from the secret store.
+    let connect_url = format!(
+        "{}{}?device_id={}&role=agent",
+        issuer, enrolled.connect_path, enrolled.device_id
+    );
+    let connect_ok = http
+        .get(&connect_url)
+        .bearer_auth(device_credential.expose())
+        .send()
+        .await
+        .expect("agent connect");
+    assert_eq!(connect_ok.status().as_u16(), 200);
+    let connect_body: serde_json::Value = connect_ok.json().await.unwrap();
+    assert_eq!(connect_body["ok"], true);
+    assert_eq!(connect_body["device_id"], enrolled.device_id);
+
+    let connect_bad = http
+        .get(&connect_url)
+        .bearer_auth("dcred_not_issued")
+        .send()
+        .await
+        .expect("agent connect bad cred");
+    assert_eq!(connect_bad.status().as_u16(), 401);
+
     let listed = list_devices(&http, &issuer, &tokens.access_token)
         .await
         .unwrap();
@@ -193,6 +235,70 @@ async fn enroll_challenge_proof_revoke_and_key_rotation() {
         .unwrap();
     assert!(listed.is_empty());
     assert!(sp.load_session().unwrap().device_id.is_none());
+
+    // Revoked device credential must no longer connect.
+    let connect_revoked = http
+        .get(&connect_url)
+        .bearer_auth(device_credential.expose())
+        .send()
+        .await
+        .expect("agent connect after revoke");
+    assert_eq!(connect_revoked.status().as_u16(), 403);
+
+    mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn enroll_proof_rejects_invalid_ed25519_signature() {
+    let mock = MockControlPlane::start().await;
+    let http = http_client();
+    let issuer = mock.base_url();
+
+    mock.set_auto_approve_device(true);
+    let tokens = login_device_code(&http, &issuer, "client_ownmesh_cli", None)
+        .await
+        .unwrap();
+
+    let store = MemorySecretStore::default();
+    let key = load_or_create_device_key(&store).unwrap();
+    let public = key.public_identity();
+
+    let enroll_resp = http
+        .post(format!("{issuer}/v1/devices/enroll"))
+        .bearer_auth(&tokens.access_token)
+        .json(&serde_json::json!({
+            "name": "bad-proof-device",
+            "hostname": "test-host",
+            "os": "test",
+            "arch": "x64",
+            "agent_version": "0",
+            "protocol_version": "ownmesh.device/1.0",
+            "public_key": public.public_key_hex,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enroll_resp.status().as_u16(), 201);
+    let enroll: serde_json::Value = enroll_resp.json().await.unwrap();
+    let device_id = enroll["device_id"].as_str().unwrap();
+    let challenge_id = enroll["challenge"]["id"].as_str().unwrap();
+    let enrollment_token = enroll["enrollment_token"].as_str().unwrap();
+
+    let bad_sig = "00".repeat(64);
+    let proof_resp = http
+        .post(format!("{issuer}/v1/devices/enroll/proof"))
+        .bearer_auth(enrollment_token)
+        .json(&serde_json::json!({
+            "device_id": device_id,
+            "challenge_id": challenge_id,
+            "signature": bad_sig,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(proof_resp.status().as_u16(), 400);
+    let body: serde_json::Value = proof_resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_proof");
 
     mock.shutdown().await;
 }

@@ -100,6 +100,7 @@ test("redirect_uri exact match enforced on authorize", async () => {
     ),
     store,
     "https://cp.test",
+    { allowDevBypass: true },
   );
   assert.equal(good.status, 302);
   const loc = good.headers.get("location") || "";
@@ -133,6 +134,7 @@ test("authorization_code + PKCE S256 exchange", async () => {
     ),
     store,
     "https://cp.test",
+    { allowDevBypass: true },
   );
   const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
   const tokRes = await handleToken(
@@ -159,6 +161,10 @@ test("device authorization grant end-to-end", async () => {
   const store = new MemoryStore();
   await store.ensureBootstrap();
   const { handleDeviceAuthorization } = await import("./oauth.ts");
+  await store.putClient({
+    client_id: "client_ownmesh_cli", tenant_id: "ten_default", client_name: "cli",
+    redirect_uris: [], created_at: new Date().toISOString(),
+  });
   const issued = await handleDeviceAuthorization(
     new Request("https://cp.test/oauth/device_authorization", {
       method: "POST",
@@ -208,28 +214,45 @@ test("device authorization grant end-to-end", async () => {
     store,
   );
   assert.equal(done.status, 200);
-  const tok = (await done.json()) as { access_token: string };
+  const tok = (await done.json()) as { access_token: string; refresh_token?: string };
   assert.ok(await store.getAccess(tok.access_token));
+  assert.equal(tok.refresh_token, undefined);
 });
 
 test("dynamic client registration returns policy", async () => {
   const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.ensurePrincipal("prin_dcr", "DCR User", "user", "ten_default");
+  const tok = await store.issueTokens("client_ownmesh_cli", "prin_dcr", "ownmesh.device");
   const res = await handleRegister(
     new Request("https://cp.test/oauth/register", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${tok.access_token}`,
+      },
       body: JSON.stringify({
         client_name: "ChatGPT",
         redirect_uris: ["https://chatgpt.com/connector/oauth/callback"],
       }),
     }),
     store,
+    { allowDynamicRegistration: true },
   );
   assert.equal(res.status, 201);
   const body = (await res.json()) as {
     client_id: string;
-    policy: { redirect_uri_match: string };
+    client_name: string;
+    redirect_uris: string[];
+    policy: { redirect_uri_match: string; dynamic_client_registration: string };
   };
   assert.ok(body.client_id);
+  assert.equal(body.client_name, "ChatGPT");
+  assert.deepEqual(body.redirect_uris, ["https://chatgpt.com/connector/oauth/callback"]);
   assert.equal(body.policy.redirect_uri_match, "exact");
+  assert.equal(body.policy.dynamic_client_registration, "supported");
+  const stored = await store.getClient(body.client_id);
+  assert.ok(stored);
+  assert.equal(stored!.tenant_id, "ten_default");
+  assert.equal(stored!.client_name, "ChatGPT");
 });

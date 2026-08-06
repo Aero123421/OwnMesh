@@ -19,7 +19,7 @@
 import type { ControlPlaneStore } from "./store.ts";
 import { bearer, json, requireScope } from "./util.ts";
 import { SERVICE_NAME, SERVICE_VERSION } from "./util.ts";
-import { DEFAULT_TENANT, randomId, nowIso } from "./store.ts";
+import { randomId, nowIso } from "./store.ts";
 
 // ---------------------------------------------------------------------------
 // Tool catalog (annotations are UX hints only — not authorization)
@@ -482,6 +482,7 @@ export type OwnMeshResultEnvelope = {
 export type TrackedOperation = OwnMeshResultEnvelope & {
   tool: string;
   principal: string;
+  tenant_id: string;
   created_at: string;
   updated_at: string;
 };
@@ -792,17 +793,7 @@ export async function handleMcp(
   const tracker = opts.tracker || defaultOpTracker;
   const issuer = opts.issuer || url.origin;
 
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "access-control-allow-origin": "*",
-        "access-control-allow-headers":
-          "authorization, content-type, mcp-session-id",
-        "access-control-allow-methods": "GET, POST, OPTIONS, DELETE",
-      },
-    });
-  }
+  if (req.method === "OPTIONS") return json({ error: "cors_not_enabled" }, { status: 405 });
 
   // Session delete (Streamable HTTP session management)
   if (req.method === "DELETE") {
@@ -918,7 +909,7 @@ export async function handleMcp(
 
     await store.appendAudit({
       id: randomId("aud_"),
-      tenant_id: DEFAULT_TENANT,
+      tenant_id: rec.tenant_id,
       principal_id: rec.principal,
       device_id: deviceId || undefined,
       kind: "mcp.tool_call",
@@ -953,6 +944,7 @@ export async function handleMcp(
         ...env,
         tool: name,
         principal: rec.principal,
+        tenant_id: rec.tenant_id,
         created_at: nowIso(),
         updated_at: nowIso(),
       });
@@ -961,7 +953,7 @@ export async function handleMcp(
 
     if (name === "ownmesh_get_device") {
       const d = await store.getDevice(deviceId);
-      if (!d || d.principal_id !== rec.principal) {
+      if (!d || d.principal_id !== rec.principal || d.tenant_id !== rec.tenant_id) {
         const env = makeEnvelope({
           operation_id: operationId,
           status: "failed",
@@ -1015,7 +1007,7 @@ export async function handleMcp(
     if (name === "ownmesh_get_operation") {
       const oid = String(args.operation_id || "");
       const tracked = tracker.get(oid);
-      if (!tracked) {
+      if (!tracked || tracked.principal !== rec.principal || tracked.tenant_id !== rec.tenant_id) {
         const env = makeEnvelope({
           operation_id: oid || operationId,
           status: "failed",
@@ -1036,20 +1028,26 @@ export async function handleMcp(
 
     if (name === "ownmesh_cancel_operation") {
       const oid = String(args.operation_id || "");
-      const tracked = tracker.get(oid);
+      const candidate = tracker.get(oid);
+      const tracked = candidate?.principal === rec.principal && candidate.tenant_id === rec.tenant_id ? candidate : undefined;
       if (tracked && (tracked.status === "pending" || tracked.status === "running" || tracked.status === "approval_required")) {
-        const updated = tracker.update(oid, {
-          status: "cancelled",
-          summary: "cancelled by client",
-          approval_required: false,
-        })!;
-        if (router && (deviceId || tracked.device_id)) {
-          await router.routeToDevice(deviceId || tracked.device_id || "", {
+        if (router && tracked.device_id) {
+          const cancelDeviceId = tracked.device_id;
+          const cancelDevice = await store.getDevice(cancelDeviceId);
+          if (!cancelDevice || cancelDevice.principal_id !== rec.principal || cancelDevice.tenant_id !== rec.tenant_id || cancelDevice.revoked || cancelDevice.status !== "active") {
+            return mcpError(id, -32004, "device_not_available", { device_id: cancelDeviceId });
+          }
+          await router.routeToDevice(cancelDeviceId, {
             type: "ownmesh_cancel_operation",
             payload: { operation_id: oid },
             correlation_id: correlation,
           });
         }
+        const updated = tracker.update(oid, {
+          status: "cancelled",
+          summary: "cancelled by client",
+          approval_required: false,
+        })!;
         return mcpResult(id, toolContent(updated));
       }
       const env = makeEnvelope({
@@ -1064,6 +1062,11 @@ export async function handleMcp(
     // ---- device-routed tools ----
     if (!deviceId) {
       return mcpError(id, -32602, "device_id required", { tool: name });
+    }
+
+    const targetDevice = await store.getDevice(deviceId);
+    if (!targetDevice || targetDevice.principal_id !== rec.principal || targetDevice.tenant_id !== rec.tenant_id || targetDevice.revoked || targetDevice.status !== "active") {
+      return mcpError(id, -32004, "device_not_available", { device_id: deviceId });
     }
 
     const wantAsync = args.async === true;
@@ -1101,39 +1104,27 @@ export async function handleMcp(
       }),
       tool: name,
       principal: rec.principal,
+      tenant_id: rec.tenant_id,
       created_at: nowIso(),
       updated_at: nowIso(),
     };
     tracker.put(trackBase);
 
     if (!router) {
-      // Logical route without DO binding — still honest about authority.
-      if (isMutating) {
-        const env = approvalRequiredEnvelope({
-          tool: name,
-          operationId,
-          deviceId,
-          issuer,
-          correlationId: correlation,
-          warnings: injectWarnings,
-          reason:
-            "Mutating tool requires device policy evaluation; DEVICE_ROOM unbound — returning approval_required placeholder.",
-        });
-        tracker.put({
-          ...trackBase,
-          ...env,
-          updated_at: nowIso(),
-        });
-        return mcpResult(id, toolContent(env));
-      }
+      // Fail closed: no router means DEVICE_ROOM is unbound / unavailable.
+      // Never emit pending or approval_required placeholders that look like progress.
       const env = makeEnvelope({
         operation_id: operationId,
-        status: "pending",
+        status: "failed",
         device_id: deviceId,
-        summary: "routed_to_device (logical; DEVICE_ROOM unbound)",
+        summary: "device room unavailable",
         data: {
-          op: name,
-          note: "Device agent evaluates policy and returns results over the device room.",
+          error: {
+            code: "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE",
+            message: "DEVICE_ROOM binding is required to route device operations.",
+            retryable: false,
+            operation_id: operationId,
+          },
         },
         correlation_id: correlation,
         warnings: injectWarnings,
@@ -1147,6 +1138,32 @@ export async function handleMcp(
       payload: routePayload,
       correlation_id: correlation,
     });
+
+    if (
+      routed.status === "unavailable" ||
+      routed.status === "error" ||
+      routed.status === "device_room_unbound"
+    ) {
+      const env = makeEnvelope({
+        operation_id: operationId,
+        status: "failed",
+        device_id: deviceId,
+        summary: "device room unavailable",
+        data: {
+          error: {
+            code: "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE",
+            message: "DEVICE_ROOM binding is required to route device operations.",
+            retryable: false,
+            operation_id: operationId,
+            details: routed.detail || {},
+          },
+        },
+        correlation_id: correlation,
+        warnings: injectWarnings,
+      });
+      tracker.put({ ...trackBase, ...env, updated_at: nowIso() });
+      return mcpResult(id, toolContent(env));
+    }
 
     if (routed.status === "device_offline") {
       const env = makeEnvelope({

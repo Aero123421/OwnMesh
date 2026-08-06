@@ -2,7 +2,8 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use ownmesh_identity::{
-    load_or_create_device_key, rotate_device_key, DevicePublicIdentity, SecretStore,
+    load_or_create_device_key, rotate_device_key, store_device_credential, DevicePublicIdentity,
+    SecretStore, SecretString,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -59,6 +60,7 @@ struct Challenge {
 #[derive(Debug, Deserialize)]
 struct ProofResponse {
     ok: bool,
+    device_credential: String,
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
@@ -136,9 +138,18 @@ pub async fn enroll_device(
         bail!("enroll proof failed ({status}): {body}");
     }
     let proof: ProofResponse = proof_resp.json().await.context("parse proof response")?;
-    if !proof.ok {
-        bail!("enroll proof rejected");
+    if !proof.ok || proof.device_credential.is_empty() {
+        bail!("enroll proof rejected or missing device credential");
     }
+    // Long-lived connect credential is bound to issuer + device_id under DeviceCredential.
+    // Never park it under DeviceEnrollmentProof (legacy purpose only).
+    store_device_credential(
+        store,
+        issuer,
+        &enroll.device_id,
+        &SecretString::new(proof.device_credential),
+    )
+    .map_err(|err| anyhow!("store device credential: {err}"))?;
 
     let mut session = session_paths.load_session().unwrap_or_default();
     session.device_id = Some(enroll.device_id.clone());

@@ -10,7 +10,13 @@
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     // Set to your Worker URL after first deploy if it differs from request origin.
-    "OAUTH_ISSUER": ""
+    "OAUTH_ISSUER": "",
+    // Security-sensitive development escape hatch. Keep false in deployments.
+    "OWNMESH_DEV_AUTH_BYPASS": "false",
+    // Dynamic registration is opt-in; provision static clients unless explicitly needed.
+    "ALLOW_DYNAMIC_CLIENT_REGISTRATION": "false",
+    // Optional comma-separated WebSocket origins in addition to OAUTH_ISSUER.
+    "OWNMESH_ALLOWED_ORIGINS": ""
   },
   "d1_databases": [
     {

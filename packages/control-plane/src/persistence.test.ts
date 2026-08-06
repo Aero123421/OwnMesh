@@ -28,6 +28,7 @@ function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
   }
 
   type SqlVal = null | number | string | bigint | Uint8Array;
+  let batchTail: Promise<void> = Promise.resolve();
   const adapter: SqlDatabase = {
     prepare(query: string): SqlStatement {
       const stmt = db.prepare(query);
@@ -46,8 +47,8 @@ function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
           return row as T;
         },
         async run() {
-          stmt.run(...bound);
-          return { success: true, results: [] };
+          const info = stmt.run(...bound) as { changes: number };
+          return { success: true, meta: { changes: info.changes }, results: [] };
         },
         async all<T>() {
           const rows = stmt.all(...bound) as T[];
@@ -59,13 +60,31 @@ function openSqliteStore(): { db: DatabaseSync; store: SqlStore } {
     exec(query: string) {
       db.exec(query);
     },
+    async batch<T>(statements: SqlStatement[]): Promise<T[]> {
+      // Mirror D1 atomic batch via a real SQLite transaction (production path).
+      const run = async (): Promise<T[]> => {
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          const results: unknown[] = [];
+          for (const statement of statements) results.push(await statement.run());
+          db.exec("COMMIT");
+          return results as T[];
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+      };
+      const result = batchTail.then(run, run);
+      batchTail = result.then(() => undefined, () => undefined);
+      return result;
+    },
   };
 
   const store = new SqlStore(adapter, "sqlite");
   return { db, store };
 }
 
-test("migrations 0001+0002 apply cleanly on sqlite", () => {
+test("all control-plane migrations apply cleanly on sqlite", () => {
   const { db } = openSqliteStore();
   const tables = db
     .prepare(
@@ -85,6 +104,9 @@ test("migrations 0001+0002 apply cleanly on sqlite", () => {
     "device_codes",
     "used_refresh_tokens",
     "enrollment_challenges",
+    "device_credentials",
+    "device_verification_transactions",
+    "revoked_refresh_families",
     "schema_migrations",
   ]) {
     assert.ok(names.includes(need), `missing table ${need}`);
@@ -96,6 +118,7 @@ test("sql store persists tokens, devices, revoke across store instances", async 
   await store.ensureBootstrap();
   await store.markMigration("0001_init.sql");
   await store.markMigration("0002_oauth_device_enrollment.sql");
+  await store.markMigration("0003_control_plane_p0.sql");
 
   const tok = await store.issueTokens(
     "client_ownmesh_cli",
@@ -123,10 +146,12 @@ test("sql store persists tokens, devices, revoke across store instances", async 
     }),
     revoked: false,
     created_at: new Date().toISOString(),
+    status: "active",
   });
 
   // New store handle on same DB = "new isolate" persistence proof
   type SqlVal = null | number | string | bigint | Uint8Array;
+  let batchTail: Promise<void> = Promise.resolve();
   const adapter: SqlDatabase = {
     prepare(query: string): SqlStatement {
       const stmt = db.prepare(query);
@@ -145,14 +170,31 @@ test("sql store persists tokens, devices, revoke across store instances", async 
           return row as T;
         },
         async run() {
-          stmt.run(...bound);
-          return { success: true };
+          const info = stmt.run(...bound) as { changes: number };
+          return { success: true, meta: { changes: info.changes } };
         },
         async all<T>() {
           return { results: stmt.all(...bound) as T[] };
         },
       };
       return api;
+    },
+    async batch<T>(statements: SqlStatement[]): Promise<T[]> {
+      const run = async (): Promise<T[]> => {
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          const results: unknown[] = [];
+          for (const statement of statements) results.push(await statement.run());
+          db.exec("COMMIT");
+          return results as T[];
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+      };
+      const result = batchTail.then(run, run);
+      batchTail = result.then(() => undefined, () => undefined);
+      return result;
     },
   };
   const store2 = new SqlStore(adapter, "sqlite");
@@ -171,6 +213,7 @@ test("sql store persists tokens, devices, revoke across store instances", async 
   const applied = await store2.appliedMigrations();
   assert.ok(applied.includes("0001_init.sql"));
   assert.ok(applied.includes("0002_oauth_device_enrollment.sql"));
+  assert.ok(applied.includes("0003_control_plane_p0.sql"));
 });
 
 test("sql store refresh rotation + reuse detection persists", async () => {
