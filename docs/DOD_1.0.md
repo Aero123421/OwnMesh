@@ -10,7 +10,7 @@
 
 ## Conclusion
 
-OwnMesh 1.0.x is **not complete against the specification DoD**. The parsed CLI contains **43 explicit generic-stub CLI surfaces** plus 5 additional hard-error unsupported surfaces (48 total), recorded in `release/SUPPORTED_SURFACES.json`; these surfaces are excluded from the 1.0.x completeness claim and return explicit errors. Remote `exec --device <id>` and `session open <device>` hard-fail rather than falling back to local execution.
+OwnMesh 1.0.x is **not complete against the specification DoD**. The parsed CLI contains **44 explicit unsupported CLI surfaces** from the authoritative Rust registry plus 7 additional hard-error unsupported surfaces (51 total), recorded in `release/SUPPORTED_SURFACES.json`; these surfaces are excluded from the 1.0.x completeness claim and return explicit errors. Remote routing hard-fails rather than falling back locally, `approval watch` does not degrade to a one-shot list, and broker install/uninstall cannot claim native service state.
 
 The v1.0.2 remediation makes build/security/release evidence fail-closed; it does not turn unimplemented product surfaces into completed features. “Library exists”, “parser accepts a command”, and “workflow exists” are not counted as end-to-end completion.
 
@@ -20,13 +20,13 @@ Legend: **done** = current shipped behavior is covered · **partial** = useful i
 
 | # | DoD item | Honest status | Evidence / remaining gap |
 |---|---|---|---|
-| 1 | Signed release Win/macOS/Linux | **partial** | Required three-OS archives, checksums, strict SBOMs, and GitHub provenance are gated. Portable minisign requires a tracked public key plus matching secret; neither trust root nor signing key is enrolled, so the release is degraded/pre-release. Authenticode and Apple notarization remain W-SIGN. |
+| 1 | Signed release Win/macOS/Linux | **partial** | Required three-OS portable archives (with LICENSE/NOTICE/README/release notes), checksums, strict SBOMs, and GitHub provenance are gated. A Windows installer and universal macOS package are not implemented. Portable minisign has no enrolled key, and Authenticode/Apple notarization remain W-SIGN. |
 | 2 | Deploy to own Cloudflare | **partial** | Wrangler config/docs and CI dry-run exist; live-account certification remains W-LIVE-E2E. |
 | 3 | D1/DO/Worker auto provision | **partial** | Migrations and bindings exist; deployment still requires account-specific setup. |
 | 4 | OAuth ChatGPT Personal Plugin | **partial** | Server/CLI automated flows exist; live ChatGPT account E2E remains W-LIVE-E2E. |
 | 5 | Normal Chat read/write/command/session tools | **partial** | MCP harness covers routing; CLI `mcp serve` is explicitly unsupported and live integration is not certified. |
 | 6 | CLI/TUI set Full User / Full Access | **partial** | Policy presets and TUI implementation exist; `setup` and the CLI no-argument TUI handoff are unsupported. |
-| 7 | Privileged Broker per OS | **partial** | Security boundaries and transport implementations are tested; full native installer/service/signature certification is absent. |
+| 7 | Privileged Broker per OS | **partial** | Security boundaries and transport implementations are tested. Native service activation/removal and verification are unsupported; templates/markers are never reported as installed service state. |
 | 8 | Generic command + arbitrary CLI PTY | **partial** | Local structured/shell execution and session foundations exist. Remote `exec --device` is unsupported. |
 | 9 | Official 9 profiles conformance | **partial** | Definitions/fixtures exist; all CLI profile commands are among the explicit unsupported surfaces. |
 | 10 | Session observer/controller handoff | **partial** | Session library and CLI lifecycle paths exist; broad production restart/PTY certification remains. |
@@ -45,9 +45,10 @@ Legend: **done** = current shipped behavior is covered · **partial** = useful i
 - CI requires `fmt`, `clippy -D warnings`, build, and tests with lockfile enforcement on Windows, Linux, and macOS.
 - CI requires frozen pnpm install plus recursive test/typecheck/lint and a blocking Wrangler dry-run.
 - Release calls CI and Security as reusable prerequisite jobs. Normal `needs` semantics prohibit build/publish after any prerequisite failure.
-- Release requires all three platform archives and both non-empty CycloneDX SBOMs; no empty SBOM fallback exists.
+- Release requires all three portable platform archives, mandatory LICENSE/NOTICE/README/current notes in each archive, and both non-empty CycloneDX SBOMs; no empty SBOM fallback exists.
+- Windows installer and universal macOS packaging are unimplemented and are not release-coverage claims.
 - Release notes are selected from the current tag. Provenance is attested. Missing minisign credentials force degraded pre-release status and a prominent warning.
-- `scripts/check_release_quality.py` mechanically checks the publish dependency graph, fail-closed workflow patterns, toolchain pins, release-note scope, and the 43-stub/48-unsupported surface manifest.
+- `scripts/check_release_quality.py` mechanically checks the publish dependency graph, fail-closed workflow patterns, toolchain pins, release-note scope, and the 44-registry/51-unsupported surface manifest.
 
 ## Explicit waivers and non-goals
 

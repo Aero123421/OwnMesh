@@ -4,10 +4,8 @@ use crate::cli::{Cli, PrivilegedCmd};
 use crate::commands::ipc_util::print_value;
 use ownmesh_domain::ExitCode;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::Command;
-use uuid::Uuid;
 
 pub fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
     match cmd {
@@ -31,6 +29,10 @@ fn run_install(cli: &Cli) -> Result<(), ExitCode> {
     match invoke_broker(&["install", "--state-dir", &base.display().to_string()]) {
         Ok(0) => {
             let st = read_status_json(&base);
+            if !st["installed"].as_bool().unwrap_or(false) {
+                eprintln!("broker install did not establish a verified native service");
+                return Err(ExitCode::ProfileUnavailable);
+            }
             print_value(cli.json, &st, |v| {
                 println!(
                     "privileged broker installed endpoint={} kind={}",
@@ -40,51 +42,17 @@ fn run_install(cli: &Cli) -> Result<(), ExitCode> {
             });
             Ok(())
         }
-        _ => fallback_install(cli, &base),
+        Ok(code) => {
+            eprintln!(
+                "broker service installation failed (exit {code}); no installed state recorded"
+            );
+            Err(ExitCode::ProfileUnavailable)
+        }
+        Err(()) => {
+            eprintln!("ownmesh-broker is unavailable; broker service was not installed");
+            Err(ExitCode::ProfileUnavailable)
+        }
     }
-}
-
-fn fallback_install(cli: &Cli, base: &std::path::Path) -> Result<(), ExitCode> {
-    let dir = base.join("broker");
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        eprintln!("{e}");
-        ExitCode::Internal
-    })?;
-    let secret = dir.join("broker.secret");
-    if !secret.exists() {
-        let mut h = Sha256::new();
-        h.update(Uuid::new_v4().as_bytes());
-        h.update(now_unix().to_le_bytes());
-        h.update(b"ownmesh-cli-broker-secret");
-        std::fs::write(&secret, h.finalize()).map_err(|e| {
-            eprintln!("{e}");
-            ExitCode::Internal
-        })?;
-    }
-    let marker = json!({
-        "installed": true,
-        "installed_at_unix": now_unix(),
-        "endpoint": "local",
-        "endpoint_kind": if cfg!(windows) { "named_pipe" } else { "unix_socket" },
-        "unit_path": null,
-        "secret_file": secret.display().to_string(),
-        "notes": [
-            "broker is networkless (no non-loopback listen)",
-            "install via ownmesh-broker for OS service templates"
-        ],
-    });
-    std::fs::write(
-        dir.join("broker-install.json"),
-        serde_json::to_string_pretty(&marker).unwrap(),
-    )
-    .map_err(|e| {
-        eprintln!("{e}");
-        ExitCode::Internal
-    })?;
-    print_value(cli.json, &marker, |_| {
-        println!("privileged broker installed (local marker)");
-    });
-    Ok(())
 }
 
 fn run_status(cli: &Cli) -> Result<(), ExitCode> {
@@ -110,28 +78,26 @@ fn run_status(cli: &Cli) -> Result<(), ExitCode> {
     Ok(())
 }
 
-fn run_uninstall(cli: &Cli) -> Result<(), ExitCode> {
+fn run_uninstall(_cli: &Cli) -> Result<(), ExitCode> {
     let base = state_base()?;
-    let _ = invoke_broker(&["uninstall", "--state-dir", &base.display().to_string()]);
-    let dir = base.join("broker");
-    let marker = json!({
-        "installed": false,
-        "installed_at_unix": now_unix(),
-        "endpoint": "",
-        "endpoint_kind": "",
-        "unit_path": null,
-        "secret_file": dir.join("broker.secret").display().to_string(),
-        "notes": ["uninstalled"],
-    });
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(
-        dir.join("broker-install.json"),
-        serde_json::to_string_pretty(&marker).unwrap(),
-    );
-    print_value(cli.json, &marker, |_| {
-        println!("privileged broker uninstalled");
-    });
-    Ok(())
+    match invoke_broker(&["uninstall", "--state-dir", &base.display().to_string()]) {
+        Ok(0) => {
+            eprintln!(
+                "broker command returned success, but native service absence is not independently verified"
+            );
+            Err(ExitCode::ProfileUnavailable)
+        }
+        Ok(code) => {
+            eprintln!(
+                "broker service uninstall could not verify native service removal (exit {code})"
+            );
+            Err(ExitCode::ProfileUnavailable)
+        }
+        Err(()) => {
+            eprintln!("ownmesh-broker is unavailable; native service removal was not attempted");
+            Err(ExitCode::ProfileUnavailable)
+        }
+    }
 }
 
 fn invoke_broker(args: &[&str]) -> Result<i32, ()> {
@@ -159,8 +125,13 @@ fn invoke_broker(args: &[&str]) -> Result<i32, ()> {
 fn read_status_json(base: &std::path::Path) -> serde_json::Value {
     let path = base.join("broker").join("broker-install.json");
     if let Ok(raw) = std::fs::read_to_string(path) {
-        if let Ok(v) = serde_json::from_str(&raw) {
-            return v;
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            // Historical markers and generated templates are not native service probes.
+            value["installed"] = json!(false);
+            value["network"] = json!("disabled");
+            value["notes"] =
+                json!(["native broker service state is unverified; reporting not installed"]);
+            return value;
         }
     }
     json!({
@@ -169,13 +140,6 @@ fn read_status_json(base: &std::path::Path) -> serde_json::Value {
         "endpoint": null,
         "endpoint_kind": "",
         "secret_present": base.join("broker").join("broker.secret").exists(),
-        "notes": ["not installed"],
+        "notes": ["not installed; native service management is unsupported"],
     })
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }

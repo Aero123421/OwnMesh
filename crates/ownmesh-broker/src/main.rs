@@ -17,7 +17,8 @@ use std::path::PathBuf;
 #[command(
     name = "ownmesh-broker",
     version,
-    about = "OwnMesh privileged broker (networkless)"
+    about = "OwnMesh privileged broker (networkless)",
+    disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]

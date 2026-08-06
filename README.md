@@ -10,9 +10,9 @@ OwnMesh is **not** an AI orchestrator, and the 1.0.x line is **not feature-compl
 
 **v1.0.2 release candidate** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
-The CLI currently has **43 explicit generic-stub CLI surfaces** plus 5 additional hard-error unsupported surfaces (48 total). They return machine-visible errors and are excluded from 1.0.x completeness. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, `ownmesh exec --device <id>` is unsupported and fails; it never silently executes on the local device.
+The CLI currently has **44 explicit unsupported CLI surfaces** from the Rust dispatch registry plus 7 additional hard-error unsupported surfaces (51 total). They return machine-visible errors and are excluded from 1.0.x completeness. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, remote execution/session routing fails instead of falling back locally, and `approval watch` fails instead of silently behaving like a one-shot list.
 
-Supported CLI areas include status, login/logout, lockdown/token revoke, config validation, device enrollment/list/show/rotate/revoke, local execution, local session lifecycle, approval decisions, policy inspection/presets, and privileged-broker management. Setup/doctor, the no-argument TUI handoff, instance/workspace/process/profile/transfer/service/update/MCP command surfaces, and other entries in the manifest are not part of 1.0.x completeness.
+Supported CLI areas include status, login/logout, lockdown/token revoke, config validation, device enrollment/list/show/rotate/revoke, local execution, local session lifecycle, approval list/show/decisions, policy inspection/presets, and fail-closed privileged-broker status. Setup/doctor, the no-argument TUI handoff, broker install/uninstall, instance/workspace/process/profile/transfer/service/update/MCP command surfaces, and other entries in the manifest are not part of 1.0.x completeness.
 
 ## Components
 
@@ -45,7 +45,7 @@ For control-plane deployment, see [docs/deploy-cloudflare.md](./docs/deploy-clou
 
 ## Release integrity
 
-Tag releases invoke the reusable CI and Security workflows before any release build. Windows, Linux, and macOS archives, non-empty CycloneDX SBOMs, SHA-256 checksums, and GitHub build provenance are required. If both a tracked minisign public key and the matching private-key secret are unavailable, the workflow publishes only a clearly marked **degraded pre-release**. No trust root is currently enrolled; see [`docs/release-keys/README.md`](./docs/release-keys/README.md). Authenticode and Apple notarization remain unsupported under W-SIGN.
+Tag releases invoke the reusable CI and Security workflows before any release build. Windows, Linux, and macOS **portable archives** are required, and each archive includes `LICENSE`, `NOTICE`, `README.md`, and current release notes. Non-empty CycloneDX SBOMs, SHA-256 checksums, and GitHub build provenance are also required. These archives are not Windows installers, macOS packages, or universal macOS binaries; those package formats remain unimplemented. If both a tracked minisign public key and the matching private-key secret are unavailable, the workflow publishes only a clearly marked **degraded pre-release**. No trust root is currently enrolled; see [`docs/release-keys/README.md`](./docs/release-keys/README.md). Authenticode and Apple notarization remain unsupported under W-SIGN.
 
 ## Design invariants
 

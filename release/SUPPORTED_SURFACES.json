@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "release_train": "1.0.x",
   "completeness_claim": false,
   "supported": [
@@ -7,15 +7,15 @@
     "login/logout",
     "lockdown/unlock/token revoke",
     "config validate",
-    "device enrollment/list/show/rotate/revoke",
+    "device enroll/list/show/rotate-key/revoke",
     "exec (local device only)",
-    "session lifecycle (local device only)",
-    "approval queue decisions",
+    "session list/show/open/attach/claim/release/give/close/terminate (local device only)",
+    "approval list/show/approve/deny",
     "policy show/preset/validate/explain",
-    "privileged broker install/status/uninstall"
+    "privileged broker status (fail-closed metadata; native service management unsupported)"
   ],
-  "explicit_stub_count": 43,
-  "explicit_stub_surfaces": [
+  "explicit_unsupported_count": 44,
+  "explicit_unsupported_surfaces": [
     "tui",
     "setup",
     "doctor",
@@ -43,6 +43,7 @@
     "profile test",
     "profile start",
     "profile resume",
+    "approval watch",
     "transfer plan",
     "transfer send",
     "transfer list",
@@ -65,8 +66,10 @@
     "device labels",
     "exec --device <id> (hard error; never falls back to local)",
     "session open <device> (hard error; never falls back to local)",
-    "policy rule mutation"
+    "policy rule mutation",
+    "privileged broker install (template preparation cannot claim native service installation)",
+    "privileged broker uninstall (template cleanup cannot claim native service removal)"
   ],
-  "total_unsupported_surfaces": 48,
-  "notes": "An unsupported entry must return a machine-visible error. It is excluded from OwnMesh 1.0.x completeness claims, not treated as a completed or silently degraded feature."
+  "total_unsupported_surfaces": 51,
+  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES registry is authoritative for explicit unsupported dispatch. Every unsupported entry returns a machine-visible hard error. Parser presence, a marker file, or a generated service template is not treated as implementation."
 }

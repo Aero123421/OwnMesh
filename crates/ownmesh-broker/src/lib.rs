@@ -196,19 +196,20 @@ mod tests {
     }
 
     #[test]
-    fn install_status_uninstall_roundtrip() {
+    fn service_template_lifecycle_fails_closed() {
         let dir = tempdir().unwrap();
         let base = dir.path();
         let st = broker_status(base).unwrap();
         assert!(!st.installed);
 
-        let rec = install_broker(base, None).unwrap();
-        assert!(rec.installed);
+        let install_error = install_broker(base, None).unwrap_err();
+        assert!(install_error.contains("no native service was activated or verified"));
         let st = broker_status(base).unwrap();
-        assert!(st.installed);
+        assert!(!st.installed);
         assert!(!st.endpoint_kind.is_empty());
 
-        uninstall_broker(base).unwrap();
+        let uninstall_error = uninstall_broker(base).unwrap_err();
+        assert!(uninstall_error.contains("native service absence cannot be verified"));
         let st = broker_status(base).unwrap();
         assert!(!st.installed);
     }

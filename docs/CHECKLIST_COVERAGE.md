@@ -1,6 +1,6 @@
 # IMPLEMENTATION_CHECKLIST Coverage Map (v1.0.x)
 
-> **Release-quality correction (v1.0.2):** This map records ownership/disposition of unchecked specification work; it is not evidence that the product surface is complete. The shipped CLI contract is `release/SUPPORTED_SURFACES.json`, whose 43 generic stubs plus additional hard-error unsupported surfaces remain outside 1.0.x completeness.
+> **Release-quality correction (v1.0.2):** This map records ownership/disposition of unchecked specification work; it is not evidence that the product surface is complete. The shipped CLI contract is `release/SUPPORTED_SURFACES.json`, whose 44 registry-backed unsupported surfaces plus additional hard-error unsupported surfaces remain outside 1.0.x completeness.
 
 **Source:** [`IMPLEMENTATION_CHECKLIST.md`](../IMPLEMENTATION_CHECKLIST.md)  
 **Authority:** meta-loop board plan (run `2026-08-06T10-56-25-625Z-phl3z8`) + [`docs/DOD_1.0.md`](./DOD_1.0.md)  
@@ -266,9 +266,10 @@ Legend for `Kind`: `impl` = implement in ticket · `waiver` = accepted deferral 
 
 | Item | Owner | Kind | Notes |
 |---|---|---|---|
-| Windows installer/package | release-08 | impl | Via release.yml artifacts |
-| macOS universal binaries/package | release-08 | impl | |
-| Linux packages/binaries | release-08 | impl | |
+| Windows installer/package | release-08 | partial | Portable `.tar.gz` archive only; no installer |
+| macOS universal binaries/package | release-08 | partial | Runner-native portable archive only; not universal/package |
+| Linux packages/binaries | release-08 | partial | Portable archive; no distro-native package |
+| Archive legal/readme/release-note payload | release-08 | impl | LICENSE, NOTICE, README, current notes are gated |
 | shell completions | release-08 | impl | Ship if present; else document gap in notes |
 | signed checksums | release-08 | impl | Real notarization → **W-SIGN** |
 | install/uninstall documentation | release-08 | impl | README / release notes |

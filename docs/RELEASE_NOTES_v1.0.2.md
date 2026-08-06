@@ -4,9 +4,9 @@ v1.0.2 corrects release/CI behavior and narrows product claims to what is actual
 
 ## Scope and compatibility
 
-The CLI has **43 explicit generic-stub CLI surfaces** plus 5 additional hard-error unsupported surfaces (48 total), machine-recorded in [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json). They return explicit machine-readable errors and are excluded from 1.0.x completeness. Supported areas are also listed in that manifest.
+The CLI has **44 explicit unsupported CLI surfaces** from the authoritative Rust registry plus 7 additional hard-error unsupported surfaces (51 total), machine-recorded in [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json). They return explicit machine-readable errors and are excluded from 1.0.x completeness. Supported areas are also listed in that manifest.
 
-`ownmesh exec --device <id>` is unsupported in this release and now hard-fails before any daemon call. It never falls back to local execution. Local `ownmesh exec -- <command>` remains supported. Likewise, `ownmesh session open <device>` now hard-fails instead of silently opening a local session; local session operations remain supported.
+`ownmesh exec --device <id>` is unsupported in this release and now hard-fails before any daemon call. It never falls back to local execution. Local `ownmesh exec -- <command>` remains supported. Likewise, `ownmesh session open <device>` now hard-fails instead of silently opening a local session; local session operations remain supported. `ownmesh approval watch` now hard-fails instead of silently running one list query. Broker install/uninstall also fail closed until native service activation/removal can be verified; generated templates and markers are not installed-state evidence.
 
 ## Release and CI changes
 
@@ -15,7 +15,8 @@ The CLI has **43 explicit generic-stub CLI surfaces** plus 5 additional hard-err
 - Required pnpm gates use a frozen lockfile and run recursive test, typecheck, and lint.
 - Wrangler validation is blocking; validation failures are no longer discarded.
 - A tag release invokes reusable CI and Security workflows first. Failed or cancelled gates prevent build and publish jobs through explicit `needs` dependencies.
-- Release build uses a Windows/Linux/macOS matrix and fails if a required binary/archive is absent.
+- Release build uses a Windows/Linux/macOS matrix and fails if a required binary/archive is absent. Every portable archive must contain LICENSE, NOTICE, README, and current release notes.
+- Release outputs are portable archives, not a Windows installer or a universal macOS package; those packaging requirements remain partial/unimplemented.
 - The release fails if either Rust or control-plane CycloneDX SBOM is absent, invalid, or empty. There is no placeholder/empty SBOM fallback.
 - GitHub build provenance is generated for release assets.
 - Release notes are selected from the current tag rather than a fixed historical file.

@@ -75,8 +75,12 @@ pub fn install_broker(
     ];
     let unit_path = write_unit_template(&dir, &endpoint, &secret_file, &mut notes)?;
 
+    notes.push(
+        "service template prepared, but native service activation and verification are unsupported"
+            .into(),
+    );
     let rec = InstallRecord {
-        installed: true,
+        installed: false,
         installed_at_unix: crate::now_unix(),
         endpoint: broker_endpoint_display(&endpoint),
         endpoint_kind: kind_name(endpoint.kind()).into(),
@@ -86,7 +90,7 @@ pub fn install_broker(
     };
     let raw = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
     std::fs::write(install_path(base), raw).map_err(|e| e.to_string())?;
-    Ok(rec)
+    Err("broker service installation is unsupported: a template was prepared, but no native service was activated or verified".into())
 }
 
 /// Remove install marker and unit templates (does not kill a running broker).
@@ -114,7 +118,7 @@ pub fn uninstall_broker(base: &Path) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&dir);
     let raw = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
     std::fs::write(install_path(base), raw).map_err(|e| e.to_string())?;
-    Ok(())
+    Err("broker service uninstall is unsupported: template cleanup completed, but native service absence cannot be verified".into())
 }
 
 /// Read install status.
@@ -133,8 +137,16 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let rec: InstallRecord = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut notes = rec.notes;
+    if rec.installed {
+        notes.push(
+            "legacy marker claimed installation, but native service state is unverified; reporting not installed"
+                .into(),
+        );
+    }
     Ok(InstallStatus {
-        installed: rec.installed,
+        // A metadata marker or unit template is not proof of an active OS service.
+        installed: false,
         network: "disabled",
         endpoint: if rec.endpoint.is_empty() {
             None
@@ -145,7 +157,7 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
         secret_present: PathBuf::from(&rec.secret_file).exists()
             || broker_dir(base).join("broker.secret").exists(),
         unit_path: rec.unit_path,
-        notes: rec.notes,
+        notes,
     })
 }
 

@@ -50,6 +50,20 @@ python scripts/check_release_quality.py
 
 Workspace Rust lints forbid `unsafe_code` and enable Clippy `pedantic` (as warnings elevated to errors in CI via `-D warnings`).
 
+### Branch protection check-name migration
+
+Commit `c37f5fc` consolidated and renamed required CI jobs. Repository administrators must update branch-protection required checks after the new workflow has run once; GitHub only offers check names it has observed. Do not remove an old required check until its replacement is selectable, and do not leave both generations required indefinitely (that deadlocks merges because old jobs no longer run).
+
+| Remove legacy required check | Require current check |
+| --- | --- |
+| `Rust (Windows)` | `Rust 1.92 (Windows)` |
+| `Rust (macOS, best-effort)` | `Rust 1.92 (macOS)` |
+| `Rust (Linux, best-effort)` | `Rust 1.92 (Linux)` |
+| `TypeScript / pnpm` and `Control Plane (Worker)` | `pnpm frozen quality gates` |
+| _(new)_ | `Release claims and gate structure` |
+
+If Security jobs are branch-protection requirements, also refresh renamed contexts such as `SAST (clippy -D warnings)` → `SAST (Rust 1.92 clippy -D warnings)`, `SAST (TypeScript typecheck)` → `SAST (TypeScript)`, and `SBOM (CycloneDX Rust + Node)` → `SBOM (strict CycloneDX Rust + Node)`. Keep the independent audit, gitleaks, retention/redaction, TUI i18n, and all matrix checks required according to repository policy.
+
 ## Project layout
 
 | Path | Responsibility |

@@ -20,6 +20,57 @@ use serde_json::json;
 
 pub use status::run_status;
 
+/// Canonical registry for CLI surfaces that hard-fail as unsupported.
+///
+/// `release/SUPPORTED_SURFACES.json` is statically checked against this list.
+/// Keep this registry authoritative instead of counting function-call text.
+pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
+    "tui",
+    "setup",
+    "doctor",
+    "completion",
+    "config get",
+    "config set",
+    "config edit",
+    "instance add",
+    "instance list",
+    "instance use",
+    "instance remove",
+    "workspace add",
+    "workspace list",
+    "workspace show",
+    "workspace update",
+    "workspace remove",
+    "process start",
+    "process status",
+    "process logs",
+    "process stop",
+    "profile scan",
+    "profile list",
+    "profile show",
+    "profile login",
+    "profile test",
+    "profile start",
+    "profile resume",
+    "approval watch",
+    "transfer plan",
+    "transfer send",
+    "transfer list",
+    "transfer status",
+    "transfer cancel",
+    "service install",
+    "service start",
+    "service stop",
+    "service restart",
+    "service status",
+    "service uninstall",
+    "update check",
+    "update download",
+    "update apply",
+    "update channel",
+    "mcp serve",
+];
+
 /// Dispatch a parsed CLI invocation.
 pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
     match &cli.command {
@@ -64,23 +115,11 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
 }
 
 fn run_tui_launch(cli: &Cli) -> Result<(), ExitCode> {
-    // TUI binary is separate; CLI without args documents the hand-off.
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "status": "not_implemented",
-                "command": "tui",
-                "message": "Launch `ownmesh-tui` or install the combined entrypoint (chapter 13).",
-            })
-        );
-    } else {
-        println!(
-            "OwnMesh TUI launches here in a later chapter. For now run `ownmesh-tui` or `ownmesh status`."
-        );
-    }
-    Err(ExitCode::ProfileUnavailable)
+    unsupported(
+        cli,
+        "tui",
+        "Launch `ownmesh-tui`; the combined no-argument entrypoint is unsupported.",
+    )
 }
 
 fn dispatch_config(cli: &Cli, cmd: &ConfigCmd) -> Result<(), ExitCode> {
@@ -225,6 +264,14 @@ fn dispatch_mcp(cli: &Cli, cmd: &McpCmd) -> Result<(), ExitCode> {
 }
 
 fn stub(cli: &Cli, command: &str, detail: &str) -> Result<(), ExitCode> {
+    unsupported(cli, command, detail)
+}
+
+pub(crate) fn unsupported(cli: &Cli, command: &str, detail: &str) -> Result<(), ExitCode> {
+    debug_assert!(
+        EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command),
+        "unsupported CLI surface is absent from the canonical registry: {command}"
+    );
     if cli.json {
         println!(
             "{}",
