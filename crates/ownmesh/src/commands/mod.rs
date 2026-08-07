@@ -13,10 +13,11 @@ mod service;
 mod session_cmd;
 mod setup;
 mod status;
+mod update_cmd;
 
 use crate::cli::{
     Cli, Commands, ConfigCmd, DeviceCmd, InstanceCmd, McpCmd, PrivilegedCmd, ProcessCmd,
-    ProfileCmd, ServiceCmd, SessionCmd, TransferCmd, UpdateCmd, WorkspaceCmd,
+    ProfileCmd, ServiceCmd, SessionCmd, TransferCmd, WorkspaceCmd,
 };
 use ownmesh_domain::ExitCode;
 use serde_json::json;
@@ -28,7 +29,7 @@ pub use status::run_status;
 /// `release/SUPPORTED_SURFACES.json` is statically checked against this list.
 /// Keep this registry authoritative instead of counting function-call text.
 ///
-/// v1.1.0 onboarding removed: setup, doctor, service install/start/stop/restart/status/uninstall.
+/// v1.1.0 removed: setup, doctor, service lifecycle, and signed update surfaces.
 pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "tui",
     "completion",
@@ -61,10 +62,6 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "transfer list",
     "transfer status",
     "transfer cancel",
-    "update check",
-    "update download",
-    "update apply",
-    "update channel",
     "mcp serve",
 ];
 
@@ -108,7 +105,7 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Transfer(cmd)) => dispatch_transfer(cli, cmd),
         Some(Commands::Service(cmd)) => dispatch_service(cli, cmd),
         Some(Commands::Privileged(cmd)) => dispatch_privileged(cli, cmd),
-        Some(Commands::Update(cmd)) => dispatch_update(cli, cmd),
+        Some(Commands::Update(cmd)) => update_cmd::dispatch_update(cli, cmd),
         Some(Commands::Mcp(cmd)) => dispatch_mcp(cli, cmd),
         Some(Commands::Completion(args)) => stub(
             cli,
@@ -245,15 +242,6 @@ fn dispatch_service(cli: &Cli, cmd: &ServiceCmd) -> Result<(), ExitCode> {
 
 fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
     privileged::dispatch_privileged(cli, cmd)
-}
-
-fn dispatch_update(cli: &Cli, cmd: &UpdateCmd) -> Result<(), ExitCode> {
-    match cmd {
-        UpdateCmd::Check => stub(cli, "update check", "chapter 14"),
-        UpdateCmd::Download => stub(cli, "update download", "chapter 14"),
-        UpdateCmd::Apply => stub(cli, "update apply", "chapter 14"),
-        UpdateCmd::Channel { name } => stub(cli, "update channel", &format!("{name:?}")),
-    }
 }
 
 fn dispatch_mcp(cli: &Cli, cmd: &McpCmd) -> Result<(), ExitCode> {

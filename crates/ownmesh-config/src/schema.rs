@@ -251,7 +251,8 @@ impl UpdateConfig {
 }
 
 fn default_update_mode() -> String {
-    "notify".into()
+    // Network off by default (specification §14 / privacy defaults).
+    "off".into()
 }
 
 fn default_update_channel() -> String {

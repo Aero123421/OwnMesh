@@ -15,9 +15,10 @@
     "approval list/show/approve/deny",
     "policy show/preset/validate/explain",
     "service install/start/stop/restart/status/uninstall (user-level ownmeshd autostart only)",
-    "privileged broker status (fail-closed metadata; native service management unsupported)"
+    "privileged broker status (fail-closed metadata; native service management unsupported)",
+    "update check/download/apply/channel (signed GitHub releases; network off by default)"
   ],
-  "explicit_unsupported_count": 36,
+  "explicit_unsupported_count": 32,
   "explicit_unsupported_surfaces": [
     "tui",
     "completion",
@@ -50,10 +51,6 @@
     "transfer list",
     "transfer status",
     "transfer cancel",
-    "update check",
-    "update download",
-    "update apply",
-    "update channel",
     "mcp serve"
   ],
   "additional_unsupported": [
@@ -65,6 +62,6 @@
     "privileged broker install",
     "privileged broker uninstall"
   ],
-  "total_unsupported_surfaces": 43,
-  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Every unsupported entry returns a machine-visible hard error; unregistered command strings are rejected at runtime. Parser presence, a marker file, or a generated service template is not treated as implementation. v1.1.0 onboarding implemented setup, doctor, and user-level service lifecycle (Windows current-user Scheduled Task ONLOGON, macOS LaunchAgent, Linux systemd --user). These are distinct from the privileged broker, which remains unsupported for install/uninstall. Additional surface notes: exec --device never falls back to local; session open <device> never falls back to local; privileged broker install/uninstall are side-effect-free unsupported operations (no templates, markers, or process spawns) until a secure mint authority exists; privileged broker status reports fail-closed metadata only."
+  "total_unsupported_surfaces": 39,
+  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Every unsupported entry returns a machine-visible hard error; unregistered command strings are rejected at runtime. Parser presence, a marker file, or a generated service template is not treated as implementation. v1.1.0 integrates onboarding (setup, doctor, user-level service lifecycle: Windows current-user Scheduled Task ONLOGON, macOS LaunchAgent, Linux systemd --user) with signed distribution/update. These service surfaces are distinct from the privileged broker, which remains unsupported for install/uninstall. Additional surface notes: exec --device never falls back to local; session open <device> never falls back to local; privileged broker install/uninstall are side-effect-free unsupported operations (no templates, markers, or process spawns) until a secure mint authority exists; privileged broker status reports fail-closed metadata only. Update surfaces are production-wired against official GitHub Releases with embedded minisign verification; automatic network checks remain off by default."
 }

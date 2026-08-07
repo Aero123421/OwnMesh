@@ -29,22 +29,34 @@ jobs:
     uses: ./.github/workflows/security.yml
 
   build:
-    name: Release build (${{ matrix.platform }})
+    name: Release build (${{ matrix.asset }})
     needs: [ci-gate, security-gate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: windows
-            os: windows-latest
-            binary_extension: .exe
-          - platform: linux
-            os: ubuntu-latest
-            binary_extension: ""
-          - platform: macos
-            os: macos-latest
-            binary_extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: ownmesh-windows-x64.zip
+            platform: windows-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: ownmesh-macos-arm64.tar.gz
+            platform: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: ownmesh-macos-x64.tar.gz
+            platform: macos-x64
+            cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: ownmesh-linux-x64.tar.gz
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: ownmesh-linux-arm64.tar.gz
+            platform: linux-arm64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -53,7 +65,13 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.92.0"
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Verify tag, workspace version, and release notes
         shell: bash
         run: |
@@ -61,21 +79,28 @@ jobs:
           version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
           test "${GITHUB_REF_NAME}" = "v${version}"
           test -s "docs/RELEASE_NOTES_${GITHUB_REF_NAME}.md"
+          test -s docs/release-keys/minisign.pub
       - name: Build release binaries (locked)
-        run: cargo build --release --workspace --locked
-      - name: Package required binaries
         shell: bash
-        env:
-          PLATFORM: ${{ matrix.platform }}
-          EXT: ${{ matrix.binary_extension }}
         run: |
           set -euo pipefail
-          staging="dist/ownmesh-${GITHUB_REF_NAME}-${PLATFORM}"
+          cargo build --release --workspace --locked --target "${{ matrix.target }}"
+      - name: Package portable archive (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          staging="dist/pkg"
           mkdir -p "${staging}"
           for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do
-            source="target/release/${binary}${EXT}"
+            source="target/${TARGET}/release/${binary}"
             test -s "${source}"
             cp "${source}" "${staging}/"
+            chmod 0755 "${staging}/${binary}"
           done
           cp LICENSE NOTICE README.md "${staging}/"
           cp "docs/RELEASE_NOTES_${GITHUB_REF_NAME}.md" "${staging}/RELEASE_NOTES.md"
@@ -83,20 +108,102 @@ jobs:
           test -s "${staging}/NOTICE"
           test -s "${staging}/README.md"
           test -s "${staging}/RELEASE_NOTES.md"
-          tar -C dist -czf "dist/ownmesh-${GITHUB_REF_NAME}-${PLATFORM}.tar.gz" \
-            "ownmesh-${GITHUB_REF_NAME}-${PLATFORM}"
-          test -s "dist/ownmesh-${GITHUB_REF_NAME}-${PLATFORM}.tar.gz"
+          tar -C "${staging}" -czf "dist/${ASSET}" \
+            ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker \
+            LICENSE NOTICE README.md RELEASE_NOTES.md
+          test -s "dist/${ASSET}"
+          (
+            cd dist
+            sha256sum "${ASSET}" > "${ASSET}.sha256"
+          )
+          mkdir -p dist/verify
+          tar -xzf "dist/${ASSET}" -C dist/verify ownmesh
+          if [ "${CROSS}" != "true" ]; then
+            ./dist/verify/ownmesh --version
+          else
+            file dist/verify/ownmesh
+          fi
+      - name: Package portable archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staging = "dist/pkg"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          foreach ($binary in @("ownmesh","ownmesh-tui","ownmeshd","ownmesh-session-host","ownmesh-broker")) {
+            $source = "target/$env:TARGET/release/$binary.exe"
+            if (-not (Test-Path -LiteralPath $source) -or (Get-Item $source).Length -le 0) {
+              throw "missing $source"
+            }
+            Copy-Item -LiteralPath $source -Destination $staging
+          }
+          Copy-Item LICENSE, NOTICE, README.md $staging
+          Copy-Item "docs/RELEASE_NOTES_$env:GITHUB_REF_NAME.md" (Join-Path $staging "RELEASE_NOTES.md")
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath "dist/$env:ASSET" -Force
+          $h = (Get-FileHash "dist/$env:ASSET" -Algorithm SHA256).Hash.ToLower()
+          # LF, not CRLF: Out-File's default trailing CRLF breaks sha256sum -c under Git Bash.
+          "$h  $env:ASSET`n" | Out-File -Encoding ascii -NoNewline "dist/$env:ASSET.sha256"
+          Expand-Archive "dist/$env:ASSET" -DestinationPath dist/verify -Force
+          & ./dist/verify/ownmesh.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "version smoke failed" }
       - name: Upload platform artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.platform }}
-          path: dist/ownmesh-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+          path: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  distribution-metadata:
+    name: Installers and Homebrew formula
+    needs: [ci-gate, security-gate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Download binary checksums
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: binary-assets
+          merge-multiple: true
+      - name: Render installers and package-manager metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release-assets
+          cp installers/ownmesh-installer.sh release-assets/
+          cp installers/ownmesh-installer.ps1 release-assets/
+          cp docs/release-keys/minisign.pub release-assets/
+          python3 scripts/render_distribution.py \
+            --version "$version" \
+            --checksums-dir binary-assets \
+            --output-dir generated \
+            --release-assets-dir release-assets
+          (
+            cd release-assets
+            for asset in ownmesh-installer.sh ownmesh-installer.ps1 ownmesh.rb minisign.pub; do
+              sha256sum "$asset" > "$asset.sha256"
+            done
+          )
+      - name: Stage installers and package-manager metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-distribution-metadata
+          path: release-assets/*
           if-no-files-found: error
           retention-days: 30
 
   publish:
     name: Publish gated release
-    needs: [ci-gate, security-gate, build]
+    needs: [ci-gate, security-gate, build, distribution-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -121,31 +228,57 @@ jobs:
         run: |
           set -euo pipefail
           test -s "docs/RELEASE_NOTES_${GITHUB_REF_NAME}.md"
-          for platform in windows linux macos; do
-            archive="dist/ownmesh-${GITHUB_REF_NAME}-${platform}.tar.gz"
-            test -s "${archive}"
-            listing=$(mktemp)
-            trap 'rm -f "${listing}"' EXIT
-            tar -tzf "${archive}" > "${listing}"
-            grep -Fxq "ownmesh-${GITHUB_REF_NAME}-${platform}/LICENSE" "${listing}"
-            grep -Fxq "ownmesh-${GITHUB_REF_NAME}-${platform}/NOTICE" "${listing}"
-            grep -Fxq "ownmesh-${GITHUB_REF_NAME}-${platform}/README.md" "${listing}"
-            grep -Fxq "ownmesh-${GITHUB_REF_NAME}-${platform}/RELEASE_NOTES.md" "${listing}"
-            if [ "${platform}" = "windows" ]; then
-              ext=".exe"
-            else
-              ext=""
-            fi
-            for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do
-              grep -Fxq "ownmesh-${GITHUB_REF_NAME}-${platform}/${binary}${ext}" "${listing}"
-            done
-            rm -f "${listing}"
-            trap - EXIT
+          test -s docs/release-keys/minisign.pub
+          version="${GITHUB_REF_NAME#v}"
+          cat > dist/ownmesh-release-meta.json <<EOF
+          {
+            "schema_version": 1,
+            "version": "${version}",
+            "channel": "stable",
+            "min_protocol": 1,
+            "max_protocol": 1
+          }
+          EOF
+          for asset in \
+            ownmesh-windows-x64.zip \
+            ownmesh-macos-arm64.tar.gz \
+            ownmesh-macos-x64.tar.gz \
+            ownmesh-linux-x64.tar.gz \
+            ownmesh-linux-arm64.tar.gz
+          do
+            test -s "dist/${asset}"
+            test -s "dist/${asset}.sha256"
           done
+          test -s dist/ownmesh-installer.sh
+          test -s dist/ownmesh-installer.ps1
+          test -s dist/ownmesh.rb
           test -s dist/sbom-rust.cdx.json
           test -s dist/sbom-control-plane.cdx.json
+          # Validate archive membership for each portable asset.
           python3 - <<'PY'
-          import json
+          import json, tarfile, zipfile
+          from pathlib import Path
+          required = {
+              "ownmesh-windows-x64.zip": [f"{b}.exe" for b in
+                  ["ownmesh","ownmesh-tui","ownmeshd","ownmesh-session-host","ownmesh-broker"]]
+                  + ["LICENSE","NOTICE","README.md","RELEASE_NOTES.md"],
+              "ownmesh-macos-arm64.tar.gz": ["ownmesh","ownmesh-tui","ownmeshd","ownmesh-session-host","ownmesh-broker","LICENSE","NOTICE","README.md","RELEASE_NOTES.md"],
+              "ownmesh-macos-x64.tar.gz": ["ownmesh","ownmesh-tui","ownmeshd","ownmesh-session-host","ownmesh-broker","LICENSE","NOTICE","README.md","RELEASE_NOTES.md"],
+              "ownmesh-linux-x64.tar.gz": ["ownmesh","ownmesh-tui","ownmeshd","ownmesh-session-host","ownmesh-broker","LICENSE","NOTICE","README.md","RELEASE_NOTES.md"],
+              "ownmesh-linux-arm64.tar.gz": ["ownmesh","ownmesh-tui","ownmeshd","ownmesh-session-host","ownmesh-broker","LICENSE","NOTICE","README.md","RELEASE_NOTES.md"],
+          }
+          root = Path("dist")
+          for asset, members in required.items():
+              path = root / asset
+              names = set()
+              if asset.endswith(".zip"):
+                  with zipfile.ZipFile(path) as zf:
+                      names = {Path(n).name for n in zf.namelist() if not n.endswith("/")}
+              else:
+                  with tarfile.open(path, "r:gz") as tf:
+                      names = {Path(m.name).name for m in tf.getmembers() if m.isfile()}
+              missing = [m for m in members if m not in names]
+              assert not missing, (asset, missing)
           for path in ["dist/sbom-rust.cdx.json", "dist/sbom-control-plane.cdx.json"]:
               with open(path, encoding="utf-8") as handle:
                   data = json.load(handle)
@@ -157,33 +290,56 @@ jobs:
               for component in components:
                   assert component.get("type") and component.get("name"), (path, component)
           PY
-      - name: Generate checksums
+      - name: Generate aggregate SHA256SUMS (all published assets)
         working-directory: dist
         run: |
           set -euo pipefail
-          sha256sum ownmesh-*.tar.gz sbom-*.cdx.json > SHA256SUMS
+          rm -f SHA256SUMS SHA256SUMS.minisig
+          sha256sum \
+            ownmesh-windows-x64.zip \
+            ownmesh-macos-arm64.tar.gz \
+            ownmesh-macos-x64.tar.gz \
+            ownmesh-linux-x64.tar.gz \
+            ownmesh-linux-arm64.tar.gz \
+            ownmesh-installer.sh \
+            ownmesh-installer.ps1 \
+            ownmesh.rb \
+            ownmesh-release-meta.json \
+            sbom-rust.cdx.json \
+            sbom-control-plane.cdx.json \
+            > SHA256SUMS
           test -s SHA256SUMS
       - name: Attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-path: dist/*
-      - name: Determine signing mode
+          subject-path: |
+            dist/ownmesh-*.zip
+            dist/ownmesh-*.tar.gz
+            dist/ownmesh-installer.*
+            dist/ownmesh.rb
+            dist/ownmesh-release-meta.json
+            dist/sbom-*.cdx.json
+            dist/SHA256SUMS
+      - name: Require minisign key material (no degraded fallback)
         id: signing
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
-          if [ -n "${MINISIGN_SECRET_KEY}" ] && [ -s docs/release-keys/minisign.pub ]; then
-            echo "available=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "available=false" >> "${GITHUB_OUTPUT}"
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is required for formal OwnMesh releases"
+            exit 1
           fi
+          if [ ! -s docs/release-keys/minisign.pub ]; then
+            echo "::error::docs/release-keys/minisign.pub trust root is required"
+            exit 1
+          fi
+          echo "available=true" >> "${GITHUB_OUTPUT}"
       - name: Install minisign
-        if: steps.signing.outputs.available == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y minisign
-      - name: Sign checksums
-        if: steps.signing.outputs.available == 'true'
+      - name: Sign checksums and immediately verify
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
@@ -196,36 +352,38 @@ jobs:
           test -s dist/SHA256SUMS.minisig
           minisign -Vm dist/SHA256SUMS -p docs/release-keys/minisign.pub \
             -x dist/SHA256SUMS.minisig
-      - name: Build truthful release body
-        env:
-          SIGNED: ${{ steps.signing.outputs.available }}
+          # Never echo key material.
+          unset MINISIGN_SECRET_KEY
+      - name: Build release body
         run: |
           set -euo pipefail
-          if [ "${SIGNED}" = "true" ]; then
-            cat > dist/RELEASE_BODY.md <<'EOF'
+          cat > dist/RELEASE_BODY.md <<'EOF'
           > [!NOTE]
-          > Portable checksums are signed with minisign. GitHub artifact provenance is available.
-          > Authenticode and Apple notarization remain unsupported and are disclosed under W-SIGN.
+          > Portable checksums are signed with minisign (key ID `C596813EFB0946A4`).
+          > Verify: `minisign -Vm SHA256SUMS -p minisign.pub` then `sha256sum -c SHA256SUMS`.
+          > GitHub artifact provenance is available. Authenticode and Apple notarization remain unsupported (W-SIGN).
 
           EOF
-          else
-            cat > dist/RELEASE_BODY.md <<'EOF'
-          > [!WARNING]
-          > **DEGRADED PRE-RELEASE:** a complete minisign key configuration (tracked public key + matching secret) was unavailable. Assets are unsigned.
-          > SHA-256 checksums and non-empty CycloneDX SBOMs are attached. Provenance is available
-          > through GitHub Artifact Attestations. None replaces artifact signing; W-SIGN remains open.
-
-          EOF
-          fi
           cat "docs/RELEASE_NOTES_${GITHUB_REF_NAME}.md" >> dist/RELEASE_BODY.md
       - name: Publish GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: OwnMesh ${{ github.ref_name }}
           body_path: dist/RELEASE_BODY.md
-          prerelease: ${{ steps.signing.outputs.available != 'true' }}
+          prerelease: false
           fail_on_unmatched_files: true
           files: |
-            dist/ownmesh-*.tar.gz
+            dist/ownmesh-windows-x64.zip
+            dist/ownmesh-macos-arm64.tar.gz
+            dist/ownmesh-macos-x64.tar.gz
+            dist/ownmesh-linux-x64.tar.gz
+            dist/ownmesh-linux-arm64.tar.gz
+            dist/ownmesh-*.sha256
+            dist/ownmesh-installer.sh
+            dist/ownmesh-installer.ps1
+            dist/ownmesh.rb
+            dist/minisign.pub
+            dist/ownmesh-release-meta.json
             dist/sbom-*.cdx.json
-            dist/SHA256SUMS*
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig

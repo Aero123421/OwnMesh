@@ -1,0 +1,48 @@
+class Ownmesh < Formula
+  desc "Capability runtime for user-owned PCs"
+  homepage "https://github.com/Aero123421/OwnMesh"
+  version "{{VERSION}}"
+  license "Apache-2.0"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-macos-arm64.tar.gz"
+      sha256 "{{MACOS_ARM64_SHA256}}"
+    else
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-macos-x64.tar.gz"
+      sha256 "{{MACOS_X64_SHA256}}"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-linux-arm64.tar.gz"
+      sha256 "{{LINUX_ARM64_SHA256}}"
+    else
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-linux-x64.tar.gz"
+      sha256 "{{LINUX_X64_SHA256}}"
+    end
+  end
+
+  def install
+    bin.install "ownmesh"
+    bin.install "ownmesh-tui"
+    bin.install "ownmeshd"
+    bin.install "ownmesh-session-host"
+    bin.install "ownmesh-broker"
+  end
+
+  # Current-user ownmeshd only. Never service ownmesh-broker (admin/privileged path).
+  # No require_root: brew services runs this as the installing user, matching
+  # `ownmesh service install` LaunchAgent / systemd --user semantics. ownmeshd
+  # discovers per-user config/state/runtime paths itself.
+  service do
+    run [opt_bin/"ownmeshd", "run"]
+    keep_alive true
+    process_type :background
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/ownmesh --version")
+  end
+end
