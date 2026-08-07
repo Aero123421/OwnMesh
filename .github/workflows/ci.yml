@@ -130,6 +130,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Minisign for Unix installer integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz"
+          archive="$RUNNER_TEMP/minisign-0.11-linux.tar.gz"
+          extract="$RUNNER_TEMP/minisign-0.11-linux"
+          tools="$RUNNER_TEMP/ownmesh-tools"
+          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+            --retry 3 --max-redirs 5 --output "$archive" "$url"
+          echo "f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0  $archive" |
+            sha256sum --check --strict
+          mkdir -p "$extract" "$tools"
+          tar -xzf "$archive" -C "$extract"
+          install -m 0755 "$extract/minisign-linux/x86_64/minisign" "$tools/minisign"
+          "$tools/minisign" -v
+          echo "$tools" >> "$GITHUB_PATH"
+      - name: Unix portable installer integration
+        run: python scripts/tests/test_installers.py
       - name: Verify release surfaces and fail-closed publish graph
         run: python scripts/check_release_quality.py
       - name: Release-quality checker fixtures and mutation tests

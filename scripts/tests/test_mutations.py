@@ -147,6 +147,21 @@ class CheckerMutationTests(unittest.TestCase):
         with _Mutation(".github/workflows/ci.yml", mutate):
             _must_fail("Windows installer integration removed")
 
+    def test_mutation_unix_installer_gate_fails(self) -> None:
+        def mutate(text: str) -> str:
+            needle = "python scripts/tests/test_installers.py"
+            first = text.find(needle)
+            second = text.find(needle, first + len(needle))
+            self.assertGreaterEqual(second, 0)
+            return (
+                text[:second]
+                + 'echo "installer integration skipped"'
+                + text[second + len(needle):]
+            )
+
+        with _Mutation(".github/workflows/ci.yml", mutate):
+            _must_fail("Unix installer integration removed")
+
     def test_mutation_continue_on_error_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(

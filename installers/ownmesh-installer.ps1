@@ -364,9 +364,10 @@
     $sig = Join-Path $tempDir "SHA256SUMS.minisig"
     $pubKey = Join-Path $tempDir "minisign.pub"
     $extractDir = Join-Path $tempDir "extract"
-    $backupDir = Join-Path $InstallDir (".ownmesh-backup-" + $PID)
+    $backupDir = Join-Path $InstallDir (".ownmesh-backup-" + [Guid]::NewGuid().ToString('N'))
     $stagedFiles = @()
     $replacedBins = @()
+    $keepBackup = $false
 
     try {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
@@ -461,10 +462,29 @@
                 if (Test-Path -LiteralPath $bak -PathType Leaf) {
                     try {
                         $restorePath = Join-Path $InstallDir $bin
+                        $restoreStaged = Join-Path $InstallDir (".{0}.restore-{1}-{2}" -f $bin, $PID, ([Guid]::NewGuid().ToString('N')))
+                        Copy-Item -LiteralPath $bak -Destination $restoreStaged -Force -ErrorAction Stop
+                        $stagedFiles += $restoreStaged
                         if (Test-Path -LiteralPath $restorePath) {
-                            Remove-Item -LiteralPath $restorePath -Force -ErrorAction Stop
+                            if (-not (Test-Path -LiteralPath $restorePath -PathType Leaf)) {
+                                throw "Rollback refused unsafe non-file target for $bin"
+                            }
+                            $restoreItem = Get-Item -LiteralPath $restorePath -Force
+                            if (($restoreItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                                throw "Rollback refused unsafe reparse point for $bin"
+                            }
+                            $displacedPath = Join-Path $InstallDir (".{0}.failed-{1}-{2}" -f $bin, $PID, ([Guid]::NewGuid().ToString('N')))
+                            $stagedFiles += $displacedPath
+                            [IO.File]::Replace($restoreStaged, $restorePath, $displacedPath, $true)
+                            Remove-Item -LiteralPath $displacedPath -Force -ErrorAction Stop
+                        } else {
+                            Move-Item -LiteralPath $restoreStaged -Destination $restorePath -ErrorAction Stop
                         }
-                        Copy-Item -LiteralPath $bak -Destination $restorePath -Force
+                        $restoredHash = (Get-FileHash -LiteralPath $restorePath -Algorithm SHA256).Hash
+                        $backupHash = (Get-FileHash -LiteralPath $bak -Algorithm SHA256).Hash
+                        if ($restoredHash -ne $backupHash) {
+                            throw "Rollback verification failed for $bin"
+                        }
                     } catch {
                         Write-Host "Rollback failed for $bin"
                         $restoreFailed = $true
@@ -482,6 +502,7 @@
                 }
             }
             if ($restoreFailed) {
+                $keepBackup = $true
                 throw "Install failed and backup rollback also failed (backup left at $backupDir)"
             }
             throw
@@ -527,6 +548,9 @@
             if ($staged -and (Test-Path -LiteralPath $staged)) {
                 Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
             }
+        }
+        if (-not $keepBackup -and (Test-Path -LiteralPath $backupDir)) {
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
         }
         if (Test-Path -LiteralPath $tempDir) {
             Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue

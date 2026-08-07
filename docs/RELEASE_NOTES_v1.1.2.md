@@ -8,13 +8,14 @@ v1.1.2 supersedes v1.1.1 for installation. It repairs the Unix portable installe
 - CR/LF and shell-metacharacter input rejection no longer relies on Bash-only quoting.
 - The optional Linux x64 Minisign 0.11 bootstrap uses the verified upstream archive SHA-256 and the exact `minisign-linux/x86_64/minisign` member instead of a disabled placeholder/ambiguous architecture search.
 - Unix and Windows installers refuse existing symlink, reparse-point, directory, or other non-file binary destinations.
-- Installer rollback restores previous binaries and removes newly installed binaries that had no predecessor, preventing a failed update from leaving a partial new set.
+- Installer rollback restores previous binaries and removes newly installed binaries that had no predecessor, preventing a failed update from leaving a partial new set. Windows restoration uses an atomic same-volume replacement and verifies the restored digest before reporting success.
+- Successful, preflight-rejected, and successfully rolled-back transactions remove their private backup and staging directories; a backup is retained only when rollback itself fails.
 
 ## Regression coverage
 
-- POSIX `sh -n` runs before any Minisign-dependent test and therefore cannot be skipped when Minisign is unavailable.
-- Linux tests cover signed happy-path installation, traversal/type/duplicate/size limits, malicious environment values, non-file destinations, and rollback behavior.
-- Windows checks cover PowerShell parsing, signed happy-path installation, all five binary version smokes, and fail-closed non-file destination handling with the original file preserved.
+- POSIX `sh -n` is unconditional, and the Ubuntu release gate installs a SHA-256-pinned Minisign 0.11 binary before running the signed installer suite; a missing or unusable signer now fails rather than skips the gate.
+- Linux tests cover signed happy-path installation, traversal/type/duplicate/size limits, malicious environment values, non-file destinations, rollback behavior, and transaction-file cleanup.
+- Windows checks cover PowerShell parsing, signed happy-path installation, all five binary version smokes, reparse/non-file rejection, deterministic mid-replacement failure, digest-exact rollback, and transaction-file cleanup.
 
 ## Distribution and trust
 

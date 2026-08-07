@@ -518,7 +518,16 @@ assert_safe_url "$BASE_URL/SHA256SUMS"
 command_exists tar || fail "tar is required"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ownmesh-install.XXXXXX")"
+BACKUP_DIR=""
+STAGED_FILE=""
+KEEP_BACKUP=0
 cleanup() {
+  if [ -n "$STAGED_FILE" ]; then
+    rm -f "$STAGED_FILE"
+  fi
+  if [ "$KEEP_BACKUP" -ne 1 ] && [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
+    rm -rf "$BACKUP_DIR"
+  fi
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -574,8 +583,8 @@ safe_extract "$ARCHIVE" "$EXTRACT_DIR"
 
 # Backup existing binaries, then atomic replace per binary.
 mkdir -p "$INSTALL_DIR"
-BACKUP_DIR="$INSTALL_DIR/.ownmesh-backup.$$"
-mkdir -p "$BACKUP_DIR"
+BACKUP_DIR="$(mktemp -d "$INSTALL_DIR/.ownmesh-backup.XXXXXX")" ||
+  fail "failed to create private backup directory"
 for bin in $REQUIRED_BINARIES; do
   if [ -L "$INSTALL_DIR/$bin" ]; then
     fail "refusing existing symlink at $INSTALL_DIR/$bin"
@@ -618,9 +627,12 @@ rollback_install() {
 for bin in $REQUIRED_BINARIES; do
   [ -f "$EXTRACT_DIR/$bin" ] || fail "partial extract: missing $bin"
   staged="$INSTALL_DIR/.${bin}.new.$$"
+  STAGED_FILE="$staged"
   if ! cp "$EXTRACT_DIR/$bin" "$staged" || ! chmod 0755 "$staged"; then
     rm -f "$staged"
+    STAGED_FILE=""
     if ! rollback_install; then
+      KEEP_BACKUP=1
       fail "failed to stage $bin; backup rollback also failed (backup left at $BACKUP_DIR)"
     fi
     rm -rf "$BACKUP_DIR"
@@ -629,12 +641,15 @@ for bin in $REQUIRED_BINARIES; do
   move_ok=0
   if mv -f "$staged" "$INSTALL_DIR/$bin"; then
     move_ok=1
+    STAGED_FILE=""
     INSTALLED_BINARIES="$INSTALLED_BINARIES $bin"
   fi
   if [ "$move_ok" -ne 1 ] || [ ! -f "$INSTALL_DIR/$bin" ] || [ -L "$INSTALL_DIR/$bin" ]; then
     say "atomic install failed; restoring backup"
     rm -f "$staged"
+    STAGED_FILE=""
     if ! rollback_install; then
+      KEEP_BACKUP=1
       fail "failed to install $bin; backup rollback also failed (backup left at $BACKUP_DIR)"
     fi
     rm -rf "$BACKUP_DIR"

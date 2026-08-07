@@ -177,12 +177,29 @@ def main() -> int:
     workflow_paths = sorted([*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")])
     workflows = "\n".join(path.read_text(encoding="utf-8") for path in workflow_paths)
 
-    require_text(ci, "Windows portable installer integration", "Windows installer CI gate")
-    require_text(ci, "python scripts/tests/test_installers.py", "Windows installer CI gate")
+    rust_job = job_block(ci, "rust")
+    release_truthfulness_job = job_block(ci, "release-truthfulness")
+    require_text(rust_job, "Windows portable installer integration", "Windows installer CI gate")
+    require_text(rust_job, "python scripts/tests/test_installers.py", "Windows installer CI gate")
     require_text(
-        ci,
+        rust_job,
         "b9c31c2c3034f81f0e5f5d92cbcc20e67a9671b6e5455661588638848dc58031",
         "Windows installer pinned minisign bootstrap",
+    )
+    require_text(
+        release_truthfulness_job,
+        "Unix portable installer integration",
+        "Unix installer CI gate",
+    )
+    require_text(
+        release_truthfulness_job,
+        "python scripts/tests/test_installers.py",
+        "Unix installer CI gate",
+    )
+    require_text(
+        release_truthfulness_job,
+        "f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0",
+        "Unix installer pinned minisign bootstrap",
     )
     require_text(installer_tests, '["sh", "-n", str(SH_INSTALLER)]', "POSIX installer syntax gate")
     require_text(attributes, "*.sh text eol=lf", "POSIX installer line endings")

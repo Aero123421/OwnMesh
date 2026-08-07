@@ -79,7 +79,7 @@ def _asset_name() -> tuple[str, bool]:
 def _require_minisign() -> str:
     path = shutil.which("minisign")
     if not path:
-        raise unittest.SkipTest("minisign is required for installer trust tests")
+        raise AssertionError("minisign is required for installer trust tests")
     return path
 
 
@@ -98,7 +98,7 @@ def _generate_trust(asset_dir: Path) -> tuple[Path, Path]:
         check=False,
     )
     if completed.returncode != 0:
-        raise unittest.SkipTest(
+        raise AssertionError(
             f"minisign keygen failed: {completed.stderr or completed.stdout}"
         )
     return pub, sec
@@ -542,6 +542,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn("non-file", failed.stderr.lower())
             self.assertIn("ownmesh-old-marker", old_bin.read_text(encoding="utf-8"))
+            self.assertEqual(list(rb_install.glob(".ownmesh-backup.*")), [])
 
             # Force the second atomic move to fail after ownmesh was replaced. Rollback
             # must restore the marker and remove every binary that had no predecessor.
@@ -574,6 +575,8 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertIn("ownmesh-old-marker", old_bin.read_text(encoding="utf-8"))
             for binary in BINS[1:]:
                 self.assertFalse((rb_install / binary).exists(), binary)
+            self.assertEqual(list(rb_install.glob(".ownmesh-backup.*")), [])
+            self.assertEqual(list(rb_install.glob(".*.new.*")), [])
             env["PATH"] = os.environ["PATH"]
             env.pop("OWNMESH_TEST_FAIL_DEST", None)
 
@@ -667,6 +670,7 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("unexpected archive member", text)
         self.assertIn("Refusing existing non-file", text)
         self.assertIn("Refusing existing reparse point", text)
+        self.assertIn("[IO.File]::Replace", text)
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
@@ -783,6 +787,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("reparse point", (completed.stdout + completed.stderr).lower())
             self.assertEqual(_sha256(old_reparse_ownmesh), old_reparse_hash)
+            self.assertEqual(list(reparse_install.glob(".ownmesh-backup-*")), [])
 
             # Deny deletion of the second existing target so Move-Item fails after
             # ownmesh.exe was replaced. The first target must be restored and no
@@ -846,6 +851,10 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertEqual(_sha256(old_tui), old_tui_hash)
             for binary in BINS[2:]:
                 self.assertFalse((rollback_install / f"{binary}.exe").exists(), binary)
+            self.assertEqual(list(rollback_install.glob(".ownmesh-backup-*")), [])
+            self.assertEqual(list(rollback_install.glob(".*.new-*")), [])
+            self.assertEqual(list(rollback_install.glob(".*.restore-*")), [])
+            self.assertEqual(list(rollback_install.glob(".*.failed-*")), [])
 
             # A signed checksum with a corrupted archive still fails before extraction.
             bad = tmp_path / "bad"
