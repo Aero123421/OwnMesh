@@ -2,13 +2,16 @@
 
 mod approval;
 pub(crate) mod device_cmd;
+mod doctor;
 mod exec;
 mod ipc_util;
 mod lockdown;
 pub(crate) mod login;
 mod policy_cmd;
 mod privileged;
+mod service;
 mod session_cmd;
+mod setup;
 mod status;
 
 use crate::cli::{
@@ -24,10 +27,10 @@ pub use status::run_status;
 ///
 /// `release/SUPPORTED_SURFACES.json` is statically checked against this list.
 /// Keep this registry authoritative instead of counting function-call text.
+///
+/// v1.1.0 onboarding removed: setup, doctor, service install/start/stop/restart/status/uninstall.
 pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "tui",
-    "setup",
-    "doctor",
     "completion",
     "config get",
     "config set",
@@ -58,12 +61,6 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "transfer list",
     "transfer status",
     "transfer cancel",
-    "service install",
-    "service start",
-    "service stop",
-    "service restart",
-    "service status",
-    "service uninstall",
     "update check",
     "update download",
     "update apply",
@@ -91,18 +88,10 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
     match &cli.command {
         None => run_tui_launch(cli),
         Some(Commands::Status) => run_status(cli),
-        Some(Commands::Setup) => stub(
-            cli,
-            "setup",
-            "Interactive setup arrives in a later chapter.",
-        ),
+        Some(Commands::Setup(args)) => setup::run_setup(cli, args),
         Some(Commands::Login(args)) => login::run_login(cli, args),
         Some(Commands::Logout) => login::run_logout(cli),
-        Some(Commands::Doctor) => stub(
-            cli,
-            "doctor",
-            "Doctor diagnostics expand in later chapters.",
-        ),
+        Some(Commands::Doctor(args)) => doctor::run_doctor_cmd(cli, args),
         Some(Commands::Lockdown) => lockdown::run_lockdown(cli),
         Some(Commands::Unlock) => lockdown::run_unlock(cli),
         Some(Commands::Tokens(cmd)) => lockdown::dispatch_tokens(cli, cmd),
@@ -251,14 +240,7 @@ fn dispatch_transfer(cli: &Cli, cmd: &TransferCmd) -> Result<(), ExitCode> {
 }
 
 fn dispatch_service(cli: &Cli, cmd: &ServiceCmd) -> Result<(), ExitCode> {
-    match cmd {
-        ServiceCmd::Install => stub(cli, "service install", "later"),
-        ServiceCmd::Start => stub(cli, "service start", "later"),
-        ServiceCmd::Stop => stub(cli, "service stop", "later"),
-        ServiceCmd::Restart => stub(cli, "service restart", "later"),
-        ServiceCmd::Status => stub(cli, "service status", "later"),
-        ServiceCmd::Uninstall => stub(cli, "service uninstall", "later"),
-    }
+    service::dispatch_service(cli, cmd)
 }
 
 fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
@@ -366,20 +348,23 @@ mod registry_tests {
             manifest["explicit_unsupported_count"].as_u64(),
             Some(explicit.len() as u64)
         );
-        assert_eq!(explicit.len(), 44, "explicit unsupported count must be 44");
+        assert_eq!(
+            explicit.len(),
+            EXPLICIT_UNSUPPORTED_CLI_SURFACES.len(),
+            "explicit unsupported count must match registry"
+        );
         assert_eq!(
             additional.len(),
-            7,
-            "additional unsupported count must be 7"
+            ADDITIONAL_UNSUPPORTED_CLI_SURFACES.len(),
+            "additional unsupported count must match registry"
         );
         assert_eq!(
             manifest["total_unsupported_surfaces"].as_u64(),
             Some((explicit.len() + additional.len()) as u64)
         );
         assert_eq!(
-            manifest["total_unsupported_surfaces"].as_u64(),
-            Some(51),
-            "total unsupported count must be 51"
+            manifest["explicit_unsupported_count"].as_u64(),
+            Some(EXPLICIT_UNSUPPORTED_CLI_SURFACES.len() as u64),
         );
 
         assert_eq!(

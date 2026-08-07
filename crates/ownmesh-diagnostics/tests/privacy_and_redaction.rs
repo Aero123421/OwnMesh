@@ -19,53 +19,107 @@
 )]
 
 use ownmesh_diagnostics::{
-    build_support_bundle, redact_text, run_doctor, CheckStatus, DoctorInput,
+    build_support_bundle, redact_text, run_doctor, BinaryObservation, CheckStatus,
+    ConfigObservation, ControlPlaneObservation, CredentialObservation, DaemonObservation,
+    DoctorInput, PrivacyPolicyObservation, ServiceObservation,
 };
 use std::collections::BTreeMap;
 
+fn base_input() -> DoctorInput {
+    DoctorInput {
+        binary: BinaryObservation {
+            cli_version: "test".into(),
+            cli_path: Some("/tmp/ownmesh".into()),
+            cli_on_path: true,
+            daemon_path: Some("/tmp/ownmeshd".into()),
+            daemon_on_path: true,
+        },
+        config: ConfigObservation {
+            path: Some("/tmp/config.toml".into()),
+            present: true,
+            readable: true,
+            parse_ok: true,
+            validate_ok: true,
+            permissions_ok: true,
+            message: None,
+        },
+        credentials: CredentialObservation {
+            human_refresh_present: true,
+            device_key_present: true,
+            device_credential_present: true,
+            auth_session_present: true,
+            enrolled_device_id_present: true,
+        },
+        daemon: DaemonObservation {
+            endpoint: Some("local".into()),
+            reachable: true,
+            message: None,
+        },
+        control_plane: ControlPlaneObservation {
+            configured: true,
+            url: Some("https://example.workers.dev".into()),
+            probed: false,
+            reachable: None,
+            http_status: None,
+            message: None,
+        },
+        privacy_policy: PrivacyPolicyObservation {
+            policy_present: true,
+            policy_preset: Some("recommended".into()),
+            policy_valid: true,
+            telemetry_project: false,
+            telemetry_crash_upload: false,
+            telemetry_usage_analytics: false,
+            relay_enabled: false,
+            update_mode: Some("off".into()),
+            update_channel: Some("stable".into()),
+            update_network_off: true,
+        },
+        service: ServiceObservation {
+            platform: "test".into(),
+            supported: true,
+            installed: true,
+            running: Some(true),
+            unit_path: None,
+            message: None,
+        },
+    }
+}
+
 #[test]
 fn doctor_passes_when_telemetry_and_relay_off() {
-    let report = run_doctor(&DoctorInput {
-        config_readable: true,
-        daemon_reachable: true,
-        identity_present: true,
-        control_plane_url: Some("https://example.workers.dev".into()),
-        telemetry_enabled: false,
-        relay_enabled: false,
-    });
+    let report = run_doctor(&base_input());
     assert!(report.ok);
     let tel = report
         .checks
         .iter()
-        .find(|c| c.id == "telemetry_default")
+        .find(|c| c.id == "privacy.telemetry")
         .unwrap();
     assert_eq!(tel.status, CheckStatus::Pass);
     let rel = report
         .checks
         .iter()
-        .find(|c| c.id == "relay_default")
+        .find(|c| c.id == "privacy.relay")
         .unwrap();
     assert_eq!(rel.status, CheckStatus::Pass);
 }
 
 #[test]
 fn doctor_warns_when_telemetry_or_relay_opted_in() {
-    let report = run_doctor(&DoctorInput {
-        config_readable: true,
-        daemon_reachable: true,
-        identity_present: true,
-        control_plane_url: None,
-        telemetry_enabled: true,
-        relay_enabled: true,
-    });
+    let mut input = base_input();
+    input.control_plane.configured = false;
+    input.control_plane.url = None;
+    input.privacy_policy.telemetry_project = true;
+    input.privacy_policy.relay_enabled = true;
+    let report = run_doctor(&input);
     assert!(report
         .checks
         .iter()
-        .any(|c| c.id == "telemetry_default" && c.status == CheckStatus::Warn));
+        .any(|c| c.id == "privacy.telemetry" && c.status == CheckStatus::Warn));
     assert!(report
         .checks
         .iter()
-        .any(|c| c.id == "relay_default" && c.status == CheckStatus::Warn));
+        .any(|c| c.id == "privacy.relay" && c.status == CheckStatus::Warn));
 }
 
 #[test]

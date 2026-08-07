@@ -1,10 +1,12 @@
 {
   "schema_version": 2,
-  "release_train": "1.0.x",
+  "release_train": "1.1.x",
   "completeness_claim": false,
   "supported": [
     "status",
+    "setup (TTY wizard + non-interactive flags/JSON; privacy defaults OFF)",
     "login/logout",
+    "doctor (read-only structured diagnostics; --json; network opt-in or when configured)",
     "lockdown/unlock/token revoke",
     "config validate",
     "device enroll/list/show/rotate-key/revoke",
@@ -12,13 +14,12 @@
     "session list/show/open/attach/claim/release/give/close/terminate (local device only)",
     "approval list/show/approve/deny",
     "policy show/preset/validate/explain",
+    "service install/start/stop/restart/status/uninstall (user-level ownmeshd autostart only)",
     "privileged broker status (fail-closed metadata; native service management unsupported)"
   ],
-  "explicit_unsupported_count": 44,
+  "explicit_unsupported_count": 36,
   "explicit_unsupported_surfaces": [
     "tui",
-    "setup",
-    "doctor",
     "completion",
     "config get",
     "config set",
@@ -49,12 +50,6 @@
     "transfer list",
     "transfer status",
     "transfer cancel",
-    "service install",
-    "service start",
-    "service stop",
-    "service restart",
-    "service status",
-    "service uninstall",
     "update check",
     "update download",
     "update apply",
@@ -70,6 +65,6 @@
     "privileged broker install",
     "privileged broker uninstall"
   ],
-  "total_unsupported_surfaces": 51,
-  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Every unsupported entry returns a machine-visible hard error; unregistered command strings are rejected at runtime. Parser presence, a marker file, or a generated service template is not treated as implementation. Additional surface notes: exec --device never falls back to local; session open <device> never falls back to local; privileged broker install/uninstall are side-effect-free unsupported operations (no templates, markers, or process spawns) until a secure mint authority exists; privileged broker status reports fail-closed metadata only."
+  "total_unsupported_surfaces": 43,
+  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Every unsupported entry returns a machine-visible hard error; unregistered command strings are rejected at runtime. Parser presence, a marker file, or a generated service template is not treated as implementation. v1.1.0 onboarding implemented setup, doctor, and user-level service lifecycle (Windows current-user Scheduled Task ONLOGON, macOS LaunchAgent, Linux systemd --user). These are distinct from the privileged broker, which remains unsupported for install/uninstall. Additional surface notes: exec --device never falls back to local; session open <device> never falls back to local; privileged broker install/uninstall are side-effect-free unsupported operations (no templates, markers, or process spawns) until a secure mint authority exists; privileged broker status reports fail-closed metadata only."
 }

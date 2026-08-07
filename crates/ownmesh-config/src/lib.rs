@@ -21,8 +21,8 @@ mod store;
 pub use error::{ConfigError, ConfigResult};
 pub use paths::OwnMeshPaths;
 pub use schema::{
-    validate_control_plane_base_url, InstanceConfig, OwnMeshConfig, PolicyFile, TelemetryConfig,
-    UpdateConfig, CONFIG_SCHEMA_VERSION,
+    validate_control_plane_base_url, InstanceConfig, OwnMeshConfig, PolicyFile,
+    ServiceSocketConfig, TelemetryConfig, UpdateConfig, CONFIG_SCHEMA_VERSION,
 };
 pub use store::{
     appears_secret_free, atomic_write, load_config, load_policy, save_config, save_policy,
