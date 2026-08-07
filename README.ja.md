@@ -16,9 +16,9 @@ CLI には Rust ディスパッチ登録上 **32** の明示 unsupported 面に�
 
 - `setup` — TTY ウィザード + 非対話 flags/JSON。プライバシー既定は telemetry / relay / update ネットワーク **OFF**
 - `doctor` — 完全 read-only 診断。`--json` 対応。ネットワーク検査は `--check-network` または control-plane 設定時のみ
-- `service install|start|stop|restart|status|uninstall` — **ユーザー権限**の `ownmeshd` 自動起動のみ  
-  - Windows: 現在ユーザーの Scheduled Task（ONLOGON / LeastPrivilege）  
-  - macOS: LaunchAgent  
+- `service install|start|stop|restart|status|uninstall` — **ユーザー権限**の `ownmeshd` 自動起動のみ
+  - Windows: 現在ユーザーの Scheduled Task（ONLOGON / LeastPrivilege）
+  - macOS: LaunchAgent
   - Linux: systemd --user
 - `update check|download|apply|channel` — 署名付き GitHub Releases。ネットワーク既定 OFF。埋め込み minisign 信頼ルート
 - status / login/logout / lockdown / config validate
@@ -27,8 +27,8 @@ CLI には Rust ディスパッチ登録上 **32** の明示 unsupported 面に�
 - approval / policy
 - privileged broker は **status のみ**（install/uninstall は unsupported）
 
-詳細とロールバック: [`docs/onboarding.md`](./docs/onboarding.md)  
-配布/更新: [`docs/RELEASE_NOTES_v1.1.0.md`](./docs/RELEASE_NOTES_v1.1.0.md)  
+詳細とロールバック: [`docs/onboarding.md`](./docs/onboarding.md)
+配布/更新: [`docs/RELEASE_NOTES_v1.1.0.md`](./docs/RELEASE_NOTES_v1.1.0.md)
 English: [`README.md`](./README.md)
 
 ## コンポーネント
