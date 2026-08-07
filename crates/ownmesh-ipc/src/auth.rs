@@ -3,19 +3,76 @@
 //! Shared `daemon.token` authentication is **abolished**. The server authenticates
 //! peers from OS credentials (Unix `SO_PEERCRED` / Windows named-pipe client PID+SID+exe)
 //! and optionally from **server-managed, per-client, non-shared** credentials.
-//! Self-reported HELLO `client_name` is never a trusted principal input.
+//! Self-reported HELLO `client_name` / `owner` are never trusted principal inputs.
+//!
+//! # Credential threat model
+//!
+//! Per-client credentials identify **cooperative** clients only. A malicious process
+//! under the same OS user can read owner-only state files and present stolen secrets.
+//! See [`crate::registry`] for the persistent store and the same limitation.
 
 use crate::error::{IpcError, IpcResult};
+use crate::registry::{
+    canonical_client_id, managed_principal, BootstrapStatus, CredentialRegistry, RegistryEntry,
+    MANAGEMENT_CLIENT_ID, MANAGEMENT_PRINCIPAL,
+};
+use crate::rpc::methods;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 /// Filename historically used for the shared daemon auth token (legacy; not used for auth).
 pub const AUTH_TOKEN_FILE_NAME: &str = "daemon.token";
+
+/// Secret wrapper that never prints its contents via [`Debug`] / [`Display`].
+///
+/// Use [`RedactedSecret::expose`] only at the authentication boundary.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedactedSecret(String);
+
+impl RedactedSecret {
+    /// Wrap plaintext secret bytes (typically hex).
+    #[must_use]
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// Controlled expose for verification / persistence only — never log this.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the wrapper holds no material.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedSecret([REDACTED])")
+    }
+}
+
+impl std::fmt::Display for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+/// Constant-time equality for equal-length secret bytes.
+///
+/// Length is not secret (generated credentials have a fixed representation), so
+/// malformed lengths are rejected before [`ConstantTimeEq::ct_eq`].
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
 
 /// OS-attested peer identity captured on the server accept path.
 ///
@@ -46,8 +103,8 @@ impl OsPeerIdentity {
 
 /// Material presented by a connecting peer (legacy shape retained for tests / redaction).
 ///
-/// `token` and `client_name` are **not** trusted authentication inputs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `token`, `client_name`, and `owner` are **not** trusted authentication inputs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerCredential {
     /// Legacy shared secret field — must be empty; non-empty values are rejected.
     #[serde(default)]
@@ -55,6 +112,9 @@ pub struct PeerCredential {
     /// Untrusted client label (ignored for principal mapping).
     #[serde(default)]
     pub client_name: String,
+    /// Untrusted owner claim (ignored for principal mapping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Optional OS user id when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_user_id: Option<String>,
@@ -66,46 +126,118 @@ pub struct PeerCredential {
     pub client_credential: Option<String>,
 }
 
-/// Server-side record for a non-shared client credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::fmt::Debug for PeerCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerCredential")
+            .field("token", &RedactedSecret::new(self.token.clone()))
+            .field("client_name", &self.client_name)
+            .field("owner", &self.owner)
+            .field("os_user_id", &self.os_user_id)
+            .field("pid", &self.pid)
+            .field(
+                "client_credential",
+                &self
+                    .client_credential
+                    .as_ref()
+                    .map(|_| RedactedSecret::new(String::new())),
+            )
+            .finish()
+    }
+}
+
+/// Server-side record for a non-shared client credential (in-memory store).
+#[derive(Clone, PartialEq, Eq)]
 pub struct ClientCredentialRecord {
-    /// Opaque secret presented at HELLO.
-    pub secret: String,
+    /// Stable client id (defaults to principal at issuance).
+    pub client_id: String,
+    /// Opaque secret presented at HELLO (redacted in Debug).
+    pub secret: RedactedSecret,
     /// Principal key bound to this credential (server-assigned).
     pub principal_key: String,
     /// OS user id the credential is bound to at issuance.
     pub bound_user_id: String,
+    /// Monotonic generation incremented by rotation.
+    pub generation: u64,
+    /// Revoked records never authenticate.
+    pub revoked: bool,
+}
+
+impl std::fmt::Debug for ClientCredentialRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCredentialRecord")
+            .field("client_id", &self.client_id)
+            .field("secret", &self.secret)
+            .field("principal_key", &self.principal_key)
+            .field("bound_user_id", &self.bound_user_id)
+            .field("generation", &self.generation)
+            .field("revoked", &self.revoked)
+            .finish()
+    }
+}
+
+/// Result of mapping an OS peer + optional client credential to a principal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthResolution {
+    /// Server-assigned principal key.
+    pub principal_key: String,
+    /// True when a valid server-issued client credential was presented.
+    pub credentialed: bool,
+    /// Registry / in-memory client id when credentialed.
+    pub client_id: Option<String>,
+    /// Credential generation bound at HELLO (registry-backed clients).
+    pub credential_generation: Option<u64>,
 }
 
 /// Expected ACL material held by the daemon.
+///
+/// # Default vs registry-backed behaviour
+///
+/// [`AuthGate::local_user`] / [`AuthGate::for_user`] keep the historical default:
+/// same-uid OS peers authenticate as the OS principal without a client credential,
+/// and method authorization is unrestricted at the gate (TUI / session-host /
+/// ipc-client consumers). Attaching daemon state via
+/// [`AuthGate::with_daemon_registry`] enables **strict uncredentialed policy**: only
+/// `daemon.status` and `ipc.ping` are allowed without a valid client credential.
 #[derive(Debug, Clone)]
 pub struct AuthGate {
     /// When empty, only `own_user_id` is accepted.
     allowed_user_ids: Vec<String>,
     /// Daemon process user id.
     own_user_id: String,
-    /// Server-managed per-client credentials (secret → record).
-    credentials: Arc<RwLock<HashMap<String, ClientCredentialRecord>>>,
+    /// In-memory per-client credentials (secret never used as a map key).
+    credentials: Arc<RwLock<Vec<ClientCredentialRecord>>>,
+    /// Optional durable registry (daemon state directory). Presence enables strict policy.
+    registry: Option<Arc<RwLock<CredentialRegistry>>>,
+    /// When true, uncredentialed peers may only call ping/status.
+    strict_uncredentialed: bool,
 }
 
 impl AuthGate {
     /// Construct a gate that accepts the current OS user (and optional allow-list).
+    ///
+    /// Default behaviour is preserved: no registry, no strict uncredentialed ACL.
     #[must_use]
     pub fn local_user() -> Self {
         Self {
             allowed_user_ids: Vec::new(),
             own_user_id: current_os_user_id(),
-            credentials: Arc::new(RwLock::new(HashMap::new())),
+            credentials: Arc::new(RwLock::new(Vec::new())),
+            registry: None,
+            strict_uncredentialed: false,
         }
     }
 
     /// Construct a gate with an explicit own-user id (tests).
+    ///
+    /// Default behaviour is preserved: no registry, no strict uncredentialed ACL.
     #[must_use]
     pub fn for_user(own_user_id: impl Into<String>) -> Self {
         Self {
             allowed_user_ids: Vec::new(),
             own_user_id: normalize_principal_part(&own_user_id.into()),
-            credentials: Arc::new(RwLock::new(HashMap::new())),
+            credentials: Arc::new(RwLock::new(Vec::new())),
+            registry: None,
+            strict_uncredentialed: false,
         }
     }
 
@@ -128,39 +260,162 @@ impl AuthGate {
         self
     }
 
-    /// Borrow the shared credential map (for daemon-side registration / diagnostics).
+    /// Attach daemon-owned durable credential state and ensure the fixed management
+    /// bootstrap credential for this gate's OS user.
+    ///
+    /// This is the only public registry attachment surface: callers cannot obtain the
+    /// registry, choose a persisted principal, or invoke its offline mutators.
+    /// Registry-backed daemons treat uncredentialed same-uid peers as probe-only.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when state custody or fixed bootstrap validation fails.
+    pub fn with_daemon_registry(
+        mut self,
+        state_dir: impl AsRef<Path>,
+    ) -> IpcResult<(Self, BootstrapStatus)> {
+        let mut registry = CredentialRegistry::open(state_dir)?;
+        let status = registry.ensure_management_bootstrap(&self.own_user_id)?;
+        self.registry = Some(Arc::new(RwLock::new(registry)));
+        self.strict_uncredentialed = true;
+        Ok((self, status))
+    }
+
+    #[cfg(test)]
+    fn with_registry(mut self, registry: Arc<RwLock<CredentialRegistry>>) -> Self {
+        self.registry = Some(registry);
+        self.strict_uncredentialed = true;
+        self
+    }
+
+    /// Whether this gate enforces the uncredentialed allow-list.
     #[must_use]
-    pub fn credentials_handle(&self) -> Arc<RwLock<HashMap<String, ClientCredentialRecord>>> {
+    pub fn strict_uncredentialed(&self) -> bool {
+        self.strict_uncredentialed
+    }
+
+    /// Borrow the shared in-memory credential list (tests only).
+    #[cfg(test)]
+    #[must_use]
+    fn credentials_handle(&self) -> Arc<RwLock<Vec<ClientCredentialRecord>>> {
         Arc::clone(&self.credentials)
     }
 
     /// Issue a server-managed, non-shared client credential bound to `bound_user_id`.
     ///
+    /// When a registry is attached, the credential is provisioned durably under
+    /// `client_id == principal_key`. Otherwise it is held in the process-local store.
+    ///
     /// The returned secret is the only copy the caller receives; it is not a shared daemon token.
-    pub fn issue_client_credential(
+    ///
+    /// This is a **daemon-local** bootstrap API — not an uncredentialed IPC method.
+    pub(crate) fn issue_client_credential(
         &self,
-        principal_key: impl Into<String>,
+        client_id: impl Into<String>,
         bound_user_id: impl Into<String>,
     ) -> IpcResult<String> {
-        let principal_key = canonicalize_principal_key(&principal_key.into());
-        let bound_user_id = normalize_principal_part(&bound_user_id.into());
-        if principal_key.is_empty() || bound_user_id.is_empty() {
+        if self.registry.is_some() {
             return Err(IpcError::Unauthorized(
-                "credential principal and bound OS user must be non-empty".into(),
+                "durable credentials may only be provisioned through authenticated management RPC"
+                    .into(),
             ));
         }
-        let secret = generate_token();
-        let record = ClientCredentialRecord {
-            secret: secret.clone(),
-            principal_key,
-            bound_user_id,
-        };
+        self.provision_client_credential(client_id, bound_user_id)
+    }
+
+    /// Internal provisioning primitive used by authenticated daemon dispatch and tests.
+    pub(crate) fn provision_client_credential(
+        &self,
+        client_id: impl Into<String>,
+        bound_user_id: impl Into<String>,
+    ) -> IpcResult<String> {
+        let client_id = canonical_client_id(&client_id.into())?;
+        let principal_key = managed_principal(&client_id);
+        let bound_user_id = normalize_principal_part(&bound_user_id.into());
+        if bound_user_id.is_empty() {
+            return Err(IpcError::Unauthorized(
+                "credential bound OS user must be non-empty".into(),
+            ));
+        }
+        if let Some(reg) = &self.registry {
+            let mut guard = reg.write().map_err(|_| registry_lock_error())?;
+            return guard.provision(client_id, bound_user_id);
+        }
         let mut guard = self
             .credentials
             .write()
             .map_err(|_| IpcError::Unauthorized("credential store lock poisoned".into()))?;
-        guard.insert(secret.clone(), record);
+        if guard.iter().any(|r| r.client_id == client_id && !r.revoked) {
+            return Err(IpcError::Unauthorized(format!(
+                "client credential '{client_id}' already provisioned"
+            )));
+        }
+        let generation = guard
+            .iter()
+            .find(|record| record.client_id == client_id)
+            .map_or(Ok(1), |record| {
+                record.generation.checked_add(1).ok_or_else(|| {
+                    IpcError::Protocol(format!("credential generation overflow for '{client_id}'"))
+                })
+            })?;
+        guard.retain(|record| record.client_id != client_id);
+        let secret = generate_token();
+        guard.push(ClientCredentialRecord {
+            client_id,
+            secret: RedactedSecret::new(secret.clone()),
+            principal_key,
+            bound_user_id,
+            generation,
+            revoked: false,
+        });
         Ok(secret)
+    }
+
+    /// Rotate the secret for `client_id` (daemon-local). Old secret becomes invalid.
+    pub(crate) fn rotate_client_credential(&self, client_id: impl AsRef<str>) -> IpcResult<String> {
+        let client_id = canonicalize_principal_key(client_id.as_ref());
+        if let Some(reg) = &self.registry {
+            let mut guard = reg.write().map_err(|_| registry_lock_error())?;
+            return guard.rotate(&client_id);
+        }
+        let mut guard = self
+            .credentials
+            .write()
+            .map_err(|_| IpcError::Unauthorized("credential store lock poisoned".into()))?;
+        let record = guard
+            .iter_mut()
+            .find(|r| r.client_id == client_id && !r.revoked)
+            .ok_or_else(|| {
+                IpcError::Unauthorized(format!("no active credential for client '{client_id}'"))
+            })?;
+        let secret = generate_token();
+        record.generation = record.generation.checked_add(1).ok_or_else(|| {
+            IpcError::Protocol(format!("credential generation overflow for '{client_id}'"))
+        })?;
+        record.secret = RedactedSecret::new(secret.clone());
+        Ok(secret)
+    }
+
+    /// Revoke `client_id` (daemon-local). Mapping stops authenticating immediately.
+    pub(crate) fn revoke_client_credential(&self, client_id: impl AsRef<str>) -> IpcResult<()> {
+        let client_id = canonicalize_principal_key(client_id.as_ref());
+        if let Some(reg) = &self.registry {
+            let mut guard = reg.write().map_err(|_| registry_lock_error())?;
+            return guard.revoke(&client_id);
+        }
+        let mut guard = self
+            .credentials
+            .write()
+            .map_err(|_| IpcError::Unauthorized("credential store lock poisoned".into()))?;
+        let record = guard
+            .iter_mut()
+            .find(|r| r.client_id == client_id && !r.revoked)
+            .ok_or_else(|| {
+                IpcError::Unauthorized(format!("no credential for client '{client_id}'"))
+            })?;
+        record.revoked = true;
+        record.secret = RedactedSecret::new(String::new());
+        Ok(())
     }
 
     /// Validate OS peer identity (user allow-list / own user).
@@ -189,19 +444,21 @@ impl AuthGate {
         Ok(())
     }
 
-    /// Map an authenticated OS peer (+ optional server-issued credential) to a principal key.
+    /// Map an authenticated OS peer (+ optional server-issued credential) to auth material.
     ///
-    /// Shared `token` values are rejected. Self-reported `client_name` is ignored.
+    /// Shared `token` values are rejected. Self-reported `client_name` / `owner` are ignored
+    /// for principal assignment — only OS peer + registry/in-memory credential map to a
+    /// registered principal.
     ///
     /// # Errors
     ///
     /// Returns [`IpcError::Unauthorized`] on failed OS checks, disabled shared tokens,
-    /// or unknown / mismatched client credentials.
-    pub fn resolve_principal(
+    /// or unknown / mismatched / revoked client credentials.
+    pub fn resolve_auth(
         &self,
         os_peer: &OsPeerIdentity,
         presented: &PeerCredential,
-    ) -> IpcResult<String> {
+    ) -> IpcResult<AuthResolution> {
         self.verify_os_peer(os_peer)?;
 
         // Shared daemon.token path is explicitly disabled.
@@ -218,25 +475,143 @@ impl AuthGate {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            return self.resolve_credentialed(os_peer, secret);
+        }
+
+        // Default: principal is derived solely from OS peer credentials.
+        // Self-reported client_name/owner never mint a registered principal here.
+        let _ = (&presented.client_name, &presented.owner);
+        Ok(AuthResolution {
+            principal_key: os_peer.principal_key(),
+            credentialed: false,
+            client_id: None,
+            credential_generation: None,
+        })
+    }
+
+    /// Map peer → principal key (compatibility wrapper around [`Self::resolve_auth`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::resolve_auth`].
+    pub fn resolve_principal(
+        &self,
+        os_peer: &OsPeerIdentity,
+        presented: &PeerCredential,
+    ) -> IpcResult<String> {
+        Ok(self.resolve_auth(os_peer, presented)?.principal_key)
+    }
+
+    fn resolve_credentialed(
+        &self,
+        os_peer: &OsPeerIdentity,
+        secret: &str,
+    ) -> IpcResult<AuthResolution> {
+        if let Some(reg) = &self.registry {
+            let guard = reg.read().map_err(|_| registry_lock_error())?;
+            let Some(entry) = guard.find_by_secret(secret) else {
+                return Err(IpcError::Unauthorized("unknown client credential".into()));
+            };
+            return bind_registry_entry(os_peer, entry);
+        }
+
+        let guard = self
+            .credentials
+            .read()
+            .map_err(|_| IpcError::Unauthorized("credential store lock poisoned".into()))?;
+        let Some(record) = find_memory_by_secret(&guard, secret) else {
+            return Err(IpcError::Unauthorized("unknown client credential".into()));
+        };
+        if normalize_principal_part(&record.bound_user_id)
+            != normalize_principal_part(&os_peer.user_id)
+        {
+            return Err(IpcError::Unauthorized(
+                "client credential is not bound to this OS peer user".into(),
+            ));
+        }
+        Ok(AuthResolution {
+            principal_key: canonicalize_principal_key(&record.principal_key),
+            credentialed: true,
+            client_id: Some(record.client_id.clone()),
+            credential_generation: Some(record.generation),
+        })
+    }
+
+    /// Authorize an IPC method for a bound client identity.
+    ///
+    /// Default (`local_user` / `for_user`): uncredentialed behavior remains unrestricted
+    /// (handler/policy decide), while issued credential lifecycle is still revalidated.
+    /// Registry-backed strict mode revalidates credential revocation on every dispatch;
+    /// uncredentialed peers may only call [`methods::PING`] and [`methods::STATUS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::Unauthorized`] when the method is denied.
+    pub fn authorize_method(&self, method: &str, auth: &AuthResolution) -> IpcResult<()> {
+        if auth.credentialed {
+            let client_id = auth.client_id.as_deref().ok_or_else(|| {
+                IpcError::Unauthorized("credentialed identity has no registry client id".into())
+            })?;
+            let expected_generation = auth.credential_generation.unwrap_or(0);
+            let expected_principal = canonicalize_principal_key(&auth.principal_key);
+            if credential_lifecycle_method(method)
+                && (client_id != MANAGEMENT_CLIENT_ID || expected_principal != MANAGEMENT_PRINCIPAL)
+            {
+                return Err(IpcError::Unauthorized(
+                    "credential lifecycle requires the fixed credentialed management client".into(),
+                ));
+            }
+            if let Some(registry) = &self.registry {
+                let guard = registry.read().map_err(|_| registry_lock_error())?;
+                let entry = guard.active_entry(client_id).ok_or_else(|| {
+                    IpcError::Unauthorized(format!(
+                        "client credential '{client_id}' is revoked or no longer registered"
+                    ))
+                })?;
+                if entry.generation != expected_generation {
+                    return Err(IpcError::Unauthorized(
+                        "client credential rotated after HELLO; reconnect required".into(),
+                    ));
+                }
+                if entry.principal_key != expected_principal {
+                    return Err(IpcError::Unauthorized(
+                        "registered principal changed after HELLO; reconnect required".into(),
+                    ));
+                }
+                return Ok(());
+            }
+
             let guard = self
                 .credentials
                 .read()
                 .map_err(|_| IpcError::Unauthorized("credential store lock poisoned".into()))?;
-            let Some(record) = guard.get(secret) else {
-                return Err(IpcError::Unauthorized("unknown client credential".into()));
-            };
-            if normalize_principal_part(&record.bound_user_id)
-                != normalize_principal_part(&os_peer.user_id)
+            let record = guard
+                .iter()
+                .find(|record| record.client_id == client_id && !record.revoked)
+                .ok_or_else(|| {
+                    IpcError::Unauthorized(format!(
+                        "client credential '{client_id}' is revoked or no longer registered"
+                    ))
+                })?;
+            if record.generation != expected_generation
+                || canonicalize_principal_key(&record.principal_key) != expected_principal
             {
                 return Err(IpcError::Unauthorized(
-                    "client credential is not bound to this OS peer user".into(),
+                    "client credential changed after HELLO; reconnect required".into(),
                 ));
             }
-            return Ok(canonicalize_principal_key(&record.principal_key));
+            return Ok(());
         }
-
-        // Default: principal is derived solely from OS peer credentials.
-        Ok(os_peer.principal_key())
+        if !self.strict_uncredentialed {
+            return Ok(());
+        }
+        if uncredentialed_method_allowed(method) {
+            return Ok(());
+        }
+        Err(IpcError::Unauthorized(format!(
+            "method '{method}' requires a server-issued client credential \
+             (uncredentialed same-uid peers may only call ipc.ping and daemon.status)"
+        )))
     }
 
     /// Legacy verify entry used by older unit tests — now enforces token abolition + OS mapping.
@@ -259,7 +634,7 @@ impl AuthGate {
                 .unwrap_or_else(|| self.own_user_id.clone()),
             exe_path: None,
         };
-        let _ = self.resolve_principal(&os_peer, peer)?;
+        let _ = self.resolve_auth(&os_peer, peer)?;
         Ok(())
     }
 
@@ -268,6 +643,58 @@ impl AuthGate {
     pub fn own_user_id(&self) -> &str {
         &self.own_user_id
     }
+}
+
+fn registry_lock_error() -> IpcError {
+    IpcError::Io(std::io::Error::other("credential registry lock poisoned"))
+}
+
+fn bind_registry_entry(
+    os_peer: &OsPeerIdentity,
+    entry: &RegistryEntry,
+) -> IpcResult<AuthResolution> {
+    if normalize_principal_part(&entry.bound_user_id) != normalize_principal_part(&os_peer.user_id)
+    {
+        return Err(IpcError::Unauthorized(
+            "client credential is not bound to this OS peer user".into(),
+        ));
+    }
+    Ok(AuthResolution {
+        principal_key: canonicalize_principal_key(&entry.principal_key),
+        credentialed: true,
+        client_id: Some(entry.client_id.clone()),
+        credential_generation: Some(entry.generation),
+    })
+}
+
+fn find_memory_by_secret<'a>(
+    records: &'a [ClientCredentialRecord],
+    presented: &str,
+) -> Option<&'a ClientCredentialRecord> {
+    // Adapt memory records into the registry scan shape without HashMap-by-secret.
+    let presented_bytes = presented.as_bytes();
+    let mut found: Option<&ClientCredentialRecord> = None;
+    for record in records {
+        let matches = !record.revoked
+            && !record.secret.is_empty()
+            && constant_time_eq(record.secret.expose().as_bytes(), presented_bytes);
+        if matches {
+            found = Some(record);
+        }
+    }
+    found
+}
+
+/// Whitelist for uncredentialed same-uid peers under strict (registry-backed) policy.
+fn uncredentialed_method_allowed(method: &str) -> bool {
+    matches!(method, methods::PING | methods::STATUS)
+}
+
+fn credential_lifecycle_method(method: &str) -> bool {
+    matches!(
+        method,
+        methods::CREDENTIAL_PROVISION | methods::CREDENTIAL_ROTATE | methods::CREDENTIAL_REVOKE
+    )
 }
 
 /// Normalize a principal key component (case-fold + trim + path separators and aliases).
@@ -449,23 +876,13 @@ unsafe fn current_windows_user_sid() -> Option<String> {
 /// Generate a high-entropy secret (hex). Used for per-client credentials, not shared tokens.
 #[must_use]
 pub fn generate_token() -> String {
+    // `Uuid::new_v4` is backed by the platform CSPRNG. Two independent UUIDs
+    // retain roughly 244 random bits after their fixed version/variant bits.
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
     let mut raw = [0_u8; 32];
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    for (idx, slot) in raw.iter_mut().enumerate() {
-        let mix = now
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(u128::from(pid) << 32)
-            .wrapping_add(idx as u128 * 0xA24B_AED4_96E9_23FD);
-        *slot = (mix ^ (mix >> 8) ^ (mix >> 16)) as u8;
-    }
-    let u = uuid::Uuid::new_v4();
-    for (dst, src) in raw.iter_mut().zip(u.as_bytes().iter().cycle()) {
-        *dst ^= *src;
-    }
+    raw[..16].copy_from_slice(first.as_bytes());
+    raw[16..].copy_from_slice(second.as_bytes());
     hex_encode(&raw)
 }
 
@@ -573,6 +990,7 @@ mod tests {
         let bad = PeerCredential {
             token: "any-shared-token".into(),
             client_name: "ownmesh".into(),
+            owner: None,
             os_user_id: Some(gate.own_user_id().into()),
             pid: Some(1),
             client_credential: None,
@@ -592,6 +1010,7 @@ mod tests {
         let a = PeerCredential {
             token: String::new(),
             client_name: "admin".into(),
+            owner: Some("root".into()),
             os_user_id: None,
             pid: None,
             client_credential: None,
@@ -599,6 +1018,7 @@ mod tests {
         let b = PeerCredential {
             token: String::new(),
             client_name: "root".into(),
+            owner: Some("admin".into()),
             os_user_id: None,
             pid: None,
             client_credential: None,
@@ -609,6 +1029,8 @@ mod tests {
         assert_eq!(pa, os.principal_key());
         assert!(!pa.contains("admin"));
         assert!(!pa.contains("root"));
+        let auth = gate.resolve_auth(&os, &a).unwrap();
+        assert!(!auth.credentialed);
     }
 
     #[test]
@@ -625,12 +1047,17 @@ mod tests {
         let presented = PeerCredential {
             token: String::new(),
             client_name: "ignored-label".into(),
+            owner: Some("spoofed-owner".into()),
             os_user_id: None,
             pid: None,
-            client_credential: Some(secret),
+            client_credential: Some(secret.clone()),
         };
-        let principal = gate.resolve_principal(&os, &presented).unwrap();
-        assert_eq!(principal, "agent-chatgpt");
+        let auth = gate.resolve_auth(&os, &presented).unwrap();
+        assert_eq!(auth.principal_key, "client:agent-chatgpt");
+        assert!(auth.credentialed);
+        // Secret must not appear in Debug of gate credentials.
+        let dbg = format!("{:?}", gate.credentials_handle());
+        assert!(!dbg.contains(&secret));
     }
 
     #[test]
@@ -681,6 +1108,7 @@ mod tests {
         let presented = PeerCredential {
             token: String::new(),
             client_name: String::new(),
+            owner: None,
             os_user_id: None,
             pid: None,
             client_credential: Some(secret),
@@ -706,5 +1134,214 @@ mod tests {
             redact_secrets(msg, &["super-secret"]),
             "token=[REDACTED] value"
         );
+    }
+
+    #[test]
+    fn redacted_secret_debug_display_hide_material() {
+        let secret = RedactedSecret::new("top-secret-value");
+        assert!(!format!("{secret:?}").contains("top-secret"));
+        assert_eq!(format!("{secret}"), "[REDACTED]");
+        assert_eq!(secret.expose(), "top-secret-value");
+    }
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"abcdef", b"abcdef"));
+        assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn rotate_and_revoke_memory_store() {
+        let gate = AuthGate::for_user("alice");
+        let old = gate.issue_client_credential("agent", "alice").unwrap();
+        let os = OsPeerIdentity {
+            pid: 1,
+            user_id: "alice".into(),
+            exe_path: None,
+        };
+        let presented_old = PeerCredential {
+            token: String::new(),
+            client_name: "spoof".into(),
+            owner: Some("other".into()),
+            os_user_id: None,
+            pid: None,
+            client_credential: Some(old.clone()),
+        };
+        assert_eq!(
+            gate.resolve_principal(&os, &presented_old).unwrap(),
+            "client:agent"
+        );
+        let new = gate.rotate_client_credential("agent").unwrap();
+        assert_ne!(old, new);
+        assert!(gate.resolve_principal(&os, &presented_old).is_err());
+        let presented_new = PeerCredential {
+            client_credential: Some(new),
+            ..presented_old.clone()
+        };
+        assert_eq!(
+            gate.resolve_principal(&os, &presented_new).unwrap(),
+            "client:agent"
+        );
+        gate.revoke_client_credential("agent").unwrap();
+        assert!(gate.resolve_principal(&os, &presented_new).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn registry_backed_gate_restores_and_enforces_strict_methods() {
+        let dir = tempdir().unwrap();
+        let reg = CredentialRegistry::open(dir.path()).unwrap();
+        let reg = Arc::new(RwLock::new(reg));
+        let gate = AuthGate::for_user("alice").with_registry(Arc::clone(&reg));
+        assert!(gate.strict_uncredentialed());
+        let secret = gate
+            .provision_client_credential("chatgpt", "alice")
+            .expect("authenticated provisioning into registry");
+
+        let os = OsPeerIdentity {
+            pid: 3,
+            user_id: "alice".into(),
+            exe_path: None,
+        };
+        // Spoofed HELLO name/owner cannot mint the registered principal without secret.
+        let spoofed = PeerCredential {
+            token: String::new(),
+            client_name: "chatgpt".into(),
+            owner: Some("chatgpt".into()),
+            os_user_id: None,
+            pid: None,
+            client_credential: None,
+        };
+        let uncred = gate.resolve_auth(&os, &spoofed).unwrap();
+        assert!(!uncred.credentialed);
+        assert_eq!(uncred.principal_key, os.principal_key());
+        assert_ne!(uncred.principal_key, "client:chatgpt");
+
+        let presented = PeerCredential {
+            client_credential: Some(secret.clone()),
+            client_name: "ignored".into(),
+            owner: Some("ignored-owner".into()),
+            ..spoofed.clone()
+        };
+        let auth = gate.resolve_auth(&os, &presented).unwrap();
+        assert!(auth.credentialed);
+        assert_eq!(auth.principal_key, "client:chatgpt");
+
+        // Strict method ACL.
+        let uncred_id = uncred.clone();
+        let cred_id = auth.clone();
+        assert!(gate.authorize_method(methods::PING, &uncred_id).is_ok());
+        assert!(gate.authorize_method(methods::STATUS, &uncred_id).is_ok());
+        for method in [
+            methods::OPS_EXEC,
+            methods::OPS_FS_WRITE,
+            methods::OPS_FS_READ,
+            methods::POLICY_SHOW,
+            methods::APPROVAL_LIST,
+            methods::DAEMON_LOCKDOWN,
+            methods::TOKEN_REVOKE,
+            "session.open",
+            "session.write",
+            "session.claim",
+        ] {
+            assert!(
+                gate.authorize_method(method, &uncred_id).is_err(),
+                "{method} must be denied for uncredentialed"
+            );
+            assert!(
+                gate.authorize_method(method, &cred_id).is_ok(),
+                "{method} allowed when credentialed"
+            );
+        }
+        for method in [
+            methods::CREDENTIAL_PROVISION,
+            methods::CREDENTIAL_ROTATE,
+            methods::CREDENTIAL_REVOKE,
+        ] {
+            assert!(gate.authorize_method(method, &uncred_id).is_err());
+            assert!(
+                gate.authorize_method(method, &cred_id).is_err(),
+                "ordinary credential must not manage lifecycle: {method}"
+            );
+        }
+
+        // Rotate + revoke + restart restore.
+        let old = secret;
+        let new = gate.rotate_client_credential("chatgpt").unwrap();
+        assert!(gate
+            .authorize_method(methods::POLICY_SHOW, &cred_id)
+            .is_err());
+        assert!(gate
+            .resolve_auth(
+                &os,
+                &PeerCredential {
+                    client_credential: Some(old),
+                    ..presented.clone()
+                }
+            )
+            .is_err());
+        assert!(
+            gate.resolve_auth(
+                &os,
+                &PeerCredential {
+                    client_credential: Some(new.clone()),
+                    ..presented.clone()
+                }
+            )
+            .unwrap()
+            .credentialed
+        );
+
+        // Restart: new gate from same state_dir.
+        drop(gate);
+        drop(reg);
+        let reopened = CredentialRegistry::open(dir.path()).unwrap();
+        let gate2 = AuthGate::for_user("alice").with_registry(Arc::new(RwLock::new(reopened)));
+        let restored_auth = gate2
+            .resolve_auth(
+                &os,
+                &PeerCredential {
+                    client_credential: Some(new.clone()),
+                    ..presented.clone()
+                },
+            )
+            .unwrap();
+        assert!(restored_auth.credentialed);
+        let restored_id = restored_auth;
+        assert!(gate2
+            .authorize_method(methods::POLICY_SHOW, &restored_id)
+            .is_ok());
+        gate2.revoke_client_credential("chatgpt").unwrap();
+        assert!(gate2
+            .authorize_method(methods::POLICY_SHOW, &restored_id)
+            .is_err());
+        assert!(gate2
+            .resolve_auth(
+                &os,
+                &PeerCredential {
+                    client_credential: Some(new),
+                    ..presented
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn local_user_default_allows_uncredentialed_methods() {
+        let gate = AuthGate::local_user();
+        assert!(!gate.strict_uncredentialed());
+        let id = AuthResolution {
+            principal_key: format!("user:{}", gate.own_user_id()),
+            credentialed: false,
+            client_id: None,
+            credential_generation: None,
+        };
+        // Default consumers (TUI / session-host) must not be locked down.
+        assert!(gate.authorize_method(methods::OPS_EXEC, &id).is_ok());
+        assert!(gate.authorize_method("session.open", &id).is_ok());
+        assert!(gate.authorize_method(methods::POLICY_SHOW, &id).is_ok());
     }
 }

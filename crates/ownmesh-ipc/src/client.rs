@@ -13,13 +13,15 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-/// Client identity presented during `ipc.hello`.
+/// Client identity presented during `ipc.hello`, and the server-assigned principal
+/// passed to method handlers after authentication.
 ///
-/// `client_name` is an untrusted label only. The server assigns the real principal
-/// from OS peer credentials (and optional server-issued client credential).
+/// On the client side `client_name` is an untrusted label. The server replaces it
+/// with its authenticated principal before invoking a handler. Credential metadata
+/// remains private to the server, preserving this public struct's source shape.
 #[derive(Debug, Clone)]
 pub struct ClientIdentity {
-    /// Process label (`ownmesh`, `ownmesh-tui`, …) — untrusted display hint.
+    /// Client HELLO label, or server-assigned principal after authentication.
     pub client_name: String,
     /// Optional semantic version.
     pub client_version: Option<String>,
@@ -33,6 +35,12 @@ impl ClientIdentity {
             client_name: client_name.into(),
             client_version: Some(client_version.into()),
         }
+    }
+
+    /// Server-assigned principal key (alias of [`Self::client_name`] post-HELLO).
+    #[must_use]
+    pub fn principal_key(&self) -> &str {
+        &self.client_name
     }
 }
 
@@ -100,6 +108,30 @@ impl IpcClient {
         self
     }
 
+    /// Explicitly load a cooperative-client credential from
+    /// [`crate::CLIENT_CREDENTIAL_ENV`] when configured.
+    ///
+    /// This opt-in delivery is not a security boundary against arbitrary malware
+    /// running as the same OS user. Invalid Unicode or an explicitly empty value is
+    /// reported instead of silently falling back to an uncredentialed client.
+    pub fn with_client_credential_from_env(mut self) -> IpcResult<Self> {
+        match std::env::var(crate::CLIENT_CREDENTIAL_ENV) {
+            Ok(value) if value.trim().is_empty() => Err(IpcError::Protocol(format!(
+                "{} is set but empty",
+                crate::CLIENT_CREDENTIAL_ENV
+            ))),
+            Ok(value) => {
+                self.client_credential = Some(value);
+                Ok(self)
+            }
+            Err(std::env::VarError::NotPresent) => Ok(self),
+            Err(std::env::VarError::NotUnicode(_)) => Err(IpcError::Protocol(format!(
+                "{} is not valid Unicode",
+                crate::CLIENT_CREDENTIAL_ENV
+            ))),
+        }
+    }
+
     /// Deliberately present a legacy shared token (negative / attack tests only).
     #[must_use]
     pub fn with_legacy_shared_token(mut self, token: impl Into<String>) -> Self {
@@ -161,6 +193,7 @@ impl IpcClient {
             Some(json!(HelloParams {
                 token: self.legacy_shared_token.clone().unwrap_or_default(),
                 client_name: self.identity.client_name.clone(),
+                owner: None,
                 client_version: self.identity.client_version.clone(),
                 client_credential: self.client_credential.clone(),
             })),

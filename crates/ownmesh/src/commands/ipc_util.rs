@@ -1,10 +1,8 @@
 //! Shared helpers for CLI ↔ ownmeshd IPC calls.
 
-use ownmesh_config::OwnMeshPaths;
+use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::{
-    app_error, ClientIdentity, ClientOptions, Endpoint, IpcBus, IpcClient, IpcError,
-};
+use ownmesh_ipc::{app_error, ClientIdentity, ClientOptions, Endpoint, IpcClient, IpcError};
 use serde_json::Value;
 use std::time::Duration;
 
@@ -15,7 +13,16 @@ pub fn connect_daemon() -> Result<(OwnMeshPaths, IpcClient), ExitCode> {
         ExitCode::UsageConfig
     })?;
     let _ = paths.ensure_layout();
-    let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+    let cfg = load_config(&paths).map_err(|err| {
+        eprintln!("config load error: {err}");
+        ExitCode::UsageConfig
+    })?;
+    let endpoint =
+        Endpoint::configured_daemon(&paths.runtime_dir, cfg.service_socket.path.as_deref())
+            .map_err(|err| {
+                eprintln!("service endpoint configuration error: {err}");
+                ExitCode::UsageConfig
+            })?;
     let client = IpcClient::new(
         endpoint,
         paths.runtime_dir.clone(),
@@ -25,15 +32,28 @@ pub fn connect_daemon() -> Result<(OwnMeshPaths, IpcClient), ExitCode> {
             max_reconnect_attempts: 3,
             reconnect_base_delay: Duration::from_millis(50),
         },
-    );
+    )
+    .with_client_credential_from_env()
+    .map_err(|err| {
+        eprintln!("client credential configuration error: {err}");
+        ExitCode::UsageConfig
+    })?;
     Ok((paths, client))
 }
 
 /// Map IPC errors onto CLI exit codes.
 pub fn map_ipc_err(err: IpcError) -> ExitCode {
     match &err {
-        IpcError::Unauthorized(_) => {
+        IpcError::Unauthorized(_)
+        | IpcError::Remote {
+            code: app_error::UNAUTHORIZED,
+            ..
+        } => {
             eprintln!("authentication failed: {err}");
+            eprintln!(
+                "hint: provision this cooperative client through the running daemon and set {}",
+                ownmesh_ipc::CLIENT_CREDENTIAL_ENV
+            );
             ExitCode::Authentication
         }
         IpcError::Remote { code, message } if *code == app_error::POLICY_DENIED => {
@@ -89,5 +109,21 @@ pub fn print_value(json_mode: bool, value: &Value, human: impl FnOnce(&Value)) {
         println!("{value}");
     } else {
         human(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_unauthorized_maps_to_authentication_failure() {
+        assert_eq!(
+            map_ipc_err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "credential required".into(),
+            }),
+            ExitCode::Authentication
+        );
     }
 }

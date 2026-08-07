@@ -5,10 +5,11 @@ use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
 use ownmesh_identity::{load_or_create_device_key, PreferredSecretStore, DEFAULT_KEYCHAIN_SERVICE};
 use ownmesh_ipc::{
-    AuthGate, ClientIdentity, ClientOptions, Endpoint, IpcBus, IpcClient, IpcServer, LocalListener,
-    MethodHandler, ServerConfig,
+    methods, read_management_credential, AuthGate, BootstrapStatus, ClientIdentity, ClientOptions,
+    CredentialSecretResult, Endpoint, IpcClient, IpcError, IpcServer, LocalListener, MethodHandler,
+    ServerConfig, CLIENT_CREDENTIAL_ENV, MANAGEMENT_CREDENTIAL_FILE_NAME,
 };
-use std::path::PathBuf;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -118,39 +119,17 @@ fn build_handler(
     Ok((runtime_handler(Arc::new(Mutex::new(runtime))), revoked))
 }
 
-/// Resolve the daemon IPC endpoint + AuthGate from `config.service_socket`.
+/// Resolve the daemon IPC endpoint + `AuthGate` from `config.service_socket`.
 ///
 /// Applies Unix socket owner/group/mode via [`LocalListener::configure_unix_security`]
-/// (fail-closed). `allowed_uids` is enforced both at accept (transport) and AuthGate.
+/// (fail-closed). `allowed_uids` is enforced both at accept (transport) and `AuthGate`.
 fn service_endpoint_and_auth(
     paths: &OwnMeshPaths,
     cfg: &ownmesh_config::OwnMeshConfig,
 ) -> Result<(Endpoint, AuthGate), String> {
     let sock = &cfg.service_socket;
-    let endpoint = if let Some(path) = sock
-        .path
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        let pb = PathBuf::from(path);
-        #[cfg(unix)]
-        {
-            Endpoint::UnixSocket(pb)
-        }
-        #[cfg(windows)]
-        {
-            // Named pipe path override: treat as pipe name when it looks like one.
-            let name = pb.to_string_lossy().into_owned();
-            if name.starts_with(r"\\.\pipe\") || name.starts_with("pipe:") {
-                Endpoint::NamedPipe(name.trim_start_matches("pipe:").to_string())
-            } else {
-                Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon)
-            }
-        }
-    } else {
-        Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon)
-    };
+    let endpoint = configured_service_endpoint(paths, cfg).map_err(|err| err.to_string())?;
+    validate_management_bootstrap_reachable(&sock.allowed_uids)?;
 
     // Privilege boundary for Unix domain sockets (no-op security clear on Windows).
     LocalListener::configure_unix_security(
@@ -170,7 +149,187 @@ fn service_endpoint_and_auth(
                 .collect(),
         );
     }
+    auth = attach_daemon_registry(paths, auth)?;
     Ok((endpoint, auth))
+}
+
+fn attach_daemon_registry(paths: &OwnMeshPaths, auth: AuthGate) -> Result<AuthGate, String> {
+    let (auth, bootstrap) = auth.with_daemon_registry(&paths.state_dir).map_err(|err| {
+        format!(
+            "failed to attach fixed client credential registry in {}: {err}",
+            paths.state_dir.display()
+        )
+    })?;
+    if bootstrap == BootstrapStatus::Created {
+        tracing::warn!(
+            path = %paths.state_dir.join(MANAGEMENT_CREDENTIAL_FILE_NAME).display(),
+            "created owner-only cooperative management credential delivery; this is not a security boundary against arbitrary malware running as the same OS user"
+        );
+    }
+    // Production ownmeshd is always registry-backed: same-uid clients without a
+    // provisioned credential are probe-only (ipc.ping / daemon.status).
+    Ok(auth)
+}
+
+fn configured_service_endpoint(
+    paths: &OwnMeshPaths,
+    cfg: &ownmesh_config::OwnMeshConfig,
+) -> ownmesh_ipc::IpcResult<Endpoint> {
+    Endpoint::configured_daemon(&paths.runtime_dir, cfg.service_socket.path.as_deref())
+}
+
+/// The fixed management credential is bound to the daemon OS user. A non-empty
+/// Unix allow-list that excludes that uid could never deliver lifecycle RPCs, so
+/// startup rejects it rather than silently locking out management.
+fn validate_management_bootstrap_reachable(allowed_uids: &[u32]) -> Result<(), String> {
+    if allowed_uids.is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let daemon_uid = ownmesh_ipc::current_os_user_id()
+            .parse::<u32>()
+            .map_err(|err| {
+                format!("failed to resolve daemon uid for management bootstrap: {err}")
+            })?;
+        if allowed_uids.contains(&daemon_uid) {
+            return Ok(());
+        }
+        return Err(format!(
+            "service_socket.allowed_uids {allowed_uids:?} excludes daemon uid {daemon_uid}; fixed management credential bootstrap would be unreachable"
+        ));
+    }
+    #[cfg(not(unix))]
+    {
+        Err("service_socket.allowed_uids is unsupported on this platform; OS-user bootstrap binding cannot be represented as a numeric uid".into())
+    }
+}
+
+/// Ask the running daemon to provision a cooperative client.
+///
+/// The caller supplies only a client id. The server derives the principal and binds
+/// the current OS-attested peer user; there is no offline registry writer.
+pub fn provision_client_credential(client_id: &str) -> Result<String, ExitCode> {
+    credential_secret_rpc(methods::CREDENTIAL_PROVISION, client_id)
+}
+
+/// Ask the running daemon to rotate a cooperative client credential.
+pub fn rotate_client_credential(client_id: &str) -> Result<String, ExitCode> {
+    credential_secret_rpc(methods::CREDENTIAL_ROTATE, client_id)
+}
+
+/// Ask the running daemon to revoke a cooperative client credential.
+pub fn revoke_client_credential(client_id: &str) -> Result<(), ExitCode> {
+    let value = credential_rpc(methods::CREDENTIAL_REVOKE, client_id)?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        tracing::error!("daemon returned an invalid credential revoke response");
+        Err(ExitCode::Internal)
+    }
+}
+
+fn credential_secret_rpc(method: &str, client_id: &str) -> Result<String, ExitCode> {
+    let value = credential_rpc(method, client_id)?;
+    let result: CredentialSecretResult = serde_json::from_value(value).map_err(|err| {
+        tracing::error!(error = %err, "daemon returned an invalid credential lifecycle response");
+        ExitCode::Internal
+    })?;
+    Ok(result.credential)
+}
+
+fn credential_rpc(method: &str, client_id: &str) -> Result<serde_json::Value, ExitCode> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| {
+            tracing::error!(error = %err, "runtime build failed");
+            ExitCode::Internal
+        })?;
+    rt.block_on(async {
+        let paths = OwnMeshPaths::discover().map_err(|err| {
+            tracing::error!(error = %err, "path discovery failed");
+            ExitCode::UsageConfig
+        })?;
+        let cfg = load_config(&paths).map_err(|err| {
+            tracing::error!(error = %err, "config load failed");
+            ExitCode::UsageConfig
+        })?;
+        let credential = match std::env::var(CLIENT_CREDENTIAL_ENV) {
+            Ok(value) if value.trim().is_empty() => Err(IpcError::Protocol(format!(
+                "{CLIENT_CREDENTIAL_ENV} is set but empty"
+            ))),
+            Ok(value) => Ok(value),
+            Err(std::env::VarError::NotPresent) => read_management_credential(&paths.state_dir),
+            Err(std::env::VarError::NotUnicode(_)) => Err(IpcError::Protocol(format!(
+                "{CLIENT_CREDENTIAL_ENV} is not valid Unicode"
+            ))),
+        }
+        .map_err(|err| {
+                tracing::error!(
+                    error = %err,
+                    env = CLIENT_CREDENTIAL_ENV,
+                    "management credential unavailable; use the owner-only first-run delivery file or set the explicit credential environment variable"
+                );
+                ExitCode::Authentication
+            })?;
+        let endpoint = configured_service_endpoint(&paths, &cfg).map_err(|err| {
+            tracing::error!(error = %err, "service endpoint configuration failed");
+            ExitCode::UsageConfig
+        })?;
+        let client = IpcClient::new(
+            endpoint,
+            paths.runtime_dir,
+            ClientIdentity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            ClientOptions {
+                request_timeout: Duration::from_secs(5),
+                max_reconnect_attempts: 1,
+                reconnect_base_delay: Duration::from_millis(50),
+            },
+        )
+        .with_client_credential(credential);
+        client
+            .call(method, Some(json!({ "client_id": client_id })))
+            .await
+            .map_err(map_credential_rpc_error)
+    })
+}
+
+fn map_credential_rpc_error(err: IpcError) -> ExitCode {
+    match err {
+        IpcError::Unauthorized(message)
+        | IpcError::Remote {
+            code: ownmesh_ipc::app_error::UNAUTHORIZED,
+            message,
+        } => {
+            tracing::error!(%message, "credential lifecycle authentication failed");
+            ExitCode::Authentication
+        }
+        IpcError::Remote {
+            code: ownmesh_ipc::app_error::CONFLICT,
+            message,
+        } => {
+            tracing::error!(%message, "credential lifecycle conflict");
+            ExitCode::Conflict
+        }
+        IpcError::Remote {
+            code: ownmesh_ipc::app_error::INVALID_PARAMS,
+            message,
+        }
+        | IpcError::Protocol(message) => {
+            tracing::error!(%message, "invalid credential lifecycle request");
+            ExitCode::UsageConfig
+        }
+        IpcError::Disconnected(message) => {
+            tracing::error!(%message, "ownmeshd is not reachable");
+            ExitCode::DeviceOffline
+        }
+        IpcError::Timeout | IpcError::Cancelled => ExitCode::TimeoutCancelled,
+        other => {
+            tracing::error!(error = %other, "credential lifecycle RPC failed");
+            ExitCode::Internal
+        }
+    }
 }
 
 fn ensure_device_identity(
@@ -223,7 +382,11 @@ pub fn probe_status() -> Result<(), ExitCode> {
         .map_err(|_| ExitCode::Internal)?;
     rt.block_on(async {
         let paths = OwnMeshPaths::discover().map_err(|_| ExitCode::UsageConfig)?;
-        let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+        let cfg = load_config(&paths).map_err(|_| ExitCode::UsageConfig)?;
+        let endpoint = configured_service_endpoint(&paths, &cfg).map_err(|err| {
+            eprintln!("invalid service endpoint configuration: {err}");
+            ExitCode::UsageConfig
+        })?;
         let client = IpcClient::new(
             endpoint,
             paths.runtime_dir,
@@ -270,7 +433,7 @@ pub async fn start_test_daemon(
     let revoked = runtime.revoked_clients_handle();
     let runtime = Arc::new(Mutex::new(runtime));
     let handler = runtime_handler(Arc::clone(&runtime));
-    let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+    let endpoint = Endpoint::default_for(&paths.runtime_dir, ownmesh_ipc::IpcBus::Daemon);
     let server = Arc::new(IpcServer::new(
         ServerConfig::new(
             endpoint.clone(),
@@ -292,10 +455,200 @@ pub async fn start_test_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ownmesh_ipc::{app_error, methods, ClientIdentity, ClientOptions, IpcClient, IpcError};
+    use ownmesh_ipc::{
+        app_error, current_os_user_id, methods, ClientIdentity, ClientOptions, IpcBus, IpcClient,
+        IpcError,
+    };
     use ownmesh_policy::{preset_document, AccessPreset, Decision, PolicyDocument, PolicyRule};
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn configured_service_endpoint_uses_shared_resolution() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut cfg = ownmesh_config::OwnMeshConfig::default();
+        #[cfg(unix)]
+        {
+            cfg.service_socket.path = Some("custom.sock".into());
+            assert_eq!(
+                configured_service_endpoint(&paths, &cfg).unwrap(),
+                Endpoint::UnixSocket(paths.runtime_dir.join("custom.sock"))
+            );
+        }
+        #[cfg(windows)]
+        {
+            cfg.service_socket.path = Some("pipe:custom-ownmesh".into());
+            assert_eq!(
+                configured_service_endpoint(&paths, &cfg).unwrap(),
+                Endpoint::NamedPipe(r"\\.\pipe\custom-ownmesh".into())
+            );
+            cfg.service_socket.path = Some(r"C:\unsupported.sock".into());
+            assert!(configured_service_endpoint(&paths, &cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn allowed_uid_configuration_cannot_lock_out_management_bootstrap() {
+        assert!(validate_management_bootstrap_reachable(&[]).is_ok());
+        #[cfg(unix)]
+        {
+            let current = current_os_user_id().parse::<u32>().unwrap();
+            assert!(validate_management_bootstrap_reachable(&[current]).is_ok());
+            let other = current.wrapping_add(1);
+            let error = validate_management_bootstrap_reachable(&[other]).unwrap_err();
+            assert!(error.contains("bootstrap would be unreachable"), "{error}");
+        }
+        #[cfg(not(unix))]
+        {
+            let error = validate_management_bootstrap_reachable(&[0]).unwrap_err();
+            assert!(error.contains("unsupported"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn production_registry_lifecycle_rpc_survives_restart_and_denies_spoof() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let user_id = current_os_user_id();
+        let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+        let handler: MethodHandler = Arc::new(|_method, _params, client| {
+            Box::pin(async move { Ok(json!({ "principal": client.client_name })) })
+        });
+
+        let auth = attach_daemon_registry(&paths, AuthGate::for_user(&user_id)).unwrap();
+        assert!(auth.strict_uncredentialed());
+        let management_secret = read_management_credential(&paths.state_dir).unwrap();
+        let server = Arc::new(IpcServer::new(
+            ServerConfig::new(endpoint.clone(), auth, "ownmeshd", "1"),
+            Arc::clone(&handler),
+        ));
+        let serve = Arc::clone(&server);
+        let task = tokio::spawn(async move { serve.serve().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let options = ClientOptions {
+            max_reconnect_attempts: 0,
+            ..ClientOptions::default()
+        };
+        let plain = IpcClient::new(
+            endpoint.clone(),
+            &paths.runtime_dir,
+            ClientIdentity::new("ownmesh-management", "1"),
+            options.clone(),
+        );
+        let denied = plain
+            .call(
+                methods::CREDENTIAL_PROVISION,
+                Some(json!({ "client_id": "agent-a" })),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            denied,
+            IpcError::Unauthorized(_)
+                | IpcError::Remote {
+                    code: app_error::UNAUTHORIZED,
+                    ..
+                }
+        ));
+
+        let management = named_client(
+            endpoint.clone(),
+            paths.runtime_dir.clone(),
+            "ignored-management-label",
+            Some(management_secret.clone()),
+        );
+        let provisioned: CredentialSecretResult = serde_json::from_value(
+            management
+                .call(
+                    methods::CREDENTIAL_PROVISION,
+                    Some(json!({ "client_id": "agent-a" })),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(provisioned.principal, "client:agent-a");
+        let old_agent = named_client(
+            endpoint.clone(),
+            paths.runtime_dir.clone(),
+            "victim-admin",
+            Some(provisioned.credential),
+        );
+        assert_eq!(
+            old_agent.call("echo.who", None).await.unwrap()["principal"],
+            "client:agent-a"
+        );
+        let rotated: CredentialSecretResult = serde_json::from_value(
+            management
+                .call(
+                    methods::CREDENTIAL_ROTATE,
+                    Some(json!({ "client_id": "agent-a" })),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(old_agent.call("echo.who", None).await.is_err());
+
+        server.request_shutdown();
+        old_agent.disconnect().await;
+        management.disconnect().await;
+        plain.disconnect().await;
+        task.await.unwrap();
+        drop(old_agent);
+        drop(management);
+        drop(plain);
+        drop(server);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let auth = attach_daemon_registry(&paths, AuthGate::for_user(&user_id)).unwrap();
+        let restarted = Arc::new(IpcServer::new(
+            ServerConfig::new(endpoint.clone(), auth, "ownmeshd", "2"),
+            handler,
+        ));
+        let serve = Arc::clone(&restarted);
+        let task = tokio::spawn(async move { serve.serve().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let management = named_client(
+            endpoint.clone(),
+            paths.runtime_dir.clone(),
+            "ignored",
+            Some(management_secret),
+        );
+        let agent = named_client(
+            endpoint.clone(),
+            paths.runtime_dir.clone(),
+            "spoofed-label",
+            Some(rotated.credential),
+        );
+        assert_eq!(
+            agent.call("echo.who", None).await.unwrap()["principal"],
+            "client:agent-a"
+        );
+        let spoof = IpcClient::new(
+            endpoint,
+            &paths.runtime_dir,
+            ClientIdentity::new("client:agent-a", "2"),
+            options,
+        );
+        assert!(spoof.call("echo.who", None).await.is_err());
+        management
+            .call(
+                methods::CREDENTIAL_REVOKE,
+                Some(json!({ "client_id": "agent-a" })),
+            )
+            .await
+            .unwrap();
+        assert!(agent.call("echo.who", None).await.is_err());
+
+        restarted.request_shutdown();
+        task.await.unwrap();
+    }
 
     #[test]
     fn legacy_token_cleanup_failure_is_reported_fail_closed() {
@@ -919,10 +1272,13 @@ mod tests {
         chatgpt.status().await.expect("chatgpt pre-revoke status");
 
         let revoked = client
-            .call(methods::TOKEN_REVOKE, Some(json!({ "client": "chatgpt" })))
+            .call(
+                methods::TOKEN_REVOKE,
+                Some(json!({ "client": "client:chatgpt" })),
+            )
             .await
             .expect("token revoke");
-        assert_eq!(revoked["revoked"], "chatgpt");
+        assert_eq!(revoked["revoked"], "client:chatgpt");
         assert_eq!(revoked["ok"], true);
 
         let live_err = chatgpt
@@ -953,7 +1309,7 @@ mod tests {
             .revoked_clients_handle()
             .read()
             .unwrap()
-            .contains("chatgpt"));
+            .contains("client:chatgpt"));
     }
 
     #[tokio::test]
@@ -992,7 +1348,7 @@ mod tests {
             .await
             .expect("open");
         let sid = opened["id"].as_str().unwrap().to_owned();
-        assert_eq!(opened["controller"]["principal_id"], "chatgpt");
+        assert_eq!(opened["controller"]["principal_id"], "client:chatgpt");
 
         let spoof = chatgpt
             .call(
@@ -1041,15 +1397,15 @@ mod tests {
                 session_methods::GIVE,
                 Some(json!({
                     "id": sid,
-                    "to": "human",
+                    "to": "client:human",
                 })),
             )
             .await
             .expect("give");
-        assert_eq!(given["lease"]["principal_id"], "human");
+        assert_eq!(given["lease"]["principal_id"], "client:human");
         let readers = given["readers"].as_array().unwrap();
-        assert!(readers.iter().any(|r| r == "chatgpt"));
-        assert!(readers.iter().any(|r| r == "human"));
+        assert!(readers.iter().any(|r| r == "client:chatgpt"));
+        assert!(readers.iter().any(|r| r == "client:human"));
 
         let replay = chatgpt
             .call(
@@ -1151,7 +1507,7 @@ mod tests {
                     session_methods::GIVE,
                     Some(json!({
                         "id": sid,
-                        "to": "human",
+                        "to": "client:human",
                     })),
                 )
                 .await
@@ -1162,8 +1518,8 @@ mod tests {
         };
 
         let mut rt = DaemonRuntime::open(&paths).expect("reload runtime");
-        let chatgpt_id = ClientIdentity::new("chatgpt", "0.1.0");
-        let human_id = ClientIdentity::new("human", "0.1.0");
+        let chatgpt_id = ClientIdentity::new("client:chatgpt", "0.1.0");
+        let human_id = ClientIdentity::new("client:human", "0.1.0");
         let shown = rt
             .dispatch(
                 session_methods::SHOW,
@@ -1173,12 +1529,12 @@ mod tests {
             .await
             .expect("show after restart");
         assert_eq!(shown["id"], sid);
-        assert_eq!(shown["controller"]["principal_id"], "human");
+        assert_eq!(shown["controller"]["principal_id"], "client:human");
         assert!(shown["observers"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|o| o == "chatgpt"));
+            .any(|o| o == "client:chatgpt"));
 
         let replay = rt
             .dispatch(
@@ -1200,7 +1556,7 @@ mod tests {
         rt.dispatch(session_methods::SHOW, Some(json!({ "id": sid })), &human_id)
             .await
             .expect("human show");
-        let stranger = ClientIdentity::new("stranger", "0.1.0");
+        let stranger = ClientIdentity::new("client:stranger", "0.1.0");
         let denied = rt
             .dispatch(session_methods::SHOW, Some(json!({ "id": sid })), &stranger)
             .await

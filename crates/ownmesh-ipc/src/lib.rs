@@ -18,22 +18,29 @@ mod client;
 mod endpoint;
 mod error;
 mod frame;
+mod registry;
 mod rpc;
 mod server;
 mod transport;
 
 pub use auth::{
-    canonicalize_principal_key, current_os_user_id, generate_token, normalize_principal_part,
-    read_token_file, redact_secrets, write_token_file, AuthGate, ClientCredentialRecord,
-    OsPeerIdentity, PeerCredential, AUTH_TOKEN_FILE_NAME,
+    canonicalize_principal_key, constant_time_eq, current_os_user_id, generate_token,
+    normalize_principal_part, read_token_file, redact_secrets, write_token_file, AuthGate,
+    AuthResolution, ClientCredentialRecord, OsPeerIdentity, PeerCredential, RedactedSecret,
+    AUTH_TOKEN_FILE_NAME,
 };
 pub use client::{ClientIdentity, ClientOptions, IpcClient};
 pub use endpoint::{Endpoint, IpcBus};
 pub use error::{IpcError, IpcResult};
 pub use frame::{read_frame, write_frame, FrameDecoder, MAX_FRAME_BYTES};
+pub use registry::{
+    read_management_credential, BootstrapStatus, CLIENT_CREDENTIAL_ENV,
+    MANAGEMENT_CREDENTIAL_FILE_NAME,
+};
 pub use rpc::{
-    app_error, methods, DaemonStatus, HelloParams, HelloResult, RequestId, RpcErrorObject,
-    RpcRequest, RpcResponse, JSONRPC_VERSION,
+    app_error, methods, CredentialClientParams, CredentialProvisionParams, CredentialSecretResult,
+    DaemonStatus, HelloParams, HelloResult, RequestId, RpcErrorObject, RpcRequest, RpcResponse,
+    JSONRPC_VERSION,
 };
 pub use server::{reject_unknown_handler, IpcServer, MethodHandler, RevokedClients, ServerConfig};
 pub use transport::{connect, ClientConnection, LocalListener, ServerConnection};

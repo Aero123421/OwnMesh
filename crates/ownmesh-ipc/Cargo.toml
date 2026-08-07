@@ -24,6 +24,8 @@ bytes = "1.9.0"
 ownmesh-domain = { path = "../ownmesh-domain" }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
+sha2 = "0.10.8"
+subtle = "2"
 tokio = { version = "1.43.0", features = [
     "fs",
     "io-util",
@@ -37,13 +39,15 @@ tracing = "0.1.41"
 uuid = { version = "1.12.1", features = ["serde", "v4"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["process"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }

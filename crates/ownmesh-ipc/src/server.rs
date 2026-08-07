@@ -1,12 +1,16 @@
 //! Local IPC server loop (daemon side).
 
-use crate::auth::{canonicalize_principal_key, AuthGate, OsPeerIdentity, PeerCredential};
+use crate::auth::{
+    canonicalize_principal_key, AuthGate, AuthResolution, OsPeerIdentity, PeerCredential,
+};
 use crate::client::ClientIdentity;
 use crate::endpoint::Endpoint;
 use crate::error::{IpcError, IpcResult};
 use crate::frame::{read_frame, write_frame};
+use crate::registry::{canonical_client_id, managed_principal, MANAGEMENT_CLIENT_ID};
 use crate::rpc::{
-    app_error, methods, DaemonStatus, HelloParams, HelloResult, RpcRequest, RpcResponse,
+    app_error, methods, CredentialClientParams, CredentialProvisionParams, CredentialSecretResult,
+    DaemonStatus, HelloParams, HelloResult, RpcRequest, RpcResponse,
 };
 use crate::transport::{LocalListener, ServerConnection};
 use serde_json::{json, Value};
@@ -36,6 +40,12 @@ pub type MethodHandler = Arc<
 /// Keys are **mapped principal keys** (from OS peer / server-managed credentials),
 /// never raw self-reported HELLO names.
 pub type RevokedClients = Arc<RwLock<HashSet<String>>>;
+
+#[derive(Clone)]
+struct BoundClient {
+    identity: ClientIdentity,
+    auth: AuthResolution,
+}
 
 /// Configuration for [`IpcServer`].
 #[derive(Clone)]
@@ -114,12 +124,14 @@ impl IpcServer {
 
     /// Issue a server-managed per-client credential bound to the daemon OS user.
     ///
-    /// Used by tests and multi-agent setups that need distinct principals under
-    /// the same OS user. The secret is non-shared.
-    pub fn issue_client_credential(&self, principal_key: impl Into<String>) -> IpcResult<String> {
+    /// This narrow daemon-local helper accepts only a client id. The principal is
+    /// always derived as `client:<canonical client_id>`; callers cannot select it
+    /// or open/mutate durable registry state directly.
+    pub fn issue_client_credential(&self, client_id: impl Into<String>) -> IpcResult<String> {
+        let client_id = validate_requested_client_id(&client_id.into())?;
         self.cfg
             .auth
-            .issue_client_credential(principal_key, self.cfg.auth.own_user_id())
+            .issue_client_credential(client_id, self.cfg.auth.own_user_id())
     }
 
     /// Build the current status snapshot.
@@ -190,7 +202,7 @@ impl IpcServer {
             return Err(err);
         }
 
-        let mut client: Option<ClientIdentity> = None;
+        let mut client: Option<BoundClient> = None;
         let mut pending_frame = Some(first_frame);
 
         loop {
@@ -224,7 +236,7 @@ impl IpcServer {
     async fn dispatch(
         &self,
         req: RpcRequest,
-        client: &mut Option<ClientIdentity>,
+        client: &mut Option<BoundClient>,
         os_peer: &OsPeerIdentity,
     ) -> RpcResponse {
         let id = req.id.clone();
@@ -239,7 +251,7 @@ impl IpcServer {
                     app_error::UNAUTHORIZED,
                     format!(
                         "ipc identity already bound to {}; reconnect to authenticate a new client",
-                        identity.client_name
+                        identity.identity.client_name
                     ),
                 );
             }
@@ -268,12 +280,23 @@ impl IpcServer {
         };
 
         // Revocation is always checked against the mapped principal key.
-        if self.is_revoked(&identity.client_name) {
+        if self.is_revoked(&identity.auth.principal_key) {
             return RpcResponse::failure(
                 id,
                 app_error::TOKEN_REVOKED,
-                format!("principal {} is revoked", identity.client_name),
+                format!("principal {} is revoked", identity.auth.principal_key),
             );
+        }
+
+        // Registry-backed gates restrict uncredentialed same-uid peers to ping/status.
+        // Default local_user()/for_user() gates leave this as a no-op.
+        if let Err(err) = self.cfg.auth.authorize_method(&req.method, &identity.auth) {
+            return match err {
+                IpcError::Unauthorized(message) => {
+                    RpcResponse::failure(id, app_error::UNAUTHORIZED, message)
+                }
+                other => RpcResponse::failure(id, app_error::INTERNAL, other.to_string()),
+            };
         }
 
         if req.method == methods::PING {
@@ -287,10 +310,26 @@ impl IpcServer {
             };
         }
 
+        if credential_lifecycle_method(&req.method) {
+            return match self.handle_credential_lifecycle(&req.method, req.params, os_peer) {
+                Ok(value) => RpcResponse::success(id, value),
+                Err(IpcError::Protocol(message) | IpcError::Codec(message)) => {
+                    RpcResponse::failure(id, app_error::INVALID_PARAMS, message)
+                }
+                // Authentication already succeeded in authorize_method. Registry
+                // Unauthorized here means invalid lifecycle state (duplicate/missing).
+                Err(IpcError::Unauthorized(message)) => {
+                    RpcResponse::failure(id, app_error::CONFLICT, message)
+                }
+                Err(IpcError::Remote { code, message }) => RpcResponse::failure(id, code, message),
+                Err(err) => RpcResponse::failure(id, app_error::INTERNAL, err.to_string()),
+            };
+        }
+
         let handler = Arc::clone(&self.handler);
         let method = req.method.clone();
         let params = req.params.clone();
-        match handler(method, params, identity).await {
+        match handler(method, params, identity.identity).await {
             Ok(value) => RpcResponse::success(id, value),
             Err(IpcError::Remote { code, message }) => RpcResponse::failure(id, code, message),
             Err(err) if err.code() == "ipc_unauthorized" => {
@@ -300,11 +339,57 @@ impl IpcServer {
         }
     }
 
+    fn handle_credential_lifecycle(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        os_peer: &OsPeerIdentity,
+    ) -> IpcResult<Value> {
+        match method {
+            methods::CREDENTIAL_PROVISION => {
+                let params: CredentialProvisionParams = parse_required_params(params)?;
+                let client_id = validate_requested_client_id(&params.client_id)?;
+                let principal = managed_principal_for_client_id(&client_id);
+                let credential = self
+                    .cfg
+                    .auth
+                    .provision_client_credential(&client_id, &os_peer.user_id)?;
+                serde_json::to_value(CredentialSecretResult {
+                    client_id,
+                    principal,
+                    credential,
+                })
+                .map_err(|err| IpcError::Protocol(err.to_string()))
+            }
+            methods::CREDENTIAL_ROTATE => {
+                let params: CredentialClientParams = parse_required_params(params)?;
+                let client_id = validate_requested_client_id(&params.client_id)?;
+                let principal = managed_principal_for_client_id(&client_id);
+                let credential = self.cfg.auth.rotate_client_credential(&client_id)?;
+                serde_json::to_value(CredentialSecretResult {
+                    client_id,
+                    principal,
+                    credential,
+                })
+                .map_err(|err| IpcError::Protocol(err.to_string()))
+            }
+            methods::CREDENTIAL_REVOKE => {
+                let params: CredentialClientParams = parse_required_params(params)?;
+                let client_id = validate_requested_client_id(&params.client_id)?;
+                self.cfg.auth.revoke_client_credential(&client_id)?;
+                Ok(json!({ "ok": true, "client_id": client_id }))
+            }
+            _ => Err(IpcError::Protocol(format!(
+                "not a credential lifecycle method: {method}"
+            ))),
+        }
+    }
+
     fn handle_hello(
         &self,
         req: RpcRequest,
         os_peer: &OsPeerIdentity,
-    ) -> IpcResult<(HelloResult, ClientIdentity)> {
+    ) -> IpcResult<(HelloResult, BoundClient)> {
         let params: HelloParams = match req.params {
             Some(value) => serde_json::from_value(value)
                 .map_err(|err| IpcError::Protocol(format!("invalid hello params: {err}")))?,
@@ -314,15 +399,19 @@ impl IpcServer {
         };
 
         // Self-reported client_name is intentionally NOT used for principal mapping.
+        // Only OS peer + registry/in-memory credential yield a registered principal.
+        // The optional owner claim is carried only to make its untrusted status explicit.
         let presented = PeerCredential {
             token: params.token,
             client_name: params.client_name,
+            owner: params.owner,
             os_user_id: Some(os_peer.user_id.clone()),
             pid: Some(os_peer.pid),
             client_credential: params.client_credential,
         };
 
-        let principal = self.cfg.auth.resolve_principal(os_peer, &presented)?;
+        let auth = self.cfg.auth.resolve_auth(os_peer, &presented)?;
+        let principal = auth.principal_key.clone();
 
         if self.is_revoked(&principal) {
             return Err(IpcError::Remote {
@@ -331,10 +420,15 @@ impl IpcServer {
             });
         }
 
-        // ClientIdentity.client_name holds the **server-assigned principal key**.
+        // Only the server-assigned principal reaches application handlers;
+        // credential metadata remains private to dispatch authorization.
         let identity = ClientIdentity {
             client_name: principal.clone(),
             client_version: params.client_version,
+        };
+        let bound = BoundClient {
+            identity,
+            auth: auth.clone(),
         };
         Ok((
             HelloResult {
@@ -342,8 +436,9 @@ impl IpcServer {
                 server_version: self.cfg.server_version.clone(),
                 authenticated: true,
                 principal: Some(principal),
+                credentialed: auth.credentialed,
             },
-            identity,
+            bound,
         ))
     }
 
@@ -363,6 +458,33 @@ impl IpcServer {
             // Revocation state failure is authorization failure, never allow.
             .unwrap_or(true)
     }
+}
+
+fn credential_lifecycle_method(method: &str) -> bool {
+    matches!(
+        method,
+        methods::CREDENTIAL_PROVISION | methods::CREDENTIAL_ROTATE | methods::CREDENTIAL_REVOKE
+    )
+}
+
+fn parse_required_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> IpcResult<T> {
+    let value = params.ok_or_else(|| IpcError::Protocol("method params are required".into()))?;
+    serde_json::from_value(value)
+        .map_err(|err| IpcError::Protocol(format!("invalid params: {err}")))
+}
+
+fn validate_requested_client_id(raw: &str) -> IpcResult<String> {
+    let client_id = canonical_client_id(raw)?;
+    if client_id == MANAGEMENT_CLIENT_ID {
+        return Err(IpcError::Protocol(
+            "client_id is reserved for fixed daemon management".into(),
+        ));
+    }
+    Ok(client_id)
+}
+
+fn managed_principal_for_client_id(client_id: &str) -> String {
+    managed_principal(client_id)
 }
 
 /// Default handler that rejects unknown methods.
@@ -419,6 +541,7 @@ mod tests {
             Some(json!(HelloParams {
                 token: String::new(),
                 client_name: "label-a".into(),
+                owner: Some("spoofed-owner-a".into()),
                 client_version: Some("1.0.0".into()),
                 client_credential: Some(cred_a),
             })),
@@ -428,13 +551,14 @@ mod tests {
             .unwrap();
         let first = RpcResponse::from_bytes(&read_frame(&mut conn).await.unwrap()).unwrap();
         let first_val = first.into_result().expect("first hello ok");
-        assert_eq!(first_val["principal"], "agent-a");
+        assert_eq!(first_val["principal"], "client:agent-a");
 
         let hello_b = RpcRequest::new(
             m::HELLO,
             Some(json!(HelloParams {
                 token: String::new(),
                 client_name: "label-b-as-admin".into(),
+                owner: Some("spoofed-owner-b".into()),
                 client_version: Some("9.9.9".into()),
                 client_credential: Some(cred_b.clone()),
             })),
@@ -554,9 +678,9 @@ mod tests {
             .call("echo.who", None)
             .await
             .expect("pre-revoke call");
-        assert_eq!(ok["client"], "agent-a");
+        assert_eq!(ok["client"], "client:agent-a");
 
-        revoked.write().unwrap().insert("agent-a".into());
+        revoked.write().unwrap().insert("client:agent-a".into());
 
         let denied = client
             .call("echo.who", None)

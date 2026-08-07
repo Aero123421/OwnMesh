@@ -520,7 +520,7 @@ async fn self_reported_principal_rejected_on_all_session_ops() {
         .await
         .expect("open");
     let sid = opened["id"].as_str().unwrap().to_owned();
-    assert_eq!(opened["controller"]["principal_id"], "chatgpt");
+    assert_eq!(opened["controller"]["principal_id"], "client:chatgpt");
 
     // open with spoofed principal
     let err = owner
@@ -677,9 +677,7 @@ async fn revoke_blocks_hello_and_dispatch() {
     let paths = OwnMeshPaths::for_base(dir.path());
     let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
     let admin = named_client(endpoint.clone(), paths.runtime_dir.clone(), "ownmesh");
-    let agent_cred = server
-        .issue_client_credential("  Agent/Path/../ChatGPT  ")
-        .unwrap();
+    let agent_cred = server.issue_client_credential("Agent-ChatGPT").unwrap();
     let agent = named_client_with_cred(
         endpoint.clone(),
         paths.runtime_dir.clone(),
@@ -698,21 +696,20 @@ async fn revoke_blocks_hello_and_dispatch() {
         .await
         .expect("pre-revoke dispatch");
 
-    // Revoke through a case/separator alias. Issuance, input, storage, and checks
-    // must converge on the same canonical principal.
+    // Revoke through a case/whitespace alias. The server-defined client namespace,
+    // persisted value, and checks must converge on the same canonical principal.
     let revoked = admin
         .call(
             methods::TOKEN_REVOKE,
-            Some(json!({ "principal": " AGENT\\CHATGPT " })),
+            Some(json!({ "principal": " CLIENT:AGENT-CHATGPT " })),
         )
         .await
         .expect("revoke");
-    assert_eq!(revoked["revoked"], "agent/chatgpt");
+    assert_eq!(revoked["revoked"], "client:agent-chatgpt");
     assert_eq!(revoked["ok"], true);
     let persisted = std::fs::read_to_string(paths.state_dir.join("revoked-clients.json")).unwrap();
-    assert!(persisted.contains("agent/chatgpt"), "{persisted}");
+    assert!(persisted.contains("client:agent-chatgpt"), "{persisted}");
     assert!(!persisted.contains("AGENT"), "{persisted}");
-    assert!(!persisted.contains("Path"), "{persisted}");
 
     // Live connection: dispatch denied.
     let live = agent
@@ -856,6 +853,7 @@ async fn attack_rehello_cannot_switch_principal_or_bypass_revoke() {
         Some(json!(HelloParams {
             token: String::new(),
             client_name: "label-chatgpt".into(),
+            owner: Some("spoofed-owner".into()),
             client_version: Some("1.0.0".into()),
             client_credential: Some(agent_cred.clone()),
         })),
@@ -865,14 +863,17 @@ async fn attack_rehello_cannot_switch_principal_or_bypass_revoke() {
         .unwrap();
     let first = RpcResponse::from_bytes(&read_frame(&mut conn).await.unwrap()).unwrap();
     let first_val = first.into_result().expect("hello");
-    assert_eq!(first_val["principal"], "chatgpt");
+    assert_eq!(first_val["principal"], "client:chatgpt");
 
     // Revoke the bound principal while the connection is live.
     let revoked = admin
-        .call(methods::TOKEN_REVOKE, Some(json!({ "client": "chatgpt" })))
+        .call(
+            methods::TOKEN_REVOKE,
+            Some(json!({ "client": "client:chatgpt" })),
+        )
         .await
         .expect("revoke");
-    assert_eq!(revoked["revoked"], "chatgpt");
+    assert_eq!(revoked["revoked"], "client:chatgpt");
     let _ = runtime; // runtime already shares revoked set via server config
 
     // Attempt to re-HELLO as a different principal on the same connection.
@@ -881,6 +882,7 @@ async fn attack_rehello_cannot_switch_principal_or_bypass_revoke() {
         Some(json!(HelloParams {
             token: String::new(),
             client_name: "other-agent".into(),
+            owner: Some("spoofed-other-owner".into()),
             client_version: Some("9.9.9".into()),
             client_credential: Some(other_cred),
         })),
@@ -951,7 +953,7 @@ async fn attack_shared_token_and_name_spoof_cannot_impersonate() {
         )
         .await
         .expect("victim open");
-    assert_eq!(opened["controller"]["principal_id"], "victim-admin");
+    assert_eq!(opened["controller"]["principal_id"], "client:victim-admin");
 
     // Attacker presents a shared token + claims victim name — must fail closed.
     let spoof = IpcClient::new(

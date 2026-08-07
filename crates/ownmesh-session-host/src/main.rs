@@ -15,9 +15,9 @@ mod pty_host;
 
 use clap::{Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ownmesh_config::OwnMeshPaths;
+use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcBus, IpcClient};
+use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use ownmesh_session::{
     load_manager, save_manager, PtyCommand, PtySize, SessionError, SessionManager, SessionResult,
 };
@@ -129,7 +129,18 @@ fn run_status() -> Result<(), ExitCode> {
             eprintln!("paths: {err}");
             ExitCode::UsageConfig
         })?;
-        let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+        let cfg = load_config(&paths).map_err(|err| {
+            eprintln!("config: {err}");
+            ExitCode::UsageConfig
+        })?;
+        let endpoint = Endpoint::configured_daemon(
+            &paths.runtime_dir,
+            cfg.service_socket.path.as_deref(),
+        )
+        .map_err(|err| {
+            eprintln!("service endpoint configuration failed: {err}");
+            ExitCode::UsageConfig
+        })?;
         let client = IpcClient::new(
             endpoint,
             paths.runtime_dir,
@@ -139,7 +150,15 @@ fn run_status() -> Result<(), ExitCode> {
                 max_reconnect_attempts: 2,
                 reconnect_base_delay: Duration::from_millis(50),
             },
-        );
+        )
+        .with_client_credential_from_env()
+        .map_err(|err| {
+            eprintln!(
+                "session-host credential configuration failed: {err}; set {} to a daemon-provisioned cooperative-client credential",
+                ownmesh_ipc::CLIENT_CREDENTIAL_ENV
+            );
+            ExitCode::Authentication
+        })?;
         match client.status().await {
             Ok(status) => {
                 println!(
@@ -152,8 +171,26 @@ fn run_status() -> Result<(), ExitCode> {
                 Ok(())
             }
             Err(err) => {
-                eprintln!("session-host failed to reach daemon: {err}");
-                Err(ExitCode::DeviceOffline)
+                if matches!(err, ownmesh_ipc::IpcError::Unauthorized(_))
+                    || matches!(
+                        err,
+                        ownmesh_ipc::IpcError::Remote { code, .. }
+                            if matches!(
+                                code,
+                                ownmesh_ipc::app_error::UNAUTHORIZED
+                                    | ownmesh_ipc::app_error::TOKEN_REVOKED
+                            )
+                    )
+                {
+                    eprintln!(
+                        "session-host authentication failed: {err}; provision this cooperative client and set {}",
+                        ownmesh_ipc::CLIENT_CREDENTIAL_ENV
+                    );
+                    Err(ExitCode::Authentication)
+                } else {
+                    eprintln!("session-host failed to reach daemon: {err}");
+                    Err(ExitCode::DeviceOffline)
+                }
             }
         }
     })
@@ -403,7 +440,7 @@ fn _touch_raw() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ownmesh_ipc::{reject_unknown_handler, AuthGate, IpcServer, ServerConfig};
+    use ownmesh_ipc::{reject_unknown_handler, AuthGate, IpcBus, IpcServer, ServerConfig};
     use ownmesh_session::{PtyBackend, PtyCommand, PtySize, SessionState};
     use std::sync::Arc;
     use tempfile::tempdir;
