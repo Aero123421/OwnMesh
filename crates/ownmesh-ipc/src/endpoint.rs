@@ -64,11 +64,11 @@ impl Endpoint {
         #[cfg(unix)]
         {
             let path = PathBuf::from(raw);
-            return Ok(Self::UnixSocket(if path.is_absolute() {
+            Ok(Self::UnixSocket(if path.is_absolute() {
                 path
             } else {
                 runtime_dir.join(path)
-            }));
+            }))
         }
         #[cfg(windows)]
         {

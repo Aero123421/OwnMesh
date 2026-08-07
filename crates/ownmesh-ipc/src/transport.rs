@@ -456,7 +456,7 @@ fn unix_peer_identity(stream: &UnixStream) -> IpcResult<OsPeerIdentity> {
         ))
     })?;
     let pid = u32::try_from(ucred.pid().unwrap_or(0)).unwrap_or(0);
-    let uid = u32::try_from(ucred.uid()).unwrap_or(u32::MAX);
+    let uid = ucred.uid();
     let exe_path = read_exe_path_for_pid(pid);
     Ok(OsPeerIdentity {
         pid,
@@ -740,12 +740,7 @@ fn apply_unix_socket_security(path: &Path, security: &UnixSocketSecurity) -> Ipc
 
     if security.owner_uid.is_some() || security.group_gid.is_some() {
         // std::os::unix::fs::chown is fail-closed: any OS error aborts serve.
-        chown(
-            path,
-            security.owner_uid.map(Into::into),
-            security.group_gid.map(Into::into),
-        )
-        .map_err(|err| {
+        chown(path, security.owner_uid, security.group_gid).map_err(|err| {
             IpcError::Protocol(format!(
                 "failed to chown socket {} to owner={:?} group={:?}: {err} (fail-closed)",
                 path.display(),
