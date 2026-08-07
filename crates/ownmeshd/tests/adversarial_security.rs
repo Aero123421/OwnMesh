@@ -1493,7 +1493,11 @@ async fn production_agent_cannot_self_approve_or_use_management_for_human_ops() 
         "agent-label",
         Some(provisioned.credential),
     );
-    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human-operator");
+    let human = named_client(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "human-operator",
+    );
 
     {
         let mut guard = runtime.lock().await;
@@ -1555,7 +1559,10 @@ async fn production_agent_cannot_self_approve_or_use_management_for_human_ops() 
     assert_unauthorized(mgmt_approve);
 
     for (method, params) in [
-        (methods::POLICY_PRESET, Some(json!({ "preset": "full_access" }))),
+        (
+            methods::POLICY_PRESET,
+            Some(json!({ "preset": "full_access" })),
+        ),
         (methods::DAEMON_UNLOCK, None),
         (
             methods::TOKEN_REVOKE,
@@ -1604,9 +1611,24 @@ async fn production_agent_cannot_self_approve_or_use_management_for_human_ops() 
     let _ = handle.await;
 }
 
-#[cfg(unix)]
+/// Benign native binary used as the pre-approval pin target.
+fn sample_native_binary() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::path::PathBuf::from("/bin/echo")
+    }
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        system_root.join("System32").join("where.exe")
+    }
+}
+
 #[tokio::test]
 async fn production_approval_rejects_executable_content_swap_toctou() {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempdir().unwrap();
@@ -1639,9 +1661,14 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
     );
     let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
 
-    let tool = dir.path().join("pinned-tool");
-    // Copy a real benign binary so structured classification + pin succeed.
-    std::fs::copy("/bin/echo", &tool).expect("copy echo");
+    // Keep a native extension so Windows still classifies the path as structured.
+    let tool = dir.path().join(if cfg!(windows) {
+        "pinned-tool.exe"
+    } else {
+        "pinned-tool"
+    });
+    std::fs::copy(sample_native_binary(), &tool).expect("copy sample native binary");
+    #[cfg(unix)]
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
     let marker = dir.path().join("pwned-marker");
 
@@ -1689,16 +1716,29 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
         )
         .await
         .expect("enqueue structured");
+    assert_eq!(pending["approval_required"], true);
     let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
 
-    // Replace the canonical path with a shebang payload before human approval.
+    // Replace the canonical path after enqueue / before human approval.
+    // Unix: shebang script. Windows: different PE bytes (cmd.exe) under the same path.
     let swapped = dir.path().join("pinned-tool.swapped");
-    std::fs::write(
-        &swapped,
-        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(unix)]
+    {
+        std::fs::write(
+            &swapped,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        std::fs::copy(system_root.join("System32").join("cmd.exe"), &swapped)
+            .expect("copy replacement pe");
+    }
     std::fs::rename(&swapped, &tool).unwrap();
 
     let denied = human
@@ -1716,16 +1756,14 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
                 lower.contains("identity")
                     || lower.contains("digest")
                     || lower.contains("classification")
-                    || lower.contains("re-authorized"),
+                    || lower.contains("re-authorized")
+                    || lower.contains("drift"),
                 "{message}"
             );
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    assert!(
-        !marker.exists(),
-        "swapped shebang payload must never execute"
-    );
+    assert!(!marker.exists(), "swapped payload must never execute");
 
     server.request_shutdown();
     let _ = handle.await;

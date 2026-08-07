@@ -202,15 +202,18 @@ fn interpreters_and_script_extensions_are_raw() {
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn shebang_script_is_raw_and_pin_detects_content_drift() {
+fn pin_detects_path_preserving_content_drift() {
     use ownmesh_exec::{pin_executable, verify_executable_pin};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tool");
+    let path = dir
+        .path()
+        .join(if cfg!(windows) { "tool.bin" } else { "tool" });
     std::fs::write(&path, b"\x7fELFnative-binary-placeholder").unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     assert_eq!(
@@ -219,9 +222,10 @@ fn shebang_script_is_raw_and_pin_detects_content_drift() {
     );
     let pin = pin_executable(&path, CommandKind::Structured).unwrap();
 
-    // Atomic path-preserving replacement with a shebang script.
+    // Atomic path-preserving replacement (shebang / alternate payload).
     let swapped = dir.path().join("tool.swapped");
     std::fs::write(&swapped, b"#!/bin/sh\ntouch pwned\n").unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::rename(&swapped, &path).unwrap();
 

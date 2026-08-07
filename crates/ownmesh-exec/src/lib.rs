@@ -130,9 +130,8 @@ const INTERPRETER_BINARIES: &[&str] = &[
 
 /// Script-like extensions that must never be treated as pinned native binaries.
 const SCRIPT_EXTENSIONS: &[&str] = &[
-    "bat", "cmd", "ps1", "psm1", "psd1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msc",
-    "sh", "bash", "zsh", "ksh", "csh", "fish", "py", "rb", "pl", "php", "lua", "tcl",
-    "command", "cgi",
+    "bat", "cmd", "ps1", "psm1", "psd1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msc", "sh",
+    "bash", "zsh", "ksh", "csh", "fish", "py", "rb", "pl", "php", "lua", "tcl", "command", "cgi",
 ];
 
 /// Filesystem identity + content digest pinned at classification / approval time.
@@ -301,7 +300,8 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
         )));
     }
     let (device, inode) = file_identity(&meta);
-    if (pin.device.is_some() || pin.inode.is_some()) && (device != pin.device || inode != pin.inode) {
+    if (pin.device.is_some() || pin.inode.is_some()) && (device != pin.device || inode != pin.inode)
+    {
         return Err(ExecError::Journal(
             "executable device/inode drifted before execution; request must be re-authorized"
                 .into(),

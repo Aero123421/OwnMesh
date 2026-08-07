@@ -99,7 +99,7 @@ pub struct ApprovalRecord {
     /// Authenticated principal that enqueued the deferred operation (server-assigned).
     #[serde(default)]
     pub requester_principal: String,
-    /// Policy facts snapshot captured at enqueue (capability/kind/program/path/…). 
+    /// Policy facts snapshot captured at enqueue (capability/kind/program/path/…).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<OperationFacts>,
     /// Serialized original request params.
@@ -826,8 +826,9 @@ impl DaemonRuntime {
             if current_kind.as_str() != pin.policy_kind {
                 return Err(IpcError::Remote {
                     code: app_error::POLICY_DENIED,
-                    message: "command classification drifted from pinned policy_kind before execution"
-                        .into(),
+                    message:
+                        "command classification drifted from pinned policy_kind before execution"
+                            .into(),
                 });
             }
         } else if matches!(approved_kind, CommandKind::Structured)
@@ -836,8 +837,9 @@ impl DaemonRuntime {
             // Structured absolute executables must always carry a pin after enqueue/allow.
             return Err(IpcError::Remote {
                 code: app_error::POLICY_DENIED,
-                message: "structured executable missing identity pin; request must be re-authorized"
-                    .into(),
+                message:
+                    "structured executable missing identity pin; request must be re-authorized"
+                        .into(),
             });
         }
         // `handle_exec` replaced argv executable aliases with the exact canonical
@@ -1058,12 +1060,13 @@ impl DaemonRuntime {
         if matches!(kind, CommandKind::Structured) {
             let program_path = Path::new(&p.program);
             if program_path.is_absolute() {
-                p.executable_pin = Some(pin_executable(program_path, kind).map_err(|e| {
-                    IpcError::Remote {
-                        code: app_error::POLICY_DENIED,
-                        message: format!("unable to pin structured executable identity: {e}"),
-                    }
-                })?);
+                p.executable_pin =
+                    Some(
+                        pin_executable(program_path, kind).map_err(|e| IpcError::Remote {
+                            code: app_error::POLICY_DENIED,
+                            message: format!("unable to pin structured executable identity: {e}"),
+                        })?,
+                    );
             }
         }
         let facts = OperationFacts {
@@ -1269,11 +1272,7 @@ impl DaemonRuntime {
             principal_id: Option<String>,
         }
         let p: P = parse_params(params)?;
-        let _ = (
-            p.approver_principal_id,
-            p.approver_id,
-            p.principal_id,
-        );
+        let _ = (p.approver_principal_id, p.approver_id, p.principal_id);
         let approver = canonicalize_principal_key(client.principal_key());
         let rec = self.approvals.get(&p.id).ok_or_else(|| IpcError::Remote {
             code: app_error::INVALID_PARAMS,
@@ -2230,21 +2229,28 @@ pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
 /// Fail-closed gate for approval decisions.
 ///
 /// - Approver must be an OS-attested human principal (`user:*`).
-/// - Credentialed client/service requesters cannot self-approve.
+/// - Non-human / credentialed principals can never approve.
+/// - Credentialed requesters cannot self-approve (identity must differ from approver).
 /// - Client-supplied approver fields are never consulted (caller passes auth identity only).
+///
+/// AuthGate already rejects credentialed callers for approve/deny; this is defense in depth
+/// inside the production runtime handler so a bypassed gate cannot self-approve.
 fn ensure_independent_human_approver(approver: &str, requester: &str) -> IpcResult<()> {
     let approver = canonicalize_principal_key(approver);
     let requester = canonicalize_principal_key(requester);
-    if approver.is_empty() || !is_human_os_principal(&approver) {
+    if approver.is_empty()
+        || !is_human_os_principal(&approver)
+        || is_credentialed_client_principal(&approver)
+    {
         return Err(IpcError::Remote {
             code: app_error::UNAUTHORIZED,
             message: "approval requires an independently authenticated human OS principal (user:*)"
                 .into(),
         });
     }
-    // Non-human / credentialed requesters may only be decided by a different human principal.
-    if is_credentialed_client_principal(&requester) && (requester == approver || requester.is_empty())
-    {
+    // Local human operators may approve their own deferred ops (same user:* principal).
+    // Agent/service creators (`client:*`) must always be decided by a different human.
+    if is_credentialed_client_principal(&requester) && requester == approver {
         return Err(IpcError::Remote {
             code: app_error::UNAUTHORIZED,
             message: "operation creator cannot self-approve; independent human principal required"
