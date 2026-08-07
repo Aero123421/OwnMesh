@@ -162,8 +162,8 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_publish_always_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "needs: [ci-gate, security-gate, build]",
-                "needs: [ci-gate, security-gate, build]\n    if: always()",
+                "needs: [ci-gate, security-gate, build, distribution-metadata]",
+                "needs: [ci-gate, security-gate, build, distribution-metadata]\n    if: always()",
                 1,
             )
 
@@ -180,8 +180,8 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_archive_binary_set_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "            for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do",
-                "            for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host; do",
+                "for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do",
+                "for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host; do",
                 1,
             )
 
@@ -215,8 +215,8 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_surface_count_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                '"explicit_unsupported_count": 44',
-                '"explicit_unsupported_count": 43',
+                '"explicit_unsupported_count": 40',
+                '"explicit_unsupported_count": 39',
                 1,
             )
 
@@ -267,8 +267,8 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_docs_surface_claim_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "44 explicit unsupported CLI surfaces",
                 "40 explicit unsupported CLI surfaces",
+                "39 explicit unsupported CLI surfaces",
                 1,
             )
 

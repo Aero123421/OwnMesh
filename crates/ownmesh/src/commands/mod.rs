@@ -10,10 +10,11 @@ mod policy_cmd;
 mod privileged;
 mod session_cmd;
 mod status;
+mod update_cmd;
 
 use crate::cli::{
     Cli, Commands, ConfigCmd, DeviceCmd, InstanceCmd, McpCmd, PrivilegedCmd, ProcessCmd,
-    ProfileCmd, ServiceCmd, SessionCmd, TransferCmd, UpdateCmd, WorkspaceCmd,
+    ProfileCmd, ServiceCmd, SessionCmd, TransferCmd, WorkspaceCmd,
 };
 use ownmesh_domain::ExitCode;
 use serde_json::json;
@@ -64,10 +65,6 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "service restart",
     "service status",
     "service uninstall",
-    "update check",
-    "update download",
-    "update apply",
-    "update channel",
     "mcp serve",
 ];
 
@@ -119,7 +116,7 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Transfer(cmd)) => dispatch_transfer(cli, cmd),
         Some(Commands::Service(cmd)) => dispatch_service(cli, cmd),
         Some(Commands::Privileged(cmd)) => dispatch_privileged(cli, cmd),
-        Some(Commands::Update(cmd)) => dispatch_update(cli, cmd),
+        Some(Commands::Update(cmd)) => update_cmd::dispatch_update(cli, cmd),
         Some(Commands::Mcp(cmd)) => dispatch_mcp(cli, cmd),
         Some(Commands::Completion(args)) => stub(
             cli,
@@ -265,15 +262,6 @@ fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
     privileged::dispatch_privileged(cli, cmd)
 }
 
-fn dispatch_update(cli: &Cli, cmd: &UpdateCmd) -> Result<(), ExitCode> {
-    match cmd {
-        UpdateCmd::Check => stub(cli, "update check", "chapter 14"),
-        UpdateCmd::Download => stub(cli, "update download", "chapter 14"),
-        UpdateCmd::Apply => stub(cli, "update apply", "chapter 14"),
-        UpdateCmd::Channel { name } => stub(cli, "update channel", &format!("{name:?}")),
-    }
-}
-
 fn dispatch_mcp(cli: &Cli, cmd: &McpCmd) -> Result<(), ExitCode> {
     match cmd {
         McpCmd::Serve { stdio } => stub(cli, "mcp serve", &format!("stdio={stdio}")),
@@ -366,7 +354,7 @@ mod registry_tests {
             manifest["explicit_unsupported_count"].as_u64(),
             Some(explicit.len() as u64)
         );
-        assert_eq!(explicit.len(), 44, "explicit unsupported count must be 44");
+        assert_eq!(explicit.len(), 40, "explicit unsupported count must be 40");
         assert_eq!(
             additional.len(),
             7,
@@ -378,8 +366,8 @@ mod registry_tests {
         );
         assert_eq!(
             manifest["total_unsupported_surfaces"].as_u64(),
-            Some(51),
-            "total unsupported count must be 51"
+            Some(47),
+            "total unsupported count must be 47"
         );
 
         assert_eq!(

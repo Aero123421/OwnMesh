@@ -1,6 +1,6 @@
 # OwnMesh 1.0 Definition of Done — Release-quality audit
 
-**Release train:** v1.0.2 candidate
+**Release train:** v1.1.0
 
 **Audit date:** 2026-08-06
 
@@ -10,7 +10,7 @@
 
 ## Conclusion
 
-OwnMesh 1.0.x is **not complete against the specification DoD**. The parsed CLI contains **44 explicit unsupported CLI surfaces** from the authoritative Rust registry plus 7 additional hard-error unsupported surfaces (51 total), recorded in `release/SUPPORTED_SURFACES.json`; these surfaces are excluded from the 1.0.x completeness claim and return explicit errors. Remote routing hard-fails rather than falling back locally, `approval watch` does not degrade to a one-shot list, and broker install/uninstall cannot claim native service state.
+OwnMesh 1.0.x is **not complete against the specification DoD**. The parsed CLI contains **40 explicit unsupported CLI surfaces** from the authoritative Rust registry plus 7 additional hard-error unsupported surfaces (47 total), recorded in `release/SUPPORTED_SURFACES.json`; these surfaces are excluded from the 1.0.x completeness claim and return explicit errors. Remote routing hard-fails rather than falling back locally, `approval watch` does not degrade to a one-shot list, and broker install/uninstall cannot claim native service state.
 
 The v1.0.2 remediation makes build/security/release evidence fail-closed; it does not turn unimplemented product surfaces into completed features. “Library exists”, “parser accepts a command”, and “workflow exists” are not counted as end-to-end completion.
 

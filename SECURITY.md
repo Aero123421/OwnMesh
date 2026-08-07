@@ -62,3 +62,18 @@ Reports in these areas are especially valuable:
 - Release signing, SBOM, and provenance approach is recorded in [`docs/adr/0001-release-signing-sbom-provenance.md`](./docs/adr/0001-release-signing-sbom-provenance.md)
 
 Thank you for helping keep OwnMesh and its users safe.
+
+## Release signing (minisign)
+
+OwnMesh portable release checksums are signed with minisign.
+
+| Field | Value |
+| --- | --- |
+| Public key | [`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub) |
+| Key ID | `C596813EFB0946A4` |
+| Fingerprint (SHA-256 of decoded public-key blob) | `1450496b7af985f57466b4b5f0b9c985d6c3e96ed66ee2cebb4f5a94ba5775d9` |
+
+**Rotation:** announce a new key ID and fingerprint in this file and the next release notes, commit only the new public key, and update the `MINISIGN_SECRET_KEY` repository secret. Never commit private keys. Historical public keys should remain documented for at least one release train so older artifacts stay verifiable.
+
+Consumers should verify in order: `SHA256SUMS.minisig` → `SHA256SUMS` → individual assets. The `ownmesh update` client embeds the tracked public key and enforces this order fail-closed.
+

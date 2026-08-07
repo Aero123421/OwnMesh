@@ -204,6 +204,7 @@ def main() -> int:
     ci_gate = job_block(release, "ci-gate")
     security_gate = job_block(release, "security-gate")
     build_job = job_block(release, "build")
+    dist_job = job_block(release, "distribution-metadata")
     publish_job = job_block(release, "publish")
     require_text(ci_gate, "uses: ./.github/workflows/ci.yml", "Release ci-gate")
     require_text(security_gate, "uses: ./.github/workflows/security.yml", "Release security-gate")
@@ -211,29 +212,39 @@ def main() -> int:
     require("steps:" not in security_gate and "runs-on:" not in security_gate,
             "security-gate must remain a reusable workflow call")
     require_text(build_job, "needs: [ci-gate, security-gate]", "Release build")
-    require_text(publish_job, "needs: [ci-gate, security-gate, build]", "Release publish")
+    require_text(dist_job, "needs: [ci-gate, security-gate, build]", "Release distribution-metadata")
+    require_text(publish_job, "needs: [ci-gate, security-gate, build, distribution-metadata]",
+                 "Release publish")
     require("if: always()" not in publish_job, "publish must not run after failed prerequisites")
-    for platform, runner in (("windows", "windows-latest"), ("linux", "ubuntu-latest"), ("macos", "macos-latest")):
-        require_text(build_job, f"platform: {platform}", "Release matrix")
-        require_text(build_job, f"os: {runner}", "Release matrix")
-    require_text(publish_job, "for platform in windows linux macos; do", "Release artifact consumer")
-    require_text(publish_job, 'archive="dist/ownmesh-${GITHUB_REF_NAME}-${platform}.tar.gz"',
-                 "Release artifact consumer")
-    require_text(publish_job, 'test -s "${archive}"', "Release artifact consumer")
+    for asset in (
+        "ownmesh-windows-x64.zip",
+        "ownmesh-macos-arm64.tar.gz",
+        "ownmesh-macos-x64.tar.gz",
+        "ownmesh-linux-x64.tar.gz",
+        "ownmesh-linux-arm64.tar.gz",
+    ):
+        require_text(build_job, f"asset: {asset}", "Release matrix asset")
+        require_text(publish_job, asset, "Release publish asset")
+    require_text(build_job, "x86_64-unknown-linux-musl", "Release linux musl x64")
+    require_text(build_job, "aarch64-unknown-linux-musl", "Release linux musl arm64")
+    require_text(build_job, "aarch64-apple-darwin", "Release macos arm64")
+    require_text(build_job, "x86_64-apple-darwin", "Release macos x64")
+    require_text(build_job, "x86_64-pc-windows-msvc", "Release windows x64")
     require_text(build_job, "if-no-files-found: error", "Release artifact upload")
     require_text(build_job, "name: release-${{ matrix.platform }}", "Release artifact producer")
     require_text(publish_job, "pattern: release-*", "Release artifact consumer")
     require_text(release, "test -s dist/sbom-rust.cdx.json", "Release artifact validation")
     require_text(release, "test -s dist/sbom-control-plane.cdx.json", "Release artifact validation")
     for packaged_file in ("LICENSE", "NOTICE", "README.md", "RELEASE_NOTES.md"):
-        require_text(build_job, f'test -s "${{staging}}/{packaged_file}"', "Release archive metadata")
-        require_text(
-            publish_job,
-            f'grep -Fxq "ownmesh-${{GITHUB_REF_NAME}}-${{platform}}/{packaged_file}"',
-            "Published archive metadata validation",
-        )
-    # Checkout must drop credentials; every build/publish checkout needs the flag.
-    release_jobs = build_job + "\n" + publish_job
+        require_text(build_job, packaged_file, "Release archive metadata")
+        require_text(publish_job, packaged_file, "Published archive metadata validation")
+    require_text(dist_job, "ownmesh-installer.sh", "Release installer asset")
+    require_text(dist_job, "ownmesh-installer.ps1", "Release installer asset")
+    require_text(dist_job, "scripts/render_distribution.py", "Release homebrew render")
+    require_text(dist_job, "ownmesh.rb", "Release homebrew formula asset")
+    require_text(publish_job, "ownmesh-release-meta.json", "Release meta asset")
+    # Checkout must drop credentials; every build/publish/dist checkout needs the flag.
+    release_jobs = build_job + "\n" + dist_job + "\n" + publish_job
     checkout_count = len(re.findall(r"(?m)^\s*- uses:\s*actions/checkout@[0-9a-f]{40}", release_jobs))
     secure_checkout_count = len(
         re.findall(
@@ -242,10 +253,10 @@ def main() -> int:
             release_jobs,
         )
     )
-    require(checkout_count >= 2, "Release build/publish must checkout the repository")
+    require(checkout_count >= 3, "Release build/dist/publish must checkout the repository")
     require(
         secure_checkout_count == checkout_count,
-        "Every release build/publish checkout must set persist-credentials: false",
+        "Every release build/dist/publish checkout must set persist-credentials: false",
     )
     # Publish permissions stay narrowly scoped (no expansion beyond the three writes).
     require_text(publish_job, "contents: write", "Release publish permissions")
@@ -260,31 +271,35 @@ def main() -> int:
             "Release publish permissions must stay exactly "
             f"contents/attestations/id-token, got {sorted(perm_keys)}",
         )
-    # Publish must verify the five required binaries inside each platform archive.
+    # Build and publish must cover the five required binaries.
     require_text(
-        publish_job,
+        build_job,
         "for binary in ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker; do",
-        "Published archive binary validation",
+        "Release archive binary packaging",
     )
     require_text(
         publish_job,
-        'grep -Fxq "ownmesh-${GITHUB_REF_NAME}-${platform}/${binary}${ext}" "${listing}"',
+        '"ownmesh","ownmesh-tui","ownmeshd","ownmesh-session-host","ownmesh-broker"',
         "Published archive binary validation",
     )
-    require_text(publish_job, 'ext=".exe"', "Published archive Windows binary extension")
-    require_text(build_job, "binary_extension: .exe", "Release Windows binary extension")
     require_text(
         publish_job,
         "actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be",
         "Release provenance",
     )
-    require_text(publish_job, "DEGRADED PRE-RELEASE", "Release signing waiver")
-    require_text(publish_job, "prerelease: ${{ steps.signing.outputs.available != 'true' }}",
-                 "Release signing waiver")
+    # Formal releases require minisign; degraded unsigned publish is forbidden.
+    require("DEGRADED PRE-RELEASE" not in publish_job, "formal release must not allow degraded unsigned publish")
+    require_text(publish_job, "MINISIGN_SECRET_KEY secret is required", "Release signing required")
     require_text(publish_job, "docs/release-keys/minisign.pub", "Release signing trust root")
     require_text(publish_job, "minisign -Vm", "Release signature verification")
+    require_text(publish_job, "minisign -S", "Release signature creation")
+    require_text(publish_job, "prerelease: false", "Formal release is not forced prerelease")
     require("RELEASE_NOTES_v1.0.1.md" not in release, "release body must not be fixed to v1.0.1")
     require_text(release, "RELEASE_NOTES_${GITHUB_REF_NAME}.md", "Release notes lookup")
+    require((ROOT / "docs/release-keys/minisign.pub").is_file(), "minisign trust root must be tracked")
+    require((ROOT / "installers/ownmesh-installer.sh").is_file(), "unix installer must exist")
+    require((ROOT / "installers/ownmesh-installer.ps1").is_file(), "windows installer must exist")
+    require((ROOT / "packaging/homebrew/ownmesh.rb.template").is_file(), "homebrew template must exist")
 
     require("secrets: inherit" not in release, "reusable Security gate must not inherit every repository secret")
     require(
@@ -313,8 +328,8 @@ def main() -> int:
         claim_docs = ["README.md", "docs/DOD_1.0.md", current_notes]
         for path in claim_docs:
             text = read(path)
-            require_text(text, "44 explicit unsupported CLI surfaces", path)
-            require_text(text, "51 total", path)
+            require_text(text, "40 explicit unsupported CLI surfaces", path)
+            require_text(text, "47 total", path)
             require_text(text, "release/SUPPORTED_SURFACES.json", path)
 
     contributing = read("CONTRIBUTING.md")

@@ -1,0 +1,41 @@
+class Ownmesh < Formula
+  desc "Capability runtime for user-owned PCs"
+  homepage "https://github.com/Aero123421/OwnMesh"
+  version "{{VERSION}}"
+  license "Apache-2.0"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-macos-arm64.tar.gz"
+      sha256 "{{MACOS_ARM64_SHA256}}"
+    else
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-macos-x64.tar.gz"
+      sha256 "{{MACOS_X64_SHA256}}"
+    end
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-linux-arm64.tar.gz"
+      sha256 "{{LINUX_ARM64_SHA256}}"
+    else
+      url "https://github.com/Aero123421/OwnMesh/releases/download/v{{VERSION}}/ownmesh-linux-x64.tar.gz"
+      sha256 "{{LINUX_X64_SHA256}}"
+    end
+  end
+
+  def install
+    bin.install "ownmesh"
+    bin.install "ownmesh-tui"
+    bin.install "ownmeshd"
+    bin.install "ownmesh-session-host"
+    bin.install "ownmesh-broker"
+  end
+
+  # service block is intentionally omitted here; integrate after the onboarding
+  # branch lands so launchd/systemd unit paths stay consistent.
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/ownmesh --version")
+  end
+end

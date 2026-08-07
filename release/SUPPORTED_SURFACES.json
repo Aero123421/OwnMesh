@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "release_train": "1.0.x",
+  "release_train": "1.1.x",
   "completeness_claim": false,
   "supported": [
     "status",
@@ -12,9 +12,10 @@
     "session list/show/open/attach/claim/release/give/close/terminate (local device only)",
     "approval list/show/approve/deny",
     "policy show/preset/validate/explain",
-    "privileged broker status (fail-closed metadata; native service management unsupported)"
+    "privileged broker status (fail-closed metadata; native service management unsupported)",
+    "update check/download/apply/channel (signed GitHub releases; network off by default)"
   ],
-  "explicit_unsupported_count": 44,
+  "explicit_unsupported_count": 40,
   "explicit_unsupported_surfaces": [
     "tui",
     "setup",
@@ -55,10 +56,6 @@
     "service restart",
     "service status",
     "service uninstall",
-    "update check",
-    "update download",
-    "update apply",
-    "update channel",
     "mcp serve"
   ],
   "additional_unsupported": [
@@ -70,6 +67,6 @@
     "privileged broker install",
     "privileged broker uninstall"
   ],
-  "total_unsupported_surfaces": 51,
-  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Every unsupported entry returns a machine-visible hard error; unregistered command strings are rejected at runtime. Parser presence, a marker file, or a generated service template is not treated as implementation. Additional surface notes: exec --device never falls back to local; session open <device> never falls back to local; privileged broker install/uninstall are side-effect-free unsupported operations (no templates, markers, or process spawns) until a secure mint authority exists; privileged broker status reports fail-closed metadata only."
+  "total_unsupported_surfaces": 47,
+  "notes": "The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Every unsupported entry returns a machine-visible hard error; unregistered command strings are rejected at runtime. Parser presence, a marker file, or a generated service template is not treated as implementation. Additional surface notes: exec --device never falls back to local; session open <device> never falls back to local; privileged broker install/uninstall are side-effect-free unsupported operations (no templates, markers, or process spawns) until a secure mint authority exists; privileged broker status reports fail-closed metadata only. Update surfaces are production-wired against official GitHub Releases with embedded minisign verification; automatic network checks remain off by default."
 }

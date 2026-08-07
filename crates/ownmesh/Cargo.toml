@@ -26,6 +26,7 @@ ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
 ownmesh-policy = { path = "../ownmesh-policy" }
 ownmesh-protocol = { path = "../ownmesh-protocol" }
+ownmesh-update = { path = "../ownmesh-update" }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 tokio = { version = "1.43.0", features = [
@@ -48,6 +49,7 @@ dirs = "6.0.0"
 oauth2 = { version = "5.0.0", default-features = false }
 rand = "0.8.5"
 reqwest = { version = "0.12.12", default-features = false, features = [
+    "blocking",
     "gzip",
     "json",
     "rustls-tls",
