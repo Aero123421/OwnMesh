@@ -491,10 +491,7 @@ fn temporary_grant_is_bound_for_capability(grant: &TemporaryGrant) -> bool {
     if !temporary_grant_requires_operation_binding(&grant.capability) {
         return true;
     }
-    let kind_ok = grant
-        .kind
-        .as_ref()
-        .is_some_and(|k| !k.trim().is_empty());
+    let kind_ok = grant.kind.as_ref().is_some_and(|k| !k.trim().is_empty());
     let program_ok = grant
         .program_equals
         .as_ref()
