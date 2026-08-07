@@ -1770,3 +1770,228 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
     server.request_shutdown();
     let _ = handle.await;
 }
+
+#[tokio::test]
+async fn production_limited_command_temporary_grant_cannot_escalate() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_production_test_daemon(&paths).await;
+
+    let management_secret =
+        ownmesh_ipc::read_management_credential(&paths.state_dir).expect("management delivery");
+    let management = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "mgmt",
+        Some(management_secret),
+    );
+    let provisioned: ownmesh_ipc::CredentialSecretResult = serde_json::from_value(
+        management
+            .call(
+                methods::CREDENTIAL_PROVISION,
+                Some(json!({ "client_id": "grant-agent" })),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let agent = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "grant-agent-label",
+        Some(provisioned.credential),
+    );
+    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
+
+    let approved_tool = sample_native_binary();
+    // Must remain structured (not a shell binary) so policy re-asks instead of deny-raw.
+    let other_tool = {
+        #[cfg(unix)]
+        {
+            std::path::PathBuf::from("/bin/ls")
+        }
+        #[cfg(windows)]
+        {
+            let system_root = std::env::var_os("SystemRoot").map_or_else(
+                || std::path::PathBuf::from(r"C:\Windows"),
+                std::path::PathBuf::from,
+            );
+            system_root.join("System32").join("hostname.exe")
+        }
+    };
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("limited structured ask".into()),
+            rules: vec![
+                PolicyRule {
+                    id: "deny-raw".into(),
+                    decision: Decision::Deny,
+                    priority: 100,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("raw_shell".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "deny-elevated".into(),
+                    decision: Decision::Deny,
+                    priority: 90,
+                    capability: "command.run".into(),
+                    when_elevated: Some(true),
+                    when_kind: None,
+                    path_prefix: None,
+                    program_equals: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "ask-structured".into(),
+                    decision: Decision::Ask,
+                    priority: 10,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("structured".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    description: None,
+                },
+            ],
+        });
+    }
+
+    let pending = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": approved_tool,
+                "args": [],
+                "idempotency_key": "limited-grant-approve",
+            })),
+        )
+        .await
+        .expect("enqueue structured");
+    assert_eq!(pending["approval_required"], true);
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    let approved = human
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({
+                "id": approval_id,
+                "temporary_grant": true,
+                "grant_seconds": 600,
+            })),
+        )
+        .await
+        .expect("human limited approve+grant");
+    assert_eq!(approved["approval_required"], false);
+
+    // Same bound structured program is covered by the temporary grant.
+    let same = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": approved_tool,
+                "args": [],
+                "idempotency_key": "limited-grant-same",
+            })),
+        )
+        .await
+        .expect("same program must be granted");
+    assert_eq!(same["approval_required"], false);
+    assert_eq!(same["decision"], "allow");
+
+    // Escalation attempts must not be Allow'd by the grant before policy deny/ask.
+    let raw = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "raw_shell",
+                "program": if cfg!(windows) { "cmd.exe" } else { "sh" },
+                "args": if cfg!(windows) {
+                    vec!["/C", "echo pwn"]
+                } else {
+                    vec!["-c", "echo pwn"]
+                },
+                "idempotency_key": "limited-grant-raw",
+            })),
+        )
+        .await
+        .expect_err("raw_shell must not ride temporary grant");
+    match raw {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::POLICY_DENIED, "{message}");
+            assert!(
+                !message.contains("temporary grant"),
+                "raw_shell must not match temporary grant: {message}"
+            );
+        }
+        other => panic!("unexpected raw_shell error: {other:?}"),
+    }
+
+    let other = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": other_tool,
+                "args": [],
+                "idempotency_key": "limited-grant-other-program",
+            })),
+        )
+        .await
+        .expect("other program should re-enter policy, not grant-allow");
+    assert_eq!(
+        other["approval_required"], true,
+        "different program must not inherit temporary grant: {other}"
+    );
+
+    let elevated = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": approved_tool,
+                "args": [],
+                "elevated": true,
+                "idempotency_key": "limited-grant-elevated",
+            })),
+        )
+        .await
+        .expect_err("elevated must not ride temporary grant");
+    match elevated {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::POLICY_DENIED, "{message}");
+            assert!(
+                !message.contains("temporary grant"),
+                "elevated must not match temporary grant: {message}"
+            );
+        }
+        other => panic!("unexpected elevated error: {other:?}"),
+    }
+
+    // Grant row itself must carry operation bindings (not capability-only).
+    {
+        let guard = runtime.lock().await;
+        let grants = guard.grants_for_test();
+        assert_eq!(grants.len(), 1);
+        let g = &grants[0];
+        assert_eq!(g.capability, "command.run");
+        assert_eq!(g.kind.as_deref(), Some("structured"));
+        assert_eq!(g.elevated, Some(false));
+        let prog = g.program_equals.as_deref().expect("program bound");
+        assert!(
+            !prog.is_empty(),
+            "program_equals must be bound from server facts"
+        );
+    }
+
+    server.request_shutdown();
+    let _ = handle.await;
+}

@@ -395,6 +395,10 @@ pub fn full_access_has_no_hidden_restrictive_rules(doc: &PolicyDocument) -> bool
 }
 
 /// Temporary grant overlay.
+///
+/// Grants are principal-scoped and time-bounded. `command.run` grants must also
+/// bind operation facts (`kind` / `program_equals` / `elevated`); unbound command
+/// grants never allow (fail closed), including legacy persisted rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporaryGrant {
     pub id: String,
@@ -403,6 +407,140 @@ pub struct TemporaryGrant {
     pub expires_unix: i64,
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// Bound operation kind (e.g. `structured`). Required for `command.run`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Bound exact program identity from server facts. Required for `command.run`.
+    #[serde(default)]
+    pub program_equals: Option<String>,
+    /// Bound elevated flag from server facts. Required for `command.run`.
+    #[serde(default)]
+    pub elevated: Option<bool>,
+}
+
+/// Capabilities whose temporary grants must bind concrete operation facts.
+#[must_use]
+pub fn temporary_grant_requires_operation_binding(capability: &str) -> bool {
+    capability == "command.run" || capability.starts_with("command.")
+}
+
+/// Build a temporary grant from **server-side** approval facts only.
+///
+/// Client-supplied facts must never be passed here. `command.run` grants without
+/// bindable kind/program/elevated are rejected fail-closed.
+pub fn temporary_grant_from_facts(
+    id: String,
+    principal_id: String,
+    expires_unix: i64,
+    facts: &OperationFacts,
+) -> Result<TemporaryGrant, String> {
+    let capability = facts.capability.trim();
+    if capability.is_empty() {
+        return Err("temporary grant requires capability from server approval facts".into());
+    }
+
+    let mut grant = TemporaryGrant {
+        id,
+        capability: capability.to_owned(),
+        principal_id,
+        expires_unix,
+        path_prefix: None,
+        kind: None,
+        program_equals: None,
+        elevated: None,
+    };
+
+    if temporary_grant_requires_operation_binding(capability) {
+        let kind = facts.kind.trim();
+        if kind.is_empty() {
+            return Err(
+                "temporary grant for command.run requires bound kind from server approval facts"
+                    .into(),
+            );
+        }
+        let program = facts
+            .program
+            .as_ref()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(ToOwned::to_owned);
+        let Some(program) = program else {
+            return Err(
+                "temporary grant for command.run requires bound program from server approval facts"
+                    .into(),
+            );
+        };
+        grant.kind = Some(kind.to_owned());
+        grant.program_equals = Some(program);
+        grant.elevated = Some(facts.elevated);
+        if let Some(path) = facts
+            .path
+            .as_ref()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+        {
+            // Bind cwd/path when the approved operation carried one.
+            grant.path_prefix = Some(path.to_owned());
+        }
+    }
+
+    Ok(grant)
+}
+
+fn temporary_grant_is_bound_for_capability(grant: &TemporaryGrant) -> bool {
+    if !temporary_grant_requires_operation_binding(&grant.capability) {
+        return true;
+    }
+    let kind_ok = grant
+        .kind
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty());
+    let program_ok = grant
+        .program_equals
+        .as_ref()
+        .is_some_and(|p| !p.trim().is_empty());
+    kind_ok && program_ok && grant.elevated.is_some()
+}
+
+fn temporary_grant_matches(
+    grant: &TemporaryGrant,
+    facts: &OperationFacts,
+    principal_id: &str,
+    now_unix: i64,
+) -> bool {
+    if grant.principal_id != principal_id || grant.expires_unix <= now_unix {
+        return false;
+    }
+    if !capability_match(&grant.capability, &facts.capability) {
+        return false;
+    }
+    // Fail closed: legacy/unbound command.run grants never force Allow.
+    if !temporary_grant_is_bound_for_capability(grant) {
+        return false;
+    }
+    if let Some(k) = &grant.kind {
+        if k != &facts.kind {
+            return false;
+        }
+    }
+    if let Some(prog) = &grant.program_equals {
+        match &facts.program {
+            Some(p) if p == prog => {}
+            _ => return false,
+        }
+    }
+    if let Some(elev) = grant.elevated {
+        if elev != facts.elevated {
+            return false;
+        }
+    }
+    if let Some(prefix) = &grant.path_prefix {
+        match &facts.path {
+            Some(p) if p.starts_with(prefix.as_str()) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Evaluate with temporary grants that force Allow when still valid.
@@ -415,17 +553,8 @@ pub fn evaluate_with_grants(
     principal_id: &str,
 ) -> PolicyVerdict {
     for g in grants {
-        if g.principal_id != principal_id || g.expires_unix <= now_unix {
+        if !temporary_grant_matches(g, facts, principal_id, now_unix) {
             continue;
-        }
-        if !capability_match(&g.capability, &facts.capability) {
-            continue;
-        }
-        if let Some(prefix) = &g.path_prefix {
-            match &facts.path {
-                Some(p) if p.starts_with(prefix.as_str()) => {}
-                _ => continue,
-            }
         }
         return PolicyVerdict {
             decision: Decision::Allow,
@@ -540,6 +669,8 @@ mod tests {
         let facts = OperationFacts {
             capability: "command.run".into(),
             kind: "structured".into(),
+            program: Some("cargo".into()),
+            elevated: false,
             ..Default::default()
         };
         let grants = vec![TemporaryGrant {
@@ -548,8 +679,119 @@ mod tests {
             principal_id: "user-1".into(),
             expires_unix: 9_999_999_999,
             path_prefix: None,
+            kind: Some("structured".into()),
+            program_equals: Some("cargo".into()),
+            elevated: Some(false),
         }];
         let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
         assert_eq!(v.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn unbound_command_run_temporary_grant_never_allows() {
+        let doc = preset_document(AccessPreset::WorkspaceOnly);
+        let facts = OperationFacts {
+            capability: "command.run".into(),
+            kind: "raw_shell".into(),
+            program: Some("bash".into()),
+            elevated: true,
+            ..Default::default()
+        };
+        // Legacy shape: principal+capability only.
+        let grants = vec![TemporaryGrant {
+            id: "legacy".into(),
+            capability: "command.run".into(),
+            principal_id: "user-1".into(),
+            expires_unix: 9_999_999_999,
+            path_prefix: None,
+            kind: None,
+            program_equals: None,
+            elevated: None,
+        }];
+        let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
+        assert_ne!(v.decision, Decision::Allow);
+        assert_eq!(v.decision, Decision::Deny);
+    }
+
+    #[test]
+    fn bound_command_grant_does_not_escalate_kind_program_or_elevated() {
+        let doc = preset_document(AccessPreset::Recommended);
+        let grant = temporary_grant_from_facts(
+            "g-bound".into(),
+            "agent-1".into(),
+            9_999_999_999,
+            &OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                program: Some("/bin/echo".into()),
+                elevated: false,
+                ..Default::default()
+            },
+        )
+        .expect("bind structured echo");
+        let grants = vec![grant];
+
+        let same = OperationFacts {
+            capability: "command.run".into(),
+            kind: "structured".into(),
+            program: Some("/bin/echo".into()),
+            elevated: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_with_grants(&doc, &same, &grants, 1, "agent-1").decision,
+            Decision::Allow
+        );
+
+        for facts in [
+            OperationFacts {
+                capability: "command.run".into(),
+                kind: "raw_shell".into(),
+                program: Some("/bin/echo".into()),
+                elevated: false,
+                ..Default::default()
+            },
+            OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                program: Some("/bin/sh".into()),
+                elevated: false,
+                ..Default::default()
+            },
+            OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                program: Some("/bin/echo".into()),
+                elevated: true,
+                ..Default::default()
+            },
+        ] {
+            let v = evaluate_with_grants(&doc, &facts, &grants, 1, "agent-1");
+            assert_ne!(
+                v.decision,
+                Decision::Allow,
+                "grant must not allow escalation: kind={} program={:?} elevated={}",
+                facts.kind,
+                facts.program,
+                facts.elevated
+            );
+        }
+    }
+
+    #[test]
+    fn command_run_temporary_grant_without_facts_fields_is_rejected() {
+        let err = temporary_grant_from_facts(
+            "g".into(),
+            "p".into(),
+            1,
+            &OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                // program missing
+                ..Default::default()
+            },
+        )
+        .expect_err("unboundable");
+        assert!(err.contains("program"), "{err}");
     }
 }

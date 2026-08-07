@@ -40,7 +40,8 @@ use ownmesh_logs::{
 };
 use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
-    AccessPreset, Decision, OperationFacts, PolicyDocument, TemporaryGrant,
+    temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset,
+    Decision, OperationFacts, PolicyDocument, TemporaryGrant,
 };
 use ownmesh_session::{SessionKind, SessionManager, StreamKind as SessionStreamKind};
 use serde::{Deserialize, Serialize};
@@ -1289,6 +1290,8 @@ impl DaemonRuntime {
         let capability = rec.capability.clone();
         let operation_id = rec.operation_id.clone();
         let requester_principal = rec.requester_principal.clone();
+        // Server-captured policy facts only — never trust client-supplied grant scope.
+        let approved_facts = rec.facts.clone();
         let idem_key = match &request {
             PendingRequest::Exec(x) => x.idempotency_key.clone(),
             PendingRequest::FsList(x) => x.idempotency_key.clone(),
@@ -1300,6 +1303,56 @@ impl DaemonRuntime {
             PendingRequest::GitStatus(x) => x.idempotency_key.clone(),
             PendingRequest::GitDiff(x) => x.idempotency_key.clone(),
         };
+
+        // Build (or refuse) the temporary grant before mutating durable approval state.
+        let pending_grant = if p.temporary_grant {
+            let secs = p.grant_seconds.unwrap_or(DEFAULT_GRANT_SECS);
+            // Bind the grant to the requester that was approved — never a global prin_local.
+            let grant_principal = if requester_principal.is_empty() {
+                LOCAL_PRINCIPAL.to_owned()
+            } else {
+                requester_principal.clone()
+            };
+            let expires_unix = Self::now().saturating_add(secs);
+            let grant_id = Self::new_id("grant_");
+            Some(if temporary_grant_requires_operation_binding(&capability) {
+                let Some(facts) = approved_facts.as_ref() else {
+                    return Err(IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: "temporary grant for command.run requires server approval facts"
+                            .into(),
+                    });
+                };
+                // Defense-in-depth: approval capability and fact capability must agree.
+                if facts.capability.trim() != capability.trim() {
+                    return Err(IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: "temporary grant capability does not match server approval facts"
+                            .into(),
+                    });
+                }
+                temporary_grant_from_facts(grant_id, grant_principal, expires_unix, facts).map_err(
+                    |message| IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message,
+                    },
+                )?
+            } else {
+                TemporaryGrant {
+                    id: grant_id,
+                    capability: capability.clone(),
+                    principal_id: grant_principal,
+                    expires_unix,
+                    path_prefix: None,
+                    kind: None,
+                    program_equals: None,
+                    elevated: None,
+                }
+            })
+        } else {
+            None
+        };
+
         let approvals_before = self.approvals.clone();
         let grants_before = self.grants.clone();
         let op_journal_before = self.op_journal.clone();
@@ -1326,21 +1379,8 @@ impl DaemonRuntime {
             return Err(with_rollback_errors(e, rollback_errors));
         }
 
-        if p.temporary_grant {
-            let secs = p.grant_seconds.unwrap_or(DEFAULT_GRANT_SECS);
-            // Bind the grant to the requester that was approved — never a global prin_local.
-            let grant_principal = if requester_principal.is_empty() {
-                LOCAL_PRINCIPAL.to_owned()
-            } else {
-                requester_principal.clone()
-            };
-            self.grants.push(TemporaryGrant {
-                id: Self::new_id("grant_"),
-                capability: capability.clone(),
-                principal_id: grant_principal,
-                expires_unix: Self::now().saturating_add(secs),
-                path_prefix: None,
-            });
+        if let Some(grant) = pending_grant {
+            self.grants.push(grant);
             if let Err(e) = self.persist_grants() {
                 self.approvals = approvals_before;
                 self.grants = grants_before;
