@@ -19,14 +19,16 @@ Linux/macOS `cargo clippy -D warnings` failed on `clippy::suspicious_open_option
 
 ### ownmesh-ipc — Windows registry custody identity/ownership
 
-Windows `cargo test` rejected GitHub Actions Temp directories whose path form uses the 8.3 account segment `RUNNER~1`, and more generally failed when elevated tokens default new-object owner to `BUILTIN\Administrators` while attestation compared `TokenUser`.
+Windows `cargo test` rejected genuine aliases of the same directory when identity was compared as a path string. Release review also found that an existing foreign-owned state directory could be reassigned before owner attestation when its ACL granted the daemon `WRITE_OWNER`/`WRITE_DAC`.
 
 **Fix:**
 
-- Attest pinned-handle identity via **volume serial + file index** (handle-based), not lossy path-string comparison across short/long/`\\?\` aliases.
-- Create and restrict state objects with an explicit SDDL **owner** (`O:{user-sid}`) plus protected owner-only DACL; `restrict_owner_only` applies owner + DACL through `SetNamedSecurityInfoW` using SID material from the process token (not path/user-name strings).
+- Attest pinned-handle identity via **volume serial + file index** (handle-based), not lossy path-string comparison across aliases.
+- Create new state directories with an explicit SDDL **owner** (`O:{user-sid}`) plus protected owner-only DACL.
+- For an existing directory, open it without delete sharing and without following reparse points, verify directory type and `TokenUser` ownership on that handle **before mutation**, then apply only the protected owner-only DACL through `SetSecurityInfo` on the same handle. Foreign owners are never reassigned.
+- Acquire an owner-attested, no-delete-share registry lock as a namespace anchor and revalidate the pinned state handle afterward; a replacement during preparation fails before registry bytes are created or trusted.
 - Owner-only DACL, reparse rejection, and regular-file checks are unchanged and still fail closed.
-- Regressions: short/long path alias open succeeds; a file owned by a different principal is rejected.
+- Regressions: a distinct extended-length alias opens by stable identity; reparse state is rejected; an external replacement attempt is blocked by the pinned lock; and a dedicated Windows CI test creates a foreign-owned, broadly writable directory and proves it is rejected without changing owner.
 
 ### OAuth consent expiration boundary
 

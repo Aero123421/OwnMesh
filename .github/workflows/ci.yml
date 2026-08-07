@@ -63,6 +63,13 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets --locked
 
+      - name: Enforce Windows foreign-owner custody regression
+        if: matrix.os == 'windows-latest'
+        run: >-
+          cargo test --locked -p ownmesh-ipc
+          windows_rejects_foreign_owned_state_directory_before_hardening
+          -- --ignored
+
   typescript:
     name: pnpm frozen quality gates
     runs-on: ubuntu-latest

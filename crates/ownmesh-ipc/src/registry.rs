@@ -133,7 +133,7 @@ pub(crate) struct CredentialRegistry {
 #[derive(Debug)]
 struct StateCustody {
     #[cfg(windows)]
-    _handles: Vec<fs::File>,
+    handles: Vec<fs::File>,
 }
 
 impl StateCustody {
@@ -146,12 +146,23 @@ impl StateCustody {
 
     #[cfg(windows)]
     fn acquire(state_dir: &Path) -> IpcResult<Self> {
+        Self::acquire_windows(state_dir, false)
+    }
+
+    #[cfg(windows)]
+    fn acquire_for_prepare(state_dir: &Path) -> IpcResult<Self> {
+        Self::acquire_windows(state_dir, true)
+    }
+
+    #[cfg(windows)]
+    fn acquire_windows(state_dir: &Path, harden_state_dir: bool) -> IpcResult<Self> {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::{AsRawHandle, FromRawHandle};
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+            WRITE_DAC,
         };
 
         let mut handles = Vec::new();
@@ -162,18 +173,26 @@ impl StateCustody {
                 .encode_wide()
                 .chain(std::iter::once(0))
                 .collect();
-            // Deliberately omit FILE_SHARE_DELETE. Holding every ancestor open
-            // prevents rename/replacement for the registry lifetime.
+            // Deliberately omit FILE_SHARE_DELETE. Ancestor identity remains pinned;
+            // the state directory itself is namespace-anchored by the registry lock
+            // after the post-lock revalidation in CredentialRegistry::open.
             // READ_CONTROL is required so post-open security revalidation is not
             // silently skipped.
+            let access = FILE_READ_ATTRIBUTES
+                | READ_CONTROL
+                | if index == 0 && harden_state_dir {
+                    WRITE_DAC
+                } else {
+                    0
+                };
             let handle = unsafe {
                 CreateFileW(
                     wide.as_ptr(),
-                    FILE_READ_ATTRIBUTES | READ_CONTROL,
+                    access,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     std::ptr::null(),
                     OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
                     std::ptr::null_mut(),
                 )
             };
@@ -181,19 +200,45 @@ impl StateCustody {
                 return Err(std::io::Error::last_os_error().into());
             }
             let file = unsafe { fs::File::from_raw_handle(handle) };
-            // Always revalidate identity of the pinned handle. Never trust the
-            // path string alone after CreateFileW returns.
-            revalidate_pinned_handle_identity(file.as_raw_handle(), ancestor)?;
+            // Always attest type, reparse state, and identity on the pinned handle.
+            // Never trust the path string alone after CreateFileW returns.
+            validate_open_windows_directory_node(file.as_raw_handle(), ancestor)?;
             // Full owner + protected-DACL attestation applies to the state dir
             // itself (index 0). Parent volumes are not required to be owner-only;
             // requiring that would be unsound on real Windows systems and is an
             // explicit non-claim (identity pin only for ancestors).
             if index == 0 {
+                revalidate_pinned_handle_security(file.as_raw_handle(), ancestor, false)?;
+                if harden_state_dir {
+                    // Owner attestation above must precede mutation. Apply the DACL
+                    // through this same no-delete-share handle so a path replacement
+                    // cannot redirect the security change to another object.
+                    restrict_open_windows_owner_only(file.as_raw_handle(), ancestor, true)?;
+                }
                 revalidate_pinned_handle_security(file.as_raw_handle(), ancestor, true)?;
             }
             handles.push(file);
         }
-        Ok(Self { _handles: handles })
+        Ok(Self { handles })
+    }
+
+    #[cfg(unix)]
+    fn revalidate(&self, _state_dir: &Path) -> IpcResult<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn revalidate(&self, state_dir: &Path) -> IpcResult<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        let state = self.handles.first().ok_or_else(|| {
+            IpcError::Unauthorized(format!(
+                "credential state custody did not pin the state directory: {}",
+                state_dir.display()
+            ))
+        })?;
+        validate_open_windows_directory_node(state.as_raw_handle(), state_dir)?;
+        revalidate_pinned_handle_security(state.as_raw_handle(), state_dir, true)
     }
 }
 
@@ -265,9 +310,12 @@ impl CredentialRegistry {
     /// existing file is unreadable / corrupt.
     pub(crate) fn open(state_dir: impl AsRef<Path>) -> IpcResult<Self> {
         let state_dir = state_dir.as_ref();
-        prepare_secure_state_dir(state_dir)?;
-        let custody = StateCustody::acquire(state_dir)?;
+        let custody = prepare_secure_state_dir(state_dir)?;
         let lock = RegistryFileLock::acquire(state_dir)?;
+        // The lock is an owner-attested, no-delete-share namespace anchor. Recheck
+        // the pinned directory after acquiring it so a replacement during lock
+        // creation fails before registry bytes are created or trusted.
+        custody.revalidate(state_dir)?;
         let path = state_dir.join(REGISTRY_FILE_NAME);
         reject_symlink_or_reparse_if_present(&path)?;
         let existed = path.exists();
@@ -1038,6 +1086,36 @@ fn validate_open_windows_regular_owned(
 }
 
 #[cfg(windows)]
+fn validate_open_windows_directory_node(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    path: &Path,
+) -> IpcResult<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    revalidate_pinned_handle_identity(handle, path)?;
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(IpcError::Unauthorized(format!(
+            "credential state path is not a directory: {}",
+            path.display()
+        )));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(IpcError::Unauthorized(format!(
+            "credential state custody rejects symlink/reparse path: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn revalidate_pinned_handle_identity(
     handle: windows_sys::Win32::Foundation::HANDLE,
     expected_path: &Path,
@@ -1407,6 +1485,80 @@ fn current_process_owner_only_sddl(directory: bool) -> IpcResult<String> {
     }
 }
 
+#[cfg(windows)]
+fn restrict_open_windows_owner_only(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    path: &Path,
+    directory: bool,
+) -> IpcResult<()> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
+    };
+
+    let sddl_text = current_process_owner_only_sddl(directory)?;
+    let sddl: Vec<u16> = sddl_text.encode_utf16().collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let result = (|| -> IpcResult<()> {
+        let mut dacl_present = 0;
+        let mut dacl_defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &raw mut dacl_present,
+                &raw mut dacl,
+                &raw mut dacl_defaulted,
+            )
+        } == 0
+            || dacl_present == 0
+            || dacl.is_null()
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(IpcError::Unauthorized(format!(
+                "credential state custody cannot harden pinned directory {}: {}",
+                path.display(),
+                std::io::Error::from_raw_os_error(status.cast_signed())
+            )));
+        }
+        Ok(())
+    })();
+    unsafe {
+        let _ = LocalFree(descriptor);
+    }
+    result
+}
+
 fn restrict_owner_only(path: &Path, directory: bool) -> IpcResult<()> {
     #[cfg(unix)]
     {
@@ -1567,11 +1719,7 @@ fn create_state_dir_owner_only(state_dir: &Path) -> IpcResult<()> {
     unsafe {
         let _ = LocalFree(descriptor);
     };
-    result?;
-    // Pre-existing leaves (tempfile, inherited Admin-default-owner) must also be
-    // claimed as the daemon user SID before owner attestation.
-    restrict_owner_only(state_dir, true)?;
-    Ok(())
+    result
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1581,21 +1729,35 @@ fn create_state_dir_owner_only(_state_dir: &Path) -> IpcResult<()> {
     ))
 }
 
-fn prepare_secure_state_dir(state_dir: &Path) -> IpcResult<()> {
+fn prepare_secure_state_dir(state_dir: &Path) -> IpcResult<StateCustody> {
     reject_symlink_or_reparse_components(state_dir)?;
     create_state_dir_owner_only(state_dir)?;
     reject_symlink_or_reparse_components(state_dir)?;
-    // Never tighten or read through a directory until its type and owner have
-    // been attested. Newly created directories are already owner-only.
-    validate_state_dir_owner(state_dir, false)?;
-    restrict_owner_only(state_dir, true)?;
-    validate_secure_state_dir(state_dir)?;
-    #[cfg(unix)]
-    if let Some(parent) = state_dir.parent() {
-        let parent_dir = fs::File::open(parent)?;
-        parent_dir.sync_all()?;
+
+    #[cfg(windows)]
+    {
+        // Pin before inspecting or changing security. acquire_for_prepare rejects
+        // foreign owners and reparse/non-directory nodes on the opened handle,
+        // then applies the protected DACL through that same handle.
+        let custody = StateCustody::acquire_for_prepare(state_dir)?;
+        validate_secure_state_dir(state_dir)?;
+        Ok(custody)
     }
-    Ok(())
+
+    #[cfg(not(windows))]
+    {
+        // Never tighten or read through a directory until its type and owner have
+        // been attested. Newly created directories are already owner-only.
+        validate_state_dir_owner(state_dir, false)?;
+        restrict_owner_only(state_dir, true)?;
+        validate_secure_state_dir(state_dir)?;
+        #[cfg(unix)]
+        if let Some(parent) = state_dir.parent() {
+            let parent_dir = fs::File::open(parent)?;
+            parent_dir.sync_all()?;
+        }
+        StateCustody::acquire(state_dir)
+    }
 }
 
 fn validate_secure_state_dir(state_dir: &Path) -> IpcResult<()> {
@@ -2216,13 +2378,10 @@ mod tests {
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !ok {
-            // Junction creation unavailable (policy/privilege). The open path still
-            // rejects symlink/reparse nodes via reject_symlink_or_reparse_if_present
-            // and FILE_FLAG_OPEN_REPARSE_POINT handle attributes when present.
-            eprintln!("skipping junction creation; mklink /J unavailable");
-            return;
-        }
+        assert!(
+            ok,
+            "mklink /J must be available for the enforced reparse regression"
+        );
         let err = CredentialRegistry::open(&link).unwrap_err();
         assert!(
             err.to_string().contains("reparse")
@@ -2258,51 +2417,176 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_short_path_alias_accepted_for_state_custody() {
+    fn windows_distinct_path_alias_accepted_for_state_custody() {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        use windows_sys::Win32::Storage::FileSystem::{GetLongPathNameW, GetShortPathNameW};
+        let dir = tempdir().unwrap();
+        // An extended-length path is a distinct spelling of the same object and
+        // is available even when the volume has 8.3 short-name generation disabled.
+        let seed = CredentialRegistry::open(dir.path()).unwrap();
+        drop(seed);
+        let mut extended: Vec<u16> = r"\\?\".encode_utf16().collect();
+        extended.extend(dir.path().as_os_str().encode_wide());
+        let alias = PathBuf::from(std::ffi::OsString::from_wide(&extended));
+        assert_ne!(alias, dir.path(), "test requires a distinct path spelling");
 
-        fn wide(path: &Path) -> Vec<u16> {
-            path.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect()
+        let via_alias = CredentialRegistry::open(&alias).unwrap_or_else(|err| {
+            panic!("extended-path open failed for {}: {err}", alias.display());
+        });
+        assert!(via_alias.path().is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires Windows owner-assignment privilege; CI runs it explicitly"]
+    fn windows_rejects_foreign_owned_state_directory_before_hardening() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, LocalFree, SetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE,
+        };
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        // GitHub's Windows runner has the administrative token privilege required
+        // to assign a deliberately foreign owner. The dedicated CI step runs this
+        // ignored test and must fail if that privilege is unavailable.
+        let mut token: HANDLE = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    &raw mut token,
+                )
+            },
+            0,
+            "open process token failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let restore_name: Vec<u16> = "SeRestorePrivilege\0".encode_utf16().collect();
+        let mut luid = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { LookupPrivilegeValueW(ptr::null(), restore_name.as_ptr(), &raw mut luid) },
+            0,
+            "lookup SeRestorePrivilege failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        unsafe {
+            SetLastError(0);
         }
-        fn short_path(path: &Path) -> PathBuf {
-            let w = wide(path);
-            let mut buf = vec![0u16; 512];
-            let n = unsafe { GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
-            if n == 0 || n as usize >= buf.len() {
-                return path.to_path_buf();
-            }
-            PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]))
-        }
-        fn long_path(path: &Path) -> PathBuf {
-            let w = wide(path);
-            let mut buf = vec![0u16; 512];
-            let n = unsafe { GetLongPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
-            if n == 0 || n as usize >= buf.len() {
-                return path.to_path_buf();
-            }
-            PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]))
+        assert_ne!(
+            unsafe {
+                AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &raw const privileges,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            0,
+            "enable SeRestorePrivilege failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            unsafe { GetLastError() },
+            ERROR_NOT_ALL_ASSIGNED,
+            "dedicated CI runner lacks SeRestorePrivilege"
+        );
+        unsafe {
+            CloseHandle(token);
         }
 
         let dir = tempdir().unwrap();
-        // Seed via whatever form tempfile yields, then reopen through short + long aliases.
-        let seed = CredentialRegistry::open(dir.path()).unwrap();
-        drop(seed);
+        let state = dir.path().join("foreign-owned-state");
+        // BUILTIN\Administrators owns the directory while Everyone has full access.
+        // This gives the daemon enough rights to reproduce the old owner-claim bug:
+        // the vulnerable preparation path rewrote owner/DACL before attestation.
+        let sddl: Vec<u16> = "O:BAD:P(A;OICI;FA;;;WD)\0".encode_utf16().collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &raw mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0,
+            "SDDL convert failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut attrs = SECURITY_ATTRIBUTES {
+            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let wide: Vec<u16> = state
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &raw mut attrs) };
+        unsafe {
+            let _ = LocalFree(descriptor);
+        }
+        assert_ne!(
+            created,
+            0,
+            "foreign-owner regression setup must succeed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(validate_state_dir_owner(&state, false).is_err());
 
-        let short = short_path(dir.path());
-        let long = long_path(dir.path());
+        let err = CredentialRegistry::open(&state).unwrap_err();
+        assert!(
+            err.to_string().contains("not owned")
+                || err.to_string().contains("Unauthorized")
+                || err.to_string().contains("owner"),
+            "expected foreign-owner rejection, got: {err}"
+        );
+        assert!(
+            validate_state_dir_owner(&state, false).is_err(),
+            "rejected foreign directory must retain its original owner"
+        );
+    }
 
-        let via_short = CredentialRegistry::open(&short).unwrap_or_else(|err| {
-            panic!("short-path open failed for {}: {err}", short.display());
-        });
-        drop(via_short);
-        let via_long = CredentialRegistry::open(&long).unwrap_or_else(|err| {
-            panic!("long-path open failed for {}: {err}", long.display());
-        });
-        assert!(via_long.path().is_file());
+    #[cfg(windows)]
+    #[test]
+    fn windows_registry_lock_anchors_state_directory_against_replacement() {
+        use std::process::Command;
+
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let registry = CredentialRegistry::open(&state).unwrap();
+
+        let _ = Command::new("cmd")
+            .args(["/C", "rmdir", "/S", "/Q", &state.to_string_lossy()])
+            .status()
+            .expect("spawn external replacement attempt");
+        assert!(
+            state.is_dir(),
+            "pinned registry lock must leave the state directory present"
+        );
+        drop(registry);
+        fs::remove_dir_all(&state).expect("removal should succeed after registry release");
     }
 
     #[cfg(windows)]
