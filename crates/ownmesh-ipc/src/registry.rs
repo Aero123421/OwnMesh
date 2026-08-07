@@ -232,11 +232,6 @@ impl StateCustody {
         Ok(Self { handles })
     }
 
-    #[cfg(unix)]
-    fn revalidate(&self, _state_dir: &Path) -> IpcResult<()> {
-        Ok(())
-    }
-
     #[cfg(windows)]
     fn revalidate(&self, state_dir: &Path) -> IpcResult<()> {
         use std::os::windows::io::AsRawHandle;
@@ -325,6 +320,7 @@ impl CredentialRegistry {
         // The lock is an owner-attested, no-delete-share namespace anchor. Recheck
         // the pinned directory after acquiring it so a replacement during lock
         // creation fails before registry bytes are created or trusted.
+        #[cfg(windows)]
         custody.revalidate(state_dir)?;
         let path = state_dir.join(REGISTRY_FILE_NAME);
         reject_symlink_or_reparse_if_present(&path)?;
