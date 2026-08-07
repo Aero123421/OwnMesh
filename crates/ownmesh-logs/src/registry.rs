@@ -4,6 +4,7 @@ use crate::docker::DockerLogProvider;
 use crate::file::FileLogProvider;
 use crate::journald::JournaldLogProvider;
 use crate::process::ProcessLogProvider;
+#[cfg(windows)]
 use crate::windows_event::WindowsEventLogProvider;
 use crate::{LogError, LogProvider, LogResult};
 use std::path::PathBuf;

@@ -353,11 +353,11 @@ fn prepare_signing_parent(signing_path: &Path) -> Result<(), String> {
     validate_signing_parent_custody(parent)
 }
 
-fn validate_signing_parent_custody(_parent: &Path) -> Result<(), String> {
+fn validate_signing_parent_custody(parent: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let mut current = Some(_parent);
+        let mut current = Some(parent);
         while let Some(path) = current {
             let md = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
             if !md.file_type().is_dir()
@@ -372,6 +372,10 @@ fn validate_signing_parent_custody(_parent: &Path) -> Result<(), String> {
             }
             current = path.parent();
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
     }
     Ok(())
 }

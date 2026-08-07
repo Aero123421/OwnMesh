@@ -451,10 +451,11 @@ pub fn check_unix_peer(stream: &tokio::net::UnixStream) -> Result<PeerCheck, Str
     if pid <= 0 {
         return Err("peer pid missing from SO_PEERCRED (fail-closed)".into());
     }
+    // tokio::net::unix::{uid_t,gid_t} are u32 on every Unix target we ship.
     let cred = PeerCred {
         pid,
-        uid: uid_to_u32(ucred.uid()),
-        gid: gid_to_u32(ucred.gid()),
+        uid: ucred.uid(),
+        gid: ucred.gid(),
     };
     let exe_path = resolve_peer_exe(pid)?;
     Ok(PeerCheck {
@@ -480,16 +481,6 @@ pub fn authorize_unix_peer(
         return Err("socket peer identity changed during authorization (fail-closed)".into());
     }
     Ok(authorized)
-}
-
-#[cfg(unix)]
-fn uid_to_u32(uid: tokio::net::unix::uid_t) -> u32 {
-    u32::try_from(uid).unwrap_or(u32::MAX)
-}
-
-#[cfg(unix)]
-fn gid_to_u32(gid: tokio::net::unix::gid_t) -> u32 {
-    u32::try_from(gid).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

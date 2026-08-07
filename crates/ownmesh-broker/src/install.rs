@@ -277,6 +277,17 @@ fn write_template_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::rename(&temp, path).map_err(|e| e.to_string())
 }
 
+/// Format `--allowed-uid` CLI flags for Windows service XML and Linux systemd units.
+/// macOS LaunchDaemon templates emit separate plist entries instead.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn format_allowed_uid_cli_args(allowed_uids: &[u32]) -> String {
+    allowed_uids.iter().fold(String::new(), |mut args, uid| {
+        write!(args, " --allowed-uid {uid}").expect("writing to String cannot fail");
+        args
+    })
+}
+
+/// Escape values embedded in systemd unit `ExecStart=` command lines (Linux only).
 #[cfg(all(unix, not(target_os = "macos")))]
 fn systemd_escape(value: &str) -> String {
     value
@@ -529,10 +540,6 @@ fn write_unit_template(
 ) -> Result<Option<PathBuf>, String> {
     #[cfg(windows)]
     let readme = dir.join("README-INSTALL.txt");
-    let allowed_args = allowed_uids.iter().fold(String::new(), |mut args, uid| {
-        write!(args, " --allowed-uid {uid}").expect("writing to String cannot fail");
-        args
-    });
     #[cfg(windows)]
     {
         let xml = dir.join("ownmesh-broker-service.xml");
@@ -560,7 +567,7 @@ fn write_unit_template(
             owner = socket_security.owner_uid,
             group = socket_security.group_gid,
             mode = socket_security.mode,
-            allowed = allowed_args,
+            allowed = format_allowed_uid_cli_args(allowed_uids),
         );
         write_template_file(&xml, body.as_bytes())?;
         write_template_file(
@@ -659,10 +666,10 @@ WantedBy=multi-user.target
             owner = socket_security.owner_uid,
             group = socket_security.group_gid,
             mode = socket_security.mode,
-            allowed = allowed_args,
+            allowed = format_allowed_uid_cli_args(allowed_uids),
             writable_dir = writable_dir,
         );
-        write_template_file(&unit, body.as_bytes()).map_err(|e| e.to_string())?;
+        write_template_file(&unit, body.as_bytes())?;
         notes.push("Linux systemd unit written (SO_PEERCRED on accept)".into());
         return Ok(Some(unit));
     }
@@ -676,10 +683,24 @@ WantedBy=multi-user.target
             trusted_executable,
             socket_security,
             allowed_uids,
-            allowed_args,
             notes,
         );
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod allowed_uid_cli_args_tests {
+    use super::format_allowed_uid_cli_args;
+
+    #[test]
+    fn formats_explicit_uid_flags_without_implicit_current_uid() {
+        assert_eq!(format_allowed_uid_cli_args(&[]), "");
+        assert_eq!(format_allowed_uid_cli_args(&[1000]), " --allowed-uid 1000");
+        assert_eq!(
+            format_allowed_uid_cli_args(&[1000, 1001]),
+            " --allowed-uid 1000 --allowed-uid 1001"
+        );
     }
 }
 

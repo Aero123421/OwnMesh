@@ -8,6 +8,7 @@
 //!   <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wevtutil>
 
 use crate::{check_cursor, page_from_lines, LogCursor, LogError, LogPage, LogProvider, LogResult};
+#[cfg(windows)]
 use std::process::Command;
 
 /// Default provider id used by ownmeshd.
@@ -107,6 +108,7 @@ fn fetch_wevtutil(channel: &str, count: usize) -> LogResult<Vec<String>> {
     Ok(split_wevtutil_events(&text))
 }
 
+#[cfg(any(test, windows))]
 fn sanitize_channel(channel: &str) -> String {
     // Allow common channel names and path-like custom channels; drop shell metacharacters.
     channel
@@ -116,6 +118,7 @@ fn sanitize_channel(channel: &str) -> String {
 }
 
 /// Split wevtutil text format (`Event[n]` blocks) into one string per event.
+#[cfg(any(test, windows))]
 fn split_wevtutil_events(text: &str) -> Vec<String> {
     let mut events = Vec::new();
     let mut current = String::new();
