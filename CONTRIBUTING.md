@@ -19,6 +19,13 @@ Participation is governed by [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md).
 - Rust **1.92.0** via `rust-toolchain.toml` (`rustfmt`, `clippy`)
 - Node.js **≥ 22**, pnpm **9.15.0** (`packageManager` field / Corepack)
 
+On Windows without Administrator rights, `corepack enable` may fail with
+`EPERM` while trying to write shims under `C:\Program Files\nodejs`. That is a
+local toolchain layout issue, not a repository defect. Install pnpm 9.15.0 on
+`PATH` (for example via `npm install -g pnpm@9.15.0`) and either skip
+`corepack enable` or use a user-writable Corepack shim earlier on `PATH`.
+GitHub Actions runners are unaffected because they can install the shims.
+
 ### Bootstrap
 
 ```bash

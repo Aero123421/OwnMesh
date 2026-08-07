@@ -41,6 +41,7 @@ Recorded during `integrate/v1.0.2-sfh` merge verification; these do **not** reop
 - Pedantic Clippy noise is crate/test-level `allow`ed where it does not change fail-closed behavior (`doc_markdown`, `missing_errors_doc`, style lints). Prefer targeted cleanup later rather than reopening release gates.
 - Elevated privileged broker remains **explicitly unsupported** until a secure mint authority exists; production CLI paths stay fail-closed (no install/serve/exec success claim).
 - Existing DoD waivers still apply: W-SIGN, W-LIVE-E2E, W-EXT-SEC, W-§12, W-§14.
+- Local Windows non-admin hosts may hit `corepack enable` EPERM when Node lives under Program Files; use a PATH-level pnpm 9.15.0 (see CONTRIBUTING). CI runners are unaffected.
 - Deeper API-doc coverage, style-only refactors, and docs lint polish remain backlog.
 
 ## Verification commands
