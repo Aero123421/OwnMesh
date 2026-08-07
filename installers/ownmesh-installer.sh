@@ -17,6 +17,13 @@
 
 set -eu
 
+# POSIX sh has no $'...' quoting. Keep literal line-break sentinels in variables
+# so validation behaves the same under dash, BusyBox sh, and macOS /bin/sh.
+LINE_FEED="$(printf '\n_')"
+LINE_FEED="${LINE_FEED%_}"
+CARRIAGE_RETURN="$(printf '\r_')"
+CARRIAGE_RETURN="${CARRIAGE_RETURN%_}"
+
 REPOSITORY="Aero123421/OwnMesh"
 DEFAULT_INSTALL_DIR="${HOME:?HOME is required}/.local/bin"
 REQUESTED_VERSION="${OWNMESH_VERSION:-latest}"
@@ -37,7 +44,7 @@ PINNED_MINISIGN_PUB_KEY="RWSkRgn7PoGWxQVPfPTcZzF3P8Wi5JMb+EOydWtYYosHDIEsLUnGl8e
 # Only used when OWNMESH_BOOTSTRAP_MINISIGN=1 and no local minisign is available.
 PINNED_MINISIGN_VERSION="0.11"
 PINNED_MINISIGN_LINUX_X64_URL="https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz"
-PINNED_MINISIGN_LINUX_X64_SHA256="0c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e"
+PINNED_MINISIGN_LINUX_X64_SHA256="f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0"
 
 say() {
   printf '%s\n' "$*"
@@ -57,7 +64,7 @@ reject_injection() {
   label="$1"
   value="$2"
   case "$value" in
-    *'$('*|*'`'*|*'|'*|*';'*|*'>'*|*'<'*|*&&*|*||*|*$'\n'*|*$'\r'*)
+    *'$('*|*'`'*|*'|'*|*';'*|*'>'*|*'<'*|*'&'*|*"$LINE_FEED"*|*"$CARRIAGE_RETURN"*)
       fail "refusing $label with shell metacharacters"
       ;;
   esac
@@ -215,15 +222,10 @@ bootstrap_minisign() {
     Linux:x86_64|Linux:amd64)
       url="$PINNED_MINISIGN_LINUX_X64_URL"
       expect="$PINNED_MINISIGN_LINUX_X64_SHA256"
+      bootstrap_relpath="minisign-linux/x86_64/minisign"
       ;;
     *)
       fail "OWNMESH_BOOTSTRAP_MINISIGN is not supported on $os/$arch; install minisign manually"
-      ;;
-  esac
-  # Placeholder pin refuses bootstrap until operators set a real digest (fail-closed).
-  case "$expect" in
-    0c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e)
-      fail "OWNMESH_BOOTSTRAP_MINISIGN pin is not enrolled for this build; install minisign or set OWNMESH_MINISIGN"
       ;;
   esac
   boot_dir="$TMP_DIR/minisign-boot"
@@ -240,8 +242,8 @@ bootstrap_minisign() {
   actual="$(sha256_file "$archive" | tr 'A-F' 'a-f')"
   [ "$actual" = "$expect" ] || fail "pinned minisign bootstrap SHA-256 mismatch"
   tar -xzf "$archive" -C "$boot_dir" || fail "extract minisign bootstrap failed"
-  found="$(find "$boot_dir" -type f -name minisign | head -n 1)"
-  [ -n "$found" ] || fail "minisign binary missing from bootstrap archive"
+  found="$boot_dir/$bootstrap_relpath"
+  [ -f "$found" ] || fail "minisign binary missing from bootstrap archive"
   chmod 0755 "$found"
   printf '%s\n' "$found"
 }
@@ -292,7 +294,7 @@ is_allowed_member_base() {
 safe_member_base() {
   member="$1"
   case "$member" in
-    ''|*..*|/*|\\*|*\\*|*'\n'*|*$'\r'*) return 1 ;;
+    ''|*..*|/*|\\*|*\\*|*"$LINE_FEED"*|*"$CARRIAGE_RETURN"*) return 1 ;;
   esac
   # Strip a single optional directory prefix (release wrapper dir).
   case "$member" in
@@ -372,7 +374,7 @@ safe_extract() {
         if (size !~ /^[0-9]+$/ || length(size) > 12) { exit 2 }
         print size
       }
-    ")" || fail "unable to parse size for archive member $base (safe extractor unavailable)"
+    ')" || fail "unable to parse size for archive member $base (safe extractor unavailable)"
     case "$size" in
       ''|*[!0-9]*) fail "invalid size for archive member $base" ;;
     esac
@@ -575,28 +577,64 @@ mkdir -p "$INSTALL_DIR"
 BACKUP_DIR="$INSTALL_DIR/.ownmesh-backup.$$"
 mkdir -p "$BACKUP_DIR"
 for bin in $REQUIRED_BINARIES; do
+  if [ -L "$INSTALL_DIR/$bin" ]; then
+    fail "refusing existing symlink at $INSTALL_DIR/$bin"
+  fi
+  if [ -e "$INSTALL_DIR/$bin" ] && [ ! -f "$INSTALL_DIR/$bin" ]; then
+    fail "refusing existing non-file at $INSTALL_DIR/$bin"
+  fi
   if [ -f "$INSTALL_DIR/$bin" ]; then
     cp "$INSTALL_DIR/$bin" "$BACKUP_DIR/$bin" || fail "backup $bin failed"
   fi
 done
 
+INSTALLED_BINARIES=""
+rollback_install() {
+  restore_rc=0
+  for b in $REQUIRED_BINARIES; do
+    case " $INSTALLED_BINARIES " in
+      *" $b "*) ;;
+      *) continue ;;
+    esac
+    target="$INSTALL_DIR/$b"
+    if [ -f "$BACKUP_DIR/$b" ]; then
+      if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+        say "rollback refused unsafe target for $b" >&2
+        restore_rc=1
+      elif ! mv -f "$BACKUP_DIR/$b" "$target"; then
+        say "rollback failed for $b" >&2
+        restore_rc=1
+      fi
+    elif [ -e "$target" ] || [ -L "$target" ]; then
+      if ! rm -f "$target"; then
+        say "rollback failed to remove newly installed $b" >&2
+        restore_rc=1
+      fi
+    fi
+  done
+  [ "$restore_rc" -eq 0 ]
+}
+
 for bin in $REQUIRED_BINARIES; do
   [ -f "$EXTRACT_DIR/$bin" ] || fail "partial extract: missing $bin"
   staged="$INSTALL_DIR/.${bin}.new.$$"
-  cp "$EXTRACT_DIR/$bin" "$staged"
-  chmod 0755 "$staged"
-  if ! mv -f "$staged" "$INSTALL_DIR/$bin"; then
+  if ! cp "$EXTRACT_DIR/$bin" "$staged" || ! chmod 0755 "$staged"; then
+    rm -f "$staged"
+    if ! rollback_install; then
+      fail "failed to stage $bin; backup rollback also failed (backup left at $BACKUP_DIR)"
+    fi
+    rm -rf "$BACKUP_DIR"
+    fail "failed to stage $bin; previous binaries restored"
+  fi
+  move_ok=0
+  if mv -f "$staged" "$INSTALL_DIR/$bin"; then
+    move_ok=1
+    INSTALLED_BINARIES="$INSTALLED_BINARIES $bin"
+  fi
+  if [ "$move_ok" -ne 1 ] || [ ! -f "$INSTALL_DIR/$bin" ] || [ -L "$INSTALL_DIR/$bin" ]; then
     say "atomic install failed; restoring backup"
-    restore_rc=0
-    for b in $REQUIRED_BINARIES; do
-      if [ -f "$BACKUP_DIR/$b" ]; then
-        if ! mv -f "$BACKUP_DIR/$b" "$INSTALL_DIR/$b"; then
-          say "rollback failed for $b" >&2
-          restore_rc=1
-        fi
-      fi
-    done
-    if [ "$restore_rc" -ne 0 ]; then
+    rm -f "$staged"
+    if ! rollback_install; then
       fail "failed to install $bin; backup rollback also failed (backup left at $BACKUP_DIR)"
     fi
     rm -rf "$BACKUP_DIR"

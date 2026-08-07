@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import shlex
 import shutil
 import stat
 import subprocess
@@ -140,6 +141,33 @@ def _pack(package: Path, asset_dir: Path, asset_name: str, windows: bool) -> tup
 
 
 class InstallerAdversarialTests(unittest.TestCase):
+    def test_unix_installer_is_posix_sh_and_rejects_line_breaks(self) -> None:
+        if _is_windows():
+            self.skipTest("unix installer")
+
+        syntax = subprocess.run(
+            ["sh", "-n", str(SH_INSTALLER)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stdout + syntax.stderr)
+
+        for unsafe in ("/tmp/ownmesh\nbad", "/tmp/ownmesh\rbad", "/tmp/ownmesh&bad"):
+            env = os.environ.copy()
+            env["OWNMESH_INSTALL_DIR"] = unsafe
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("shell metacharacters", failed.stderr)
+
     def test_unix_happy_and_adversarial(self) -> None:
         if _is_windows():
             self.skipTest("unix installer")
@@ -186,6 +214,14 @@ class InstallerAdversarialTests(unittest.TestCase):
             )
             self.assertEqual(smoke.returncode, 0, smoke.stderr)
             self.assertIn("ownmesh", smoke.stdout.lower())
+            for binary in (
+                "ownmesh",
+                "ownmesh-tui",
+                "ownmeshd",
+                "ownmesh-session-host",
+                "ownmesh-broker",
+            ):
+                self.assertTrue((install / binary).is_file(), binary)
 
             # Checksum mismatch (signature still verifies; archive digest fails).
             bad = tmp_path / "bad-assets"
@@ -305,10 +341,11 @@ class InstallerAdversarialTests(unittest.TestCase):
             bomb_asset = bomb_assets / asset_name
             with tarfile.open(bomb_asset, "w:gz") as tf:
                 for i in range(80):
-                    info = tarfile.TarInfo(name=f"pad-{i}.txt")
-                    data = b"x"
-                    info.size = len(data)
-                    tf.addfile(info, fileobj=__import__("io").BytesIO(data))
+                    # Directory headers are otherwise ignored by the allow-list,
+                    # so this reaches the independent entry-count gate.
+                    info = tarfile.TarInfo(name=f"pad-{i}/")
+                    info.type = tarfile.DIRTYPE
+                    tf.addfile(info)
             digest = _sha256(bomb_asset)
             sums = bomb_assets / "SHA256SUMS"
             sums.write_text(f"{digest}  {asset_name}\n", encoding="ascii", newline="\n")
@@ -468,8 +505,7 @@ class InstallerAdversarialTests(unittest.TestCase):
                 failed.stderr,
             )
 
-            # Rollback: pre-install a marker binary, force install failure mid-way via
-            # non-writable install dir after backup — previous binary must remain.
+            # Non-file destinations fail before any binary replacement.
             rollback_pkg = tmp_path / "rollback-pkg"
             _write_fake_bins(rollback_pkg, windows=False)
             rollback_assets = tmp_path / "rollback-assets"
@@ -483,9 +519,6 @@ class InstallerAdversarialTests(unittest.TestCase):
                 newline="\n",
             )
             old_bin.chmod(old_bin.stat().st_mode | stat.S_IEXEC)
-            # Make install dir non-writable after placing marker so replace fails closed.
-            # Use a file named like a binary as a directory to break mv for one member:
-            # replace ownmesh-tui target with a directory so atomic install fails and rolls back.
             tui_blocker = rb_install / "ownmesh-tui"
             tui_blocker.mkdir()
             (tui_blocker / "nested").write_text("x", encoding="utf-8")
@@ -502,9 +535,42 @@ class InstallerAdversarialTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(failed.returncode, 0)
-            # ownmesh must still be the old marker (or restored); never a partial new set only.
-            if old_bin.is_file():
-                self.assertIn("ownmesh-old-marker", old_bin.read_text(encoding="utf-8"))
+            self.assertIn("non-file", failed.stderr.lower())
+            self.assertIn("ownmesh-old-marker", old_bin.read_text(encoding="utf-8"))
+
+            # Force the second atomic move to fail after ownmesh was replaced. Rollback
+            # must restore the marker and remove every binary that had no predecessor.
+            shutil.rmtree(tui_blocker)
+            shim_dir = tmp_path / "rollback-shim"
+            shim_dir.mkdir()
+            real_mv = shutil.which("mv")
+            self.assertIsNotNone(real_mv)
+            mv_shim = shim_dir / "mv"
+            mv_shim.write_text(
+                "#!/bin/sh\n"
+                'if [ "$3" = "$OWNMESH_TEST_FAIL_DEST" ]; then exit 91; fi\n'
+                f"exec {shlex.quote(real_mv or '/bin/mv')} \"$@\"\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            mv_shim.chmod(mv_shim.stat().st_mode | stat.S_IEXEC)
+            env["PATH"] = str(shim_dir) + os.pathsep + env["PATH"]
+            env["OWNMESH_TEST_FAIL_DEST"] = str(rb_install / "ownmesh-tui")
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("previous binaries restored", failed.stderr.lower())
+            self.assertIn("ownmesh-old-marker", old_bin.read_text(encoding="utf-8"))
+            for binary in BINS[1:]:
+                self.assertFalse((rb_install / binary).exists(), binary)
+            env["PATH"] = os.environ["PATH"]
+            env.pop("OWNMESH_TEST_FAIL_DEST", None)
 
             # Unsupported arch simulation via uname override is hard in pure sh;
             # instead refuse bad OWNMESH_BASE_URL injection.
@@ -594,11 +660,18 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("MaxTotalUncompressedBytes", text)
         self.assertIn("duplicate archive member", text)
         self.assertIn("unexpected archive member", text)
+        self.assertIn("Refusing existing non-file", text)
+        self.assertIn("Refusing existing reparse point", text)
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
         self.assertIn("SHA256SUMS.minisig", text)
         self.assertIn("require_verify_minisign", text)
+        self.assertIn(
+            'PINNED_MINISIGN_LINUX_X64_SHA256="f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0"',
+            text,
+        )
+        self.assertIn('bootstrap_relpath="minisign-linux/x86_64/minisign"', text)
         self.assertIn("PINNED_MINISIGN_PUB_KEY", text)
         # No executable curl|sh pipeline (comments may discuss the anti-pattern).
         self.assertNotRegex(text, r"(?m)^[^#\n]*curl[^\n]*\|\s*sh")

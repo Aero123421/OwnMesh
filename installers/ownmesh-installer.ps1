@@ -366,6 +366,7 @@
     $extractDir = Join-Path $tempDir "extract"
     $backupDir = Join-Path $InstallDir (".ownmesh-backup-" + $PID)
     $stagedFiles = @()
+    $replacedBins = @()
 
     try {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
@@ -420,7 +421,14 @@
         New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
         foreach ($bin in $RequiredBinaries) {
             $current = Join-Path $InstallDir $bin
-            if (Test-Path -LiteralPath $current -PathType Leaf) {
+            if (Test-Path -LiteralPath $current) {
+                if (-not (Test-Path -LiteralPath $current -PathType Leaf)) {
+                    throw "Refusing existing non-file at $current"
+                }
+                $currentItem = Get-Item -LiteralPath $current -Force
+                if (($currentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "Refusing existing reparse point at $current"
+                }
                 Copy-Item -LiteralPath $current -Destination (Join-Path $backupDir $bin) -Force
             }
         }
@@ -433,18 +441,43 @@
                 $stagedFiles += $staged
                 $finalPath = Join-Path $InstallDir $bin
                 Move-Item -LiteralPath $staged -Destination $finalPath -Force
+                $replacedBins += $bin
+                if (-not (Test-Path -LiteralPath $finalPath -PathType Leaf)) {
+                    throw "Installed target is not a file: $finalPath"
+                }
+                $installedItem = Get-Item -LiteralPath $finalPath -Force
+                if (($installedItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "Installed target is a reparse point: $finalPath"
+                }
             }
         } catch {
             Write-Host "Atomic install failed; restoring backup..."
             $restoreFailed = $false
             foreach ($bin in $RequiredBinaries) {
+                if ($replacedBins -notcontains $bin) {
+                    continue
+                }
                 $bak = Join-Path $backupDir $bin
                 if (Test-Path -LiteralPath $bak -PathType Leaf) {
                     try {
-                        Copy-Item -LiteralPath $bak -Destination (Join-Path $InstallDir $bin) -Force
+                        $restorePath = Join-Path $InstallDir $bin
+                        if (Test-Path -LiteralPath $restorePath) {
+                            Remove-Item -LiteralPath $restorePath -Force -ErrorAction Stop
+                        }
+                        Copy-Item -LiteralPath $bak -Destination $restorePath -Force
                     } catch {
                         Write-Host "Rollback failed for $bin"
                         $restoreFailed = $true
+                    }
+                } else {
+                    $newPath = Join-Path $InstallDir $bin
+                    if (Test-Path -LiteralPath $newPath) {
+                        try {
+                            Remove-Item -LiteralPath $newPath -Force -ErrorAction Stop
+                        } catch {
+                            Write-Host "Rollback failed to remove newly installed $bin"
+                            $restoreFailed = $true
+                        }
                     }
                 }
             }
