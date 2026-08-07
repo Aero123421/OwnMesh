@@ -9,8 +9,8 @@ use crate::wizard::{
 use ownmesh_config::{load_config, load_policy, OwnMeshPaths};
 use ownmesh_diagnostics::{
     run_doctor, BinaryObservation, ConfigObservation, ControlPlaneObservation,
-    CredentialObservation, DaemonObservation, DoctorInput, DoctorReport,
-    PrivacyPolicyObservation, ServiceObservation,
+    CredentialObservation, DaemonObservation, DoctorInput, DoctorReport, PrivacyPolicyObservation,
+    ServiceObservation,
 };
 use ownmesh_ipc::DaemonStatus;
 use ownmesh_policy::AccessPreset;
@@ -123,7 +123,12 @@ impl App {
         let pol = load_policy(&paths).unwrap_or_default();
         let policy_preset = preset_from_wire(pol.preset.as_deref().unwrap_or("recommended"));
         // Read-only local observations only: no network probes, no secret material.
-        let doctor = run_doctor(&doctor_input_from_local(&paths, &cfg, &pol, daemon.as_ref()));
+        let doctor = run_doctor(&doctor_input_from_local(
+            &paths,
+            &cfg,
+            &pol,
+            daemon.as_ref(),
+        ));
 
         let mut app = Self {
             lang,
