@@ -1,4 +1,10 @@
 # Local-only secrets for `wrangler dev`. Copy to .dev.vars (gitignored).
 # Never commit real values. Generate: openssl rand -hex 32
 SESSION_SECRET=replace-me-with-openssl-rand-hex-32
+# Used to HMAC-sign short-lived Worker→DeviceRoom internal context (principal/tenant/device/op).
 OAUTH_ISSUER=http://127.0.0.1:8787
+# OFF by default. Set true only for isolated local/test use with no production data.
+OWNMESH_DEV_AUTH_BYPASS=false
+# Prefer statically provisioned clients. Enable only when DCR is intentionally exposed.
+ALLOW_DYNAMIC_CLIENT_REGISTRATION=false
+OWNMESH_ALLOWED_ORIGINS=http://127.0.0.1:8787

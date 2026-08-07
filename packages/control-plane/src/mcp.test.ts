@@ -19,6 +19,7 @@ import {
 import { DeviceRoomHarness, type DeviceEnvelope } from "./device-room.ts";
 import { MemoryStore } from "./store.ts";
 import { randomId } from "./util.ts";
+import { __test } from "./index.ts";
 
 async function authed(scope = "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device") {
   const store = new MemoryStore();
@@ -44,6 +45,12 @@ function rpc(
   });
 }
 
+function connectTestAgent(room: DeviceRoomHarness): string {
+  const id = room.connect("agent");
+  room.router.sessions.get(id)!.phase = "ready";
+  return id;
+}
+
 async function callTool(
   store: MemoryStore,
   token: string,
@@ -52,6 +59,15 @@ async function callTool(
   router?: Parameters<typeof handleMcp>[3],
   tracker?: OperationTracker,
 ) {
+  const deviceId = typeof args.device_id === "string" ? args.device_id : "";
+  if (deviceId && !(await store.getDevice(deviceId))) {
+    await store.putDevice({
+      id: deviceId, tenant_id: "ten_default", principal_id: "prin_dev", name: deviceId,
+      hostname: deviceId, os: "test", arch: "test", agent_version: "test",
+      protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false,
+      created_at: new Date().toISOString(), status: "active",
+    });
+  }
   const res = await handleMcp(
     rpc("tools/call", { name, arguments: args }, token),
     store,
@@ -158,14 +174,12 @@ test("read scope cannot write files", async () => {
 
 test("exec scope required for shell tool", async () => {
   const { store, token } = await authed("ownmesh.write");
-  // write scope implies exec via requireScope helper
+  // write scope must not imply execution authority
   const { body } = await callTool(store, token, "ownmesh_command_shell", {
     device_id: "dev_x",
     command: "echo hi",
   });
-  // ownmesh.write grants exec in requireScope
-  assert.equal(body.error, undefined);
-  assert.ok(body.result?.structuredContent);
+  assert.equal(body.error?.code, -32003);
 });
 
 // ---------------------------------------------------------------------------
@@ -202,6 +216,7 @@ test("list_devices supports cursor pagination", async () => {
       public_key: "ab".repeat(32),
       revoked: false,
       created_at: new Date().toISOString(),
+      status: "active",
     });
   }
   const { body } = await callTool(store, token, "ownmesh_list_devices", {
@@ -234,10 +249,11 @@ test("read tool routes through DeviceRoom to agent and returns completed", async
     public_key: "cd".repeat(32),
     revoked: false,
     created_at: new Date().toISOString(),
+    status: "active",
   });
 
   const room = new DeviceRoomHarness(deviceId);
-  const agent = room.connect("agent");
+  const agent = connectTestAgent(room);
   const tracker = new OperationTracker();
 
   const router = createHarnessRouter({
@@ -283,7 +299,7 @@ test("write tool → device ask → approval_required with approval_url", async 
   const { store, token } = await authed();
   const deviceId = "dev_mcp_write_01abcdef0";
   const room = new DeviceRoomHarness(deviceId);
-  room.connect("agent");
+  connectTestAgent(room);
   const tracker = new OperationTracker();
 
   const router = createHarnessRouter({
@@ -361,7 +377,7 @@ test("approval round-trip: ask → human approve metadata → completed result",
   const { store, token } = await authed();
   const deviceId = "dev_mcp_apr_roundtrip01";
   const room = new DeviceRoomHarness(deviceId);
-  room.connect("agent");
+  connectTestAgent(room);
   const tracker = new OperationTracker();
   let approved = false;
   let lastOpId = "";
@@ -403,21 +419,24 @@ test("approval round-trip: ask → human approve metadata → completed result",
     tracker,
   );
   assert.equal(first.body.result!.structuredContent!.status, "approval_required");
+  const opId = String(first.body.result!.structuredContent!.operation_id);
 
-  // Simulate human approval via browser page recording + device grant
+  // Authoritative store update (simulates /approve + device completion)
   approved = true;
-  tracker.update(String(first.body.result!.structuredContent!.operation_id), {
+  await store.updateMcpOperation(opId, {
     status: "completed",
     approval_required: false,
     summary: "approved and executed",
     data: { bytes_written: 4, path: "ok.txt" },
   });
+  // Cache may lag; poll must read store authority
+  tracker.clear();
 
   const second = await callTool(
     store,
     token,
     "ownmesh_get_operation",
-    { operation_id: first.body.result!.structuredContent!.operation_id as string },
+    { operation_id: opId },
     router,
     tracker,
   );
@@ -429,7 +448,7 @@ test("async command returns pending and is pollable", async () => {
   const { store, token } = await authed();
   const deviceId = "dev_mcp_async_01abcdef";
   const room = new DeviceRoomHarness(deviceId);
-  room.connect("agent");
+  connectTestAgent(room);
   const tracker = new OperationTracker();
   const router = createHarnessRouter({
     inject: (_id, op) => room.router.injectOperation(op),
@@ -470,7 +489,7 @@ test("session_open routes to device room", async () => {
   const { store, token } = await authed();
   const deviceId = "dev_mcp_sess_01abcdef01";
   const room = new DeviceRoomHarness(deviceId);
-  room.connect("agent");
+  connectTestAgent(room);
   const router = createHarnessRouter({
     inject: (_id, op) => {
       const r = room.router.injectOperation(op);
@@ -515,7 +534,7 @@ test("prompt-injection in write content cannot force allow or skip approval", as
   const { store, token } = await authed();
   const deviceId = "dev_mcp_inject_01abcdef";
   const room = new DeviceRoomHarness(deviceId);
-  room.connect("agent");
+  connectTestAgent(room);
   const tracker = new OperationTracker();
 
   const router = createHarnessRouter({
@@ -579,7 +598,7 @@ test("device deny is preserved even when args claim allow", async () => {
   const { store, token } = await authed();
   const deviceId = "dev_mcp_deny_01abcdef01";
   const room = new DeviceRoomHarness(deviceId);
-  room.connect("agent");
+  connectTestAgent(room);
   const router = createHarnessRouter({
     inject: () => ({
       status: "routed_to_device",
@@ -631,4 +650,193 @@ test("makeEnvelope defaults policy_authority", () => {
   });
   assert.equal(env.policy_authority, "ownmesh_device");
   assert.equal(env.truncated, false);
+});
+
+// ---------------------------------------------------------------------------
+// DEVICE_ROOM fail-closed (no logical route / approval placeholder)
+// ---------------------------------------------------------------------------
+
+test("routeToDeviceRoom without DEVICE_ROOM returns unavailable (never routed_to_device)", async () => {
+  const routed = await __test.routeToDeviceRoom(
+    {},
+    "dev_unbound_01abcdef01",
+    {
+      type: "ownmesh_fs_list",
+      payload: { path: "/" },
+      correlation_id: "corr_unbound",
+    },
+  );
+  assert.equal(routed.status, "unavailable");
+  assert.notEqual(routed.status, "routed_to_device");
+  const detail = (routed.detail || {}) as { error?: string };
+  assert.equal(detail.error, "device_room_unbound");
+});
+
+test("device-routed tool without router surfaces failed/unavailable (not pending/approval)", async () => {
+  const { store, token } = await authed();
+  const deviceId = "dev_mcp_unbound_read01";
+
+  // Read tool, no router → failed unavailable (not pending logical route)
+  const readCall = await callTool(store, token, "ownmesh_fs_list", {
+    device_id: deviceId,
+    path: "/",
+  });
+  const readSc = readCall.body.result!.structuredContent!;
+  assert.equal(readSc.status, "failed");
+  assert.notEqual(readSc.status, "pending");
+  assert.notEqual(readSc.status, "approval_required");
+  assert.equal(readSc.approval_required, false);
+  assert.equal(
+    (readSc.data as { error: { code: string } }).error.code,
+    "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE",
+  );
+  assert.equal(readCall.body.result!.isError, true);
+
+  // Mutating tool, no router → failed unavailable (not approval_required placeholder)
+  const writeCall = await callTool(store, token, "ownmesh_fs_write", {
+    device_id: deviceId,
+    path: "x.txt",
+    content: "data",
+  });
+  const writeSc = writeCall.body.result!.structuredContent!;
+  assert.equal(writeSc.status, "failed");
+  assert.notEqual(writeSc.status, "pending");
+  assert.notEqual(writeSc.status, "approval_required");
+  assert.equal(writeSc.approval_required, false);
+  assert.equal(
+    (writeSc.data as { error: { code: string } }).error.code,
+    "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE",
+  );
+  assert.equal(writeCall.body.result!.isError, true);
+});
+
+test("router reporting unavailable surfaces failed (not pending/approval)", async () => {
+  const { store, token } = await authed();
+  const deviceId = "dev_mcp_route_unavail01";
+  const router = createHarnessRouter({
+    inject: () => ({
+      status: "unavailable",
+      detail: { error: "device_room_unbound" },
+    }),
+  });
+
+  const readCall = await callTool(
+    store,
+    token,
+    "ownmesh_fs_read",
+    { device_id: deviceId, path: "/a" },
+    router,
+  );
+  const readSc = readCall.body.result!.structuredContent!;
+  assert.equal(readSc.status, "failed");
+  assert.notEqual(readSc.status, "pending");
+  assert.equal(
+    (readSc.data as { error: { code: string } }).error.code,
+    "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE",
+  );
+
+  const writeCall = await callTool(
+    store,
+    token,
+    "ownmesh_fs_write",
+    { device_id: deviceId, path: "b.txt", content: "x" },
+    router,
+  );
+  const writeSc = writeCall.body.result!.structuredContent!;
+  assert.equal(writeSc.status, "failed");
+  assert.notEqual(writeSc.status, "approval_required");
+  assert.equal(writeSc.approval_required, false);
+  assert.equal(
+    (writeSc.data as { error: { code: string } }).error.code,
+    "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE",
+  );
+});
+
+test("local tools still work without router (list_devices/get_device/list_profiles/get_operation)", async () => {
+  const { store, token } = await authed();
+  const deviceId = "dev_mcp_local_01abcdef01";
+  await store.putDevice({
+    id: deviceId,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    name: "local",
+    hostname: "local",
+    os: "linux",
+    arch: "x64",
+    agent_version: "1.0.1",
+    protocol_version: "ownmesh.device/1.0",
+    public_key: "ab".repeat(32),
+    revoked: false,
+    created_at: new Date().toISOString(),
+    status: "active",
+  });
+
+  const list = await callTool(store, token, "ownmesh_list_devices", {});
+  assert.equal(list.body.result!.structuredContent!.status, "completed");
+
+  const get = await callTool(store, token, "ownmesh_get_device", {
+    device_id: deviceId,
+  });
+  assert.equal(get.body.result!.structuredContent!.status, "completed");
+
+  const profiles = await callTool(store, token, "ownmesh_list_profiles", {});
+  assert.equal(profiles.body.result!.structuredContent!.status, "completed");
+
+  // Seed op in authoritative store (tracker is cache-only; no tracker fallback).
+  const tracker = new OperationTracker();
+  const opId = "op_local_get_01";
+  await store.putMcpOperation({
+    operation_id: opId,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_list",
+    status: "completed",
+    summary: "seed",
+    data: { ok: true },
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const op = await callTool(
+    store,
+    token,
+    "ownmesh_get_operation",
+    { operation_id: opId },
+    undefined,
+    tracker,
+  );
+  assert.equal(op.body.result!.structuredContent!.status, "completed");
+  assert.equal(op.body.result!.structuredContent!.operation_id, opId);
+  // Tracker-only seed must NOT resurrect after store-backed authority.
+  const trackerOnly = new OperationTracker();
+  trackerOnly.put({
+    ...makeEnvelope({
+      operation_id: "op_tracker_only_ghost",
+      status: "completed",
+      summary: "ghost",
+      data: { ok: true },
+    }),
+    tool: "ownmesh_fs_list",
+    principal: "prin_dev",
+    tenant_id: "ten_default",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const ghost = await callTool(
+    store,
+    token,
+    "ownmesh_get_operation",
+    { operation_id: "op_tracker_only_ghost" },
+    undefined,
+    trackerOnly,
+  );
+  assert.match(
+    JSON.stringify(ghost.body),
+    /unknown operation|not found/i,
+  );
 });

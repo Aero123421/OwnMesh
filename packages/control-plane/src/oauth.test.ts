@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { __test, MCP_TOOLS } from "./index.ts";
-import { handleAuthorize, handleRegister, handleToken } from "./oauth.ts";
+import {
+  handleAuthorize,
+  handleRegister,
+  handleToken,
+  oauthMetadata,
+} from "./oauth.ts";
 import { MemoryStore } from "./store.ts";
 import { verifyPkceS256 } from "./util.ts";
 
@@ -100,6 +105,7 @@ test("redirect_uri exact match enforced on authorize", async () => {
     ),
     store,
     "https://cp.test",
+    { allowDevBypass: true },
   );
   assert.equal(good.status, 302);
   const loc = good.headers.get("location") || "";
@@ -133,6 +139,7 @@ test("authorization_code + PKCE S256 exchange", async () => {
     ),
     store,
     "https://cp.test",
+    { allowDevBypass: true },
   );
   const code = new URL(authRes.headers.get("location")!).searchParams.get("code")!;
   const tokRes = await handleToken(
@@ -159,6 +166,10 @@ test("device authorization grant end-to-end", async () => {
   const store = new MemoryStore();
   await store.ensureBootstrap();
   const { handleDeviceAuthorization } = await import("./oauth.ts");
+  await store.putClient({
+    client_id: "client_ownmesh_cli", tenant_id: "ten_default", client_name: "cli",
+    redirect_uris: [], created_at: new Date().toISOString(),
+  });
   const issued = await handleDeviceAuthorization(
     new Request("https://cp.test/oauth/device_authorization", {
       method: "POST",
@@ -208,28 +219,225 @@ test("device authorization grant end-to-end", async () => {
     store,
   );
   assert.equal(done.status, 200);
-  const tok = (await done.json()) as { access_token: string };
+  const tok = (await done.json()) as { access_token: string; refresh_token?: string };
   assert.ok(await store.getAccess(tok.access_token));
+  assert.equal(tok.refresh_token, undefined);
 });
 
 test("dynamic client registration returns policy", async () => {
   const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.ensurePrincipal("prin_dcr", "DCR User", "user", "ten_default");
+  const tok = await store.issueTokens("client_ownmesh_cli", "prin_dcr", "ownmesh.device");
   const res = await handleRegister(
     new Request("https://cp.test/oauth/register", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${tok.access_token}`,
+      },
       body: JSON.stringify({
         client_name: "ChatGPT",
         redirect_uris: ["https://chatgpt.com/connector/oauth/callback"],
       }),
     }),
     store,
+    { allowDynamicRegistration: true },
   );
   assert.equal(res.status, 201);
   const body = (await res.json()) as {
     client_id: string;
-    policy: { redirect_uri_match: string };
+    client_name: string;
+    redirect_uris: string[];
+    token_endpoint_auth_method: string;
+    policy: { redirect_uri_match: string; dynamic_client_registration: string };
   };
   assert.ok(body.client_id);
+  assert.equal(body.client_name, "ChatGPT");
+  assert.deepEqual(body.redirect_uris, ["https://chatgpt.com/connector/oauth/callback"]);
+  assert.equal(body.token_endpoint_auth_method, "none");
   assert.equal(body.policy.redirect_uri_match, "exact");
+  assert.equal(body.policy.dynamic_client_registration, "supported");
+  const stored = await store.getClient(body.client_id);
+  assert.ok(stored);
+  assert.equal(stored!.tenant_id, "ten_default");
+  assert.equal(stored!.client_name, "ChatGPT");
+});
+
+test("AS metadata does not advertise client_secret_post", () => {
+  const meta = oauthMetadata("https://cp.test");
+  assert.deepEqual(meta.token_endpoint_auth_methods_supported, ["none"]);
+  assert.equal(
+    meta.token_endpoint_auth_methods_supported.includes("client_secret_post"),
+    false,
+  );
+});
+
+test("register rejects token_endpoint_auth_method=client_secret_post", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.ensurePrincipal("prin_dcr2", "DCR User", "user", "ten_default");
+  const tok = await store.issueTokens("client_ownmesh_cli", "prin_dcr2", "ownmesh.device");
+  const res = await handleRegister(
+    new Request("https://cp.test/oauth/register", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${tok.access_token}`,
+      },
+      body: JSON.stringify({
+        client_name: "secret-client",
+        redirect_uris: ["https://example.com/cb"],
+        token_endpoint_auth_method: "client_secret_post",
+      }),
+    }),
+    store,
+    { allowDynamicRegistration: true },
+  );
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "invalid_client_metadata");
+});
+
+test("register accepts token_endpoint_auth_method=none (public client)", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.ensurePrincipal("prin_dcr3", "DCR User", "user", "ten_default");
+  const tok = await store.issueTokens("client_ownmesh_cli", "prin_dcr3", "ownmesh.device");
+  const res = await handleRegister(
+    new Request("https://cp.test/oauth/register", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${tok.access_token}`,
+      },
+      body: JSON.stringify({
+        client_name: "public-client",
+        redirect_uris: ["https://example.com/cb"],
+        token_endpoint_auth_method: "none",
+      }),
+    }),
+    store,
+    { allowDynamicRegistration: true },
+  );
+  assert.equal(res.status, 201);
+  const body = (await res.json()) as { token_endpoint_auth_method: string };
+  assert.equal(body.token_endpoint_auth_method, "none");
+});
+
+test("token endpoint rejects body client_secret (client_secret_post)", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: "client_pkce",
+    tenant_id: "ten_default",
+    client_name: "cli",
+    redirect_uris: ["http://127.0.0.1:8750/callback"],
+    created_at: new Date().toISOString(),
+  });
+  // Even with a valid-looking grant shape, client_secret must fail closed.
+  const res = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: "ac_fake",
+        redirect_uri: "http://127.0.0.1:8750/callback",
+        client_id: "client_pkce",
+        code_verifier: "0123456789012345678901234567890123456789013",
+        client_secret: "super-secret",
+      }),
+    }),
+    store,
+  );
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "invalid_client");
+});
+
+test("token endpoint rejects empty client_secret as present (not absent)", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  // Empty string must NOT be treated as "no secret" / public-client proof.
+  const res = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: "rtk_whatever",
+        client_id: "client_pkce",
+        client_secret: "",
+      }),
+    }),
+    store,
+  );
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: string; error_description?: string };
+  assert.equal(body.error, "invalid_client");
+  assert.match(body.error_description || "", /client_secret/i);
+});
+
+test("token endpoint rejects Authorization: Basic (client_secret_basic)", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const basic = Buffer.from("client_pkce:super-secret").toString("base64");
+  const res = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: `Basic ${basic}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: "rtk_whatever",
+        client_id: "client_pkce",
+      }),
+    }),
+    store,
+  );
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: string; error_description?: string };
+  assert.equal(body.error, "invalid_client");
+  assert.match(body.error_description || "", /basic|client_secret_basic/i);
+});
+
+test("token endpoint rejects token_endpoint_auth_method=client_secret_post", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const res = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: "rtk_whatever",
+        token_endpoint_auth_method: "client_secret_post",
+      }),
+    }),
+    store,
+  );
+  assert.equal(res.status, 401);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "invalid_client");
+});
+
+test("AS metadata advertises only token_endpoint_auth_method none", () => {
+  const meta = oauthMetadata("https://cp.test");
+  assert.deepEqual(meta.token_endpoint_auth_methods_supported, ["none"]);
+  assert.equal(meta.token_endpoint_auth_methods_supported.length, 1);
+  for (const method of [
+    "client_secret_post",
+    "client_secret_basic",
+    "client_secret_jwt",
+    "private_key_jwt",
+  ]) {
+    assert.equal(
+      meta.token_endpoint_auth_methods_supported.includes(method),
+      false,
+      `must not advertise ${method}`,
+    );
+  }
 });

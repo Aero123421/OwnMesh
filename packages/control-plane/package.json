@@ -27,6 +27,12 @@
       },
       "SESSION_SECRET": {
         "description": "Optional signing secret. Generate with `openssl rand -hex 32`."
+      },
+      "AUTH_PROVIDER": {
+        "description": "Required production service binding that authenticates browser requests and returns principal_id + tenant_id. OAuth browser routes return 503 when absent."
+      },
+      "OWNMESH_DEV_AUTH_BYPASS": {
+        "description": "Explicit local/test-only bypass. Must remain false in production."
       }
     }
   },

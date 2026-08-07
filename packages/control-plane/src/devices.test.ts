@@ -17,6 +17,9 @@ async function authedStore() {
 
 test("enroll returns challenge shape then proof + revoke persist", async () => {
   const { store, token } = await authedStore();
+  const keyPair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
+  const publicBytes = new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey) as ArrayBuffer);
+  const publicKey = [...publicBytes].map((b) => b.toString(16).padStart(2, "0")).join("");
   const enrollRes = await handleDevices(
     new Request("https://cp.test/v1/devices/enroll", {
       method: "POST",
@@ -31,7 +34,7 @@ test("enroll returns challenge shape then proof + revoke persist", async () => {
         arch: "x64",
         agent_version: "1.0.1",
         protocol_version: "ownmesh.device/1.0",
-        public_key: "ab".repeat(32),
+        public_key: publicKey,
       }),
     }),
     store,
@@ -53,6 +56,23 @@ test("enroll returns challenge shape then proof + revoke persist", async () => {
   );
   assert.equal(body.connect_path, "/agent/connect");
 
+  const signatureBytes = new Uint8Array(await crypto.subtle.sign(
+    "Ed25519", keyPair.privateKey, new TextEncoder().encode(body.challenge.message),
+  ));
+  const signature = [...signatureBytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+  const invalidProof = await handleDevices(
+    new Request("https://cp.test/v1/devices/enroll/proof", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ device_id: body.device_id, challenge_id: body.challenge.id, signature: "00".repeat(64) }),
+    }),
+    store,
+    new URL("https://cp.test/v1/devices/enroll/proof"),
+  );
+  assert.equal(invalidProof.status, 400);
+  assert.equal((await store.getDevice(body.device_id))?.status, "pending");
+
   const proofRes = await handleDevices(
     new Request("https://cp.test/v1/devices/enroll/proof", {
       method: "POST",
@@ -63,7 +83,7 @@ test("enroll returns challenge shape then proof + revoke persist", async () => {
       body: JSON.stringify({
         device_id: body.device_id,
         challenge_id: body.challenge.id,
-        signature: "cd".repeat(64),
+        signature,
       }),
     }),
     store,
@@ -85,13 +105,13 @@ test("enroll returns challenge shape then proof + revoke persist", async () => {
       body: JSON.stringify({
         device_id: body.device_id,
         challenge_id: body.challenge.id,
-        signature: "cd".repeat(64),
+        signature,
       }),
     }),
     store,
     new URL("https://cp.test/v1/devices/enroll/proof"),
   );
-  assert.equal(reuse.status, 400);
+  assert.equal(reuse.status, 409);
 
   const list = await handleDevices(
     new Request("https://cp.test/v1/devices", {

@@ -134,8 +134,10 @@ pub enum SecretPurpose {
     DevicePrivateKey,
     /// Human OAuth refresh token.
     HumanRefreshToken,
-    /// Optional device enrollment proof material.
+    /// Legacy short-lived enrollment proof material (not the long-lived credential).
     DeviceEnrollmentProof,
+    /// Long-lived device credential (issuer + device_id bound envelope).
+    DeviceCredential,
 }
 
 impl SecretPurpose {
@@ -146,6 +148,7 @@ impl SecretPurpose {
             Self::DevicePrivateKey => "device-private-key",
             Self::HumanRefreshToken => "human-refresh-token",
             Self::DeviceEnrollmentProof => "device-enrollment-proof",
+            Self::DeviceCredential => "device-credential",
         }
     }
 
@@ -156,6 +159,7 @@ impl SecretPurpose {
             Self::DevicePrivateKey => "device signing private key",
             Self::HumanRefreshToken => "human OAuth refresh token",
             Self::DeviceEnrollmentProof => "device enrollment proof",
+            Self::DeviceCredential => "device connect credential",
         }
     }
 }

@@ -26,6 +26,8 @@ struct Inner {
     device_codes: Mutex<HashMap<String, DeviceCode>>,
     devices: Mutex<HashMap<String, DeviceRec>>,
     challenges: Mutex<HashMap<String, ChallengeRec>>,
+    /// Issued device credentials: token → device_id.
+    device_credentials: Mutex<HashMap<String, String>>,
     clients: Mutex<HashMap<String, Vec<String>>>,
     auto_approve_device: AtomicBool,
 }
@@ -68,6 +70,8 @@ struct DeviceRec {
     name: String,
     public_key: String,
     revoked: bool,
+    /// pending | active
+    status: String,
 }
 
 #[derive(Clone)]
@@ -93,6 +97,7 @@ impl MockControlPlane {
             device_codes: Mutex::new(HashMap::new()),
             devices: Mutex::new(HashMap::new()),
             challenges: Mutex::new(HashMap::new()),
+            device_credentials: Mutex::new(HashMap::new()),
             clients: Mutex::new({
                 let mut m = HashMap::new();
                 m.insert(
@@ -185,6 +190,9 @@ async fn handle_client(mut stream: TcpStream, inner: Arc<Inner>, base: &str) -> 
         ("POST", "/v1/devices/enroll/proof") => handle_proof(&inner, &headers, &body).await,
         ("GET", "/v1/devices") => handle_list_devices(&inner, &headers).await,
         ("POST", "/v1/devices/revoke") => handle_revoke_device(&inner, &headers, &body).await,
+        ("GET", "/agent/connect") | ("POST", "/agent/connect") => {
+            handle_agent_connect(&inner, &headers, &url).await
+        }
         _ => json_response(404, json!({"error":"not_found","path": path})),
     };
 
@@ -501,6 +509,7 @@ async fn handle_enroll(inner: &Inner, headers: &HashMap<String, String>, body: &
             name: name.clone(),
             public_key: public_key.clone(),
             revoked: false,
+            status: "pending".into(),
         },
     );
     let nonce = MockControlPlane::alloc(inner, "n_");
@@ -558,20 +567,23 @@ async fn handle_proof(inner: &Inner, headers: &HashMap<String, String>, body: &s
     let device_id = v
         .get("device_id")
         .and_then(|x| x.as_str())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
     let challenge_id = v
         .get("challenge_id")
         .and_then(|x| x.as_str())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
     let signature = v
         .get("signature")
         .and_then(|x| x.as_str())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
     if device_id.is_empty() || challenge_id.is_empty() || signature.is_empty() {
         return json_response(400, json!({"error":"invalid_request"}));
     }
-    let devices = inner.devices.lock().await;
-    let Some(device) = devices.get(device_id).cloned() else {
+    let mut devices = inner.devices.lock().await;
+    let Some(device) = devices.get(&device_id).cloned() else {
         return json_response(404, json!({"error":"not_found"}));
     };
     if device.principal_id != rec.principal {
@@ -580,31 +592,124 @@ async fn handle_proof(inner: &Inner, headers: &HashMap<String, String>, body: &s
     if device.revoked {
         return json_response(403, json!({"error":"device_revoked"}));
     }
-    drop(devices);
-    // Require well-formed 64-byte ed25519 hex (cp-04 contract).
-    if signature.len() != 128 || !signature.chars().all(|c| c.is_ascii_hexdigit()) {
-        return json_response(400, json!({"error":"invalid_proof"}));
+    if device.status != "pending" {
+        return json_response(409, json!({"error":"invalid_device_state"}));
     }
+
     let mut ch = inner.challenges.lock().await;
-    let Some(challenge) = ch.get_mut(challenge_id) else {
+    let Some(challenge) = ch.get_mut(&challenge_id) else {
         return json_response(400, json!({"error":"invalid_challenge"}));
     };
     if challenge.device_id != device_id || challenge.consumed {
         return json_response(400, json!({"error":"challenge_consumed_or_expired"}));
     }
+    // Real Ed25519 verification against the stored device public key.
+    if ownmesh_identity::verify_from_public_key_hex(
+        &device.public_key,
+        challenge.message.as_bytes(),
+        &signature,
+    )
+    .is_err()
+    {
+        return json_response(400, json!({"error":"invalid_proof"}));
+    }
     challenge.consumed = true;
+    drop(ch);
+
+    if let Some(d) = devices.get_mut(&device_id) {
+        d.status = "active".into();
+    }
+    let active = devices.get(&device_id).cloned().unwrap_or(device);
+    drop(devices);
+
+    let device_credential = MockControlPlane::alloc(inner, "dcred_");
+    inner
+        .device_credentials
+        .lock()
+        .await
+        .insert(device_credential.clone(), device_id.clone());
+
     json_response(
         200,
         json!({
             "ok": true,
             "status": "active",
+            "device_credential": device_credential,
             "device": {
-                "id": device.id,
-                "name": device.name,
-                "public_key": device.public_key,
-                "revoked": false
+                "id": active.id,
+                "name": active.name,
+                "public_key": active.public_key,
+                "revoked": false,
+                "status": "active"
             },
             "connect_path": "/agent/connect"
+        }),
+    )
+}
+
+/// Mock `/agent/connect`: accepts only previously issued device credentials.
+async fn handle_agent_connect(
+    inner: &Inner,
+    headers: &HashMap<String, String>,
+    url: &str,
+) -> Vec<u8> {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return json_response(400, json!({"error":"invalid_request"})),
+    };
+    let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+    let device_id = q.get("device_id").cloned().unwrap_or_default();
+    let role = q
+        .get("role")
+        .cloned()
+        .unwrap_or_else(|| "agent".into());
+    if device_id.is_empty() {
+        return json_response(400, json!({"error":"device_id required"}));
+    }
+    if role != "agent" && role != "client" {
+        return json_response(403, json!({"error":"invalid_role"}));
+    }
+
+    let devices = inner.devices.lock().await;
+    let Some(device) = devices.get(&device_id).cloned() else {
+        return json_response(403, json!({"error":"device_not_active"}));
+    };
+    if device.revoked || device.status != "active" {
+        return json_response(403, json!({"error":"device_not_active"}));
+    }
+    drop(devices);
+
+    let Some(tok) = bearer(headers) else {
+        return json_response(401, json!({"error":"invalid_device_credential"}));
+    };
+
+    if role == "agent" {
+        let creds = inner.device_credentials.lock().await;
+        let Some(bound_device) = creds.get(&tok) else {
+            return json_response(401, json!({"error":"invalid_device_credential"}));
+        };
+        if bound_device != &device_id {
+            return json_response(401, json!({"error":"invalid_device_credential"}));
+        }
+    } else {
+        // client role: human access token belonging to the device principal
+        let access = inner.access_tokens.lock().await;
+        let Some(rec) = access.get(&tok) else {
+            return json_response(401, json!({"error":"unauthorized"}));
+        };
+        if rec.principal != device.principal_id {
+            return json_response(401, json!({"error":"unauthorized"}));
+        }
+    }
+
+    // Mock has no WebSocket upgrade path; successful auth is enough for CLI tests.
+    json_response(
+        200,
+        json!({
+            "ok": true,
+            "device_id": device_id,
+            "role": role,
+            "status": "connected"
         }),
     )
 }
@@ -662,6 +767,10 @@ async fn handle_revoke_device(
     } else {
         false
     };
+    if ok {
+        let mut creds = inner.device_credentials.lock().await;
+        creds.retain(|_, device_id| device_id != id);
+    }
     json_response(200, json!({"ok": ok}))
 }
 
