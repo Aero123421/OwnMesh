@@ -1318,6 +1318,9 @@ impl DaemonRuntime {
             let expires_unix = Self::now().saturating_add(secs);
             let grant_id = Self::new_id("grant_");
             Some(if temporary_grant_requires_operation_binding(&capability) {
+                // Fail closed before any approval-state mutation: command.run
+                // temporary grants are never safe (interpreter argv reuse, etc.).
+                // One-shot approve without temporary_grant still executes once.
                 let Some(facts) = approved_facts.as_ref() else {
                     return Err(IpcError::Remote {
                         code: app_error::INVALID_PARAMS,
@@ -1333,32 +1336,12 @@ impl DaemonRuntime {
                             .into(),
                     });
                 }
-                // Prefer the approval request's server-captured pin; cross-check facts.
-                let mut facts_for_grant = facts.clone();
-                if let PendingRequest::Exec(exec) = &request {
-                    if let Some(pin) = &exec.executable_pin {
-                        let from_pin = executable_identity_from_pin(pin);
-                        if let Some(from_facts) = &facts_for_grant.executable_identity {
-                            if from_facts != &from_pin {
-                                return Err(IpcError::Remote {
-                                    code: app_error::INVALID_PARAMS,
-                                    message: "temporary grant executable identity mismatch between approval facts and pinned request".into(),
-                                });
-                            }
-                        }
-                        facts_for_grant.executable_identity = Some(from_pin);
-                    }
-                }
-                temporary_grant_from_facts(
-                    grant_id,
-                    grant_principal,
-                    expires_unix,
-                    &facts_for_grant,
-                )
-                .map_err(|message| IpcError::Remote {
-                    code: app_error::INVALID_PARAMS,
-                    message,
-                })?
+                temporary_grant_from_facts(grant_id, grant_principal, expires_unix, facts).map_err(
+                    |message| IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message,
+                    },
+                )?
             } else {
                 TemporaryGrant {
                     id: grant_id,
@@ -2203,6 +2186,16 @@ impl DaemonRuntime {
     #[must_use]
     pub fn grants_for_test(&self) -> &[TemporaryGrant] {
         &self.grants
+    }
+
+    /// Test helper: inject a legacy/forged grant row (does not persist).
+    ///
+    /// Used to prove command.run grant matching stays fail-closed even when a
+    /// persisted-shaped row is already present in memory.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn inject_grant_for_test(&mut self, grant: TemporaryGrant) {
+        self.grants.push(grant);
     }
 
     /// Test helper: whether an idempotency key is present in the op journal.
