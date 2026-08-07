@@ -154,8 +154,7 @@ mod unix_socket_boundary {
             },
         );
         // status() performs dial + ipc.hello + method dispatch.
-        let st = client.status().await.expect("allowed peer HELLO+status");
-        assert!(!st.version.is_empty() || st.pid > 0 || true);
+        let _status = client.status().await.expect("allowed peer HELLO+status");
         let _ = methods::STATUS; // keep import meaningful for method name stability
 
         server.request_shutdown();
@@ -221,7 +220,10 @@ mod unix_socket_boundary {
         let endpoint = Endpoint::UnixSocket(sock_path);
         let result = LocalListener::bind(endpoint).await;
         LocalListener::clear_unix_security();
-        let err = result.expect_err("chown to root without privilege must fail-closed");
+        let err = match result {
+            Ok(_) => panic!("chown to root without privilege must fail-closed"),
+            Err(err) => err,
+        };
         let msg = err.to_string().to_ascii_lowercase();
         assert!(
             msg.contains("fail-closed") || msg.contains("chown") || msg.contains("permission"),

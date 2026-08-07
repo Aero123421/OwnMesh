@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 fn secure_run_dir() -> PathBuf {
-    PathBuf::from(std::env::temp_dir()).join(format!(
+    std::env::temp_dir().join(format!(
         "ownmesh-broker-wire-unsup-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()

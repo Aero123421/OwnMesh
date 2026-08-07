@@ -127,6 +127,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+    #[cfg(not(windows))]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     #[test]
@@ -158,7 +160,6 @@ mod tests {
             writeln!(f, "echo line-b").unwrap();
             writeln!(f, "echo line-c").unwrap();
             drop(f);
-            use std::os::unix::fs::PermissionsExt;
             let mut perms = fs::metadata(&path).unwrap().permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&path, perms).unwrap();

@@ -129,7 +129,10 @@ pub fn apply_binaries(
         }
     }
 
+    #[cfg(windows)]
     let mut pending_windows_replace = false;
+    #[cfg(not(windows))]
+    let pending_windows_replace = false;
     let mut replaced = Vec::new();
 
     // Swap staged → final. On failure, rollback from backup.
@@ -272,14 +275,5 @@ fn write_windows_replace_helper(
     let _ = staged_name;
     fs::write(&helper, script)
         .map_err(|err| UpdateError::Install(format!("write replace helper: {err}")))?;
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn write_windows_replace_helper(
-    _install_dir: &Path,
-    _staged: &Path,
-    _final_path: &Path,
-) -> UpdateResult<()> {
     Ok(())
 }

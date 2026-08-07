@@ -204,7 +204,7 @@ mod unix_permissions {
         let err = save_manager(&path, &mgr).expect_err("rename must fail");
         match err {
             PersistError::Io(msg) => assert!(!msg.is_empty()),
-            other => panic!("expected PersistError::Io, got {other:?}"),
+            PersistError::Serde(msg) => panic!("expected PersistError::Io, got serde: {msg}"),
         }
 
         let temps = operation_temps(&path);

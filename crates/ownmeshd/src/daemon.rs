@@ -195,9 +195,9 @@ fn validate_management_bootstrap_reachable(allowed_uids: &[u32]) -> Result<(), S
         if allowed_uids.contains(&daemon_uid) {
             return Ok(());
         }
-        return Err(format!(
+        Err(format!(
             "service_socket.allowed_uids {allowed_uids:?} excludes daemon uid {daemon_uid}; fixed management credential bootstrap would be unreachable"
-        ));
+        ))
     }
     #[cfg(not(unix))]
     {
