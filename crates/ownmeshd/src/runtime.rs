@@ -4,10 +4,7 @@
 //! allow execute | ask enqueue | deny. Completed results are journaled by
 //! idempotency key so duplicate operations are not re-executed.
 
-use ownmesh_broker_client::{
-    elevate, resolve_broker_endpoint, BrokerEndpoint, BrokerSecret, CapabilityVerifyKey,
-    ElevatedCommand,
-};
+use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
     classify_from_request_in_dir, resolve_executable_path, run_command, CommandKind,
@@ -777,11 +774,11 @@ impl DaemonRuntime {
         let kind = CommandKind::parse_requested(p.kind.as_deref());
         let execution_program = p.program.clone();
 
-        // elevated=true is fail-closed: broker must succeed. Never fall back to local exec.
+        // elevated=true is production-unsupported until a secure mint authority exists.
+        // Fail closed regardless of broker install/artifacts; never fall back to local exec.
         if p.elevated {
-            let mut resolved = p.clone();
-            resolved.program = execution_program;
-            return self.try_broker_elevated(&resolved).await;
+            let _ = execution_program;
+            return self.try_broker_elevated(p).await;
         }
         // Spawn mode follows the client request shape (argv vs shell-string).
         // Policy already used server-side classification in handle_exec.
@@ -814,57 +811,14 @@ impl DaemonRuntime {
         })
     }
 
-    async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
-        let (Some(endpoint), Some(secret)) = (&self.broker_endpoint, &self.broker_secret) else {
-            return Err(IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: "elevated execution requires broker; broker unavailable (not configured)"
-                    .into(),
-            });
-        };
-        let cmd = ElevatedCommand {
-            program: p.program.clone(),
-            args: p.args.clone(),
-            cwd: p.cwd.clone(),
-            env: vec![],
-        };
-        match elevate(
-            endpoint,
-            secret,
-            "ownmeshd",
-            p.idempotency_key
-                .clone()
-                .unwrap_or_else(|| Self::new_id("elev_")),
-            cmd,
-            Self::now(),
-            60,
-        )
-        .await
-        {
-            Ok(resp) if resp.ok => Ok(json!({
-                "exit_code": resp.exit_code,
-                "stdout": resp.stdout,
-                "stderr": resp.stderr,
-                "timed_out": false,
-                "duration_ms": 0,
-                "truncated": false,
-                "replayed": false,
-                "elevated_via": "broker",
-                "broker_ok": true,
-            })),
-            Ok(resp) => Err(IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: format!(
-                    "elevated broker error: {}",
-                    resp.error
-                        .unwrap_or_else(|| "unknown broker failure".into())
-                ),
-            }),
-            Err(err) => Err(IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: format!("elevated broker unavailable: {err}"),
-            }),
-        }
+    async fn try_broker_elevated(&self, _p: &ExecParams) -> IpcResult<Value> {
+        // Ignore broker_endpoint/broker_secret presence: production elevated exec is
+        // unsupported until secure mint authority is established. No process spawn.
+        let _ = (&self.broker_endpoint, &self.broker_secret);
+        Err(IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: "unsupported: elevated execution requires broker; broker unavailable (not configured); secure mint authority not established (fail-closed; no local exec)".into(),
+        })
     }
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
@@ -2193,282 +2147,13 @@ fn session_err(err: ownmesh_session::SessionError) -> IpcError {
     }
 }
 
-/// Load request-MAC secret + endpoint for elevated broker calls.
-///
-/// Intentionally does **not** load the capability signing key (`broker.cap.signing`).
-/// That key is broker-only; ownmeshd holds at most the shared request MAC secret
-/// and cannot mint capabilities from it.
+/// Production elevated broker loading is disabled until a secure mint authority
+/// exists. Ignore all install records and artifacts, including hand-written
+/// `installed=true` / `support=supported` records, and return no broker config.
 pub(crate) fn load_broker_client(
-    paths: &OwnMeshPaths,
+    _paths: &OwnMeshPaths,
 ) -> (Option<BrokerEndpoint>, Option<BrokerSecret>) {
-    #[derive(serde::Deserialize)]
-    struct BrokerInstallRecord {
-        installed: bool,
-        support: String,
-        endpoint: String,
-        endpoint_kind: String,
-        secret_file: String,
-        signing_key_file: String,
-        verify_key_file: String,
-        trusted_executable: String,
-        socket_owner_uid: u32,
-        socket_group_gid: u32,
-        socket_mode: u32,
-        allowed_uids: Vec<u32>,
-    }
-
-    let install_path = paths.state_dir.join("broker").join("broker-install.json");
-    if !broker_install_record_is_trusted(&install_path) {
-        return (None, None);
-    }
-    let record = std::fs::read_to_string(&install_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<BrokerInstallRecord>(&raw).ok());
-    let Some(record) = record else {
-        return (None, None);
-    };
-    // The daemon consumes the exact endpoint and secret selected by install; it
-    // never falls back to a default or legacy broker.addr override.
-    if !record.installed
-        || record.support != "supported"
-        || record.endpoint_kind != "unix_socket"
-        || record.endpoint.trim().is_empty()
-        || record.trusted_executable.trim().is_empty()
-        || record.socket_mode != 0o600
-        || record.allowed_uids.len() != 1
-        || record.allowed_uids[0] != record.socket_owner_uid
-        || broker_current_effective_uid() != Some(record.socket_owner_uid)
-    {
-        return (None, None);
-    }
-    let broker_dir = paths.state_dir.join("broker");
-    let secret_path = std::path::PathBuf::from(&record.secret_file);
-    let signing_path = std::path::PathBuf::from(&record.signing_key_file);
-    let verify_path = std::path::PathBuf::from(&record.verify_key_file);
-    if secret_path != broker_dir.join("broker.secret")
-        || signing_path != broker_dir.join("private").join("broker.cap.signing")
-        || verify_path != broker_dir.join("broker.cap.verify")
-        || !broker_regular_file_is_trusted(&secret_path, record.socket_owner_uid, 0o600)
-        || !broker_regular_file_is_trusted(&signing_path, 0, 0o600)
-        || !broker_signing_parent_is_trusted(&signing_path)
-        || !broker_regular_file_is_trusted(&verify_path, 0, 0o644)
-        || !broker_file_identities_differ(&secret_path, &signing_path)
-        || !broker_trusted_executable_is_valid(Path::new(&record.trusted_executable))
-    {
-        return (None, None);
-    }
-    let verify_bytes = match std::fs::read(&verify_path) {
-        Ok(bytes) => bytes,
-        Err(_) => return (None, None),
-    };
-    if CapabilityVerifyKey::from_bytes(&verify_bytes).is_err() {
-        return (None, None);
-    }
-    let bytes = match std::fs::read(&secret_path) {
-        Ok(b) if b.len() >= 32 => b,
-        _ => return (None, None),
-    };
-    let endpoint = match resolve_broker_endpoint(&paths.runtime_dir, Some(&record.endpoint)) {
-        Ok(BrokerEndpoint::UnixSocket(path))
-            if broker_socket_endpoint_is_trusted(
-                &path,
-                record.socket_owner_uid,
-                record.socket_group_gid,
-                record.socket_mode,
-            ) =>
-        {
-            BrokerEndpoint::UnixSocket(path)
-        }
-        _ => return (None, None),
-    };
-    (Some(endpoint), Some(BrokerSecret::from_bytes(bytes)))
-}
-
-#[cfg(target_os = "linux")]
-fn broker_current_effective_uid() -> Option<u32> {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()?
-        .lines()
-        .find(|line| line.starts_with("Uid:"))?
-        .split_whitespace()
-        .nth(2)?
-        .parse()
-        .ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn broker_current_effective_uid() -> Option<u32> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn broker_install_record_is_trusted(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    let mut current = Some(parent);
-    while let Some(candidate) = current {
-        let Ok(metadata) = std::fs::symlink_metadata(candidate) else {
-            return false;
-        };
-        if !metadata.file_type().is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o022 != 0
-        {
-            return false;
-        }
-        current = candidate.parent();
-    }
-    let Ok(file_md) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    file_md.file_type().is_file()
-        && !file_md.file_type().is_symlink()
-        && file_md.uid() == 0
-        && file_md.mode() & 0o022 == 0
-}
-
-#[cfg(not(target_os = "linux"))]
-fn broker_install_record_is_trusted(_path: &Path) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn broker_regular_file_is_trusted(path: &Path, owner_uid: u32, mode: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(md) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    md.file_type().is_file()
-        && !md.file_type().is_symlink()
-        && md.uid() == owner_uid
-        && md.mode() & 0o777 == mode
-}
-
-#[cfg(not(target_os = "linux"))]
-fn broker_regular_file_is_trusted(_path: &Path, _owner_uid: u32, _mode: u32) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn broker_signing_parent_is_trusted(signing_path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Some(mut current) = signing_path.parent() else {
-        return false;
-    };
-    loop {
-        let Ok(md) = std::fs::symlink_metadata(current) else {
-            return false;
-        };
-        if !md.file_type().is_dir()
-            || md.file_type().is_symlink()
-            || md.uid() != 0
-            || md.mode() & 0o022 != 0
-        {
-            return false;
-        }
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        current = parent;
-    }
-    true
-}
-
-#[cfg(not(target_os = "linux"))]
-fn broker_signing_parent_is_trusted(_signing_path: &Path) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn broker_file_identities_differ(first: &Path, second: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let (Ok(first), Ok(second)) = (std::fs::metadata(first), std::fs::metadata(second)) else {
-        return false;
-    };
-    (first.dev(), first.ino()) != (second.dev(), second.ino())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn broker_file_identities_differ(_first: &Path, _second: &Path) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn broker_trusted_executable_is_valid(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(md) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !path.is_absolute()
-        || !md.file_type().is_file()
-        || md.file_type().is_symlink()
-        || md.uid() != 0
-        || md.mode() & 0o022 != 0
-    {
-        return false;
-    }
-    let mut current = path.parent();
-    while let Some(candidate) = current {
-        let Ok(md) = std::fs::symlink_metadata(candidate) else {
-            return false;
-        };
-        if !md.file_type().is_dir()
-            || md.file_type().is_symlink()
-            || md.uid() != 0
-            || md.mode() & 0o022 != 0
-        {
-            return false;
-        }
-        current = candidate.parent();
-    }
-    true
-}
-
-#[cfg(not(target_os = "linux"))]
-fn broker_trusted_executable_is_valid(_path: &Path) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn broker_socket_endpoint_is_trusted(path: &Path, owner: u32, group: u32, mode: u32) -> bool {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    if !path.is_absolute() || mode != 0o600 {
-        return false;
-    }
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    let mut current = Some(parent);
-    while let Some(candidate) = current {
-        let Ok(metadata) = std::fs::symlink_metadata(candidate) else {
-            return false;
-        };
-        if !metadata.file_type().is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o022 != 0
-        {
-            return false;
-        }
-        current = candidate.parent();
-    }
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    metadata.file_type().is_socket()
-        && !metadata.file_type().is_symlink()
-        && metadata.uid() == owner
-        && metadata.gid() == group
-        && metadata.mode() & 0o777 == mode
-        && std::os::unix::net::UnixStream::connect(path).is_ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn broker_socket_endpoint_is_trusted(_path: &Path, _owner: u32, _group: u32, _mode: u32) -> bool {
-    false
+    (None, None)
 }
 
 fn is_op_journal_in_progress(value: &Value) -> bool {

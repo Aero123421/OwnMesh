@@ -152,6 +152,7 @@ impl AuthorizedPeer {
         self.process_start_time
     }
 
+    #[allow(dead_code)]
     pub(crate) fn validate_refresh(&self, refreshed: &Self) -> Result<(), String> {
         if refreshed.process_start_time != self.process_start_time {
             return Err(

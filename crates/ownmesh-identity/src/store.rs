@@ -279,14 +279,104 @@ impl SecretStore for EncryptedFileKeystore {
 /// When primary `store` succeeds, the secret is **not** mirrored into the fallback backend.
 /// `delete` evaluates both backends and surfaces real errors from either side
 /// (`NoEntry`-equivalent success is handled inside each backend).
+///
+/// Fallback policy is always [`PreferredStoreFallbackPolicy::PrimaryPreferredEncryptedFileFallback`].
+/// Legacy mirror cleanup failures do **not** make [`Self::open`] fail; the store is returned in a
+/// degraded state with residual/report observability instead.
 pub struct PreferredSecretStore<P = OsKeychainStore, F = EncryptedFileKeystore> {
     primary: P,
     fallback: F,
     /// When true, primary backend probed successfully at least once.
     prefer_primary: Mutex<bool>,
+    /// Outcome of the last legacy-mirror cleanup attempt (if any).
+    cleanup_report: Mutex<LegacyMirrorCleanupReport>,
 }
 
-/// Known secret purposes scanned during legacy mirror cleanup.
+/// Explicit policy for how [`PreferredSecretStore`] uses the encrypted-file fallback.
+///
+/// This is not a security boundary against other processes running as the same OS user:
+/// file-backed secrets remain readable by any process with the same uid/DAC rights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferredStoreFallbackPolicy {
+    /// Prefer the primary backend (OS keychain). On primary `store` failure, write to the
+    /// encrypted-file fallback unlocked by `OWNMESH_KEYSTORE_PASSWORD` or `fallback_dir/.unlock`.
+    /// Successful primary writes are never mirrored. Legacy dual-write mirrors are removed only
+    /// when primary holds identical bytes. Cleanup failure warns and marks the store degraded
+    /// without blocking open; residual fallback secrets remain observable via report APIs.
+    PrimaryPreferredEncryptedFileFallback,
+}
+
+impl PreferredStoreFallbackPolicy {
+    /// Stable diagnostic label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryPreferredEncryptedFileFallback => {
+                "primary_preferred_encrypted_file_fallback"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PreferredStoreFallbackPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Why a secret still exists in the fallback backend after (or without) cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResidualFallbackKind {
+    /// Primary has no entry; fallback may be the only copy (intentionally retained).
+    FallbackOnly,
+    /// Primary and fallback hold different material (not a confirmed mirror).
+    DivergentFromPrimary,
+    /// Bytes match primary (confirmed mirror) but the fallback copy is still present.
+    ConfirmedMirrorPresent,
+    /// Primary could not be verified; fallback was not deleted.
+    PrimaryUnverified { detail: String },
+    /// Fallback entry exists but could not be read/decrypted for classification.
+    FallbackUnreadable { detail: String },
+}
+
+/// Observable residual secret presence in the fallback backend (no secret bytes exposed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidualFallbackSecret {
+    /// [`SecretPurpose::account`] label.
+    pub purpose_account: &'static str,
+    /// Classification of the residual entry.
+    pub kind: ResidualFallbackKind,
+}
+
+/// Outcome of a legacy mirror cleanup pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LegacyMirrorCleanupReport {
+    /// Whether cleanup was attempted.
+    pub attempted: bool,
+    /// Confirmed mirrors successfully removed in this pass.
+    pub removed_mirrors: usize,
+    /// True when cleanup hit a verification/delete failure and stopped early.
+    pub degraded: bool,
+    /// Human-readable cleanup failure (no secret material), when `degraded`.
+    pub error: Option<String>,
+}
+
+/// Snapshot of preferred-store health, policy, and residual fallback presence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreferredSecretStoreReport {
+    /// Active backend selection label (same as [`SecretStore::backend_name`]).
+    pub backend_name: &'static str,
+    /// Explicit fallback policy in effect.
+    pub fallback_policy: PreferredStoreFallbackPolicy,
+    /// True when cleanup failed or a residual mirror cannot be safely verified/removed.
+    pub degraded: bool,
+    /// Last cleanup attempt outcome.
+    pub cleanup: LegacyMirrorCleanupReport,
+    /// Fallback secrets still present (classified; no secret bytes).
+    pub residual_fallback_secrets: Vec<ResidualFallbackSecret>,
+}
+
+/// Known secret purposes scanned during legacy mirror cleanup / residual detection.
 const LEGACY_MIRROR_CLEANUP_PURPOSES: &[SecretPurpose] = &[
     SecretPurpose::DevicePrivateKey,
     SecretPurpose::HumanRefreshToken,
@@ -299,10 +389,14 @@ impl PreferredSecretStore<OsKeychainStore, EncryptedFileKeystore> {
     /// Runs [`Self::cleanup_legacy_fallback_mirrors`] so old dual-write mirror copies left in
     /// the fallback backend are removed when primary is authoritative for the same secret.
     ///
+    /// Cleanup failures do **not** fail `open`: a tracing warning is emitted, the store is
+    /// marked degraded, and residual fallback secrets remain observable via
+    /// [`Self::report`] / [`Self::residual_fallback_secrets`]. Callers can still use the store.
+    ///
     /// # Errors
     ///
-    /// Returns IO errors while preparing the fallback unlock material, or cleanup errors
-    /// when primary/fallback cannot be verified or a confirmed mirror delete fails.
+    /// Returns IO errors while preparing the fallback unlock material only. Legacy mirror
+    /// cleanup errors are converted into degraded state + warning, not `Err`.
     pub fn open(
         service: impl Into<String>,
         fallback_dir: impl AsRef<Path>,
@@ -314,7 +408,18 @@ impl PreferredSecretStore<OsKeychainStore, EncryptedFileKeystore> {
             OsKeychainStore::new(service),
             EncryptedFileKeystore::new(fallback_dir, passphrase),
         );
-        store.cleanup_legacy_fallback_mirrors()?;
+        let policy = store.fallback_policy();
+        if let Err(err) = store.cleanup_legacy_fallback_mirrors() {
+            // Safety-preserving cleanup failed (primary unverified / delete failed, etc.).
+            // Do not block startup: warn and keep serving with explicit fallback policy.
+            let residual_count = store.residual_fallback_secrets().len();
+            tracing::warn!(
+                error = %err,
+                fallback_policy = %policy,
+                residual_count,
+                "legacy fallback mirror cleanup failed; continuing with degraded preferred secret store; residual fallback secrets may remain"
+            );
+        }
         Ok(store)
     }
 }
@@ -331,16 +436,115 @@ impl<P, F> PreferredSecretStore<P, F> {
             primary,
             fallback,
             prefer_primary: Mutex::new(true),
+            cleanup_report: Mutex::new(LegacyMirrorCleanupReport::default()),
         }
+    }
+
+    /// Explicit fallback policy for this store (always the production policy today).
+    #[must_use]
+    pub const fn fallback_policy(&self) -> PreferredStoreFallbackPolicy {
+        PreferredStoreFallbackPolicy::PrimaryPreferredEncryptedFileFallback
     }
 }
 
 impl<P: SecretStore, F: SecretStore> PreferredSecretStore<P, F> {
+    /// True when cleanup failed or a residual mirror cannot be safely verified/removed.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        let cleanup_degraded = self
+            .cleanup_report
+            .lock()
+            .map(|g| g.degraded)
+            .unwrap_or(true);
+        if cleanup_degraded {
+            return true;
+        }
+        self.residual_fallback_secrets()
+            .iter()
+            .any(|residual| residual_kind_is_degraded(&residual.kind))
+    }
+
+    /// Last legacy-mirror cleanup report (cloned snapshot).
+    #[must_use]
+    pub fn cleanup_report(&self) -> LegacyMirrorCleanupReport {
+        match self.cleanup_report.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => LegacyMirrorCleanupReport {
+                attempted: true,
+                removed_mirrors: 0,
+                degraded: true,
+                error: Some("cleanup report lock poisoned".into()),
+            },
+        }
+    }
+
+    /// Detect secrets still present in the fallback backend (read-only; never deletes).
+    ///
+    /// Does not expose secret bytes — only purpose labels and residual classification.
+    #[must_use]
+    pub fn residual_fallback_secrets(&self) -> Vec<ResidualFallbackSecret> {
+        let mut out = Vec::new();
+        for &purpose in LEGACY_MIRROR_CLEANUP_PURPOSES {
+            let fallback_secret = match self.fallback.load(purpose) {
+                Ok(Some(secret)) => secret,
+                Ok(None) => continue,
+                Err(err) => {
+                    out.push(ResidualFallbackSecret {
+                        purpose_account: purpose.account(),
+                        kind: ResidualFallbackKind::FallbackUnreadable {
+                            detail: err.to_string(),
+                        },
+                    });
+                    continue;
+                }
+            };
+            // `fallback_secret` held only for byte comparison; never logged.
+            let kind = match self.primary.load(purpose) {
+                Ok(None) => ResidualFallbackKind::FallbackOnly,
+                Ok(Some(primary_secret)) => {
+                    if primary_secret.expose() == fallback_secret.expose() {
+                        ResidualFallbackKind::ConfirmedMirrorPresent
+                    } else {
+                        ResidualFallbackKind::DivergentFromPrimary
+                    }
+                }
+                Err(err) => ResidualFallbackKind::PrimaryUnverified {
+                    detail: err.to_string(),
+                },
+            };
+            out.push(ResidualFallbackSecret {
+                purpose_account: purpose.account(),
+                kind,
+            });
+        }
+        out
+    }
+
+    /// Observability snapshot: policy, degraded flag, cleanup outcome, residual fallback secrets.
+    #[must_use]
+    pub fn report(&self) -> PreferredSecretStoreReport {
+        let cleanup = self.cleanup_report();
+        let residual_fallback_secrets = self.residual_fallback_secrets();
+        let degraded = cleanup.degraded
+            || residual_fallback_secrets
+                .iter()
+                .any(|residual| residual_kind_is_degraded(&residual.kind));
+        PreferredSecretStoreReport {
+            backend_name: self.backend_name(),
+            fallback_policy: self.fallback_policy(),
+            degraded,
+            cleanup,
+            residual_fallback_secrets,
+        }
+    }
+
     /// Delete legacy fallback mirror copies when primary holds the identical secret.
     ///
     /// Idempotent migration helper for older builds that mirrored successful primary
     /// writes into the fallback backend. Safety rules:
     ///
+    /// - Probe the fallback first. If it has no entry, cleanup for that purpose is complete
+    ///   without querying primary (important when the primary is unavailable headlessly).
     /// - Delete fallback **only** when primary `load` succeeds with `Some` and the
     ///   bytes are identical to the fallback entry (confirmed mirror).
     /// - If primary has no entry, keep fallback (it may be the only copy).
@@ -350,35 +554,46 @@ impl<P: SecretStore, F: SecretStore> PreferredSecretStore<P, F> {
     /// - Fallback `load` / confirmed-mirror `delete` failures are returned, never
     ///   swallowed (no silent cleanup that could hide secret-loss risk).
     ///
+    /// On failure the cleanup report is marked `degraded` before the error is returned so
+    /// [`Self::open`] can continue startup with warning + residual observability.
+    ///
     /// # Errors
     ///
     /// Primary/fallback load failures, or delete failure after a confirmed mirror match.
     pub fn cleanup_legacy_fallback_mirrors(&self) -> IdentityResult<()> {
+        let mut removed_mirrors = 0_usize;
         for &purpose in LEGACY_MIRROR_CLEANUP_PURPOSES {
+            let fallback_secret = match self.fallback.load(purpose) {
+                Ok(value) => value,
+                Err(err) => {
+                    let err = IdentityError::Keystore(format!(
+                        "legacy mirror cleanup: fallback load failed for {}: {err}",
+                        purpose.account()
+                    ));
+                    self.record_cleanup_failure(removed_mirrors, &err);
+                    return Err(err);
+                }
+            };
+            let Some(fallback_secret) = fallback_secret else {
+                // No fallback entry means there is no mirror to classify or remove. Do not
+                // probe primary: it may be unavailable in the headless environments that use
+                // this fallback.
+                continue;
+            };
+
             let primary_secret = match self.primary.load(purpose) {
                 Ok(value) => value,
                 Err(err) => {
-                    return Err(IdentityError::Keystore(format!(
+                    let err = IdentityError::Keystore(format!(
                         "legacy mirror cleanup: primary load failed for {}: {err}; fallback entry retained",
                         purpose.account()
-                    )));
+                    ));
+                    self.record_cleanup_failure(removed_mirrors, &err);
+                    return Err(err);
                 }
             };
             let Some(primary_secret) = primary_secret else {
                 // Primary missing — fallback may be the sole copy; never delete.
-                continue;
-            };
-
-            let fallback_secret = match self.fallback.load(purpose) {
-                Ok(value) => value,
-                Err(err) => {
-                    return Err(IdentityError::Keystore(format!(
-                        "legacy mirror cleanup: fallback load failed for {}: {err}",
-                        purpose.account()
-                    )));
-                }
-            };
-            let Some(fallback_secret) = fallback_secret else {
                 continue;
             };
 
@@ -388,15 +603,50 @@ impl<P: SecretStore, F: SecretStore> PreferredSecretStore<P, F> {
             }
 
             // Primary is authoritative and bytes match: safe to drop the mirror copy.
-            self.fallback.delete(purpose).map_err(|err| {
-                IdentityError::Keystore(format!(
+            if let Err(err) = self.fallback.delete(purpose) {
+                let err = IdentityError::Keystore(format!(
                     "legacy mirror cleanup: fallback delete failed for {}: {err}",
                     purpose.account()
-                ))
-            })?;
+                ));
+                self.record_cleanup_failure(removed_mirrors, &err);
+                return Err(err);
+            }
+            removed_mirrors = removed_mirrors.saturating_add(1);
         }
+        self.record_cleanup_success(removed_mirrors);
         Ok(())
     }
+
+    fn record_cleanup_success(&self, removed_mirrors: usize) {
+        if let Ok(mut guard) = self.cleanup_report.lock() {
+            *guard = LegacyMirrorCleanupReport {
+                attempted: true,
+                removed_mirrors,
+                degraded: false,
+                error: None,
+            };
+        }
+    }
+
+    fn record_cleanup_failure(&self, removed_mirrors: usize, err: &IdentityError) {
+        if let Ok(mut guard) = self.cleanup_report.lock() {
+            *guard = LegacyMirrorCleanupReport {
+                attempted: true,
+                removed_mirrors,
+                degraded: true,
+                error: Some(err.to_string()),
+            };
+        }
+    }
+}
+
+fn residual_kind_is_degraded(kind: &ResidualFallbackKind) -> bool {
+    matches!(
+        kind,
+        ResidualFallbackKind::ConfirmedMirrorPresent
+            | ResidualFallbackKind::PrimaryUnverified { .. }
+            | ResidualFallbackKind::FallbackUnreadable { .. }
+    )
 }
 
 /// Combine delete outcomes from both backends.
@@ -447,8 +697,7 @@ impl<P: SecretStore, F: SecretStore> SecretStore for PreferredSecretStore<P, F> 
     fn load(&self, purpose: SecretPurpose) -> IdentityResult<Option<SecretBytes>> {
         match self.primary.load(purpose) {
             Ok(Some(v)) => Ok(Some(v)),
-            Ok(None) => self.fallback.load(purpose),
-            Err(_) => self.fallback.load(purpose),
+            Ok(None) | Err(_) => self.fallback.load(purpose),
         }
     }
 
@@ -512,6 +761,7 @@ mod tests {
         load_human_refresh_token, load_or_create_device_key, store_human_refresh_token,
     };
     use crate::secret::SecretString;
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
@@ -588,6 +838,52 @@ mod tests {
 
         fn backend_name(&self) -> &'static str {
             self.name
+        }
+    }
+
+    /// Keyring test backend that behaves like an unavailable headless primary: reads and writes
+    /// fail, while deleting a missing credential has normal `NoEntry` semantics.
+    #[derive(Debug)]
+    struct HeadlessCredential;
+
+    impl keyring::credential::CredentialApi for HeadlessCredential {
+        fn set_secret(&self, _secret: &[u8]) -> keyring::Result<()> {
+            Err(keyring::Error::Invalid(
+                "keychain".into(),
+                "unavailable in headless test".into(),
+            ))
+        }
+
+        fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            Err(keyring::Error::Invalid(
+                "keychain".into(),
+                "unavailable in headless test".into(),
+            ))
+        }
+
+        fn delete_credential(&self) -> keyring::Result<()> {
+            Err(keyring::Error::NoEntry)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct HeadlessCredentialBuilder;
+
+    impl keyring::credential::CredentialBuilderApi for HeadlessCredentialBuilder {
+        fn build(
+            &self,
+            _target: Option<&str>,
+            _service: &str,
+            _user: &str,
+        ) -> keyring::Result<Box<keyring::Credential>> {
+            Ok(Box::new(HeadlessCredential))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
@@ -844,6 +1140,25 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_skips_unavailable_primary_when_fallback_is_absent() {
+        let store = PreferredSecretStore::from_backends(
+            ControllableStore::with_fail_load("primary"),
+            ControllableStore::ok("fallback"),
+        );
+
+        store
+            .cleanup_legacy_fallback_mirrors()
+            .expect("absent fallback entries must not require a primary probe");
+
+        let report = store.report();
+        assert!(report.cleanup.attempted);
+        assert!(!report.cleanup.degraded);
+        assert!(report.cleanup.error.is_none());
+        assert!(!report.degraded);
+        assert!(report.residual_fallback_secrets.is_empty());
+    }
+
+    #[test]
     fn cleanup_errors_and_retains_fallback_when_primary_load_fails() {
         let primary = ControllableStore::with_fail_load("primary");
         let fallback = ControllableStore::ok("fallback");
@@ -872,10 +1187,27 @@ mod tests {
             .unwrap()
             .expect("fallback must be retained when primary is unverified");
         assert_eq!(fb.expose(), b"must-not-be-deleted");
+        assert!(store.is_degraded(), "cleanup failure must mark degraded");
+        let report = store.report();
+        assert!(report.degraded);
+        assert!(report.cleanup.degraded);
+        assert!(report
+            .cleanup
+            .error
+            .as_ref()
+            .is_some_and(|e| e.contains("primary load failed")));
+        assert!(
+            report.residual_fallback_secrets.iter().any(|r| {
+                r.purpose_account == SecretPurpose::HumanRefreshToken.account()
+                    && matches!(r.kind, ResidualFallbackKind::PrimaryUnverified { .. })
+            }),
+            "residual API must detect unverified fallback secret: {:?}",
+            report.residual_fallback_secrets
+        );
     }
 
     #[test]
-    fn cleanup_errors_when_fallback_load_fails_after_primary_hit() {
+    fn cleanup_errors_when_fallback_probe_fails() {
         let primary = ControllableStore::ok("primary");
         let fallback = ControllableStore::with_fail_load("fallback");
         let store = PreferredSecretStore::from_backends(primary, fallback);
@@ -1147,8 +1479,11 @@ mod tests {
             .seed_bytes()
             .expose()
             .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+            .fold(String::new(), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            });
         assert!(!format!("{key:?}").contains(&seed_hex));
         let cfg_sim = toml_like_config_dump();
         assert!(!cfg_sim.contains("VERY_SECRET"));
@@ -1158,5 +1493,297 @@ mod tests {
     fn toml_like_config_dump() -> String {
         // Simulated config/stdout content — secrets must not be interpolated.
         "schema_version = 1\nlang = \"en-US\"\n".into()
+    }
+
+    #[test]
+    fn residual_api_detects_fallback_only_and_divergent_secrets() {
+        let primary = ControllableStore::ok("primary");
+        let fallback = ControllableStore::ok("fallback");
+        let store = PreferredSecretStore::from_backends(primary, fallback);
+
+        store
+            .fallback
+            .store(
+                SecretPurpose::DeviceEnrollmentProof,
+                &SecretBytes::new(b"fallback-only-residual".to_vec()),
+            )
+            .unwrap();
+        store
+            .primary
+            .store(
+                SecretPurpose::DevicePrivateKey,
+                &SecretBytes::new(b"primary-v2".to_vec()),
+            )
+            .unwrap();
+        store
+            .fallback
+            .store(
+                SecretPurpose::DevicePrivateKey,
+                &SecretBytes::new(b"fallback-old-residual".to_vec()),
+            )
+            .unwrap();
+
+        store
+            .cleanup_legacy_fallback_mirrors()
+            .expect("intentional residuals must not fail cleanup");
+
+        let residuals = store.residual_fallback_secrets();
+        assert!(
+            residuals.iter().any(|r| {
+                r.purpose_account == SecretPurpose::DeviceEnrollmentProof.account()
+                    && matches!(r.kind, ResidualFallbackKind::FallbackOnly)
+            }),
+            "fallback-only residual must be detectable: {residuals:?}"
+        );
+        assert!(
+            residuals.iter().any(|r| {
+                r.purpose_account == SecretPurpose::DevicePrivateKey.account()
+                    && matches!(r.kind, ResidualFallbackKind::DivergentFromPrimary)
+            }),
+            "divergent residual must be detectable: {residuals:?}"
+        );
+        // Intentional non-mirror residuals do not by themselves mark degraded.
+        assert!(!store.is_degraded());
+        let report = store.report();
+        assert_eq!(
+            report.fallback_policy,
+            PreferredStoreFallbackPolicy::PrimaryPreferredEncryptedFileFallback
+        );
+        assert!(!report.degraded);
+        assert!(report.cleanup.attempted);
+        assert!(!report.cleanup.degraded);
+    }
+
+    #[test]
+    fn report_is_degraded_for_unverified_or_unreadable_residuals() {
+        let primary = ControllableStore::ok("primary");
+        let fallback = ControllableStore::ok("fallback");
+        let store = PreferredSecretStore::from_backends(primary, fallback);
+        store
+            .fallback
+            .store(
+                SecretPurpose::HumanRefreshToken,
+                &SecretBytes::new(b"residual".to_vec()),
+            )
+            .unwrap();
+        store.cleanup_legacy_fallback_mirrors().unwrap();
+        store.primary.fail_load.store(true, Ordering::SeqCst);
+
+        let report = store.report();
+        assert!(!report.cleanup.degraded);
+        assert!(report.degraded);
+        assert!(report.residual_fallback_secrets.iter().any(|residual| {
+            matches!(
+                residual.kind,
+                ResidualFallbackKind::PrimaryUnverified { .. }
+            )
+        }));
+        assert!(store.is_degraded());
+
+        let primary = ControllableStore::ok("primary");
+        let fallback = ControllableStore::ok("fallback");
+        let store = PreferredSecretStore::from_backends(primary, fallback);
+        store
+            .fallback
+            .store(
+                SecretPurpose::HumanRefreshToken,
+                &SecretBytes::new(b"unreadable-residual".to_vec()),
+            )
+            .unwrap();
+        store.cleanup_legacy_fallback_mirrors().unwrap();
+        store.fallback.fail_load.store(true, Ordering::SeqCst);
+
+        let report = store.report();
+        assert!(!report.cleanup.degraded);
+        assert!(report.degraded);
+        assert!(report.residual_fallback_secrets.iter().any(|residual| {
+            matches!(
+                residual.kind,
+                ResidualFallbackKind::FallbackUnreadable { .. }
+            )
+        }));
+        assert!(store.is_degraded());
+    }
+
+    #[test]
+    fn residual_api_detects_unremoved_confirmed_mirror_after_delete_failure() {
+        let primary = ControllableStore::ok("primary");
+        let fallback = ControllableStore::with_fail_delete("fallback");
+        let store = PreferredSecretStore::from_backends(primary, fallback);
+        let secret = SecretBytes::new(b"identical-mirror-residual".to_vec());
+
+        store
+            .primary
+            .store(SecretPurpose::HumanRefreshToken, &secret)
+            .unwrap();
+        store
+            .fallback
+            .store(SecretPurpose::HumanRefreshToken, &secret)
+            .unwrap();
+
+        store
+            .cleanup_legacy_fallback_mirrors()
+            .expect_err("confirmed mirror delete failure must surface");
+
+        assert!(store.is_degraded());
+        let residuals = store.residual_fallback_secrets();
+        assert!(
+            residuals.iter().any(|r| {
+                r.purpose_account == SecretPurpose::HumanRefreshToken.account()
+                    && matches!(r.kind, ResidualFallbackKind::ConfirmedMirrorPresent)
+            }),
+            "unremoved confirmed mirror must be residual-detectable: {residuals:?}"
+        );
+        // Safety: fallback secret must still exist (delete failed, never force-removed).
+        assert_eq!(
+            store
+                .fallback
+                .load(SecretPurpose::HumanRefreshToken)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            b"identical-mirror-residual"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_leaves_usable_store_in_degraded_state_like_open_policy() {
+        // Mirrors PreferredSecretStore::open behaviour: cleanup Err must not prevent use.
+        // Primary load fails during cleanup; primary store also fails so later writes use fallback.
+        let primary = ControllableStore::ok("primary");
+        primary.fail_load.store(true, Ordering::SeqCst);
+        primary.fail_store.store(true, Ordering::SeqCst);
+        let fallback = ControllableStore::ok("fallback");
+        let store = PreferredSecretStore::from_backends(primary, fallback);
+
+        store
+            .fallback
+            .store(
+                SecretPurpose::HumanRefreshToken,
+                &SecretBytes::new(b"preexisting-fallback".to_vec()),
+            )
+            .unwrap();
+
+        let cleanup_err = store
+            .cleanup_legacy_fallback_mirrors()
+            .expect_err("primary load fail");
+        // open() would warn + return Ok(store) here rather than propagating cleanup_err.
+        assert!(cleanup_err.to_string().contains("legacy mirror cleanup"));
+        assert!(store.is_degraded());
+        assert_eq!(
+            store.fallback_policy(),
+            PreferredStoreFallbackPolicy::PrimaryPreferredEncryptedFileFallback
+        );
+
+        // Store remains usable via fallback path despite degraded cleanup state.
+        let secret = SecretBytes::new(b"post-degraded-write".to_vec());
+        store
+            .store(SecretPurpose::DevicePrivateKey, &secret)
+            .expect("degraded store must still accept writes via fallback");
+        let loaded = store
+            .load(SecretPurpose::DevicePrivateKey)
+            .unwrap()
+            .expect("load via fallback");
+        assert_eq!(loaded.expose(), b"post-degraded-write");
+        store
+            .delete(SecretPurpose::DevicePrivateKey)
+            .expect("delete still works");
+    }
+
+    #[test]
+    fn preferred_open_headless_unlock_production_roundtrip() {
+        const CHILD_MARKER: &str = "OWNMESH_IDENTITY_HEADLESS_OPEN_CHILD";
+        const FALLBACK_DIR_ENV: &str = "OWNMESH_IDENTITY_HEADLESS_FALLBACK_DIR";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            // This isolated child is the only test in its process, so replacing keyring's global
+            // builder cannot interfere with parallel tests. Its parent also removes the password
+            // environment variable, selecting the production `.unlock` path without mutating the
+            // parent test process environment.
+            keyring::set_default_credential_builder(Box::new(HeadlessCredentialBuilder));
+            let fallback_dir = PathBuf::from(
+                std::env::var_os(FALLBACK_DIR_ENV).expect("child fallback directory"),
+            );
+            let service = "dev.ownmesh.test.production-headless";
+            let secret = SecretBytes::new(b"headless-production-roundtrip".to_vec());
+
+            let store = PreferredSecretStore::open(service, &fallback_dir)
+                .expect("fresh production open must not probe unavailable primary");
+            assert!(fallback_dir.join(".unlock").is_file());
+            assert_eq!(
+                std::fs::read(fallback_dir.join(".unlock")).unwrap().len(),
+                32
+            );
+            let initial_report = store.report();
+            assert!(initial_report.cleanup.attempted);
+            assert!(!initial_report.cleanup.degraded);
+            assert!(!initial_report.degraded);
+            assert!(initial_report.residual_fallback_secrets.is_empty());
+
+            store
+                .store(SecretPurpose::HumanRefreshToken, &secret)
+                .expect("unavailable primary must fall back to encrypted file");
+            assert_eq!(store.backend_name(), "preferred(encrypted-file)");
+            assert!(fallback_dir
+                .join(format!(
+                    "{}.oms",
+                    SecretPurpose::HumanRefreshToken.account()
+                ))
+                .is_file());
+            drop(store);
+
+            let restarted = PreferredSecretStore::open(service, &fallback_dir)
+                .expect("cleanup failure on restart must remain nonfatal");
+            let restart_report = restarted.report();
+            assert!(restart_report.cleanup.degraded);
+            assert!(restart_report.degraded);
+            assert!(restart_report
+                .cleanup
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains("primary load failed")));
+            assert!(restart_report
+                .residual_fallback_secrets
+                .iter()
+                .any(|residual| {
+                    residual.purpose_account == SecretPurpose::HumanRefreshToken.account()
+                        && matches!(
+                            residual.kind,
+                            ResidualFallbackKind::PrimaryUnverified { .. }
+                        )
+                }));
+
+            let loaded = restarted
+                .load(SecretPurpose::HumanRefreshToken)
+                .unwrap()
+                .expect("restart must load from `.unlock`-encrypted fallback");
+            assert_eq!(loaded.expose(), secret.expose());
+            restarted
+                .delete(SecretPurpose::HumanRefreshToken)
+                .expect("headless delete");
+            assert!(restarted
+                .load(SecretPurpose::HumanRefreshToken)
+                .unwrap()
+                .is_none());
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let fallback_dir = dir.path().join("keystore");
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("store::tests::preferred_open_headless_unlock_production_roundtrip")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(FALLBACK_DIR_ENV, &fallback_dir)
+            .env_remove("OWNMESH_KEYSTORE_PASSWORD")
+            .output()
+            .expect("run isolated headless production-path test");
+        assert!(
+            output.status.success(),
+            "headless production-path child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

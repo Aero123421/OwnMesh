@@ -1,4 +1,4 @@
-//! OwnMesh device identity, keychain, and credential storage.
+//! `OwnMesh` device identity, keychain, and credential storage.
 //!
 //! Device private keys and human refresh tokens are stored by purpose in an OS keychain
 //! when available, with an encrypted on-disk keystore fallback for headless environments.
@@ -23,7 +23,9 @@ pub use device_key::{
 pub use error::{IdentityError, IdentityResult};
 pub use secret::{SecretBytes, SecretPurpose, SecretString};
 pub use store::{
-    EncryptedFileKeystore, MemorySecretStore, OsKeychainStore, PreferredSecretStore, SecretStore,
+    EncryptedFileKeystore, LegacyMirrorCleanupReport, MemorySecretStore, OsKeychainStore,
+    PreferredSecretStore, PreferredSecretStoreReport, PreferredStoreFallbackPolicy,
+    ResidualFallbackKind, ResidualFallbackSecret, SecretStore,
 };
 
 /// Stable crate name used by diagnostics and tests.

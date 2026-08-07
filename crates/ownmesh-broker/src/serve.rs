@@ -1,10 +1,7 @@
 //! Broker accept loop and elevated execution.
 
 use crate::now_unix;
-use crate::peer::{
-    assert_endpoint_peer_verifiable, loopback_tcp_peer_unverifiable_error,
-    named_pipe_peer_unverifiable_error, AuthorizedPeer,
-};
+use crate::peer::AuthorizedPeer;
 use ownmesh_broker_client::{
     verify_request, verify_request_mac, BrokerEndpoint, BrokerRequest, BrokerResponse,
     BrokerSecret, CapabilitySigningKey, CapabilityToken, CapabilityVerifyKey, ElevatedCommand,
@@ -720,212 +717,38 @@ fn run_elevated(request_id: &str, command: &ElevatedCommand) -> BrokerResponse {
     }
 }
 
-/// Run the broker accept loop until cancelled / error.
+/// Production elevated broker serve is fixed as **unsupported** until a secure
+/// mint authority exists. Never binds an endpoint or executes processes.
 ///
-/// Production start is fail-closed unless the endpoint supports OS peer
-/// credential verification (Unix domain socket + SO_PEERCRED). Loopback TCP and
-/// Named Pipe are refused with an explicit error.
+/// In-process helpers (`execute_verified*`) remain available for unit tests only
+/// and are unreachable from this production entry point.
 pub async fn run_broker(cfg: BrokerServeConfig) -> Result<(), String> {
-    // Peer-cred gate before bind / secret side effects that imply a live broker.
-    assert_endpoint_peer_verifiable(&cfg.endpoint)?;
-
-    match &cfg.endpoint {
-        BrokerEndpoint::LoopbackTcp(_) => {
-            // Double-check: never bind an unverifiable privileged endpoint.
-            Err(loopback_tcp_peer_unverifiable_error())
-        }
-        BrokerEndpoint::NamedPipe(_name) => {
-            // Safe peer identity is not available without large/unsafe OS API surface.
-            Err(named_pipe_peer_unverifiable_error())
-        }
-        #[cfg(unix)]
-        BrokerEndpoint::UnixSocket(path) => run_unix_broker(path, &cfg).await,
-        #[cfg(not(unix))]
-        BrokerEndpoint::UnixSocket(path) => Err(format!(
-            "unix socket {} not supported on this OS (fail-closed)",
-            path.display()
-        )),
-    }
+    let _ = cfg;
+    Err(production_elevated_broker_unsupported())
 }
 
-#[cfg(unix)]
-async fn run_unix_broker(path: &Path, cfg: &BrokerServeConfig) -> Result<(), String> {
-    if rustix::process::geteuid().as_raw() != 0 {
-        return Err("unsupported: privileged Unix broker requires effective UID 0".into());
-    }
-    let socket_security = cfg.socket_security.validate()?;
-    let daemon_uid = validate_daemon_dac_policy(socket_security, &cfg.allowed_uids)?;
-    let policy =
-        crate::peer::load_trusted_peer_policy(&cfg.trusted_executable, cfg.allowed_uids.clone())?;
-    validate_socket_parent_custody(path, daemon_uid)?;
-    require_socket_endpoint_absent(path, socket_security)?;
-
-    ensure_broker_key_separation(&cfg.secret_file, &cfg.signing_key_file)?;
-    let secret = load_or_create_request_secret(&cfg.secret_file, daemon_uid)?;
-    let (signing_key, verify_key) = load_or_create_capability_keys(&cfg.signing_key_file)?;
-    ensure_broker_key_separation(&cfg.secret_file, &cfg.signing_key_file)?;
-    let state = Arc::new(AsyncMutex::new(BrokerState {
-        secret,
-        signing_key,
-        verify_key,
-        replay: ReplayCache::new(),
-    }));
-
-    let listener = tokio::net::UnixListener::bind(path).map_err(|e| format!("unix bind: {e}"))?;
-    if let Err(err) = configure_unix_socket(path, socket_security)
-        .and_then(|()| validate_socket_path_custody(path, socket_security))
-    {
-        let _ = std::fs::remove_file(path);
-        return Err(err);
-    }
-    eprintln!(
-        "ownmesh-broker listening on unix socket {} (owner={}:{} mode={:o}, SO_PEERCRED+/proc required)",
-        path.display(), socket_security.owner_uid, socket_security.group_gid, socket_security.mode
-    );
-    if let Some(af) = &cfg.addr_file {
-        if let Err(err) = std::fs::write(af, path.display().to_string()) {
-            let _ = std::fs::remove_file(path);
-            return Err(err.to_string());
-        }
-    }
-    loop {
-        let (sock, _addr) = listener.accept().await.map_err(|e| e.to_string())?;
-        // Fail closed unless live PID/UID/executable exactly matches explicit policy.
-        match crate::peer::authorize_unix_peer(&sock, &policy) {
-            Ok(peer) => {
-                if std::env::var_os("OWNMESH_BROKER_DEBUG").is_some() {
-                    eprintln!("peer authorization ok bind={:?}", peer.peer_bind());
-                }
-                let st = Arc::clone(&state);
-                let request_policy = policy.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_authorized_stream(sock, st, peer, request_policy).await {
-                        eprintln!("unix conn error: {e}");
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("ownmesh-broker: rejecting peer (fail-closed): {e}");
-                // sock dropped — connection not served
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn validate_socket_parent_custody(socket_path: &Path, daemon_uid: u32) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let parent = socket_path
-        .parent()
-        .ok_or_else(|| "broker socket requires a root-controlled parent".to_string())?;
-    validate_daemon_traversable_ancestry(parent, daemon_uid)?;
-    let mut current = Some(parent);
-    while let Some(candidate) = current {
-        let metadata = std::fs::symlink_metadata(candidate).map_err(|e| {
-            format!(
-                "inspect broker socket ancestor {}: {e}",
-                candidate.display()
-            )
-        })?;
-        if !metadata.file_type().is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(format!(
-                "broker socket ancestor {} must be a root-owned directory not writable by group/other (fail-closed)",
-                candidate.display()
-            ));
-        }
-        current = candidate.parent();
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn socket_custody_metadata(path: &Path) -> Result<SocketCustodyMetadata, String> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("inspect broker endpoint {}: {e}", path.display()))?;
-    Ok(SocketCustodyMetadata {
-        owner_uid: metadata.uid(),
-        group_gid: metadata.gid(),
-        mode: metadata.mode(),
-        is_socket: metadata.file_type().is_socket(),
-        is_symlink: metadata.file_type().is_symlink(),
-    })
-}
-
-#[cfg(unix)]
-fn validate_socket_path_custody(path: &Path, security: UnixSocketSecurity) -> Result<(), String> {
-    validate_socket_custody_metadata(socket_custody_metadata(path)?, security)
-        .map_err(|e| format!("{e}: {} (fail-closed)", path.display()))
-}
-
-#[cfg(unix)]
-fn require_socket_endpoint_absent(path: &Path, security: UnixSocketSecurity) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {
-            // Never unlink automatically: even an inode validated as a stale socket can
-            // be replaced by a concurrently starting broker between check and unlink.
-            // A root operator/service manager must remove stale sockets while the
-            // service is stopped.
-            validate_socket_path_custody(path, security)?;
-            let state = if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                "active"
-            } else {
-                "existing or stale"
-            };
-            Err(format!(
-                "broker endpoint {} is an {state} Unix socket; refusing automatic unlink to avoid a check/unlink race (fail-closed)",
-                path.display()
-            ))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!(
-            "inspect broker endpoint {}: {err} (fail-closed)",
-            path.display()
-        )),
-    }
-}
-
-#[cfg(unix)]
-fn configure_unix_socket(path: &Path, security: UnixSocketSecurity) -> Result<(), String> {
-    set_owner(path, security.owner_uid, security.group_gid)?;
-    // chown may clear mode bits, so chmod must be last.
-    set_mode(path, security.mode)
+/// Stable operator-facing reason for production elevated broker disablement.
+#[must_use]
+pub fn production_elevated_broker_unsupported() -> String {
+    "unsupported: elevated broker production serve is disabled until a secure mint authority is established; refusing to bind or execute (fail-closed)".into()
 }
 
 /// Handle a TCP connection (public for tests of strict MAC/capability path only).
 ///
-/// Production `run_broker` refuses LoopbackTcp endpoints; this helper remains for
-/// in-process unit tests that exercise request auth with a **synthetic** peer bind.
+/// Production `run_broker` is fixed as unsupported and never binds. This helper remains
+/// for in-process unit tests that exercise request auth with a **synthetic** peer bind.
 pub async fn handle_tcp_conn(
     sock: tokio::net::TcpStream,
     state: Arc<AsyncMutex<BrokerState>>,
     peer: PeerBind,
 ) -> Result<(), String> {
-    handle_stream(sock, state, peer, None).await
-}
-
-#[cfg(unix)]
-async fn handle_authorized_stream<S>(
-    sock: S,
-    state: Arc<AsyncMutex<BrokerState>>,
-    peer: AuthorizedPeer,
-    policy: crate::peer::TrustedPeerPolicy,
-) -> Result<(), String>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    handle_stream(sock, state, peer.peer_bind().clone(), Some((peer, policy))).await
+    handle_stream(sock, state, peer).await
 }
 
 async fn handle_stream<S>(
     mut sock: S,
     state: Arc<AsyncMutex<BrokerState>>,
     peer: PeerBind,
-    authorized_peer: Option<(AuthorizedPeer, crate::peer::TrustedPeerPolicy)>,
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -958,32 +781,15 @@ where
         let signing = CapabilitySigningKey::from_bytes(&st.signing_key.to_bytes())
             .map_err(|e| e.to_string())?;
         let verify = st.verify_key.clone();
-        let result = if let Some((accepted, policy)) = &authorized_peer {
-            // Re-resolve immediately before minting/verification so an accepted
-            // process cannot change executable or be replaced while the request waits.
-            let refreshed = policy.authorize_process(accepted.peer_bind().pid)?;
-            accepted.validate_refresh(&refreshed)?;
-            execute_verified_for_authorized_peer(
-                &secret,
-                &signing,
-                &verify,
-                &mut st.replay,
-                &req,
-                &refreshed,
-                now_unix(),
-            )
-        } else {
-            execute_verified(
-                &secret,
-                &signing,
-                &verify,
-                &mut st.replay,
-                &req,
-                &peer,
-                now_unix(),
-            )
-        };
-        match result {
+        match execute_verified(
+            &secret,
+            &signing,
+            &verify,
+            &mut st.replay,
+            &req,
+            &peer,
+            now_unix(),
+        ) {
             Ok(r) => r,
             Err(e) => BrokerResponse {
                 request_id: req.request_id.clone(),

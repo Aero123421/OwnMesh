@@ -124,13 +124,12 @@ fn verify_with_public(
 ///
 /// Returns store / crypto errors.
 pub fn load_or_create_device_key(store: &dyn SecretStore) -> IdentityResult<DeviceKeyPair> {
-    match store.load(SecretPurpose::DevicePrivateKey)? {
-        Some(secret) => DeviceKeyPair::from_seed(secret.expose()),
-        None => {
-            let key = DeviceKeyPair::generate();
-            store.store(SecretPurpose::DevicePrivateKey, &key.seed_bytes())?;
-            Ok(key)
-        }
+    if let Some(secret) = store.load(SecretPurpose::DevicePrivateKey)? {
+        DeviceKeyPair::from_seed(secret.expose())
+    } else {
+        let key = DeviceKeyPair::generate();
+        store.store(SecretPurpose::DevicePrivateKey, &key.seed_bytes())?;
+        Ok(key)
     }
 }
 

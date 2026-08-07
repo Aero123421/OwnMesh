@@ -162,7 +162,7 @@ fn signed_broker_request(
 }
 
 // ---------------------------------------------------------------------------
-// (1) elevated=true fail-closed when broker missing / unreachable / rejecting
+// (1) elevated=true is production-unsupported (broker artifacts irrelevant)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -193,14 +193,15 @@ async fn elevated_without_broker_is_fail_closed() {
             })),
         )
         .await
-        .expect_err("elevated without broker must fail closed");
+        .expect_err("elevated must be production unsupported");
 
     match err {
         IpcError::Remote { code, message } => {
             assert_eq!(code, app_error::INTERNAL);
             let m = message.to_ascii_lowercase();
             assert!(
-                m.contains("broker") && (m.contains("unavailable") || m.contains("not configured")),
+                m.contains("unsupported")
+                    && (m.contains("elevated") || m.contains("broker") || m.contains("mint")),
                 "unexpected message: {message}"
             );
             assert!(!m.contains("fallback"), "{message}");
@@ -213,18 +214,39 @@ async fn elevated_without_broker_is_fail_closed() {
 }
 
 #[tokio::test]
-async fn elevated_with_unreachable_broker_is_fail_closed() {
+async fn elevated_with_broker_artifacts_is_still_unsupported() {
     let dir = tempdir().unwrap();
     let paths = OwnMeshPaths::for_base(dir.path());
     paths.ensure_layout().unwrap();
 
-    // Secret present → runtime treats broker as configured, but nothing listens.
+    // Residual secrets/records must not enable elevated exec.
     let broker_dir = paths.state_dir.join("broker");
     std::fs::create_dir_all(&broker_dir).unwrap();
     let secret = BrokerSecret::generate();
     std::fs::write(broker_dir.join("broker.secret"), secret.as_bytes()).unwrap();
-    // Bind to an unused loopback port that nothing serves.
     std::fs::write(broker_dir.join("broker.addr"), b"127.0.0.1:1").unwrap();
+    std::fs::write(
+        broker_dir.join("broker-install.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "installed": true,
+            "support": "supported",
+            "endpoint": "unix:/tmp/forged.sock",
+            "endpoint_kind": "unix_socket",
+            "secret_file": broker_dir.join("broker.secret").display().to_string(),
+            "signing_key_file": broker_dir.join("private").join("broker.cap.signing").display().to_string(),
+            "verify_key_file": broker_dir.join("broker.cap.verify").display().to_string(),
+            "trusted_executable": "/bin/true",
+            "socket_owner_uid": 0,
+            "socket_group_gid": 0,
+            "socket_mode": 384,
+            "allowed_uids": [0],
+            "notes": ["forged"],
+            "installed_at_unix": 1,
+            "unit_path": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 
     let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
     let client = named_client(endpoint, paths.runtime_dir.clone(), "ownmesh");
@@ -246,23 +268,18 @@ async fn elevated_with_unreachable_broker_is_fail_closed() {
                 },
                 "kind": "structured",
                 "elevated": true,
-                "idempotency_key": "adv-elev-unreachable",
+                "idempotency_key": "adv-elev-artifacts",
             })),
         )
         .await
-        .expect_err("elevated with dead broker must fail closed");
+        .expect_err("elevated with broker artifacts must still be unsupported");
 
     match err {
         IpcError::Remote { code, message } => {
             assert_eq!(code, app_error::INTERNAL);
             let m = message.to_ascii_lowercase();
-            assert!(
-                m.contains("broker")
-                    && (m.contains("unavailable") || m.contains("error") || m.contains("fail")),
-                "unexpected message: {message}"
-            );
+            assert!(m.contains("unsupported"), "unexpected message: {message}");
             assert!(!m.contains("fallback"), "{message}");
-            // Must not silently succeed via local exec.
             assert!(!m.is_empty());
         }
         other => panic!("unexpected: {other:?}"),
@@ -1213,7 +1230,7 @@ fn corrupt_revoked_clients_state_fails_runtime_open() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn broker_install_loader_rejects_missing_socket_and_adversarial_files() {
+fn broker_install_loader_ignores_even_trusted_looking_installed_true_records() {
     use std::os::unix::fs::PermissionsExt;
 
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -1284,7 +1301,11 @@ fn broker_install_loader_rejects_missing_socket_and_adversarial_files() {
     std::fs::write(&install_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     std::fs::set_permissions(&install_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    assert!(runtime::load_broker_client(&paths).0.is_some());
+    assert!(
+        runtime::load_broker_client(&paths).0.is_none()
+            && runtime::load_broker_client(&paths).1.is_none(),
+        "production loader must ignore handwritten installed=true records"
+    );
 
     std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o640)).unwrap();
     assert!(runtime::load_broker_client(&paths).0.is_none());

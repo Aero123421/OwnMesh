@@ -1,15 +1,11 @@
 //! OwnMesh networkless privileged broker library.
 //!
-//! Production privileged serve requires OS peer credential verification:
-//! - Unix domain socket mode 0600 + `SO_PEERCRED` (uid allow-list / euid)
-//! - Loopback TCP and Named Pipe are **fail-closed** at startup (explicit error)
-//!
-//! Capability tokens are Ed25519-signed by a broker-only key, separate from the
-//! request-MAC [`ownmesh_broker_client::BrokerSecret`]. Peer pid/uid/exe are bound
-//! into capability claims; `caller_principal` alone is never authoritative.
+//! **Production elevated broker is unsupported** until a secure mint authority
+//! is established. `run_broker` / install / status never bind or claim success.
 //!
 //! In-process test helpers may still exercise MAC/capability over loopback TCP
-//! without going through `run_broker` endpoint gating (synthetic peer bind).
+//! with a synthetic peer bind (`execute_verified*`, `handle_tcp_conn`) — these
+//! paths are unreachable from production CLI entry points.
 //!
 //! Never opens outbound network connections or non-loopback listeners.
 //!
@@ -50,10 +46,10 @@ pub use serve::{
     default_signing_key_path, default_verify_key_path, enforce_bind_is_networkless,
     ensure_broker_key_separation, execute_verified, execute_verified_for_process, handle_tcp_conn,
     load_or_create_capability_keys, load_or_create_request_secret, load_or_create_secret,
-    load_verify_key, run_broker, validate_daemon_dac_policy,
-    validate_daemon_directory_custody_metadata, validate_request_secret_custody_metadata,
-    validate_signing_custody_metadata, validate_signing_key_custody,
-    validate_socket_custody_metadata, validate_verify_key_custody,
+    load_verify_key, production_elevated_broker_unsupported, run_broker,
+    validate_daemon_dac_policy, validate_daemon_directory_custody_metadata,
+    validate_request_secret_custody_metadata, validate_signing_custody_metadata,
+    validate_signing_key_custody, validate_socket_custody_metadata, validate_verify_key_custody,
     validate_verify_key_custody_metadata, BrokerServeConfig, BrokerState, CustodyMetadata,
     SocketCustodyMetadata, UnixSocketSecurity, CAPABILITY_SIGNING_FILE, CAPABILITY_VERIFY_FILE,
 };
@@ -96,6 +92,7 @@ mod tests {
         ElevatedCommand, PeerBind, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
     };
     use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex as AsyncMutex;
@@ -271,35 +268,57 @@ mod tests {
     }
 
     #[test]
-    fn install_creates_separate_signing_key() {
+    fn production_install_is_canonical_unsupported() {
         let dir = tempdir().unwrap();
         let base = dir.path();
         let st = broker_status(base).unwrap();
         assert!(!st.installed);
+        assert_eq!(st.support, "unsupported");
 
-        #[cfg(unix)]
-        {
-            let err = install_broker(base, None).expect_err("explicit custody required");
-            assert!(err.contains("explicit"), "{err}");
-        }
+        let err = install_broker(base, None).expect_err("production install is unsupported");
+        assert!(
+            err.contains("unsupported") && err.contains("no filesystem changes"),
+            "{err}"
+        );
+        assert!(!base.join("broker").exists());
+    }
 
-        #[cfg(windows)]
-        {
-            // Windows cannot safely enforce Named Pipe peer PID/token/ACL — install
-            // must fail closed without ever returning installed=true.
-            let err = install_broker(base, None).expect_err("windows install unsupported");
-            assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
-            let st = broker_status(base).unwrap();
-            assert!(!st.installed, "must not claim installed on Windows");
-            assert_eq!(st.support, "unsupported");
-            assert!(
-                st.notes
-                    .iter()
-                    .any(|n| n.to_ascii_lowercase().contains("unsupported")
-                        || n.to_ascii_lowercase().contains("fail-closed")),
-                "{st:?}"
-            );
-        }
+    #[test]
+    fn unsupported_install_and_uninstall_are_side_effect_free() {
+        let dir = tempdir().unwrap();
+        let install_base = dir.path().join("new-state");
+        let err = install_broker_with_config(
+            &install_base,
+            BrokerInstallConfig {
+                endpoint: Some(BrokerEndpoint::NamedPipe("ignored".into())),
+                trusted_executable: PathBuf::from("ignored"),
+                socket_security: UnixSocketSecurity {
+                    owner_uid: 0,
+                    group_gid: 0,
+                    mode: 0o600,
+                },
+                allowed_uids: vec![0],
+            },
+        )
+        .expect_err("configured production install is unsupported");
+        assert!(err.contains("unsupported"), "{err}");
+        assert!(!install_base.exists(), "install must not create state");
+
+        let broker_dir = dir.path().join("existing-state").join("broker");
+        std::fs::create_dir_all(&broker_dir).unwrap();
+        let marker = broker_dir.join(INSTALL_FILE);
+        let template = broker_dir.join("ownmesh-broker.service");
+        std::fs::write(&marker, b"operator marker").unwrap();
+        std::fs::write(&template, b"operator template").unwrap();
+
+        let err = uninstall_broker(&dir.path().join("existing-state"))
+            .expect_err("production uninstall is unsupported");
+        assert!(
+            err.contains("unsupported") && err.contains("no filesystem changes"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(marker).unwrap(), b"operator marker");
+        assert_eq!(std::fs::read(template).unwrap(), b"operator template");
     }
 
     #[test]

@@ -66,7 +66,10 @@ async fn run_broker_errors_on_loopback_tcp_before_accept() {
         .await
         .expect("run_broker should return promptly")
         .expect_err("LoopbackTcp must be rejected");
-    assert!(err.contains("fail-closed"), "{err}");
+    assert!(
+        err.contains("unsupported") && err.contains("fail-closed"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -89,7 +92,10 @@ async fn run_broker_errors_on_named_pipe_before_accept() {
         .await
         .expect("run_broker should return promptly")
         .expect_err("NamedPipe must be rejected without safe peer cred");
-    assert!(err.contains("fail-closed"), "{err}");
+    assert!(
+        err.contains("unsupported") && err.contains("fail-closed"),
+        "{err}"
+    );
 }
 
 #[cfg(target_os = "linux")]

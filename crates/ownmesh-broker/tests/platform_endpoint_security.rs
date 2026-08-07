@@ -96,7 +96,8 @@ async fn run_broker_named_pipe_is_failed_not_success() {
         .expect("must return promptly")
         .expect_err("NamedPipe run must fail-closed");
     assert!(
-        err.to_ascii_lowercase().contains("fail-closed")
+        err.to_ascii_lowercase().contains("unsupported")
+            || err.to_ascii_lowercase().contains("fail-closed")
             || err.to_ascii_lowercase().contains("named"),
         "{err}"
     );
@@ -114,8 +115,9 @@ fn loopback_tcp_install_is_unsupported() {
 }
 
 #[test]
-fn install_without_explicit_trust_boundary_never_succeeds() {
+fn install_without_legacy_arguments_is_explicitly_unsupported_and_side_effect_free() {
     let dir = tempdir().unwrap();
-    let err = install_broker(dir.path(), None).expect_err("explicit boundary required");
-    assert!(err.to_ascii_lowercase().contains("explicit"), "{err}");
+    let err = install_broker(dir.path(), None).expect_err("production install is unsupported");
+    assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
+    assert!(!dir.path().join("broker").exists());
 }
