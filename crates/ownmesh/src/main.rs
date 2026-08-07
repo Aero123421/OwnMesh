@@ -42,6 +42,7 @@ fn init_tracing() {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use ownmesh_domain::ExitCode;
 
     #[test]
     fn help_renders() {

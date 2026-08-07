@@ -140,7 +140,7 @@ pub async fn enroll_device(
     // Never park it under DeviceEnrollmentProof (legacy purpose only).
     store_device_credential(
         store,
-        issuer,
+        issuer.as_str(),
         &enroll.device_id,
         &SecretString::new(proof.device_credential),
     )

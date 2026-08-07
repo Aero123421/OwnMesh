@@ -190,9 +190,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             socket_group_gid: _,
             socket_mode: _,
             allowed_uids: _,
-        } => Err("unsupported: elevated broker production install is disabled until a secure mint authority is established; no filesystem changes were made (fail-closed)".into()),
+        } => Err("unsupported: elevated broker production install is disabled until a secure mint authority is established; no native service was activated or verified; no filesystem changes were made (fail-closed)".into()),
         Commands::Uninstall { state_dir: _ } => Err(
-            "unsupported: elevated broker production uninstall is disabled; no filesystem changes were made (fail-closed)".into(),
+            "unsupported: elevated broker production uninstall is disabled; native service absence cannot be verified; no filesystem changes were made (fail-closed)".into(),
         ),
         Commands::Run {
             endpoint: _,

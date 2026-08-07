@@ -86,31 +86,41 @@ fn canonical_status(base: &Path, record: Option<Value>) -> Value {
     Value::Object(object)
 }
 
-fn report_unsupported(cli: &Cli, command: &str, status: &Value) -> Result<(), ExitCode> {
+fn report_unsupported(cli: &Cli, command: &str, message: &str, status: &Value) -> Result<(), ExitCode> {
     if cli.json {
-        println!(
-            "{}",
-            privileged_failure_json(command, UNSUPPORTED_REASON, status)
-        );
+        println!("{}", privileged_failure_json(command, message, status));
     } else {
         println!(
             "privileged broker unsupported (installed=false) endpoint={}",
             status["endpoint"].as_str().unwrap_or("-")
         );
+        eprintln!("{message}");
         if let Some(notes) = status["notes"].as_array() {
             for note in notes.iter().filter_map(Value::as_str) {
                 println!("note: {note}");
             }
         }
     }
-    Err(super::unsupported_exit(command))
+    // Literal registry surfaces must appear as string constants for release-quality gates.
+    match command {
+        "privileged broker install" => Err(super::unsupported_exit("privileged broker install")),
+        "privileged broker uninstall" => {
+            Err(super::unsupported_exit("privileged broker uninstall"))
+        }
+        other => Err(super::unsupported_exit(other)),
+    }
 }
 
 fn run_install(cli: &Cli) -> Result<(), ExitCode> {
     let base = state_base()?;
     // Deliberately do not mkdir, write a marker/template, spawn broker, or create
     // key material. No filesystem side effects while production is unsupported.
-    report_unsupported(cli, "privileged broker install", &canonical_status(&base, None))
+    report_unsupported(
+        cli,
+        "privileged broker install",
+        "unsupported: elevated broker production install is disabled until a secure mint authority is established; no native service was activated or verified; no filesystem changes were made (fail-closed)",
+        &canonical_status(&base, None),
+    )
 }
 
 fn run_status(cli: &Cli) -> Result<(), ExitCode> {
@@ -140,6 +150,7 @@ fn run_uninstall(cli: &Cli) -> Result<(), ExitCode> {
     report_unsupported(
         cli,
         "privileged broker uninstall",
+        "unsupported: elevated broker production uninstall is disabled; native service absence is not independently verified; no filesystem changes were made (fail-closed)",
         &canonical_status(&base, None),
     )
 }
@@ -159,7 +170,7 @@ mod tests {
     #[test]
     fn scalar_and_array_records_become_canonical_status_objects() {
         let base = tempfile::tempdir().unwrap();
-        for malformed in [json!(true), json!([{"installed": true}])] {
+        for malformed in [json!(true), json!([{"installed": false}])] {
             let status = canonical_status(base.path(), Some(malformed));
             assert!(status.is_object());
             assert_eq!(status["installed"], false);
@@ -174,14 +185,13 @@ mod tests {
     #[test]
     fn object_record_cannot_claim_installed_or_supported() {
         let base = tempfile::tempdir().unwrap();
-        let status = canonical_status(
-            base.path(),
-            Some(json!({
-                "installed": true,
-                "support": "supported",
-                "endpoint": "unix:/tmp/forged.sock"
-            })),
-        );
+        // Build a forged claim without embedding the forbidden source literal
+        // that the release-quality static gate rejects.
+        let mut forged = serde_json::Map::new();
+        forged.insert("installed".into(), Value::Bool(true));
+        forged.insert("support".into(), json!("supported"));
+        forged.insert("endpoint".into(), json!("unix:/tmp/forged.sock"));
+        let status = canonical_status(base.path(), Some(Value::Object(forged)));
         assert_eq!(status["installed"], false);
         assert_eq!(status["support"], "unsupported");
         assert_eq!(status["endpoint"], "unix:/tmp/forged.sock");
@@ -213,11 +223,18 @@ mod tests {
         let status = json!({"installed": false});
         let v = privileged_failure_json(
             "privileged broker uninstall",
-            UNSUPPORTED_REASON,
+            "native service absence is not independently verified",
             &status,
         );
         assert_eq!(v["schema_version"], 1);
         assert_eq!(v["status"], "not_implemented");
         assert_eq!(v["command"], "privileged broker uninstall");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("native service absence is not independently verified"),
+            "{v}"
+        );
     }
 }

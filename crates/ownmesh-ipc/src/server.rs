@@ -152,7 +152,7 @@ impl IpcServer {
     ///
     /// Returns bind failures. Per-connection errors are logged and swallowed.
     pub async fn serve(self: Arc<Self>) -> IpcResult<()> {
-        let listener = LocalListener::bind(self.cfg.endpoint.clone())?;
+        let listener = LocalListener::bind(self.cfg.endpoint.clone()).await?;
         tracing::info!(endpoint = %listener.endpoint().display(), "ipc server listening");
 
         let mut shutdown_rx = self.shutdown_rx.clone();

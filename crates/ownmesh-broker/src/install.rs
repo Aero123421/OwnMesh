@@ -94,7 +94,10 @@ pub fn install_broker(
     _base: &Path,
     _endpoint_override: Option<BrokerEndpoint>,
 ) -> Result<InstallRecord, String> {
-    Err("unsupported: elevated broker production install is disabled until a secure mint authority is established; no filesystem changes were made (fail-closed)".into())
+    Err(
+        "unsupported: elevated broker production install is disabled until a secure mint authority is established; no native service was activated or verified; no filesystem changes were made (fail-closed)"
+            .into(),
+    )
 }
 
 /// Refuse configured production installation with the same side-effect-free
@@ -104,7 +107,10 @@ pub fn install_broker_with_config(
     _base: &Path,
     _config: BrokerInstallConfig,
 ) -> Result<InstallRecord, String> {
-    Err("unsupported: elevated broker production install is disabled until a secure mint authority is established; no filesystem changes were made (fail-closed)".into())
+    Err(
+        "unsupported: elevated broker production install is disabled until a secure mint authority is established; no native service was activated or verified; no filesystem changes were made (fail-closed)"
+            .into(),
+    )
 }
 
 // Retained custody helpers for a future secure mint path; unused while production
@@ -378,7 +384,10 @@ fn prepare_root_directory(_path: &Path, _mode: u32) -> Result<(), String> {
 /// Refuse production uninstallation without deleting or rewriting any privileged
 /// filesystem state. Manual cleanup remains an explicit operator action.
 pub fn uninstall_broker(_base: &Path) -> Result<(), String> {
-    Err("unsupported: elevated broker production uninstall is disabled; no filesystem changes were made (fail-closed)".into())
+    Err(
+        "unsupported: elevated broker production uninstall is disabled; native service absence cannot be verified; no filesystem changes were made (fail-closed)"
+            .into(),
+    )
 }
 
 #[allow(dead_code)]
