@@ -16,6 +16,7 @@
 
 import { createStore, MemoryStore, MissingD1Error, type ControlPlaneStore } from "./store.ts";
 import {
+  captureAuthorizeRequestReceipt,
   handleAuthorize,
   handleDeviceAuthorization,
   handleDeviceVerification,
@@ -372,6 +373,9 @@ export default {
       });
     }
     if (url.pathname === "/oauth/authorize" && (request.method === "GET" || request.method === "POST")) {
+      // Consent expiry begins on GET receipt, before any form parsing or external
+      // AUTH_PROVIDER round trip; POST only consumes an existing transaction.
+      if (request.method === "GET") captureAuthorizeRequestReceipt(request);
       if (request.method === "POST" && request.headers.get("origin") !== new URL(issuer).origin) {
         return json({ error: "origin_not_allowed" }, { status: 403 });
       }

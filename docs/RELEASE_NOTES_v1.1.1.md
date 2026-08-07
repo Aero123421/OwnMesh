@@ -30,7 +30,7 @@ Windows `cargo test` rejected GitHub Actions Temp directories whose path form us
 
 ### OAuth consent expiration boundary
 
-The consent transaction's five-minute lifetime is now anchored at request receipt, before asynchronous bootstrap, authentication, hashing, or persistence work. Its test uses an injected internal clock and asserts the exact expiry rather than relying on a wall-clock scheduling allowance; request input cannot control that clock.
+The consent transaction's five-minute lifetime is now captured at the Worker route boundary on GET receipt, before asynchronous form parsing, authentication, bootstrap, hashing, or persistence work. The timestamp is held in a request-identity keyed internal map; callers cannot supply an arbitrary clock or timestamp. A Worker-level delayed-`AUTH_PROVIDER` regression proves that the delay cannot extend expiry.
 
 ## Compatibility
 

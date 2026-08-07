@@ -44,6 +44,16 @@ export type OAuthRequestSecurity = {
   allowDynamicRegistration?: boolean;
 };
 
+// Request identity is the capability: only the Worker entrypoint that receives
+// the original Request can establish its receipt timestamp. A caller cannot
+// supply an arbitrary clock or timestamp to the authorize handler.
+const authorizeRequestReceipts = new WeakMap<Request, number>();
+
+/** Record an OAuth authorize GET's receipt before route-level async work. */
+export function captureAuthorizeRequestReceipt(request: Request): void {
+  authorizeRequestReceipts.set(request, Date.now());
+}
+
 const SUPPORTED_SCOPES = new Set([
   "ownmesh.read", "ownmesh.write", "ownmesh.exec", "ownmesh.session", "ownmesh.device", "offline_access",
 ]);
@@ -210,15 +220,12 @@ export async function handleAuthorize(
   store: ControlPlaneStore,
   issuer: string,
   security: OAuthRequestSecurity = {},
-  // Internal seam for deterministic expiration-boundary tests. Production callers
-  // use Date.now; request input can never select this clock.
-  now: () => number = Date.now,
 ): Promise<Response> {
   void issuer;
-  // Bound the consent lifetime to request receipt, not completion of asynchronous
-  // bootstrap/authentication work, so load cannot silently extend the five-minute
-  // user-visible approval window.
-  const requestReceivedAt = now();
+  // The Worker records GET receipt before form parsing/authentication. Direct
+  // internal callers have no forged-clock seam and fall back to handler entry.
+  const requestReceivedAt = authorizeRequestReceipts.get(req) ?? Date.now();
+  authorizeRequestReceipts.delete(req);
   const url = new URL(req.url);
 
   // POST consent decision first: consume one-time transaction and issue code

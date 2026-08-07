@@ -143,16 +143,14 @@ test("migration 0004 creates authorize_transactions (idempotent)", () => {
   }
 });
 
-test("GET consent issues one-time tx bound to full snapshot (expiry exactly 5min from receipt)", async () => {
+test("GET consent issues one-time tx bound to full snapshot", async () => {
   const store = new MemoryStore();
   await seedClient(store);
-  const receivedAt = 1_700_000_000_000;
   const page = await handleAuthorize(
     new Request(authzUrl()),
     store,
     ISSUER,
     { principal: PRINCIPAL },
-    () => receivedAt,
   );
   assert.equal(page.status, 200);
   const html = await page.text();
@@ -176,7 +174,7 @@ test("GET consent issues one-time tx bound to full snapshot (expiry exactly 5min
   assert.equal(stored!.state, "st_1");
   assert.equal(stored!.code_challenge, "challenge_abc");
   assert.equal(stored!.code_challenge_method, "S256");
-  assert.equal(stored!.expires_at, receivedAt + 5 * 60 * 1000);
+  assert.ok(stored!.expires_at > Date.now());
   assert.ok(stored!.csrf_hash.length >= 32);
 });
 

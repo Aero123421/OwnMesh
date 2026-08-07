@@ -18,7 +18,7 @@ import {
   type DeviceEnvelope,
   type SessionAttachment,
 } from "./device-room.ts";
-import { SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
+import { MemoryStore, SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
 import { internalDoHeaders, randomId, sha256Hex } from "./util.ts";
 
 const ctx = {} as ExecutionContext;
@@ -531,6 +531,55 @@ function mcpRpc(
 // ---------------------------------------------------------------------------
 // Happy paths on SqlStore + worker
 // ---------------------------------------------------------------------------
+
+test("production-path: delayed AUTH_PROVIDER cannot extend consent expiry past GET receipt", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.putClient({
+    client_id: CLIENT,
+    tenant_id: TENANT_ID,
+    client_name: "receipt-boundary",
+    redirect_uris: [REDIRECT],
+    created_at: new Date().toISOString(),
+  });
+  __setTestStore(store);
+  let providerStartedAt = 0;
+  try {
+    const response = await worker.fetch(
+      new Request(
+        `${ISSUER}/oauth/authorize?response_type=code&client_id=${CLIENT}` +
+          `&redirect_uri=${encodeURIComponent(REDIRECT)}` +
+          "&code_challenge=receipt_boundary&code_challenge_method=S256&scope=ownmesh.read",
+      ),
+      {
+        OAUTH_ISSUER: ISSUER,
+        AUTH_PROVIDER: {
+          fetch: async () => {
+            providerStartedAt = Date.now();
+            await new Promise<void>((resolve) => setTimeout(resolve, 150));
+            return Response.json({
+              principal_id: PRINCIPAL_ID,
+              tenant_id: TENANT_ID,
+              display_name: PRINCIPAL_ID,
+            });
+          },
+        } as unknown as Fetcher,
+      },
+      ctx,
+    );
+    assert.equal(response.status, 200);
+    const { tx } = parseConsentForm(await response.text());
+    const stored = store.authorizeTransactions.get(tx);
+    assert.ok(stored, "worker must persist the consent transaction");
+    assert.ok(providerStartedAt > 0, "delayed AUTH_PROVIDER must have run");
+    assert.ok(
+      stored!.expires_at <= providerStartedAt + 5 * 60 * 1000,
+      "consent expiry must be anchored before the delayed AUTH_PROVIDER call",
+    );
+  } finally {
+    __setTestStore(null);
+  }
+});
 
 test("production-path: authorize consent-tx + PKCE exchange via worker + SqlStore", async () => {
   await withStore(async (store) => {
