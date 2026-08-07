@@ -921,17 +921,26 @@ mod tests {
         let approvals = listed["approvals"].as_array().unwrap();
         assert!(approvals.iter().any(|a| a["id"] == approval_id));
 
-        let approved = client
-            .call(
+        // Ordinary IPC approve is fail-closed (no presence proof). Exercise execution via
+        // direct runtime dispatch as an OS-shaped human principal.
+        let human = ClientIdentity::new(
+            format!("user:{}", ownmesh_ipc::current_os_user_id()),
+            "0.1.0",
+        );
+        let approved = {
+            let mut g = runtime.lock().await;
+            g.dispatch(
                 methods::APPROVAL_APPROVE,
                 Some(json!({
                     "id": approval_id,
                     "temporary_grant": true,
                     "grant_seconds": 600,
                 })),
+                &human,
             )
             .await
-            .expect("approve");
+            .expect("approve")
+        };
         assert_eq!(approved["approval_required"], false);
         assert_eq!(approved["result"]["bytes_written"], 13);
         assert!(marker.exists(), "must execute after approval");
@@ -1236,10 +1245,17 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
-        client
-            .call(methods::DAEMON_UNLOCK, None)
-            .await
-            .expect("unlock");
+        // Unlock is a human-operator method: ordinary IPC is fail-closed.
+        {
+            let mut g = runtime.lock().await;
+            let human = ClientIdentity::new(
+                format!("user:{}", ownmesh_ipc::current_os_user_id()),
+                "0.1.0",
+            );
+            g.dispatch(methods::DAEMON_UNLOCK, None, &human)
+                .await
+                .expect("unlock");
+        }
         assert!(!runtime.lock().await.is_lockdown());
 
         let ok = client
@@ -1271,13 +1287,20 @@ mod tests {
         );
         chatgpt.status().await.expect("chatgpt pre-revoke status");
 
-        let revoked = client
-            .call(
+        let revoked = {
+            let mut g = runtime.lock().await;
+            let human = ClientIdentity::new(
+                format!("user:{}", ownmesh_ipc::current_os_user_id()),
+                "0.1.0",
+            );
+            g.dispatch(
                 methods::TOKEN_REVOKE,
                 Some(json!({ "client": "client:chatgpt" })),
+                &human,
             )
             .await
-            .expect("token revoke");
+            .expect("token revoke")
+        };
         assert_eq!(revoked["revoked"], "client:chatgpt");
         assert_eq!(revoked["ok"], true);
 

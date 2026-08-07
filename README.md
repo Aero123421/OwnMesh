@@ -15,7 +15,7 @@ The CLI currently has **32 explicit unsupported CLI surfaces** from the Rust dis
 ### Supported CLI areas
 
 - `setup` — TTY wizard + non-interactive flags/JSON; privacy defaults (telemetry/relay/update network **OFF**)
-- `doctor` — read-only structured diagnostics; global `--json`; network probes only with `--check-network` or a configured control-plane URL
+- `doctor` — read-only structured diagnostics; global `--json`; network probes only with `--check-network` or a configured control-plane URL; credentials reported from non-secret metadata only (no keychain load)
 - `service install|start|stop|restart|status|uninstall` — **user-level** `ownmeshd` autostart only (Windows current-user Scheduled Task ONLOGON, macOS LaunchAgent, Linux systemd --user)
 - `update check|download|apply|channel` — signed GitHub Releases; network off by default; embedded minisign trust root
 - status, login/logout, lockdown/token revoke, config validate
@@ -41,19 +41,35 @@ Japanese summary: [`README.ja.md`](./README.ja.md).
 
 ## Install (portable)
 
+**Do not** pipe remote installer text into a shell (`curl|sh` / `irm|iex`). Download, inspect, verify against the signed release checksums, then execute from a local path.
+
 macOS / Linux:
 
 ```bash
-curl -fsSL https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh | sh
+curl -fsSL -o ownmesh-installer.sh \
+  https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh
+curl -fsSL -O https://github.com/Aero123421/OwnMesh/releases/latest/download/SHA256SUMS
+curl -fsSL -O https://github.com/Aero123421/OwnMesh/releases/latest/download/SHA256SUMS.minisig
+curl -fsSL -O https://github.com/Aero123421/OwnMesh/releases/latest/download/minisign.pub
+minisign -Vm SHA256SUMS -p minisign.pub -x SHA256SUMS.minisig
+sha256sum -c SHA256SUMS --ignore-missing  # confirm ownmesh-installer.sh
+less ownmesh-installer.sh   # inspect
+sh ./ownmesh-installer.sh   # execute only after inspect + verify
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 | iex
+Invoke-WebRequest -Uri https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile ownmesh-installer.ps1
+# Download SHA256SUMS + SHA256SUMS.minisig + minisign.pub, verify with minisign, inspect the script, then:
+powershell -NoProfile -File .\ownmesh-installer.ps1
 ```
 
-Prefer downloading the installer script, inspecting it, then running it locally. Set `OWNMESH_VERSION`, `OWNMESH_INSTALL_DIR`, or `OWNMESH_NO_MODIFY_PATH` as needed. Homebrew formula assets are published as `ownmesh.rb` on each release.
+The installer requires **minisign** (on `PATH` or `OWNMESH_MINISIGN`) and verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting any checksum. Set `OWNMESH_VERSION`, `OWNMESH_INSTALL_DIR`, or `OWNMESH_NO_MODIFY_PATH` as needed. Homebrew formula assets are published as `ownmesh.rb` on each release.
+
+### Local approval / human-operator note (v1.1.0)
+
+`approval approve|deny`, `policy preset`, `unlock`, and `tokens revoke` over ordinary local IPC are **fail-closed** until a distinct OS/UI user-presence proof bound to the operation exists. Same-UID unauthenticated sockets are forgeable and are not treated as human presence.
 
 ## Quick start (development)
 

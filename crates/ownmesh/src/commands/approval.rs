@@ -3,8 +3,27 @@
 use crate::cli::{ApprovalCmd, Cli};
 use crate::commands::ipc_util::{call_daemon, print_value};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::methods;
+use ownmesh_ipc::{human_operator_disabled_message, methods};
 use serde_json::json;
+
+fn human_operator_unavailable(cli: &Cli, command: &str) -> Result<(), ExitCode> {
+    let message = human_operator_disabled_message();
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "ok": false,
+                "command": command,
+                "error": "human_presence_unavailable",
+                "message": message,
+            })
+        );
+    } else {
+        eprintln!("{command}: {message}");
+    }
+    Err(ExitCode::UsageConfig)
+}
 
 pub fn dispatch_approval(cli: &Cli, cmd: &ApprovalCmd) -> Result<(), ExitCode> {
     match cmd {
@@ -44,39 +63,15 @@ pub fn dispatch_approval(cli: &Cli, cmd: &ApprovalCmd) -> Result<(), ExitCode> {
             grant,
             grant_seconds,
         } => {
-            let value = call_daemon(
-                methods::APPROVAL_APPROVE,
-                Some(json!({
-                    "id": id,
-                    "temporary_grant": grant,
-                    "grant_seconds": grant_seconds,
-                })),
-            )?;
-            print_value(cli.json, &value, |v| {
-                println!(
-                    "approved {} (operation {})",
-                    v["approval_id"].as_str().unwrap_or(id),
-                    v["operation_id"].as_str().unwrap_or("?")
-                );
-                if let Some(result) = v.get("result") {
-                    println!(
-                        "result: {}",
-                        serde_json::to_string_pretty(result).unwrap_or_default()
-                    );
-                }
-            });
-            Ok(())
+            let _ = (id, grant, grant_seconds);
+            // No distinct OS/UI user-presence proof is bound to approve yet. Ordinary
+            // local IPC (including this CLI path) is fail-closed — same-UID sockets are
+            // forgeable and must not be treated as human presence.
+            human_operator_unavailable(cli, "approval approve")
         }
         ApprovalCmd::Deny { id } => {
-            let value = call_daemon(methods::APPROVAL_DENY, Some(json!({ "id": id })))?;
-            print_value(cli.json, &value, |v| {
-                println!(
-                    "denied {} (operation {})",
-                    v["approval_id"].as_str().unwrap_or(id),
-                    v["operation_id"].as_str().unwrap_or("?")
-                );
-            });
-            Ok(())
+            let _ = id;
+            human_operator_unavailable(cli, "approval deny")
         }
         ApprovalCmd::Watch => super::unsupported(
             cli,

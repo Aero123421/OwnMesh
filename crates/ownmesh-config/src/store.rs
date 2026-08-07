@@ -159,6 +159,226 @@ fn backup_path(path: &Path) -> PathBuf {
     PathBuf::from(bak)
 }
 
+/// On-disk journal for a two-file config+policy setup transaction.
+///
+/// Durable recovery: if a crash leaves the journal present, [`recover_config_policy_transaction`]
+/// restores the pre-transaction pair (or completes a fully-staged commit when both new blobs
+/// were written before the journal was cleared).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConfigPolicyTransaction {
+    pub schema_version: u32,
+    pub phase: String,
+    pub old_config: Option<String>,
+    pub old_policy: Option<String>,
+    pub new_config: String,
+    pub new_policy: String,
+}
+
+const TX_SCHEMA: u32 = 1;
+const TX_FILE_NAME: &str = "setup-config-policy.txn.json";
+
+fn transaction_path(paths: &OwnMeshPaths) -> PathBuf {
+    paths.config_dir.join(TX_FILE_NAME)
+}
+
+fn read_optional_text(path: &Path) -> ConfigResult<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        }),
+    }
+}
+
+fn write_transaction_journal(path: &Path, tx: &ConfigPolicyTransaction) -> ConfigResult<()> {
+    let rendered =
+        serde_json::to_vec_pretty(tx).map_err(|err| ConfigError::Other(err.to_string()))?;
+    write_atomically(path, &rendered).map_err(|source| ConfigError::Io {
+        path: Some(path.to_path_buf()),
+        source,
+    })?;
+    // Best-effort durability of the journal parent on Unix.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn clear_transaction_journal(path: &Path) -> ConfigResult<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ConfigError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        }),
+    }
+}
+
+/// Atomically apply a config+policy pair with a durable recovery journal.
+///
+/// Guarantees:
+/// - Both documents are validated before any write.
+/// - A journal capturing the previous pair is durable before either live file changes.
+/// - On policy write failure, the previous config (and policy) are restored from the journal.
+/// - Never leaves a committed new config paired with a stale old strong policy after failure.
+///
+/// # Errors
+///
+/// Validation or IO failures. On failure the live pair matches the pre-call pair when a
+/// previous pair existed; first-run partial creates are rolled back to absent files.
+pub fn save_config_and_policy_transactional(
+    paths: &OwnMeshPaths,
+    cfg: &OwnMeshConfig,
+    policy: &PolicyFile,
+) -> ConfigResult<()> {
+    cfg.validate()?;
+    policy.validate()?;
+    paths.ensure_layout()?;
+
+    // Recover any interrupted prior transaction before starting a new one.
+    recover_config_policy_transaction(paths)?;
+
+    let config_path = paths.config_file();
+    let policy_path = paths.policy_file();
+    let tx_path = transaction_path(paths);
+
+    let new_config =
+        toml::to_string_pretty(cfg).map_err(|err| ConfigError::Other(err.to_string()))?;
+    let new_policy =
+        toml::to_string_pretty(policy).map_err(|err| ConfigError::Other(err.to_string()))?;
+    assert_no_plaintext_secrets(&new_config)?;
+    assert_no_plaintext_secrets(&new_policy)?;
+
+    let old_config = read_optional_text(&config_path)?;
+    let old_policy = read_optional_text(&policy_path)?;
+
+    let mut tx = ConfigPolicyTransaction {
+        schema_version: TX_SCHEMA,
+        phase: "prepared".into(),
+        old_config: old_config.clone(),
+        old_policy: old_policy.clone(),
+        new_config: new_config.clone(),
+        new_policy: new_policy.clone(),
+    };
+    write_transaction_journal(&tx_path, &tx)?;
+
+    // Stage config.
+    if let Err(err) = atomic_write(&config_path, new_config.as_bytes()) {
+        let _ = restore_pair_from_transaction(&config_path, &policy_path, &tx);
+        let _ = clear_transaction_journal(&tx_path);
+        return Err(err);
+    }
+    tx.phase = "config_written".into();
+    if let Err(err) = write_transaction_journal(&tx_path, &tx) {
+        let _ = restore_pair_from_transaction(&config_path, &policy_path, &tx);
+        let _ = clear_transaction_journal(&tx_path);
+        return Err(err);
+    }
+
+    // Stage policy. On failure, restore the previous pair completely.
+    if let Err(err) = atomic_write(&policy_path, new_policy.as_bytes()) {
+        let _ = restore_pair_from_transaction(&config_path, &policy_path, &tx);
+        let _ = clear_transaction_journal(&tx_path);
+        return Err(err);
+    }
+
+    tx.phase = "committed".into();
+    // Best-effort journal update then clear — recovery treats missing journal as clean.
+    let _ = write_transaction_journal(&tx_path, &tx);
+    clear_transaction_journal(&tx_path)?;
+    Ok(())
+}
+
+fn restore_pair_from_transaction(
+    config_path: &Path,
+    policy_path: &Path,
+    tx: &ConfigPolicyTransaction,
+) -> ConfigResult<()> {
+    match &tx.old_config {
+        Some(bytes) => atomic_write(config_path, bytes.as_bytes())?,
+        None => match fs::remove_file(config_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: Some(config_path.to_path_buf()),
+                    source,
+                });
+            }
+        },
+    }
+    match &tx.old_policy {
+        Some(bytes) => atomic_write(policy_path, bytes.as_bytes())?,
+        None => match fs::remove_file(policy_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: Some(policy_path.to_path_buf()),
+                    source,
+                });
+            }
+        },
+    }
+    Ok(())
+}
+
+/// Complete or roll back an interrupted config+policy transaction.
+///
+/// - `prepared` / `config_written`: restore the old pair (or delete new-only files).
+/// - `committed`: ensure both new files are present, then clear the journal.
+///
+/// # Errors
+///
+/// IO / parse failures while reading or applying the journal.
+pub fn recover_config_policy_transaction(paths: &OwnMeshPaths) -> ConfigResult<()> {
+    let tx_path = transaction_path(paths);
+    let raw = match fs::read_to_string(&tx_path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ConfigError::Io {
+                path: Some(tx_path),
+                source,
+            });
+        }
+    };
+    let tx: ConfigPolicyTransaction =
+        serde_json::from_str(&raw).map_err(|err| ConfigError::Parse {
+            path: tx_path.clone(),
+            message: format!("setup transaction journal: {err}"),
+        })?;
+    if tx.schema_version != TX_SCHEMA {
+        return Err(ConfigError::Migration {
+            message: format!(
+                "unsupported setup transaction schema_version {}",
+                tx.schema_version
+            ),
+        });
+    }
+
+    let config_path = paths.config_file();
+    let policy_path = paths.policy_file();
+
+    if tx.phase.as_str() == "committed" {
+        // Finish publishing the new pair if needed, then drop the journal.
+        atomic_write(&config_path, tx.new_config.as_bytes())?;
+        atomic_write(&policy_path, tx.new_policy.as_bytes())?;
+        clear_transaction_journal(&tx_path)?;
+    } else {
+        // prepared / config_written / unknown → fail closed back to the old pair.
+        restore_pair_from_transaction(&config_path, &policy_path, &tx)?;
+        clear_transaction_journal(&tx_path)?;
+    }
+    Ok(())
+}
+
 /// Migrate a raw TOML table in place. Returns whether a migration occurred.
 fn migrate_config_value(value: &mut toml::Value) -> ConfigResult<bool> {
     let table = value.as_table_mut().ok_or_else(|| ConfigError::Migration {
@@ -386,5 +606,155 @@ mod tests {
         assert!(err.is_err());
         assert!(path.is_dir());
         assert_eq!(fs::read_to_string(&path2).unwrap(), "STABLE-OLD");
+    }
+
+    #[test]
+    fn config_policy_transaction_commits_pair() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let cfg = OwnMeshConfig {
+            active_instance: Some("a".into()),
+            instances: vec![crate::schema::InstanceConfig {
+                id: "a".into(),
+                base_url: "https://cp.example.test".into(),
+                display_name: None,
+            }],
+            ..OwnMeshConfig::default()
+        };
+        let policy = PolicyFile {
+            schema_version: 1,
+            preset: Some("recommended".into()),
+        };
+        save_config_and_policy_transactional(&paths, &cfg, &policy).unwrap();
+        assert!(!transaction_path(&paths).exists());
+        let loaded = load_config(&paths).unwrap();
+        assert_eq!(loaded.active_instance.as_deref(), Some("a"));
+        let pol = load_policy(&paths).unwrap();
+        assert_eq!(pol.preset.as_deref(), Some("recommended"));
+    }
+
+    #[test]
+    fn config_policy_transaction_fault_on_policy_restores_old_pair() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let old_cfg = OwnMeshConfig {
+            active_instance: Some("old".into()),
+            instances: vec![crate::schema::InstanceConfig {
+                id: "old".into(),
+                base_url: "https://old.example.test".into(),
+                display_name: None,
+            }],
+            ..OwnMeshConfig::default()
+        };
+        let old_policy = PolicyFile {
+            schema_version: 1,
+            preset: Some("full_access".into()),
+        };
+        save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
+
+        let new_cfg = OwnMeshConfig {
+            active_instance: Some("new".into()),
+            instances: vec![crate::schema::InstanceConfig {
+                id: "new".into(),
+                base_url: "https://new.example.test".into(),
+                display_name: None,
+            }],
+            ..OwnMeshConfig::default()
+        };
+        let new_policy = PolicyFile {
+            schema_version: 1,
+            preset: Some("workspace_only".into()),
+        };
+
+        // Simulate crash after config stage: journal left in config_written with new config
+        // already on disk and old strong policy still present.
+        let new_config = toml::to_string_pretty(&new_cfg).unwrap();
+        let new_policy_text = toml::to_string_pretty(&new_policy).unwrap();
+        let old_config = fs::read_to_string(paths.config_file()).unwrap();
+        let old_policy_text = fs::read_to_string(paths.policy_file()).unwrap();
+        let tx = ConfigPolicyTransaction {
+            schema_version: TX_SCHEMA,
+            phase: "config_written".into(),
+            old_config: Some(old_config),
+            old_policy: Some(old_policy_text.clone()),
+            new_config: new_config.clone(),
+            new_policy: new_policy_text,
+        };
+        write_transaction_journal(&transaction_path(&paths), &tx).unwrap();
+        atomic_write(&paths.config_file(), new_config.as_bytes()).unwrap();
+        // Policy intentionally left as old strong full_access.
+
+        // Recovery must restore the old pair (never leave new config + old strong policy).
+        recover_config_policy_transaction(&paths).unwrap();
+        assert!(!transaction_path(&paths).exists());
+        let cfg = load_config(&paths).unwrap();
+        assert_eq!(cfg.active_instance.as_deref(), Some("old"));
+        let pol = load_policy(&paths).unwrap();
+        assert_eq!(pol.preset.as_deref(), Some("full_access"));
+        assert_eq!(
+            fs::read_to_string(paths.policy_file()).unwrap(),
+            old_policy_text
+        );
+    }
+
+    #[test]
+    fn config_policy_transaction_policy_write_failure_rolls_back() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let old_cfg = OwnMeshConfig {
+            active_instance: Some("stable".into()),
+            instances: vec![crate::schema::InstanceConfig {
+                id: "stable".into(),
+                base_url: "https://stable.example.test".into(),
+                display_name: None,
+            }],
+            ..OwnMeshConfig::default()
+        };
+        let old_policy = PolicyFile {
+            schema_version: 1,
+            preset: Some("recommended".into()),
+        };
+        save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
+
+        let new_cfg = OwnMeshConfig {
+            active_instance: Some("broken".into()),
+            instances: vec![crate::schema::InstanceConfig {
+                id: "broken".into(),
+                base_url: "https://broken.example.test".into(),
+                display_name: None,
+            }],
+            ..OwnMeshConfig::default()
+        };
+        let new_policy = PolicyFile {
+            schema_version: 1,
+            preset: Some("workspace_only".into()),
+        };
+
+        // Fault-inject policy destination as a non-empty directory so atomic_write fails.
+        let policy_path = paths.policy_file();
+        let policy_backup = dir.path().join("policy.saved");
+        fs::rename(&policy_path, &policy_backup).unwrap();
+        fs::create_dir(&policy_path).unwrap();
+        fs::write(policy_path.join("blocker"), b"1").unwrap();
+
+        let err = save_config_and_policy_transactional(&paths, &new_cfg, &new_policy);
+        assert!(err.is_err(), "policy fault must fail the transaction");
+
+        // Clean the blocker and restore path shape so we can inspect results.
+        fs::remove_dir_all(&policy_path).unwrap();
+        fs::rename(&policy_backup, &policy_path).unwrap();
+
+        // Transaction helper should have restored config to old and left no journal.
+        // (policy path was a directory during failure; restore writes old policy bytes back).
+        recover_config_policy_transaction(&paths).unwrap();
+        assert!(!transaction_path(&paths).exists());
+        let cfg = load_config(&paths).unwrap();
+        assert_eq!(
+            cfg.active_instance.as_deref(),
+            Some("stable"),
+            "must not leave new config after policy failure"
+        );
+        let pol = load_policy(&paths).unwrap();
+        assert_eq!(pol.preset.as_deref(), Some("recommended"));
     }
 }

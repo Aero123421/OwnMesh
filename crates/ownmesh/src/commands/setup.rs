@@ -2,7 +2,8 @@
 
 use crate::cli::{Cli, SetupArgs};
 use ownmesh_config::{
-    load_config, save_config, save_policy, validate_control_plane_base_url, InstanceConfig,
+    load_config, recover_config_policy_transaction, redact_control_plane_url,
+    save_config_and_policy_transactional, validate_control_plane_base_url, InstanceConfig,
     OwnMeshConfig, OwnMeshPaths, PolicyFile, TelemetryConfig, UpdateConfig,
 };
 use ownmesh_domain::ExitCode;
@@ -279,8 +280,12 @@ pub fn apply_setup(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApplySetupError::usage("control-plane URL is required"))?;
-    let url = validate_control_plane_base_url(url_raw)
-        .map_err(|e| ApplySetupError::usage(format!("invalid control-plane URL: {e}")))?;
+    let url = validate_control_plane_base_url(url_raw).map_err(|e| {
+        ApplySetupError::usage(format!(
+            "invalid control-plane URL ({}): {e}",
+            redact_control_plane_url(url_raw)
+        ))
+    })?;
 
     let instance_id = req
         .instance_id
@@ -403,10 +408,10 @@ pub fn apply_setup(
     Ok(result)
 }
 
-/// Create config root and write config/policy atomically.
+/// Create config root and write config/policy as one journaled transaction.
 ///
-/// If config write fails after directories exist, no half-written `config.toml` is left
-/// (atomic replace). Policy is written after config succeeds.
+/// Uses [`save_config_and_policy_transactional`]: durable journal + complete rollback on
+/// policy failure so a new config is never left paired with an old strong policy.
 pub fn apply_setup_atomic(
     paths: &OwnMeshPaths,
     cfg: &OwnMeshConfig,
@@ -430,8 +435,12 @@ pub fn apply_setup_atomic(
         }
     }
 
-    save_config(paths, cfg).map_err(|e| ApplySetupError::io(format!("write config: {e}")))?;
-    save_policy(paths, policy).map_err(|e| ApplySetupError::io(format!("write policy: {e}")))?;
+    // Complete any interrupted prior transaction before writing a new pair.
+    recover_config_policy_transaction(paths)
+        .map_err(|e| ApplySetupError::io(format!("recover setup transaction: {e}")))?;
+
+    save_config_and_policy_transactional(paths, cfg, policy)
+        .map_err(|e| ApplySetupError::io(format!("write config+policy transaction: {e}")))?;
 
     // Verify round-trip without logging contents that could ever include secrets.
     let loaded =

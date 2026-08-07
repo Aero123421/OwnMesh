@@ -2,14 +2,14 @@
 
 use crate::cli::{Cli, DoctorArgs};
 use crate::commands::service::{self, ServiceStatusSnapshot};
-use ownmesh_config::OwnMeshPaths;
+use ownmesh_config::{redact_control_plane_url, OwnMeshPaths};
 use ownmesh_diagnostics::{
     appears_redacted, run_doctor, BinaryObservation, ConfigObservation, ControlPlaneObservation,
     CredentialObservation, DaemonObservation, DoctorOutcome, DoctorReport,
     PrivacyPolicyObservation, ServiceObservation,
 };
 use ownmesh_domain::ExitCode;
-use ownmesh_identity::{SecretPurpose, SecretStore, DEFAULT_KEYCHAIN_SERVICE};
+use ownmesh_identity::SecretPurpose;
 use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use std::env;
 use std::fs;
@@ -32,32 +32,51 @@ pub fn collect_doctor_report(
         service: observe_service(),
     };
 
-    // Control-plane URL from config (no secrets).
-    if let Ok(cfg) = load_config_readonly(paths) {
-        if let Some(url) = active_control_plane_url(&cfg) {
-            input.control_plane.configured = true;
-            input.control_plane.url = Some(url.clone());
-            let should_probe = args.check_network || input.control_plane.configured;
-            if should_probe {
-                input.control_plane.probed = true;
-                match probe_control_plane_health(&url) {
-                    Ok(status) if (200..300).contains(&status) => {
-                        input.control_plane.reachable = Some(true);
-                        input.control_plane.http_status = Some(status);
-                    }
-                    Ok(status) => {
-                        input.control_plane.reachable = Some(false);
-                        input.control_plane.http_status = Some(status);
-                        input.control_plane.message =
-                            Some(format!("control plane /health returned HTTP {status}"));
-                    }
-                    Err(msg) => {
-                        input.control_plane.reachable = Some(false);
-                        input.control_plane.message = Some(msg);
+    // Control-plane URL from config. Unsafe URLs are rejected/redacted before any output.
+    match load_config_readonly(paths) {
+        Ok(cfg) => {
+            if let Some(url) = active_control_plane_url(&cfg) {
+                input.control_plane.configured = true;
+                // Never surface raw URL material that could carry userinfo/query.
+                input.control_plane.url = Some(redact_control_plane_url(&url));
+                let should_probe = args.check_network || input.control_plane.configured;
+                if should_probe {
+                    input.control_plane.probed = true;
+                    match probe_control_plane_health(&url) {
+                        Ok(status) if (200..300).contains(&status) => {
+                            input.control_plane.reachable = Some(true);
+                            input.control_plane.http_status = Some(status);
+                        }
+                        Ok(status) => {
+                            input.control_plane.reachable = Some(false);
+                            input.control_plane.http_status = Some(status);
+                            input.control_plane.message =
+                                Some(format!("control plane /health returned HTTP {status}"));
+                        }
+                        Err(msg) => {
+                            input.control_plane.reachable = Some(false);
+                            input.control_plane.message =
+                                Some(msg.replace(&url, &redact_control_plane_url(&url)));
+                        }
                     }
                 }
             }
         }
+        Err(msg) if msg != "missing" => {
+            // Config present but unreadable/invalid (including unsafe URL). Do not echo secrets.
+            input.config.message = Some(sanitize_doctor_message(&msg));
+            if msg.to_ascii_lowercase().contains("base_url")
+                || msg.to_ascii_lowercase().contains("userinfo")
+                || msg.to_ascii_lowercase().contains("http")
+            {
+                input.control_plane.configured = true;
+                input.control_plane.url = Some("[REDACTED]".into());
+                input.control_plane.message = Some(
+                    "control-plane URL failed validation (value redacted; re-run setup)".into(),
+                );
+            }
+        }
+        Err(_) => {}
     }
 
     let report = run_doctor(&input);
@@ -195,46 +214,51 @@ fn observe_credentials(paths: &OwnMeshPaths) -> CredentialObservation {
         }
     }
 
-    // Secret store: presence only, without creating keystore dirs (read-only).
-    // Prefer OS keychain; only consult on-disk fallback if the directory already exists.
-    observe_secret_presence(paths, &mut obs);
+    // Presence from non-secret metadata only. Doctor must never call OS credential
+    // store load APIs or decode secret material (no keychain read, no prompt).
+    observe_secret_presence_metadata_only(paths, &mut obs);
     obs
 }
 
-fn observe_secret_presence(paths: &OwnMeshPaths, obs: &mut CredentialObservation) {
-    // OS keychain only — never create keystore dirs or unlock files.
-    let os = ownmesh_identity::OsKeychainStore::new(DEFAULT_KEYCHAIN_SERVICE);
-    if let Ok(Some(_)) = os.load(SecretPurpose::HumanRefreshToken) {
+/// File-name / path metadata only — never opens keychain or decrypts blobs.
+fn observe_secret_presence_metadata_only(paths: &OwnMeshPaths, obs: &mut CredentialObservation) {
+    let keystore = paths.keystore_dir();
+    if !keystore.is_dir() {
+        // No non-secret metadata available → leave presence flags false ("unknown"/
+        // absent in the report). Do not probe the OS credential store.
+        return;
+    }
+    let human_blob = keystore.join(format!(
+        "{}.oms",
+        SecretPurpose::HumanRefreshToken.account()
+    ));
+    let device_key_blob =
+        keystore.join(format!("{}.oms", SecretPurpose::DevicePrivateKey.account()));
+    let device_cred_blob =
+        keystore.join(format!("{}.oms", SecretPurpose::DeviceCredential.account()));
+    if human_blob.is_file() {
         obs.human_refresh_present = true;
     }
-    if let Ok(Some(_)) = os.load(SecretPurpose::DevicePrivateKey) {
+    if device_key_blob.is_file() {
         obs.device_key_present = true;
     }
-    if let Ok(Some(_)) = os.load(SecretPurpose::DeviceCredential) {
+    if device_cred_blob.is_file() {
         obs.device_credential_present = true;
     }
+}
 
-    // File-fallback presence: detect encrypted blobs by filename only (no decrypt, no writes).
-    let keystore = paths.keystore_dir();
-    if keystore.is_dir() {
-        let human_blob = keystore.join(format!(
-            "{}.oms",
-            SecretPurpose::HumanRefreshToken.account()
-        ));
-        let device_key_blob =
-            keystore.join(format!("{}.oms", SecretPurpose::DevicePrivateKey.account()));
-        let device_cred_blob =
-            keystore.join(format!("{}.oms", SecretPurpose::DeviceCredential.account()));
-        if human_blob.is_file() {
-            obs.human_refresh_present = true;
-        }
-        if device_key_blob.is_file() {
-            obs.device_key_present = true;
-        }
-        if device_cred_blob.is_file() {
-            obs.device_credential_present = true;
-        }
+fn sanitize_doctor_message(msg: &str) -> String {
+    // Collapse anything that looks like a URL or credential carrier.
+    let mut out = msg.to_string();
+    if let Some(start) = out.find("http://").or_else(|| out.find("https://")) {
+        let rest = &out[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '`' || c == '"' || c == '\'')
+            .unwrap_or(rest.len());
+        let url = &rest[..end];
+        out = out.replace(url, &redact_control_plane_url(url));
     }
+    out
 }
 
 fn observe_daemon(paths: &OwnMeshPaths) -> DaemonObservation {
@@ -466,6 +490,97 @@ mod tests {
         assert!(!paths.config_file().exists());
         assert!(report.checks.iter().any(|c| c.id == "config.present"));
         let json = serde_json::to_string(&report).unwrap();
+        assert!(appears_redacted(&json));
+    }
+
+    #[test]
+    fn doctor_never_loads_os_credential_store() {
+        // Source-level guard on production code only (strip the tests module).
+        let src = include_str!("doctor.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !prod.contains("OsKeychainStore"),
+            "doctor must not construct OsKeychainStore"
+        );
+        assert!(
+            !prod.contains("keyring::"),
+            "doctor must not use keyring APIs"
+        );
+        assert!(
+            !prod.contains(".load(SecretPurpose"),
+            "doctor must not load secret purposes from a credential store"
+        );
+        assert!(
+            !prod.contains("SecretStore"),
+            "doctor must not use SecretStore trait in production paths"
+        );
+        assert!(
+            prod.contains("observe_secret_presence_metadata_only"),
+            "doctor must use metadata-only credential observation"
+        );
+
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        // Plant a fake encrypted blob and a decoy secret file; doctor may note presence
+        // via filename only and must never emit blob bytes.
+        let keystore = paths.keystore_dir();
+        fs::create_dir_all(&keystore).unwrap();
+        let decoy = b"SUPER-SECRET-REFRESH-TOKEN-VALUE-do-not-leak";
+        fs::write(
+            keystore.join(format!(
+                "{}.oms",
+                SecretPurpose::HumanRefreshToken.account()
+            )),
+            decoy,
+        )
+        .unwrap();
+        let report = collect_doctor_report(
+            &paths,
+            &DoctorArgs {
+                check_network: false,
+            },
+            "test",
+        );
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(!json.contains("SUPER-SECRET-REFRESH-TOKEN-VALUE"));
+        assert!(appears_redacted(&json));
+        assert!(
+            report.checks.iter().any(|c| c.id == "credential.human"),
+            "presence metadata should surface as a check"
+        );
+    }
+
+    #[test]
+    fn doctor_redacts_unsafe_control_plane_url() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        // Bypass save_config validation to simulate a hostile on-disk URL.
+        fs::write(
+            paths.config_file(),
+            r#"
+schema_version = 1
+active_instance = "bad"
+lang = "en-US"
+
+[[instances]]
+id = "bad"
+base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
+"#,
+        )
+        .unwrap();
+        let report = collect_doctor_report(
+            &paths,
+            &DoctorArgs {
+                check_network: false,
+            },
+            "test",
+        );
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(!json.contains("s3cretTOKEN"));
+        assert!(!json.contains("access_token=abc"));
+        assert!(!json.contains("USER:"));
         assert!(appears_redacted(&json));
     }
 

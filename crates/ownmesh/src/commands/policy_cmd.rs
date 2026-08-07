@@ -36,11 +36,26 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
             Err(e) => Err(e),
         },
         PolicyCmd::Preset { name } => {
-            let value = call_daemon(methods::POLICY_PRESET, Some(json!({ "name": name })))?;
-            print_value(cli.json, &value, |v| {
-                println!("preset set to {}", v["preset"].as_str().unwrap_or(name));
-            });
-            Ok(())
+            let _ = name;
+            // Policy preset mutation is a human-operator method. Ordinary IPC has no
+            // distinct OS/UI presence proof; fail closed (use setup --force offline).
+            let message = ownmesh_ipc::human_operator_disabled_message();
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({
+                        "schema_version": 1,
+                        "ok": false,
+                        "command": "policy preset",
+                        "error": "human_presence_unavailable",
+                        "message": message,
+                    })
+                );
+            } else {
+                eprintln!("policy preset: {message}");
+                eprintln!("hint: re-run `ownmesh setup --force --policy-preset …` to rewrite local policy offline");
+            }
+            Err(ExitCode::UsageConfig)
         }
         PolicyCmd::Rule { spec } => {
             if cli.json {

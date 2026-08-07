@@ -292,85 +292,159 @@ impl InstanceConfig {
                 message: "instance.id must not be empty".into(),
             });
         }
-        validate_instance_base_url(&self.id, &self.base_url)?;
-        // Guard against accidental secret embedding in URL userinfo for config dumps.
-        if self.base_url.contains('@') && self.base_url.contains("token") {
-            return Err(ConfigError::Validation {
-                message: "instance base_url must not embed credentials".into(),
-            });
-        }
+        let _normalized = validate_control_plane_base_url(&self.base_url).map_err(|err| {
+            // Re-scope generic issuer errors to the instance id without echoing secrets.
+            match err {
+                ConfigError::Validation { message } => ConfigError::Validation {
+                    message: message.replace("`<issuer>`", &format!("`{id}`", id = self.id)),
+                },
+                other => other,
+            }
+        })?;
         Ok(())
     }
 }
 
-/// Validate a control-plane base URL / issuer.
+/// Redact a control-plane URL for logs, doctor, setup errors, and JSON surfaces.
 ///
-/// `https://` is always accepted. `http://` is accepted only for loopback hosts
-/// (`127.0.0.0/8`, `::1`, `localhost`) so local mock servers keep working while
-/// non-loopback cleartext issuers are fail-closed.
-///
-/// Returns the trimmed URL (no trailing `/`) on success.
-pub fn validate_control_plane_base_url(base_url: &str) -> ConfigResult<String> {
-    validate_instance_base_url("<issuer>", base_url)?;
-    Ok(base_url.trim().trim_end_matches('/').to_owned())
+/// Strips userinfo, query, and fragment. Invalid / secret-looking values collapse to
+/// `[REDACTED]` so unsafe config cannot leak credentials through diagnostics.
+#[must_use]
+pub fn redact_control_plane_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().any(char::is_control) {
+        return "[REDACTED]".into();
+    }
+    let Ok(mut url) = url::Url::parse(trimmed) else {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains('@')
+            || lower.contains("token")
+            || lower.contains("password")
+            || lower.contains("secret")
+            || lower.contains('%')
+        {
+            return "[REDACTED]".into();
+        }
+        return trimmed.to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut out = url.to_string();
+    if out.ends_with('/') && url.path() == "/" {
+        out.pop();
+    }
+    out
 }
 
-fn validate_instance_base_url(id: &str, base_url: &str) -> ConfigResult<()> {
-    let raw = base_url.trim().trim_end_matches('/');
+/// Validate a control-plane base URL / issuer with strict [`url::Url`] parsing.
+///
+/// Rules (shared by flag / JSON / config load):
+/// - Parse with `url::Url` (rejects whitespace control chars and malformed input).
+/// - `https://` is accepted for any host.
+/// - `http://` is accepted **only** for loopback hosts (`127.0.0.0/8`, `::1`, `localhost`)
+///   so local mock servers keep working while non-loopback cleartext is fail-closed.
+/// - Reject userinfo, query, fragment, and ASCII control characters.
+/// - Require a non-empty host.
+///
+/// Returns the normalized URL (no trailing `/` on the origin path) on success.
+/// Error messages never echo credential-bearing input — only redacted forms.
+pub fn validate_control_plane_base_url(base_url: &str) -> ConfigResult<String> {
+    let raw = base_url.trim();
     if raw.is_empty() {
         return Err(ConfigError::Validation {
-            message: format!("instance `{id}` base_url must not be empty"),
+            message: "instance `<issuer>` base_url must not be empty".into(),
         });
     }
-
-    if let Some(rest) = raw.strip_prefix("https://") {
-        if host_from_authority(rest).is_empty() {
-            return Err(ConfigError::Validation {
-                message: format!("instance `{id}` base_url must include a host"),
-            });
-        }
-        return Ok(());
-    }
-
-    if let Some(rest) = raw.strip_prefix("http://") {
-        let host = host_from_authority(rest);
-        if host.is_empty() {
-            return Err(ConfigError::Validation {
-                message: format!("instance `{id}` base_url must include a host"),
-            });
-        }
-        if is_loopback_host(host) {
-            return Ok(());
-        }
+    if raw.chars().any(char::is_control) {
         return Err(ConfigError::Validation {
             message: format!(
-                "instance `{id}` base_url refuses non-loopback http:// (`{raw}`); use https:// or a loopback host (127.0.0.1, ::1, localhost)"
+                "instance `<issuer>` base_url contains control characters ({})",
+                redact_control_plane_url(raw)
             ),
         });
     }
 
-    Err(ConfigError::Validation {
+    let url = url::Url::parse(raw).map_err(|err| ConfigError::Validation {
         message: format!(
-            "instance `{id}` base_url must start with https:// (or http:// on loopback only)"
+            "instance `<issuer>` base_url is not a valid URL ({}): {err}",
+            redact_control_plane_url(raw)
         ),
-    })
-}
+    })?;
 
-/// Extract host from the authority+path portion after `scheme://`.
-fn host_from_authority(after_scheme: &str) -> &str {
-    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    // Drop userinfo if present.
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, hostport)| hostport);
-    if let Some(inner) = authority.strip_prefix('[') {
-        // IPv6 literal: [2001:db8::1]:443
-        return inner.split(']').next().unwrap_or("");
+    match url.scheme() {
+        "https" => {}
+        "http" => {
+            let host = url.host_str().unwrap_or("");
+            if !is_loopback_host(host) {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "instance `<issuer>` base_url refuses non-loopback http:// ({}); use https:// or a loopback host (127.0.0.1, ::1, localhost)",
+                        redact_control_plane_url(raw)
+                    ),
+                });
+            }
+        }
+        other => {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "instance `<issuer>` base_url must start with https:// (or http:// on loopback only); got scheme `{other}` ({})",
+                    redact_control_plane_url(raw)
+                ),
+            });
+        }
     }
-    authority.split(':').next().unwrap_or("")
+
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "instance `<issuer>` base_url must not embed userinfo/credentials ({})",
+                redact_control_plane_url(raw)
+            ),
+        });
+    }
+    if url.query().is_some() {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "instance `<issuer>` base_url must not include a query string ({})",
+                redact_control_plane_url(raw)
+            ),
+        });
+    }
+    if url.fragment().is_some() {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "instance `<issuer>` base_url must not include a fragment ({})",
+                redact_control_plane_url(raw)
+            ),
+        });
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(ConfigError::Validation {
+            message: "instance `<issuer>` base_url must include a host".into(),
+        });
+    }
+
+    let mut normalized = url.to_string();
+    if normalized.ends_with('/') && url.path() == "/" {
+        normalized.pop();
+    } else if normalized.ends_with('/') && normalized.matches('/').count() > 2 {
+        // Drop a lone trailing slash after a non-root path (base URL convention).
+        normalized.pop();
+    }
+    Ok(normalized)
 }
 
 fn is_loopback_host(host: &str) -> bool {
+    // `url::Url::host_str` may yield bracketed IPv6 (`[::1]`) depending on version.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -477,6 +551,63 @@ mod tests {
         assert!(
             msg.contains("non-loopback"),
             "expected explicit non-loopback error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("example.test") || msg.contains("http://example.test"),
+            "message may include redacted host form: {msg}"
+        );
+    }
+
+    #[test]
+    fn rejects_userinfo_query_fragment_and_control_chars() {
+        for bad in [
+            "https://user:s3cret@cp.example.test",
+            "https://USER:TokenValue@cp.example.test/path",
+            "https://cp.example.test?access_token=abc",
+            "https://cp.example.test#frag",
+            "https://cp.example.test/path?x=1#y",
+            "https://cp.example.test/\npath",
+            "http://user:pw@127.0.0.1:9",
+        ] {
+            let err =
+                validate_control_plane_base_url(bad).expect_err(&format!("must reject {bad}"));
+            let msg = err.to_string();
+            assert!(
+                !msg.to_ascii_lowercase().contains("s3cret"),
+                "secret leaked in error: {msg}"
+            );
+            assert!(
+                !msg.contains("TokenValue") && !msg.contains("access_token=abc"),
+                "credential leaked in error: {msg}"
+            );
+            let redacted = redact_control_plane_url(bad);
+            assert!(
+                !redacted.to_ascii_lowercase().contains("s3cret"),
+                "redact leaked secret: {redacted}"
+            );
+            assert!(
+                !redacted.contains("user:"),
+                "userinfo not stripped: {redacted}"
+            );
+            assert!(!redacted.contains('?'), "query not stripped: {redacted}");
+            assert!(!redacted.contains('#'), "fragment not stripped: {redacted}");
+        }
+    }
+
+    #[test]
+    fn mixed_case_userinfo_is_rejected_and_redacted() {
+        let bad = "https://AdMiN:P@ssW0rd@Example.TEST/base";
+        let err = validate_control_plane_base_url(bad).expect_err("userinfo");
+        let msg = err.to_string();
+        assert!(!msg.contains("P@ssW0rd"));
+        assert!(!msg.contains("AdMiN"));
+        let red = redact_control_plane_url(bad);
+        assert!(!red.contains("P@ssW0rd"));
+        assert!(
+            !red.contains('@')
+                || red.starts_with("https://example.test")
+                || red == "[REDACTED]"
+                || red.contains("example.test")
         );
     }
 

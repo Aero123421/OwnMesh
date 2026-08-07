@@ -16,11 +16,25 @@ pub fn run_lockdown(cli: &Cli) -> Result<(), ExitCode> {
 }
 
 pub fn run_unlock(cli: &Cli) -> Result<(), ExitCode> {
-    let value = call_daemon(methods::DAEMON_UNLOCK, None)?;
-    print_value(cli.json, &value, |_| {
-        println!("lockdown cleared");
-    });
-    Ok(())
+    let _ = cli;
+    // Unlock is a human-operator method. No distinct OS/UI presence proof is available
+    // on ordinary local IPC; fail closed rather than treating same-UID as human.
+    let message = ownmesh_ipc::human_operator_disabled_message();
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "ok": false,
+                "command": "unlock",
+                "error": "human_presence_unavailable",
+                "message": message,
+            })
+        );
+    } else {
+        eprintln!("unlock: {message}");
+    }
+    Err(ExitCode::UsageConfig)
 }
 
 pub fn dispatch_tokens(cli: &Cli, cmd: &TokensCmd) -> Result<(), ExitCode> {
@@ -33,17 +47,23 @@ pub fn dispatch_tokens(cli: &Cli, cmd: &TokensCmd) -> Result<(), ExitCode> {
                 );
                 return Err(ExitCode::UsageConfig);
             }
-            let value = call_daemon(
-                methods::TOKEN_REVOKE,
-                Some(json!({ "principal": canonical })),
-            )?;
-            print_value(cli.json, &value, |v| {
+            let _ = canonical;
+            let message = ownmesh_ipc::human_operator_disabled_message();
+            if cli.json {
                 println!(
-                    "revoked principal {}",
-                    v["revoked"].as_str().unwrap_or(principal)
+                    "{}",
+                    json!({
+                        "schema_version": 1,
+                        "ok": false,
+                        "command": "tokens revoke",
+                        "error": "human_presence_unavailable",
+                        "message": message,
+                    })
                 );
-            });
-            Ok(())
+            } else {
+                eprintln!("tokens revoke: {message}");
+            }
+            Err(ExitCode::UsageConfig)
         }
     }
 }

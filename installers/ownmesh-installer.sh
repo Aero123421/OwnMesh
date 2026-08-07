@@ -1,6 +1,19 @@
 #!/bin/sh
 # OwnMesh portable installer (macOS / Linux).
-# Verifies SHA-256 (and minisign when available) before atomic user install.
+#
+# Trust model (fail-closed):
+#   1. Obtain SHA256SUMS.minisig and verify it with minisign against the pinned
+#      OwnMesh public key (never trust checksums before the signature verifies).
+#   2. Verify the archive digest from the now-trusted SHA256SUMS.
+#   3. Extract only required top-level binaries (never pipe remote script into a shell).
+#
+# Installer integrity: download this script, inspect it, then execute it from a
+# local path. Prefer verifying the script against the release SHA256SUMS after
+# signature verification. Never pipe remote script text into a shell.
+#
+# Minisign: provide `minisign` on PATH, or set OWNMESH_MINISIGN to a binary.
+# Optional bootstrap: set OWNMESH_BOOTSTRAP_MINISIGN=1 to fetch a pinned minisign
+# release binary (hash-verified) when none is available.
 
 set -eu
 
@@ -10,8 +23,21 @@ REQUESTED_VERSION="${OWNMESH_VERSION:-latest}"
 INSTALL_DIR="${OWNMESH_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 ASSET_DIR="${OWNMESH_ASSET_DIR:-}"
 BASE_URL_OVERRIDE="${OWNMESH_BASE_URL:-}"
+MINISIGN_BIN="${OWNMESH_MINISIGN:-}"
+BOOTSTRAP_MINISIGN="${OWNMESH_BOOTSTRAP_MINISIGN:-0}"
 
 REQUIRED_BINARIES="ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker"
+
+# Pinned OwnMesh minisign trust root (docs/release-keys/minisign.pub).
+# Key ID: C596813EFB0946A4
+PINNED_MINISIGN_PUB_COMMENT="untrusted comment: minisign public key C596813EFB0946A4"
+PINNED_MINISIGN_PUB_KEY="RWSkRgn7PoGWxQVPfPTcZzF3P8Wi5JMb+EOydWtYYosHDIEsLUnGl8eI"
+
+# Pinned jedisct1/minisign 0.11 linux bootstrap (optional; independent of OwnMesh key).
+# Only used when OWNMESH_BOOTSTRAP_MINISIGN=1 and no local minisign is available.
+PINNED_MINISIGN_VERSION="0.11"
+PINNED_MINISIGN_LINUX_X64_URL="https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz"
+PINNED_MINISIGN_LINUX_X64_SHA256="0c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e"
 
 say() {
   printf '%s\n' "$*"
@@ -154,17 +180,88 @@ lookup_checksum() {
   ' "$sums_file"
 }
 
-maybe_verify_minisign() {
+write_pinned_pubkey() {
+  dest="$1"
+  {
+    printf '%s\n' "$PINNED_MINISIGN_PUB_COMMENT"
+    printf '%s\n' "$PINNED_MINISIGN_PUB_KEY"
+  } >"$dest"
+}
+
+resolve_minisign() {
+  if [ -n "$MINISIGN_BIN" ]; then
+    [ -x "$MINISIGN_BIN" ] || fail "OWNMESH_MINISIGN is not executable: $MINISIGN_BIN"
+    printf '%s\n' "$MINISIGN_BIN"
+    return
+  fi
+  if command_exists minisign; then
+    command -v minisign
+    return
+  fi
+  case "$BOOTSTRAP_MINISIGN" in
+    1|true|TRUE|yes|YES)
+      bootstrap_minisign
+      return
+      ;;
+  esac
+  fail "minisign is required to verify SHA256SUMS.minisig (install minisign, set OWNMESH_MINISIGN, or OWNMESH_BOOTSTRAP_MINISIGN=1)"
+}
+
+bootstrap_minisign() {
+  # Optional pinned bootstrap — never a silent skip. Hash must match exactly.
+  os="$(uname -s 2>/dev/null || true)"
+  arch="$(uname -m 2>/dev/null || true)"
+  case "$os:$arch" in
+    Linux:x86_64|Linux:amd64)
+      url="$PINNED_MINISIGN_LINUX_X64_URL"
+      expect="$PINNED_MINISIGN_LINUX_X64_SHA256"
+      ;;
+    *)
+      fail "OWNMESH_BOOTSTRAP_MINISIGN is not supported on $os/$arch; install minisign manually"
+      ;;
+  esac
+  # Placeholder pin refuses bootstrap until operators set a real digest (fail-closed).
+  case "$expect" in
+    0c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e8c5e0d7d3f0e5c5b1f5e6c2c0d6e)
+      fail "OWNMESH_BOOTSTRAP_MINISIGN pin is not enrolled for this build; install minisign or set OWNMESH_MINISIGN"
+      ;;
+  esac
+  boot_dir="$TMP_DIR/minisign-boot"
+  mkdir -p "$boot_dir"
+  archive="$boot_dir/minisign.tgz"
+  assert_safe_url "$url"
+  if command_exists curl; then
+    curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+      --retry 3 --max-redirs 5 --output "$archive" "$url" ||
+      fail "failed to download pinned minisign bootstrap"
+  else
+    fail "curl is required to bootstrap minisign"
+  fi
+  actual="$(sha256_file "$archive" | tr 'A-F' 'a-f')"
+  [ "$actual" = "$expect" ] || fail "pinned minisign bootstrap SHA-256 mismatch"
+  tar -xzf "$archive" -C "$boot_dir" || fail "extract minisign bootstrap failed"
+  found="$(find "$boot_dir" -type f -name minisign | head -n 1)"
+  [ -n "$found" ] || fail "minisign binary missing from bootstrap archive"
+  chmod 0755 "$found"
+  printf '%s\n' "$found"
+}
+
+require_verify_minisign() {
   sums_file="$1"
   sig_file="$2"
   pubkey_file="$3"
-  if ! command_exists minisign; then
-    say "minisign not installed; continuing with SHA-256 only (install minisign for signature verification)."
-    return 0
-  fi
-  [ -f "$sig_file" ] || fail "SHA256SUMS.minisig missing"
+  minisign_cmd="$4"
+  [ -f "$sig_file" ] || fail "SHA256SUMS.minisig missing (signature required; refusing unsigned checksums)"
   [ -f "$pubkey_file" ] || fail "minisign public key missing"
-  minisign -Vm "$sums_file" -p "$pubkey_file" -x "$sig_file" >/dev/null ||
+  # Default trust root is the pinned OwnMesh key. OWNMESH_MINISIGN_PUB may point at an
+  # alternate file only when the operator explicitly opts in (offline/test). Signature
+  # verification is never skipped.
+  if [ -z "${OWNMESH_MINISIGN_PUB:-}" ]; then
+    if ! grep -Fq "$PINNED_MINISIGN_PUB_KEY" "$pubkey_file"; then
+      fail "minisign public key does not match the pinned OwnMesh trust root"
+    fi
+  fi
+  "$minisign_cmd" -Vm "$sums_file" -p "$pubkey_file" -x "$sig_file" >/dev/null ||
     fail "minisign verification failed for SHA256SUMS"
   say "minisign: SHA256SUMS signature ok"
 }
@@ -294,35 +391,35 @@ SIG="$TMP_DIR/SHA256SUMS.minisig"
 EXTRACT_DIR="$TMP_DIR/extract"
 PUBKEY="$TMP_DIR/minisign.pub"
 
+# Resolve minisign before trusting any checksum file.
+MINISIGN_CMD="$(resolve_minisign)"
+
 say "Downloading $ASSET..."
 fetch_asset "$ASSET" "$ARCHIVE"
 fetch_asset "SHA256SUMS" "$SUMS"
 
-# Optional signature assets (required when minisign is present).
+# Signature is mandatory — never trust SHA256SUMS without minisig verification.
 if [ -n "$ASSET_DIR" ] && [ -f "$ASSET_DIR/SHA256SUMS.minisig" ]; then
   cp "$ASSET_DIR/SHA256SUMS.minisig" "$SIG"
-elif [ -z "$ASSET_DIR" ]; then
-  if fetch_asset "SHA256SUMS.minisig" "$SIG" 2>/dev/null; then
-    :
-  else
-    rm -f "$SIG"
-  fi
+else
+  fetch_asset "SHA256SUMS.minisig" "$SIG"
 fi
 
-# Prefer installer-embedded / repo public key when provided beside assets.
-if [ -n "$ASSET_DIR" ] && [ -f "$ASSET_DIR/minisign.pub" ]; then
+# Public key: explicit override, asset dir, repo-tracked key, or embedded pin.
+if [ -n "${OWNMESH_MINISIGN_PUB:-}" ]; then
+  [ -f "$OWNMESH_MINISIGN_PUB" ] || fail "OWNMESH_MINISIGN_PUB is not a file"
+  cp "$OWNMESH_MINISIGN_PUB" "$PUBKEY"
+elif [ -n "$ASSET_DIR" ] && [ -f "$ASSET_DIR/minisign.pub" ]; then
   cp "$ASSET_DIR/minisign.pub" "$PUBKEY"
 elif [ -f "$(dirname "$0")/../docs/release-keys/minisign.pub" ]; then
   cp "$(dirname "$0")/../docs/release-keys/minisign.pub" "$PUBKEY"
 elif [ -f "$(dirname "$0")/minisign.pub" ]; then
   cp "$(dirname "$0")/minisign.pub" "$PUBKEY"
+else
+  write_pinned_pubkey "$PUBKEY"
 fi
 
-if [ -f "$SIG" ] && [ -f "$PUBKEY" ]; then
-  maybe_verify_minisign "$SUMS" "$SIG" "$PUBKEY"
-elif command_exists minisign; then
-  fail "minisign is available but SHA256SUMS.minisig or public key is missing"
-fi
+require_verify_minisign "$SUMS" "$SIG" "$PUBKEY" "$MINISIGN_CMD"
 
 EXPECTED="$(lookup_checksum "$SUMS" "$ASSET")"
 if ! printf '%s\n' "$EXPECTED" | grep -Eq '^[0-9a-f]{64}$'; then

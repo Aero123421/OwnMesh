@@ -47,13 +47,19 @@ English: [`README.md`](./README.md)
 macOS / Linux:
 
 ```bash
-curl -fsSL https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh | sh
+# リモートスクリプトをシェルに直接流し込まないこと（curl|sh / irm|iex 禁止）
+curl -fsSL -o ownmesh-installer.sh \
+  https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh
+# SHA256SUMS + SHA256SUMS.minisig を minisign で検証し、スクリプトを確認してから:
+sh ./ownmesh-installer.sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 | iex
+Invoke-WebRequest -Uri https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile ownmesh-installer.ps1
+# minisign で署名検証・内容確認の後:
+powershell -NoProfile -File .\ownmesh-installer.ps1
 ```
 
 可能なら installer を一度ダウンロードして内容を確認してから実行してください。

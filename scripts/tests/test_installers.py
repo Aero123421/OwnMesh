@@ -74,7 +74,49 @@ def _asset_name() -> tuple[str, bool]:
     raise unittest.SkipTest(f"unsupported OS {system}")
 
 
-def _pack(package: Path, asset_dir: Path, asset_name: str, windows: bool) -> None:
+def _require_minisign() -> str:
+    path = shutil.which("minisign")
+    if not path:
+        raise unittest.SkipTest("minisign is required for installer trust tests")
+    return path
+
+
+def _generate_trust(asset_dir: Path) -> tuple[Path, Path]:
+    """Create an ephemeral minisign trust root and return (pub, secret)."""
+    minisign = _require_minisign()
+    key_dir = asset_dir / ".keys"
+    key_dir.mkdir(parents=True, exist_ok=True)
+    pub = key_dir / "minisign.pub"
+    sec = key_dir / "minisign.key"
+    # minisign -G refuses overwrite; use unique paths.
+    completed = subprocess.run(
+        [minisign, "-G", "-p", str(pub), "-s", str(sec), "-W"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise unittest.SkipTest(
+            f"minisign keygen failed: {completed.stderr or completed.stdout}"
+        )
+    return pub, sec
+
+
+def _sign_sums(sums_path: Path, secret: Path, sig_path: Path) -> None:
+    minisign = _require_minisign()
+    completed = subprocess.run(
+        [minisign, "-S", "-s", str(secret), "-m", str(sums_path), "-x", str(sig_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"minisign sign failed: {completed.stderr or completed.stdout}"
+        )
+
+
+def _pack(package: Path, asset_dir: Path, asset_name: str, windows: bool) -> tuple[Path, Path]:
     asset_dir.mkdir(parents=True, exist_ok=True)
     asset_path = asset_dir / asset_name
     if windows:
@@ -86,9 +128,15 @@ def _pack(package: Path, asset_dir: Path, asset_name: str, windows: bool) -> Non
             for path in package.iterdir():
                 tf.add(path, arcname=path.name)
     digest = _sha256(asset_path)
-    (asset_dir / "SHA256SUMS").write_text(
-        f"{digest}  {asset_name}\n", encoding="ascii", newline="\n"
-    )
+    sums_path = asset_dir / "SHA256SUMS"
+    sums_path.write_text(f"{digest}  {asset_name}\n", encoding="ascii", newline="\n")
+    pub, sec = _generate_trust(asset_dir)
+    # Publish the test trust root beside assets (operator override via OWNMESH_MINISIGN_PUB).
+    published_pub = asset_dir / "minisign.pub"
+    published_pub.write_bytes(pub.read_bytes())
+    sig_path = asset_dir / "SHA256SUMS.minisig"
+    _sign_sums(sums_path, sec, sig_path)
+    return published_pub, sec
 
 
 class InstallerAdversarialTests(unittest.TestCase):
@@ -107,12 +155,13 @@ class InstallerAdversarialTests(unittest.TestCase):
             assets = tmp_path / "assets"
             install = tmp_path / "install"
             _write_fake_bins(package, windows=False)
-            _pack(package, assets, asset_name, windows=False)
+            pub, _sec = _pack(package, assets, asset_name, windows=False)
 
             env = os.environ.copy()
             env["OWNMESH_ASSET_DIR"] = str(assets)
             env["OWNMESH_INSTALL_DIR"] = str(install)
             env["OWNMESH_NO_MODIFY_PATH"] = "1"
+            env["OWNMESH_MINISIGN_PUB"] = str(pub)
             env.pop("OWNMESH_BASE_URL", None)
 
             completed = subprocess.run(
@@ -128,6 +177,7 @@ class InstallerAdversarialTests(unittest.TestCase):
                 0,
                 completed.stdout + "\n" + completed.stderr,
             )
+            self.assertIn("minisign: SHA256SUMS signature ok", completed.stdout + completed.stderr)
             smoke = subprocess.run(
                 [str(install / "ownmesh"), "--version"],
                 capture_output=True,
@@ -137,13 +187,14 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.assertEqual(smoke.returncode, 0, smoke.stderr)
             self.assertIn("ownmesh", smoke.stdout.lower())
 
-            # Checksum mismatch
+            # Checksum mismatch (signature still verifies; archive digest fails).
             bad = tmp_path / "bad-assets"
             shutil.copytree(assets, bad)
             with (bad / asset_name).open("ab") as handle:
                 handle.write(b"corrupt")
             env["OWNMESH_ASSET_DIR"] = str(bad)
             env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "rejected")
+            env["OWNMESH_MINISIGN_PUB"] = str(bad / "minisign.pub")
             failed = subprocess.run(
                 ["sh", str(SH_INSTALLER)],
                 cwd=str(ROOT),
@@ -154,6 +205,48 @@ class InstallerAdversarialTests(unittest.TestCase):
             )
             self.assertNotEqual(failed.returncode, 0)
             self.assertIn("SHA-256 mismatch", failed.stderr)
+
+            # Missing signature fails closed (never trusts bare SHA256SUMS).
+            unsigned = tmp_path / "unsigned-assets"
+            shutil.copytree(assets, unsigned)
+            (unsigned / "SHA256SUMS.minisig").unlink()
+            env["OWNMESH_ASSET_DIR"] = str(unsigned)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "unsigned-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(unsigned / "minisign.pub")
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(
+                "minisig" in failed.stderr.lower() or "signature" in failed.stderr.lower(),
+                failed.stderr,
+            )
+
+            # Tampered signature / wrong key fails closed.
+            evil = tmp_path / "evil-sig"
+            shutil.copytree(assets, evil)
+            (evil / "SHA256SUMS.minisig").write_text("untrusted comment: corrupt\nbad\n", encoding="ascii")
+            env["OWNMESH_ASSET_DIR"] = str(evil)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "evil-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(evil / "minisign.pub")
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(
+                "minisign" in failed.stderr.lower() or "signature" in failed.stderr.lower(),
+                failed.stderr,
+            )
 
             # Traversal archive
             trav = tmp_path / "trav-assets"
@@ -169,11 +262,14 @@ class InstallerAdversarialTests(unittest.TestCase):
                 info.size = len(data)
                 tf.addfile(info, fileobj=__import__("io").BytesIO(data))
             digest = _sha256(trav_asset)
-            (trav / "SHA256SUMS").write_text(
-                f"{digest}  {asset_name}\n", encoding="ascii", newline="\n"
-            )
+            sums = trav / "SHA256SUMS"
+            sums.write_text(f"{digest}  {asset_name}\n", encoding="ascii", newline="\n")
+            pub_trav, sec_trav = _generate_trust(trav)
+            (trav / "minisign.pub").write_bytes(pub_trav.read_bytes())
+            _sign_sums(sums, sec_trav, trav / "SHA256SUMS.minisig")
             env["OWNMESH_ASSET_DIR"] = str(trav)
             env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "trav-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(trav / "minisign.pub")
             failed = subprocess.run(
                 ["sh", str(SH_INSTALLER)],
                 cwd=str(ROOT),
@@ -189,9 +285,10 @@ class InstallerAdversarialTests(unittest.TestCase):
             _write_fake_bins(partial_pkg, windows=False)
             (partial_pkg / "ownmesh-broker").unlink()
             partial_assets = tmp_path / "partial-assets"
-            _pack(partial_pkg, partial_assets, asset_name, windows=False)
+            pub_partial, _ = _pack(partial_pkg, partial_assets, asset_name, windows=False)
             env["OWNMESH_ASSET_DIR"] = str(partial_assets)
             env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "partial-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(pub_partial)
             failed = subprocess.run(
                 ["sh", str(SH_INSTALLER)],
                 cwd=str(ROOT),
@@ -228,6 +325,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             env["OWNMESH_ASSET_DIR"] = str(assets)
             env["OWNMESH_INSTALL_DIR"] = str(spaced)
             env["OWNMESH_NO_MODIFY_PATH"] = "0"
+            env["OWNMESH_MINISIGN_PUB"] = str(pub)
             # Re-pack good assets (previous env only)
             completed = subprocess.run(
                 ["sh", str(SH_INSTALLER)],
@@ -246,6 +344,7 @@ class InstallerAdversarialTests(unittest.TestCase):
             (empty / "SHA256SUMS").write_text("00  missing\n", encoding="ascii")
             env["OWNMESH_ASSET_DIR"] = str(empty)
             env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "404")
+            env.pop("OWNMESH_MINISIGN_PUB", None)
             failed = subprocess.run(
                 ["sh", str(SH_INSTALLER)],
                 cwd=str(ROOT),
@@ -256,7 +355,10 @@ class InstallerAdversarialTests(unittest.TestCase):
             )
             self.assertNotEqual(failed.returncode, 0)
             self.assertTrue(
-                "not found" in failed.stderr.lower() or "asset" in failed.stderr.lower(),
+                "not found" in failed.stderr.lower()
+                or "asset" in failed.stderr.lower()
+                or "minisign" in failed.stderr.lower()
+                or "minisig" in failed.stderr.lower(),
                 failed.stderr,
             )
 
@@ -265,11 +367,27 @@ class InstallerAdversarialTests(unittest.TestCase):
             self.fail("missing ps1 installer")
         text = PS_INSTALLER.read_text(encoding="utf-8")
         # Reject real invocation forms; comments alone are insufficient protection.
-        self.assertNotRegex(text, r"(?i)\bInvoke-Expression\b")
-        self.assertNotRegex(text, r"(?i)(^|[\s|;&])iex\b")
+        # Reject real invocation forms; comments alone mentioning the banned names are OK
+        # only when not used as executable statements.
+        self.assertNotRegex(text, r"(?im)^\s*Invoke-Expression\b")
+        self.assertNotRegex(text, r"(?im)^\s*iex\b")
+        self.assertNotRegex(text, r"(?i)\|\s*iex\b")
+        self.assertNotRegex(text, r"(?i)\birm\b[^\n]*\|\s*iex\b")
         self.assertIn("SHA-256 mismatch", text)
         self.assertIn("OWNMESH_BASE_URL", text)
         self.assertIn("Tls12", text)
+        self.assertIn("SHA256SUMS.minisig", text)
+        self.assertIn("minisign", text.lower())
+        self.assertIn("pinned OwnMesh trust root", text)
+
+    def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
+        text = SH_INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("SHA256SUMS.minisig", text)
+        self.assertIn("require_verify_minisign", text)
+        self.assertIn("PINNED_MINISIGN_PUB_KEY", text)
+        # No executable curl|sh pipeline (comments may discuss the anti-pattern).
+        self.assertNotRegex(text, r"(?m)^[^#\n]*curl[^\n]*\|\s*sh")
+        self.assertIn("Never pipe remote script", text)
         if not _is_windows():
             self.skipTest("powershell execution only on Windows")
         # Run happy path when powershell is available.

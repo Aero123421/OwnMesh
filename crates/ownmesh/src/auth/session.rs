@@ -7,9 +7,7 @@ use ownmesh_identity::{
     SecretStore, SecretString, DEFAULT_KEYCHAIN_SERVICE,
 };
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use url::Url;
 
 use super::oauth::{refresh_access_token, TokenSet};
 
@@ -95,56 +93,11 @@ pub fn open_secret_store(paths: &OwnMeshPaths) -> Result<PreferredSecretStore> {
 
 /// Validate a control-plane issuer / base URL.
 ///
-/// Rules:
-/// - `https://` is accepted when a non-empty host is present.
-/// - `http://` is accepted **only** when the host is loopback
-///   (`127.0.0.0/8`, `::1`, or the name `localhost`) — required for local mock servers.
-/// - Non-loopback `http://` issuers are rejected with an explicit error.
-/// - Other schemes are rejected.
-///
-/// Returns the trimmed issuer (no trailing `/`).
+/// Delegates to the single workspace-wide [`ownmesh_config::validate_control_plane_base_url`]
+/// so flag / JSON / config / issuer paths share one strict `url::Url` policy
+/// (https, or loopback http only; reject userinfo/query/fragment/control chars).
 pub fn validate_issuer(raw: &str) -> Result<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err(anyhow!("issuer URL must not be empty"));
-    }
-    let parsed = Url::parse(trimmed).map_err(|err| anyhow!("invalid issuer URL: {err}"))?;
-    let host = parsed
-        .host_str()
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| anyhow!("issuer URL must include a host"))?;
-
-    match parsed.scheme() {
-        "https" => Ok(trimmed.to_owned()),
-        "http" => {
-            if is_loopback_host(host) {
-                Ok(trimmed.to_owned())
-            } else {
-                Err(anyhow!(
-                    "refusing non-loopback http:// issuer `{trimmed}`; use https:// or a loopback host (127.0.0.1, ::1, localhost)"
-                ))
-            }
-        }
-        other => Err(anyhow!(
-            "unsupported issuer URL scheme `{other}`; expected https (or http on loopback only)"
-        )),
-    }
-}
-
-/// True when `host` is a loopback IP or the conventional `localhost` name.
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // `url` may yield IPv6 with brackets (`[::1]`) via `host_str()`.
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    match host.parse::<IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => false,
-    }
+    ownmesh_config::validate_control_plane_base_url(raw).map_err(|err| anyhow!("{err}"))
 }
 
 /// Resolve the control-plane issuer URL.

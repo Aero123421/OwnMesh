@@ -2282,15 +2282,16 @@ pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
     })
 }
 
-/// Fail-closed gate for approval decisions.
+/// Fail-closed gate for approval decisions at the runtime handler boundary.
 ///
-/// - Approver must be an OS-attested human principal (`user:*`).
-/// - Non-human / credentialed principals can never approve.
-/// - Credentialed requesters cannot self-approve (identity must differ from approver).
+/// Ordinary IPC already denies approve/deny (no distinct OS/UI presence proof). This gate
+/// remains as defense in depth for direct-dispatch / internal callers:
+/// - Approver must be an OS-shaped human principal (`user:*`) — never a client credential.
+/// - Credentialed requesters cannot self-approve.
 /// - Client-supplied approver fields are never consulted (caller passes auth identity only).
 ///
-/// AuthGate already rejects credentialed callers for approve/deny; this is defense in depth
-/// inside the production runtime handler so a bypassed gate cannot self-approve.
+/// Note: a bare `user:<uid>` string is **not** a presence proof on the IPC plane; AuthGate
+/// refuses ordinary IPC human-operator methods entirely until a bound presence mechanism exists.
 fn ensure_independent_human_approver(approver: &str, requester: &str) -> IpcResult<()> {
     let approver = canonicalize_principal_key(approver);
     let requester = canonicalize_principal_key(requester);
@@ -2304,8 +2305,7 @@ fn ensure_independent_human_approver(approver: &str, requester: &str) -> IpcResu
                 .into(),
         });
     }
-    // Local human operators may approve their own deferred ops (same user:* principal).
-    // Agent/service creators (`client:*`) must always be decided by a different human.
+    // Agent/service creators (`client:*`) must always be decided by a different principal.
     if is_credentialed_client_principal(&requester) && requester == approver {
         return Err(IpcError::Remote {
             code: app_error::UNAUTHORIZED,

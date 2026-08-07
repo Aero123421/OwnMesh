@@ -350,3 +350,124 @@ fn protocol_incompatible_fails() {
     let err = download_and_verify(&transport, &bundle.trust, &release, 1).unwrap_err();
     assert!(matches!(err, UpdateError::ProtocolIncompatible(_)));
 }
+
+#[test]
+fn zip_bomb_entry_count_rejected() {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        // Exceed MAX_ARCHIVE_ENTRIES (64).
+        for i in 0..80 {
+            zip.start_file(format!("pad-{i}.txt"), options).unwrap();
+            zip.write_all(b"x").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    let archive = cursor.into_inner();
+    let err = extract_required_binaries(&archive, ArchiveKind::Zip, "windows").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("entry count") || msg.contains("limit"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn zip_unexpected_and_duplicate_members_rejected() {
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("ownmesh.exe", options).unwrap();
+        zip.write_all(b"bin").unwrap();
+        zip.start_file("evil-extra.dll", options).unwrap();
+        zip.write_all(b"x").unwrap();
+        zip.finish().unwrap();
+    }
+    let archive = cursor.into_inner();
+    let err = extract_required_binaries(&archive, ArchiveKind::Zip, "windows").unwrap_err();
+    assert!(
+        err.to_string().contains("unexpected") || err.to_string().contains("missing"),
+        "{err}"
+    );
+
+    // Duplicate required binary.
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default();
+        for base in REQUIRED_BINARIES {
+            let name = binary_file_name_for(base, "windows");
+            zip.start_file(&name, options).unwrap();
+            zip.write_all(b"a").unwrap();
+        }
+        // Second ownmesh.exe
+        zip.start_file("wrapper/ownmesh.exe", options).unwrap();
+        zip.write_all(b"b").unwrap();
+        zip.finish().unwrap();
+    }
+    let archive = cursor.into_inner();
+    let err = extract_required_binaries(&archive, ArchiveKind::Zip, "windows").unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate") || err.to_string().contains("unexpected"),
+        "{err}"
+    );
+}
+
+#[test]
+fn tar_symlink_and_bomb_rejected() {
+    // Symlink member.
+    let mut raw = Vec::new();
+    {
+        let mut builder = Builder::new(&mut raw);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "ownmesh", std::io::empty())
+            .unwrap();
+        builder.finish().unwrap();
+    }
+    let mut encoded = Vec::new();
+    {
+        let mut gz = GzEncoder::new(&mut encoded, Compression::default());
+        gz.write_all(&raw).unwrap();
+        gz.finish().unwrap();
+    }
+    let err = extract_required_binaries(&encoded, ArchiveKind::TarGz, "linux").unwrap_err();
+    assert!(
+        err.to_string().to_ascii_lowercase().contains("symlink")
+            || err.to_string().contains("link"),
+        "{err}"
+    );
+
+    // Entry-count bomb.
+    let mut raw = Vec::new();
+    {
+        let mut builder = Builder::new(&mut raw);
+        for i in 0..80 {
+            let mut header = tar::Header::new_gnu();
+            let data = b"x";
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("pad-{i}.txt"), &data[..])
+                .unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    let mut encoded = Vec::new();
+    {
+        let mut gz = GzEncoder::new(&mut encoded, Compression::default());
+        gz.write_all(&raw).unwrap();
+        gz.finish().unwrap();
+    }
+    let err = extract_required_binaries(&encoded, ArchiveKind::TarGz, "linux").unwrap_err();
+    assert!(
+        err.to_string().contains("entry count") || err.to_string().contains("unexpected"),
+        "{err}"
+    );
+}

@@ -548,9 +548,9 @@ impl AuthGate {
     ///
     /// Returns [`IpcError::Unauthorized`] when the method is denied.
     pub fn authorize_method(&self, method: &str, auth: &AuthResolution) -> IpcResult<()> {
-        // Human-operator actions require OS user-presence (uncredentialed user:*).
-        // Client credentials — including the cooperative management credential that is
-        // readable by any same-uid process — are never a human approval boundary.
+        // Human-operator actions are fail-closed on ordinary IPC until a distinct
+        // OS/UI user-presence proof exists. Same-UID uncredentialed connections are
+        // forgeable and must not be treated as human presence.
         if human_operator_method(method) {
             return authorize_human_operator_method(auth);
         }
@@ -616,8 +616,7 @@ impl AuthGate {
         }
         Err(IpcError::Unauthorized(format!(
             "method '{method}' requires a server-issued client credential \
-             (uncredentialed same-uid peers may only call ipc.ping/daemon.status \
-              or human-operator methods with OS user presence)"
+             (uncredentialed same-uid peers may only call ipc.ping/daemon.status)"
         )))
     }
 
@@ -694,10 +693,10 @@ fn find_memory_by_secret<'a>(
 
 /// Whitelist for uncredentialed same-uid peers under strict (registry-backed) policy.
 ///
-/// Human-operator methods are deliberately included: they require OS user presence and
-/// are denied for every client credential (see [`human_operator_method`]).
+/// Human-operator methods are **not** included: same-UID uncredentialed IPC is forgeable
+/// by any local process and is not a user-presence proof (see [`human_operator_method`]).
 fn uncredentialed_method_allowed(method: &str) -> bool {
-    matches!(method, methods::PING | methods::STATUS) || human_operator_method(method)
+    matches!(method, methods::PING | methods::STATUS)
 }
 
 fn credential_lifecycle_method(method: &str) -> bool {
@@ -707,11 +706,13 @@ fn credential_lifecycle_method(method: &str) -> bool {
     )
 }
 
-/// Methods that may only be performed by an uncredentialed OS-user principal.
+/// Methods that mutate human-boundary state (approve/deny, policy preset, unlock, revoke).
 ///
-/// Generic agent / management credentials must not self-approve, unlock, rewrite policy
-/// presets, or revoke principals — the management delivery file is readable by any
-/// same-uid process and is not a human boundary.
+/// Until a distinct OS/UI user-presence proof is bound to the specific operation and
+/// expiry, these methods are fail-closed for **all** ordinary IPC clients — including
+/// uncredentialed same-UID peers. Same-UID unauthenticated connections are forgeable by
+/// any local process (including a credentialed agent opening a second socket) and must
+/// never be represented as human presence.
 #[must_use]
 pub fn human_operator_method(method: &str) -> bool {
     matches!(
@@ -722,6 +723,14 @@ pub fn human_operator_method(method: &str) -> bool {
             | methods::DAEMON_UNLOCK
             | methods::TOKEN_REVOKE
     )
+}
+
+/// Stable unauthorized message when human-operator IPC is disabled (no presence proof).
+#[must_use]
+pub fn human_operator_disabled_message() -> &'static str {
+    "human-operator method disabled: no distinct OS/UI user-presence proof is bound to this \
+operation; ordinary IPC clients (including uncredentialed same-uid peers and client \
+credentials) cannot approve, deny, change policy preset, unlock, or revoke tokens"
 }
 
 /// True when `principal` is an OS-attested local human (`user:…`).
@@ -737,20 +746,12 @@ pub fn is_credentialed_client_principal(principal: &str) -> bool {
 }
 
 fn authorize_human_operator_method(auth: &AuthResolution) -> IpcResult<()> {
-    if auth.credentialed {
-        return Err(IpcError::Unauthorized(
-            "human-operator method requires uncredentialed OS user presence; \
-             client credentials (including management) cannot approve, unlock, \
-             change policy preset, or revoke tokens"
-                .into(),
-        ));
-    }
-    if !is_human_os_principal(&auth.principal_key) {
-        return Err(IpcError::Unauthorized(
-            "human-operator method requires an OS-attested user:* principal".into(),
-        ));
-    }
-    Ok(())
+    // Fail-closed for every ordinary IPC principal. Credentialed and uncredentialed
+    // same-UID peers alike lack a distinct OS/UI presence proof bound to this op.
+    let _ = auth;
+    Err(IpcError::Unauthorized(
+        human_operator_disabled_message().into(),
+    ))
 }
 
 /// Normalize a principal key component (case-fold + trim + path separators and aliases).
@@ -1291,7 +1292,8 @@ mod tests {
         let cred_id = auth.clone();
         assert!(gate.authorize_method(methods::PING, &uncred_id).is_ok());
         assert!(gate.authorize_method(methods::STATUS, &uncred_id).is_ok());
-        // Human-operator methods: OS user presence only (never client credentials).
+        // Human-operator methods: fail-closed for every ordinary IPC principal
+        // (uncredentialed same-UID is forgeable; not a presence proof).
         for method in [
             methods::APPROVAL_APPROVE,
             methods::APPROVAL_DENY,
@@ -1300,8 +1302,8 @@ mod tests {
             methods::TOKEN_REVOKE,
         ] {
             assert!(
-                gate.authorize_method(method, &uncred_id).is_ok(),
-                "{method} must allow uncredentialed OS user presence"
+                gate.authorize_method(method, &uncred_id).is_err(),
+                "{method} must deny uncredentialed same-uid (no presence proof)"
             );
             assert!(
                 gate.authorize_method(method, &cred_id).is_err(),

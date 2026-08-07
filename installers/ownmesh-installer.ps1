@@ -1,6 +1,16 @@
 # OwnMesh portable installer (Windows x64).
-# Verifies SHA-256 before atomic per-user install.
-# Security: never evaluate remote script text; download only to files via Invoke-WebRequest.
+#
+# Trust model (fail-closed):
+#   1. Verify SHA256SUMS.minisig with minisign against the pinned OwnMesh public key
+#      before trusting any checksum line.
+#   2. Verify the archive SHA-256 from the trusted sums.
+#   3. Extract only required binaries. Never evaluate remote script text in-process.
+#
+# Installer integrity: download this script, inspect it, then execute from a local path
+# (powershell -File .\ownmesh-installer.ps1). Prefer verifying the script digest against
+# the signed release SHA256SUMS. Do not pipe remote installer text into the shell.
+#
+# Minisign: provide minisign.exe on PATH, or set OWNMESH_MINISIGN to a full path.
 
 & {
     Set-StrictMode -Version Latest
@@ -16,6 +26,7 @@
     }
     $AssetDir = $env:OWNMESH_ASSET_DIR
     $BaseUrlOverride = $env:OWNMESH_BASE_URL
+    $MinisignBin = $env:OWNMESH_MINISIGN
     $RequiredBinaries = @(
         "ownmesh.exe",
         "ownmesh-tui.exe",
@@ -23,6 +34,10 @@
         "ownmesh-session-host.exe",
         "ownmesh-broker.exe"
     )
+
+    # Pinned OwnMesh minisign trust root (docs/release-keys/minisign.pub).
+    $PinnedMinisignPubComment = "untrusted comment: minisign public key C596813EFB0946A4"
+    $PinnedMinisignPubKey = "RWSkRgn7PoGWxQVPfPTcZzF3P8Wi5JMb+EOydWtYYosHDIEsLUnGl8eI"
 
     function Test-Injection {
         param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][string]$Value)
@@ -107,6 +122,46 @@
         throw "SHA256SUMS missing entry for $AssetName"
     }
 
+    function Resolve-Minisign {
+        if ($MinisignBin) {
+            if (-not (Test-Path -LiteralPath $MinisignBin -PathType Leaf)) {
+                throw "OWNMESH_MINISIGN is not a file: $MinisignBin"
+            }
+            return $MinisignBin
+        }
+        $cmd = Get-Command minisign -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        $cmd = Get-Command minisign.exe -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+        throw "minisign is required to verify SHA256SUMS.minisig (install minisign or set OWNMESH_MINISIGN)"
+    }
+
+    function Assert-MinisignSums {
+        param(
+            [Parameter(Mandatory)][string]$SumsPath,
+            [Parameter(Mandatory)][string]$SigPath,
+            [Parameter(Mandatory)][string]$PubKeyPath,
+            [Parameter(Mandatory)][string]$MinisignPath
+        )
+        if (-not (Test-Path -LiteralPath $SigPath -PathType Leaf)) {
+            throw "SHA256SUMS.minisig missing (signature required; refusing unsigned checksums)"
+        }
+        if (-not (Test-Path -LiteralPath $PubKeyPath -PathType Leaf)) {
+            throw "minisign public key missing"
+        }
+        if (-not $env:OWNMESH_MINISIGN_PUB) {
+            $pubText = Get-Content -LiteralPath $PubKeyPath -Raw
+            if ($pubText -notlike "*$PinnedMinisignPubKey*") {
+                throw "minisign public key does not match the pinned OwnMesh trust root"
+            }
+        }
+        & $MinisignPath -Vm $SumsPath -p $PubKeyPath -x $SigPath | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "minisign verification failed for SHA256SUMS"
+        }
+        Write-Host "minisign: SHA256SUMS signature ok"
+    }
+
     function Test-SafeZipEntry {
         param([Parameter(Mandatory)][string]$Name)
         if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
@@ -154,16 +209,42 @@
     $tempDir = Join-Path ([IO.Path]::GetTempPath()) "ownmesh-install-$([Guid]::NewGuid().ToString('N'))"
     $archive = Join-Path $tempDir $asset
     $sums = Join-Path $tempDir "SHA256SUMS"
+    $sig = Join-Path $tempDir "SHA256SUMS.minisig"
+    $pubKey = Join-Path $tempDir "minisign.pub"
     $extractDir = Join-Path $tempDir "extract"
     $backupDir = Join-Path $InstallDir (".ownmesh-backup-" + $PID)
     $stagedFiles = @()
 
     try {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
+        $minisignPath = Resolve-Minisign
 
         Write-Host "Downloading $asset..."
         Copy-ReleaseAsset $asset $archive
         Copy-ReleaseAsset "SHA256SUMS" $sums
+        Copy-ReleaseAsset "SHA256SUMS.minisig" $sig
+
+        if ($env:OWNMESH_MINISIGN_PUB) {
+            if (-not (Test-Path -LiteralPath $env:OWNMESH_MINISIGN_PUB -PathType Leaf)) {
+                throw "OWNMESH_MINISIGN_PUB is not a file"
+            }
+            Copy-Item -LiteralPath $env:OWNMESH_MINISIGN_PUB -Destination $pubKey -Force
+        } elseif ($AssetDir -and (Test-Path -LiteralPath (Join-Path $AssetDir "minisign.pub") -PathType Leaf)) {
+            Copy-Item -LiteralPath (Join-Path $AssetDir "minisign.pub") -Destination $pubKey -Force
+        } else {
+            $repoPub = Join-Path $PSScriptRoot "..\docs\release-keys\minisign.pub"
+            $beside = Join-Path $PSScriptRoot "minisign.pub"
+            if (Test-Path -LiteralPath $repoPub -PathType Leaf) {
+                Copy-Item -LiteralPath $repoPub -Destination $pubKey -Force
+            } elseif (Test-Path -LiteralPath $beside -PathType Leaf) {
+                Copy-Item -LiteralPath $beside -Destination $pubKey -Force
+            } else {
+                @($PinnedMinisignPubComment, $PinnedMinisignPubKey) |
+                    Set-Content -LiteralPath $pubKey -Encoding ascii
+            }
+        }
+
+        Assert-MinisignSums -SumsPath $sums -SigPath $sig -PubKeyPath $pubKey -MinisignPath $minisignPath
 
         $expected = Get-ChecksumFromSums -SumsPath $sums -AssetName $asset
         $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()

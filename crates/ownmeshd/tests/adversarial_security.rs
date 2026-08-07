@@ -119,6 +119,46 @@ fn named_client_with_cred(
     }
 }
 
+/// Direct runtime dispatch as an OS-shaped human principal.
+///
+/// Ordinary IPC human-operator methods are fail-closed (no presence proof). Tests that
+/// exercise approval *execution* mechanics (pins, grants, TOCTOU) call the runtime handler
+/// directly — never via a forgeable same-UID uncredentialed IPC socket.
+async fn direct_human_approve(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    approval_id: &str,
+    temporary_grant: bool,
+    grant_seconds: Option<i64>,
+) -> Result<serde_json::Value, IpcError> {
+    let human = ClientIdentity::new(format!("user:{}", current_os_user_id()), "0.1.0");
+    let mut params = json!({
+        "id": approval_id,
+        "temporary_grant": temporary_grant,
+    });
+    if let Some(secs) = grant_seconds {
+        params["grant_seconds"] = json!(secs);
+    }
+    let mut guard = runtime.lock().await;
+    guard
+        .dispatch(methods::APPROVAL_APPROVE, Some(params), &human)
+        .await
+}
+
+async fn direct_human_token_revoke(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    principal: &str,
+) -> Result<serde_json::Value, IpcError> {
+    let human = ClientIdentity::new(format!("user:{}", current_os_user_id()), "0.1.0");
+    let mut guard = runtime.lock().await;
+    guard
+        .dispatch(
+            methods::TOKEN_REVOKE,
+            Some(json!({ "principal": principal })),
+            &human,
+        )
+        .await
+}
+
 fn assert_remote_code(err: IpcError, expected: i64) {
     match err {
         IpcError::Remote { code, message } => {
@@ -485,14 +525,8 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
 
     std::fs::remove_file(&alias).unwrap();
     symlink("/bin/sh", &alias).unwrap();
-    let approved = client
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": approval_id,
-                "temporary_grant": false,
-            })),
-        )
+    // IPC approve is fail-closed; exercise pin revalidation via direct runtime dispatch.
+    let approved = direct_human_approve(&runtime, &approval_id, false, None)
         .await
         .expect("approval must execute the safely pinned canonical echo target");
     assert_eq!(approved["approval_required"], false);
@@ -714,13 +748,10 @@ async fn revoke_blocks_hello_and_dispatch() {
         .await
         .expect("pre-revoke dispatch");
 
-    // Revoke through a case/whitespace alias. The server-defined client namespace,
-    // persisted value, and checks must converge on the same canonical principal.
-    let revoked = admin
-        .call(
-            methods::TOKEN_REVOKE,
-            Some(json!({ "principal": " CLIENT:AGENT-CHATGPT " })),
-        )
+    // Revoke through a case/whitespace alias. Ordinary IPC token.revoke is fail-closed;
+    // exercise canonicalization via direct runtime dispatch.
+    let _ = admin;
+    let revoked = direct_human_token_revoke(&runtime, " CLIENT:AGENT-CHATGPT ")
         .await
         .expect("revoke");
     assert_eq!(revoked["revoked"], "client:agent-chatgpt");
@@ -817,7 +848,7 @@ async fn legacy_process_scoped_revoke_rpc_blocks_stable_user_principal() {
     for suffix in [":exe:C:\\OwnMesh\\ownmesh.exe", ":pid:424242"] {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
-        let (server, handle, endpoint, _runtime) = start_test_daemon(&paths).await;
+        let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
         let client = named_client(
             endpoint,
             paths.runtime_dir.clone(),
@@ -826,8 +857,8 @@ async fn legacy_process_scoped_revoke_rpc_blocks_stable_user_principal() {
         client.status().await.expect("pre-revoke status");
 
         let legacy = format!("{stable}{suffix}");
-        let revoked = client
-            .call(methods::TOKEN_REVOKE, Some(json!({ "principal": legacy })))
+        // IPC token.revoke is fail-closed; canonicalize legacy keys via direct dispatch.
+        let revoked = direct_human_token_revoke(&runtime, &legacy)
             .await
             .expect("legacy revoke RPC");
         assert_eq!(revoked["revoked"], stable);
@@ -883,16 +914,13 @@ async fn attack_rehello_cannot_switch_principal_or_bypass_revoke() {
     let first_val = first.into_result().expect("hello");
     assert_eq!(first_val["principal"], "client:chatgpt");
 
-    // Revoke the bound principal while the connection is live.
-    let revoked = admin
-        .call(
-            methods::TOKEN_REVOKE,
-            Some(json!({ "client": "client:chatgpt" })),
-        )
+    // Revoke the bound principal while the connection is live (direct dispatch;
+    // ordinary IPC token.revoke is fail-closed without presence proof).
+    let _ = admin;
+    let revoked = direct_human_token_revoke(&runtime, "client:chatgpt")
         .await
         .expect("revoke");
     assert_eq!(revoked["revoked"], "client:chatgpt");
-    let _ = runtime; // runtime already shares revoked set via server config
 
     // Attempt to re-HELLO as a different principal on the same connection.
     let rehello = RpcRequest::new(
@@ -1493,10 +1521,11 @@ async fn production_agent_cannot_self_approve_or_use_management_for_human_ops() 
         "agent-label",
         Some(provisioned.credential),
     );
-    let human = named_client(
+    // Second same-UID unauthenticated IPC connection (forgeable "user:<uid>").
+    let forged_human = named_client(
         endpoint.clone(),
         paths.runtime_dir.clone(),
-        "human-operator",
+        "forged-human-presence",
     );
 
     {
@@ -1577,34 +1606,122 @@ async fn production_agent_cannot_self_approve_or_use_management_for_human_ops() 
         );
         assert_unauthorized(
             management
-                .call(method, params)
+                .call(method, params.clone())
                 .await
                 .expect_err(&format!("{method} denied for management")),
         );
+        // Two-connection presence forgery: uncredentialed same-UID must also be denied.
+        assert_unauthorized(forged_human.call(method, params).await.expect_err(&format!(
+            "{method} denied for forged uncredentialed presence"
+        )));
     }
 
-    // Independent uncredentialed OS human may approve once.
-    let approved = human
+    // C1 regression: second unauthenticated same-UID IPC must not approve.
+    let forged_approve = forged_human
         .call(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": approval_id, "temporary_grant": false })),
         )
         .await
-        .expect("human approve");
-    assert_eq!(approved["approval_required"], false);
-    assert_eq!(approved["result"]["bytes_written"], 11);
+        .expect_err("forged uncredentialed presence must not approve");
+    assert_unauthorized(forged_approve);
 
-    // Replay / second decision is fail-closed.
-    let replay = human
+    // Approval remains pending — no ordinary IPC path can decide it.
+    let still = agent
+        .call(methods::APPROVAL_SHOW, Some(json!({ "id": approval_id })))
+        .await
+        .expect("show pending");
+    assert_eq!(still["state"], "pending");
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
+
+/// Production registry: credentialed agent opens a second unauthenticated connection and
+/// must not obtain human-operator powers (approve/deny/preset/unlock/revoke).
+#[tokio::test]
+async fn production_two_connection_presence_forgery_denied() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_production_test_daemon(&paths).await;
+
+    let management_secret =
+        ownmesh_ipc::read_management_credential(&paths.state_dir).expect("management delivery");
+    let management = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "mgmt",
+        Some(management_secret),
+    );
+    let provisioned: ownmesh_ipc::CredentialSecretResult = serde_json::from_value(
+        management
+            .call(
+                methods::CREDENTIAL_PROVISION,
+                Some(json!({ "client_id": "dual-conn-agent" })),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let agent = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "dual-conn-agent-label",
+        Some(provisioned.credential),
+    );
+    // Second connection: no client credential → maps to user:<uid> (forgeable).
+    let second = named_client(endpoint.clone(), paths.runtime_dir.clone(), "second-sock");
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask".into()),
+            rules: vec![PolicyRule {
+                id: "ask-write".into(),
+                decision: Decision::Ask,
+                priority: 10,
+                capability: "filesystem.write".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: None,
+                program_equals: None,
+                description: None,
+            }],
+        });
+    }
+
+    let pending = agent
         .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({ "id": approval_id })),
+            methods::OPS_FS_WRITE,
+            Some(json!({
+                "path": "dual.txt",
+                "content": "x",
+                "idempotency_key": "dual-conn",
+            })),
         )
         .await
-        .expect_err("approval replay must fail");
-    match replay {
-        IpcError::Remote { code, .. } => assert_eq!(code, app_error::CONFLICT),
-        other => panic!("expected conflict on replay, got {other:?}"),
+        .unwrap();
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    for method in [
+        methods::APPROVAL_APPROVE,
+        methods::APPROVAL_DENY,
+        methods::POLICY_PRESET,
+        methods::DAEMON_UNLOCK,
+        methods::TOKEN_REVOKE,
+    ] {
+        let params = match method {
+            methods::APPROVAL_APPROVE | methods::APPROVAL_DENY => {
+                Some(json!({ "id": approval_id }))
+            }
+            methods::POLICY_PRESET => Some(json!({ "preset": "full_access" })),
+            methods::TOKEN_REVOKE => Some(json!({ "principal": "client:dual-conn-agent" })),
+            _ => None,
+        };
+        assert_unauthorized(second.call(method, params).await.expect_err(&format!(
+            "{method} must fail on second uncredentialed connection"
+        )));
     }
 
     server.request_shutdown();
@@ -1660,7 +1777,6 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
         "exec-agent-label",
         Some(provisioned.credential),
     );
-    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
 
     // Keep a native extension so Windows still classifies the path as structured.
     let tool = dir.path().join(if cfg!(windows) {
@@ -1743,11 +1859,7 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
     }
     std::fs::rename(&swapped, &tool).unwrap();
 
-    let denied = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({ "id": approval_id, "temporary_grant": false })),
-        )
+    let denied = direct_human_approve(&runtime, &approval_id, false, None)
         .await
         .expect_err("content-swapped executable must fail closed");
     match denied {
@@ -1810,7 +1922,6 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
         "grant-agent-label",
         Some(provisioned.credential),
     );
-    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
 
     // python3.12 is intentionally NOT an exact INTERPRETER_BINARIES stem match, so
     // classification stays structured — the historical temporary-grant hole.
@@ -1899,15 +2010,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
     // Provisioned client_id "grant-agent" → server principal `client:grant-agent`.
     let agent_principal = "client:grant-agent".to_owned();
 
-    let grant_denied = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": py_approval,
-                "temporary_grant": true,
-                "grant_seconds": 600,
-            })),
-        )
+    let grant_denied = direct_human_approve(&runtime, &py_approval, true, Some(600))
         .await
         .expect_err("command.run temporary_grant must be refused");
     match grant_denied {
@@ -1932,14 +2035,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
     }
 
     // One-shot human approval still executes the approved operation once.
-    let approved_once = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": py_approval,
-                "temporary_grant": false,
-            })),
-        )
+    let approved_once = direct_human_approve(&runtime, &py_approval, false, None)
         .await
         .expect("one-shot command.run approval must still work");
     assert_eq!(approved_once["approval_required"], false);
@@ -1985,15 +2081,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
         .expect("enqueue gawk");
     assert_eq!(pending_gawk["approval_required"], true);
     let gawk_approval = pending_gawk["approval_id"].as_str().unwrap().to_owned();
-    let gawk_denied = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": gawk_approval,
-                "temporary_grant": true,
-                "grant_seconds": 600,
-            })),
-        )
+    let gawk_denied = direct_human_approve(&runtime, &gawk_approval, true, Some(600))
         .await
         .expect_err("gawk temporary_grant must be refused");
     match gawk_denied {
@@ -2021,14 +2109,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
         .await
         .expect("enqueue plain structured");
     let plain_approval = pending_plain["approval_id"].as_str().unwrap().to_owned();
-    let plain_denied = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": plain_approval,
-                "temporary_grant": true,
-            })),
-        )
+    let plain_denied = direct_human_approve(&runtime, &plain_approval, true, None)
         .await
         .expect_err("plain structured temporary_grant must be refused");
     match plain_denied {
@@ -2063,14 +2144,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
         .expect("enqueue raw script");
     assert_eq!(pending_raw["approval_required"], true);
     let raw_approval = pending_raw["approval_id"].as_str().unwrap().to_owned();
-    let raw_denied = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": raw_approval,
-                "temporary_grant": true,
-            })),
-        )
+    let raw_denied = direct_human_approve(&runtime, &raw_approval, true, None)
         .await
         .expect_err("raw_shell temporary_grant must be refused");
     match raw_denied {
@@ -2083,14 +2157,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
         }
         other => panic!("unexpected raw grant refusal: {other:?}"),
     }
-    let raw_once = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": raw_approval,
-                "temporary_grant": false,
-            })),
-        )
+    let raw_once = direct_human_approve(&runtime, &raw_approval, false, None)
         .await
         .expect("one-shot raw_shell approval must still work");
     assert_eq!(raw_once["approval_required"], false);
@@ -2260,7 +2327,6 @@ async fn production_filesystem_temporary_grant_still_works() {
         "fs-grant-agent-label",
         Some(provisioned.credential),
     );
-    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
 
     {
         let mut guard = runtime.lock().await;
@@ -2295,15 +2361,7 @@ async fn production_filesystem_temporary_grant_still_works() {
     assert_eq!(pending["approval_required"], true);
     let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
 
-    let approved = human
-        .call(
-            methods::APPROVAL_APPROVE,
-            Some(json!({
-                "id": approval_id,
-                "temporary_grant": true,
-                "grant_seconds": 600,
-            })),
-        )
+    let approved = direct_human_approve(&runtime, &approval_id, true, Some(600))
         .await
         .expect("fs temporary_grant must still be issued");
     assert_eq!(approved["approval_required"], false);

@@ -45,8 +45,9 @@ pub use error::{UpdateError, UpdateResult};
 pub use github::{ReleaseMeta, SelectedRelease, DEFAULT_REPOSITORY};
 pub use install::{apply_binaries, current_install_dir, is_homebrew_install, ApplyReport};
 pub use limits::{
-    DOWNLOAD_TIMEOUT_SECS, MAX_ARCHIVE_BYTES, MAX_CHECKSUMS_BYTES, MAX_METADATA_BYTES,
-    MAX_SIGNATURE_BYTES, METADATA_TIMEOUT_SECS,
+    ALLOWED_DOC_FILES, DOWNLOAD_TIMEOUT_SECS, MAX_ARCHIVE_BYTES, MAX_ARCHIVE_ENTRIES,
+    MAX_CHECKSUMS_BYTES, MAX_ENTRY_UNCOMPRESSED_BYTES, MAX_METADATA_BYTES, MAX_SIGNATURE_BYTES,
+    MAX_TOTAL_UNCOMPRESSED_BYTES, METADATA_TIMEOUT_SECS,
 };
 pub use platform::{
     binary_file_name, binary_file_name_for, select_platform_asset, select_platform_asset_for,

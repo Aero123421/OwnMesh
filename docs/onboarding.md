@@ -66,8 +66,9 @@ Fail-closed rules:
 - Existing config without `--force` / confirmation → error exit
 - Secret markers in JSON (`refresh_token`, `access_token`, …) → refused
 - Non-loopback `http://` control-plane URLs → refused
+- Control-plane URLs with userinfo, query, fragment, or control characters → refused (errors redact the URL)
 
-Config and policy writes are atomic (temp + replace, with `.bak` on replace).
+Config and policy writes use a **journaled two-file transaction** (temp + replace, with `.bak` on replace, durable recovery journal). A policy write failure rolls back so a new config is never left paired with an old strong policy.
 
 ### Next steps printed by setup
 
@@ -78,7 +79,7 @@ Config and policy writes are atomic (temp + replace, with `.bak` on replace).
 
 ## `ownmesh doctor`
 
-Fully **read-only**: does not create config roots, keystores, unlock files, or services.
+Fully **read-only**: does not create config roots, keystores, unlock files, or services. Does **not** call OS credential store `load` / keychain APIs; credential checks use non-secret metadata (e.g. encrypted blob filenames) only.
 
 ```bash
 ownmesh doctor

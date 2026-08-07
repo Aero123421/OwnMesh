@@ -18,7 +18,11 @@ The CLI has **32 explicit unsupported CLI surfaces** from the authoritative Rust
 
 Update defaults keep **network off** (`update.mode = "off"`). Explicit `check` / `download` / `apply` are user-initiated and may contact official GitHub Release endpoints only.
 
-Doctor never writes config or mutates OS services. Network probes run only with `--check-network` or when a control-plane URL is already configured. Outputs redact secret-looking material.
+Doctor never writes config or mutates OS services. Network probes run only with `--check-network` or when a control-plane URL is already configured. Outputs redact secret-looking material and never call OS credential `load`/keychain APIs (presence is inferred from non-secret metadata only).
+
+### Human-operator IPC (fail-closed)
+
+Until a distinct OS/UI user-presence proof bound to the approval operation and expiry exists, ordinary local IPC clients **cannot** call `approval.approve` / `approval.deny`, `policy.preset`, `daemon.unlock`, or `token.revoke`. Same-UID unauthenticated connections are forgeable by any local process (including a credentialed agent opening a second socket) and are **not** treated as human presence. The CLI surfaces the same fail-closed error. Offline policy rewrite remains available via `ownmesh setup --force --policy-preset …`.
 
 ### Compatibility impact
 
@@ -30,7 +34,8 @@ Doctor never writes config or mutates OS services. Network probes run only with 
 
 ## Onboarding and user-level service
 
-- `setup` writes local config/policy with atomic replace, optional backup, and non-TTY / `--non-interactive` support.
+- `setup` writes local config/policy as a **journaled two-file transaction** (durable recovery / complete rollback on policy failure so a new config is never left with an old strong policy), with non-TTY / `--non-interactive` support.
+- Control-plane URLs use one strict `url::Url` validator (https, or loopback http only); userinfo/query/fragment/control characters are rejected; doctor/setup errors and JSON redact URL secrets.
 - Privacy defaults: telemetry OFF, relay OFF, update network OFF.
 - `service` manages **current-user** autostart only:
   - Windows: current-user Scheduled Task (ONLOGON / LeastPrivilege)
@@ -80,7 +85,7 @@ Authenticode and Apple notarization remain unsupported (W-SIGN).
 - Semver downgrade refused; device protocol major compatibility enforced via signed `ownmesh-release-meta.json`.
 - Size and time limits; redirect host allow-list fail-closed.
 - Embedded minisign public key; verification order **signature → SHA256SUMS → archive**.
-- Staging + atomic multi-binary install with backup/rollback; partial binary sets refused.
+- Staging + atomic multi-binary install with backup/rollback; partial binary sets refused; archive bomb limits enforced before allocation/extraction.
 - Homebrew-managed installs print `brew upgrade ownmesh` and refuse self-update.
 - Windows running-image replace helper when the live `ownmesh.exe` cannot be swapped.
 - JSON output redacts secret-looking fields and URL userinfo/query.
@@ -89,8 +94,10 @@ The legacy demo shared-secret manifest signature is isolated under `ownmesh_upda
 
 ## Installers
 
-- `installers/ownmesh-installer.sh` — macOS/Linux x64/arm64, latest or `OWNMESH_VERSION`, SHA-256 (+ minisign when available), traversal refusal, user install dir, atomic copy, PATH guidance, `--version` smoke, untrusted env/URL injection refusal.
-- `installers/ownmesh-installer.ps1` — Windows x64, TLS 1.2+, same integrity properties, temp cleanup, non-admin user install, backup/rollback, no `Invoke-Expression`.
+- **Never** `curl|sh` / `irm|iex`. Download the installer, inspect it, verify against signed `SHA256SUMS`, then execute from a local path.
+- `installers/ownmesh-installer.sh` — macOS/Linux x64/arm64, latest or `OWNMESH_VERSION`. **Requires minisign**; verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting checksums; then SHA-256, traversal refusal, user install dir, atomic copy, PATH guidance, `--version` smoke, untrusted env/URL injection refusal.
+- `installers/ownmesh-installer.ps1` — Windows x64, TLS 1.2+, same mandatory minisign + checksum order, temp cleanup, non-admin user install, backup/rollback, no `Invoke-Expression`.
+- Update archive extraction caps entry count / per-entry / total uncompressed bytes, streams with bounded reads, and permits only the five required binaries plus declared docs (rejects duplicates, unexpected members, symlinks, devices, path traversal).
 
 ## Homebrew
 
