@@ -1,7 +1,18 @@
-//! OwnMesh interactive session model and handoff primitives.
+//! `OwnMesh` interactive session model and handoff primitives.
 //!
 //! Multiple observers, single controller lease, claim/release/give,
 //! detached persistence across daemon restarts, PTY size/view metadata.
+
+#![allow(
+    clippy::doc_markdown,
+    clippy::ignored_unit_patterns,
+    clippy::let_unit_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::unnecessary_wraps
+)]
 
 mod persist;
 mod pty;

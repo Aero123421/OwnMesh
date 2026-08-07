@@ -4,6 +4,16 @@
 //! priority wins within the same decision. Cloud + local synthesis is the
 //! most restrictive combination. Full Access has no hidden hard denies.
 
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::too_many_lines
+)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;

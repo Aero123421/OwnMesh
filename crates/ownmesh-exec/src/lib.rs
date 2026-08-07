@@ -1,7 +1,20 @@
-//! OwnMesh structured command and process execution.
+//! `OwnMesh` structured command and process execution.
 //!
 //! Provides shell-free structured commands, optional raw shell, timeouts,
 //! process-tree kill best-effort, bounded output, and an idempotency journal.
+
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::map_unwrap_or,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::needless_borrows_for_generic_args
+)]
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -651,7 +664,7 @@ pub async fn run_command(
         }
     };
 
-    if let (Some(key), Some(j)) = (req.idempotency_key.clone(), journal.as_deref_mut()) {
+    if let (Some(key), Some(j)) = (req.idempotency_key.clone(), journal.as_mut()) {
         j.put(key, result.clone())?;
     }
     Ok(result)

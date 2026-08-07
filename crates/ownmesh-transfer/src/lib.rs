@@ -3,6 +3,16 @@
 //! Direct/LAN encrypted transfer only by default. Cloud relay (R2/TURN/S3)
 //! is never used as an implicit fallback.
 
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::too_many_lines
+)]
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

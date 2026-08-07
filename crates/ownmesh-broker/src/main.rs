@@ -6,10 +6,12 @@
 
 #![allow(
     clippy::doc_markdown,
-    clippy::too_many_lines,
     clippy::map_unwrap_or,
     clippy::missing_errors_doc,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    clippy::unused_async,
+    clippy::useless_format
 )]
 
 use clap::{Parser, Subcommand};

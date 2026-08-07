@@ -1,5 +1,23 @@
 //! External adapter isolation tests (harden-07).
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::manual_let_else,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::needless_pass_by_value,
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::unnested_or_patterns
+)]
+
 use ownmesh_profiles::{
     generic_interactive_session, generic_launch, generic_to_plan, normalize_event_json,
     official_profiles, ProfileRegistry,

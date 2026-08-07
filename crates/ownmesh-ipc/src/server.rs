@@ -579,12 +579,14 @@ mod tests {
         }
 
         // Bound identity remains agent-a for subsequent methods on this conn.
-        let ping = RpcRequest::new(m::PING, None);
-        write_frame(&mut conn, &ping.to_bytes().unwrap())
+        let ping_req = RpcRequest::new(m::PING, None);
+        write_frame(&mut conn, &ping_req.to_bytes().unwrap())
             .await
             .unwrap();
-        let pong = RpcResponse::from_bytes(&read_frame(&mut conn).await.unwrap()).unwrap();
-        pong.into_result().expect("ping under original principal");
+        let ping_resp = RpcResponse::from_bytes(&read_frame(&mut conn).await.unwrap()).unwrap();
+        ping_resp
+            .into_result()
+            .expect("ping under original principal");
 
         // A fresh connection may authenticate as agent-b.
         let client_b = IpcClient::new(

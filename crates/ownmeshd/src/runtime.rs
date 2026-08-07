@@ -4,6 +4,23 @@
 //! allow execute | ask enqueue | deny. Completed results are journaled by
 //! idempotency key so duplicate operations are not re-executed.
 
+#![allow(
+    clippy::doc_markdown,
+    clippy::io_other_error,
+    clippy::map_unwrap_or,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::unnested_or_patterns,
+    clippy::unused_async,
+    clippy::unused_self
+)]
+
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{

@@ -86,7 +86,12 @@ fn canonical_status(base: &Path, record: Option<Value>) -> Value {
     Value::Object(object)
 }
 
-fn report_unsupported(cli: &Cli, command: &str, message: &str, status: &Value) -> Result<(), ExitCode> {
+fn report_unsupported(
+    cli: &Cli,
+    command: &str,
+    message: &str,
+    status: &Value,
+) -> Result<(), ExitCode> {
     if cli.json {
         println!("{}", privileged_failure_json(command, message, status));
     } else {
@@ -200,11 +205,7 @@ mod tests {
     #[test]
     fn json_failure_payload_is_structured() {
         let status = json!({"installed": false, "support": "unsupported"});
-        let v = privileged_failure_json(
-            "privileged broker install",
-            UNSUPPORTED_REASON,
-            &status,
-        );
+        let v = privileged_failure_json("privileged broker install", UNSUPPORTED_REASON, &status);
         assert_eq!(v["schema_version"], 1);
         assert_eq!(v["status"], "not_implemented");
         assert_eq!(v["command"], "privileged broker install");

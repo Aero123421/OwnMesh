@@ -138,9 +138,8 @@ pub fn verify_from_public_key_hex(
     }
     let mut pk = [0_u8; 32];
     pk.copy_from_slice(&pk_bytes);
-    let verifying = VerifyingKey::from_bytes(&pk).map_err(|err| {
-        IdentityError::Invalid(format!("invalid ed25519 public key: {err}"))
-    })?;
+    let verifying = VerifyingKey::from_bytes(&pk)
+        .map_err(|err| IdentityError::Invalid(format!("invalid ed25519 public key: {err}")))?;
     let sig_bytes = hex_decode(signature_hex.trim())?;
     verify_with_public(&verifying, message, &sig_bytes)
 }
@@ -484,15 +483,18 @@ mod tests {
         assert!(!format!("{env:?}").contains("dcred_test_token_value"));
         assert!(!format!("{env}").contains("dcred_test_token_value"));
 
-        let matched =
-            load_device_credential_for(&store, "http://cp.example", "dev_abc").unwrap();
+        let matched = load_device_credential_for(&store, "http://cp.example", "dev_abc").unwrap();
         assert_eq!(matched.unwrap().expose(), "dcred_test_token_value");
-        assert!(load_device_credential_for(&store, "http://other", "dev_abc")
-            .unwrap()
-            .is_none());
-        assert!(load_device_credential_for(&store, "http://cp.example", "dev_other")
-            .unwrap()
-            .is_none());
+        assert!(
+            load_device_credential_for(&store, "http://other", "dev_abc")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load_device_credential_for(&store, "http://cp.example", "dev_other")
+                .unwrap()
+                .is_none()
+        );
 
         delete_device_credential(&store).unwrap();
         assert!(load_device_credential(&store).unwrap().is_none());

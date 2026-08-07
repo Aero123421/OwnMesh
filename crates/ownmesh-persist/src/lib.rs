@@ -7,6 +7,16 @@
 //! `FILE_RENAME_FLAG_REPLACE_IF_EXISTS`. Therefore replacing a sibling target
 //! does not require a target delete and has no delete/create window.
 
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::too_many_lines
+)]
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

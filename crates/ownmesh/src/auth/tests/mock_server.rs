@@ -693,10 +693,7 @@ async fn handle_agent_connect(
     };
     let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
     let device_id = q.get("device_id").cloned().unwrap_or_default();
-    let role = q
-        .get("role")
-        .cloned()
-        .unwrap_or_else(|| "agent".into());
+    let role = q.get("role").cloned().unwrap_or_else(|| "agent".into());
     if device_id.is_empty() {
         return json_response(400, json!({"error":"device_id required"}));
     }

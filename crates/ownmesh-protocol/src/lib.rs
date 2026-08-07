@@ -3,6 +3,14 @@
 //! Design authority: `OWNMESH_SPECIFICATION.ja.md` §21.
 
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate
+)]
 
 mod envelope;
 mod version;

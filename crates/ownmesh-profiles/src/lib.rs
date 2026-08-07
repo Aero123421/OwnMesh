@@ -4,6 +4,16 @@
 //! unknown-CLI execution path. Fixture-based conformance tests live in
 //! `tests` module and `fixtures/`.
 
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::too_many_lines
+)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

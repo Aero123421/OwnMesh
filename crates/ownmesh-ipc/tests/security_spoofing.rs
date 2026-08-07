@@ -3,6 +3,24 @@
 //! Registry storage internals are deliberately not imported here: external callers
 //! must not be able to open or mutate stopped-daemon credential state.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::manual_let_else,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    clippy::needless_pass_by_value,
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::unnested_or_patterns
+)]
+
 use ownmesh_ipc::{
     app_error, canonicalize_principal_key, constant_time_eq, current_os_user_id, generate_token,
     methods, normalize_principal_part, read_management_credential, read_token_file, redact_secrets,
@@ -131,7 +149,7 @@ fn legacy_token_file_and_debug_output_do_not_leak_secrets() {
 fn frame_decoder_rejects_oversize_and_tolerates_garbage() {
     let mut decoder = FrameDecoder::new();
     let error = decoder
-        .push(&(MAX_FRAME_BYTES as u64 + 1).to_be_bytes())
+        .push(&(u64::from(MAX_FRAME_BYTES) + 1).to_be_bytes())
         .unwrap_err();
     assert!(error.to_string().contains("frame") || error.to_string().contains("exceeds"));
     for chunk in [

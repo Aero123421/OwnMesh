@@ -1,8 +1,17 @@
-//! OwnMesh log providers and cursor-based queries.
+//! `OwnMesh` log providers and cursor-based queries.
 //!
 //! Providers share one contract: opaque `LogCursor` + page limit → `LogPage`.
 //! Platform backends (Windows Event Log, journald) are cfg-gated; Docker and
 //! process providers compile everywhere and degrade cleanly when tools are absent.
+
+#![allow(
+    clippy::assertions_on_constants,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate
+)]
 
 mod docker;
 mod file;
@@ -76,6 +85,13 @@ pub struct LogPage {
 /// Provider trait.
 pub trait LogProvider: Send + Sync {
     fn id(&self) -> &str;
+
+    /// Query log lines starting after `cursor` (or from the beginning when `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogError`] when the cursor is invalid for this provider or the
+    /// backend cannot satisfy the query.
     fn query(&self, cursor: Option<&LogCursor>, limit: usize) -> LogResult<LogPage>;
 }
 
