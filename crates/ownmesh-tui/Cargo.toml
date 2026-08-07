@@ -27,7 +27,7 @@ ownmesh-ipc = { path = "../ownmesh-ipc" }
 ownmesh-policy = { path = "../ownmesh-policy" }
 ownmesh-profiles = { path = "../ownmesh-profiles" }
 ownmesh-transfer = { path = "../ownmesh-transfer" }
-ratatui = "0.29.0"
+ratatui = "0.30.2"
 serde_json = "1.0.135"
 tokio = { version = "1.43.0", features = [
     "macros",
