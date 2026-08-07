@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.1 — CI repair
+
+- **ownmesh-config:** transaction lock `OpenOptions` now sets explicit `truncate(false)` with `create(true)` (crash-safe lock semantics; fixes `clippy::suspicious_open_options` under `-D warnings`).
+- **ownmesh-ipc (Windows):** registry state custody attests identity via handle file-index (stable across 8.3 / long path aliases) and claims owner SID + protected owner-only DACL from the process token; does not relax owner-only DACL / reparse / non-regular checks.
+- Release notes: [`docs/RELEASE_NOTES_v1.1.1.md`](./docs/RELEASE_NOTES_v1.1.1.md).
+- No Dependabot merges; `v1.1.0` tag left immutable.
+
 ## v1.1.0 — 2026-08-07
 
 ### Secure distribution

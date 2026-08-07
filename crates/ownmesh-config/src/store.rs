@@ -264,6 +264,10 @@ fn reject_symlink_if_present(path: &Path) -> ConfigResult<()> {
 }
 
 fn open_tx_lock_file(path: &Path) -> ConfigResult<File> {
+    // Crash-safe journal/lock semantics: create the lock node if missing, but never
+    // truncate an existing lock file. Mutual exclusion is the OS advisory/mandatory
+    // lock on the open handle; wiping contents is unnecessary and would race with
+    // concurrent validators inspecting the same node.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -271,6 +275,7 @@ fn open_tx_lock_file(path: &Path) -> ConfigResult<File> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(path)
             .map_err(|source| ConfigError::Io {
@@ -318,6 +323,7 @@ fn open_tx_lock_file(path: &Path) -> ConfigResult<File> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .map_err(|source| ConfigError::Io {
                 path: Some(path.to_path_buf()),
@@ -1215,5 +1221,32 @@ mod tests {
         );
         let pol = load_policy(&paths).unwrap();
         assert_eq!(pol.preset.as_deref(), Some("recommended"));
+    }
+
+    #[test]
+    fn tx_lock_open_creates_without_truncating_existing_contents() {
+        // Lock files use create + explicit truncate(false): an existing lock node
+        // must keep its bytes (crash-safe journal lock semantics).
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let lock_path = transaction_lock_path(&paths);
+        const MARKER: &[u8] = b"lock-marker-keep-me";
+        fs::write(&lock_path, MARKER).unwrap();
+
+        let guard = acquire_config_policy_tx_lock(&paths).unwrap();
+        // On Windows the lock is opened with share_mode(0), so peer path reads are
+        // denied while held; release first, then attest bytes were not truncated.
+        drop(guard);
+        assert_eq!(
+            fs::read(&lock_path).unwrap(),
+            MARKER,
+            "open_tx_lock_file must not truncate existing lock contents"
+        );
+
+        // Second acquire/release still preserves the marker (create+truncate(false)).
+        let guard = acquire_config_policy_tx_lock(&paths).unwrap();
+        drop(guard);
+        assert_eq!(fs::read(&lock_path).unwrap(), MARKER);
     }
 }
