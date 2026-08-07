@@ -2043,7 +2043,7 @@ fn validate_parent_custody(state_dir: &Path) -> IpcResult<()> {
         if parent == child || parent.as_os_str().is_empty() {
             break;
         }
-        let parent_metadata = fs::symlink_metadata(parent)?;
+        let parent_metadata = parent_custody_metadata(parent)?;
         if parent_metadata.uid() != expected && parent_metadata.uid() != 0 {
             return Err(IpcError::Unauthorized(format!(
                 "credential state ancestor is owned by untrusted uid {}: {}",
@@ -2072,6 +2072,23 @@ fn validate_parent_custody(state_dir: &Path) -> IpcResult<()> {
         child = parent;
     }
     Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn parent_custody_metadata(path: &Path) -> IpcResult<fs::Metadata> {
+    Ok(fs::symlink_metadata(path)?)
+}
+
+#[cfg(target_os = "macos")]
+fn parent_custody_metadata(path: &Path) -> IpcResult<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() && is_trusted_macos_var_alias(path)? {
+        // Inspect the fixed system target rather than symlink mode bits. macOS
+        // spells temporary directories below /var even though /var itself is the
+        // root-controlled compatibility alias to /private/var.
+        return Ok(fs::metadata(path)?);
+    }
+    Ok(metadata)
 }
 
 #[cfg(windows)]
@@ -2106,6 +2123,10 @@ fn reject_symlink_or_reparse_if_present(path: &Path) -> IpcResult<()> {
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
         metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     };
+    #[cfg(target_os = "macos")]
+    if is_link && is_trusted_macos_var_alias(path)? {
+        return Ok(());
+    }
     if is_link {
         return Err(IpcError::Unauthorized(format!(
             "credential state custody rejects symlink/reparse path: {}",
@@ -2113,6 +2134,29 @@ fn reject_symlink_or_reparse_if_present(path: &Path) -> IpcResult<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn is_trusted_macos_var_alias(path: &Path) -> IpcResult<bool> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if path != Path::new("/var") {
+        return Ok(false);
+    }
+    let link_target = fs::read_link(path)?;
+    if link_target != Path::new("private/var") && link_target != Path::new("/private/var") {
+        return Ok(false);
+    }
+    if fs::canonicalize(path)? != Path::new("/private/var") {
+        return Ok(false);
+    }
+    for trusted_directory in [Path::new("/private"), Path::new("/private/var")] {
+        let metadata = fs::symlink_metadata(trusted_directory)?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2344,6 +2388,20 @@ mod tests {
         fs::set_permissions(&replaceable, fs::Permissions::from_mode(0o777)).unwrap();
         let state = replaceable.join("state");
         assert!(CredentialRegistry::open(&state).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registry_accepts_root_controlled_macos_var_alias() {
+        assert!(fs::symlink_metadata("/var")
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(is_trusted_macos_var_alias(Path::new("/var")).unwrap());
+
+        let dir = tempdir().unwrap();
+        let registry = CredentialRegistry::open(dir.path()).unwrap();
+        assert!(registry.path().is_file());
     }
 
     #[cfg(unix)]
