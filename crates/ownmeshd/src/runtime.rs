@@ -297,9 +297,13 @@ impl DaemonRuntime {
     /// Bootstrap runtime from discovered / test paths.
     pub fn open(paths: &OwnMeshPaths) -> Result<Self, String> {
         paths.ensure_layout().map_err(|e| e.to_string())?;
+        // Fail closed: recover any interrupted config+policy journal before policy is consumed.
+        // load_policy performs mandatory recovery under the exclusive transaction lock.
         let journal_path = paths.state_dir.join("idempotency-journal.json");
         let exec_journal = IdempotencyJournal::open(&journal_path).map_err(|e| e.to_string())?;
-        let policy_file = load_policy(paths).unwrap_or_default();
+        let policy_file = load_policy(paths).map_err(|e| {
+            format!("policy load failed (refusing startup; config+policy journal preserved on recovery failure): {e}")
+        })?;
         let policy = policy_from_file(&policy_file);
         let enforce_workspace = matches!(
             policy.preset,

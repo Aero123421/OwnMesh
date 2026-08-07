@@ -410,8 +410,9 @@ pub fn apply_setup(
 
 /// Create config root and write config/policy as one journaled transaction.
 ///
-/// Uses [`save_config_and_policy_transactional`]: durable journal + complete rollback on
-/// policy failure so a new config is never left paired with an old strong policy.
+/// Uses [`save_config_and_policy_transactional`]: exclusive lock + durable journal +
+/// complete rollback on policy failure so a new config is never left paired with an old
+/// strong policy. Rollback failure preserves the journal (fail closed).
 pub fn apply_setup_atomic(
     paths: &OwnMeshPaths,
     cfg: &OwnMeshConfig,

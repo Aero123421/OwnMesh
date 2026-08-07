@@ -162,14 +162,166 @@
         Write-Host "minisign: SHA256SUMS signature ok"
     }
 
-    function Test-SafeZipEntry {
+    # Archive contract (identical security intent to ownmesh-update).
+    $MaxArchiveEntries = 64
+    $MaxEntryUncompressedBytes = [uint64](256 * 1024 * 1024)
+    $MaxTotalUncompressedBytes = [uint64](512 * 1024 * 1024)
+    $AllowedDocFiles = @("LICENSE", "NOTICE", "README.md", "RELEASE_NOTES.md", "CHANGELOG.md")
+
+    function Get-SafeZipMemberBase {
         param([Parameter(Mandatory)][string]$Name)
-        if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            throw "Refusing empty archive member name"
+        }
         $normalized = $Name -replace '\\', '/'
-        if ($normalized.StartsWith("/") -or $normalized.Contains("..")) { return $false }
+        if ($normalized.StartsWith("/") -or $normalized.Contains("..")) {
+            throw "Archive refuses member '$Name' (traversal)"
+        }
         $parts = $normalized.Split('/', [System.StringSplitOptions]::RemoveEmptyEntries)
-        if ($parts.Count -lt 1 -or $parts.Count -gt 2) { return $false }
-        return $true
+        if ($parts.Count -lt 1 -or $parts.Count -gt 2) {
+            throw "Archive refuses nested member '$Name'"
+        }
+        $base = $parts[$parts.Count - 1]
+        if ([string]::IsNullOrWhiteSpace($base) -or $base.Contains("..") -or $base.Contains("/") -or $base.Contains("\")) {
+            throw "Archive refuses member name '$base'"
+        }
+        return $base
+    }
+
+    function Test-AllowedMemberBase {
+        param([Parameter(Mandatory)][string]$Base)
+        foreach ($bin in $RequiredBinaries) {
+            if ($Base -ceq $bin) { return $true }
+        }
+        foreach ($doc in $AllowedDocFiles) {
+            if ($Base -ceq $doc) { return $true }
+        }
+        return $false
+    }
+
+    function Test-ZipEntryIsSymlink {
+        param($Entry)
+        # ZIP external attributes: high 16 bits are Unix mode when created on Unix.
+        # Use decimal constants (Windows PowerShell 5.1 has no 0o octal literals).
+        try {
+            $ext = [uint32]$Entry.ExternalAttributes
+            $mode = ($ext -shr 16) -band 0xFFFF
+            $ifmt = $mode -band 61440   # 0o170000
+            $iflnk = 49152              # 0o120000
+            if ($ifmt -eq $iflnk) { return $true }
+            # Non-regular, non-directory special types.
+            $ifreg = 32768              # 0o100000
+            $ifdir = 16384              # 0o040000
+            if ($mode -ne 0 -and $ifmt -ne 0 -and $ifmt -ne $ifreg -and $ifmt -ne $ifdir) {
+                return $true
+            }
+        } catch {
+            # If attributes cannot be interpreted, continue with other checks.
+        }
+        return $false
+    }
+
+    # Validate the full zip contract before allocating/extracting any member payload.
+    # Never uses Expand-Archive (full extract). Streams allow-listed members only.
+    function Assert-ArchiveContractAndExtract {
+        param(
+            [Parameter(Mandatory)][string]$ArchivePath,
+            [Parameter(Mandatory)][string]$DestinationDir
+        )
+
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+        try {
+            if ($zip.Entries.Count -gt $MaxArchiveEntries) {
+                throw "Archive entry count exceeds limit $MaxArchiveEntries"
+            }
+
+            $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+            $totalUncompressed = [uint64]0
+            $planned = New-Object System.Collections.Generic.List[object]
+
+            foreach ($entry in $zip.Entries) {
+                $fullName = $entry.FullName
+                if ([string]::IsNullOrWhiteSpace($fullName)) { continue }
+                $normalized = $fullName -replace '\\', '/'
+                if ($normalized.EndsWith("/")) {
+                    # Directory entry — no payload retained.
+                    continue
+                }
+                if (Test-ZipEntryIsSymlink -Entry $entry) {
+                    throw "Refusing symlink/special archive member '$fullName'"
+                }
+
+                $base = Get-SafeZipMemberBase -Name $fullName
+                if (-not (Test-AllowedMemberBase -Base $base)) {
+                    throw "Refusing unexpected archive member $base"
+                }
+                if (-not $seen.Add($base)) {
+                    throw "Refusing duplicate archive member $base"
+                }
+
+                $declared = [uint64]$entry.Length
+                if ($declared -gt $MaxEntryUncompressedBytes) {
+                    throw "Archive member $base exceeds per-entry limit $MaxEntryUncompressedBytes"
+                }
+                $totalUncompressed += $declared
+                if ($totalUncompressed -gt $MaxTotalUncompressedBytes) {
+                    throw "Archive total uncompressed size exceeds limit $MaxTotalUncompressedBytes"
+                }
+
+                $planned.Add([pscustomobject]@{
+                        Base     = $base
+                        Entry    = $entry
+                        Declared = $declared
+                    }) | Out-Null
+            }
+
+            foreach ($bin in $RequiredBinaries) {
+                if (-not $seen.Contains($bin)) {
+                    throw "Archive missing required binary $bin"
+                }
+            }
+
+            New-Item -ItemType Directory -Force -Path $DestinationDir | Out-Null
+
+            foreach ($item in $planned) {
+                # Only stage required binaries for install; docs may be written too.
+                $outPath = Join-Path $DestinationDir $item.Base
+                $inStream = $item.Entry.Open()
+                try {
+                    $outStream = [System.IO.File]::Create($outPath)
+                    try {
+                        $buffer = New-Object byte[] 8192
+                        $readTotal = [uint64]0
+                        while (($n = $inStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                            $readTotal += [uint64]$n
+                            if ($readTotal -gt $MaxEntryUncompressedBytes) {
+                                throw "Archive member $($item.Base) exceeds per-entry limit $MaxEntryUncompressedBytes"
+                            }
+                            if ($item.Declared -gt 0 -and $readTotal -gt $item.Declared) {
+                                throw "Archive member $($item.Base) expanded past declared size $($item.Declared)"
+                            }
+                            $outStream.Write($buffer, 0, $n)
+                        }
+                        if ($readTotal -eq 0 -and ($RequiredBinaries -contains $item.Base)) {
+                            throw "Archive member $($item.Base) is empty"
+                        }
+                    } finally {
+                        $outStream.Dispose()
+                    }
+                } finally {
+                    $inStream.Dispose()
+                }
+
+                if ((Get-Item -LiteralPath $outPath).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    throw "Extracted $($item.Base) is a reparse point; refusing"
+                }
+            }
+        } finally {
+            $zip.Dispose()
+        }
     }
 
     Test-Injection -Label "OWNMESH_VERSION" -Value $RequestedVersion
@@ -252,33 +404,16 @@
             throw "SHA-256 mismatch for $asset (expected $expected, got $actual)"
         }
 
-        New-Item -ItemType Directory -Path $extractDir | Out-Null
-        # Expand then validate members (refuse traversal).
-        Expand-Archive -LiteralPath $archive -DestinationPath $extractDir
-        Get-ChildItem -LiteralPath $extractDir -Recurse -File | ForEach-Object {
-            $rel = $_.FullName.Substring($extractDir.Length).TrimStart('\', '/')
-            if (-not (Test-SafeZipEntry -Name $rel)) {
-                throw "Archive refuses member '$rel' (traversal)"
-            }
-        }
+        # Validate contract then stream members into a private staging dir (no Expand-Archive).
+        Assert-ArchiveContractAndExtract -ArchivePath $archive -DestinationDir $extractDir
 
         $resolved = @{}
         foreach ($bin in $RequiredBinaries) {
             $direct = Join-Path $extractDir $bin
-            if (Test-Path -LiteralPath $direct -PathType Leaf) {
-                $resolved[$bin] = $direct
-                continue
+            if (-not (Test-Path -LiteralPath $direct -PathType Leaf)) {
+                throw "Partial extract: missing $bin"
             }
-            $found = Get-ChildItem -LiteralPath $extractDir -Recurse -Filter $bin -File -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-            if (-not $found) {
-                throw "Archive missing required binary $bin"
-            }
-            $rel = $found.FullName.Substring($extractDir.Length).TrimStart('\', '/')
-            if (-not (Test-SafeZipEntry -Name $rel)) {
-                throw "Archive refuses member '$rel' (traversal)"
-            }
-            $resolved[$bin] = $found.FullName
+            $resolved[$bin] = $direct
         }
 
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -301,17 +436,26 @@
             }
         } catch {
             Write-Host "Atomic install failed; restoring backup..."
+            $restoreFailed = $false
             foreach ($bin in $RequiredBinaries) {
                 $bak = Join-Path $backupDir $bin
                 if (Test-Path -LiteralPath $bak -PathType Leaf) {
-                    Copy-Item -LiteralPath $bak -Destination (Join-Path $InstallDir $bin) -Force
+                    try {
+                        Copy-Item -LiteralPath $bak -Destination (Join-Path $InstallDir $bin) -Force
+                    } catch {
+                        Write-Host "Rollback failed for $bin"
+                        $restoreFailed = $true
+                    }
                 }
+            }
+            if ($restoreFailed) {
+                throw "Install failed and backup rollback also failed (backup left at $backupDir)"
             }
             throw
         }
 
         if (Test-Path -LiteralPath $backupDir) {
-            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
         }
 
         $env:Path = "$InstallDir;$env:Path"

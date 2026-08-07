@@ -65,7 +65,7 @@ Invoke-WebRequest -Uri https://github.com/Aero123421/OwnMesh/releases/latest/dow
 powershell -NoProfile -File .\ownmesh-installer.ps1
 ```
 
-The installer requires **minisign** (on `PATH` or `OWNMESH_MINISIGN`) and verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting any checksum. Set `OWNMESH_VERSION`, `OWNMESH_INSTALL_DIR`, or `OWNMESH_NO_MODIFY_PATH` as needed. Homebrew formula assets are published as `ownmesh.rb` on each release.
+The installer requires **minisign** (on `PATH` or `OWNMESH_MINISIGN`) and verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting any checksum. After checksum verification it enforces the same archive contract as `ownmesh update` (entry/size caps, exact binary+doc allow-list, no duplicates/symlinks/traversal) with member-by-member staging — never full `tar -xzf` / `Expand-Archive`. The shell installer fails closed if `tar -tvzf` listing cannot be parsed safely. Set `OWNMESH_VERSION`, `OWNMESH_INSTALL_DIR`, or `OWNMESH_NO_MODIFY_PATH` as needed. Homebrew formula assets are published as `ownmesh.rb` on each release.
 
 ### Local approval / human-operator note (v1.1.0)
 

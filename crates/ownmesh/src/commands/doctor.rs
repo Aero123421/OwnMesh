@@ -88,6 +88,9 @@ pub fn collect_doctor_report(
 }
 
 fn load_config_readonly(paths: &OwnMeshPaths) -> Result<ownmesh_config::OwnMeshConfig, String> {
+    // Recover interrupted setup transactions before observing the live pair.
+    // Fail closed if recovery cannot complete (journal preserved).
+    ownmesh_config::ensure_config_policy_consistent(paths).map_err(|e| e.to_string())?;
     // Avoid create-on-missing side effects: only read if present.
     let path = paths.config_file();
     if !path.exists() {
@@ -362,7 +365,12 @@ fn observe_privacy_policy(paths: &OwnMeshPaths) -> PrivacyPolicyObservation {
 }
 
 fn load_policy_readonly(paths: &OwnMeshPaths) -> Result<ownmesh_config::PolicyFile, String> {
+    // Mandatory recovery before policy is observed or reported.
+    ownmesh_config::ensure_config_policy_consistent(paths).map_err(|e| e.to_string())?;
     let path = paths.policy_file();
+    if !path.exists() {
+        return Err("missing".into());
+    }
     let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let policy: ownmesh_config::PolicyFile = toml::from_str(&raw).map_err(|e| e.to_string())?;
     policy.validate().map_err(|e| e.to_string())?;

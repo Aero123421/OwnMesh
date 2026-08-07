@@ -266,51 +266,190 @@ require_verify_minisign() {
   say "minisign: SHA256SUMS signature ok"
 }
 
-# Extract only required top-level binaries; refuse path traversal.
+# Archive contract (identical security intent to ownmesh-update):
+# - max entry count / per-entry / total uncompressed sizes
+# - exact allow-list: five required binaries + declared docs only
+# - reject duplicates, symlinks/hardlinks/devices, traversal, unexpected members
+# - never full-extract (`tar -xzf archive` without member list)
+# - member-by-member streaming into a private staging dir
+MAX_ARCHIVE_ENTRIES=64
+MAX_ENTRY_UNCOMPRESSED_BYTES=268435456
+MAX_TOTAL_UNCOMPRESSED_BYTES=536870912
+ALLOWED_DOC_FILES="LICENSE NOTICE README.md RELEASE_NOTES.md CHANGELOG.md"
+
+is_allowed_member_base() {
+  base="$1"
+  for bin in $REQUIRED_BINARIES; do
+    [ "$base" = "$bin" ] && return 0
+  done
+  for doc in $ALLOWED_DOC_FILES; do
+    [ "$base" = "$doc" ] && return 0
+  done
+  return 1
+}
+
+# Normalize archive member path to a single base name; empty => reject.
+safe_member_base() {
+  member="$1"
+  case "$member" in
+    ''|*..*|/*|\\*|*\\*|*'\n'*|*$'\r'*) return 1 ;;
+  esac
+  # Strip a single optional directory prefix (release wrapper dir).
+  case "$member" in
+    */*/*) return 1 ;;
+    */*)
+      prefix="${member%%/*}"
+      base="${member#*/}"
+      case "$prefix" in ''|'.'|'..') return 1 ;; esac
+      case "$base" in ''|*/*|*\\*|*..*) return 1 ;; esac
+      printf '%s\n' "$base"
+      ;;
+    *)
+      printf '%s\n' "$member"
+      ;;
+  esac
+}
+
+# Validate the full tar.gz contract, then stream allowed members one-by-one.
+# Uses `tar -tvzf` listing (GNU/BSD). Fails closed when the listing cannot be parsed
+# safely or when any contract check fails — never falls back to full extraction.
 safe_extract() {
   archive="$1"
   dest="$2"
-  list_file="$TMP_DIR/tar-list.txt"
-  tar -tzf "$archive" >"$list_file" || fail "unable to list archive"
+  list_file="$TMP_DIR/tar-tv.txt"
+  names_file="$TMP_DIR/tar-names.txt"
+  seen_file="$TMP_DIR/tar-seen.txt"
+  : >"$seen_file"
 
-  # Fail closed on any traversal-like member names.
-  while IFS= read -r member; do
-    [ -n "$member" ] || continue
-    case "$member" in
-      *..*|/*|\\*|*\\*) fail "archive refuses member '$member' (traversal)" ;;
+  # Verbose listing carries type + size; plain -tzf is insufficient for bomb/type checks.
+  if ! tar -tvzf "$archive" >"$list_file" 2>/dev/null; then
+    fail "unable to list archive with tar -tvzf (safe extractor unavailable; refusing)"
+  fi
+  tar -tzf "$archive" >"$names_file" || fail "unable to list archive member names"
+
+  entry_count=0
+  total_uncompressed=0
+  # shellcheck disable=SC2162
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    entry_count=$((entry_count + 1))
+    if [ "$entry_count" -gt "$MAX_ARCHIVE_ENTRIES" ]; then
+      fail "archive entry count exceeds limit $MAX_ARCHIVE_ENTRIES"
+    fi
+
+    # First field is the mode string on both GNU and BSD tar -tv output.
+    mode="${line%% *}"
+    case "$mode" in
+      d*) continue ;; # directory headers are ignored (no payload retained)
+      l*|h*) fail "refusing symlink/hardlink archive member" ;;
+      c*|b*|p*|s*) fail "refusing special archive member type ($mode)" ;;
+      -*) ;; # regular file
+      *) fail "refusing unknown archive member type ($mode)" ;;
     esac
+
+    # Member name is the final field; BSD links append " -> target" which we reject above.
+    name="${line##* }"
+    case "$name" in
+      *'->'*) fail "refusing link-style archive member '$name'" ;;
+    esac
+
+    base="$(safe_member_base "$name")" || fail "archive refuses member '$name' (traversal/nested)"
+    if ! is_allowed_member_base "$base"; then
+      fail "refusing unexpected archive member $base"
+    fi
+    if grep -Fxq "$base" "$seen_file"; then
+      fail "refusing duplicate archive member $base"
+    fi
+    printf '%s\n' "$base" >>"$seen_file"
+
+    # Size from tar -tv listing:
+    # GNU: permissions owner/group size date time name
+    # BSD: permissions links owner group size mon day time name
+    # Never scan "last integer" (BSD day-of-month would win over size).
+    size="$(printf '%s\n' "$line" | awk '
+      {
+        if ($2 ~ /\//) { size = $3 } else { size = $5 }
+        if (size !~ /^[0-9]+$/ || length(size) > 12) { exit 2 }
+        print size
+      }
+    ")" || fail "unable to parse size for archive member $base (safe extractor unavailable)"
+    case "$size" in
+      ''|*[!0-9]*) fail "invalid size for archive member $base" ;;
+    esac
+    if [ "$size" -gt "$MAX_ENTRY_UNCOMPRESSED_BYTES" ]; then
+      fail "archive member $base exceeds per-entry limit $MAX_ENTRY_UNCOMPRESSED_BYTES"
+    fi
+    total_uncompressed=$((total_uncompressed + size))
+    if [ "$total_uncompressed" -gt "$MAX_TOTAL_UNCOMPRESSED_BYTES" ]; then
+      fail "archive total uncompressed size exceeds limit $MAX_TOTAL_UNCOMPRESSED_BYTES"
+    fi
   done <"$list_file"
 
+  # Require all five binaries (docs optional).
+  for bin in $REQUIRED_BINARIES; do
+    grep -Fxq "$bin" "$seen_file" || fail "archive missing required binary $bin"
+  done
+
   mkdir -p "$dest"
+  # Map base name -> exact member path for extraction.
   for bin in $REQUIRED_BINARIES; do
     member="$(
       awk -v b="$bin" '
         $0 == b { print; exit }
         {
-          n=split($0, a, "/")
+          n = split($0, a, "/")
           if (n == 2 && a[2] == b && a[1] != ".." && a[1] != "" && a[1] != ".") { print; exit }
         }
-      ' "$list_file"
+      ' "$names_file"
     )"
     [ -n "$member" ] || fail "archive missing required binary $bin"
-    case "$member" in
-      *..*|/*) fail "archive refuses member '$member'" ;;
-    esac
-    tar -xzf "$archive" -C "$dest" "$member" || fail "extract failed for $member"
-    if [ ! -f "$dest/$bin" ]; then
-      # Flatten single directory prefix.
-      if [ -f "$dest/$member" ]; then
-        mv "$dest/$member" "$dest/$bin"
-        # Best-effort cleanup of empty prefix dir.
-        prefix="${member%/*}"
-        if [ "$prefix" != "$member" ] && [ -d "$dest/$prefix" ]; then
-          rmdir "$dest/$prefix" 2>/dev/null || true
-        fi
-      else
-        fail "extracted $bin not found"
-      fi
+    base="$(safe_member_base "$member")" || fail "archive refuses member '$member'"
+    [ "$base" = "$bin" ] || fail "archive member mapping mismatch for $bin"
+
+    # Stream a single member to a private regular file (no full-archive extract).
+    out="$dest/$bin"
+    # tar -xOf writes member bytes to stdout; reject if the tool cannot isolate the member.
+    if ! tar -xOf "$archive" "$member" >"$out" 2>/dev/null; then
+      # Some tar builds need -z explicitly for gzip when using -O.
+      tar -xOzf "$archive" "$member" >"$out" || fail "extract failed for $member"
     fi
-    chmod 0755 "$dest/$bin"
+    [ -f "$out" ] || fail "extracted $bin is not a regular file"
+    if [ -L "$out" ]; then
+      fail "extracted $bin resolved to a symlink; refusing"
+    fi
+    actual_size="$(wc -c <"$out" | tr -d ' ')"
+    case "$actual_size" in
+      ''|*[!0-9]*) fail "unable to measure extracted size for $bin" ;;
+    esac
+    if [ "$actual_size" -le 0 ]; then
+      fail "archive member $bin is empty"
+    fi
+    if [ "$actual_size" -gt "$MAX_ENTRY_UNCOMPRESSED_BYTES" ]; then
+      fail "extracted $bin exceeds per-entry limit $MAX_ENTRY_UNCOMPRESSED_BYTES"
+    fi
+    chmod 0755 "$out"
+  done
+
+  # Optional docs: extract when present (still allow-listed and size-checked above).
+  for doc in $ALLOWED_DOC_FILES; do
+    grep -Fxq "$doc" "$seen_file" || continue
+    member="$(
+      awk -v b="$doc" '
+        $0 == b { print; exit }
+        {
+          n = split($0, a, "/")
+          if (n == 2 && a[2] == b && a[1] != ".." && a[1] != "" && a[1] != ".") { print; exit }
+        }
+      ' "$names_file"
+    )"
+    [ -n "$member" ] || continue
+    out="$dest/$doc"
+    if ! tar -xOf "$archive" "$member" >"$out" 2>/dev/null; then
+      tar -xOzf "$archive" "$member" >"$out" || fail "extract failed for $member"
+    fi
+    if [ -L "$out" ]; then
+      fail "extracted $doc resolved to a symlink; refusing"
+    fi
   done
 }
 
@@ -446,15 +585,23 @@ for bin in $REQUIRED_BINARIES; do
   staged="$INSTALL_DIR/.${bin}.new.$$"
   cp "$EXTRACT_DIR/$bin" "$staged"
   chmod 0755 "$staged"
-  mv -f "$staged" "$INSTALL_DIR/$bin" || {
+  if ! mv -f "$staged" "$INSTALL_DIR/$bin"; then
     say "atomic install failed; restoring backup"
+    restore_rc=0
     for b in $REQUIRED_BINARIES; do
       if [ -f "$BACKUP_DIR/$b" ]; then
-        mv -f "$BACKUP_DIR/$b" "$INSTALL_DIR/$b" || true
+        if ! mv -f "$BACKUP_DIR/$b" "$INSTALL_DIR/$b"; then
+          say "rollback failed for $b" >&2
+          restore_rc=1
+        fi
       fi
     done
-    fail "failed to install $bin"
-  }
+    if [ "$restore_rc" -ne 0 ]; then
+      fail "failed to install $bin; backup rollback also failed (backup left at $BACKUP_DIR)"
+    fi
+    rm -rf "$BACKUP_DIR"
+    fail "failed to install $bin; previous binaries restored"
+  fi
 done
 rm -rf "$BACKUP_DIR"
 

@@ -25,8 +25,10 @@ pub use schema::{
     PolicyFile, ServiceSocketConfig, TelemetryConfig, UpdateConfig, CONFIG_SCHEMA_VERSION,
 };
 pub use store::{
-    appears_secret_free, atomic_write, load_config, load_policy, recover_config_policy_transaction,
+    acquire_config_policy_tx_lock, appears_secret_free, atomic_write,
+    ensure_config_policy_consistent, load_config, load_policy, recover_config_policy_transaction,
     save_config, save_config_and_policy_transactional, save_policy, ConfigPolicyTransaction,
+    ConfigPolicyTxLock,
 };
 
 /// Stable crate name used by diagnostics and tests.

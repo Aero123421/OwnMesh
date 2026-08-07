@@ -34,7 +34,7 @@ Until a distinct OS/UI user-presence proof bound to the approval operation and e
 
 ## Onboarding and user-level service
 
-- `setup` writes local config/policy as a **journaled two-file transaction** (durable recovery / complete rollback on policy failure so a new config is never left with an old strong policy), with non-TTY / `--non-interactive` support.
+- `setup` writes local config/policy as a **journaled two-file transaction** under an exclusive identity-bound lock (durable recovery / complete rollback on policy failure so a new config is never left with an old strong policy). Every production daemon/CLI config or policy load path recovers under that lock **before** the live pair is consumed; recovery failure preserves the journal and fails closed. Non-TTY / `--non-interactive` supported.
 - Control-plane URLs use one strict `url::Url` validator (https, or loopback http only); userinfo/query/fragment/control characters are rejected; doctor/setup errors and JSON redact URL secrets.
 - Privacy defaults: telemetry OFF, relay OFF, update network OFF.
 - `service` manages **current-user** autostart only:
@@ -85,7 +85,7 @@ Authenticode and Apple notarization remain unsupported (W-SIGN).
 - Semver downgrade refused; device protocol major compatibility enforced via signed `ownmesh-release-meta.json`.
 - Size and time limits; redirect host allow-list fail-closed.
 - Embedded minisign public key; verification order **signature → SHA256SUMS → archive**.
-- Staging + atomic multi-binary install with backup/rollback; partial binary sets refused; archive bomb limits enforced before allocation/extraction.
+- Staging + atomic multi-binary install with backup/rollback; partial binary sets refused; archive bomb limits enforced before allocation/extraction (shared contract with portable installers).
 - Homebrew-managed installs print `brew upgrade ownmesh` and refuse self-update.
 - Windows running-image replace helper when the live `ownmesh.exe` cannot be swapped.
 - JSON output redacts secret-looking fields and URL userinfo/query.
@@ -95,9 +95,9 @@ The legacy demo shared-secret manifest signature is isolated under `ownmesh_upda
 ## Installers
 
 - **Never** `curl|sh` / `irm|iex`. Download the installer, inspect it, verify against signed `SHA256SUMS`, then execute from a local path.
-- `installers/ownmesh-installer.sh` — macOS/Linux x64/arm64, latest or `OWNMESH_VERSION`. **Requires minisign**; verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting checksums; then SHA-256, traversal refusal, user install dir, atomic copy, PATH guidance, `--version` smoke, untrusted env/URL injection refusal.
-- `installers/ownmesh-installer.ps1` — Windows x64, TLS 1.2+, same mandatory minisign + checksum order, temp cleanup, non-admin user install, backup/rollback, no `Invoke-Expression`.
-- Update archive extraction caps entry count / per-entry / total uncompressed bytes, streams with bounded reads, and permits only the five required binaries plus declared docs (rejects duplicates, unexpected members, symlinks, devices, path traversal).
+- `installers/ownmesh-installer.sh` — macOS/Linux x64/arm64, latest or `OWNMESH_VERSION`. **Requires minisign**; verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting checksums; then SHA-256. **Before any extraction**, enforces the same archive contract as the updater (max entry count / per-entry / total uncompressed size; exact allow-list of five binaries + declared docs; reject duplicates, symlinks/hardlinks/devices, unexpected members, path traversal) via `tar -tvzf` listing + member-by-member `tar -xOf` streaming into a private staging dir (never full `tar -xzf`). If the platform `tar` cannot produce a parseable verbose listing, extraction **fails closed**. Then user install dir, atomic copy with backup/rollback, PATH guidance, `--version` smoke, untrusted env/URL injection refusal.
+- `installers/ownmesh-installer.ps1` — Windows x64, TLS 1.2+, same mandatory minisign + checksum order. **Never** `Expand-Archive`; validates the full zip contract (entry count / size caps / allow-list / no symlink or traversal / no duplicates) via `System.IO.Compression.ZipFile` **before** streaming any member payload into a private staging dir; atomic install with backup/rollback; temp cleanup; non-admin user install; no `Invoke-Expression`.
+- Update archive extraction caps entry count / per-entry / total uncompressed bytes, streams with bounded reads, and permits only the five required binaries plus declared docs (rejects duplicates, unexpected members, symlinks, devices, path traversal). Installers share that security intent.
 
 ## Homebrew
 

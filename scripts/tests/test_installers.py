@@ -299,6 +299,213 @@ class InstallerAdversarialTests(unittest.TestCase):
             )
             self.assertNotEqual(failed.returncode, 0)
 
+            # Entry-count bomb
+            bomb_assets = tmp_path / "bomb-assets"
+            bomb_assets.mkdir()
+            bomb_asset = bomb_assets / asset_name
+            with tarfile.open(bomb_asset, "w:gz") as tf:
+                for i in range(80):
+                    info = tarfile.TarInfo(name=f"pad-{i}.txt")
+                    data = b"x"
+                    info.size = len(data)
+                    tf.addfile(info, fileobj=__import__("io").BytesIO(data))
+            digest = _sha256(bomb_asset)
+            sums = bomb_assets / "SHA256SUMS"
+            sums.write_text(f"{digest}  {asset_name}\n", encoding="ascii", newline="\n")
+            pub_bomb, sec_bomb = _generate_trust(bomb_assets)
+            (bomb_assets / "minisign.pub").write_bytes(pub_bomb.read_bytes())
+            _sign_sums(sums, sec_bomb, bomb_assets / "SHA256SUMS.minisig")
+            env["OWNMESH_ASSET_DIR"] = str(bomb_assets)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "bomb-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(bomb_assets / "minisign.pub")
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(
+                "entry count" in failed.stderr.lower() or "limit" in failed.stderr.lower(),
+                failed.stderr,
+            )
+
+            # Oversized member (declared size over per-entry limit). Zeros compress tightly.
+            class _ZeroReader:
+                def __init__(self, n: int) -> None:
+                    self.left = n
+
+                def read(self, size: int = -1) -> bytes:
+                    if self.left <= 0:
+                        return b""
+                    take = self.left if size < 0 else min(size, self.left)
+                    self.left -= take
+                    return b"\0" * take
+
+            huge_assets = tmp_path / "huge-assets"
+            huge_assets.mkdir()
+            huge_asset = huge_assets / asset_name
+            huge_size = 257 * 1024 * 1024  # just over 256 MiB cap
+            with tarfile.open(huge_asset, "w:gz") as tf:
+                info = tarfile.TarInfo(name="ownmesh")
+                info.size = huge_size
+                tf.addfile(info, fileobj=_ZeroReader(huge_size))
+            digest = _sha256(huge_asset)
+            sums = huge_assets / "SHA256SUMS"
+            sums.write_text(f"{digest}  {asset_name}\n", encoding="ascii", newline="\n")
+            pub_huge, sec_huge = _generate_trust(huge_assets)
+            (huge_assets / "minisign.pub").write_bytes(pub_huge.read_bytes())
+            _sign_sums(sums, sec_huge, huge_assets / "SHA256SUMS.minisig")
+            env["OWNMESH_ASSET_DIR"] = str(huge_assets)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "huge-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(huge_assets / "minisign.pub")
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(
+                "per-entry" in failed.stderr.lower() or "limit" in failed.stderr.lower(),
+                failed.stderr,
+            )
+
+            # Duplicate required binary
+            dup_pkg = tmp_path / "dup-pkg"
+            _write_fake_bins(dup_pkg, windows=False)
+            dup_assets = tmp_path / "dup-assets"
+            dup_assets.mkdir()
+            dup_asset = dup_assets / asset_name
+            with tarfile.open(dup_asset, "w:gz") as tf:
+                for path in dup_pkg.iterdir():
+                    tf.add(path, arcname=path.name)
+                # Second ownmesh under wrapper prefix — same base name after normalize.
+                info = tarfile.TarInfo(name="wrapper/ownmesh")
+                data = b"duplicate-ownmesh"
+                info.size = len(data)
+                tf.addfile(info, fileobj=__import__("io").BytesIO(data))
+            digest = _sha256(dup_asset)
+            sums = dup_assets / "SHA256SUMS"
+            sums.write_text(f"{digest}  {asset_name}\n", encoding="ascii", newline="\n")
+            pub_dup, sec_dup = _generate_trust(dup_assets)
+            (dup_assets / "minisign.pub").write_bytes(pub_dup.read_bytes())
+            _sign_sums(sums, sec_dup, dup_assets / "SHA256SUMS.minisig")
+            env["OWNMESH_ASSET_DIR"] = str(dup_assets)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "dup-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(dup_assets / "minisign.pub")
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(
+                "duplicate" in failed.stderr.lower() or "unexpected" in failed.stderr.lower(),
+                failed.stderr,
+            )
+
+            # Symlink member
+            link_assets = tmp_path / "link-assets"
+            link_assets.mkdir()
+            link_asset = link_assets / asset_name
+            with tarfile.open(link_asset, "w:gz") as tf:
+                info = tarfile.TarInfo(name="ownmesh")
+                info.type = tarfile.SYMTYPE
+                info.linkname = "/etc/passwd"
+                info.size = 0
+                tf.addfile(info)
+            digest = _sha256(link_asset)
+            sums = link_assets / "SHA256SUMS"
+            sums.write_text(f"{digest}  {asset_name}\n", encoding="ascii", newline="\n")
+            pub_link, sec_link = _generate_trust(link_assets)
+            (link_assets / "minisign.pub").write_bytes(pub_link.read_bytes())
+            _sign_sums(sums, sec_link, link_assets / "SHA256SUMS.minisig")
+            env["OWNMESH_ASSET_DIR"] = str(link_assets)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "link-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(link_assets / "minisign.pub")
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(
+                "symlink" in failed.stderr.lower() or "link" in failed.stderr.lower(),
+                failed.stderr,
+            )
+
+            # Unexpected member beside required set
+            unexp_pkg = tmp_path / "unexp-pkg"
+            _write_fake_bins(unexp_pkg, windows=False)
+            (unexp_pkg / "evil-extra.so").write_bytes(b"evil")
+            unexp_assets = tmp_path / "unexp-assets"
+            pub_unexp, _ = _pack(unexp_pkg, unexp_assets, asset_name, windows=False)
+            env["OWNMESH_ASSET_DIR"] = str(unexp_assets)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "unexp-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(pub_unexp)
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertTrue(
+                "unexpected" in failed.stderr.lower() or "refusing" in failed.stderr.lower(),
+                failed.stderr,
+            )
+
+            # Rollback: pre-install a marker binary, force install failure mid-way via
+            # non-writable install dir after backup — previous binary must remain.
+            rollback_pkg = tmp_path / "rollback-pkg"
+            _write_fake_bins(rollback_pkg, windows=False)
+            rollback_assets = tmp_path / "rollback-assets"
+            pub_rb, _ = _pack(rollback_pkg, rollback_assets, asset_name, windows=False)
+            rb_install = tmp_path / "rollback-install"
+            rb_install.mkdir()
+            old_bin = rb_install / "ownmesh"
+            old_bin.write_text(
+                "#!/bin/sh\necho ownmesh-old-marker\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            old_bin.chmod(old_bin.stat().st_mode | stat.S_IEXEC)
+            # Make install dir non-writable after placing marker so replace fails closed.
+            # Use a file named like a binary as a directory to break mv for one member:
+            # replace ownmesh-tui target with a directory so atomic install fails and rolls back.
+            tui_blocker = rb_install / "ownmesh-tui"
+            tui_blocker.mkdir()
+            (tui_blocker / "nested").write_text("x", encoding="utf-8")
+            env["OWNMESH_ASSET_DIR"] = str(rollback_assets)
+            env["OWNMESH_INSTALL_DIR"] = str(rb_install)
+            env["OWNMESH_MINISIGN_PUB"] = str(pub_rb)
+            env["OWNMESH_NO_MODIFY_PATH"] = "1"
+            failed = subprocess.run(
+                ["sh", str(SH_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            # ownmesh must still be the old marker (or restored); never a partial new set only.
+            if old_bin.is_file():
+                self.assertIn("ownmesh-old-marker", old_bin.read_text(encoding="utf-8"))
+
             # Unsupported arch simulation via uname override is hard in pure sh;
             # instead refuse bad OWNMESH_BASE_URL injection.
             env["OWNMESH_ASSET_DIR"] = str(assets)
@@ -379,6 +586,14 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("SHA256SUMS.minisig", text)
         self.assertIn("minisign", text.lower())
         self.assertIn("pinned OwnMesh trust root", text)
+        # Must not full-extract before validation.
+        self.assertNotRegex(text, r"(?im)^\s*Expand-Archive\b")
+        self.assertIn("Assert-ArchiveContractAndExtract", text)
+        self.assertIn("MaxArchiveEntries", text)
+        self.assertIn("MaxEntryUncompressedBytes", text)
+        self.assertIn("MaxTotalUncompressedBytes", text)
+        self.assertIn("duplicate archive member", text)
+        self.assertIn("unexpected archive member", text)
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
@@ -388,6 +603,19 @@ class InstallerAdversarialTests(unittest.TestCase):
         # No executable curl|sh pipeline (comments may discuss the anti-pattern).
         self.assertNotRegex(text, r"(?m)^[^#\n]*curl[^\n]*\|\s*sh")
         self.assertIn("Never pipe remote script", text)
+        # Bounded member-by-member extract; no full-archive tar -xzf without member list.
+        self.assertIn("MAX_ARCHIVE_ENTRIES", text)
+        self.assertIn("MAX_ENTRY_UNCOMPRESSED_BYTES", text)
+        self.assertIn("MAX_TOTAL_UNCOMPRESSED_BYTES", text)
+        self.assertIn("safe_extract", text)
+        self.assertIn("tar -tvzf", text)
+        self.assertIn("tar -xOzf", text)
+        # OwnMesh payload extract must stream single members (`$member`), not full-archive xzf.
+        self.assertIn('tar -xOzf "$archive" "$member"', text)
+        self.assertNotRegex(
+            text,
+            r'(?m)^(?!\s*#)\s*tar\s+-xzf\s+"\$archive"\s*$',
+        )
         if not _is_windows():
             self.skipTest("powershell execution only on Windows")
         # Run happy path when powershell is available.

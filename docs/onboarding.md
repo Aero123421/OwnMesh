@@ -68,7 +68,9 @@ Fail-closed rules:
 - Non-loopback `http://` control-plane URLs → refused
 - Control-plane URLs with userinfo, query, fragment, or control characters → refused (errors redact the URL)
 
-Config and policy writes use a **journaled two-file transaction** (temp + replace, with `.bak` on replace, durable recovery journal). A policy write failure rolls back so a new config is never left paired with an old strong policy.
+Config and policy writes use a **journaled two-file transaction** under an exclusive lock file in the config directory (temp + replace, with `.bak` on replace, durable recovery journal). Concurrent setup/recovery is serialized. A policy write failure rolls back so a new config is never left paired with an old strong policy. If rollback itself fails, the journal is **preserved** and the operation fails closed.
+
+Every production path that loads config or policy (including `ownmeshd` startup and CLI reads that could act on policy) runs recovery under that lock **before** consuming the live pair. A leftover `config_written` journal is never ignored.
 
 ### Next steps printed by setup
 
@@ -153,10 +155,16 @@ Security controls:
 
 Privileged broker paths are unchanged and remain fail-closed unsupported for install/uninstall.
 
+## Installer archive handling
+
+Portable installers (`installers/ownmesh-installer.sh`, `installers/ownmesh-installer.ps1`) verify minisign → checksums, then enforce the updater archive contract **before** any member payload is written: entry-count and uncompressed-size caps, exact required binaries + declared docs only, no duplicates/symlinks/devices/traversal/unexpected members. Extraction is member-by-member into a private staging directory, then atomic install with backup/rollback.
+
+- Shell installer requires a `tar` that supports verbose listing (`tar -tvzf`) and single-member stdout extract (`tar -xOf` / `tar -xOzf`). If listing/parsing is unavailable, install **fails closed** (no full-archive fallback).
+- PowerShell installer uses `System.IO.Compression.ZipFile` only (never `Expand-Archive`).
+
 ## Out of scope (still unsupported)
 
 - no-argument TUI handoff (`ownmesh` with no subcommand)
 - privileged broker install/uninstall
-- update check/download/apply
 - MCP serve, transfer, profile, process, workspace, multi-instance management
-- Windows installers / macOS packages / notarization / Authenticode
+- Windows MSI/NSIS installers / macOS packages / notarization / Authenticode

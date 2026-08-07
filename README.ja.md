@@ -62,7 +62,7 @@ Invoke-WebRequest -Uri https://github.com/Aero123421/OwnMesh/releases/latest/dow
 powershell -NoProfile -File .\ownmesh-installer.ps1
 ```
 
-可能なら installer を一度ダウンロードして内容を確認してから実行してください。
+可能なら installer を一度ダウンロードして内容を確認してから実行してください。minisign 必須。チェックサム検証後、updater と同等のアーカイブ契約（件数/展開サイズ上限・必須バイナリ+文書のみ・symlink/重複/path traversal 拒否）を**展開前**に強制し、メンバー単位でステージングします（フル `tar -xzf` / `Expand-Archive` は使いません）。`tar -tvzf` が安全に使えない環境では fail-closed します。
 
 ## 初回セットアップ（ビルド後）
 

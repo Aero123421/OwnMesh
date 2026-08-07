@@ -1224,6 +1224,139 @@ fn corrupt_sessions_json_fails_runtime_open() {
     );
 }
 
+/// Production daemon-start fixture: a leftover `config_written` journal (new config +
+/// old strong policy) must be recovered **before** policy is loaded into the runtime.
+#[test]
+fn production_daemon_start_recovers_config_written_journal_before_policy_use() {
+    use ownmesh_config::{
+        atomic_write, save_config_and_policy_transactional, ConfigPolicyTransaction, OwnMeshConfig,
+        PolicyFile,
+    };
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+
+    let old_cfg = OwnMeshConfig {
+        active_instance: Some("stable".into()),
+        instances: vec![ownmesh_config::InstanceConfig {
+            id: "stable".into(),
+            base_url: "https://stable.example.test".into(),
+            display_name: None,
+        }],
+        ..OwnMeshConfig::default()
+    };
+    let old_policy = PolicyFile {
+        schema_version: 1,
+        preset: Some("full_access".into()),
+    };
+    save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
+
+    let new_cfg = OwnMeshConfig {
+        active_instance: Some("half-applied".into()),
+        instances: vec![ownmesh_config::InstanceConfig {
+            id: "half-applied".into(),
+            base_url: "https://half.example.test".into(),
+            display_name: None,
+        }],
+        ..OwnMeshConfig::default()
+    };
+    let new_policy = PolicyFile {
+        schema_version: 1,
+        preset: Some("workspace_only".into()),
+    };
+    // Render via a successful transactional write to a sibling layout, then copy bytes.
+    let render_dir = tempdir().unwrap();
+    let render_paths = OwnMeshPaths::for_base(render_dir.path());
+    save_config_and_policy_transactional(&render_paths, &new_cfg, &new_policy).unwrap();
+    let new_config = std::fs::read_to_string(render_paths.config_file()).unwrap();
+    let new_policy_text = std::fs::read_to_string(render_paths.policy_file()).unwrap();
+    let old_config = std::fs::read_to_string(paths.config_file()).unwrap();
+    let old_policy_text = std::fs::read_to_string(paths.policy_file()).unwrap();
+
+    let tx = ConfigPolicyTransaction {
+        schema_version: 1,
+        phase: "config_written".into(),
+        old_config: Some(old_config),
+        old_policy: Some(old_policy_text.clone()),
+        new_config: new_config.clone(),
+        new_policy: new_policy_text,
+    };
+    let tx_path = paths.config_dir.join("setup-config-policy.txn.json");
+    let rendered = serde_json::to_vec_pretty(&tx).unwrap();
+    atomic_write(&tx_path, &rendered).unwrap();
+    atomic_write(&paths.config_file(), new_config.as_bytes()).unwrap();
+    // Policy intentionally left as old strong full_access — the H6 hazard window.
+
+    let runtime = DaemonRuntime::open(&paths).expect("daemon open must recover then start");
+    drop(runtime);
+
+    assert!(
+        !tx_path.exists(),
+        "journal must be cleared after successful recovery at daemon start"
+    );
+    let cfg_raw = std::fs::read_to_string(paths.config_file()).unwrap();
+    assert!(
+        cfg_raw.contains("stable") && !cfg_raw.contains("half-applied"),
+        "config must be restored to pre-transaction pair before policy use: {cfg_raw}"
+    );
+    let pol_raw = std::fs::read_to_string(paths.policy_file()).unwrap();
+    assert_eq!(pol_raw, old_policy_text);
+    assert!(
+        pol_raw.contains("full_access"),
+        "recovered policy must be the old pair, not a silent default"
+    );
+}
+
+/// When rollback cannot complete, daemon start must fail closed and preserve the journal.
+#[test]
+fn production_daemon_start_preserves_journal_when_recovery_rollback_fails() {
+    use ownmesh_config::{atomic_write, ConfigPolicyTransaction};
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+
+    let old_cfg_text = "schema_version = 1\nlang = \"en-US\"\n";
+    let old_pol_text = "schema_version = 1\npreset = \"full_access\"\n";
+    let new_cfg_text = "schema_version = 1\nlang = \"ja-JP\"\n";
+    let new_pol_text = "schema_version = 1\npreset = \"recommended\"\n";
+    atomic_write(&paths.config_file(), new_cfg_text.as_bytes()).unwrap();
+    atomic_write(&paths.policy_file(), old_pol_text.as_bytes()).unwrap();
+
+    let tx = ConfigPolicyTransaction {
+        schema_version: 1,
+        phase: "config_written".into(),
+        old_config: Some(old_cfg_text.into()),
+        old_policy: Some(old_pol_text.into()),
+        new_config: new_cfg_text.into(),
+        new_policy: new_pol_text.into(),
+    };
+    let tx_path = paths.config_dir.join("setup-config-policy.txn.json");
+    atomic_write(&tx_path, &serde_json::to_vec_pretty(&tx).unwrap()).unwrap();
+
+    // Fault-inject restore target: config path becomes a non-empty directory.
+    std::fs::remove_file(paths.config_file()).unwrap();
+    std::fs::create_dir(paths.config_file()).unwrap();
+    std::fs::write(paths.config_file().join("blocker"), b"1").unwrap();
+
+    let err = match DaemonRuntime::open(&paths) {
+        Ok(_) => panic!("daemon must refuse start when recovery cannot complete"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_ascii_lowercase().contains("policy")
+            || err.to_ascii_lowercase().contains("journal")
+            || err.to_ascii_lowercase().contains("recover")
+            || err.to_ascii_lowercase().contains("rollback"),
+        "err={err}"
+    );
+    assert!(
+        tx_path.is_file(),
+        "journal must be preserved after failed recovery at daemon start"
+    );
+}
+
 #[test]
 fn revoked_state_aliases_are_canonicalized_on_load_and_rewritten() {
     let dir = tempdir().unwrap();

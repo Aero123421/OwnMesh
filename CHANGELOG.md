@@ -7,6 +7,7 @@
 - Multi-arch portable archives: Windows x64, macOS arm64/x64, Linux musl arm64/x64.
 - Required minisign signing of `SHA256SUMS` with immediate verify; no degraded unsigned formal release.
 - Installers for macOS/Linux (`ownmesh-installer.sh`) and Windows (`ownmesh-installer.ps1`) **require** minisign verification of `SHA256SUMS.minisig` against the pinned trust root before trusting checksums (no SHA-only fallback; no `curl|sh` / `irm|iex`).
+- Installers enforce the updater archive contract **before** extraction (entry/size caps, exact allow-list, no full `tar -xzf` / `Expand-Archive`); member-by-member staging + atomic install/rollback; fail closed when safe listing/extract is unavailable.
 - Homebrew formula template + `scripts/render_distribution.py` checksum injection.
 - Release assets include installers, `ownmesh.rb`, `ownmesh-release-meta.json`, SBOMs, provenance.
 
@@ -20,7 +21,8 @@
 
 ### Onboarding / local trust boundary
 
-- `setup` config+policy journaled transaction with durable recovery (no new-config + old-strong-policy window).
+- `setup` config+policy journaled transaction under exclusive lock with durable recovery (no new-config + old-strong-policy window).
+- Mandatory fail-closed recovery on every production config/policy load path (daemon start, CLI); recovery failure preserves journal and refuses operation; concurrent setup serialized.
 - Strict control-plane `url::Url` validation (https / loopback-http only; reject userinfo/query/fragment); redacted errors.
 - `doctor` never loads OS credentials; presence from non-secret metadata only.
 - Human-operator IPC (`approval.approve|deny`, `policy.preset`, `daemon.unlock`, `token.revoke`) fail-closed until a distinct OS/UI presence proof exists (same-UID unauthenticated IPC is not human presence).
