@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import re
 import shlex
 import shutil
 import stat
@@ -163,6 +164,8 @@ class InstallerAdversarialTests(unittest.TestCase):
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
             self.assertNotEqual(failed.returncode, 0)
@@ -198,6 +201,8 @@ class InstallerAdversarialTests(unittest.TestCase):
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
             self.assertEqual(
@@ -695,7 +700,9 @@ class InstallerAdversarialTests(unittest.TestCase):
         asset_name, windows = _asset_name()
         if not windows:
             self.skipTest("windows host required")
-        pwsh = shutil.which("powershell") or shutil.which("pwsh")
+        # Prefer PowerShell 7 so a pwsh-hosted CI process does not pass a PS7-only
+        # PSModulePath into Windows PowerShell 5.1 and break cmdlet auto-loading.
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
         if not pwsh:
             self.skipTest("powershell not available")
         with tempfile.TemporaryDirectory(prefix="ownmesh-ps-installer-") as tmp:
@@ -703,30 +710,159 @@ class InstallerAdversarialTests(unittest.TestCase):
             package = tmp_path / "pkg"
             assets = tmp_path / "assets"
             install = tmp_path / "install"
-            _write_fake_bins(package, windows=True)
-            # Provide a tiny realish ownmesh.exe that returns version via cmd shim:
-            # The smoke test executes ownmesh.exe --version; write a .cmd won't work for .exe.
-            # Skip full execution if we cannot produce a runnable PE; still pack for checksum path
-            # by replacing smoke binary with a copy of a real python launcher? Too heavy.
-            # Instead run installer expecting smoke failure after integrity — assert checksum path
-            # by corrupting and expecting mismatch first.
-            _pack(package, assets, asset_name, windows=True)
+            package.mkdir()
+            for binary in BINS:
+                source = ROOT / "target" / "debug" / f"{binary}.exe"
+                self.assertTrue(source.is_file(), f"cargo build must produce {source}")
+                shutil.copy2(source, package / f"{binary}.exe")
+            for meta in ("LICENSE", "NOTICE", "README.md", "RELEASE_NOTES.md"):
+                source = ROOT / meta
+                if source.is_file():
+                    shutil.copy2(source, package / meta)
+                else:
+                    (package / meta).write_text(meta + "\n", encoding="utf-8")
+            pub, _ = _pack(package, assets, asset_name, windows=True)
             env = os.environ.copy()
             env["OWNMESH_ASSET_DIR"] = str(assets)
             env["OWNMESH_INSTALL_DIR"] = str(install)
             env["OWNMESH_NO_MODIFY_PATH"] = "1"
-            # Corrupt checksum path
-            bad = tmp_path / "bad"
-            shutil.copytree(assets, bad)
-            with (bad / asset_name).open("ab") as handle:
-                handle.write(b"x")
-            env["OWNMESH_ASSET_DIR"] = str(bad)
+            env["OWNMESH_MINISIGN_PUB"] = str(pub)
+
             completed = subprocess.run(
                 [pwsh, "-NoProfile", "-File", str(PS_INSTALLER)],
                 cwd=str(ROOT),
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn(
+                "minisign: SHA256SUMS signature ok",
+                completed.stdout + completed.stderr,
+            )
+            version_match = re.search(
+                r'(?m)^version = "([^"]+)"$',
+                (ROOT / "Cargo.toml").read_text(encoding="utf-8"),
+            )
+            self.assertIsNotNone(version_match)
+            expected_version = version_match.group(1) if version_match else ""
+            for binary in BINS:
+                installed = install / f"{binary}.exe"
+                self.assertTrue(installed.is_file(), binary)
+                smoke = subprocess.run(
+                    [str(installed), "--version"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(smoke.returncode, 0, smoke.stdout + smoke.stderr)
+                self.assertIn(binary, smoke.stdout.lower())
+                self.assertIn(expected_version, smoke.stdout)
+
+            # A file reparse point must be rejected before replacing any target.
+            reparse_install = tmp_path / "reparse-install"
+            reparse_install.mkdir()
+            old_reparse_ownmesh = reparse_install / "ownmesh.exe"
+            shutil.copy2(sys.executable, old_reparse_ownmesh)
+            old_reparse_hash = _sha256(old_reparse_ownmesh)
+            os.symlink(sys.executable, reparse_install / "ownmesh-tui.exe")
+            env["OWNMESH_INSTALL_DIR"] = str(reparse_install)
+            completed = subprocess.run(
+                [pwsh, "-NoProfile", "-File", str(PS_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("reparse point", (completed.stdout + completed.stderr).lower())
+            self.assertEqual(_sha256(old_reparse_ownmesh), old_reparse_hash)
+
+            # Deny deletion of the second existing target so Move-Item fails after
+            # ownmesh.exe was replaced. The first target must be restored and no
+            # later binary may remain as a partial new installation.
+            import ctypes
+            from ctypes import wintypes
+
+            rollback_install = tmp_path / "rollback-install"
+            rollback_install.mkdir()
+            old_ownmesh = rollback_install / "ownmesh.exe"
+            old_tui = rollback_install / "ownmesh-tui.exe"
+            shutil.copy2(sys.executable, old_ownmesh)
+            shutil.copy2(sys.executable, old_tui)
+            old_ownmesh_hash = _sha256(old_ownmesh)
+            old_tui_hash = _sha256(old_tui)
+            create_file = ctypes.windll.kernel32.CreateFileW
+            create_file.argtypes = [
+                wintypes.LPCWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.HANDLE,
+            ]
+            create_file.restype = wintypes.HANDLE
+            close_handle = ctypes.windll.kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            locked_handle = create_file(
+                str(old_tui),
+                0x80000000,  # GENERIC_READ
+                0x00000001,  # FILE_SHARE_READ (deny replacement/delete)
+                None,
+                3,  # OPEN_EXISTING
+                0x00000080,  # FILE_ATTRIBUTE_NORMAL
+                None,
+            )
+            invalid_handle = ctypes.c_void_p(-1).value
+            self.assertNotEqual(locked_handle, invalid_handle)
+            env["OWNMESH_INSTALL_DIR"] = str(rollback_install)
+            try:
+                completed = subprocess.run(
+                    [pwsh, "-NoProfile", "-File", str(PS_INSTALLER)],
+                    cwd=str(ROOT),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            finally:
+                close_handle(locked_handle)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(
+                "Atomic install failed; restoring backup",
+                completed.stdout + completed.stderr,
+            )
+            self.assertEqual(_sha256(old_ownmesh), old_ownmesh_hash)
+            self.assertEqual(_sha256(old_tui), old_tui_hash)
+            for binary in BINS[2:]:
+                self.assertFalse((rollback_install / f"{binary}.exe").exists(), binary)
+
+            # A signed checksum with a corrupted archive still fails before extraction.
+            bad = tmp_path / "bad"
+            shutil.copytree(assets, bad)
+            with (bad / asset_name).open("ab") as handle:
+                handle.write(b"x")
+            env["OWNMESH_ASSET_DIR"] = str(bad)
+            env["OWNMESH_INSTALL_DIR"] = str(tmp_path / "bad-install")
+            env["OWNMESH_MINISIGN_PUB"] = str(bad / "minisign.pub")
+            completed = subprocess.run(
+                [pwsh, "-NoProfile", "-File", str(PS_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
             self.assertNotEqual(completed.returncode, 0)

@@ -9,6 +9,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
+    clippy::await_holding_lock,
     clippy::doc_markdown,
     clippy::manual_let_else,
     clippy::missing_errors_doc,
@@ -25,6 +26,28 @@
 
 use ownmesh_config::OwnMeshConfig;
 use ownmesh_ipc::LocalListener;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+static UNIX_SECURITY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct UnixSecurityTestGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for UnixSecurityTestGuard {
+    fn drop(&mut self) {
+        LocalListener::clear_unix_security();
+    }
+}
+
+fn unix_security_test_guard() -> UnixSecurityTestGuard {
+    let lock = UNIX_SECURITY_TEST_LOCK.get_or_init(|| Mutex::new(()));
+    let guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    LocalListener::clear_unix_security();
+    UnixSecurityTestGuard { _lock: guard }
+}
 
 #[test]
 fn service_socket_config_rejects_world_writable_mode() {
@@ -64,6 +87,7 @@ fn service_socket_group_bits_require_group() {
 
 #[test]
 fn local_listener_refuses_world_mode_configuration() {
+    let _security_guard = unix_security_test_guard();
     let err = LocalListener::configure_unix_security(None, None, Some(0o666), vec![])
         .expect_err("0666 refused");
     let msg = err.to_string();
@@ -76,12 +100,14 @@ fn local_listener_refuses_world_mode_configuration() {
 
 #[test]
 fn local_listener_accepts_restrictive_mode() {
+    let _security_guard = unix_security_test_guard();
     LocalListener::configure_unix_security(None, None, Some(0o600), vec![1, 2]).expect("0600 ok");
     LocalListener::clear_unix_security();
 }
 
 #[test]
 fn daemon_service_socket_fields_are_readable_from_config() {
+    let _security_guard = unix_security_test_guard();
     let mut cfg = OwnMeshConfig::default();
     cfg.service_socket.allowed_uids = vec![1, 2, 3];
     cfg.service_socket.mode = Some("600".into());
@@ -121,6 +147,7 @@ mod unix_socket_boundary {
 
     #[tokio::test]
     async fn allowed_peer_connect_hello_succeeds_disallowed_uid_rejected() {
+        let _security_guard = unix_security_test_guard();
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("svc.sock");
         let uid = current_uid();
@@ -134,10 +161,11 @@ mod unix_socket_boundary {
             Arc::new(|_m, _p, _id| Box::pin(async { Ok(serde_json::json!({ "ok": true })) })),
         ));
         let serve = Arc::clone(&server);
-        let handle = tokio::spawn(async move {
-            let _ = serve.serve().await;
-        });
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let mut handle = tokio::spawn(async move { serve.serve().await });
+        tokio::select! {
+            result = &mut handle => panic!("server exited before readiness: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(80)) => {}
+        }
 
         let meta = std::fs::metadata(&sock_path).expect("socket exists");
         let mode = meta.permissions().mode() & 0o777;
@@ -158,7 +186,10 @@ mod unix_socket_boundary {
         let _ = methods::STATUS; // keep import meaningful for method name stability
 
         server.request_shutdown();
-        let _ = handle.await;
+        handle
+            .await
+            .expect("server task join")
+            .expect("server shutdown");
         LocalListener::clear_unix_security();
 
         if uid != 0 {
@@ -171,10 +202,11 @@ mod unix_socket_boundary {
                 Arc::new(|_m, _p, _id| Box::pin(async { Ok(serde_json::json!({ "ok": true })) })),
             ));
             let serve2 = Arc::clone(&server2);
-            let handle2 = tokio::spawn(async move {
-                let _ = serve2.serve().await;
-            });
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            let mut handle2 = tokio::spawn(async move { serve2.serve().await });
+            tokio::select! {
+                result = &mut handle2 => panic!("disallowed server exited before readiness: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(80)) => {}
+            }
 
             let client2 = IpcClient::new(
                 endpoint2,
@@ -202,13 +234,17 @@ mod unix_socket_boundary {
             );
 
             server2.request_shutdown();
-            let _ = handle2.await;
+            handle2
+                .await
+                .expect("disallowed server task join")
+                .expect("disallowed server shutdown");
             LocalListener::clear_unix_security();
         }
     }
 
     #[tokio::test]
     async fn acl_apply_failure_is_fail_closed() {
+        let _security_guard = unix_security_test_guard();
         let uid = current_uid();
         if uid == 0 {
             return;

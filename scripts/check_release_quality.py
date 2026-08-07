@@ -171,9 +171,21 @@ def main() -> int:
     ci = read(".github/workflows/ci.yml")
     security = read(".github/workflows/security.yml")
     release = read(".github/workflows/release.yml")
+    installer_tests = read("scripts/tests/test_installers.py")
+    attributes = read(".gitattributes")
     workflow_dir = ROOT / ".github/workflows"
     workflow_paths = sorted([*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")])
     workflows = "\n".join(path.read_text(encoding="utf-8") for path in workflow_paths)
+
+    require_text(ci, "Windows portable installer integration", "Windows installer CI gate")
+    require_text(ci, "python scripts/tests/test_installers.py", "Windows installer CI gate")
+    require_text(
+        ci,
+        "b9c31c2c3034f81f0e5f5d92cbcc20e67a9671b6e5455661588638848dc58031",
+        "Windows installer pinned minisign bootstrap",
+    )
+    require_text(installer_tests, '["sh", "-n", str(SH_INSTALLER)]', "POSIX installer syntax gate")
+    require_text(attributes, "*.sh text eol=lf", "POSIX installer line endings")
     require("1.85" not in workflows, "workflow toolchains must not reference Rust 1.85")
     require("continue-on-error" not in workflows, "required workflow jobs cannot continue on error")
     require("|| true" not in workflows, "workflow validation cannot discard failures")

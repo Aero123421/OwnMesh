@@ -136,6 +136,17 @@ class CheckerMutationTests(unittest.TestCase):
         with _Mutation(".github/workflows/ci.yml", mutate):
             _must_fail("rust 1.85 toolchain")
 
+    def test_mutation_windows_installer_gate_fails(self) -> None:
+        def mutate(text: str) -> str:
+            return text.replace(
+                "python scripts/tests/test_installers.py",
+                'Write-Host "installer integration skipped"',
+                1,
+            )
+
+        with _Mutation(".github/workflows/ci.yml", mutate):
+            _must_fail("Windows installer integration removed")
+
     def test_mutation_continue_on_error_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
