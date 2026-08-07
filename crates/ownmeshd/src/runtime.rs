@@ -24,16 +24,16 @@
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
-    classify_from_request_in_dir, resolve_executable_path, run_command, CommandKind,
-    IdempotencyJournal, RunRequest, RunResult,
+    classify_from_request_in_dir, pin_executable, resolve_executable_path, run_command,
+    verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
 };
 use ownmesh_fs::{
     delete_path, git_diff, git_status, list_dir, read_file, stat_path, write_file, GitDiffOpts,
     GitStatusOpts, WorkspaceRoot,
 };
 use ownmesh_ipc::{
-    app_error, canonicalize_principal_key, methods, ClientIdentity, IpcError, IpcResult,
-    MethodHandler, RevokedClients,
+    app_error, canonicalize_principal_key, is_credentialed_client_principal, is_human_os_principal,
+    methods, ClientIdentity, IpcError, IpcResult, MethodHandler, RevokedClients,
 };
 use ownmesh_logs::{
     register_builtin_providers, BuiltinProviderConfig, LogCursor, LogError, LogRegistry,
@@ -96,10 +96,19 @@ pub struct ApprovalRecord {
     pub decided_at_unix: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule_id: Option<String>,
+    /// Authenticated principal that enqueued the deferred operation (server-assigned).
+    #[serde(default)]
+    pub requester_principal: String,
+    /// Policy facts snapshot captured at enqueue (capability/kind/program/path/…). 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<OperationFacts>,
     /// Serialized original request params.
     pub request: PendingRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Principal that decided the approval (human OS user only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by_principal: Option<String>,
 }
 
 /// Deferred request body stored until approval.
@@ -138,6 +147,9 @@ pub struct ExecParams {
     pub max_output_bytes: Option<usize>,
     #[serde(default)]
     pub elevated: bool,
+    /// Server-computed executable identity pin (device/inode/digest). Client values overwritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_pin: Option<ExecutablePin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,14 +594,17 @@ impl DaemonRuntime {
         Ok(())
     }
 
-    fn evaluate(&self, facts: &OperationFacts) -> ownmesh_policy::PolicyVerdict {
-        evaluate_with_grants(
-            &self.policy,
-            facts,
-            &self.grants,
-            Self::now(),
-            LOCAL_PRINCIPAL,
-        )
+    fn evaluate(
+        &self,
+        facts: &OperationFacts,
+        principal_id: &str,
+    ) -> ownmesh_policy::PolicyVerdict {
+        let principal = if principal_id.trim().is_empty() {
+            LOCAL_PRINCIPAL
+        } else {
+            principal_id
+        };
+        evaluate_with_grants(&self.policy, facts, &self.grants, Self::now(), principal)
     }
 
     fn lookup_idempotent(&self, key: Option<&String>) -> IpcResult<Option<Value>> {
@@ -658,6 +673,7 @@ impl DaemonRuntime {
         facts: OperationFacts,
         idempotency_key: Option<String>,
         request: PendingRequest,
+        client: &ClientIdentity,
     ) -> IpcResult<Value> {
         if let Some(prev) = self.lookup_idempotent(idempotency_key.as_ref())? {
             let mut replayed = prev;
@@ -666,8 +682,9 @@ impl DaemonRuntime {
             }
             return Ok(replayed);
         }
+        let requester_principal = canonicalize_principal_key(client.principal_key());
 
-        let verdict = self.evaluate(&facts);
+        let verdict = self.evaluate(&facts, &requester_principal);
         let operation_id = Self::new_id("op_");
         self.append_audit(
             "policy.evaluate",
@@ -702,8 +719,11 @@ impl DaemonRuntime {
                     created_at_unix: Self::now(),
                     decided_at_unix: None,
                     matched_rule_id: verdict.matched_rule_id.clone(),
+                    requester_principal: requester_principal.clone(),
+                    facts: Some(facts.clone()),
                     request,
                     result: None,
+                    decided_by_principal: None,
                 };
                 let approvals_snapshot = self.approvals.clone();
                 self.approvals.insert(approval_id.clone(), rec);
@@ -786,10 +806,48 @@ impl DaemonRuntime {
                 message: "command classification changed to raw_shell before execution; request must be re-authorized".into(),
             });
         }
+        // Fail closed when the pinned executable identity/content drifted (TOCTOU).
+        if let Some(pin) = &p.executable_pin {
+            let pin_path = Path::new(&pin.path);
+            // Prefer the pinned path; fall back to the request program only when equal.
+            let check_path = if p.program == pin.path {
+                Path::new(&p.program)
+            } else {
+                pin_path
+            };
+            if let Err(err) = verify_executable_pin(check_path, pin) {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!(
+                        "executable identity changed before execution; request must be re-authorized ({err})"
+                    ),
+                });
+            }
+            if current_kind.as_str() != pin.policy_kind {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: "command classification drifted from pinned policy_kind before execution"
+                        .into(),
+                });
+            }
+        } else if matches!(approved_kind, CommandKind::Structured)
+            && Path::new(&p.program).is_absolute()
+        {
+            // Structured absolute executables must always carry a pin after enqueue/allow.
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: "structured executable missing identity pin; request must be re-authorized"
+                    .into(),
+            });
+        }
         // `handle_exec` replaced argv executable aliases with the exact canonical
         // path that was classified. Do not reopen the original symlink/PATH alias.
         let kind = CommandKind::parse_requested(p.kind.as_deref());
-        let execution_program = p.program.clone();
+        let execution_program = p
+            .executable_pin
+            .as_ref()
+            .map(|pin| pin.path.clone())
+            .unwrap_or_else(|| p.program.clone());
 
         // elevated=true is production-unsupported until a secure mint authority exists.
         // Fail closed regardless of broker install/artifacts; never fall back to local exec.
@@ -967,8 +1025,15 @@ impl DaemonRuntime {
         })
     }
 
-    async fn handle_exec(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_exec(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let mut p: ExecParams = parse_params(params)?;
+        // Never trust client-supplied pins / policy classification.
+        p.executable_pin = None;
+        p.policy_kind = None;
         if p.program.trim().is_empty() {
             return Err(IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
@@ -990,6 +1055,17 @@ impl DaemonRuntime {
         // all `env` indirection cannot bypass raw_shell rules.
         let kind = classify_from_request_in_dir(p.kind.as_deref(), &p.program, &p.args, cwd);
         p.policy_kind = Some(kind.as_str().to_owned());
+        if matches!(kind, CommandKind::Structured) {
+            let program_path = Path::new(&p.program);
+            if program_path.is_absolute() {
+                p.executable_pin = Some(pin_executable(program_path, kind).map_err(|e| {
+                    IpcError::Remote {
+                        code: app_error::POLICY_DENIED,
+                        message: format!("unable to pin structured executable identity: {e}"),
+                    }
+                })?);
+            }
+        }
         let facts = OperationFacts {
             capability: "command.run".into(),
             kind: kind.as_str().to_string(),
@@ -999,10 +1075,15 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::Exec(p)).await
+        self.gate_and_run(facts, key, PendingRequest::Exec(p), client)
+            .await
     }
 
-    async fn handle_fs_list(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_fs_list(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: FsListParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
@@ -1012,11 +1093,15 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsList(p))
+        self.gate_and_run(facts, key, PendingRequest::FsList(p), client)
             .await
     }
 
-    async fn handle_fs_stat(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_fs_stat(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: FsStatParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
@@ -1026,11 +1111,15 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsStat(p))
+        self.gate_and_run(facts, key, PendingRequest::FsStat(p), client)
             .await
     }
 
-    async fn handle_fs_read(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_fs_read(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: FsReadParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
@@ -1040,11 +1129,15 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsRead(p))
+        self.gate_and_run(facts, key, PendingRequest::FsRead(p), client)
             .await
     }
 
-    async fn handle_fs_write(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_fs_write(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: FsWriteParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
@@ -1054,11 +1147,15 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsWrite(p))
+        self.gate_and_run(facts, key, PendingRequest::FsWrite(p), client)
             .await
     }
 
-    async fn handle_fs_delete(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_fs_delete(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: FsDeleteParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
@@ -1069,11 +1166,15 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsDelete(p))
+        self.gate_and_run(facts, key, PendingRequest::FsDelete(p), client)
             .await
     }
 
-    async fn handle_logs_query(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_logs_query(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: LogsQueryParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "logs.read".into(),
@@ -1081,7 +1182,7 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::LogsQuery(p))
+        self.gate_and_run(facts, key, PendingRequest::LogsQuery(p), client)
             .await
     }
 
@@ -1091,7 +1192,11 @@ impl DaemonRuntime {
         Ok(json!({ "providers": reg.list_ids() }))
     }
 
-    async fn handle_git_status(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_git_status(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: GitStatusParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
@@ -1102,11 +1207,15 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::GitStatus(p))
+        self.gate_and_run(facts, key, PendingRequest::GitStatus(p), client)
             .await
     }
 
-    async fn handle_git_diff(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_git_diff(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let p: GitDiffParams = parse_params(params)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
@@ -1117,7 +1226,7 @@ impl DaemonRuntime {
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::GitDiff(p))
+        self.gate_and_run(facts, key, PendingRequest::GitDiff(p), client)
             .await
     }
 
@@ -1139,7 +1248,11 @@ impl DaemonRuntime {
         })
     }
 
-    async fn handle_approval_approve(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    async fn handle_approval_approve(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         #[derive(Deserialize)]
         struct P {
             id: String,
@@ -1147,8 +1260,21 @@ impl DaemonRuntime {
             grant_seconds: Option<i64>,
             #[serde(default)]
             temporary_grant: bool,
+            // Client-supplied approver identity is intentionally ignored.
+            #[serde(default)]
+            approver_principal_id: Option<String>,
+            #[serde(default)]
+            approver_id: Option<String>,
+            #[serde(default)]
+            principal_id: Option<String>,
         }
         let p: P = parse_params(params)?;
+        let _ = (
+            p.approver_principal_id,
+            p.approver_id,
+            p.principal_id,
+        );
+        let approver = canonicalize_principal_key(client.principal_key());
         let rec = self.approvals.get(&p.id).ok_or_else(|| IpcError::Remote {
             code: app_error::INVALID_PARAMS,
             message: format!("approval not found: {}", p.id),
@@ -1159,9 +1285,11 @@ impl DaemonRuntime {
                 message: format!("approval already {}", rec.state),
             });
         }
+        ensure_independent_human_approver(&approver, &rec.requester_principal)?;
         let request = rec.request.clone();
         let capability = rec.capability.clone();
         let operation_id = rec.operation_id.clone();
+        let requester_principal = rec.requester_principal.clone();
         let idem_key = match &request {
             PendingRequest::Exec(x) => x.idempotency_key.clone(),
             PendingRequest::FsList(x) => x.idempotency_key.clone(),
@@ -1201,10 +1329,16 @@ impl DaemonRuntime {
 
         if p.temporary_grant {
             let secs = p.grant_seconds.unwrap_or(DEFAULT_GRANT_SECS);
+            // Bind the grant to the requester that was approved — never a global prin_local.
+            let grant_principal = if requester_principal.is_empty() {
+                LOCAL_PRINCIPAL.to_owned()
+            } else {
+                requester_principal.clone()
+            };
             self.grants.push(TemporaryGrant {
                 id: Self::new_id("grant_"),
                 capability: capability.clone(),
-                principal_id: LOCAL_PRINCIPAL.into(),
+                principal_id: grant_principal,
                 expires_unix: Self::now().saturating_add(secs),
                 path_prefix: None,
             });
@@ -1251,6 +1385,7 @@ impl DaemonRuntime {
         if let Some(rec) = self.approvals.get_mut(&p.id) {
             rec.state = "approved".into();
             rec.result = Some(body.clone());
+            rec.decided_by_principal = Some(approver);
         }
         if let Err(e) = self.persist_approvals() {
             // The operation ran. Keep the durable and in-memory non-retriable
@@ -1270,8 +1405,13 @@ impl DaemonRuntime {
         Ok(body)
     }
 
-    fn handle_approval_deny(&mut self, params: Option<Value>) -> IpcResult<Value> {
+    fn handle_approval_deny(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
         let id = require_id(params, "id")?;
+        let approver = canonicalize_principal_key(client.principal_key());
         let approvals_snapshot = self.approvals.clone();
         let rec = self
             .approvals
@@ -1286,8 +1426,10 @@ impl DaemonRuntime {
                 message: format!("approval already {}", rec.state),
             });
         }
+        ensure_independent_human_approver(&approver, &rec.requester_principal)?;
         rec.state = "denied".into();
         rec.decided_at_unix = Some(Self::now());
+        rec.decided_by_principal = Some(approver);
         let operation_id = rec.operation_id.clone();
         let capability = rec.capability.clone();
         if let Err(e) = self.persist_approvals() {
@@ -1422,7 +1564,8 @@ impl DaemonRuntime {
             elevated: p.elevated,
             ..Default::default()
         };
-        let verdict = self.evaluate(&facts);
+        // Explain uses the local operator principal; grants are principal-scoped.
+        let verdict = self.evaluate(&facts, LOCAL_PRINCIPAL);
         Ok(json!({
             "facts": facts,
             "decision": decision_str(verdict.decision),
@@ -1511,20 +1654,20 @@ impl DaemonRuntime {
         }
         self.check_lockdown(method)?;
         match method {
-            methods::OPS_EXEC => self.handle_exec(params).await,
-            methods::OPS_FS_LIST => self.handle_fs_list(params).await,
-            methods::OPS_FS_STAT => self.handle_fs_stat(params).await,
-            methods::OPS_FS_READ => self.handle_fs_read(params).await,
-            methods::OPS_FS_WRITE => self.handle_fs_write(params).await,
-            methods::OPS_FS_DELETE => self.handle_fs_delete(params).await,
-            methods::OPS_LOGS_QUERY => self.handle_logs_query(params).await,
+            methods::OPS_EXEC => self.handle_exec(params, client).await,
+            methods::OPS_FS_LIST => self.handle_fs_list(params, client).await,
+            methods::OPS_FS_STAT => self.handle_fs_stat(params, client).await,
+            methods::OPS_FS_READ => self.handle_fs_read(params, client).await,
+            methods::OPS_FS_WRITE => self.handle_fs_write(params, client).await,
+            methods::OPS_FS_DELETE => self.handle_fs_delete(params, client).await,
+            methods::OPS_LOGS_QUERY => self.handle_logs_query(params, client).await,
             ops_methods::LOGS_LIST_PROVIDERS => self.handle_logs_list_providers(params),
-            ops_methods::GIT_STATUS => self.handle_git_status(params).await,
-            ops_methods::GIT_DIFF => self.handle_git_diff(params).await,
+            ops_methods::GIT_STATUS => self.handle_git_status(params, client).await,
+            ops_methods::GIT_DIFF => self.handle_git_diff(params, client).await,
             methods::APPROVAL_LIST => self.handle_approval_list(),
             methods::APPROVAL_SHOW => self.handle_approval_show(params),
-            methods::APPROVAL_APPROVE => self.handle_approval_approve(params).await,
-            methods::APPROVAL_DENY => self.handle_approval_deny(params),
+            methods::APPROVAL_APPROVE => self.handle_approval_approve(params, client).await,
+            methods::APPROVAL_DENY => self.handle_approval_deny(params, client),
             methods::POLICY_SHOW => self.handle_policy_show(),
             methods::POLICY_PRESET => self.handle_policy_preset(params),
             methods::POLICY_VALIDATE => self.handle_policy_validate(),
@@ -2082,6 +2225,33 @@ pub fn runtime_handler(runtime: Arc<Mutex<DaemonRuntime>>) -> MethodHandler {
             guard.dispatch(&method, params, &client).await
         })
     })
+}
+
+/// Fail-closed gate for approval decisions.
+///
+/// - Approver must be an OS-attested human principal (`user:*`).
+/// - Credentialed client/service requesters cannot self-approve.
+/// - Client-supplied approver fields are never consulted (caller passes auth identity only).
+fn ensure_independent_human_approver(approver: &str, requester: &str) -> IpcResult<()> {
+    let approver = canonicalize_principal_key(approver);
+    let requester = canonicalize_principal_key(requester);
+    if approver.is_empty() || !is_human_os_principal(&approver) {
+        return Err(IpcError::Remote {
+            code: app_error::UNAUTHORIZED,
+            message: "approval requires an independently authenticated human OS principal (user:*)"
+                .into(),
+        });
+    }
+    // Non-human / credentialed requesters may only be decided by a different human principal.
+    if is_credentialed_client_principal(&requester) && (requester == approver || requester.is_empty())
+    {
+        return Err(IpcError::Remote {
+            code: app_error::UNAUTHORIZED,
+            message: "operation creator cannot self-approve; independent human principal required"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Reject request-declared principal when it disagrees with authenticated identity.

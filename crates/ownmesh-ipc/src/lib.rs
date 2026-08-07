@@ -40,6 +40,7 @@ mod transport;
 
 pub use auth::{
     canonicalize_principal_key, constant_time_eq, current_os_user_id, generate_token,
+    human_operator_method, is_credentialed_client_principal, is_human_os_principal,
     normalize_principal_part, read_token_file, redact_secrets, write_token_file, AuthGate,
     AuthResolution, ClientCredentialRecord, OsPeerIdentity, PeerCredential, RedactedSecret,
     AUTH_TOKEN_FILE_NAME,

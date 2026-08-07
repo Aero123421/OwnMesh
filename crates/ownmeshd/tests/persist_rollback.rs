@@ -39,6 +39,16 @@ fn client(name: &str) -> ClientIdentity {
     ClientIdentity::new(name, "0.1.0")
 }
 
+/// Direct-dispatch human principal for approval.approve/deny runtime gates.
+fn human(name: &str) -> ClientIdentity {
+    let principal = if name.starts_with("user:") {
+        name.to_owned()
+    } else {
+        format!("user:{name}")
+    };
+    ClientIdentity::new(principal, "0.1.0")
+}
+
 fn block_path_as_dir(path: &Path) {
     if path.exists() {
         if path.is_file() {
@@ -217,7 +227,7 @@ async fn approval_deny_persist_failure_restores_pending_record() {
         .dispatch(
             methods::APPROVAL_DENY,
             Some(json!({ "id": id })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect_err("approval deny persist must fail");
@@ -256,7 +266,7 @@ async fn grant_persist_failure_through_approval_handler_restores_all_memory() {
         .dispatch(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": id, "temporary_grant": true })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect_err("grant persist must fail");
@@ -292,7 +302,7 @@ async fn approval_journal_final_persist_failure_retains_executing_marker() {
         .dispatch(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": id, "temporary_grant": true })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect_err("approval journal final persist must fail");
@@ -319,7 +329,7 @@ async fn approval_journal_final_persist_failure_retains_executing_marker() {
         .dispatch(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": id })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect_err("executing approval must not be retried");
@@ -384,7 +394,7 @@ async fn approval_record_persist_failure_restores_all_related_memory() {
         .dispatch(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": id, "temporary_grant": true })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect_err("approval persist must fail");
@@ -436,7 +446,7 @@ async fn approval_final_record_persist_failure_retains_durable_executing_marker(
         .dispatch(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": id })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect_err("final approval persist must fail");
@@ -472,7 +482,7 @@ async fn approval_final_record_persist_failure_retains_durable_executing_marker(
         .dispatch(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": id })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect_err("durable executing marker must reject retry");
@@ -506,7 +516,7 @@ async fn approvals_survive_restart_with_pending_and_decided_state() {
         rt.dispatch(
             methods::APPROVAL_DENY,
             Some(json!({ "id": id })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect("persist denial");
@@ -537,7 +547,7 @@ async fn approved_result_grant_and_journal_survive_restart() {
         rt.dispatch(
             methods::APPROVAL_APPROVE,
             Some(json!({ "id": id, "temporary_grant": true })),
-            &client("local"),
+            &human("local"),
         )
         .await
         .expect("approve");

@@ -167,8 +167,6 @@ fn non_shell_programs_remain_structured() {
         ("echo", &["hi"]),
         ("/bin/ls", &["-la"]),
         ("git", &["status", "-c", "foo=bar"]),
-        ("python3", &["-c", "print(1)"]),
-        ("node", &["-e", "1"]),
         ("cargo", &["test"]),
     ];
     for (program, args) in cases {
@@ -181,6 +179,61 @@ fn non_shell_programs_remain_structured() {
         );
         assert!(!is_shell_binary(program));
     }
+}
+
+#[test]
+fn interpreters_and_script_extensions_are_raw() {
+    let cases: &[(&str, &[&str])] = &[
+        ("python3", &["-c", "print(1)"]),
+        ("node", &["-e", "1"]),
+        ("ruby", &["-e", "1"]),
+        ("tool.ps1", &[]),
+        ("run.bat", &[]),
+        ("setup.cmd", &[]),
+        ("helper.sh", &[]),
+    ];
+    for (program, args) in cases {
+        let argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            classify_from_request(Some("structured"), program, &argv),
+            CommandKind::RawShell,
+            "interpreter/script must be raw: {program:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shebang_script_is_raw_and_pin_detects_content_drift() {
+    use ownmesh_exec::{pin_executable, verify_executable_pin};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool");
+    std::fs::write(&path, b"\x7fELFnative-binary-placeholder").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        classify_from_request(Some("structured"), path.to_str().unwrap(), &[]),
+        CommandKind::Structured
+    );
+    let pin = pin_executable(&path, CommandKind::Structured).unwrap();
+
+    // Atomic path-preserving replacement with a shebang script.
+    let swapped = dir.path().join("tool.swapped");
+    std::fs::write(&swapped, b"#!/bin/sh\ntouch pwned\n").unwrap();
+    std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&swapped, &path).unwrap();
+
+    assert_eq!(
+        classify_from_request(Some("structured"), path.to_str().unwrap(), &[]),
+        CommandKind::RawShell,
+        "shebang replacement must classify raw"
+    );
+    assert!(
+        verify_executable_pin(&path, &pin).is_err(),
+        "content digest must fail closed on replacement"
+    );
 }
 
 #[test]

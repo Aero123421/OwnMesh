@@ -548,6 +548,12 @@ impl AuthGate {
     ///
     /// Returns [`IpcError::Unauthorized`] when the method is denied.
     pub fn authorize_method(&self, method: &str, auth: &AuthResolution) -> IpcResult<()> {
+        // Human-operator actions require OS user-presence (uncredentialed user:*).
+        // Client credentials — including the cooperative management credential that is
+        // readable by any same-uid process — are never a human approval boundary.
+        if human_operator_method(method) {
+            return authorize_human_operator_method(auth);
+        }
         if auth.credentialed {
             let client_id = auth.client_id.as_deref().ok_or_else(|| {
                 IpcError::Unauthorized("credentialed identity has no registry client id".into())
@@ -610,7 +616,8 @@ impl AuthGate {
         }
         Err(IpcError::Unauthorized(format!(
             "method '{method}' requires a server-issued client credential \
-             (uncredentialed same-uid peers may only call ipc.ping and daemon.status)"
+             (uncredentialed same-uid peers may only call ipc.ping/daemon.status \
+              or human-operator methods with OS user presence)"
         )))
     }
 
@@ -686,8 +693,11 @@ fn find_memory_by_secret<'a>(
 }
 
 /// Whitelist for uncredentialed same-uid peers under strict (registry-backed) policy.
+///
+/// Human-operator methods are deliberately included: they require OS user presence and
+/// are denied for every client credential (see [`human_operator_method`]).
 fn uncredentialed_method_allowed(method: &str) -> bool {
-    matches!(method, methods::PING | methods::STATUS)
+    matches!(method, methods::PING | methods::STATUS) || human_operator_method(method)
 }
 
 fn credential_lifecycle_method(method: &str) -> bool {
@@ -695,6 +705,52 @@ fn credential_lifecycle_method(method: &str) -> bool {
         method,
         methods::CREDENTIAL_PROVISION | methods::CREDENTIAL_ROTATE | methods::CREDENTIAL_REVOKE
     )
+}
+
+/// Methods that may only be performed by an uncredentialed OS-user principal.
+///
+/// Generic agent / management credentials must not self-approve, unlock, rewrite policy
+/// presets, or revoke principals — the management delivery file is readable by any
+/// same-uid process and is not a human boundary.
+#[must_use]
+pub fn human_operator_method(method: &str) -> bool {
+    matches!(
+        method,
+        methods::APPROVAL_APPROVE
+            | methods::APPROVAL_DENY
+            | methods::POLICY_PRESET
+            | methods::DAEMON_UNLOCK
+            | methods::TOKEN_REVOKE
+    )
+}
+
+/// True when `principal` is an OS-attested local human (`user:…`).
+#[must_use]
+pub fn is_human_os_principal(principal: &str) -> bool {
+    canonicalize_principal_key(principal).starts_with("user:")
+}
+
+/// True when `principal` is a server-issued cooperative / service principal (`client:…`).
+#[must_use]
+pub fn is_credentialed_client_principal(principal: &str) -> bool {
+    canonicalize_principal_key(principal).starts_with("client:")
+}
+
+fn authorize_human_operator_method(auth: &AuthResolution) -> IpcResult<()> {
+    if auth.credentialed {
+        return Err(IpcError::Unauthorized(
+            "human-operator method requires uncredentialed OS user presence; \
+             client credentials (including management) cannot approve, unlock, \
+             change policy preset, or revoke tokens"
+                .into(),
+        ));
+    }
+    if !is_human_os_principal(&auth.principal_key) {
+        return Err(IpcError::Unauthorized(
+            "human-operator method requires an OS-attested user:* principal".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Normalize a principal key component (case-fold + trim + path separators and aliases).
@@ -1235,6 +1291,23 @@ mod tests {
         let cred_id = auth.clone();
         assert!(gate.authorize_method(methods::PING, &uncred_id).is_ok());
         assert!(gate.authorize_method(methods::STATUS, &uncred_id).is_ok());
+        // Human-operator methods: OS user presence only (never client credentials).
+        for method in [
+            methods::APPROVAL_APPROVE,
+            methods::APPROVAL_DENY,
+            methods::POLICY_PRESET,
+            methods::DAEMON_UNLOCK,
+            methods::TOKEN_REVOKE,
+        ] {
+            assert!(
+                gate.authorize_method(method, &uncred_id).is_ok(),
+                "{method} must allow uncredentialed OS user presence"
+            );
+            assert!(
+                gate.authorize_method(method, &cred_id).is_err(),
+                "{method} must deny credentialed agents"
+            );
+        }
         for method in [
             methods::OPS_EXEC,
             methods::OPS_FS_WRITE,
@@ -1242,7 +1315,6 @@ mod tests {
             methods::POLICY_SHOW,
             methods::APPROVAL_LIST,
             methods::DAEMON_LOCKDOWN,
-            methods::TOKEN_REVOKE,
             "session.open",
             "session.write",
             "session.claim",

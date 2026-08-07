@@ -1409,3 +1409,324 @@ fn non_loopback_http_issuer_rejected() {
         validate_control_plane_base_url(ok).unwrap_or_else(|e| panic!("ok={ok} err={e}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// (8) production registry: no credentialed self-approval / management bypass
+// ---------------------------------------------------------------------------
+
+/// Production-shaped daemon: registry-backed AuthGate (strict uncredentialed).
+async fn start_production_test_daemon(
+    paths: &OwnMeshPaths,
+) -> (
+    Arc<IpcServer>,
+    tokio::task::JoinHandle<()>,
+    Endpoint,
+    Arc<Mutex<DaemonRuntime>>,
+) {
+    paths.ensure_layout().unwrap();
+    let legacy = paths.runtime_dir.join(ownmesh_ipc::AUTH_TOKEN_FILE_NAME);
+    let _ = std::fs::remove_file(legacy);
+    let runtime = DaemonRuntime::open(paths).expect("runtime");
+    let revoked = runtime.revoked_clients_handle();
+    let runtime = Arc::new(Mutex::new(runtime));
+    let handler = runtime_handler(Arc::clone(&runtime));
+    let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+    let user_id = current_os_user_id();
+    let (auth, _) = AuthGate::for_user(&user_id)
+        .with_daemon_registry(&paths.state_dir)
+        .expect("registry");
+    let server = Arc::new(IpcServer::new(
+        ServerConfig::new(
+            endpoint.clone(),
+            auth,
+            "ownmeshd",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_revoked_clients(revoked),
+        handler,
+    ));
+    let serve = Arc::clone(&server);
+    let handle = tokio::spawn(async move {
+        let _ = serve.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (server, handle, endpoint, runtime)
+}
+
+fn assert_unauthorized(err: IpcError) {
+    match err {
+        IpcError::Unauthorized(_) => {}
+        IpcError::Remote { code, .. } if code == app_error::UNAUTHORIZED => {}
+        other => panic!("expected unauthorized, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn production_agent_cannot_self_approve_or_use_management_for_human_ops() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_production_test_daemon(&paths).await;
+
+    let management_secret =
+        ownmesh_ipc::read_management_credential(&paths.state_dir).expect("management delivery");
+    let management = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "mgmt-label",
+        Some(management_secret),
+    );
+    let provisioned: ownmesh_ipc::CredentialSecretResult = serde_json::from_value(
+        management
+            .call(
+                methods::CREDENTIAL_PROVISION,
+                Some(json!({ "client_id": "agent-chatgpt" })),
+            )
+            .await
+            .expect("provision agent"),
+    )
+    .unwrap();
+    assert_eq!(provisioned.principal, "client:agent-chatgpt");
+
+    let agent = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "agent-label",
+        Some(provisioned.credential),
+    );
+    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human-operator");
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask writes".into()),
+            rules: vec![PolicyRule {
+                id: "ask-write".into(),
+                decision: Decision::Ask,
+                priority: 10,
+                capability: "filesystem.write".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: None,
+                program_equals: None,
+                description: None,
+            }],
+        });
+    }
+
+    let pending = agent
+        .call(
+            methods::OPS_FS_WRITE,
+            Some(json!({
+                "path": "agent-write.txt",
+                "content": "needs-human",
+                "idempotency_key": "agent-self-approve",
+            })),
+        )
+        .await
+        .expect("agent enqueue");
+    assert_eq!(pending["approval_required"], true);
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    // Same agent credential cannot approve its own Ask.
+    let self_approve = agent
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({
+                "id": approval_id,
+                "temporary_grant": false,
+                // Client-supplied identity must be ignored even if present.
+                "approver_principal_id": "user:spoofed-human",
+                "principal_id": format!("user:{}", current_os_user_id()),
+            })),
+        )
+        .await
+        .expect_err("agent self-approve must fail");
+    assert_unauthorized(self_approve);
+
+    // Management credential is not a human boundary either.
+    let mgmt_approve = management
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({ "id": approval_id })),
+        )
+        .await
+        .expect_err("management cannot approve");
+    assert_unauthorized(mgmt_approve);
+
+    for (method, params) in [
+        (methods::POLICY_PRESET, Some(json!({ "preset": "full_access" }))),
+        (methods::DAEMON_UNLOCK, None),
+        (
+            methods::TOKEN_REVOKE,
+            Some(json!({ "principal": "client:agent-chatgpt" })),
+        ),
+    ] {
+        assert_unauthorized(
+            agent
+                .call(method, params.clone())
+                .await
+                .expect_err(&format!("{method} denied for agent")),
+        );
+        assert_unauthorized(
+            management
+                .call(method, params)
+                .await
+                .expect_err(&format!("{method} denied for management")),
+        );
+    }
+
+    // Independent uncredentialed OS human may approve once.
+    let approved = human
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({ "id": approval_id, "temporary_grant": false })),
+        )
+        .await
+        .expect("human approve");
+    assert_eq!(approved["approval_required"], false);
+    assert_eq!(approved["result"]["bytes_written"], 11);
+
+    // Replay / second decision is fail-closed.
+    let replay = human
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({ "id": approval_id })),
+        )
+        .await
+        .expect_err("approval replay must fail");
+    match replay {
+        IpcError::Remote { code, .. } => assert_eq!(code, app_error::CONFLICT),
+        other => panic!("expected conflict on replay, got {other:?}"),
+    }
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn production_approval_rejects_executable_content_swap_toctou() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_production_test_daemon(&paths).await;
+
+    let management_secret =
+        ownmesh_ipc::read_management_credential(&paths.state_dir).expect("management delivery");
+    let management = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "mgmt",
+        Some(management_secret),
+    );
+    let provisioned: ownmesh_ipc::CredentialSecretResult = serde_json::from_value(
+        management
+            .call(
+                methods::CREDENTIAL_PROVISION,
+                Some(json!({ "client_id": "exec-agent" })),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let agent = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "exec-agent-label",
+        Some(provisioned.credential),
+    );
+    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
+
+    let tool = dir.path().join("pinned-tool");
+    // Copy a real benign binary so structured classification + pin succeed.
+    std::fs::copy("/bin/echo", &tool).expect("copy echo");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = dir.path().join("pwned-marker");
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask structured".into()),
+            rules: vec![
+                PolicyRule {
+                    id: "deny-raw".into(),
+                    decision: Decision::Deny,
+                    priority: 100,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("raw_shell".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "ask-structured".into(),
+                    decision: Decision::Ask,
+                    priority: 10,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("structured".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    description: None,
+                },
+            ],
+        });
+    }
+
+    let pending = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": tool,
+                "args": ["ok"],
+                "idempotency_key": "exec-toctou-pin",
+            })),
+        )
+        .await
+        .expect("enqueue structured");
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    // Replace the canonical path with a shebang payload before human approval.
+    let swapped = dir.path().join("pinned-tool.swapped");
+    std::fs::write(
+        &swapped,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&swapped, &tool).unwrap();
+
+    let denied = human
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({ "id": approval_id, "temporary_grant": false })),
+        )
+        .await
+        .expect_err("content-swapped executable must fail closed");
+    match denied {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::POLICY_DENIED, "{message}");
+            let lower = message.to_ascii_lowercase();
+            assert!(
+                lower.contains("identity")
+                    || lower.contains("digest")
+                    || lower.contains("classification")
+                    || lower.contains("re-authorized"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert!(
+        !marker.exists(),
+        "swapped shebang payload must never execute"
+    );
+
+    server.request_shutdown();
+    let _ = handle.await;
+}

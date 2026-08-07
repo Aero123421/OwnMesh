@@ -104,6 +104,58 @@ const SHELL_BINARIES: &[&str] = &[
     "pwsh",
 ];
 
+/// Interpreter / script-host stems always classified as raw (conservative).
+const INTERPRETER_BINARIES: &[&str] = &[
+    "python",
+    "python2",
+    "python3",
+    "py",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "tclsh",
+    "wish",
+    "osascript",
+    "wscript",
+    "cscript",
+    "mshta",
+    "csi",
+    "pwsh-preview",
+];
+
+/// Script-like extensions that must never be treated as pinned native binaries.
+const SCRIPT_EXTENSIONS: &[&str] = &[
+    "bat", "cmd", "ps1", "psm1", "psd1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "msc",
+    "sh", "bash", "zsh", "ksh", "csh", "fish", "py", "rb", "pl", "php", "lua", "tcl",
+    "command", "cgi",
+];
+
+/// Filesystem identity + content digest pinned at classification / approval time.
+///
+/// Re-checked immediately before spawn so a path-preserving binary/script swap
+/// cannot execute a different payload after human approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutablePin {
+    /// Canonical absolute path that was inspected.
+    pub path: String,
+    /// Hex SHA-256 of the full file contents at pin time.
+    pub content_sha256: String,
+    /// Byte length at pin time (fast reject before hashing).
+    pub len: u64,
+    /// Platform file identity (Unix dev+ino; Windows unavailable → None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<u64>,
+    /// Policy classification recorded with the pin (`structured` / `raw_shell`).
+    pub policy_kind: String,
+}
+
 /// Flags that turn a shell binary into an arbitrary command interpreter.
 /// Kept for diagnostics / callers; classification no longer depends on them.
 const SHELL_EXEC_FLAGS: &[&str] = &["-c", "/c", "/k", "-command", "-encodedcommand", "-enc"];
@@ -143,6 +195,153 @@ fn known_shell_name(program: &str) -> bool {
         && SHELL_BINARIES
             .iter()
             .any(|name| stem.eq_ignore_ascii_case(name))
+}
+
+fn known_interpreter_name(program: &str) -> bool {
+    let base = program_basename(program);
+    if base.is_empty() {
+        return false;
+    }
+    let stem = strip_windows_executable_ext(base);
+    !stem.is_empty()
+        && INTERPRETER_BINARIES
+            .iter()
+            .any(|name| stem.eq_ignore_ascii_case(name))
+}
+
+fn script_extension(program: &str) -> bool {
+    let base = program_basename(program);
+    let Some(dot) = base.rfind('.') else {
+        return false;
+    };
+    let ext = &base[dot + 1..];
+    !ext.is_empty()
+        && SCRIPT_EXTENSIONS
+            .iter()
+            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+}
+
+fn path_has_shebang(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut magic = [0u8; 2];
+    matches!(file.read(&mut magic), Ok(2) if &magic == b"#!")
+}
+
+fn is_script_or_interpreter_in_dir(program: &str, cwd: Option<&Path>) -> bool {
+    if known_interpreter_name(program) || script_extension(program) {
+        return true;
+    }
+    let resolved = resolve_executable_path(program, cwd);
+    let Some(path) = resolved.as_deref() else {
+        return false;
+    };
+    if path
+        .to_str()
+        .is_some_and(|s| known_interpreter_name(s) || script_extension(s))
+    {
+        return true;
+    }
+    path_has_shebang(path)
+}
+
+/// Capture device/inode/content digest for a structured executable path.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be read or is not a regular file.
+pub fn pin_executable(path: &Path, policy_kind: CommandKind) -> ExecResult<ExecutablePin> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(ExecError::Journal(format!(
+            "executable pin requires a regular file: {}",
+            path.display()
+        )));
+    }
+    let bytes = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let content_sha256 = hex::encode(hasher.finalize());
+    let (device, inode) = file_identity(&meta);
+    Ok(ExecutablePin {
+        path: path.to_string_lossy().into_owned(),
+        content_sha256,
+        len: meta.len(),
+        device,
+        inode,
+        policy_kind: policy_kind.as_str().to_owned(),
+    })
+}
+
+/// Re-read `path` and ensure it still matches `pin` (fail closed on any drift).
+///
+/// # Errors
+///
+/// Returns [`ExecError::Journal`] describing the mismatch / IO failure.
+pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
+    let meta = std::fs::metadata(path).map_err(|e| {
+        ExecError::Journal(format!(
+            "executable pin revalidation failed for {}: {e}",
+            path.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(ExecError::Journal(format!(
+            "executable is no longer a regular file: {}",
+            path.display()
+        )));
+    }
+    if meta.len() != pin.len {
+        return Err(ExecError::Journal(format!(
+            "executable length drifted before execution ({} -> {})",
+            pin.len,
+            meta.len()
+        )));
+    }
+    let (device, inode) = file_identity(&meta);
+    if (pin.device.is_some() || pin.inode.is_some()) && (device != pin.device || inode != pin.inode) {
+        return Err(ExecError::Journal(
+            "executable device/inode drifted before execution; request must be re-authorized"
+                .into(),
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| {
+        ExecError::Journal(format!(
+            "executable content revalidation failed for {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hex::encode(hasher.finalize());
+    if digest != pin.content_sha256 {
+        return Err(ExecError::Journal(
+            "executable content digest drifted before execution; request must be re-authorized"
+                .into(),
+        ));
+    }
+    if pin.policy_kind == CommandKind::Structured.as_str()
+        && (path_has_shebang(path) || path.to_str().is_some_and(script_extension))
+    {
+        return Err(ExecError::Journal(
+            "executable became a script/shebang payload before execution; request must be re-authorized"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+    (Some(meta.dev()), Some(meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
+    (None, None)
 }
 
 /// Resolve an executable exactly once through an explicit path or the current PATH.
@@ -347,6 +546,7 @@ pub fn classify_command_kind_in_dir(
     if matches!(requested, CommandKind::RawShell)
         || is_shell_binary_in_dir(program, cwd)
         || program_is_env(program, cwd)
+        || is_script_or_interpreter_in_dir(program, cwd)
     {
         return CommandKind::RawShell;
     }
@@ -886,7 +1086,7 @@ mod tests {
             "python3",
             &["-c".into(), "print(1)".into()],
         );
-        assert_eq!(python, CommandKind::Structured);
+        assert_eq!(python, CommandKind::RawShell);
 
         assert!(!is_shell_binary("echo"));
         assert!(!is_shell_binary("python3"));
