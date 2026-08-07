@@ -154,15 +154,18 @@ mod tests {
         #[cfg(not(windows))]
         let bin = {
             let path = dir.path().join("mock-docker");
-            let mut f = fs::File::create(&path).unwrap();
+            let staged = dir.path().join("mock-docker.staged");
+            let mut f = fs::File::create(&staged).unwrap();
             writeln!(f, "#!/bin/sh").unwrap();
             writeln!(f, "echo line-a").unwrap();
             writeln!(f, "echo line-b").unwrap();
             writeln!(f, "echo line-c").unwrap();
+            f.sync_all().unwrap();
             drop(f);
-            let mut perms = fs::metadata(&path).unwrap().permissions();
+            let mut perms = fs::metadata(&staged).unwrap().permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(&path, perms).unwrap();
+            fs::set_permissions(&staged, perms).unwrap();
+            fs::rename(staged, &path).unwrap();
             path.to_string_lossy().into_owned()
         };
 

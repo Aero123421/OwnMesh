@@ -602,8 +602,15 @@ mod tests {
         drop(old_agent);
         drop(management);
         drop(plain);
+        let server_weak = Arc::downgrade(&server);
         drop(server);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server_weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stopped server connections must release the registry lock");
 
         let auth = attach_daemon_registry(&paths, AuthGate::for_user(&user_id)).unwrap();
         let restarted = Arc::new(IpcServer::new(
