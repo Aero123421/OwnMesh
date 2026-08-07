@@ -916,6 +916,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1682,6 +1691,7 @@ dependencies = [
  "hex",
  "ownmesh-broker-client",
  "ownmesh-domain",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
@@ -1695,11 +1705,15 @@ dependencies = [
 name = "ownmesh-broker-client"
 version = "1.0.1"
 dependencies = [
+ "ed25519-dalek",
  "hex",
+ "hmac",
  "ownmesh-domain",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -1712,6 +1726,7 @@ name = "ownmesh-config"
 version = "1.0.1"
 dependencies = [
  "ownmesh-domain",
+ "ownmesh-persist",
  "serde",
  "serde_json",
  "tempfile",
@@ -1743,6 +1758,7 @@ version = "1.0.1"
 dependencies = [
  "hex",
  "ownmesh-domain",
+ "ownmesh-persist",
  "serde",
  "serde_json",
  "sha2",
@@ -1776,11 +1792,13 @@ dependencies = [
  "ed25519-dalek",
  "keyring",
  "ownmesh-domain",
+ "ownmesh-persist",
  "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tracing",
  "zeroize",
 ]
 
@@ -1790,12 +1808,16 @@ version = "1.0.1"
 dependencies = [
  "bytes",
  "ownmesh-domain",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tempfile",
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1806,6 +1828,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "ownmesh-persist"
+version = "1.0.1"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -1847,6 +1876,7 @@ name = "ownmesh-session"
 version = "1.0.1"
 dependencies = [
  "ownmesh-domain",
+ "ownmesh-persist",
  "serde",
  "serde_json",
  "tempfile",

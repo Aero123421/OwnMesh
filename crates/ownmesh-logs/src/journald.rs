@@ -7,9 +7,9 @@
 //! - sd-journal API: https://www.freedesktop.org/software/systemd/man/latest/sd-journal.html
 //! - journalctl(1): https://www.man7.org/linux/man-pages/man1/journalctl.1.html
 
-use crate::{check_cursor, LogCursor, LogError, LogPage, LogProvider, LogResult};
 #[cfg(target_os = "linux")]
 use crate::page_from_lines;
+use crate::{check_cursor, LogCursor, LogError, LogPage, LogProvider, LogResult};
 #[cfg(target_os = "linux")]
 use std::process::Command;
 

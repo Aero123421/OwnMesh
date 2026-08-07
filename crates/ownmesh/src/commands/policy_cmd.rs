@@ -36,8 +36,7 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
             Err(e) => Err(e),
         },
         PolicyCmd::Preset { name } => {
-            let value =
-                call_daemon(methods::POLICY_PRESET, Some(json!({ "name": name })))?;
+            let value = call_daemon(methods::POLICY_PRESET, Some(json!({ "name": name })))?;
             print_value(cli.json, &value, |v| {
                 println!("preset set to {}", v["preset"].as_str().unwrap_or(name));
             });

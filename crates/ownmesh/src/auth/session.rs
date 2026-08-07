@@ -7,7 +7,9 @@ use ownmesh_identity::{
     SecretStore, SecretString, DEFAULT_KEYCHAIN_SERVICE,
 };
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use url::Url;
 
 use super::oauth::{refresh_access_token, TokenSet};
 
@@ -68,8 +70,7 @@ impl SessionPaths {
             .with_context(|| format!("read {}", self.session_file.display()))?;
         // Defense: session file must never carry raw tokens.
         assert_no_plaintext_tokens(&raw)?;
-        let session: AuthSession =
-            serde_json::from_str(&raw).context("parse auth_session.json")?;
+        let session: AuthSession = serde_json::from_str(&raw).context("parse auth_session.json")?;
         Ok(session)
     }
 
@@ -92,26 +93,81 @@ pub fn open_secret_store(paths: &OwnMeshPaths) -> Result<PreferredSecretStore> {
         .map_err(|err| anyhow!("open secret store: {err}"))
 }
 
+/// Validate a control-plane issuer / base URL.
+///
+/// Rules:
+/// - `https://` is accepted when a non-empty host is present.
+/// - `http://` is accepted **only** when the host is loopback
+///   (`127.0.0.0/8`, `::1`, or the name `localhost`) — required for local mock servers.
+/// - Non-loopback `http://` issuers are rejected with an explicit error.
+/// - Other schemes are rejected.
+///
+/// Returns the trimmed issuer (no trailing `/`).
+pub fn validate_issuer(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(anyhow!("issuer URL must not be empty"));
+    }
+    let parsed = Url::parse(trimmed).map_err(|err| anyhow!("invalid issuer URL: {err}"))?;
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow!("issuer URL must include a host"))?;
+
+    match parsed.scheme() {
+        "https" => Ok(trimmed.to_owned()),
+        "http" => {
+            if is_loopback_host(host) {
+                Ok(trimmed.to_owned())
+            } else {
+                Err(anyhow!(
+                    "refusing non-loopback http:// issuer `{trimmed}`; use https:// or a loopback host (127.0.0.1, ::1, localhost)"
+                ))
+            }
+        }
+        other => Err(anyhow!(
+            "unsupported issuer URL scheme `{other}`; expected https (or http on loopback only)"
+        )),
+    }
+}
+
+/// True when `host` is a loopback IP or the conventional `localhost` name.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `url` may yield IPv6 with brackets (`[::1]`) via `host_str()`.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 /// Resolve the control-plane issuer URL.
 ///
 /// Order: `OWNMESH_ISSUER` env → active instance `base_url` → session.issuer.
+/// Every source is passed through [`validate_issuer`] (non-loopback http is rejected).
 pub fn resolve_issuer(session: &AuthSession) -> Result<String> {
     if let Ok(env) = std::env::var("OWNMESH_ISSUER") {
         let t = env.trim().trim_end_matches('/').to_owned();
         if !t.is_empty() {
-            return Ok(t);
+            return validate_issuer(&t);
         }
     }
     if let Ok(paths) = OwnMeshPaths::discover() {
         if let Ok(cfg) = load_config(&paths) {
             if let Some(url) = active_instance_url(&cfg) {
-                return Ok(url);
+                return validate_issuer(&url);
             }
         }
     }
     let from_session = session.issuer.trim().trim_end_matches('/');
     if !from_session.is_empty() {
-        return Ok(from_session.to_owned());
+        return validate_issuer(from_session);
     }
     Err(anyhow!(
         "no control-plane issuer configured; set OWNMESH_ISSUER or `ownmesh instance add/use`"
@@ -128,20 +184,21 @@ fn active_instance_url(cfg: &OwnMeshConfig) -> Option<String> {
 
 /// Ensure an instance alias exists and is active (best-effort after login).
 pub fn ensure_instance_alias(paths: &OwnMeshPaths, issuer: &str) -> Result<()> {
+    let issuer = validate_issuer(issuer)?;
     let mut cfg = load_config(paths).unwrap_or_default();
     let id = "default".to_owned();
     if let Some(existing) = cfg.instances.iter_mut().find(|i| i.id == id) {
-        existing.base_url = issuer.to_owned();
+        existing.base_url = issuer.clone();
     } else {
         cfg.instances.push(InstanceConfig {
             id: id.clone(),
-            base_url: issuer.to_owned(),
+            base_url: issuer,
             display_name: Some("Default".into()),
         });
     }
     cfg.active_instance = Some(id);
-    // Ignore validation failures for http:// in odd environments — save_config validates.
-    let _ = save_config(paths, &cfg);
+    // save_config re-validates (incl. non-loopback http rejection).
+    save_config(paths, &cfg).map_err(|err| anyhow!("save instance config: {err}"))?;
     Ok(())
 }
 
@@ -157,7 +214,7 @@ pub fn save_token_set(
             .map_err(|err| anyhow!("store refresh token: {err}"))?;
     }
     let mut session = session_paths.load_session().unwrap_or_default();
-    session.issuer = issuer.trim().trim_end_matches('/').to_owned();
+    session.issuer = validate_issuer(issuer)?;
     session.client_id = if tokens.client_id.is_empty() {
         DEFAULT_CLIENT_ID.to_owned()
     } else {
@@ -186,13 +243,10 @@ pub async fn load_access_token(
         .map_err(|err| anyhow!("load refresh token: {err}"))?
         .ok_or_else(|| anyhow!("not logged in (no refresh token in keychain)"))?;
 
-    let tokens = refresh_access_token(
-        http,
-        &session.issuer,
-        &session.client_id,
-        refresh.expose(),
-    )
-    .await?;
+    // Validate persisted metadata before sending the refresh token anywhere. This
+    // protects upgrades from legacy/tampered auth_session.json values.
+    let issuer = validate_issuer(&session.issuer)?;
+    let tokens = refresh_access_token(http, &issuer, &session.client_id, refresh.expose()).await?;
     // Persist rotated refresh token when the server rotates it.
     if let Some(new_rt) = &tokens.refresh_token {
         if new_rt != refresh.expose() {
@@ -200,7 +254,7 @@ pub async fn load_access_token(
                 .map_err(|err| anyhow!("store rotated refresh token: {err}"))?;
         }
     }
-    let mut session = save_token_set(session_paths, store, &session.issuer, &tokens)?;
+    let mut session = save_token_set(session_paths, store, &issuer, &tokens)?;
     // Keep prior device_id.
     let prior = session_paths.load_session().unwrap_or_default();
     if session.device_id.is_none() {
@@ -211,11 +265,10 @@ pub async fn load_access_token(
 }
 
 /// Clear human credentials from keychain + session file.
-pub fn clear_session_secrets(
-    session_paths: &SessionPaths,
-    store: &dyn SecretStore,
-) -> Result<()> {
-    let _ = store.delete(SecretPurpose::HumanRefreshToken);
+pub fn clear_session_secrets(session_paths: &SessionPaths, store: &dyn SecretStore) -> Result<()> {
+    store
+        .delete(SecretPurpose::HumanRefreshToken)
+        .map_err(|err| anyhow!("delete refresh token from all secret backends: {err}"))?;
     let mut session = session_paths.load_session().unwrap_or_default();
     session.has_refresh_token = false;
     // Keep issuer/client_id/device_id for convenience; tokens are gone.
@@ -295,5 +348,92 @@ mod tests {
         let raw = std::fs::read_to_string(&sp.session_file).unwrap();
         assert!(!raw.contains("rt_"));
         assert!(!raw.to_ascii_lowercase().contains("\"refresh_token\""));
+    }
+
+    #[test]
+    fn validate_issuer_allows_loopback_http_and_https() {
+        // mock_server / local CP compatibility
+        assert_eq!(
+            validate_issuer("http://127.0.0.1:9").unwrap(),
+            "http://127.0.0.1:9"
+        );
+        assert!(validate_issuer("http://127.0.0.1").is_ok());
+        assert!(validate_issuer("http://127.0.0.1:8750/").is_ok());
+        assert!(validate_issuer("http://[::1]:8080").is_ok());
+        assert!(validate_issuer("http://localhost:8750").is_ok());
+        assert!(validate_issuer("https://cp.example.test").is_ok());
+        assert!(validate_issuer("https://example.test/").is_ok());
+    }
+
+    #[test]
+    fn validate_issuer_rejects_non_loopback_http() {
+        let err = validate_issuer("http://example.test")
+            .expect_err("non-loopback http must fail")
+            .to_string();
+        assert!(
+            err.contains("non-loopback"),
+            "expected explicit non-loopback error, got: {err}"
+        );
+
+        assert!(validate_issuer("http://example.test/oauth").is_err());
+        assert!(validate_issuer("http://192.168.1.10").is_err());
+        assert!(validate_issuer("http://10.0.0.1:443").is_err());
+        assert!(validate_issuer("http://[fe80::1]").is_err());
+        assert!(validate_issuer("ftp://127.0.0.1").is_err());
+        assert!(validate_issuer("").is_err());
+    }
+
+    #[test]
+    fn resolve_issuer_validates_session_value() {
+        let bad = AuthSession {
+            issuer: "http://example.test".into(),
+            ..AuthSession::default()
+        };
+        // Only exercises the session fallback when env/config are absent or empty.
+        // If OWNMESH_ISSUER is set in the ambient environment it is also validated.
+        match resolve_issuer(&bad) {
+            Ok(url) => {
+                // Ambient env overrode session — still must be a valid issuer.
+                validate_issuer(&url).expect("resolve_issuer must only return validated URLs");
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("non-loopback")
+                        || msg.contains("no control-plane issuer")
+                        || msg.contains("invalid issuer"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+
+        let good = AuthSession {
+            issuer: "http://127.0.0.1:9".into(),
+            ..AuthSession::default()
+        };
+        // When session is the source (or env is also valid), must not reject loopback http.
+        if std::env::var("OWNMESH_ISSUER")
+            .ok()
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            // May still pick up a user config active instance; only assert when we get a result
+            // from session or when error is "not configured".
+            match resolve_issuer(&good) {
+                Ok(url) => assert!(
+                    validate_issuer(&url).is_ok(),
+                    "resolved issuer must pass validate_issuer: {url}"
+                ),
+                Err(err) => {
+                    let msg = err.to_string();
+                    assert!(
+                        !msg.contains("127.0.0.1"),
+                        "loopback http must not be rejected: {msg}"
+                    );
+                }
+            }
+        }
     }
 }

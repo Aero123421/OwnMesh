@@ -11,9 +11,9 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
         eprintln!("exec: command is required");
         return Err(ExitCode::UsageConfig);
     }
-    if args.device.is_some() {
-        eprintln!("exec: --device routing is not implemented yet; using local daemon");
-    }
+    // Remote device routing is not implemented. Fail closed: never fall back to
+    // the local daemon when the operator explicitly targeted another device.
+    reject_unimplemented_device(args.device.as_deref())?;
     let program = args.command[0].clone();
     let rest = args.command[1..].to_vec();
     let params = json!({
@@ -51,8 +51,7 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
                     }
                 }
             }
-            if result["replayed"].as_bool() == Some(true) || v["replayed"].as_bool() == Some(true)
-            {
+            if result["replayed"].as_bool() == Some(true) || v["replayed"].as_bool() == Some(true) {
                 eprintln!("(replayed from idempotency journal)");
             }
         }
@@ -62,4 +61,56 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
         return Err(ExitCode::Authorization);
     }
     Ok(())
+}
+
+/// Reject `--device` without contacting the local daemon.
+///
+/// Extracted so unit tests can assert fail-closed behavior without IPC.
+pub(crate) fn reject_unimplemented_device(device: Option<&str>) -> Result<(), ExitCode> {
+    if let Some(device) = device {
+        eprintln!(
+            "exec: --device routing is not implemented yet (requested device: {device}); refusing to run on local daemon"
+        );
+        return Err(ExitCode::UsageConfig);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_flag_is_hard_error_not_local_fallback() {
+        let err =
+            reject_unimplemented_device(Some("dev_remote")).expect_err("--device must hard-error");
+        assert_eq!(err, ExitCode::UsageConfig);
+        assert_ne!(err.code(), 0);
+    }
+
+    #[test]
+    fn device_absent_allows_local_path() {
+        assert!(reject_unimplemented_device(None).is_ok());
+    }
+
+    #[test]
+    fn run_exec_with_device_never_reaches_daemon() {
+        // Construct minimal args; call_daemon would panic/fail if reached without a daemon.
+        let cli = Cli {
+            json: false,
+            lang: None,
+            command: None,
+        };
+        let args = ExecArgs {
+            device: Some("dev_x".into()),
+            cwd: None,
+            idempotency_key: None,
+            raw_shell: false,
+            timeout_ms: None,
+            command: vec!["echo".into(), "hi".into()],
+        };
+        let err = run_exec(&cli, &args).expect_err("must not fall back to local daemon");
+        assert_eq!(err, ExitCode::UsageConfig);
+        assert_ne!(err.code(), 0);
+    }
 }

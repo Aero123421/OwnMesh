@@ -1,9 +1,9 @@
 //! `ownmesh status` — fetch daemon status over local IPC.
 
 use crate::cli::Cli;
-use ownmesh_config::OwnMeshPaths;
+use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcBus, IpcClient};
+use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use serde_json::json;
 use std::process::Command;
 use std::time::Duration;
@@ -27,8 +27,16 @@ async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
         ExitCode::UsageConfig
     })?;
     let _ = paths.ensure_layout();
-
-    let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+    let cfg = load_config(&paths).map_err(|err| {
+        eprintln!("config load error: {err}");
+        ExitCode::UsageConfig
+    })?;
+    let endpoint =
+        Endpoint::configured_daemon(&paths.runtime_dir, cfg.service_socket.path.as_deref())
+            .map_err(|err| {
+                eprintln!("service endpoint configuration error: {err}");
+                ExitCode::UsageConfig
+            })?;
     let client = IpcClient::new(
         endpoint,
         paths.runtime_dir.clone(),
@@ -38,7 +46,12 @@ async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
             max_reconnect_attempts: 3,
             reconnect_base_delay: Duration::from_millis(50),
         },
-    );
+    )
+    .with_client_credential_from_env()
+    .map_err(|err| {
+        eprintln!("client credential configuration error: {err}");
+        ExitCode::UsageConfig
+    })?;
 
     match client.status().await {
         Ok(status) => {
@@ -84,13 +97,11 @@ async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
 #[allow(dead_code)]
 pub fn spawn_ownmeshd_for_tests(runtime_dir: &std::path::Path) -> Option<std::process::Child> {
     let exe = std::env::current_exe().ok()?;
-    let ownmeshd = exe
-        .parent()?
-        .join(if cfg!(windows) {
-            "ownmeshd.exe"
-        } else {
-            "ownmeshd"
-        });
+    let ownmeshd = exe.parent()?.join(if cfg!(windows) {
+        "ownmeshd.exe"
+    } else {
+        "ownmeshd"
+    });
     if !ownmeshd.exists() {
         return None;
     }

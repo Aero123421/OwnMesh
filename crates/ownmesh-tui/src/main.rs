@@ -34,11 +34,9 @@ use app::{App, Overlay, Screen};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use i18n::Lang;
-use ownmesh_config::OwnMeshPaths;
+use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::{
-    methods, ClientIdentity, ClientOptions, DaemonStatus, Endpoint, IpcBus, IpcClient,
-};
+use ownmesh_ipc::{methods, ClientIdentity, ClientOptions, DaemonStatus, Endpoint, IpcClient};
 use palette::filter_commands;
 use serde_json::json;
 use std::process::ExitCode as StdExitCode;
@@ -109,6 +107,11 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
         .map_err(|_| ExitCode::Internal)?;
 
     let status = rt.block_on(fetch_status());
+    if let Err(err) = &status {
+        if ipc_unauthorized(err) {
+            eprintln!("{}", actionable_ipc_error(err));
+        }
+    }
 
     if cli.status || cli.once {
         match status {
@@ -123,8 +126,12 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
                 Ok(())
             }
             Err(err) => {
-                eprintln!("TUI failed to reach daemon: {err}");
-                Err(ExitCode::DeviceOffline)
+                if ipc_unauthorized(&err) {
+                    Err(ExitCode::Authentication)
+                } else {
+                    eprintln!("TUI failed to reach daemon: {err}");
+                    Err(ExitCode::DeviceOffline)
+                }
             }
         }
     } else {
@@ -142,22 +149,30 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
         }
         // Best-effort refresh of approvals / sessions while runtime is live.
         if app.daemon.is_some() {
-            if let Ok(v) = rt.block_on(ipc_call(methods::APPROVAL_LIST, None)) {
-                app.set_approvals_from_json(&v);
+            match rt.block_on(ipc_call(methods::APPROVAL_LIST, None)) {
+                Ok(v) => app.set_approvals_from_json(&v),
+                Err(err) => app.status_line = actionable_ipc_error(&err),
             }
-            if let Ok(v) = rt.block_on(ipc_call("session.list", None)) {
-                app.set_sessions_from_json(&v);
+            match rt.block_on(ipc_call("session.list", None)) {
+                Ok(v) => app.set_sessions_from_json(&v),
+                Err(err) => app.status_line = actionable_ipc_error(&err),
             }
         }
         run_interactive(app, &rt)
     }
 }
 
+fn daemon_endpoint(paths: &OwnMeshPaths) -> Result<Endpoint, ownmesh_ipc::IpcError> {
+    let cfg = load_config(paths)
+        .map_err(|err| ownmesh_ipc::IpcError::Protocol(format!("config: {err}")))?;
+    Endpoint::configured_daemon(&paths.runtime_dir, cfg.service_socket.path.as_deref())
+}
+
 async fn fetch_status() -> Result<DaemonStatus, ownmesh_ipc::IpcError> {
     let paths = OwnMeshPaths::discover()
         .map_err(|err| ownmesh_ipc::IpcError::Protocol(format!("paths: {err}")))?;
     let _ = paths.ensure_layout();
-    let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+    let endpoint = daemon_endpoint(&paths)?;
     let client = IpcClient::new(
         endpoint,
         paths.runtime_dir,
@@ -167,7 +182,8 @@ async fn fetch_status() -> Result<DaemonStatus, ownmesh_ipc::IpcError> {
             max_reconnect_attempts: 2,
             reconnect_base_delay: Duration::from_millis(50),
         },
-    );
+    )
+    .with_client_credential_from_env()?;
     client.status().await
 }
 
@@ -177,7 +193,7 @@ async fn ipc_call(
 ) -> Result<serde_json::Value, ownmesh_ipc::IpcError> {
     let paths = OwnMeshPaths::discover()
         .map_err(|err| ownmesh_ipc::IpcError::Protocol(format!("paths: {err}")))?;
-    let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
+    let endpoint = daemon_endpoint(&paths)?;
     let client = IpcClient::new(
         endpoint,
         paths.runtime_dir,
@@ -187,7 +203,8 @@ async fn ipc_call(
             max_reconnect_attempts: 1,
             reconnect_base_delay: Duration::from_millis(20),
         },
-    );
+    )
+    .with_client_credential_from_env()?;
     client.call(method, params).await
 }
 
@@ -414,7 +431,7 @@ fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) {
             app.status_line = format!("approvals: {}", app.approvals.len());
         }
         Err(e) => {
-            app.status_line = format!("refresh failed: {e}");
+            app.status_line = actionable_ipc_error(&e);
         }
     }
 }
@@ -443,7 +460,36 @@ fn approve_selected(app: &mut App, rt: &tokio::runtime::Runtime, approve: bool) 
                 i18n::t(app.lang, i18n::Msg::ApprovalsDeny).to_owned()
             };
         }
-        Err(e) => app.status_line = format!("ipc: {e}"),
+        Err(e) => app.status_line = actionable_ipc_error(&e),
+    }
+}
+
+fn ipc_unauthorized(err: &ownmesh_ipc::IpcError) -> bool {
+    matches!(err, ownmesh_ipc::IpcError::Unauthorized(_))
+        || matches!(
+            err,
+            ownmesh_ipc::IpcError::Remote { code, .. }
+                if matches!(
+                    *code,
+                    ownmesh_ipc::app_error::UNAUTHORIZED
+                        | ownmesh_ipc::app_error::TOKEN_REVOKED
+                )
+        )
+        || matches!(
+            err,
+            ownmesh_ipc::IpcError::Protocol(message)
+                if message.contains(ownmesh_ipc::CLIENT_CREDENTIAL_ENV)
+        )
+}
+
+fn actionable_ipc_error(err: &ownmesh_ipc::IpcError) -> String {
+    if ipc_unauthorized(err) {
+        format!(
+            "authentication failed: {err}; provision ownmesh-tui and set {}",
+            ownmesh_ipc::CLIENT_CREDENTIAL_ENV
+        )
+    } else {
+        format!("ipc: {err}")
     }
 }
 
@@ -460,9 +506,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ownmesh_ipc::{
-        generate_token, reject_unknown_handler, write_token_file, AuthGate, IpcServer, ServerConfig,
-    };
+    use ownmesh_ipc::{reject_unknown_handler, AuthGate, IpcBus, IpcServer, ServerConfig};
     use ownmesh_policy::{
         full_access_has_no_hidden_restrictive_rules, preset_document, AccessPreset,
     };
@@ -476,16 +520,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
         paths.ensure_layout().unwrap();
-        let token = generate_token();
-        write_token_file(&paths.runtime_dir, &token).unwrap();
         let endpoint = Endpoint::default_for(&paths.runtime_dir, IpcBus::Daemon);
         let server = Arc::new(IpcServer::new(
-            ServerConfig {
-                endpoint: endpoint.clone(),
-                auth: AuthGate::new(token),
-                server_name: "ownmeshd".into(),
-                server_version: "0.1.0".into(),
-            },
+            ServerConfig::new(
+                endpoint.clone(),
+                AuthGate::local_user(),
+                "ownmeshd",
+                "0.1.0",
+            ),
             reject_unknown_handler(),
         ));
         let serve = Arc::clone(&server);

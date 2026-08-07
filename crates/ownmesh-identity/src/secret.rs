@@ -100,11 +100,7 @@ impl SecretString {
 
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "SecretString([redacted]; len={})",
-            self.inner.len()
-        )
+        write!(f, "SecretString([redacted]; len={})", self.inner.len())
     }
 }
 

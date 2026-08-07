@@ -248,10 +248,7 @@ pub fn official_profiles() -> Vec<Profile> {
             id: OfficialProfileId::ClaudeCode.as_str().into(),
             display_name: "Claude Code".into(),
             binaries: vec!["claude".into()],
-            interface_order: vec![
-                InterfacePreference::Jsonl,
-                InterfacePreference::Pty,
-            ],
+            interface_order: vec![InterfacePreference::Jsonl, InterfacePreference::Pty],
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
@@ -610,7 +607,11 @@ impl ProfileRegistry {
     }
 }
 
-fn expand_template(template: &[String], prompt: Option<&str>, native_id: Option<&str>) -> Vec<String> {
+fn expand_template(
+    template: &[String],
+    prompt: Option<&str>,
+    native_id: Option<&str>,
+) -> Vec<String> {
     template
         .iter()
         .map(|s| {
@@ -906,7 +907,10 @@ pub fn official_fixtures() -> Vec<ProfileFixture> {
             supports_acp: p.supports_acp,
             min_version: p.min_version.clone(),
             sample_versions_ok: vec![
-                format!("{} (test)", p.min_version.clone().unwrap_or_else(|| "1.0.0".into())),
+                format!(
+                    "{} (test)",
+                    p.min_version.clone().unwrap_or_else(|| "1.0.0".into())
+                ),
                 "v9.9.9-beta".into(),
             ],
             sample_versions_bad: p
@@ -921,12 +925,7 @@ pub fn official_fixtures() -> Vec<ProfileFixture> {
                     }
                 })
                 .unwrap_or_default(),
-            structured_start_prefix: p
-                .structured_start_args
-                .iter()
-                .take(2)
-                .cloned()
-                .collect(),
+            structured_start_prefix: p.structured_start_args.iter().take(2).cloned().collect(),
             non_interactive_contains: p
                 .non_interactive_args
                 .iter()
@@ -1309,7 +1308,8 @@ acp = false
 
     #[test]
     fn normalize_events() {
-        let e = normalize_event_json(r#"{"type":"message","text":"hi","session_id":"s1"}"#).unwrap();
+        let e =
+            normalize_event_json(r#"{"type":"message","text":"hi","session_id":"s1"}"#).unwrap();
         assert_eq!(e.kind, "message");
         assert_eq!(e.text.as_deref(), Some("hi"));
         assert_eq!(e.native_session_id.as_deref(), Some("s1"));
@@ -1319,7 +1319,10 @@ acp = false
 
     #[test]
     fn parse_semver_prefix_samples() {
-        assert_eq!(parse_semver_prefix("codex-cli 0.25.1").as_deref(), Some("0.25.1"));
+        assert_eq!(
+            parse_semver_prefix("codex-cli 0.25.1").as_deref(),
+            Some("0.25.1")
+        );
         assert_eq!(parse_semver_prefix("v1.2.3-beta").as_deref(), Some("1.2.3"));
         assert!(version_less("0.9.0", "1.0.0"));
         assert!(!version_less("1.0.0", "0.9.9"));

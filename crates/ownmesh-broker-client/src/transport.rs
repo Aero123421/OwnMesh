@@ -90,19 +90,17 @@ pub fn default_broker_endpoint(runtime_dir: &Path) -> BrokerEndpoint {
         if key.is_empty() {
             let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
             for b in raw.as_bytes() {
-                acc = acc.wrapping_mul(0x0100_0000_01b3).wrapping_add(u64::from(*b));
+                acc = acc
+                    .wrapping_mul(0x0100_0000_01b3)
+                    .wrapping_add(u64::from(*b));
             }
             key = format!("{acc:016x}");
         }
-        BrokerEndpoint::NamedPipe(format!(
-            r"\\.\pipe\{DEFAULT_BROKER_ENDPOINT}-{key}"
-        ))
+        BrokerEndpoint::NamedPipe(format!(r"\\.\pipe\{DEFAULT_BROKER_ENDPOINT}-{key}"))
     }
     #[cfg(not(windows))]
     {
-        BrokerEndpoint::UnixSocket(
-            runtime_dir.join(format!("{DEFAULT_BROKER_ENDPOINT}.sock")),
-        )
+        BrokerEndpoint::UnixSocket(runtime_dir.join(format!("{DEFAULT_BROKER_ENDPOINT}.sock")))
     }
 }
 
@@ -129,11 +127,13 @@ pub fn resolve_broker_endpoint(
         return Ok(ep);
     }
     if let Some(rest) = spec.strip_prefix("pipe:") {
-        return Ok(BrokerEndpoint::NamedPipe(if rest.starts_with(r"\\.\pipe\") {
-            rest.to_string()
-        } else {
-            format!(r"\\.\pipe\{rest}")
-        }));
+        return Ok(BrokerEndpoint::NamedPipe(
+            if rest.starts_with(r"\\.\pipe\") {
+                rest.to_string()
+            } else {
+                format!(r"\\.\pipe\{rest}")
+            },
+        ));
     }
     if let Some(rest) = spec.strip_prefix("unix:") {
         return Ok(BrokerEndpoint::UnixSocket(PathBuf::from(rest)));

@@ -38,6 +38,9 @@ tokio = { version = "1", features = [
     "fs",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process", "fs"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }

@@ -1,6 +1,5 @@
 //! Local IPC client with timeout, cancellation, and reconnect.
 
-use crate::auth::read_token_file;
 use crate::endpoint::Endpoint;
 use crate::error::{IpcError, IpcResult};
 use crate::frame::{read_frame, write_frame};
@@ -14,10 +13,15 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-/// Client identity presented during `ipc.hello`.
+/// Client identity presented during `ipc.hello`, and the server-assigned principal
+/// passed to method handlers after authentication.
+///
+/// On the client side `client_name` is an untrusted label. The server replaces it
+/// with its authenticated principal before invoking a handler. Credential metadata
+/// remains private to the server, preserving this public struct's source shape.
 #[derive(Debug, Clone)]
 pub struct ClientIdentity {
-    /// Process label (`ownmesh`, `ownmesh-tui`, …).
+    /// Client HELLO label, or server-assigned principal after authentication.
     pub client_name: String,
     /// Optional semantic version.
     pub client_version: Option<String>,
@@ -31,6 +35,12 @@ impl ClientIdentity {
             client_name: client_name.into(),
             client_version: Some(client_version.into()),
         }
+    }
+
+    /// Server-assigned principal key (alias of [`Self::client_name`] post-HELLO).
+    #[must_use]
+    pub fn principal_key(&self) -> &str {
+        &self.client_name
     }
 }
 
@@ -61,13 +71,18 @@ pub struct IpcClient {
     runtime_dir: PathBuf,
     identity: ClientIdentity,
     options: ClientOptions,
-    /// Explicit token override (tests). When `None`, read from runtime dir.
-    token_override: Option<String>,
+    /// Optional server-issued per-client credential (non-shared).
+    client_credential: Option<String>,
+    /// When set, deliberately send a shared token (negative tests only).
+    legacy_shared_token: Option<String>,
     conn: Mutex<Option<ClientConnection>>,
 }
 
 impl IpcClient {
-    /// Create a client targeting `endpoint`, reading the auth token from `runtime_dir`.
+    /// Create a client targeting `endpoint`.
+    ///
+    /// Authentication uses OS peer credentials on the server; no shared token file
+    /// is read. `runtime_dir` is retained for path symmetry / future credential files.
     #[must_use]
     pub fn new(
         endpoint: Endpoint,
@@ -80,16 +95,54 @@ impl IpcClient {
             runtime_dir: runtime_dir.into(),
             identity,
             options,
-            token_override: None,
+            client_credential: None,
+            legacy_shared_token: None,
             conn: Mutex::new(None),
         }
     }
 
-    /// Override the auth token (used by negative tests).
+    /// Attach a server-issued per-client credential (non-shared).
     #[must_use]
-    pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        self.token_override = Some(token.into());
+    pub fn with_client_credential(mut self, credential: impl Into<String>) -> Self {
+        self.client_credential = Some(credential.into());
         self
+    }
+
+    /// Explicitly load a cooperative-client credential from
+    /// [`crate::CLIENT_CREDENTIAL_ENV`] when configured.
+    ///
+    /// This opt-in delivery is not a security boundary against arbitrary malware
+    /// running as the same OS user. Invalid Unicode or an explicitly empty value is
+    /// reported instead of silently falling back to an uncredentialed client.
+    pub fn with_client_credential_from_env(mut self) -> IpcResult<Self> {
+        match std::env::var(crate::CLIENT_CREDENTIAL_ENV) {
+            Ok(value) if value.trim().is_empty() => Err(IpcError::Protocol(format!(
+                "{} is set but empty",
+                crate::CLIENT_CREDENTIAL_ENV
+            ))),
+            Ok(value) => {
+                self.client_credential = Some(value);
+                Ok(self)
+            }
+            Err(std::env::VarError::NotPresent) => Ok(self),
+            Err(std::env::VarError::NotUnicode(_)) => Err(IpcError::Protocol(format!(
+                "{} is not valid Unicode",
+                crate::CLIENT_CREDENTIAL_ENV
+            ))),
+        }
+    }
+
+    /// Deliberately present a legacy shared token (negative / attack tests only).
+    #[must_use]
+    pub fn with_legacy_shared_token(mut self, token: impl Into<String>) -> Self {
+        self.legacy_shared_token = Some(token.into());
+        self
+    }
+
+    /// Backward-compatible alias for attack tests that previously overrode the shared token.
+    #[must_use]
+    pub fn with_token(self, token: impl Into<String>) -> Self {
+        self.with_legacy_shared_token(token)
     }
 
     /// Endpoint currently targeted.
@@ -98,7 +151,7 @@ impl IpcClient {
         &self.endpoint
     }
 
-    /// Runtime directory used for token discovery.
+    /// Runtime directory (legacy token path / future credential material).
     #[must_use]
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
@@ -135,16 +188,14 @@ impl IpcClient {
 
     async fn dial_and_hello(&self) -> IpcResult<ClientConnection> {
         let mut conn = connect(&self.endpoint).await?;
-        let token = match &self.token_override {
-            Some(t) => t.clone(),
-            None => read_token_file(&self.runtime_dir)?,
-        };
         let hello = RpcRequest::new(
             methods::HELLO,
             Some(json!(HelloParams {
-                token,
+                token: self.legacy_shared_token.clone().unwrap_or_default(),
                 client_name: self.identity.client_name.clone(),
+                owner: None,
                 client_version: self.identity.client_version.clone(),
+                client_credential: self.client_credential.clone(),
             })),
         );
         write_frame(&mut conn, &hello.to_bytes()?).await?;
@@ -156,6 +207,11 @@ impl IpcClient {
                 if code == crate::rpc::app_error::UNAUTHORIZED =>
             {
                 return Err(IpcError::Unauthorized(message));
+            }
+            Err(IpcError::Remote { code, message })
+                if code == crate::rpc::app_error::TOKEN_REVOKED =>
+            {
+                return Err(IpcError::Remote { code, message });
             }
             Err(err) => return Err(err),
         };
@@ -197,19 +253,14 @@ impl IpcClient {
         loop {
             attempts = attempts.saturating_add(1);
             self.ensure_connected().await?;
-            let result = self
-                .call_once(method, params.clone(), cancel)
-                .await;
+            let result = self.call_once(method, params.clone(), cancel).await;
             match result {
                 Ok(value) => return Ok(value),
                 Err(IpcError::Disconnected(_)) | Err(IpcError::Io(_))
                     if attempts <= self.options.max_reconnect_attempts =>
                 {
                     self.disconnect().await;
-                    let delay = self
-                        .options
-                        .reconnect_base_delay
-                        .saturating_mul(attempts);
+                    let delay = self.options.reconnect_base_delay.saturating_mul(attempts);
                     tokio::time::sleep(delay).await;
                 }
                 Err(err) => return Err(err),
@@ -314,7 +365,7 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{generate_token, write_token_file, AuthGate};
+    use crate::auth::AuthGate;
     use crate::endpoint::{Endpoint, IpcBus};
     use crate::server::{reject_unknown_handler, IpcServer, ServerConfig};
     use std::sync::Arc;
@@ -322,32 +373,29 @@ mod tests {
 
     async fn start_test_server(
         runtime: &Path,
-    ) -> (Arc<IpcServer>, Endpoint, String, tokio::task::JoinHandle<()>) {
-        let token = generate_token();
-        write_token_file(runtime, &token).unwrap();
+    ) -> (Arc<IpcServer>, Endpoint, tokio::task::JoinHandle<()>) {
         let endpoint = Endpoint::default_for(runtime, IpcBus::Daemon);
         let server = Arc::new(IpcServer::new(
-            ServerConfig {
-                endpoint: endpoint.clone(),
-                auth: AuthGate::new(token.clone()),
-                server_name: "ownmeshd-test".into(),
-                server_version: "0.1.0-test".into(),
-            },
+            ServerConfig::new(
+                endpoint.clone(),
+                AuthGate::local_user(),
+                "ownmeshd-test",
+                "0.1.0-test",
+            ),
             reject_unknown_handler(),
         ));
         let serve = Arc::clone(&server);
         let handle = tokio::spawn(async move {
             let _ = serve.serve().await;
         });
-        // Give the listener a moment to bind.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        (server, endpoint, token, handle)
+        (server, endpoint, handle)
     }
 
     #[tokio::test]
     async fn cli_status_over_ipc() {
         let dir = tempdir().unwrap();
-        let (server, endpoint, _token, handle) = start_test_server(dir.path()).await;
+        let (server, endpoint, handle) = start_test_server(dir.path()).await;
 
         let client = IpcClient::new(
             endpoint,
@@ -367,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn tui_status_over_ipc() {
         let dir = tempdir().unwrap();
-        let (server, endpoint, _token, handle) = start_test_server(dir.path()).await;
+        let (server, endpoint, handle) = start_test_server(dir.path()).await;
 
         let client = IpcClient::new(
             endpoint,
@@ -383,9 +431,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_token_is_rejected() {
+    async fn shared_token_is_rejected() {
         let dir = tempdir().unwrap();
-        let (server, endpoint, _token, handle) = start_test_server(dir.path()).await;
+        let (server, endpoint, handle) = start_test_server(dir.path()).await;
 
         let client = IpcClient::new(
             endpoint,
@@ -396,19 +444,15 @@ mod tests {
                 ..ClientOptions::default()
             },
         )
-        .with_token("definitely-not-the-real-token");
+        .with_token("definitely-not-valid-shared-token");
 
         let err = client.status().await.expect_err("must reject");
         assert!(
-            matches!(err, IpcError::Unauthorized(_) | IpcError::Remote { .. } | IpcError::Disconnected(_)),
+            matches!(
+                err,
+                IpcError::Unauthorized(_) | IpcError::Remote { .. } | IpcError::Disconnected(_)
+            ),
             "unexpected error: {err:?}"
-        );
-        assert!(
-            err.code() == "ipc_unauthorized"
-                || err.code() == "ipc_remote"
-                || err.code() == "ipc_disconnected",
-            "code={}",
-            err.code()
         );
 
         server.request_shutdown();
@@ -418,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_after_disconnect() {
         let dir = tempdir().unwrap();
-        let (server, endpoint, _token, handle) = start_test_server(dir.path()).await;
+        let (server, endpoint, handle) = start_test_server(dir.path()).await;
         let client = IpcClient::new(
             endpoint,
             dir.path(),

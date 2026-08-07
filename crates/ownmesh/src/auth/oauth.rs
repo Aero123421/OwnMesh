@@ -16,10 +16,11 @@ use url::Url;
 
 use super::callback::CallbackServer;
 use super::pkce::{generate_pkce, generate_state};
-use super::session::{DEFAULT_CLIENT_ID, PREFERRED_CALLBACK_PORT};
+use super::session::{validate_issuer, DEFAULT_CLIENT_ID, PREFERRED_CALLBACK_PORT};
 
 /// Default scopes requested by the OwnMesh CLI.
-pub const DEFAULT_SCOPES: &str = "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access";
+pub const DEFAULT_SCOPES: &str =
+    "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access";
 
 /// Token response subset used by the CLI.
 #[derive(Debug, Clone)]
@@ -98,7 +99,7 @@ pub async fn login_browser_pkce(
     issuer: &str,
     opts: BrowserLoginOpts,
 ) -> Result<TokenSet> {
-    let issuer = issuer.trim().trim_end_matches('/');
+    let issuer = validate_issuer(issuer)?;
     let callback = CallbackServer::bind(PREFERRED_CALLBACK_PORT).await?;
     let redirect_uri = callback.redirect_uri.clone();
 
@@ -106,13 +107,13 @@ pub async fn login_browser_pkce(
     let client_id = if callback.bind_addr.port() == PREFERRED_CALLBACK_PORT {
         DEFAULT_CLIENT_ID.to_owned()
     } else {
-        register_public_client(http, issuer, &redirect_uri).await?
+        register_public_client(http, &issuer, &redirect_uri).await?
     };
 
     let pkce = generate_pkce();
     let state = generate_state();
-    let mut auth = Url::parse(&format!("{issuer}/oauth/authorize"))
-        .context("build authorize URL")?;
+    let mut auth =
+        Url::parse(&format!("{issuer}/oauth/authorize")).context("build authorize URL")?;
     {
         let mut q = auth.query_pairs_mut();
         q.append_pair("response_type", "code");
@@ -147,7 +148,7 @@ pub async fn login_browser_pkce(
         .await?;
     exchange_authorization_code(
         http,
-        issuer,
+        &issuer,
         &client_id,
         &cb.code,
         &pkce.verifier,
@@ -165,7 +166,7 @@ pub async fn exchange_authorization_code(
     code_verifier: &str,
     redirect_uri: &str,
 ) -> Result<TokenSet> {
-    let issuer = issuer.trim().trim_end_matches('/');
+    let issuer = validate_issuer(issuer)?;
     let resp = http
         .post(format!("{issuer}/oauth/token"))
         .header("content-type", "application/x-www-form-urlencoded")
@@ -189,7 +190,7 @@ pub async fn login_device_code(
     client_id: &str,
     poll_hook: Option<&dyn Fn(&DeviceCodeStart)>,
 ) -> Result<TokenSet> {
-    let issuer = issuer.trim().trim_end_matches('/');
+    let issuer = validate_issuer(issuer)?;
     let client_id = if client_id.is_empty() {
         DEFAULT_CLIENT_ID
     } else {
@@ -199,10 +200,7 @@ pub async fn login_device_code(
     let start_resp = http
         .post(format!("{issuer}/oauth/device_authorization"))
         .header("content-type", "application/x-www-form-urlencoded")
-        .body(form(&[
-            ("client_id", client_id),
-            ("scope", DEFAULT_SCOPES),
-        ]))
+        .body(form(&[("client_id", client_id), ("scope", DEFAULT_SCOPES)]))
         .send()
         .await
         .context("device_authorization endpoint")?;
@@ -228,7 +226,7 @@ pub async fn login_device_code(
         eprintln!("Waiting for approval…");
     }
 
-    poll_device_token(http, issuer, client_id, &start).await
+    poll_device_token(http, &issuer, client_id, &start).await
 }
 
 async fn poll_device_token(
@@ -250,10 +248,7 @@ async fn poll_device_token(
             .post(format!("{issuer}/oauth/token"))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(form(&[
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:device_code",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", &start.device_code),
                 ("client_id", client_id),
             ]))
@@ -300,7 +295,7 @@ pub async fn refresh_access_token(
     client_id: &str,
     refresh_token: &str,
 ) -> Result<TokenSet> {
-    let issuer = issuer.trim().trim_end_matches('/');
+    let issuer = validate_issuer(issuer)?;
     let resp = http
         .post(format!("{issuer}/oauth/token"))
         .header("content-type", "application/x-www-form-urlencoded")
@@ -316,12 +311,20 @@ pub async fn refresh_access_token(
 }
 
 /// Best-effort token revocation (RFC 7009).
-pub async fn revoke_token(
-    http: &reqwest::Client,
-    issuer: &str,
-    token: &str,
-) -> Result<()> {
-    let issuer = issuer.trim().trim_end_matches('/');
+///
+/// Always performs the revoke POST with [`reqwest::redirect::Policy::none`].
+/// A 3xx response is an error: the token must never be forwarded to `Location`
+/// (open-redirect / token exfiltration). The `http` argument is retained for
+/// call-site compatibility; redirect policy is enforced here regardless.
+pub async fn revoke_token(_http: &reqwest::Client, issuer: &str, token: &str) -> Result<()> {
+    let issuer = validate_issuer(issuer)?;
+    // Defense in depth: never follow redirects on revoke, even if the caller
+    // accidentally passed a default (follow-redirects) client.
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build no-redirect revoke client")?;
     let resp = http
         .post(format!("{issuer}/oauth/revoke"))
         .header("content-type", "application/x-www-form-urlencoded")
@@ -329,9 +332,15 @@ pub async fn revoke_token(
         .send()
         .await
         .context("revoke endpoint")?;
-    if !(resp.status().is_success() || resp.status().as_u16() == 200) {
+    let status = resp.status();
+    if status.is_redirection() {
+        bail!(
+            "revoke endpoint returned HTTP {status} redirect; refusing to follow (token not sent to Location)"
+        );
+    }
+    if !status.is_success() {
         // RFC 7009: endpoint should return 200 even for unknown tokens; still tolerate.
-        debug!(status = %resp.status(), "revoke returned non-success");
+        debug!(status = %status, "revoke returned non-success");
     }
     Ok(())
 }
@@ -342,7 +351,7 @@ pub async fn register_public_client(
     issuer: &str,
     redirect_uri: &str,
 ) -> Result<String> {
-    let issuer = issuer.trim().trim_end_matches('/');
+    let issuer = validate_issuer(issuer)?;
     let resp = http
         .post(format!("{issuer}/oauth/register"))
         .json(&json!({
@@ -411,4 +420,25 @@ fn urlencoding_encode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn token_bearing_endpoints_reject_non_loopback_http_before_network() {
+        let http = reqwest::Client::new();
+
+        let refresh =
+            refresh_access_token(&http, "http://example.test", "client", "refresh-secret")
+                .await
+                .expect_err("refresh must reject a cleartext remote issuer");
+        assert!(refresh.to_string().contains("non-loopback"), "{refresh}");
+
+        let revoke = revoke_token(&http, "http://192.0.2.1", "refresh-secret")
+            .await
+            .expect_err("revoke must reject a cleartext remote issuer");
+        assert!(revoke.to_string().contains("non-loopback"), "{revoke}");
+    }
 }

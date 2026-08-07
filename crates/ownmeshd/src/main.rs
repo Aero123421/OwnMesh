@@ -1,4 +1,4 @@
-//! OwnMesh device agent (`ownmeshd`) entrypoint.
+//! `OwnMesh` device agent (`ownmeshd`) entrypoint.
 
 #![forbid(unsafe_code)]
 #![allow(
@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use ownmesh_domain::ExitCode;
 use std::process::ExitCode as StdExitCode;
 
-/// OwnMesh user-level device agent.
+/// `OwnMesh` user-level device agent.
 #[derive(Debug, Parser)]
 #[command(
     name = "ownmeshd",
@@ -35,6 +35,32 @@ enum Commands {
     Version,
     /// Show whether a local daemon appears reachable.
     Status,
+    /// Manage cooperative-client credentials through the running daemon.
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CredentialCommands {
+    /// Provision a client and print its one-time credential secret.
+    ///
+    /// The running daemon derives a namespaced principal and binds the attested OS user.
+    Provision {
+        /// Stable client id used for later rotate/revoke operations.
+        client_id: String,
+    },
+    /// Rotate a client secret and print the replacement secret.
+    Rotate {
+        /// Stable client id to rotate.
+        client_id: String,
+    },
+    /// Revoke a client credential and erase its persisted secret.
+    Revoke {
+        /// Stable client id to revoke.
+        client_id: String,
+    },
 }
 
 fn main() -> StdExitCode {
@@ -56,6 +82,35 @@ fn main() -> StdExitCode {
         Commands::Status => match daemon::probe_status() {
             Ok(()) => ExitCode::Success,
             Err(code) => code,
+        },
+        Commands::Credentials { command } => match command {
+            CredentialCommands::Provision { client_id } => {
+                match daemon::provision_client_credential(&client_id) {
+                    Ok(secret) => {
+                        // Intentional one-time delivery to the invoking administrator;
+                        // the secret is never sent to tracing/log output.
+                        println!("{secret}");
+                        ExitCode::Success
+                    }
+                    Err(code) => code,
+                }
+            }
+            CredentialCommands::Rotate { client_id } => {
+                match daemon::rotate_client_credential(&client_id) {
+                    Ok(secret) => {
+                        // Intentional one-time delivery, not diagnostic logging.
+                        println!("{secret}");
+                        ExitCode::Success
+                    }
+                    Err(code) => code,
+                }
+            }
+            CredentialCommands::Revoke { client_id } => {
+                match daemon::revoke_client_credential(&client_id) {
+                    Ok(()) => ExitCode::Success,
+                    Err(code) => code,
+                }
+            }
         },
     };
     StdExitCode::from(code.code() as u8)
@@ -80,5 +135,27 @@ mod tests {
     fn cli_help_has_run() {
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("run") || help.contains("Run"));
+    }
+
+    #[test]
+    fn credential_lifecycle_commands_have_no_identity_override_flags() {
+        for args in [
+            vec!["ownmeshd", "credentials", "provision", "agent-a"],
+            vec!["ownmeshd", "credentials", "rotate", "agent-a"],
+            vec!["ownmeshd", "credentials", "revoke", "agent-a"],
+        ] {
+            Cli::try_parse_from(args).unwrap();
+        }
+        for forbidden in ["--principal", "--user-id"] {
+            assert!(Cli::try_parse_from([
+                "ownmeshd",
+                "credentials",
+                "provision",
+                "agent-a",
+                forbidden,
+                "attacker-chosen",
+            ])
+            .is_err());
+        }
     }
 }

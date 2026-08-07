@@ -3,7 +3,7 @@
 use crate::cli::{Cli, TokensCmd};
 use crate::commands::ipc_util::{call_daemon, print_value};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::methods;
+use ownmesh_ipc::{canonicalize_principal_key, methods};
 use serde_json::json;
 
 pub fn run_lockdown(cli: &Cli) -> Result<(), ExitCode> {
@@ -25,13 +25,22 @@ pub fn run_unlock(cli: &Cli) -> Result<(), ExitCode> {
 
 pub fn dispatch_tokens(cli: &Cli, cmd: &TokensCmd) -> Result<(), ExitCode> {
     match cmd {
-        TokensCmd::Revoke { client } => {
-            let value =
-                call_daemon(methods::TOKEN_REVOKE, Some(json!({ "client": client })))?;
+        TokensCmd::Revoke { principal } => {
+            let canonical = canonicalize_principal_key(principal);
+            if canonical.is_empty() || canonical != principal.as_str() {
+                eprintln!(
+                    "--principal must be the canonical server-assigned principal (got {principal:?}; canonical form is {canonical:?})"
+                );
+                return Err(ExitCode::UsageConfig);
+            }
+            let value = call_daemon(
+                methods::TOKEN_REVOKE,
+                Some(json!({ "principal": canonical })),
+            )?;
             print_value(cli.json, &value, |v| {
                 println!(
-                    "revoked client {}",
-                    v["revoked"].as_str().unwrap_or(client)
+                    "revoked principal {}",
+                    v["revoked"].as_str().unwrap_or(principal)
                 );
             });
             Ok(())

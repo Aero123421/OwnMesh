@@ -116,7 +116,9 @@ fn nested_dotdot_cannot_climb_above_workspace_root() {
     let dir = tempdir().unwrap();
     fs::create_dir_all(dir.path().join("a/b/c")).unwrap();
     let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
-    let err = ws.resolve("a/b/c/../../../../../../etc/passwd").unwrap_err();
+    let err = ws
+        .resolve("a/b/c/../../../../../../etc/passwd")
+        .unwrap_err();
     assert!(
         matches!(err, FsError::EscapesWorkspace(_)) || matches!(err, FsError::InvalidPath(_)),
         "{err:?}"

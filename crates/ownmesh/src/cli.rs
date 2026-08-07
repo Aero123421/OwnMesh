@@ -497,11 +497,11 @@ pub enum McpCmd {
 /// `ownmesh tokens` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum TokensCmd {
-    /// Revoke tokens for a client label (e.g. chatgpt).
+    /// Revoke a server-assigned canonical IPC principal.
     Revoke {
-        /// Client label to revoke.
-        #[arg(long)]
-        client: String,
+        /// Canonical principal returned by IPC HELLO (not a self-reported client label).
+        #[arg(long, value_name = "CANONICAL_PRINCIPAL")]
+        principal: String,
     },
 }
 

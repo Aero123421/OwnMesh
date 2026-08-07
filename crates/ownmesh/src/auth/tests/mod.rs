@@ -98,7 +98,9 @@ async fn pkce_login_stores_refresh_in_keychain_not_plaintext() {
     let session_raw = std::fs::read_to_string(&sp.session_file).unwrap();
     assert!(!session_raw.contains(tokens.refresh_token.as_ref().unwrap()));
     assert!(!session_raw.contains(&tokens.access_token));
-    assert!(!session_raw.to_ascii_lowercase().contains("\"refresh_token\""));
+    assert!(!session_raw
+        .to_ascii_lowercase()
+        .contains("\"refresh_token\""));
 
     if sp.paths.config_file().exists() {
         let cfg = std::fs::read_to_string(sp.paths.config_file()).unwrap();
@@ -326,7 +328,9 @@ async fn no_stub_paths_for_login_device_enroll() {
     );
 
     // Runtime: handlers are wired (compile-time linkage).
-    let _ = std::any::type_name::<fn(&crate::cli::Cli, &crate::cli::LoginArgs) -> Result<(), ownmesh_domain::ExitCode>>();
+    let _ = std::any::type_name::<
+        fn(&crate::cli::Cli, &crate::cli::LoginArgs) -> Result<(), ownmesh_domain::ExitCode>,
+    >();
     let login_name = std::any::type_name_of_val(&crate::commands::login::run_login);
     let enroll_name = std::any::type_name_of_val(&crate::commands::device_cmd::run_enroll);
     assert!(login_name.contains("login"));
@@ -342,4 +346,109 @@ async fn refresh_token_not_logged_via_tracing_fields() {
     let debug = format!("session tokens debug={loaded:?} display={loaded}");
     assert!(!debug.contains("rt_super_secret"));
     assert!(!debug.contains(secret.expose()));
+}
+
+/// sec-04: revoke must not follow HTTP 3xx (token must not hit redirect sink).
+///
+/// Passes an adversarial *follow-redirects* client on purpose: `revoke_token` must
+/// ignore it and enforce `Policy::none` internally so the token never reaches Location.
+#[tokio::test]
+async fn revoke_token_refuses_http_redirect_and_does_not_forward_token() {
+    let mock = MockControlPlane::start().await;
+    mock.set_revoke_redirect(true);
+    // Adversarial caller: default/limited follow policy must not leak the token.
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("following http client");
+    let issuer = mock.base_url();
+    let token = "rt_must_not_leak_via_revoke_redirect";
+
+    let err = revoke_token(&http, &issuer, token)
+        .await
+        .expect_err("3xx revoke must be treated as failure");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("redirect") || msg.contains("302") || msg.contains("3"),
+        "error should mention redirect refusal, got: {msg}"
+    );
+
+    // Give any misbehaving follow-up request a moment to land.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        mock.revoke_redirect_sink_hits(),
+        0,
+        "revoke client must not follow 302 to sink"
+    );
+    assert!(
+        !mock.revoke_redirect_sink_saw_token(),
+        "refresh token must not be POSTed to redirect Location"
+    );
+
+    mock.shutdown().await;
+}
+
+/// Same redirect refusal when the caller already built a Policy::none client.
+#[tokio::test]
+async fn revoke_token_refuses_redirect_with_none_policy_client() {
+    let mock = MockControlPlane::start().await;
+    mock.set_revoke_redirect(true);
+    let http = http_client(); // Policy::none
+    let issuer = mock.base_url();
+    let err = revoke_token(&http, &issuer, "rt_none_policy_client")
+        .await
+        .expect_err("3xx revoke must fail");
+    assert!(
+        err.to_string().contains("redirect") || err.to_string().contains("302"),
+        "got: {err}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(mock.revoke_redirect_sink_hits(), 0);
+    assert!(!mock.revoke_redirect_sink_saw_token());
+    mock.shutdown().await;
+}
+
+/// logout semantics: even when remote revoke fails (redirect), local secrets clear.
+#[tokio::test]
+async fn logout_clears_local_secrets_when_remote_revoke_redirects() {
+    let mock = MockControlPlane::start().await;
+    mock.set_revoke_redirect(true);
+    let dir = tempdir().unwrap();
+    let sp = session_paths(dir.path());
+    let store = MemorySecretStore::default();
+    let issuer = mock.base_url();
+
+    // Seed a session + refresh token as if login succeeded.
+    let tokens = TokenSet {
+        access_token: "at_logout_test".into(),
+        refresh_token: Some("rt_logout_redirect_fail".into()),
+        expires_in: Some(3600),
+        scope: Some(DEFAULT_SCOPES.into()),
+        client_id: "client_ownmesh_cli".into(),
+        token_type: "bearer".into(),
+    };
+    save_token_set(&sp, &store, &issuer, &tokens).unwrap();
+    assert!(load_human_refresh_token(&store).unwrap().is_some());
+
+    // Mirror logout_async remote-revoke + local clear path.
+    // Use a following client to prove logout's revoke path is still redirect-safe
+    // (revoke_token enforces Policy::none internally).
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("following http client");
+    let revoke_result = revoke_token(&http, &issuer, "rt_logout_redirect_fail").await;
+    assert!(revoke_result.is_err(), "redirect revoke must fail");
+    // Local clear must still succeed (logout success semantics).
+    clear_session_secrets(&sp, &store).expect("local logout must complete");
+    assert!(
+        load_human_refresh_token(&store).unwrap().is_none(),
+        "refresh token must be removed locally even if remote revoke failed"
+    );
+    assert_eq!(mock.revoke_redirect_sink_hits(), 0);
+    assert!(!mock.revoke_redirect_sink_saw_token());
+
+    mock.shutdown().await;
 }

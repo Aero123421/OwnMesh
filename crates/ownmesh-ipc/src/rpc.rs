@@ -54,8 +54,15 @@ pub mod methods {
     pub const DAEMON_LOCKDOWN: &str = "daemon.lockdown";
     /// Lift lockdown.
     pub const DAEMON_UNLOCK: &str = "daemon.unlock";
-    /// Revoke a local token / client label.
+    /// Revoke a principal / client credential mapping.
     pub const TOKEN_REVOKE: &str = "token.revoke";
+
+    /// Daemon-managed credential lifecycle (fixed management client only).
+    pub const CREDENTIAL_PROVISION: &str = "credential.provision";
+    /// Rotate a per-client credential secret (denied for uncredentialed IPC).
+    pub const CREDENTIAL_ROTATE: &str = "credential.rotate";
+    /// Revoke a per-client credential (denied for uncredentialed IPC).
+    pub const CREDENTIAL_REVOKE: &str = "credential.revoke";
 }
 
 /// Correlation identifier for a single request/response pair.
@@ -86,7 +93,7 @@ impl std::fmt::Display for RequestId {
 }
 
 /// Outgoing or incoming JSON-RPC request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct RpcRequest {
     /// Must be `"2.0"`.
     pub jsonrpc: String,
@@ -97,6 +104,27 @@ pub struct RpcRequest {
     /// Optional params object/array.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+}
+
+impl std::fmt::Debug for RpcRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut params = self.params.clone();
+        if self.method == methods::HELLO {
+            if let Some(Value::Object(fields)) = params.as_mut() {
+                for key in ["token", "client_credential"] {
+                    if fields.contains_key(key) {
+                        fields.insert(key.into(), Value::String("[REDACTED]".into()));
+                    }
+                }
+            }
+        }
+        f.debug_struct("RpcRequest")
+            .field("jsonrpc", &self.jsonrpc)
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("params", &params)
+            .finish()
+    }
 }
 
 impl RpcRequest {
@@ -214,15 +242,43 @@ impl RpcResponse {
 }
 
 /// Parameters for `ipc.hello`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Self-reported `client_name` is **untrusted** and never becomes the principal.
+/// Any self-reported owner/label is likewise ignored: principal mapping uses OS peer
+/// identity plus optional server-issued `client_credential` (registry / memory).
+/// Shared `token` is rejected when non-empty (path abolished).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloParams {
-    /// Shared daemon token from the runtime directory.
+    /// Legacy shared daemon token — must be absent/empty (rejected otherwise).
+    #[serde(default)]
     pub token: String,
-    /// Client process label (`ownmesh`, `ownmesh-tui`, …).
+    /// Untrusted client label (ignored for principal mapping / revocation).
+    #[serde(default)]
     pub client_name: String,
+    /// Untrusted owner/principal claim (ignored for principal mapping / revocation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Optional client version string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// Optional server-issued per-client credential (non-shared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_credential: Option<String>,
+}
+
+impl std::fmt::Debug for HelloParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HelloParams")
+            .field("token", &"[REDACTED]")
+            .field("client_name", &self.client_name)
+            .field("owner", &self.owner)
+            .field("client_version", &self.client_version)
+            .field(
+                "client_credential",
+                &self.client_credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 /// Successful hello acknowledgement.
@@ -234,6 +290,52 @@ pub struct HelloResult {
     pub server_version: String,
     /// Authenticated peer accepted.
     pub authenticated: bool,
+    /// Server-assigned principal key (from OS peer / credential mapping).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// True when HELLO presented a valid server-issued client credential.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credentialed: bool,
+}
+
+/// Parameters for daemon-managed `credential.provision`.
+///
+/// Principal and OS-user fields intentionally do not exist. The server derives a
+/// namespaced principal from `client_id` and binds the current attested peer user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialProvisionParams {
+    /// Stable cooperative-client id (server validates and namespaces it).
+    pub client_id: String,
+}
+
+/// Parameters for daemon-managed credential rotation/revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialClientParams {
+    /// Existing stable cooperative-client id.
+    pub client_id: String,
+}
+
+/// Lifecycle result containing one-time secret material.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialSecretResult {
+    /// Stable canonical client id.
+    pub client_id: String,
+    /// Server-derived principal.
+    pub principal: String,
+    /// One-time bearer credential. Callers must not log it.
+    pub credential: String,
+}
+
+impl std::fmt::Debug for CredentialSecretResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialSecretResult")
+            .field("client_id", &self.client_id)
+            .field("principal", &self.principal)
+            .field("credential", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Daemon status payload returned by `daemon.status`.

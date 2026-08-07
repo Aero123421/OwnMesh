@@ -1,15 +1,20 @@
-//! OwnMesh networkless privileged broker binary.
+//! `OwnMesh` networkless privileged broker binary.
+//!
+//! Production elevated broker entry points are fixed as **unsupported** until a
+//! secure mint authority is established. CLI never binds a serve endpoint or
+//! executes elevated processes.
+
+#![allow(
+    clippy::doc_markdown,
+    clippy::too_many_lines,
+    clippy::map_unwrap_or,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
 
 use clap::{Parser, Subcommand};
-use ownmesh_broker::{
-    broker_status, enforce_bind_is_networkless, execute_verified, install_broker,
-    load_or_create_secret, now_unix, run_broker, uninstall_broker, BrokerServeConfig,
-};
-use ownmesh_broker_client::{
-    broker_endpoint_display, build_request, default_broker_endpoint, resolve_broker_endpoint,
-    BrokerEndpoint, ElevatedCommand, ReplayCache, DEFAULT_BROKER_ENDPOINT,
-};
-use std::net::SocketAddr;
+use ownmesh_broker::{broker_status, production_elevated_broker_unsupported};
+use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;
 use std::path::PathBuf;
 
 /// CLI.
@@ -17,7 +22,8 @@ use std::path::PathBuf;
 #[command(
     name = "ownmesh-broker",
     version,
-    about = "OwnMesh privileged broker (networkless)"
+    about = "OwnMesh privileged broker (networkless; production elevated unsupported)",
+    disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,59 +36,102 @@ enum Commands {
     Help,
     /// Show version.
     Version,
-    /// Run broker (OS pipe/socket or loopback fallback).
+    /// Production serve — always unsupported (no bind / no exec).
     Run {
-        /// Endpoint override: `tcp:127.0.0.1:0`, `pipe:NAME`, `unix:/path.sock`.
+        /// Endpoint override (ignored; production serve is unsupported).
         #[arg(long)]
         endpoint: Option<String>,
-        /// Legacy bind address (loopback only). Prefer `--endpoint`.
+        /// Legacy bind address (ignored).
         #[arg(long)]
         bind: Option<String>,
-        /// Path to secret file (32+ bytes). Generated if missing.
+        /// Path to request-MAC secret file (ignored).
         #[arg(long)]
-        secret_file: PathBuf,
-        /// Write chosen bind address / endpoint to this file.
+        secret_file: Option<PathBuf>,
+        /// Path to capability Ed25519 signing key (ignored).
+        #[arg(long)]
+        signing_key_file: Option<PathBuf>,
+        /// Addr file (ignored).
         #[arg(long)]
         addr_file: Option<PathBuf>,
-        /// Allowed caller principal ids (comma-separated).
-        #[arg(long, default_value = "ownmeshd")]
-        allow_callers: String,
-        /// Require capability token on every request.
-        #[arg(long, default_value_t = false)]
-        require_capability: bool,
-        /// Runtime dir used when resolving default endpoint.
+        /// Runtime dir (ignored).
         #[arg(long)]
         runtime_dir: Option<PathBuf>,
+        /// Trusted executable (ignored).
+        #[arg(long)]
+        trusted_executable: Option<PathBuf>,
+        /// Socket owner UID (ignored).
+        #[arg(long)]
+        socket_owner_uid: Option<u32>,
+        /// Socket group GID (ignored).
+        #[arg(long)]
+        socket_group_gid: Option<u32>,
+        /// Socket mode (ignored).
+        #[arg(long, value_parser = parse_octal_mode)]
+        socket_mode: Option<u32>,
+        /// Allowed UIDs (ignored).
+        #[arg(long = "allowed-uid")]
+        allowed_uids: Vec<u32>,
     },
-    /// Status (always local; no network probes).
+    /// Status (always local; always unsupported / installed=false).
     Status {
         /// State base directory (defaults to ./ownmesh-broker-state for bare binary).
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Install service templates + local marker.
+    /// Install — always unsupported / installed=false.
     Install {
+        /// Legacy state directory (ignored).
         #[arg(long)]
-        state_dir: PathBuf,
+        state_dir: Option<PathBuf>,
+        /// Legacy endpoint (ignored).
         #[arg(long)]
         endpoint: Option<String>,
-    },
-    /// Uninstall local marker + templates.
-    Uninstall {
+        /// Legacy trusted executable (ignored).
         #[arg(long)]
-        state_dir: PathBuf,
+        trusted_executable: Option<PathBuf>,
+        /// Legacy socket owner UID (ignored).
+        #[arg(long)]
+        socket_owner_uid: Option<u32>,
+        /// Legacy socket group GID (ignored).
+        #[arg(long)]
+        socket_group_gid: Option<u32>,
+        /// Legacy socket mode (ignored).
+        #[arg(long, value_parser = parse_octal_mode)]
+        socket_mode: Option<u32>,
+        /// Legacy allowed UIDs (ignored).
+        #[arg(long = "allowed-uid")]
+        allowed_uids: Vec<u32>,
     },
-    /// One-shot local elevated run via in-process verify (test helper).
+    /// Uninstall — unsupported and side-effect-free.
+    Uninstall {
+        /// Legacy state directory (ignored).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    /// One-shot elevated exec — production-unsupported (no process spawn).
     Exec {
         #[arg(long)]
-        secret_file: PathBuf,
+        secret_file: Option<PathBuf>,
         #[arg(long)]
-        program: String,
+        signing_key_file: Option<PathBuf>,
+        #[arg(long)]
+        program: Option<String>,
+        #[arg(long)]
+        peer_pid: Option<i32>,
+        #[arg(long)]
+        trusted_executable: Option<PathBuf>,
+        #[arg(long = "allowed-uid")]
+        allowed_uids: Vec<u32>,
         #[arg(long, default_value = "ownmeshd")]
         caller: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+fn parse_octal_mode(value: &str) -> Result<u32, String> {
+    let trimmed = value.trim().trim_start_matches("0o");
+    u32::from_str_radix(trimmed, 8).map_err(|e| format!("invalid octal Unix mode {value:?}: {e}"))
 }
 
 #[tokio::main]
@@ -100,7 +149,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!(
                 "ownmesh-broker — networkless privileged broker\n\
                  endpoint basename: {DEFAULT_BROKER_ENDPOINT}\n\
-                 commands: help, version, run, status, install, uninstall, exec"
+                 commands: help, version, run, status, install, uninstall, exec\n\
+                 PRODUCTION: elevated install/status/serve/exec are unsupported until secure mint authority"
             );
             Ok(())
         }
@@ -112,121 +162,78 @@ async fn run(cli: Cli) -> Result<(), String> {
             let base = state_dir.unwrap_or_else(|| PathBuf::from("."));
             let st = broker_status(&base)?;
             println!(
-                "status={} network={} endpoint={} kind={} secret={}",
-                if st.installed {
-                    "installed"
-                } else {
-                    "idle"
-                },
+                "status=unsupported support={} network={} endpoint={} kind={} secret={} signing={} verify={}",
+                st.support,
                 st.network,
                 st.endpoint.as_deref().unwrap_or("-"),
                 st.endpoint_kind,
-                st.secret_present
+                st.secret_present,
+                st.signing_key_present,
+                st.verify_key_present
             );
-            Ok(())
+            for n in &st.notes {
+                println!("note: {n}");
+            }
+            Err(format!(
+                "unsupported: privileged broker not available ({})",
+                st.notes
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| st.support.clone())
+            ))
         }
         Commands::Install {
-            state_dir,
-            endpoint,
-        } => {
-            let ep = match endpoint {
-                Some(s) => Some(resolve_broker_endpoint(
-                    &state_dir.join("runtime"),
-                    Some(&s),
-                )
-                .map_err(|e| e.to_string())?),
-                None => None,
-            };
-            let rec = install_broker(&state_dir, ep)?;
-            println!(
-                "installed endpoint={} kind={}",
-                rec.endpoint, rec.endpoint_kind
-            );
-            Ok(())
-        }
-        Commands::Uninstall { state_dir } => {
-            uninstall_broker(&state_dir)?;
-            println!("uninstalled");
-            Ok(())
-        }
+            state_dir: _,
+            endpoint: _,
+            trusted_executable: _,
+            socket_owner_uid: _,
+            socket_group_gid: _,
+            socket_mode: _,
+            allowed_uids: _,
+        } => Err("unsupported: elevated broker production install is disabled until a secure mint authority is established; no filesystem changes were made (fail-closed)".into()),
+        Commands::Uninstall { state_dir: _ } => Err(
+            "unsupported: elevated broker production uninstall is disabled; no filesystem changes were made (fail-closed)".into(),
+        ),
         Commands::Run {
-            endpoint,
-            bind,
-            secret_file,
-            addr_file,
-            allow_callers,
-            require_capability,
-            runtime_dir,
-        } => {
-            let runtime = runtime_dir.unwrap_or_else(|| {
-                secret_file
-                    .parent()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
-            let ep = if let Some(bind) = bind {
-                let addr: SocketAddr = bind
-                    .parse()
-                    .map_err(|e| format!("invalid bind address: {e}"))?;
-                enforce_bind_is_networkless(addr)?;
-                BrokerEndpoint::LoopbackTcp(addr)
-            } else {
-                resolve_broker_endpoint(&runtime, endpoint.as_deref())
-                    .map_err(|e| e.to_string())?
-            };
-            ep.enforce_networkless().map_err(|e| e.to_string())?;
-            let allowed: Vec<String> = allow_callers
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            eprintln!(
-                "ownmesh-broker starting endpoint={}",
-                broker_endpoint_display(&ep)
-            );
-            run_broker(BrokerServeConfig {
-                endpoint: ep,
-                secret_file,
-                allow_callers: allowed,
-                require_capability,
-                addr_file,
-            })
-            .await
-        }
+            endpoint: _,
+            bind: _,
+            secret_file: _,
+            signing_key_file: _,
+            addr_file: _,
+            runtime_dir: _,
+            trusted_executable: _,
+            socket_owner_uid: _,
+            socket_group_gid: _,
+            socket_mode: _,
+            allowed_uids: _,
+        } => Err(production_elevated_broker_unsupported()),
         Commands::Exec {
-            secret_file,
-            program,
-            caller,
-            args,
-        } => {
-            let secret = load_or_create_secret(&secret_file)?;
-            let now = now_unix();
-            let req = build_request(
-                &secret,
-                caller,
-                format!("op_{now}"),
-                ElevatedCommand {
-                    program,
-                    args,
-                    cwd: None,
-                    env: vec![],
-                },
-                now,
-                60,
-            );
-            let mut replay = ReplayCache::new();
-            let resp = execute_verified(&secret, &mut replay, &["ownmeshd".into()], &req, now)?;
-            println!("{}", serde_json::to_string_pretty(&resp).unwrap());
-            if !resp.ok {
-                std::process::exit(resp.exit_code.unwrap_or(1));
-            }
-            Ok(())
-        }
+            secret_file: _,
+            signing_key_file: _,
+            program: _,
+            peer_pid: _,
+            trusted_executable: _,
+            allowed_uids: _,
+            caller: _,
+            args: _,
+        } => Err(format!(
+            "unsupported: elevated broker exec CLI is disabled until a secure mint authority is established (fail-closed; no process spawn)"
+        )),
     }
 }
 
-// silence unused import when default_broker_endpoint only used on some cfgs
-#[allow(dead_code)]
-fn _keep(p: &std::path::Path) -> BrokerEndpoint {
-    default_broker_endpoint(p)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_commands_accept_no_legacy_arguments() {
+        for command in ["run", "install", "exec", "uninstall"] {
+            let cli = Cli::try_parse_from(["ownmesh-broker", command]).unwrap();
+            let err = run(cli)
+                .await
+                .expect_err("production path must be unsupported");
+            assert!(err.contains("unsupported"), "{command}: {err}");
+        }
+    }
 }

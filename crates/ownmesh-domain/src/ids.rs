@@ -134,7 +134,10 @@ pub fn parse_prefixed_id(raw: &str, kind: IdKind) -> Result<String, DomainError>
         ));
     }
     if raw.is_empty() {
-        return Err(DomainError::new(ErrorCode::InvalidId, "id must not be empty"));
+        return Err(DomainError::new(
+            ErrorCode::InvalidId,
+            "id must not be empty",
+        ));
     }
     let prefix = kind.prefix();
     if !raw.starts_with(prefix) {
@@ -293,8 +296,14 @@ mod tests {
 
     #[test]
     fn parses_valid_ids() {
-        assert_eq!(TenantId::parse("ten_example").unwrap().as_str(), "ten_example");
-        assert_eq!(DeviceId::parse("dev_windows-01").unwrap().body(), "windows-01");
+        assert_eq!(
+            TenantId::parse("ten_example").unwrap().as_str(),
+            "ten_example"
+        );
+        assert_eq!(
+            DeviceId::parse("dev_windows-01").unwrap().body(),
+            "windows-01"
+        );
         assert_eq!(
             SessionId::parse("sess_01HABCXYZ").unwrap().as_str(),
             "sess_01HABCXYZ"

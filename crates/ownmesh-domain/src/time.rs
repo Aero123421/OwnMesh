@@ -80,22 +80,22 @@ impl Timestamp {
 
     /// Checked addition of a duration.
     pub fn checked_add(self, duration: Duration) -> Result<Self, DomainError> {
-        let t_duration = time::Duration::try_from(duration).map_err(|_| {
-            DomainError::new(ErrorCode::InvalidArgument, "duration out of range")
-        })?;
-        self.0.checked_add(t_duration).map(Self).ok_or_else(|| {
-            DomainError::new(ErrorCode::InvalidArgument, "timestamp overflow")
-        })
+        let t_duration = time::Duration::try_from(duration)
+            .map_err(|_| DomainError::new(ErrorCode::InvalidArgument, "duration out of range"))?;
+        self.0
+            .checked_add(t_duration)
+            .map(Self)
+            .ok_or_else(|| DomainError::new(ErrorCode::InvalidArgument, "timestamp overflow"))
     }
 
     /// Checked subtraction of a duration.
     pub fn checked_sub(self, duration: Duration) -> Result<Self, DomainError> {
-        let t_duration = time::Duration::try_from(duration).map_err(|_| {
-            DomainError::new(ErrorCode::InvalidArgument, "duration out of range")
-        })?;
-        self.0.checked_sub(t_duration).map(Self).ok_or_else(|| {
-            DomainError::new(ErrorCode::InvalidArgument, "timestamp underflow")
-        })
+        let t_duration = time::Duration::try_from(duration)
+            .map_err(|_| DomainError::new(ErrorCode::InvalidArgument, "duration out of range"))?;
+        self.0
+            .checked_sub(t_duration)
+            .map(Self)
+            .ok_or_else(|| DomainError::new(ErrorCode::InvalidArgument, "timestamp underflow"))
     }
 }
 
@@ -139,7 +139,11 @@ impl Expiry {
         if self.is_expired_at_with_skew(now, skew) {
             Err(DomainError::new(
                 ErrorCode::Expired,
-                format!("expired at {} (now {now}, skew {}s)", self.at, skew.as_secs()),
+                format!(
+                    "expired at {} (now {now}, skew {}s)",
+                    self.at,
+                    skew.as_secs()
+                ),
             ))
         } else {
             Ok(())
