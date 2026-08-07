@@ -1,7 +1,7 @@
-//! OwnMesh doctor, support bundles, and local diagnostics.
+//! `OwnMesh` doctor, support bundles, and local diagnostics.
 //!
 //! Support bundles are previewed and redacted before any export. Nothing is
-//! sent to OwnMesh operators unless the user explicitly exports a bundle.
+//! sent to `OwnMesh` operators unless the user explicitly exports a bundle.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -54,6 +54,10 @@ pub struct DoctorReport {
 }
 
 /// Inputs gathered by CLI/daemon for doctor.
+///
+/// The boolean fields are independent diagnostic observations and privacy
+/// settings, so replacing them with a state machine would obscure the API.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct DoctorInput {
     pub config_readable: bool,

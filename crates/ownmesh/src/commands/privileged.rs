@@ -2,7 +2,7 @@
 //!
 //! Production elevated broker is fixed as **unsupported** until a secure mint
 //! authority exists. Install and uninstall are side-effect-free, status is
-//! canonical, and no path spawns elevated processes.
+//! canonical fail-closed metadata, and no path spawns elevated processes.
 
 use crate::cli::{Cli, PrivilegedCmd};
 use crate::commands::ipc_util::print_value;
@@ -30,6 +30,17 @@ fn state_base() -> Result<PathBuf, ExitCode> {
         })
 }
 
+/// Structured JSON error body for privileged install/uninstall failures (`--json`).
+fn privileged_failure_json(command: &str, message: &str, status: &Value) -> Value {
+    json!({
+        "schema_version": 1,
+        "status": "not_implemented",
+        "command": command,
+        "message": message,
+        "broker": status,
+    })
+}
+
 fn canonical_status(base: &Path, record: Option<Value>) -> Value {
     let malformed_shape = record.as_ref().is_some_and(|value| !value.is_object());
     let mut object = record
@@ -37,6 +48,8 @@ fn canonical_status(base: &Path, record: Option<Value>) -> Value {
         .unwrap_or_else(Map::new);
     let broker_dir = base.join("broker");
 
+    // Never trust on-disk markers: production elevated broker cannot claim
+    // installed/supported while mint authority is absent.
     object.insert("installed".into(), json!(false));
     object.insert("support".into(), json!("unsupported"));
     object.insert("network".into(), json!("disabled"));
@@ -73,10 +86,42 @@ fn canonical_status(base: &Path, record: Option<Value>) -> Value {
     Value::Object(object)
 }
 
-fn report_unsupported(cli: &Cli, status: &Value) -> Result<(), ExitCode> {
-    print_value(cli.json, status, |value| {
+fn report_unsupported(cli: &Cli, command: &str, status: &Value) -> Result<(), ExitCode> {
+    if cli.json {
+        println!(
+            "{}",
+            privileged_failure_json(command, UNSUPPORTED_REASON, status)
+        );
+    } else {
         println!(
             "privileged broker unsupported (installed=false) endpoint={}",
+            status["endpoint"].as_str().unwrap_or("-")
+        );
+        if let Some(notes) = status["notes"].as_array() {
+            for note in notes.iter().filter_map(Value::as_str) {
+                println!("note: {note}");
+            }
+        }
+    }
+    Err(super::unsupported_exit(command))
+}
+
+fn run_install(cli: &Cli) -> Result<(), ExitCode> {
+    let base = state_base()?;
+    // Deliberately do not mkdir, write a marker/template, spawn broker, or create
+    // key material. No filesystem side effects while production is unsupported.
+    report_unsupported(cli, "privileged broker install", &canonical_status(&base, None))
+}
+
+fn run_status(cli: &Cli) -> Result<(), ExitCode> {
+    let base = state_base()?;
+    let status = read_status_json(&base);
+    // Status is supported fail-closed metadata (see release/SUPPORTED_SURFACES.json).
+    print_value(cli.json, &status, |value| {
+        println!(
+            "privileged status=unsupported support={} network={} endpoint={}",
+            value["support"].as_str().unwrap_or("unsupported"),
+            value["network"].as_str().unwrap_or("disabled"),
             value["endpoint"].as_str().unwrap_or("-")
         );
         if let Some(notes) = value["notes"].as_array() {
@@ -85,34 +130,18 @@ fn report_unsupported(cli: &Cli, status: &Value) -> Result<(), ExitCode> {
             }
         }
     });
-    Err(ExitCode::ProfileUnavailable)
-}
-
-fn run_install(cli: &Cli) -> Result<(), ExitCode> {
-    let base = state_base()?;
-    // Deliberately do not mkdir, write a marker/template, or create key material.
-    report_unsupported(cli, &canonical_status(&base, None))
-}
-
-fn run_status(cli: &Cli) -> Result<(), ExitCode> {
-    let base = state_base()?;
-    let status = read_status_json(&base);
-    print_value(cli.json, &status, |value| {
-        println!(
-            "privileged status=unsupported support={} network={} endpoint={}",
-            value["support"].as_str().unwrap_or("unsupported"),
-            value["network"].as_str().unwrap_or("disabled"),
-            value["endpoint"].as_str().unwrap_or("-")
-        );
-    });
-    Err(ExitCode::ProfileUnavailable)
+    Ok(())
 }
 
 fn run_uninstall(cli: &Cli) -> Result<(), ExitCode> {
     let base = state_base()?;
     // Deliberately do not delete or rewrite privileged state. Manual cleanup is
     // an explicit operator action while this production feature is unsupported.
-    report_unsupported(cli, &canonical_status(&base, None))
+    report_unsupported(
+        cli,
+        "privileged broker uninstall",
+        &canonical_status(&base, None),
+    )
 }
 
 fn read_status_json(base: &Path) -> Value {
@@ -156,5 +185,39 @@ mod tests {
         assert_eq!(status["installed"], false);
         assert_eq!(status["support"], "unsupported");
         assert_eq!(status["endpoint"], "unix:/tmp/forged.sock");
+    }
+
+    #[test]
+    fn json_failure_payload_is_structured() {
+        let status = json!({"installed": false, "support": "unsupported"});
+        let v = privileged_failure_json(
+            "privileged broker install",
+            UNSUPPORTED_REASON,
+            &status,
+        );
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["status"], "not_implemented");
+        assert_eq!(v["command"], "privileged broker install");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("secure mint authority"),
+            "{v}"
+        );
+        assert_eq!(v["broker"]["installed"], false);
+    }
+
+    #[test]
+    fn json_uninstall_failure_payload_includes_command() {
+        let status = json!({"installed": false});
+        let v = privileged_failure_json(
+            "privileged broker uninstall",
+            UNSUPPORTED_REASON,
+            &status,
+        );
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["status"], "not_implemented");
+        assert_eq!(v["command"], "privileged broker uninstall");
     }
 }

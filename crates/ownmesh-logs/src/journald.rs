@@ -4,8 +4,8 @@
 //! Off Linux a stub is registered so cfg-gated wiring tests stay green.
 //!
 //! Official references:
-//! - sd-journal API: https://www.freedesktop.org/software/systemd/man/latest/sd-journal.html
-//! - journalctl(1): https://www.man7.org/linux/man-pages/man1/journalctl.1.html
+//! - sd-journal API: <https://www.freedesktop.org/software/systemd/man/latest/sd-journal.html>
+//! - journalctl(1): <https://www.man7.org/linux/man-pages/man1/journalctl.1.html>
 
 #[cfg(target_os = "linux")]
 use crate::page_from_lines;
@@ -63,7 +63,9 @@ impl LogProvider for JournaldLogProvider {
         let start = check_cursor(&self.id, cursor)?;
         #[cfg(target_os = "linux")]
         {
-            let need = start as usize + limit.max(1);
+            let need = usize::try_from(start)
+                .unwrap_or(usize::MAX)
+                .saturating_add(limit.max(1));
             let fetch_n = need.max(1).min(self.fetch_cap);
             let lines = fetch_journalctl(self.unit.as_deref(), fetch_n)?;
             Ok(page_from_lines(&self.id, &lines, start, limit))

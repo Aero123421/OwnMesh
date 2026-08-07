@@ -4,16 +4,42 @@ use crate::cli::{Cli, ExecArgs};
 use crate::commands::ipc_util::{call_daemon, print_value};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::methods;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
+    run_exec_with(cli, args, call_daemon)
+}
+
+fn run_exec_with(
+    cli: &Cli,
+    args: &ExecArgs,
+    call_local_daemon: impl FnOnce(&str, Option<Value>) -> Result<Value, ExitCode>,
+) -> Result<(), ExitCode> {
     if args.command.is_empty() {
         eprintln!("exec: command is required");
         return Err(ExitCode::UsageConfig);
     }
     // Remote device routing is not implemented. Fail closed: never fall back to
     // the local daemon when the operator explicitly targeted another device.
-    reject_unimplemented_device(args.device.as_deref())?;
+    if let Some(device) = &args.device {
+        if cli.json {
+            println!(
+                "{}",
+                json!({
+                    "schema_version": 1,
+                    "status": "not_implemented",
+                    "command": "exec --device",
+                    "device": device,
+                    "message": "remote execution is unsupported; local execution refused",
+                })
+            );
+        } else {
+            eprintln!(
+                "exec: --device routing is not implemented (requested device: {device}); refusing local execution"
+            );
+        }
+        return Err(super::unsupported_exit("exec --device"));
+    }
     let program = args.command[0].clone();
     let rest = args.command[1..].to_vec();
     let params = json!({
@@ -24,7 +50,7 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
         "timeout_ms": args.timeout_ms,
         "idempotency_key": args.idempotency_key,
     });
-    let value = call_daemon(methods::OPS_EXEC, Some(params))?;
+    let value = call_local_daemon(methods::OPS_EXEC, Some(params))?;
     print_value(cli.json, &value, |v| {
         if v["approval_required"].as_bool() == Some(true) {
             println!(
@@ -63,54 +89,61 @@ pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
     Ok(())
 }
 
-/// Reject `--device` without contacting the local daemon.
-///
-/// Extracted so unit tests can assert fail-closed behavior without IPC.
-pub(crate) fn reject_unimplemented_device(device: Option<&str>) -> Result<(), ExitCode> {
-    if let Some(device) = device {
-        eprintln!(
-            "exec: --device routing is not implemented yet (requested device: {device}); refusing to run on local daemon"
-        );
-        return Err(ExitCode::UsageConfig);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Commands;
+    use clap::Parser;
+    use std::cell::Cell;
 
     #[test]
-    fn device_flag_is_hard_error_not_local_fallback() {
-        let err =
-            reject_unimplemented_device(Some("dev_remote")).expect_err("--device must hard-error");
-        assert_eq!(err, ExitCode::UsageConfig);
-        assert_ne!(err.code(), 0);
+    fn device_exec_fails_without_attempting_local_daemon() {
+        let cli = Cli::try_parse_from([
+            "ownmesh",
+            "exec",
+            "--device",
+            "dev_remote",
+            "--",
+            "echo",
+            "hello",
+        ])
+        .expect("device exec arguments should parse");
+        let Commands::Exec(args) = cli.command.as_ref().expect("exec command") else {
+            panic!("expected exec command");
+        };
+        let local_daemon_attempted = Cell::new(false);
+
+        let result = run_exec_with(&cli, args, |_, _| {
+            local_daemon_attempted.set(true);
+            Ok(json!({}))
+        });
+
+        assert_eq!(result, Err(ExitCode::ProfileUnavailable));
+        assert!(!local_daemon_attempted.get());
     }
 
     #[test]
-    fn device_absent_allows_local_path() {
-        assert!(reject_unimplemented_device(None).is_ok());
-    }
-
-    #[test]
-    fn run_exec_with_device_never_reaches_daemon() {
-        // Construct minimal args; call_daemon would panic/fail if reached without a daemon.
+    fn device_absent_reaches_injected_local_path() {
         let cli = Cli {
             json: false,
             lang: None,
             command: None,
         };
         let args = ExecArgs {
-            device: Some("dev_x".into()),
+            device: None,
             cwd: None,
             idempotency_key: None,
             raw_shell: false,
             timeout_ms: None,
             command: vec!["echo".into(), "hi".into()],
         };
-        let err = run_exec(&cli, &args).expect_err("must not fall back to local daemon");
-        assert_eq!(err, ExitCode::UsageConfig);
-        assert_ne!(err.code(), 0);
+        let reached = Cell::new(false);
+        let result = run_exec_with(&cli, &args, |method, _| {
+            reached.set(true);
+            assert_eq!(method, methods::OPS_EXEC);
+            Ok(json!({"result": {"stdout": "hi\n", "stderr": ""}}))
+        });
+        assert!(result.is_ok());
+        assert!(reached.get());
     }
 }

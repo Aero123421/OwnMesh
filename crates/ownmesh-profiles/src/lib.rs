@@ -1,6 +1,6 @@
-//! OwnMesh official and custom CLI profile definitions.
+//! `OwnMesh` official and custom CLI profile definitions.
 //!
-//! Official 9 profiles (OWNMESH_SPECIFICATION.ja.md §13) plus generic
+//! Official 9 profiles (`OWNMESH_SPECIFICATION.ja.md` §13) plus generic
 //! unknown-CLI execution path. Fixture-based conformance tests live in
 //! `tests` module and `fixtures/`.
 
@@ -36,7 +36,7 @@ pub enum ProfileError {
 
 pub type ProfileResult<T> = Result<T, ProfileError>;
 
-/// How OwnMesh prefers to connect to a CLI.
+/// How `OwnMesh` prefers to connect to a CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfacePreference {
@@ -65,17 +65,17 @@ impl InterfacePreference {
     }
 }
 
-/// Official profile identifiers — must match OWNMESH_SPECIFICATION.ja.md §13.1.
+/// Official profile identifiers — must match `OWNMESH_SPECIFICATION.ja.md` §13.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OfficialProfileId {
-    /// OpenAI Codex CLI (`codex`)
+    /// `OpenAI` Codex CLI (`codex`)
     Codex,
     /// Claude Code (`claude`)
     ClaudeCode,
     /// Kimi Code (`kimi`)
     KimiCode,
-    /// OpenCode (`opencode`)
+    /// `OpenCode` (`opencode`)
     OpenCode,
     /// Pi Coding Agent (`pi`)
     Pi,
@@ -110,7 +110,8 @@ impl OfficialProfileId {
         &OFFICIAL_ALL
     }
 
-    /// Parse from stable id string.
+    /// Parse from stable ID string.
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         // Accept legacy aliases used in early scaffolding.
         match s {
@@ -142,6 +143,10 @@ const OFFICIAL_ALL: [OfficialProfileId; 9] = [
 
 /// Profile definition (runtime + TOML).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "fields mirror the stable profile TOML schema"
+)]
 pub struct Profile {
     pub id: String,
     pub display_name: String,
@@ -221,6 +226,10 @@ pub struct LaunchPlan {
 
 /// Build the nine official profiles (spec §13.4 adapter policy).
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the profile matrix is clearest as one declarative table"
+)]
 pub fn official_profiles() -> Vec<Profile> {
     vec![
         Profile {
@@ -440,6 +449,11 @@ impl ProfileRegistry {
         self.profiles.insert(profile.id.clone(), profile);
     }
 
+    /// Retrieve a profile by its stable ID or a supported legacy alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Unknown`] when no matching profile is registered.
     pub fn get(&self, id: &str) -> ProfileResult<&Profile> {
         if let Some(p) = self.profiles.get(id) {
             return Ok(p);
@@ -454,6 +468,8 @@ impl ProfileRegistry {
         Err(ProfileError::Unknown(id.to_string()))
     }
 
+    /// List registered profiles in stable ID order.
+    #[must_use]
     pub fn list(&self) -> Vec<&Profile> {
         self.profiles.values().collect()
     }
@@ -472,7 +488,11 @@ impl ProfileRegistry {
         InterfacePreference::Pty
     }
 
-    /// Detect binary on PATH and pick preferred interface.
+    /// Detect a binary on `PATH` and pick its preferred interface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Unknown`] when `id` is not registered.
     pub fn detect(&self, id: &str) -> ProfileResult<ProfileStatus> {
         let p = self.get(id)?;
         let mut notes = Vec::new();
@@ -522,6 +542,8 @@ impl ProfileRegistry {
         })
     }
 
+    /// Detect all registered profiles, omitting profiles that cannot be resolved.
+    #[must_use]
     pub fn detect_all(&self) -> Vec<ProfileStatus> {
         self.profiles
             .keys()
@@ -530,6 +552,11 @@ impl ProfileRegistry {
     }
 
     /// Build a launch plan for interactive or structured start.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile is unknown, has no executable candidate,
+    /// or its detected version is unsupported.
     pub fn launch_plan(
         &self,
         id: &str,
@@ -582,7 +609,12 @@ impl ProfileRegistry {
         })
     }
 
-    /// Native resume plan when supported.
+    /// Build a native resume plan when supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile is unknown, has no executable candidate,
+    /// or does not support native resume.
     pub fn resume_plan(&self, id: &str, native_id: &str) -> ProfileResult<LaunchPlan> {
         let p = self.get(id)?;
         if !p.supports_native_resume || p.resume_args.is_empty() {
@@ -738,7 +770,7 @@ pub fn generic_interactive_session(
     }
 }
 
-/// Convert generic launch into a LaunchPlan.
+/// Convert a generic launch into a [`LaunchPlan`].
 #[must_use]
 pub fn generic_to_plan(g: &GenericLaunch) -> LaunchPlan {
     LaunchPlan {
@@ -757,6 +789,11 @@ pub fn generic_to_plan(g: &GenericLaunch) -> LaunchPlan {
 }
 
 /// Load optional custom profile TOML (spec §13.6 shape + extended fields).
+///
+/// # Errors
+///
+/// Returns [`ProfileError::Parse`] when the TOML is malformed or required profile
+/// fields are missing.
 pub fn load_custom_profile_toml(raw: &str) -> ProfileResult<Profile> {
     // Support both `binaries` and schema `commands`.
     #[derive(Deserialize)]
@@ -938,6 +975,15 @@ pub fn official_fixtures() -> Vec<ProfileFixture> {
 }
 
 /// Run conformance checks for one profile against its fixture.
+///
+/// # Errors
+///
+/// Returns [`ProfileError::Parse`] when profile metadata, capabilities, version
+/// handling, interface ordering, or launch behavior differs from the fixture.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the conformance checks form one linear audit sequence"
+)]
 pub fn conform_profile(profile: &Profile, fixture: &ProfileFixture) -> ProfileResult<Vec<String>> {
     let mut ok = Vec::new();
     if profile.id != fixture.id {
@@ -1063,13 +1109,18 @@ pub fn conform_profile(profile: &Profile, fixture: &ProfileFixture) -> ProfileRe
     Ok(ok)
 }
 
-/// Load fixture JSON from path (for optional external matrices).
+/// Load fixture JSON from a path (for optional external matrices).
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or does not contain a valid
+/// [`ProfileFixture`].
 pub fn load_fixture_json(path: &Path) -> ProfileResult<ProfileFixture> {
     let raw = std::fs::read_to_string(path)?;
     serde_json::from_str(&raw).map_err(|e| ProfileError::Parse(e.to_string()))
 }
 
-/// Normalize adapter events into a common OwnMesh shape (minimal).
+/// Normalize adapter events into a common `OwnMesh` shape (minimal).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedEvent {
     pub kind: String,

@@ -13,16 +13,20 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    /// Current OwnMesh device protocol.
+    /// Current `OwnMesh` device protocol.
     pub const CURRENT: Self = Self { major: 1, minor: 0 };
 
     /// Parse `ownmesh.device/1.0` or bare `1.0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if `raw` does not contain a valid major and minor
+    /// protocol version.
     pub fn parse(raw: &str) -> Result<Self, DomainError> {
         let rest = raw
             .strip_prefix("ownmesh.device/")
             .or_else(|| raw.strip_prefix("ownmesh.device"))
-            .map(|s| s.trim_start_matches('/'))
-            .unwrap_or(raw);
+            .map_or(raw, |s| s.trim_start_matches('/'));
         let mut parts = rest.split('.');
         let major_s = parts.next().unwrap_or("");
         let minor_s = parts.next().unwrap_or("0");
@@ -85,6 +89,11 @@ pub struct NegotiatedProtocol {
 /// - major must match for compatibility
 /// - prefer highest mutually supported minor
 /// - Control Plane and Agent support current minor and the previous minor
+///
+/// # Errors
+///
+/// Returns [`DomainError`] if either version set is empty or the two sets have
+/// no version in common.
 pub fn negotiate(
     offered: &[ProtocolVersion],
     supported: &[ProtocolVersion],
@@ -149,7 +158,12 @@ pub fn default_supported_versions() -> Vec<ProtocolVersion> {
     out
 }
 
-/// Ensure the constant wire string parses to CURRENT.
+/// Ensure the constant wire string parses to [`ProtocolVersion::CURRENT`].
+///
+/// # Errors
+///
+/// Returns [`DomainError`] if [`PROTOCOL_DEVICE_V1`] is invalid or does not match
+/// [`ProtocolVersion::CURRENT`].
 pub fn assert_current_wire_constant() -> Result<(), DomainError> {
     let parsed = ProtocolVersion::parse(PROTOCOL_DEVICE_V1)?;
     if parsed != ProtocolVersion::CURRENT {

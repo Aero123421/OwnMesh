@@ -3,12 +3,12 @@
 //! Production order of preference:
 //! - Windows: Named Pipe (ACL-backed; see Microsoft Named Pipe Security docs)
 //! - Unix: filesystem Unix socket (mode 0600) + optional `SO_PEERCRED` (Linux)
-//! - Fallback: loopback TCP (127.0.0.1 / ::1 only) for portable tests
+//! - Fallback: loopback TCP (`127.0.0.1` / `::1` only) for portable tests
 //!
 //! References:
-//! - https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights
-//! - https://www.man7.org/linux/man-pages/man7/unix.7.html (SO_PEERCRED)
-//! - https://www.man7.org/linux/man-pages/man7/socket.7.html
+//! - <https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights>
+//! - <https://www.man7.org/linux/man-pages/man7/unix.7.html> (`SO_PEERCRED`)
+//! - <https://www.man7.org/linux/man-pages/man7/socket.7.html>
 
 use crate::{BrokerError, BrokerRequest, BrokerResponse, BrokerResult, DEFAULT_BROKER_ENDPOINT};
 use std::net::SocketAddr;
@@ -45,6 +45,10 @@ impl BrokerEndpoint {
     }
 
     /// Ensure TCP endpoints are loopback-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Networkless`] for a non-loopback TCP endpoint.
     pub fn enforce_networkless(&self) -> BrokerResult<()> {
         match self {
             Self::LoopbackTcp(addr) => {
@@ -84,7 +88,7 @@ pub fn default_broker_endpoint(runtime_dir: &Path) -> BrokerEndpoint {
         let raw = runtime_dir.to_string_lossy();
         let mut key: String = raw
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
+            .filter(char::is_ascii_alphanumeric)
             .take(40)
             .collect();
         if key.is_empty() {
@@ -110,6 +114,11 @@ pub fn default_broker_endpoint(runtime_dir: &Path) -> BrokerEndpoint {
 /// - `tcp:127.0.0.1:PORT` or bare `127.0.0.1:PORT` / `[::1]:PORT`
 /// - `pipe:NAME` or `\\.\pipe\...`
 /// - `unix:/path` or absolute/relative filesystem path ending in `.sock`
+///
+/// # Errors
+///
+/// Returns [`BrokerError::Protocol`] if the endpoint cannot be parsed, or
+/// [`BrokerError::Networkless`] if a TCP endpoint is not loopback-only.
 pub fn resolve_broker_endpoint(
     runtime_dir: &Path,
     override_spec: Option<&str>,
@@ -141,7 +150,12 @@ pub fn resolve_broker_endpoint(
     if spec.starts_with(r"\\.\pipe\") {
         return Ok(BrokerEndpoint::NamedPipe(spec.to_string()));
     }
-    if spec.ends_with(".sock") || spec.starts_with('/') {
+    if spec.eq_ignore_ascii_case(".sock")
+        || Path::new(spec)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sock"))
+        || spec.starts_with('/')
+    {
         return Ok(BrokerEndpoint::UnixSocket(PathBuf::from(spec)));
     }
     if let Ok(addr) = spec.parse::<SocketAddr>() {
@@ -154,7 +168,12 @@ pub fn resolve_broker_endpoint(
     )))
 }
 
-/// Connect, write one JSON request line, read one JSON response line.
+/// Connect, write one JSON request line, and read one JSON response line.
+///
+/// # Errors
+///
+/// Returns a [`BrokerError`] if endpoint validation, connection, request writing,
+/// response reading, or response deserialization fails.
 pub async fn connect_and_call(
     endpoint: &BrokerEndpoint,
     req: &BrokerRequest,
@@ -250,6 +269,12 @@ mod tests {
         assert!(matches!(err, BrokerError::Networkless(_)));
         let err = resolve_broker_endpoint(Path::new("/tmp"), Some("tcp:8.8.8.8:53")).unwrap_err();
         assert!(matches!(err, BrokerError::Networkless(_)));
+    }
+
+    #[test]
+    fn resolve_accepts_dotfile_unix_socket() {
+        let ep = resolve_broker_endpoint(Path::new("/tmp/om"), Some(".sock")).unwrap();
+        assert_eq!(ep, BrokerEndpoint::UnixSocket(PathBuf::from(".sock")));
     }
 
     #[test]

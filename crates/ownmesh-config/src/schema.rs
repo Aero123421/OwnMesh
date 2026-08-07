@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Current on-disk schema version for `config.toml`.
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
-/// Top-level OwnMesh configuration file.
+/// Top-level `OwnMesh` configuration file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnMeshConfig {
     /// Schema version used for migrations.
@@ -259,7 +259,7 @@ fn default_update_channel() -> String {
 }
 
 /// Telemetry toggles — all default off per specification §25.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryConfig {
     /// Project telemetry upload.
     #[serde(default)]
@@ -270,16 +270,6 @@ pub struct TelemetryConfig {
     /// Usage analytics.
     #[serde(default)]
     pub usage_analytics: bool,
-}
-
-impl Default for TelemetryConfig {
-    fn default() -> Self {
-        Self {
-            project: false,
-            crash_upload: false,
-            usage_analytics: false,
-        }
-    }
 }
 
 /// A configured control-plane instance.

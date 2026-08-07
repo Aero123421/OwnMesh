@@ -78,15 +78,10 @@ pub fn dispatch_approval(cli: &Cli, cmd: &ApprovalCmd) -> Result<(), ExitCode> {
             });
             Ok(())
         }
-        ApprovalCmd::Watch => {
-            // Simple one-shot list; interactive watch can refine later.
-            eprintln!("approval watch: listing current queue (live watch arrives with TUI)");
-            let value = call_daemon(methods::APPROVAL_LIST, None)?;
-            print_value(cli.json, &value, |v| {
-                let n = v["approvals"].as_array().map_or(0, Vec::len);
-                println!("{n} approval(s) in queue");
-            });
-            Ok(())
-        }
+        ApprovalCmd::Watch => super::unsupported(
+            cli,
+            "approval watch",
+            "live approval watching is unsupported; use `ownmesh approval list` for a one-shot query",
+        ),
     }
 }

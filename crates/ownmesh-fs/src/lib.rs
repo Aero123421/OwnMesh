@@ -1,4 +1,4 @@
-//! OwnMesh filesystem operations and path safety.
+//! `OwnMesh` filesystem operations and path safety.
 //!
 //! Workspace-relative resolution, symlink/junction-aware canonicalization,
 //! list/stat/read/write/delete, hash-checked patch apply, and read-only git
@@ -73,6 +73,11 @@ pub struct WorkspaceRoot {
 
 impl WorkspaceRoot {
     /// Create a workspace root. `enforce=false` is Full Access style.
+    ///
+    /// # Errors
+    ///
+    /// This constructor currently accepts both existing and not-yet-created roots;
+    /// the result type preserves compatibility with fallible workspace setup.
     pub fn new(root: impl Into<PathBuf>, enforce: bool) -> FsResult<Self> {
         let root = root.into();
         let canon = dunce_canonicalize(&root).unwrap_or(root);
@@ -83,6 +88,11 @@ impl WorkspaceRoot {
     }
 
     /// Resolve a relative (or absolute when not enforcing) path safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid paths, paths that escape an enforced workspace,
+    /// or paths whose existing ancestors cannot be canonicalized.
     pub fn resolve(&self, rel: impl AsRef<Path>) -> FsResult<PathBuf> {
         let rel = rel.as_ref();
         if rel.as_os_str().is_empty() {
@@ -195,6 +205,11 @@ pub struct FileStat {
 }
 
 /// List directory (non-recursive by default).
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved or read, is not a directory,
+/// or when the requested entry limit is reached.
 pub fn list_dir(
     ws: &WorkspaceRoot,
     rel: impl AsRef<Path>,
@@ -258,7 +273,12 @@ pub fn list_dir(
     Ok(out)
 }
 
-/// Stat a path; optionally compute sha256 for files.
+/// Stat a path; optionally compute SHA-256 for files.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved, inspected, or read for
+/// hashing.
 pub fn stat_path(ws: &WorkspaceRoot, rel: impl AsRef<Path>, hash: bool) -> FsResult<FileStat> {
     let path = ws.resolve(rel)?;
     let meta = fs::symlink_metadata(&path).map_err(|source| FsError::Io {
@@ -285,6 +305,11 @@ pub fn stat_path(ws: &WorkspaceRoot, rel: impl AsRef<Path>, hash: bool) -> FsRes
 }
 
 /// Read file bytes with size cap.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved or read, does not identify a
+/// file, or exceeds `max_bytes`.
 pub fn read_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, max_bytes: u64) -> FsResult<Vec<u8>> {
     let path = ws.resolve(rel)?;
     let meta = fs::metadata(&path).map_err(|source| FsError::Io {
@@ -304,6 +329,11 @@ pub fn read_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, max_bytes: u64) -> F
 }
 
 /// Write file atomically (temp + rename) when possible.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved or its parent, temporary
+/// file, or final destination cannot be written.
 pub fn write_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, data: &[u8]) -> FsResult<()> {
     let path = ws.resolve(rel)?;
     if let Some(parent) = path.parent() {
@@ -332,6 +362,11 @@ pub fn write_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, data: &[u8]) -> FsR
 }
 
 /// Delete file or empty directory; `recursive` removes trees.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved, does not exist, or cannot be
+/// removed.
 pub fn delete_path(ws: &WorkspaceRoot, rel: impl AsRef<Path>, recursive: bool) -> FsResult<()> {
     let path = ws.resolve(rel)?;
     if !path.exists() {
@@ -353,6 +388,11 @@ pub fn delete_path(ws: &WorkspaceRoot, rel: impl AsRef<Path>, recursive: bool) -
 }
 
 /// Apply whole-file patch when `expected_sha256` matches (if provided).
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved, the current file cannot be
+/// hashed, the expected hash differs, or the replacement cannot be written.
 pub fn apply_patch(
     ws: &WorkspaceRoot,
     rel: impl AsRef<Path>,
@@ -379,7 +419,7 @@ pub fn apply_patch(
         }
     }
     write_file(ws, rel, new_content)?;
-    hash_bytes(new_content)
+    Ok(hash_bytes(new_content))
 }
 
 fn hash_file(path: &Path) -> FsResult<String> {
@@ -402,10 +442,10 @@ fn hash_file(path: &Path) -> FsResult<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn hash_bytes(data: &[u8]) -> FsResult<String> {
+fn hash_bytes(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    Ok(hex::encode(hasher.finalize()))
+    hex::encode(hasher.finalize())
 }
 
 fn empty_hash() -> &'static str {
@@ -430,8 +470,11 @@ pub fn looks_sensitive(path: &Path) -> bool {
             | "secret"
             | "secrets.yaml"
             | "secrets.yml"
-    ) || name.ends_with(".pem")
-        || name.ends_with(".key")
+    ) || name == ".pem"
+        || name == ".key"
+        || Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("key"))
 }
 
 #[cfg(test)]
@@ -488,6 +531,9 @@ mod tests {
     #[test]
     fn sensitive_hint() {
         assert!(looks_sensitive(Path::new("/tmp/.env")));
+        assert!(looks_sensitive(Path::new("/tmp/server.key")));
+        assert!(looks_sensitive(Path::new("/tmp/.key")));
+        assert!(looks_sensitive(Path::new("/tmp/.pem")));
         assert!(!looks_sensitive(Path::new("/tmp/readme.md")));
     }
 }

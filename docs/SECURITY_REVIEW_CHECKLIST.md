@@ -221,7 +221,7 @@ Legend: ✅ covered by automated tests in v1.0.1 · ⚠ partial / best-effort ·
 ## 14. Release Gate
 
 - [x] Windows、macOS、Linux で threat-driven integration tests が通る  
-  **CI:** `.github/workflows/ci.yml` (Windows required; macOS/Linux best-effort)
+  **CI:** `.github/workflows/ci.yml` (Windows/macOS/Linux all required; Rust 1.92 locked gates)
 - [x] protocol、path、broker、adapter fuzzing の重大 crash がない  
   **Tests:** fuzz harness + security_* suites
 - [x] critical/high vulnerability が解消または公開された受容判断を持つ  

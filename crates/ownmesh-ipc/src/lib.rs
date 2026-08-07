@@ -1,4 +1,4 @@
-//! OwnMesh local IPC transport (Named Pipe on Windows, Unix domain sockets elsewhere).
+//! `OwnMesh` local IPC transport (Named Pipe on Windows, Unix domain sockets elsewhere).
 //!
 //! Framing is 4-byte big-endian length + UTF-8 JSON-RPC 2.0. Peers authenticate via
 //! **OS peer credentials** (Unix `SO_PEERCRED` / Windows named-pipe client PID+SID+exe)

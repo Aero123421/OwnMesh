@@ -3,9 +3,9 @@
 //! Uses `wevtutil qe` (Windows Event Log command-line) so the crate stays
 //! `forbid(unsafe_code)`. Official surface:
 //! - Windows Event Log API overview:
-//!   https://learn.microsoft.com/en-us/windows/win32/wes/windows-event-log
+//!   <https://learn.microsoft.com/en-us/windows/win32/wes/windows-event-log>
 //! - wevtutil query-events:
-//!   https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wevtutil
+//!   <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/wevtutil>
 
 use crate::{check_cursor, page_from_lines, LogCursor, LogError, LogPage, LogProvider, LogResult};
 use std::process::Command;
@@ -44,7 +44,12 @@ impl WindowsEventLogProvider {
         &self.channel
     }
 
-    /// Read events via wevtutil. Public for live integration tests.
+    /// Reads events via `wevtutil`. Public for live integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform does not provide Windows Event Log
+    /// access or when `wevtutil` cannot query the configured channel.
     pub fn fetch_events(&self, count: usize) -> LogResult<Vec<String>> {
         #[cfg(windows)]
         {
@@ -67,7 +72,9 @@ impl LogProvider for WindowsEventLogProvider {
 
     fn query(&self, cursor: Option<&LogCursor>, limit: usize) -> LogResult<LogPage> {
         let start = check_cursor(&self.id, cursor)?;
-        let need = start as usize + limit.max(1);
+        let need = usize::try_from(start)
+            .unwrap_or(usize::MAX)
+            .saturating_add(limit.max(1));
         let fetch_n = need.max(1).min(self.fetch_cap);
         let events = self.fetch_events(fetch_n)?;
         Ok(page_from_lines(&self.id, &events, start, limit))

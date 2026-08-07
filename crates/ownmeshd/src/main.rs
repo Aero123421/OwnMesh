@@ -113,7 +113,8 @@ fn main() -> StdExitCode {
             }
         },
     };
-    StdExitCode::from(code.code() as u8)
+    let status = u8::try_from(code.code()).unwrap_or(u8::MAX);
+    StdExitCode::from(status)
 }
 
 fn init_tracing() {

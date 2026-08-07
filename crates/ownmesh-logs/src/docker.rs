@@ -64,7 +64,9 @@ impl LogProvider for DockerLogProvider {
         if safe.is_empty() {
             return Err(LogError::Backend("invalid container name".into()));
         }
-        let need = start as usize + limit.max(1);
+        let need = usize::try_from(start)
+            .unwrap_or(usize::MAX)
+            .saturating_add(limit.max(1));
         let fetch_n = need.max(1).min(self.fetch_cap);
         let lines = fetch_container_logs(self.binary.as_deref(), &safe, fetch_n)?;
         Ok(page_from_lines(&self.id, &lines, start, limit))

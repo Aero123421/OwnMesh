@@ -151,6 +151,10 @@ impl ErrorCode {
     }
 
     /// Parse a stable wire code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when `raw` is not a recognized error code.
     pub fn parse(raw: &str) -> Result<Self, DomainError> {
         match raw {
             "OWNMESH_E_INVALID_ID" => Ok(Self::InvalidId),

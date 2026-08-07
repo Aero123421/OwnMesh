@@ -100,6 +100,11 @@ fn default_diff_limit(n: usize) -> usize {
 }
 
 /// Run read-only `git status --porcelain=v1 -b` with entry pagination.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is invalid or outside the enforced
+/// workspace, or when a `git` subprocess cannot be run successfully.
 pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatusPage> {
     let cwd = resolve_repo_cwd(ws, &opts.path)?;
     let output = run_git(
@@ -108,20 +113,17 @@ pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatu
     )?;
     let (branch, upstream, entries) = parse_porcelain_v1(&output);
     let clean = entries.is_empty();
-    let start = opts.cursor.unwrap_or(0) as usize;
+    let start = cursor_to_index(opts.cursor);
     let limit = default_status_limit(opts.limit);
     let slice = if start >= entries.len() {
         &[][..]
     } else {
-        let end = (start + limit).min(entries.len());
+        let end = start.saturating_add(limit).min(entries.len());
         &entries[start..end]
     };
-    let exhausted = start + slice.len() >= entries.len();
-    let next_cursor = if exhausted {
-        None
-    } else {
-        Some((start + slice.len()) as u64)
-    };
+    let next_index = start.saturating_add(slice.len());
+    let exhausted = next_index >= entries.len();
+    let next_cursor = (!exhausted).then(|| u64::try_from(next_index).unwrap_or(u64::MAX));
     Ok(GitStatusPage {
         repo_root: cwd.to_string_lossy().into_owned(),
         branch,
@@ -134,6 +136,11 @@ pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatu
 }
 
 /// Run read-only `git diff` (or `--cached`) with line pagination.
+///
+/// # Errors
+///
+/// Returns an error when the repository path is invalid or outside the enforced
+/// workspace, or when a `git` subprocess cannot be run successfully.
 pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage> {
     let cwd = resolve_repo_cwd(ws, &opts.path)?;
     let mut args: Vec<String> = vec!["diff".into(), "--no-color".into(), "--no-ext-diff".into()];
@@ -156,20 +163,17 @@ pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage>
         raw.truncate(max_bytes);
     }
     let all_lines: Vec<String> = raw.lines().map(str::to_owned).collect();
-    let start = opts.cursor.unwrap_or(0) as usize;
+    let start = cursor_to_index(opts.cursor);
     let limit = default_diff_limit(opts.limit);
     let slice = if start >= all_lines.len() {
         &[][..]
     } else {
-        let end = (start + limit).min(all_lines.len());
+        let end = start.saturating_add(limit).min(all_lines.len());
         &all_lines[start..end]
     };
-    let exhausted = start + slice.len() >= all_lines.len();
-    let next_cursor = if exhausted {
-        None
-    } else {
-        Some((start + slice.len()) as u64)
-    };
+    let next_index = start.saturating_add(slice.len());
+    let exhausted = next_index >= all_lines.len();
+    let next_cursor = (!exhausted).then(|| u64::try_from(next_index).unwrap_or(u64::MAX));
     Ok(GitDiffPage {
         repo_root: cwd.to_string_lossy().into_owned(),
         staged: opts.staged,
@@ -178,6 +182,10 @@ pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage>
         exhausted,
         truncated,
     })
+}
+
+fn cursor_to_index(cursor: Option<u64>) -> usize {
+    cursor.map_or(0, |value| usize::try_from(value).unwrap_or(usize::MAX))
 }
 
 fn resolve_repo_cwd(ws: &WorkspaceRoot, rel: &Path) -> FsResult<PathBuf> {
@@ -263,6 +271,7 @@ fn parse_porcelain_v1(text: &str) -> (Option<String>, Option<String>, Vec<GitSta
 mod tests {
     use super::*;
     use crate::WorkspaceRoot;
+    use std::fmt::Write as _;
     use std::fs;
     use tempfile::tempdir;
 
@@ -419,7 +428,7 @@ mod tests {
         // Produce a multi-line diff.
         let mut body = String::from("v1\n");
         for i in 0..30 {
-            body.push_str(&format!("line {i}\n"));
+            writeln!(&mut body, "line {i}").unwrap();
         }
         fs::write(dir.path().join("README.md"), body.as_bytes()).unwrap();
         let ws = WorkspaceRoot::new(dir.path(), true).unwrap();

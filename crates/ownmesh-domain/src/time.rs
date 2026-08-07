@@ -41,6 +41,10 @@ impl Timestamp {
     }
 
     /// Parse an RFC3339 string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when `raw` is not a valid RFC3339 timestamp.
     pub fn parse(raw: &str) -> Result<Self, DomainError> {
         let dt = OffsetDateTime::parse(raw, &Rfc3339).map_err(|e| {
             DomainError::new(
@@ -79,6 +83,11 @@ impl Timestamp {
     }
 
     /// Checked addition of a duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when the duration cannot be represented or the
+    /// resulting timestamp would overflow.
     pub fn checked_add(self, duration: Duration) -> Result<Self, DomainError> {
         let t_duration = time::Duration::try_from(duration)
             .map_err(|_| DomainError::new(ErrorCode::InvalidArgument, "duration out of range"))?;
@@ -89,6 +98,11 @@ impl Timestamp {
     }
 
     /// Checked subtraction of a duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when the duration cannot be represented or the
+    /// resulting timestamp would underflow.
     pub fn checked_sub(self, duration: Duration) -> Result<Self, DomainError> {
         let t_duration = time::Duration::try_from(duration)
             .map_err(|_| DomainError::new(ErrorCode::InvalidArgument, "duration out of range"))?;
@@ -135,6 +149,11 @@ impl Expiry {
     }
 
     /// Return `Err(OWNMESH_E_EXPIRED)` when expired under the given skew.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when this expiry is at or before the skew-adjusted
+    /// current time.
     pub fn check_at(self, now: Timestamp, skew: Duration) -> Result<(), DomainError> {
         if self.is_expired_at_with_skew(now, skew) {
             Err(DomainError::new(
@@ -151,6 +170,11 @@ impl Expiry {
     }
 
     /// Check against current wall clock with default skew.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when this expiry has passed after applying the
+    /// default clock skew.
     pub fn check_now(self) -> Result<(), DomainError> {
         self.check_at(Timestamp::now(), DEFAULT_CLOCK_SKEW)
     }

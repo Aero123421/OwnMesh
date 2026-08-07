@@ -110,7 +110,13 @@ pub(crate) fn check_cursor(id: &str, cursor: Option<&LogCursor>) -> LogResult<u6
 
 /// Build a page from a slice of text lines starting at absolute `start` offset.
 pub(crate) fn page_from_lines(id: &str, all_lines: &[String], start: u64, limit: usize) -> LogPage {
-    let start_idx = start as usize;
+    let Ok(start_idx) = usize::try_from(start) else {
+        return LogPage {
+            lines: vec![],
+            next_cursor: None,
+            exhausted: true,
+        };
+    };
     if start_idx >= all_lines.len() || limit == 0 {
         return LogPage {
             lines: vec![],

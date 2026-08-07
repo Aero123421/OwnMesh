@@ -15,13 +15,21 @@ pub const MAX_PAGE_LIMIT: u32 = 1000;
 pub struct Cursor(String);
 
 impl Cursor {
-    /// Parse a stable cursor id.
+    /// Parse a stable cursor ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when `raw` is not a valid cursor ID.
     pub fn parse(raw: impl AsRef<str>) -> Result<Self, DomainError> {
         let s = parse_prefixed_id(raw.as_ref(), IdKind::Cursor)?;
         Ok(Self(s))
     }
 
-    /// Construct from a validated body (without prefix).
+    /// Construct from a body without the `cur_` prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when `body` is not a valid cursor body.
     pub fn from_body(body: impl AsRef<str>) -> Result<Self, DomainError> {
         let raw = format!("cur_{}", body.as_ref());
         Self::parse(raw)
@@ -81,7 +89,11 @@ impl Default for PageRequest {
 }
 
 impl PageRequest {
-    /// Validate and clamp limit into the allowed range.
+    /// Validate that the limit is within the allowed range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] when `limit` is zero or exceeds [`MAX_PAGE_LIMIT`].
     pub fn validated(self) -> Result<Self, DomainError> {
         if self.limit == 0 {
             return Err(DomainError::new(

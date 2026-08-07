@@ -104,6 +104,11 @@ impl Envelope {
     }
 
     /// Validate `expires_at` against `now` with the given skew.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError`] if the envelope is expired at `now` after applying
+    /// `skew`.
     pub fn validate_expiry_at(&self, now: Timestamp, skew: Duration) -> Result<(), DomainError> {
         if let Some(exp) = self.expires_at {
             exp.check_at(now, skew).map_err(|e| {

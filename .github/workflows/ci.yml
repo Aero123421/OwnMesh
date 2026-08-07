@@ -6,178 +6,121 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  PNPM_HOME: ${{ github.workspace }}/.pnpm-store
 
 jobs:
-  rust-windows:
-    name: Rust (Windows)
-    runs-on: windows-latest
+  rust:
+    name: Rust 1.92 (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+          - name: Linux
+            os: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Rust 1.92 toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: "1.85.0"
+          toolchain: "1.92.0"
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      # cargo-fmt does not accept Cargo's --locked flag because it never resolves
+      # dependencies. Lockfile immutability is checked explicitly before formatting.
+      - name: Verify Cargo.lock is current
+        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
+        shell: bash
 
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo build
-        run: cargo build --workspace
+        run: cargo build --workspace --locked
 
       - name: cargo test
-        run: cargo test --workspace
-
-  rust-macos:
-    name: Rust (macOS, best-effort)
-    runs-on: macos-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.85.0"
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo build
-        run: cargo build --workspace
-
-      - name: cargo test
-        run: cargo test --workspace
-
-  rust-linux:
-    name: Rust (Linux, best-effort)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.85.0"
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo build
-        run: cargo build --workspace
-
-      - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets --locked
 
   typescript:
-    name: TypeScript / pnpm
+    name: pnpm frozen quality gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
 
-      - name: Enable corepack (pnpm)
+      - name: Enable corepack (pnpm 9.15.0)
         run: |
           corepack enable
           corepack prepare pnpm@9.15.0 --activate
 
-      - name: pnpm install
-        run: pnpm install --frozen-lockfile=false
+      - name: pnpm install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
 
-      - name: typecheck
+      - name: pnpm tests
+        run: pnpm -r test
+
+      - name: pnpm typecheck
         run: pnpm -r typecheck
 
-      - name: lint
+      - name: pnpm lint
         run: pnpm -r lint
 
-  worker:
-    name: Control Plane (Worker)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
+      - name: Wrangler configuration dry-run
         working-directory: packages/control-plane
+        run: pnpm exec wrangler deploy --dry-run
+
+  release-truthfulness:
+    name: Release claims and gate structure
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Enable corepack (pnpm)
-        run: |
-          corepack enable
-          corepack prepare pnpm@9.15.0 --activate
-
-      - name: pnpm install (workspace root)
-        working-directory: .
-        run: pnpm install --frozen-lockfile=false
-
-      - name: typecheck control-plane
-        run: pnpm typecheck
-
-      - name: lint control-plane
-        run: pnpm lint
-
-      - name: wrangler dry-run (if configured)
-        run: |
-          if [ -f wrangler.jsonc ] || [ -f wrangler.toml ]; then
-            pnpm exec wrangler deploy --dry-run || pnpm exec wrangler validate || true
-          else
-            echo "No wrangler config yet — skeleton OK"
-          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify release surfaces and fail-closed publish graph
+        run: python scripts/check_release_quality.py
+      - name: Release-quality checker fixtures and mutation tests
+        run: python scripts/tests/run_release_quality_tests.py
 
   tui-i18n:
     name: TUI i18n completeness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Rust 1.92 toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: "1.85.0"
+          toolchain: "1.92.0"
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
-      - name: translation completeness (en-US / ja-JP / zh-Hans / ru-RU)
-        run: cargo run -p ownmesh-tui -- --check-i18n
+      - name: Translation completeness (en-US / ja-JP / zh-Hans / ru-RU)
+        run: cargo run --locked -p ownmesh-tui -- --check-i18n
 
       - name: TUI snapshot tests (CJK width, ru overflow, 80x24, wizard)
-        run: cargo test -p ownmesh-tui -- --nocapture
+        run: cargo test --locked -p ownmesh-tui -- --nocapture

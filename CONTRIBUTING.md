@@ -16,18 +16,19 @@ Participation is governed by [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md).
 
 ### Toolchain
 
-- Rust **1.85.0** via `rust-toolchain.toml` (`rustfmt`, `clippy`)
+- Rust **1.92.0** via `rust-toolchain.toml` (`rustfmt`, `clippy`)
 - Node.js **≥ 22**, pnpm **9.15.0** (`packageManager` field / Corepack)
 
 ### Bootstrap
 
 ```bash
 # Rust
-cargo build --workspace
-cargo test --workspace
+cargo build --workspace --locked
+cargo test --workspace --all-targets --locked
 
 # TypeScript monorepo packages
-pnpm install
+pnpm install --frozen-lockfile
+pnpm -r test
 pnpm -r typecheck
 pnpm -r lint
 ```
@@ -35,15 +36,33 @@ pnpm -r lint
 ### Quality gates (match CI)
 
 ```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build --workspace
-cargo test --workspace
+cargo metadata --locked --format-version 1 --no-deps > /dev/null
+cargo fmt --all --check # cargo-fmt never resolves dependencies and has no --locked option
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo build --workspace --locked
+cargo test --workspace --all-targets --locked
+pnpm install --frozen-lockfile
+pnpm -r test
 pnpm -r typecheck
 pnpm -r lint
+python scripts/check_release_quality.py
 ```
 
 Workspace Rust lints forbid `unsafe_code` and enable Clippy `pedantic` (as warnings elevated to errors in CI via `-D warnings`).
+
+### Branch protection check-name migration
+
+Commit `c37f5fc` consolidated and renamed required CI jobs. Repository administrators must update branch-protection required checks after the new workflow has run once; GitHub only offers check names it has observed. Do not remove an old required check until its replacement is selectable, and do not leave both generations required indefinitely (that deadlocks merges because old jobs no longer run).
+
+| Remove legacy required check | Require current check |
+| --- | --- |
+| `Rust (Windows)` | `Rust 1.92 (Windows)` |
+| `Rust (macOS, best-effort)` | `Rust 1.92 (macOS)` |
+| `Rust (Linux, best-effort)` | `Rust 1.92 (Linux)` |
+| `TypeScript / pnpm` and `Control Plane (Worker)` | `pnpm frozen quality gates` |
+| _(new)_ | `Release claims and gate structure` |
+
+If Security jobs are branch-protection requirements, also refresh renamed contexts such as `SAST (clippy -D warnings)` → `SAST (Rust 1.92 clippy -D warnings)`, `SAST (TypeScript typecheck)` → `SAST (TypeScript)`, and `SBOM (CycloneDX Rust + Node)` → `SBOM (strict CycloneDX Rust + Node)`. Keep the independent audit, gitleaks, retention/redaction, TUI i18n, and all matrix checks required according to repository policy.
 
 ## Project layout
 

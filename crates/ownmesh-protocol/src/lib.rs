@@ -1,4 +1,4 @@
-//! OwnMesh device protocol envelopes and version negotiation.
+//! `OwnMesh` device protocol envelopes and version negotiation.
 //!
 //! Design authority: `OWNMESH_SPECIFICATION.ja.md` §21.
 

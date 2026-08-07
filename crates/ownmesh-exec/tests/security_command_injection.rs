@@ -52,14 +52,11 @@ async fn structured_args_are_not_shell_expanded() {
 async fn structured_does_not_invoke_shell_for_metachar_program_name_failure() {
     let req = structured("echo;true", vec!["x".into()]);
     let res = run_command(&req, None).await;
-    match res {
-        Ok(r) => {
-            assert!(
-                r.exit_code != Some(0) || !r.stdout.is_empty() || r.stderr.is_empty(),
-                "unexpected success via shell: {r:?}"
-            );
-        }
-        Err(_) => {}
+    if let Ok(r) = res {
+        assert!(
+            r.exit_code != Some(0) || !r.stdout.is_empty() || r.stderr.is_empty(),
+            "unexpected success via shell: {r:?}"
+        );
     }
 }
 

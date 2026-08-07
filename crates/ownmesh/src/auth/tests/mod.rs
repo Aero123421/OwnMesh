@@ -12,7 +12,6 @@ use ownmesh_identity::{
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
-use BrowserLoginOpts;
 
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()

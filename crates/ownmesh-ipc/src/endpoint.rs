@@ -113,7 +113,7 @@ impl Endpoint {
             let raw = runtime_dir.to_string_lossy();
             let mut key: String = raw
                 .chars()
-                .filter(|c| c.is_ascii_alphanumeric())
+                .filter(char::is_ascii_alphanumeric)
                 .take(40)
                 .collect();
             if key.is_empty() {

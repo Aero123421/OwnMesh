@@ -1,4 +1,4 @@
-//! IPC error types mapped onto the OwnMesh domain taxonomy.
+//! IPC error types mapped onto the `OwnMesh` domain taxonomy.
 
 use ownmesh_domain::{DomainError, ErrorCode};
 use std::fmt;

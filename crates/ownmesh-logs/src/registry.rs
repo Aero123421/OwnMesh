@@ -26,11 +26,16 @@ impl LogRegistry {
         self.providers.push(provider);
     }
 
+    /// Returns the provider registered under `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogError::ProviderNotFound`] when no provider has that id.
     pub fn get(&self, id: &str) -> LogResult<&dyn LogProvider> {
         self.providers
             .iter()
             .find(|p| p.id() == id)
-            .map(|p| p.as_ref())
+            .map(std::convert::AsRef::as_ref)
             .ok_or_else(|| LogError::ProviderNotFound(id.to_string()))
     }
 

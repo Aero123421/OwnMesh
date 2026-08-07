@@ -1,11 +1,11 @@
-//! PTY / ConPTY abstraction types.
+//! PTY / `ConPTY` abstraction types.
 //!
-//! Concrete backends live in `ownmesh-session-host` (portable-pty wraps
-//! Windows ConPTY / POSIX openpty). This module defines the cross-crate contract.
+//! Concrete backends live in `ownmesh-session-host` (`portable-pty` wraps
+//! Windows `ConPTY` / POSIX `openpty`). This module defines the cross-crate contract.
 //!
 //! References:
-//! - ConPTY: https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session
-//! - CreatePseudoConsole: https://learn.microsoft.com/en-us/windows/console/createpseudoconsole
+//! - `ConPTY`: <https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session>
+//! - `CreatePseudoConsole`: <https://learn.microsoft.com/en-us/windows/console/createpseudoconsole>
 
 use serde::{Deserialize, Serialize};
 
@@ -38,7 +38,7 @@ pub enum PtyViewMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PtyBackend {
-    /// Windows Pseudoconsole (ConPTY).
+    /// Windows Pseudoconsole (`ConPTY`).
     ConPty,
     /// POSIX openpty /pts.
     PosixPty,

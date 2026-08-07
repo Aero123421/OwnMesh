@@ -1,0 +1,9 @@
+name: bad-pin-branch
+on: push
+jobs:
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@main
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@master

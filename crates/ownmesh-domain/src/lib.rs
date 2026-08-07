@@ -1,4 +1,4 @@
-//! OwnMesh domain types, stable identifiers, shared models, and error taxonomy.
+//! `OwnMesh` domain types, stable identifiers, shared models, and error taxonomy.
 //!
 //! Design authority: `OWNMESH_SPECIFICATION.ja.md` (§7, §12, §14.7, §16.3, §20, §21).
 
