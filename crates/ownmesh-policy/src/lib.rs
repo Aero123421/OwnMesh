@@ -458,8 +458,10 @@ pub fn full_access_has_no_hidden_restrictive_rules(doc: &PolicyDocument) -> bool
 /// Grants are principal-scoped and time-bounded. `command.run` grants must also
 /// bind operation facts (`kind` / `program_equals` / `elevated`); structured
 /// grants additionally bind server-captured executable identity (path / digest /
-/// device / inode / policy_kind). Unbound command grants never allow (fail
-/// closed), including legacy persisted rows.
+/// device / inode / policy_kind). `raw_shell` cannot safely pin script content or
+/// dependent interpreter binaries, so raw_shell grants are never issued or
+/// applied (fail closed), including legacy/unbound persisted rows. Client-supplied
+/// kind/digest must never be trusted — only server approval facts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporaryGrant {
     pub id: String,
@@ -469,6 +471,7 @@ pub struct TemporaryGrant {
     #[serde(default)]
     pub path_prefix: Option<String>,
     /// Bound operation kind (e.g. `structured`). Required for `command.run`.
+    /// `raw_shell` is never a valid bound grant kind.
     #[serde(default)]
     pub kind: Option<String>,
     /// Bound exact program identity from server facts. Required for `command.run`.
@@ -489,11 +492,21 @@ pub fn temporary_grant_requires_operation_binding(capability: &str) -> bool {
     capability == "command.run" || capability.starts_with("command.")
 }
 
+/// True when `kind` is a raw shell / interpreter classification that must never
+/// receive or match a reusable temporary grant.
+#[must_use]
+pub fn temporary_grant_forbids_kind(kind: &str) -> bool {
+    let k = kind.trim();
+    k.eq_ignore_ascii_case("raw_shell") || k.eq_ignore_ascii_case("raw")
+}
+
 /// Build a temporary grant from **server-side** approval facts only.
 ///
 /// Client-supplied facts must never be passed here. `command.run` grants without
 /// bindable kind/program/elevated are rejected fail-closed. Structured grants
 /// additionally require a server-captured executable identity binding.
+/// `raw_shell` grants are never issued — dependent binaries / script bytes cannot
+/// be pinned safely for reuse; one-shot approval remains the only path.
 pub fn temporary_grant_from_facts(
     id: String,
     principal_id: String,
@@ -522,6 +535,14 @@ pub fn temporary_grant_from_facts(
         if kind.is_empty() {
             return Err(
                 "temporary grant for command.run requires bound kind from server approval facts"
+                    .into(),
+            );
+        }
+        // raw_shell cannot pin execution content / interpreter dependencies safely.
+        // Fail closed: never mint a reusable grant (one-shot approval still works).
+        if temporary_grant_forbids_kind(kind) {
+            return Err(
+                "temporary grant for raw_shell command.run is not permitted; approve once without temporary grant"
                     .into(),
             );
         }
@@ -556,6 +577,12 @@ pub fn temporary_grant_from_facts(
                         .into(),
                 );
             }
+            // Identity policy_kind is server-captured; never trust a raw_shell pin for grants.
+            if temporary_grant_forbids_kind(&identity.policy_kind) {
+                return Err(
+                    "temporary grant for raw_shell executable identity is not permitted".into(),
+                );
+            }
             grant.executable_identity = Some(identity.clone());
         } else if kind == "structured" {
             return Err(
@@ -580,6 +607,15 @@ fn temporary_grant_is_bound_for_capability(grant: &TemporaryGrant) -> bool {
     if !(kind_ok && program_ok && grant.elevated.is_some()) {
         return false;
     }
+    // raw_shell grants (including legacy rows) never Allow — content/interpreter
+    // swaps at the same program path string cannot be pinned safely for reuse.
+    if grant
+        .kind
+        .as_deref()
+        .is_some_and(temporary_grant_forbids_kind)
+    {
+        return false;
+    }
     // Structured grants without identity never Allow — same-path swaps must re-ask.
     if grant.kind.as_deref() == Some("structured") {
         return grant
@@ -587,7 +623,11 @@ fn temporary_grant_is_bound_for_capability(grant: &TemporaryGrant) -> bool {
             .as_ref()
             .is_some_and(ExecutableIdentityBinding::is_bound);
     }
-    true
+    // Unknown/non-structured command kinds are fail-closed without identity pins.
+    grant
+        .executable_identity
+        .as_ref()
+        .is_some_and(ExecutableIdentityBinding::is_bound)
 }
 
 fn temporary_grant_matches(
@@ -602,7 +642,12 @@ fn temporary_grant_matches(
     if !capability_match(&grant.capability, &facts.capability) {
         return false;
     }
-    // Fail closed: legacy/unbound command.run grants never force Allow.
+    // Fail closed: never apply a temporary grant to raw_shell operations. Script
+    // bytes and dependent binaries are not safely reusable under path identity.
+    if temporary_grant_forbids_kind(&facts.kind) {
+        return false;
+    }
+    // Fail closed: legacy/unbound/raw command.run grants never force Allow.
     if !temporary_grant_is_bound_for_capability(grant) {
         return false;
     }
@@ -967,5 +1012,129 @@ mod tests {
             err.contains("executable identity") || err.contains("pin"),
             "{err}"
         );
+
+        let err = temporary_grant_from_facts(
+            "g-raw".into(),
+            "p".into(),
+            1,
+            &OperationFacts {
+                capability: "command.run".into(),
+                kind: "raw_shell".into(),
+                program: Some("/bin/bash".into()),
+                elevated: false,
+                ..Default::default()
+            },
+        )
+        .expect_err("raw_shell must not mint temporary grant");
+        assert!(
+            err.contains("raw_shell") || err.to_ascii_lowercase().contains("not permitted"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn raw_shell_temporary_grants_never_issue_or_allow() {
+        let doc = preset_document(AccessPreset::Recommended);
+        let facts = OperationFacts {
+            capability: "command.run".into(),
+            kind: "raw_shell".into(),
+            program: Some("/tmp/tool.sh".into()),
+            elevated: false,
+            ..Default::default()
+        };
+
+        // Issuance must fail closed (server facts only — client kind is irrelevant here).
+        let err =
+            temporary_grant_from_facts("g-raw".into(), "agent-1".into(), 9_999_999_999, &facts)
+                .expect_err("raw_shell issuance forbidden");
+        assert!(err.contains("raw_shell"), "{err}");
+
+        // Legacy/unbound and "bound" raw_shell rows must never force Allow.
+        let grants = vec![
+            TemporaryGrant {
+                id: "legacy-unbound".into(),
+                capability: "command.run".into(),
+                principal_id: "agent-1".into(),
+                expires_unix: 9_999_999_999,
+                path_prefix: None,
+                kind: None,
+                program_equals: None,
+                elevated: None,
+                executable_identity: None,
+            },
+            TemporaryGrant {
+                id: "legacy-raw-bound".into(),
+                capability: "command.run".into(),
+                principal_id: "agent-1".into(),
+                expires_unix: 9_999_999_999,
+                path_prefix: None,
+                kind: Some("raw_shell".into()),
+                program_equals: Some("/tmp/tool.sh".into()),
+                elevated: Some(false),
+                executable_identity: None,
+            },
+            // Even a forged identity on a raw_shell grant must not Allow.
+            TemporaryGrant {
+                id: "forged-raw-identity".into(),
+                capability: "command.run".into(),
+                principal_id: "agent-1".into(),
+                expires_unix: 9_999_999_999,
+                path_prefix: None,
+                kind: Some("raw_shell".into()),
+                program_equals: Some("/tmp/tool.sh".into()),
+                elevated: Some(false),
+                executable_identity: Some(ExecutableIdentityBinding {
+                    path: "/tmp/tool.sh".into(),
+                    content_sha256: "aa".repeat(32),
+                    len: 12,
+                    device: None,
+                    inode: None,
+                    policy_kind: "raw_shell".into(),
+                }),
+            },
+        ];
+        let v = evaluate_with_grants(&doc, &facts, &grants, 1, "agent-1");
+        assert_ne!(
+            v.decision,
+            Decision::Allow,
+            "raw_shell must never ride temporary grant: {v:?}"
+        );
+        assert!(
+            !v.reason.contains("temporary grant"),
+            "grant overlay must not match raw_shell: {}",
+            v.reason
+        );
+    }
+
+    #[test]
+    fn temporary_grant_never_applies_to_raw_shell_facts_even_with_structured_grant() {
+        let doc = preset_document(AccessPreset::Recommended);
+        let identity = sample_identity("/bin/echo", "ab".repeat(32).as_str());
+        let grant = temporary_grant_from_facts(
+            "g-struct".into(),
+            "agent-1".into(),
+            9_999_999_999,
+            &OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                program: Some("/bin/echo".into()),
+                elevated: false,
+                executable_identity: Some(identity),
+                ..Default::default()
+            },
+        )
+        .expect("structured grant");
+
+        // Same program path but server-classified raw_shell must not inherit grant.
+        let raw_facts = OperationFacts {
+            capability: "command.run".into(),
+            kind: "raw_shell".into(),
+            program: Some("/bin/echo".into()),
+            elevated: false,
+            ..Default::default()
+        };
+        let v = evaluate_with_grants(&doc, &raw_facts, &[grant], 1, "agent-1");
+        assert_ne!(v.decision, Decision::Allow);
+        assert!(!v.reason.contains("temporary grant"), "{}", v.reason);
     }
 }

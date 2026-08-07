@@ -2216,3 +2216,209 @@ async fn production_temporary_grant_rejects_same_path_content_swap() {
     server.request_shutdown();
     let _ = handle.await;
 }
+
+/// raw_shell cannot safely pin script/interpreter content for reuse. Approving a
+/// raw absolute path must never mint/apply a temporary grant; one-shot approval
+/// still runs once, and same-path content swap + new idempotency key must re-Ask
+/// (never grant-Allow). Client-supplied kind/digest are ignored.
+#[tokio::test]
+async fn production_raw_shell_absolute_path_temporary_grant_fail_closed_on_swap() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_production_test_daemon(&paths).await;
+
+    let management_secret =
+        ownmesh_ipc::read_management_credential(&paths.state_dir).expect("management delivery");
+    let management = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "mgmt",
+        Some(management_secret),
+    );
+    let provisioned: ownmesh_ipc::CredentialSecretResult = serde_json::from_value(
+        management
+            .call(
+                methods::CREDENTIAL_PROVISION,
+                Some(json!({ "client_id": "raw-grant-agent" })),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let agent = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "raw-grant-agent-label",
+        Some(provisioned.credential),
+    );
+    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
+
+    // Absolute script path → server classifies raw_shell (script extension / shebang).
+    let tool = dir.path().join(if cfg!(windows) {
+        "raw-granted-tool.cmd"
+    } else {
+        "raw-granted-tool.sh"
+    });
+    let marker = dir.path().join("raw-grant-pwned-marker");
+    #[cfg(unix)]
+    {
+        std::fs::write(&tool, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        std::fs::write(&tool, "@echo off\r\necho ok\r\n").unwrap();
+    }
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask raw_shell; never auto-allow".into()),
+            rules: vec![PolicyRule {
+                id: "ask-raw".into(),
+                decision: Decision::Ask,
+                priority: 10,
+                capability: "command.run".into(),
+                when_elevated: None,
+                when_kind: Some("raw_shell".into()),
+                path_prefix: None,
+                program_equals: None,
+                description: None,
+            }],
+        });
+    }
+
+    // Client may claim structured + forged pin; server must reclassify raw_shell.
+    let pending = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": &tool,
+                "args": [],
+                "executable_pin": {
+                    "path": &tool,
+                    "content_sha256": "aa".repeat(32),
+                    "len": 1,
+                    "policy_kind": "structured"
+                },
+                "idempotency_key": "raw-grant-approve",
+            })),
+        )
+        .await
+        .expect("enqueue raw absolute path");
+    assert_eq!(pending["approval_required"], true);
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    // temporary_grant must be refused for raw_shell (issuance fail-closed).
+    let grant_denied = human
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({
+                "id": approval_id,
+                "temporary_grant": true,
+                "grant_seconds": 600,
+            })),
+        )
+        .await
+        .expect_err("raw_shell temporary_grant must not be issued");
+    match grant_denied {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::INVALID_PARAMS, "{message}");
+            let lower = message.to_ascii_lowercase();
+            assert!(
+                lower.contains("raw_shell") || lower.contains("not permitted"),
+                "expected raw_shell grant refusal, got: {message}"
+            );
+        }
+        other => panic!("unexpected grant refusal error: {other:?}"),
+    }
+    {
+        let guard = runtime.lock().await;
+        assert!(
+            guard.grants_for_test().is_empty(),
+            "no temporary grant row may be persisted for raw_shell"
+        );
+    }
+
+    // One-shot approval without temporary grant still executes the approved op once.
+    let approved = human
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({
+                "id": approval_id,
+                "temporary_grant": false,
+            })),
+        )
+        .await
+        .expect("one-shot raw_shell approval must still work");
+    assert_eq!(approved["approval_required"], false);
+    {
+        let guard = runtime.lock().await;
+        assert!(
+            guard.grants_for_test().is_empty(),
+            "one-shot approval must not mint a grant"
+        );
+    }
+
+    // Same-path content swap after approval (malicious payload).
+    #[cfg(unix)]
+    {
+        std::fs::write(&tool, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        std::fs::write(
+            &tool,
+            format!("@echo off\r\necho pwned > \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+    }
+
+    // New idempotency key + client-forged kind/digest must not grant-Allow.
+    let after_swap = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": &tool,
+                "args": [],
+                "executable_pin": {
+                    "path": &tool,
+                    "content_sha256": "ff".repeat(32),
+                    "len": 99,
+                    "policy_kind": "structured"
+                },
+                "idempotency_key": "raw-grant-swapped-new-key",
+            })),
+        )
+        .await
+        .expect("swap must re-enter policy, not hard-crash");
+    assert_eq!(
+        after_swap["approval_required"], true,
+        "raw_shell path swap + new key must re-Ask, not grant-Allow: {after_swap}"
+    );
+    assert_ne!(
+        after_swap["decision"], "allow",
+        "must not Allow via temporary grant after raw path swap: {after_swap}"
+    );
+    assert!(
+        !marker.exists(),
+        "swapped raw_shell payload must never execute via grant reuse"
+    );
+    {
+        let guard = runtime.lock().await;
+        assert!(
+            guard.grants_for_test().is_empty(),
+            "grants must remain empty after raw_shell flow"
+        );
+    }
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
