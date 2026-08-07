@@ -210,8 +210,15 @@ export async function handleAuthorize(
   store: ControlPlaneStore,
   issuer: string,
   security: OAuthRequestSecurity = {},
+  // Internal seam for deterministic expiration-boundary tests. Production callers
+  // use Date.now; request input can never select this clock.
+  now: () => number = Date.now,
 ): Promise<Response> {
   void issuer;
+  // Bound the consent lifetime to request receipt, not completion of asynchronous
+  // bootstrap/authentication work, so load cannot silently extend the five-minute
+  // user-visible approval window.
+  const requestReceivedAt = now();
   const url = new URL(req.url);
 
   // POST consent decision first: consume one-time transaction and issue code
@@ -351,9 +358,9 @@ export async function handleAuthorize(
   const transactionId = randomId("atz_");
   const csrf = randomToken("csrf_");
   const txTtlMs = 5 * 60 * 1000;
-  // Anchor expiry before hashing/persistence so slow crypto cannot extend the
-  // externally promised five-minute consent window.
-  const transactionIssuedAt = Date.now();
+  // Anchor expiry at request receipt so validation, hashing, and persistence
+  // cannot extend the externally promised five-minute consent window.
+  const transactionIssuedAt = requestReceivedAt;
   await store.putAuthorizeTransaction({
     id: transactionId,
     csrf_hash: await sha256Hex(csrf),

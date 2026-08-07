@@ -28,6 +28,10 @@ Windows `cargo test` rejected GitHub Actions Temp directories whose path form us
 - Owner-only DACL, reparse rejection, and regular-file checks are unchanged and still fail closed.
 - Regressions: short/long path alias open succeeds; a file owned by a different principal is rejected.
 
+### OAuth consent expiration boundary
+
+The consent transaction's five-minute lifetime is now anchored at request receipt, before asynchronous bootstrap, authentication, hashing, or persistence work. Its test uses an injected internal clock and asserts the exact expiry rather than relying on a wall-clock scheduling allowance; request input cannot control that clock.
+
 ## Compatibility
 
 - Behavior matches v1.1.0 except for the CI-blocking correctness fixes above.
