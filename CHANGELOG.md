@@ -4,6 +4,7 @@
 
 - **ownmesh-config:** transaction lock `OpenOptions` now sets explicit `truncate(false)` with `create(true)` (crash-safe lock semantics; fixes `clippy::suspicious_open_options` under `-D warnings`).
 - **ownmesh-ipc (Windows):** registry state custody attests identity via handle file-index (stable across 8.3 / long path aliases) and claims owner SID + protected owner-only DACL from the process token; does not relax owner-only DACL / reparse / non-regular checks.
+- **control-plane OAuth:** consent expiry is captured at Worker GET receipt, before asynchronous form parsing/authentication; a delayed-auth-provider regression proves the five-minute lifetime cannot be extended by route work.
 - Release notes: [`docs/RELEASE_NOTES_v1.1.1.md`](./docs/RELEASE_NOTES_v1.1.1.md).
 - No Dependabot merges; `v1.1.0` tag left immutable.
 

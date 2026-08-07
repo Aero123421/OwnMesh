@@ -1,6 +1,6 @@
-# OwnMesh v1.1.1 — CI repair
+# OwnMesh v1.1.1 — CI and OAuth correctness repair
 
-v1.1.1 is a **CI repair** release on top of v1.1.0. It does not add product surfaces. The immutable `v1.1.0` tag is unchanged; this train only unblocks verified Linux/macOS Clippy and Windows test failures that blocked the v1.1.0 publish path.
+v1.1.1 is a **CI and OAuth correctness/security repair** release on top of v1.1.0. It does not add product surfaces. The immutable `v1.1.0` tag is unchanged; this train fixes verified Linux/macOS Clippy and Windows test failures that blocked the v1.1.0 publish path, plus a verified consent-expiry route-boundary issue found during release review.
 
 ## Scope
 
