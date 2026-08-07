@@ -1619,9 +1619,10 @@ fn sample_native_binary() -> std::path::PathBuf {
     }
     #[cfg(windows)]
     {
-        let system_root = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        let system_root = std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        );
         system_root.join("System32").join("where.exe")
     }
 }
@@ -1733,9 +1734,10 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
     }
     #[cfg(windows)]
     {
-        let system_root = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+        let system_root = std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        );
         std::fs::copy(system_root.join("System32").join("cmd.exe"), &swapped)
             .expect("copy replacement pe");
     }
