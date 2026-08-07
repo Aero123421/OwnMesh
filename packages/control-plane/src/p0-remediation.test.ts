@@ -197,7 +197,29 @@ test("audit and approval routes authenticate and approval handler is live", asyn
   const audit = await worker.fetch(new Request("https://cp.test/v1/audit", { headers: { authorization: `Bearer ${token.access_token}` } }), {}, ctx);
   assert.equal(audit.status, 200);
   assert.equal((await worker.fetch(new Request("https://cp.test/approve"), {}, ctx)).status, 401);
-  const approval = await worker.fetch(new Request("https://cp.test/approve", { headers: { authorization: `Bearer ${token.access_token}` } }), {}, ctx);
+  // Bearer (including creator MCP token) cannot approve.
+  const bearerApproval = await worker.fetch(
+    new Request("https://cp.test/approve", {
+      headers: { authorization: `Bearer ${token.access_token}` },
+    }),
+    {},
+    ctx,
+  );
+  assert.equal(bearerApproval.status, 403);
+  assert.equal(
+    ((await bearerApproval.json()) as { error?: string }).error,
+    "self_approval_forbidden",
+  );
+  // Independent human AUTH_PROVIDER session reaches the live handler.
+  const authProvider = {
+    fetch: async () =>
+      Response.json({ principal_id: "prin_dev", tenant_id: "ten_default" }),
+  } as unknown as Fetcher;
+  const approval = await worker.fetch(
+    new Request("https://cp.test/approve"),
+    { AUTH_PROVIDER: authProvider },
+    ctx,
+  );
   assert.equal(approval.status, 400);
   assert.deepEqual(await approval.json(), {
     error: "invalid_request",

@@ -410,52 +410,42 @@ export default {
       return handleDeviceVerification(request, store, { principal: principal || undefined, allowDevBypass: bypass });
     }
 
-    // Human approval for MCP approval_required ops: auth + CSRF + one-time tx,
-    // then deliver decision into DeviceRoom (never a success stub).
+    // Human approval for MCP approval_required ops: independent human auth +
+    // CSRF + one-time tx, then deliver decision into DeviceRoom (never a stub).
+    // OAuth/MCP/device bearer tokens must NOT approve — that enables creator
+    // self-approval of write/exec ops. Only AUTH_PROVIDER browser principal.
     if (url.pathname === "/approve") {
-      const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
-      const access = token ? await store.getAccess(token) : null;
-      let principal: AuthenticatedPrincipal | null = access
-        ? { id: access.principal, tenant_id: access.tenant_id, display_name: access.principal }
-        : null;
-      if (!principal) {
-        principal = await browserPrincipal(request, env);
+      const bearerToken =
+        request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+      const access = bearerToken ? await store.getAccess(bearerToken) : null;
+      // Fail closed: any resolvable control-plane access token is rejected here.
+      // (MCP write/exec creator bearer cannot self-approve via /approve.)
+      if (access) {
+        return json(
+          {
+            error: "self_approval_forbidden",
+            error_description:
+              "bearer tokens cannot approve MCP operations; use an independently authenticated human session",
+          },
+          { status: 403 },
+        );
       }
+
+      const principal = await browserPrincipal(request, env);
       if (!principal) return json({ error: "unauthorized" }, { status: 401 });
 
-      // Deciding a high-risk op requires write or exec scope on the bearer.
-      // Read-only / scope-less bearer tokens are rejected on POST.
-      // Browser session (no bearer) remains allowed for human HTML form flow.
-      if (request.method === "POST" && access) {
-        const canDecide =
-          requireScope(access.scope, "ownmesh.write") ||
-          requireScope(access.scope, "ownmesh.exec");
-        if (!canDecide) {
-          return json(
-            {
-              error: "insufficient_scope",
-              error_description: "ownmesh.write or ownmesh.exec required to decide approval",
-              required: ["ownmesh.write", "ownmesh.exec"],
-            },
-            { status: 403 },
-          );
-        }
-      }
-
       const postOriginOk =
-        request.method !== "POST" ||
-        originAllowed(request, env, issuer) ||
-        // Non-browser JSON clients may omit Origin; require bearer in that case.
-        (!request.headers.get("origin") && Boolean(access));
+        request.method !== "POST" || originAllowed(request, env, issuer);
 
       return handleApprove(request, store, {
         issuer,
         principal: { id: principal.id, tenant_id: principal.tenant_id },
+        authSource: "browser",
         originAllowed: postOriginOk,
         routeToDevice: (deviceId, operation) =>
           routeToDeviceRoom(env, deviceId, operation, {
-            principal_id: principal!.id,
-            tenant_id: principal!.tenant_id,
+            principal_id: principal.id,
+            tenant_id: principal.tenant_id,
           }),
       });
     }

@@ -1429,14 +1429,26 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       updated_at: new Date().toISOString(),
     });
 
-    // Wrong principal via worker.fetch → not found (no leak).
-    const other = await store.issueTokens(CLIENT, "prin_other", "ownmesh.read ownmesh.exec");
-    // prin_other may not exist as tenant principal — still must not leak op details.
-    const wrongPrin = await worker.fetch(
+    // Creator/MCP bearer must not self-approve (fail-closed).
+    const creatorBearer = await worker.fetch(
       new Request(`${ISSUER}/approve?operation_id=${opId}`, {
-        headers: { authorization: `Bearer ${other.access_token}` },
+        headers: { authorization: `Bearer ${accessToken}` },
       }),
       wenv,
+      ctx,
+    );
+    assert.equal(creatorBearer.status, 403, await creatorBearer.clone().text());
+    assert.equal(
+      ((await creatorBearer.json()) as { error?: string }).error,
+      "self_approval_forbidden",
+    );
+    assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
+
+    // Wrong human principal via AUTH_PROVIDER → not found / forbidden (no leak).
+    await store.ensurePrincipal("prin_other", "Other", "human", TENANT_ID);
+    const wrongPrin = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId}`),
+      { ...wenv, AUTH_PROVIDER: authProvider("prin_other", TENANT_ID) },
       ctx,
     );
     assert.ok(
@@ -1444,11 +1456,34 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       `foreign principal must not see op, got ${wrongPrin.status}`,
     );
 
-    // GET approval page through worker (auth required).
+    // Non-human principal cannot approve.
+    await store.ensurePrincipal("prin_service", "Svc", "service", TENANT_ID);
+    const servicePrin = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId}`),
+      { ...wenv, AUTH_PROVIDER: authProvider("prin_service", TENANT_ID) },
+      ctx,
+    );
+    assert.equal(servicePrin.status, 403, await servicePrin.clone().text());
+    assert.match(
+      String(((await servicePrin.json()) as { error_description?: string }).error_description || ""),
+      /human/i,
+    );
+
+    // Tenant mismatch fail-closed: AUTH_PROVIDER claims owner id but wrong tenant.
+    const tenantMismatch = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId}`),
+      { ...wenv, AUTH_PROVIDER: authProvider(PRINCIPAL_ID, "ten_other") },
+      ctx,
+    );
+    assert.equal(tenantMismatch.status, 403, await tenantMismatch.clone().text());
+    assert.match(
+      String(((await tenantMismatch.json()) as { error_description?: string }).error_description || ""),
+      /tenant/i,
+    );
+
+    // GET approval page through worker via independent human browser auth.
     const getRes = await worker.fetch(
-      new Request(`${ISSUER}/approve?operation_id=${opId}`, {
-        headers: { authorization: `Bearer ${accessToken}` },
-      }),
+      new Request(`${ISSUER}/approve?operation_id=${opId}`),
       wenv,
       ctx,
     );
@@ -1458,11 +1493,14 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     const csrf = /name="csrf_token" value="([^"]+)"/.exec(html)?.[1];
     assert.ok(tx && csrf, "approval form must include transaction_id and csrf_token");
 
+    // Client-supplied approver identity must be ignored (auth principal wins).
     const postBody = {
       decision: "approve",
       transaction_id: tx!,
       csrf_token: csrf!,
       operation_id: opId,
+      approver_principal_id: "prin_attacker",
+      principal_id: "prin_attacker",
     };
     const postOnce = () =>
       worker.fetch(
@@ -1471,7 +1509,6 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
           headers: {
             "content-type": "application/json",
             accept: "application/json",
-            authorization: `Bearer ${accessToken}`,
             origin: ISSUER,
           },
           body: JSON.stringify(postBody),
@@ -1479,6 +1516,28 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
         wenv,
         ctx,
       );
+
+    // Bearer POST still forbidden even with a valid browser-minted tx id in body.
+    const bearerPost = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=${opId}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          authorization: `Bearer ${accessToken}`,
+          origin: ISSUER,
+        },
+        body: JSON.stringify(postBody),
+      }),
+      wenv,
+      ctx,
+    );
+    assert.equal(bearerPost.status, 403);
+    assert.equal(
+      ((await bearerPost.json()) as { error?: string }).error,
+      "self_approval_forbidden",
+    );
+    assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
 
     const first = await postOnce();
     assert.equal(first.status, 200, await first.clone().text());
@@ -1508,7 +1567,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     assert.equal((await store.getMcpOperation(opId))?.status, "pending");
     assert.equal((await store.getMcpOperation(opId))?.approval_required, false);
 
-    // One-time: same transaction rejected.
+    // One-time: same transaction rejected (replay/TOCTOU).
     const second = await postOnce();
     assert.equal(second.status, 400);
 
@@ -1534,9 +1593,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       updated_at: new Date().toISOString(),
     });
     const get2 = await worker.fetch(
-      new Request(`${ISSUER}/approve?operation_id=${opId2}`, {
-        headers: { authorization: `Bearer ${accessToken}` },
-      }),
+      new Request(`${ISSUER}/approve?operation_id=${opId2}`),
       wenv,
       ctx,
     );
@@ -1550,7 +1607,6 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
         headers: {
           "content-type": "application/json",
           accept: "application/json",
-          authorization: `Bearer ${accessToken}`,
           origin: ISSUER,
         },
         body: JSON.stringify({
@@ -1595,9 +1651,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       updated_at: new Date().toISOString(),
     });
     const get3 = await worker.fetch(
-      new Request(`${ISSUER}/approve?operation_id=${opId3}`, {
-        headers: { authorization: `Bearer ${accessToken}` },
-      }),
+      new Request(`${ISSUER}/approve?operation_id=${opId3}`),
       offlineEnv,
       ctx,
     );
@@ -1612,7 +1666,6 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
         headers: {
           "content-type": "application/json",
           accept: "application/json",
-          authorization: `Bearer ${accessToken}`,
           origin: ISSUER,
         },
         body: JSON.stringify({
@@ -1646,9 +1699,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
 
 test("production-path: worker /approve is implemented (auth required, not 501)", async () => {
   await withStore(async (store) => {
-    const human = await store.issueTokens(CLIENT, PRINCIPAL_ID, "ownmesh.read ownmesh.exec");
-
-    // No bearer and no AUTH_PROVIDER → unauthorized (not a 501 stub).
+    // No AUTH_PROVIDER → unauthorized (not a 501 stub).
     const unauth = await worker.fetch(
       new Request(`${ISSUER}/approve`),
       { OAUTH_ISSUER: ISSUER },
@@ -1657,11 +1708,24 @@ test("production-path: worker /approve is implemented (auth required, not 501)",
     assert.equal(unauth.status, 401);
     assert.notEqual(unauth.status, 501);
 
-    // Authenticated but missing operation_id → 400 (handler is live).
-    const authNoOp = await worker.fetch(
+    // Creator bearer rejected (not treated as human approval session).
+    const human = await store.issueTokens(CLIENT, PRINCIPAL_ID, "ownmesh.read ownmesh.exec");
+    const bearerDenied = await worker.fetch(
       new Request(`${ISSUER}/approve`, {
         headers: { authorization: `Bearer ${human.access_token}` },
       }),
+      env(store),
+      ctx,
+    );
+    assert.equal(bearerDenied.status, 403);
+    assert.equal(
+      ((await bearerDenied.json()) as { error?: string }).error,
+      "self_approval_forbidden",
+    );
+
+    // Independent human browser auth, missing operation_id → 400 (handler is live).
+    const authNoOp = await worker.fetch(
+      new Request(`${ISSUER}/approve`),
       env(store),
       ctx,
     );

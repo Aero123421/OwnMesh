@@ -1722,10 +1722,29 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+/** Auth ceremony used to bind an MCP approval decision. */
+export type ApproveAuthSource = "browser" | "bearer";
+
+/** Principal kinds allowed to decide human approvals (fail-closed otherwise). */
+const HUMAN_APPROVER_KINDS = new Set(["human", "user"]);
+
+export function isHumanApproverKind(kind: string | undefined | null): boolean {
+  return Boolean(kind && HUMAN_APPROVER_KINDS.has(String(kind).toLowerCase()));
+}
+
 export type ApproveHandleOptions = {
   issuer?: string;
-  /** Authenticated principal (browser session or bearer owner). */
+  /**
+   * Independently authenticated principal from control-plane auth only.
+   * Client-supplied approver identity is never trusted (ignored if present in body).
+   */
   principal: { id: string; tenant_id: string };
+  /**
+   * How the principal was authenticated.
+   * - browser: AUTH_PROVIDER / human session (required for approval decisions)
+   * - bearer: OAuth/MCP/device access token — rejected for self-approval path
+   */
+  authSource?: ApproveAuthSource;
   /** Deliver approval decision into DeviceRoom. */
   routeToDevice?: OperationRouter["routeToDevice"];
   /** Origin allowed for state-changing POST (CSRF defense in depth). */
@@ -1733,8 +1752,64 @@ export type ApproveHandleOptions = {
 };
 
 /**
+ * Fail-closed gate for human MCP approval.
+ * - non-human principal → 403
+ * - tenant mismatch (auth claim vs store vs operation) → 403
+ * - creator/self principal via bearer (MCP write/exec token) → 403
+ * - operation not owned by approver → 404 (no leak)
+ *
+ * Approver identity comes only from `opts.principal` (server auth). Body fields
+ * like approver_principal_id are never read.
+ */
+export async function authorizeMcpApprover(
+  store: ControlPlaneStore,
+  principal: { id: string; tenant_id: string },
+  op: { principal_id: string; tenant_id: string; operation_id?: string },
+  authSource: ApproveAuthSource = "browser",
+): Promise<Response | null> {
+  const rec = await store.getPrincipal(principal.id);
+  if (!rec) {
+    return json(
+      { error: "forbidden", error_description: "principal not registered" },
+      { status: 403 },
+    );
+  }
+  // Bind to store tenant; never trust a client-asserted tenant alone.
+  if (rec.tenant_id !== principal.tenant_id || op.tenant_id !== rec.tenant_id) {
+    return json({ error: "forbidden", error_description: "tenant mismatch" }, { status: 403 });
+  }
+  if (!isHumanApproverKind(rec.kind)) {
+    return json(
+      {
+        error: "forbidden",
+        error_description: "human principal required for approval",
+      },
+      { status: 403 },
+    );
+  }
+  // Ownership: approver must be the operation owner principal (device/resource owner).
+  if (op.principal_id !== principal.id) {
+    return json({ error: "not_found", error_description: "operation not found" }, { status: 404 });
+  }
+  // Creator bearer (MCP write/exec / service token) must not self-approve.
+  // Independent browser human authentication is required.
+  if (authSource === "bearer") {
+    return json(
+      {
+        error: "self_approval_forbidden",
+        error_description:
+          "operation creator bearer cannot approve; use an independently authenticated human session",
+      },
+      { status: 403 },
+    );
+  }
+  return null;
+}
+
+/**
  * Human approval page + one-time CSRF decision delivery for MCP operations.
  * GET: mint approval transaction + form. POST: consume once and route decision.
+ * Approval is bound only to an independently authenticated human principal.
  */
 export async function handleApprove(
   req: Request,
@@ -1744,6 +1819,7 @@ export async function handleApprove(
   const url = new URL(req.url);
   const issuer = (opts.issuer || url.origin).replace(/\/$/, "");
   const principal = opts.principal;
+  const authSource: ApproveAuthSource = opts.authSource ?? "browser";
 
   if (req.method === "POST") {
     if (opts.originAllowed === false) {
@@ -1760,12 +1836,20 @@ export async function handleApprove(
       transactionId = String(body.transaction_id || "");
       csrfToken = String(body.csrf_token || "");
       if (body.operation_id) operationId = String(body.operation_id);
+      // Intentionally ignore client-supplied approver identity fields.
+      void body.approver_principal_id;
+      void body.approver_id;
+      void body.principal_id;
     } else {
       const form = await req.formData();
       decision = String(form.get("decision") || "");
       transactionId = String(form.get("transaction_id") || "");
       csrfToken = String(form.get("csrf_token") || "");
       if (form.get("operation_id")) operationId = String(form.get("operation_id"));
+      // Intentionally ignore client-supplied approver identity fields.
+      void form.get("approver_principal_id");
+      void form.get("approver_id");
+      void form.get("principal_id");
     }
     if (decision !== "approve" && decision !== "deny") {
       return json({ error: "invalid_request", error_description: "decision must be approve or deny" }, { status: 400 });
@@ -1776,6 +1860,7 @@ export async function handleApprove(
 
     // Durable one-time decision: atomic consume+outbox → claim → deliver → finalize.
     // Never report ok:true before successful delivery + authoritative transition.
+    // Approver principal is the authenticated human only (not client body).
     const started = await store.beginMcpApprovalOutbox(
       transactionId,
       await sha256Hex(csrfToken),
@@ -1807,13 +1892,19 @@ export async function handleApprove(
 
     const { outbox, tx } = started;
     if (tx.tenant_id !== principal.tenant_id || outbox.tenant_id !== principal.tenant_id) {
-      return json({ error: "forbidden" }, { status: 403 });
+      return json({ error: "forbidden", error_description: "tenant mismatch" }, { status: 403 });
+    }
+    // Transaction must stay bound to the authenticated human (replay/TOCTOU).
+    if (tx.principal_id !== principal.id || outbox.principal_id !== principal.id) {
+      return json({ error: "forbidden", error_description: "approver mismatch" }, { status: 403 });
     }
 
     const op = await store.getMcpOperation(outbox.operation_id);
-    if (!op || op.principal_id !== principal.id || op.tenant_id !== principal.tenant_id) {
+    if (!op) {
       return json({ error: "not_found", error_description: "operation not found" }, { status: 404 });
     }
+    const denied = await authorizeMcpApprover(store, principal, op, authSource);
+    if (denied) return denied;
     if (operationId && operationId !== op.operation_id) {
       return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
     }
@@ -2059,9 +2150,11 @@ export async function handleApprove(
   }
 
   const op = await store.getMcpOperation(operationId);
-  if (!op || op.principal_id !== principal.id || op.tenant_id !== principal.tenant_id) {
+  if (!op) {
     return json({ error: "not_found" }, { status: 404 });
   }
+  const deniedGet = await authorizeMcpApprover(store, principal, op, authSource);
+  if (deniedGet) return deniedGet;
   if (op.status !== "approval_required") {
     return json(
       {
@@ -2083,6 +2176,7 @@ export async function handleApprove(
 
   const csrf = randomToken("csrf_");
   const txId = randomId("apr_");
+  // Bind one-time tx to the authenticated human only (never client-supplied identity).
   await store.putMcpApprovalTransaction({
     id: txId,
     csrf_hash: await sha256Hex(csrf),

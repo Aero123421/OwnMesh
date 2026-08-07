@@ -563,12 +563,10 @@ test("invalid outbox decision/delivery_status fail closed on read", async () => 
   assert.equal(await store.getMcpApprovalOutbox("bad2"), null);
 });
 
-test("/approve POST bearer requires write or exec scope; read-only rejected", async () => {
+test("/approve rejects creator bearer; independent human browser session may decide", async () => {
   const store = new MemoryStore();
-  const readTok = await seed(store, "ownmesh.read");
   const writeTok = await seed(store, "ownmesh.write");
   const execTok = await seed(store, "ownmesh.exec");
-  const noneTok = await seed(store, "");
   const deviceId = "dev_scope_apr_01abcdefab";
   await putDevice(store, deviceId);
   const opId = randomId("op_");
@@ -579,63 +577,58 @@ test("/approve POST bearer requires write or exec scope; read-only rejected", as
     waitUntil() {},
     passThroughOnException() {},
   } as unknown as ExecutionContext;
+  const authProvider = {
+    fetch: async () =>
+      Response.json({
+        principal_id: "prin_dev",
+        tenant_id: "ten_default",
+        display_name: "Dev",
+      }),
+  } as unknown as Fetcher;
 
   try {
-    // GET with read-only still allowed (form render).
-    const getRead = await worker.fetch(
-      new Request(`https://cp.test/approve?operation_id=${opId}`, {
-        headers: { authorization: `Bearer ${readTok.access_token}` },
-      }),
-      {},
-      ctx,
-    );
-    assert.equal(getRead.status, 200);
-
-    const html = await getRead.text();
-    const tx = /name="transaction_id" value="([^"]+)"/.exec(html)?.[1];
-    const csrf = /name="csrf_token" value="([^"]+)"/.exec(html)?.[1];
-    assert.ok(tx && csrf);
-
-    const postWith = (token: string) =>
-      worker.fetch(
+    // Worker: any control-plane bearer (including write/exec creator) is rejected.
+    for (const token of [writeTok.access_token, execTok.access_token]) {
+      const denied = await worker.fetch(
         new Request(`https://cp.test/approve?operation_id=${opId}`, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            accept: "application/json",
-            authorization: `Bearer ${token}`,
-            origin: "https://cp.test",
-          },
-          body: JSON.stringify({
-            decision: "approve",
-            transaction_id: tx,
-            csrf_token: csrf,
-            operation_id: opId,
-          }),
+          headers: { authorization: `Bearer ${token}` },
         }),
-        {},
+        { AUTH_PROVIDER: authProvider },
         ctx,
       );
+      assert.equal(denied.status, 403, await denied.clone().text());
+      assert.equal(
+        ((await denied.json()) as { error?: string }).error,
+        "self_approval_forbidden",
+      );
+    }
+    assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
 
-    // Worker-level scope gate (before delivery).
-    const readDenied = await postWith(readTok.access_token);
-    assert.equal(readDenied.status, 403);
-    const readBody = (await readDenied.json()) as { error?: string };
-    assert.equal(readBody.error, "insufficient_scope");
-
-    const noneDenied = await postWith(noneTok.access_token);
-    assert.equal(noneDenied.status, 403);
-    assert.equal(((await noneDenied.json()) as { error?: string }).error, "insufficient_scope");
-
-    // write/exec may decide via handleApprove (mock route; worker needs DEVICE_ROOM).
-    const routeToDevice = async () => ({ status: "routed_to_device" as const, detail: {} });
-
-    const get2 = await handleApprove(
-      new Request(`https://cp.test/approve?operation_id=${opId}`, {
-        headers: { authorization: `Bearer ${writeTok.access_token}` },
-      }),
+    // handleApprove with authSource=bearer is fail-closed even if principal matches.
+    const bearerDirect = await handleApprove(
+      new Request(`https://cp.test/approve?operation_id=${opId}`),
       store,
-      { principal: { id: "prin_dev", tenant_id: "ten_default" }, routeToDevice },
+      {
+        principal: { id: "prin_dev", tenant_id: "ten_default" },
+        authSource: "bearer",
+      },
+    );
+    assert.equal(bearerDirect.status, 403);
+    assert.equal(
+      ((await bearerDirect.json()) as { error?: string }).error,
+      "self_approval_forbidden",
+    );
+
+    // Independent human browser session (AUTH_PROVIDER, no bearer) may GET+POST.
+    const routeToDevice = async () => ({ status: "routed_to_device" as const, detail: {} });
+    const get2 = await handleApprove(
+      new Request(`https://cp.test/approve?operation_id=${opId}`),
+      store,
+      {
+        principal: { id: "prin_dev", tenant_id: "ten_default" },
+        authSource: "browser",
+        routeToDevice,
+      },
     );
     assert.equal(get2.status, 200);
     const html2 = await get2.text();
@@ -643,13 +636,12 @@ test("/approve POST bearer requires write or exec scope; read-only rejected", as
     const csrf2 = /name="csrf_token" value="([^"]+)"/.exec(html2)?.[1];
     assert.ok(tx2 && csrf2);
 
-    const writeOk = await handleApprove(
+    const humanOk = await handleApprove(
       new Request(`https://cp.test/approve?operation_id=${opId}`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           accept: "application/json",
-          authorization: `Bearer ${writeTok.access_token}`,
           origin: "https://cp.test",
         },
         body: JSON.stringify({
@@ -657,76 +649,39 @@ test("/approve POST bearer requires write or exec scope; read-only rejected", as
           transaction_id: tx2,
           csrf_token: csrf2,
           operation_id: opId,
+          // Client-supplied identity must not override authenticated human.
+          approver_principal_id: "prin_attacker",
         }),
       }),
       store,
       {
         principal: { id: "prin_dev", tenant_id: "ten_default" },
+        authSource: "browser",
         originAllowed: true,
         routeToDevice,
       },
     );
-    assert.equal(writeOk.status, 200, await writeOk.clone().text());
+    assert.equal(humanOk.status, 200, await humanOk.clone().text());
     assert.equal((await store.getMcpOperation(opId))?.status, "denied");
 
-    // exec scope also permitted on a new op.
-    const opId2 = randomId("op_");
-    await store.putMcpOperation(approvalOp(opId2, deviceId));
-    const get3 = await handleApprove(
-      new Request(`https://cp.test/approve?operation_id=${opId2}`, {
-        headers: { authorization: `Bearer ${execTok.access_token}` },
-      }),
-      store,
-      { principal: { id: "prin_dev", tenant_id: "ten_default" }, routeToDevice },
-    );
-    const html3 = await get3.text();
-    const tx3 = /name="transaction_id" value="([^"]+)"/.exec(html3)?.[1];
-    const csrf3 = /name="csrf_token" value="([^"]+)"/.exec(html3)?.[1];
-    const execOk = await handleApprove(
-      new Request(`https://cp.test/approve?operation_id=${opId2}`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json",
-          authorization: `Bearer ${execTok.access_token}`,
-          origin: "https://cp.test",
-        },
-        body: JSON.stringify({
-          decision: "deny",
-          transaction_id: tx3,
-          csrf_token: csrf3,
-          operation_id: opId2,
-        }),
-      }),
-      store,
-      {
-        principal: { id: "prin_dev", tenant_id: "ten_default" },
-        originAllowed: true,
-        routeToDevice,
-      },
-    );
-    assert.equal(execOk.status, 200, await execOk.clone().text());
-
-    // Worker gate still accepts write-scoped bearer (scope check passes; may 503 without DO).
+    // Worker browser path (AUTH_PROVIDER) is live; may 503 without DEVICE_ROOM on approve.
     const opId3 = randomId("op_");
     await store.putMcpOperation(approvalOp(opId3, deviceId));
     const getW = await worker.fetch(
-      new Request(`https://cp.test/approve?operation_id=${opId3}`, {
-        headers: { authorization: `Bearer ${writeTok.access_token}` },
-      }),
-      {},
+      new Request(`https://cp.test/approve?operation_id=${opId3}`),
+      { AUTH_PROVIDER: authProvider },
       ctx,
     );
+    assert.equal(getW.status, 200, await getW.clone().text());
     const htmlW = await getW.text();
     const txW = /name="transaction_id" value="([^"]+)"/.exec(htmlW)?.[1];
     const csrfW = /name="csrf_token" value="([^"]+)"/.exec(htmlW)?.[1];
-    const writeScoped = await worker.fetch(
+    const browserPost = await worker.fetch(
       new Request(`https://cp.test/approve?operation_id=${opId3}`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           accept: "application/json",
-          authorization: `Bearer ${writeTok.access_token}`,
           origin: "https://cp.test",
         },
         body: JSON.stringify({
@@ -736,14 +691,13 @@ test("/approve POST bearer requires write or exec scope; read-only rejected", as
           operation_id: opId3,
         }),
       }),
-      {},
+      { AUTH_PROVIDER: authProvider },
       ctx,
     );
-    // Must not be insufficient_scope (403); delivery may fail without DEVICE_ROOM.
-    assert.notEqual(writeScoped.status, 403);
+    // Not a bearer self-approval rejection; delivery may fail without DEVICE_ROOM.
     assert.notEqual(
-      ((await writeScoped.clone().json()) as { error?: string }).error,
-      "insufficient_scope",
+      ((await browserPost.clone().json()) as { error?: string }).error,
+      "self_approval_forbidden",
     );
   } finally {
     __setTestStore(null);

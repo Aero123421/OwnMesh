@@ -441,19 +441,31 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     return { status: "routed_to_device", detail: { recipients: 1 } };
   };
 
-  // Unauthenticated denied
+  // Unregistered principal fail-closed
   const unauth = await handleApprove(
     new Request(`https://cp.test/approve?operation_id=${opId}`),
     store,
     {
       principal: { id: "nope", tenant_id: "ten_default" },
-      // principal wrong → 404
+      authSource: "browser",
     },
   );
-  // Wrong principal sees not_found
-  assert.equal(unauth.status, 404);
+  assert.equal(unauth.status, 403);
 
-  const getRes = await handleApprove(
+  // Wrong registered human must not see foreign op.
+  await store.ensurePrincipal("prin_other", "Other", "human", "ten_default");
+  const wrong = await handleApprove(
+    new Request(`https://cp.test/approve?operation_id=${opId}`),
+    store,
+    {
+      principal: { id: "prin_other", tenant_id: "ten_default" },
+      authSource: "browser",
+    },
+  );
+  assert.equal(wrong.status, 404);
+
+  // Creator bearer path rejected inside handler.
+  const bearerDenied = await handleApprove(
     new Request(`https://cp.test/approve?operation_id=${opId}`, {
       headers: { authorization: `Bearer ${tok.access_token}` },
     }),
@@ -461,6 +473,19 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     {
       issuer: "https://cp.test",
       principal: { id: "prin_dev", tenant_id: "ten_default" },
+      authSource: "bearer",
+      routeToDevice,
+    },
+  );
+  assert.equal(bearerDenied.status, 403);
+
+  const getRes = await handleApprove(
+    new Request(`https://cp.test/approve?operation_id=${opId}`),
+    store,
+    {
+      issuer: "https://cp.test",
+      principal: { id: "prin_dev", tenant_id: "ten_default" },
+      authSource: "browser",
       routeToDevice,
     },
   );
@@ -477,7 +502,6 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
         headers: {
           "content-type": "application/json",
           accept: "application/json",
-          authorization: `Bearer ${tok.access_token}`,
           origin: "https://cp.test",
         },
         body: JSON.stringify({
@@ -491,6 +515,7 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
       {
         issuer: "https://cp.test",
         principal: { id: "prin_dev", tenant_id: "ten_default" },
+        authSource: "browser",
         originAllowed: true,
         routeToDevice,
       },
@@ -517,6 +542,7 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     store,
     {
       principal: { id: "prin_dev", tenant_id: "ten_default" },
+      authSource: "browser",
       routeToDevice,
     },
   );
@@ -572,6 +598,7 @@ test("/approve delivery failure is retryable non-success; retry delivers exactly
       {
         issuer: "https://cp.test",
         principal: { id: "prin_dev", tenant_id: "ten_default" },
+        authSource: "browser",
         routeToDevice,
       },
     );
@@ -580,6 +607,7 @@ test("/approve delivery failure is retryable non-success; retry delivers exactly
     const tx = /name="transaction_id" value="([^"]+)"/.exec(html)?.[1];
     const csrf = /name="csrf_token" value="([^"]+)"/.exec(html)?.[1];
     assert.ok(tx && csrf);
+    void tok; // creator bearer intentionally unused for approval
 
     const postOnce = () =>
       handleApprove(
@@ -588,7 +616,6 @@ test("/approve delivery failure is retryable non-success; retry delivers exactly
           headers: {
             "content-type": "application/json",
             accept: "application/json",
-            authorization: `Bearer ${tok.access_token}`,
             origin: "https://cp.test",
           },
           body: JSON.stringify({
@@ -602,6 +629,7 @@ test("/approve delivery failure is retryable non-success; retry delivers exactly
         {
           issuer: "https://cp.test",
           principal: { id: "prin_dev", tenant_id: "ten_default" },
+          authSource: "browser",
           originAllowed: true,
           routeToDevice,
         },
@@ -686,15 +714,27 @@ test("worker /approve no longer returns 501; requires auth", async () => {
   const store = new MemoryStore();
   const tok = await seedAuthed(store);
   __setTestStore(store);
+  const authProvider = {
+    fetch: async () =>
+      Response.json({ principal_id: "prin_dev", tenant_id: "ten_default" }),
+  } as unknown as Fetcher;
   try {
     const unauth = await worker.fetch(new Request("https://cp.test/approve"), {}, ctx);
     assert.equal(unauth.status, 401);
 
-    const authNoOp = await worker.fetch(
+    // Creator bearer cannot act as human approval session.
+    const bearerDenied = await worker.fetch(
       new Request("https://cp.test/approve", {
         headers: { authorization: `Bearer ${tok.access_token}` },
       }),
-      {},
+      { AUTH_PROVIDER: authProvider },
+      ctx,
+    );
+    assert.equal(bearerDenied.status, 403);
+
+    const authNoOp = await worker.fetch(
+      new Request("https://cp.test/approve"),
+      { AUTH_PROVIDER: authProvider },
       ctx,
     );
     // Implemented: missing operation_id → 400 (not 501 stub)
