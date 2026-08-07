@@ -30,16 +30,16 @@ pub struct Cli {
 /// Top-level commands (specification §16.2).
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Interactive first-run setup wizard (stub).
-    Setup,
+    /// Interactive or non-interactive first-run setup wizard.
+    Setup(SetupArgs),
     /// Authenticate the human user (browser or device code).
     Login(LoginArgs),
     /// Clear local human credentials.
     Logout,
     /// Show daemon / device status via local IPC.
     Status,
-    /// Run local diagnostics.
-    Doctor,
+    /// Run local diagnostics (read-only).
+    Doctor(DoctorArgs),
     /// Emergency lockdown of the local agent.
     Lockdown,
     /// Lift emergency lockdown (local recovery).
@@ -93,6 +93,46 @@ pub enum Commands {
     Mcp(McpCmd),
     /// Shell completion scripts.
     Completion(CompletionArgs),
+}
+
+/// `ownmesh setup` arguments.
+#[derive(Debug, Clone, Parser)]
+pub struct SetupArgs {
+    /// Control-plane base URL (https://…; http:// loopback only).
+    #[arg(long, value_name = "URL")]
+    pub control_plane_url: Option<String>,
+
+    /// Local instance alias for the control plane (default: `default`).
+    #[arg(long, value_name = "ID")]
+    pub instance_id: Option<String>,
+
+    /// Policy preset: workspace_only | recommended | full_user_access | full_access.
+    #[arg(long, value_name = "NAME")]
+    pub policy_preset: Option<String>,
+
+    /// UI / CLI language tag (e.g. en-US, ja-JP).
+    #[arg(long)]
+    pub language: Option<String>,
+
+    /// Read setup options from a JSON object (path, or `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    pub from_json: Option<String>,
+
+    /// Overwrite an existing config without prompting.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Never prompt; fail closed when required values are missing (implied when stdin is not a TTY).
+    #[arg(long)]
+    pub non_interactive: bool,
+}
+
+/// `ownmesh doctor` arguments.
+#[derive(Debug, Clone, Parser)]
+pub struct DoctorArgs {
+    /// Opt in to network probes (control-plane /health). Also runs when a control-plane URL is already configured.
+    #[arg(long)]
+    pub check_network: bool,
 }
 
 /// `ownmesh login` arguments.
@@ -439,21 +479,33 @@ pub enum TransferCmd {
     },
 }
 
+/// Shared flags for `ownmesh service` mutating subcommands.
+#[derive(Debug, Clone, Parser, Default)]
+pub struct ServiceActionArgs {
+    /// Print the planned action without changing OS service state.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Override path to the `ownmeshd` executable (must be a canonical regular file).
+    #[arg(long, value_name = "PATH")]
+    pub executable: Option<String>,
+}
+
 /// `ownmesh service` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum ServiceCmd {
-    /// Install ownmeshd as a user service.
-    Install,
-    /// Start the service.
-    Start,
-    /// Stop the service.
-    Stop,
-    /// Restart the service.
-    Restart,
-    /// Show service status.
+    /// Install ownmeshd as a current-user autostart service (not admin/root).
+    Install(ServiceActionArgs),
+    /// Start the user-level ownmeshd service.
+    Start(ServiceActionArgs),
+    /// Stop the user-level ownmeshd service.
+    Stop(ServiceActionArgs),
+    /// Restart the user-level ownmeshd service.
+    Restart(ServiceActionArgs),
+    /// Show user-level service status (read-only).
     Status,
-    /// Uninstall the service.
-    Uninstall,
+    /// Uninstall the user-level ownmeshd service.
+    Uninstall(ServiceActionArgs),
 }
 
 /// `ownmesh privileged` subcommands.

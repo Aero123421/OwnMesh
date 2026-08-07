@@ -21,9 +21,11 @@ workspace = true
 anyhow = "1.0.95"
 clap = { version = "4.5.27", features = ["derive", "env", "wrap_help", "string"] }
 ownmesh-config = { path = "../ownmesh-config" }
+ownmesh-diagnostics = { path = "../ownmesh-diagnostics" }
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
+ownmesh-persist = { path = "../ownmesh-persist" }
 ownmesh-policy = { path = "../ownmesh-policy" }
 ownmesh-protocol = { path = "../ownmesh-protocol" }
 serde = { version = "1.0.217", features = ["derive"] }
@@ -48,6 +50,7 @@ dirs = "6.0.0"
 oauth2 = { version = "5.0.0", default-features = false }
 rand = "0.8.5"
 reqwest = { version = "0.12.12", default-features = false, features = [
+    "blocking",
     "gzip",
     "json",
     "rustls-tls",
