@@ -41,7 +41,7 @@ use ownmesh_logs::{
 use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
     temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
-    OperationFacts, PolicyDocument, TemporaryGrant,
+    ExecutableIdentityBinding, OperationFacts, PolicyDocument, TemporaryGrant,
 };
 use ownmesh_session::{SessionKind, SessionManager, StreamKind as SessionStreamKind};
 use serde::{Deserialize, Serialize};
@@ -1070,12 +1070,14 @@ impl DaemonRuntime {
                     );
             }
         }
+        // Facts carry only server-computed pin identity — never client digests.
         let facts = OperationFacts {
             capability: "command.run".into(),
             kind: kind.as_str().to_string(),
             program: Some(p.program.clone()),
             elevated: p.elevated,
             path: p.cwd.clone(),
+            executable_identity: p.executable_pin.as_ref().map(executable_identity_from_pin),
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -1331,12 +1333,32 @@ impl DaemonRuntime {
                             .into(),
                     });
                 }
-                temporary_grant_from_facts(grant_id, grant_principal, expires_unix, facts).map_err(
-                    |message| IpcError::Remote {
-                        code: app_error::INVALID_PARAMS,
-                        message,
-                    },
-                )?
+                // Prefer the approval request's server-captured pin; cross-check facts.
+                let mut facts_for_grant = facts.clone();
+                if let PendingRequest::Exec(exec) = &request {
+                    if let Some(pin) = &exec.executable_pin {
+                        let from_pin = executable_identity_from_pin(pin);
+                        if let Some(from_facts) = &facts_for_grant.executable_identity {
+                            if from_facts != &from_pin {
+                                return Err(IpcError::Remote {
+                                    code: app_error::INVALID_PARAMS,
+                                    message: "temporary grant executable identity mismatch between approval facts and pinned request".into(),
+                                });
+                            }
+                        }
+                        facts_for_grant.executable_identity = Some(from_pin);
+                    }
+                }
+                temporary_grant_from_facts(
+                    grant_id,
+                    grant_principal,
+                    expires_unix,
+                    &facts_for_grant,
+                )
+                .map_err(|message| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message,
+                })?
             } else {
                 TemporaryGrant {
                     id: grant_id,
@@ -1347,6 +1369,7 @@ impl DaemonRuntime {
                     kind: None,
                     program_equals: None,
                     elevated: None,
+                    executable_identity: None,
                 }
             })
         } else {
@@ -2391,6 +2414,19 @@ pub(crate) fn load_broker_client(
 
 fn is_op_journal_in_progress(value: &Value) -> bool {
     value.get(OP_JOURNAL_STATE_FIELD).and_then(Value::as_str) == Some(OP_JOURNAL_IN_PROGRESS)
+}
+
+/// Project a server-side [`ExecutablePin`] into policy grant/facts identity binding.
+/// Never construct this from client-supplied digests.
+fn executable_identity_from_pin(pin: &ExecutablePin) -> ExecutableIdentityBinding {
+    ExecutableIdentityBinding {
+        path: pin.path.clone(),
+        content_sha256: pin.content_sha256.clone(),
+        len: pin.len,
+        device: pin.device,
+        inode: pin.inode,
+        policy_kind: pin.policy_kind.clone(),
+    }
 }
 
 fn decision_str(d: Decision) -> &'static str {

@@ -74,6 +74,62 @@ pub enum AccessPreset {
     Custom,
 }
 
+/// Server-captured executable identity used to bind temporary grants and match
+/// subsequent `command.run` evaluations. Built only from daemon-side pins — never
+/// from client-supplied digests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableIdentityBinding {
+    /// Canonical absolute path inspected when the pin was captured.
+    pub path: String,
+    /// Hex SHA-256 of full file contents at pin time.
+    pub content_sha256: String,
+    /// Byte length at pin time.
+    pub len: u64,
+    /// Platform file identity (Unix dev; Windows → None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<u64>,
+    /// Platform file identity (Unix ino; Windows → None).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inode: Option<u64>,
+    /// Policy classification recorded with the pin (`structured` / `raw_shell`).
+    pub policy_kind: String,
+}
+
+impl ExecutableIdentityBinding {
+    /// True when the binding carries the minimum fields required to pin identity.
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        !self.path.trim().is_empty()
+            && !self.content_sha256.trim().is_empty()
+            && !self.policy_kind.trim().is_empty()
+    }
+
+    /// Exact match of path/digest/len/policy_kind and of any recorded device/inode.
+    #[must_use]
+    pub fn matches(&self, other: &Self) -> bool {
+        if !self.is_bound() || !other.is_bound() {
+            return false;
+        }
+        if self.path != other.path
+            || self.content_sha256 != other.content_sha256
+            || self.len != other.len
+            || self.policy_kind != other.policy_kind
+        {
+            return false;
+        }
+        // When either side recorded device/inode, both must agree (fail closed on drift).
+        if (self.device.is_some()
+            || other.device.is_some()
+            || self.inode.is_some()
+            || other.inode.is_some())
+            && (self.device != other.device || self.inode != other.inode)
+        {
+            return false;
+        }
+        true
+    }
+}
+
 /// Facts about an operation used for matching (machine facts, not AI opinion).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperationFacts {
@@ -92,6 +148,9 @@ pub struct OperationFacts {
     pub workspace_relative: bool,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Server-captured executable identity (structured `command.run` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_identity: Option<ExecutableIdentityBinding>,
 }
 
 /// Single policy rule.
@@ -397,8 +456,10 @@ pub fn full_access_has_no_hidden_restrictive_rules(doc: &PolicyDocument) -> bool
 /// Temporary grant overlay.
 ///
 /// Grants are principal-scoped and time-bounded. `command.run` grants must also
-/// bind operation facts (`kind` / `program_equals` / `elevated`); unbound command
-/// grants never allow (fail closed), including legacy persisted rows.
+/// bind operation facts (`kind` / `program_equals` / `elevated`); structured
+/// grants additionally bind server-captured executable identity (path / digest /
+/// device / inode / policy_kind). Unbound command grants never allow (fail
+/// closed), including legacy persisted rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporaryGrant {
     pub id: String,
@@ -416,6 +477,10 @@ pub struct TemporaryGrant {
     /// Bound elevated flag from server facts. Required for `command.run`.
     #[serde(default)]
     pub elevated: Option<bool>,
+    /// Bound executable pin from server approval facts. Required for structured
+    /// `command.run` so same-path content/identity swaps cannot reuse the grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_identity: Option<ExecutableIdentityBinding>,
 }
 
 /// Capabilities whose temporary grants must bind concrete operation facts.
@@ -427,7 +492,8 @@ pub fn temporary_grant_requires_operation_binding(capability: &str) -> bool {
 /// Build a temporary grant from **server-side** approval facts only.
 ///
 /// Client-supplied facts must never be passed here. `command.run` grants without
-/// bindable kind/program/elevated are rejected fail-closed.
+/// bindable kind/program/elevated are rejected fail-closed. Structured grants
+/// additionally require a server-captured executable identity binding.
 pub fn temporary_grant_from_facts(
     id: String,
     principal_id: String,
@@ -448,6 +514,7 @@ pub fn temporary_grant_from_facts(
         kind: None,
         program_equals: None,
         elevated: None,
+        executable_identity: None,
     };
 
     if temporary_grant_requires_operation_binding(capability) {
@@ -482,6 +549,20 @@ pub fn temporary_grant_from_facts(
             // Bind cwd/path when the approved operation carried one.
             grant.path_prefix = Some(path.to_owned());
         }
+        if let Some(identity) = facts.executable_identity.as_ref() {
+            if !identity.is_bound() {
+                return Err(
+                    "temporary grant for command.run requires complete server-captured executable identity"
+                        .into(),
+                );
+            }
+            grant.executable_identity = Some(identity.clone());
+        } else if kind == "structured" {
+            return Err(
+                "temporary grant for structured command.run requires server-captured executable identity pin"
+                    .into(),
+            );
+        }
     }
 
     Ok(grant)
@@ -496,7 +577,17 @@ fn temporary_grant_is_bound_for_capability(grant: &TemporaryGrant) -> bool {
         .program_equals
         .as_ref()
         .is_some_and(|p| !p.trim().is_empty());
-    kind_ok && program_ok && grant.elevated.is_some()
+    if !(kind_ok && program_ok && grant.elevated.is_some()) {
+        return false;
+    }
+    // Structured grants without identity never Allow — same-path swaps must re-ask.
+    if grant.kind.as_deref() == Some("structured") {
+        return grant
+            .executable_identity
+            .as_ref()
+            .is_some_and(ExecutableIdentityBinding::is_bound);
+    }
+    true
 }
 
 fn temporary_grant_matches(
@@ -534,6 +625,14 @@ fn temporary_grant_matches(
     if let Some(prefix) = &grant.path_prefix {
         match &facts.path {
             Some(p) if p.starts_with(prefix.as_str()) => {}
+            _ => return false,
+        }
+    }
+    // Bound executable identity must match server-computed facts for this request.
+    // Content/device/inode/policy_kind drift → no grant Allow (Ask/deny via policy).
+    if let Some(bound) = &grant.executable_identity {
+        match &facts.executable_identity {
+            Some(current) if bound.matches(current) => {}
             _ => return false,
         }
     }
@@ -660,14 +759,27 @@ mod tests {
         assert_eq!(v.decision, Decision::Deny);
     }
 
+    fn sample_identity(path: &str, digest: &str) -> ExecutableIdentityBinding {
+        ExecutableIdentityBinding {
+            path: path.into(),
+            content_sha256: digest.into(),
+            len: 32,
+            device: Some(1),
+            inode: Some(2),
+            policy_kind: "structured".into(),
+        }
+    }
+
     #[test]
     fn temporary_grant_overrides() {
         let doc = preset_document(AccessPreset::WorkspaceOnly);
+        let identity = sample_identity("/usr/bin/cargo", "aa".repeat(32).as_str());
         let facts = OperationFacts {
             capability: "command.run".into(),
             kind: "structured".into(),
-            program: Some("cargo".into()),
+            program: Some("/usr/bin/cargo".into()),
             elevated: false,
+            executable_identity: Some(identity.clone()),
             ..Default::default()
         };
         let grants = vec![TemporaryGrant {
@@ -677,8 +789,9 @@ mod tests {
             expires_unix: 9_999_999_999,
             path_prefix: None,
             kind: Some("structured".into()),
-            program_equals: Some("cargo".into()),
+            program_equals: Some("/usr/bin/cargo".into()),
             elevated: Some(false),
+            executable_identity: Some(identity),
         }];
         let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
         assert_eq!(v.decision, Decision::Allow);
@@ -704,6 +817,7 @@ mod tests {
             kind: None,
             program_equals: None,
             elevated: None,
+            executable_identity: None,
         }];
         let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
         assert_ne!(v.decision, Decision::Allow);
@@ -711,8 +825,36 @@ mod tests {
     }
 
     #[test]
+    fn structured_grant_without_identity_never_allows() {
+        let doc = preset_document(AccessPreset::WorkspaceOnly);
+        let facts = OperationFacts {
+            capability: "command.run".into(),
+            kind: "structured".into(),
+            program: Some("/bin/echo".into()),
+            elevated: false,
+            executable_identity: Some(sample_identity("/bin/echo", "bb".repeat(32).as_str())),
+            ..Default::default()
+        };
+        // Legacy bound kind/program/elevated but missing executable identity.
+        let grants = vec![TemporaryGrant {
+            id: "no-pin".into(),
+            capability: "command.run".into(),
+            principal_id: "user-1".into(),
+            expires_unix: 9_999_999_999,
+            path_prefix: None,
+            kind: Some("structured".into()),
+            program_equals: Some("/bin/echo".into()),
+            elevated: Some(false),
+            executable_identity: None,
+        }];
+        let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
+        assert_ne!(v.decision, Decision::Allow);
+    }
+
+    #[test]
     fn bound_command_grant_does_not_escalate_kind_program_or_elevated() {
         let doc = preset_document(AccessPreset::Recommended);
+        let identity = sample_identity("/bin/echo", "cc".repeat(32).as_str());
         let grant = temporary_grant_from_facts(
             "g-bound".into(),
             "agent-1".into(),
@@ -722,6 +864,7 @@ mod tests {
                 kind: "structured".into(),
                 program: Some("/bin/echo".into()),
                 elevated: false,
+                executable_identity: Some(identity.clone()),
                 ..Default::default()
             },
         )
@@ -733,6 +876,7 @@ mod tests {
             kind: "structured".into(),
             program: Some("/bin/echo".into()),
             elevated: false,
+            executable_identity: Some(identity.clone()),
             ..Default::default()
         };
         assert_eq!(
@@ -753,6 +897,7 @@ mod tests {
                 kind: "structured".into(),
                 program: Some("/bin/sh".into()),
                 elevated: false,
+                executable_identity: Some(sample_identity("/bin/sh", "dd".repeat(32).as_str())),
                 ..Default::default()
             },
             OperationFacts {
@@ -760,6 +905,16 @@ mod tests {
                 kind: "structured".into(),
                 program: Some("/bin/echo".into()),
                 elevated: true,
+                executable_identity: Some(identity.clone()),
+                ..Default::default()
+            },
+            // Same path, swapped content digest must not reuse the grant.
+            OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                program: Some("/bin/echo".into()),
+                elevated: false,
+                executable_identity: Some(sample_identity("/bin/echo", "ee".repeat(32).as_str())),
                 ..Default::default()
             },
         ] {
@@ -767,10 +922,14 @@ mod tests {
             assert_ne!(
                 v.decision,
                 Decision::Allow,
-                "grant must not allow escalation: kind={} program={:?} elevated={}",
+                "grant must not allow escalation: kind={} program={:?} elevated={} digest={:?}",
                 facts.kind,
                 facts.program,
-                facts.elevated
+                facts.elevated,
+                facts
+                    .executable_identity
+                    .as_ref()
+                    .map(|i| &i.content_sha256)
             );
         }
     }
@@ -790,5 +949,23 @@ mod tests {
         )
         .expect_err("unboundable");
         assert!(err.contains("program"), "{err}");
+
+        let err = temporary_grant_from_facts(
+            "g2".into(),
+            "p".into(),
+            1,
+            &OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                program: Some("/bin/echo".into()),
+                // identity missing
+                ..Default::default()
+            },
+        )
+        .expect_err("structured requires pin");
+        assert!(
+            err.contains("executable identity") || err.contains("pin"),
+            "{err}"
+        );
     }
 }

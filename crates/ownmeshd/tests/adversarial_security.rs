@@ -1990,6 +1990,227 @@ async fn production_limited_command_temporary_grant_cannot_escalate() {
             !prog.is_empty(),
             "program_equals must be bound from server facts"
         );
+        let identity = g
+            .executable_identity
+            .as_ref()
+            .expect("structured grant must bind executable identity");
+        assert!(!identity.path.is_empty());
+        assert_eq!(identity.content_sha256.len(), 64);
+        assert_eq!(identity.policy_kind, "structured");
+        assert_eq!(identity.path, prog);
+    }
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
+
+/// After a temporary grant, swapping bytes at the same canonical path must not
+/// Allow under the old grant — server pin identity (digest/device/inode) is bound.
+#[tokio::test]
+async fn production_temporary_grant_rejects_same_path_content_swap() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_production_test_daemon(&paths).await;
+
+    let management_secret =
+        ownmesh_ipc::read_management_credential(&paths.state_dir).expect("management delivery");
+    let management = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "mgmt",
+        Some(management_secret),
+    );
+    let provisioned: ownmesh_ipc::CredentialSecretResult = serde_json::from_value(
+        management
+            .call(
+                methods::CREDENTIAL_PROVISION,
+                Some(json!({ "client_id": "grant-swap-agent" })),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let agent = named_client_with_cred(
+        endpoint.clone(),
+        paths.runtime_dir.clone(),
+        "grant-swap-agent-label",
+        Some(provisioned.credential),
+    );
+    let human = named_client(endpoint.clone(), paths.runtime_dir.clone(), "human");
+
+    // Keep a native extension so Windows still classifies the path as structured.
+    let tool = dir.path().join(if cfg!(windows) {
+        "grant-pinned-tool.exe"
+    } else {
+        "grant-pinned-tool"
+    });
+    std::fs::copy(sample_native_binary(), &tool).expect("copy sample native binary");
+    #[cfg(unix)]
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = dir.path().join("grant-pwned-marker");
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask structured for grant pin swap".into()),
+            rules: vec![
+                PolicyRule {
+                    id: "deny-raw".into(),
+                    decision: Decision::Deny,
+                    priority: 100,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("raw_shell".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "ask-structured".into(),
+                    decision: Decision::Ask,
+                    priority: 10,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("structured".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    description: None,
+                },
+            ],
+        });
+    }
+
+    let pending = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": &tool,
+                "args": [],
+                "idempotency_key": "grant-pin-approve",
+            })),
+        )
+        .await
+        .expect("enqueue structured");
+    assert_eq!(pending["approval_required"], true);
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    let approved = human
+        .call(
+            methods::APPROVAL_APPROVE,
+            Some(json!({
+                "id": approval_id,
+                "temporary_grant": true,
+                "grant_seconds": 600,
+            })),
+        )
+        .await
+        .expect("human approve+grant with pin binding");
+    assert_eq!(approved["approval_required"], false);
+
+    let bound_digest = {
+        let guard = runtime.lock().await;
+        let grants = guard.grants_for_test();
+        assert_eq!(grants.len(), 1, "temporary grant must be persisted");
+        let identity = grants[0]
+            .executable_identity
+            .as_ref()
+            .expect("grant must retain approval-time ExecutablePin identity");
+        assert_eq!(identity.policy_kind, "structured");
+        assert!(!identity.content_sha256.is_empty());
+        #[cfg(unix)]
+        {
+            assert!(identity.device.is_some(), "unix grant must bind device");
+            assert!(identity.inode.is_some(), "unix grant must bind inode");
+        }
+        identity.content_sha256.clone()
+    };
+
+    // Same path still covered while content is unchanged.
+    let same = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": &tool,
+                "args": [],
+                "idempotency_key": "grant-pin-same-content",
+            })),
+        )
+        .await
+        .expect("unchanged path+content must ride temporary grant");
+    assert_eq!(same["approval_required"], false);
+    assert_eq!(same["decision"], "allow");
+
+    // Swap bytes at the same canonical path after the grant is live.
+    // Keep a native (non-shell) payload so classification stays structured and the
+    // regression specifically covers grant identity drift → Ask (not raw_shell Deny).
+    let swapped = dir.path().join("grant-pinned-tool.swapped");
+    #[cfg(unix)]
+    {
+        // sample was /bin/echo; /bin/ls is a different structured native binary.
+        std::fs::copy("/bin/ls", &swapped).expect("copy replacement unix binary");
+        std::fs::set_permissions(&swapped, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        );
+        // sample was where.exe; hostname.exe is a different PE at same path after rename.
+        std::fs::copy(system_root.join("System32").join("hostname.exe"), &swapped)
+            .expect("copy replacement pe");
+    }
+    std::fs::rename(&swapped, &tool).unwrap();
+
+    // Client-supplied forged digest must be ignored; server re-pins current bytes.
+    let forged = "ff".repeat(32);
+    let after_swap = agent
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": &tool,
+                "args": [],
+                "executable_pin": {
+                    "path": tool,
+                    "content_sha256": forged,
+                    "len": 1,
+                    "policy_kind": "structured"
+                },
+                "idempotency_key": "grant-pin-swapped-content",
+            })),
+        )
+        .await
+        .expect("swap must re-enter policy, not grant-allow or hard-crash");
+    assert_eq!(
+        after_swap["approval_required"], true,
+        "same-path content swap must not reuse temporary grant: {after_swap}"
+    );
+    assert_ne!(
+        after_swap["decision"], "allow",
+        "grant must not Allow after identity drift: {after_swap}"
+    );
+    assert!(
+        !marker.exists(),
+        "swapped payload must never execute via grant"
+    );
+
+    // Bound grant digest must still be the pre-swap server pin (not client forged).
+    {
+        let guard = runtime.lock().await;
+        let grants = guard.grants_for_test();
+        let identity = grants[0]
+            .executable_identity
+            .as_ref()
+            .expect("identity remains");
+        assert_eq!(identity.content_sha256, bound_digest);
+        assert_ne!(identity.content_sha256, forged);
     }
 
     server.request_shutdown();
