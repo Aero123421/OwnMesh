@@ -1,0 +1,19 @@
+{
+  "protocol": "ownmesh.device/1.0",
+  "message_id": "msg_01OPRESULT",
+  "type": "operation.result",
+  "device_id": "dev_windows-01",
+  "correlation_id": "op_01REMOTE",
+  "seq": 127,
+  "sent_at": "2026-08-06T00:00:02Z",
+  "payload": {
+    "operation_contract": "ownmesh.operation/1.0",
+    "operation_id": "op_01REMOTE",
+    "status": "completed",
+    "result": {
+      "path": "README.md",
+      "content": "# OwnMesh\n",
+      "truncated": false
+    }
+  }
+}

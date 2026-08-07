@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.0-beta.1 — E0 operation contract freeze
+
+- Add the independent `ownmesh.operation/1.0` request/progress/event/result payload contract while retaining the `ownmesh.device/1.0` outer envelope.
+- Require operation/correlation binding, request expiry and idempotency, exact payload fields, safe cross-runtime sequence integers, and fail-closed terminal result shapes.
+- Add Rust/TypeScript typed parsers, a JSON Schema, and four shared golden fixtures with cross-language round-trip coverage.
+- Reserve `workspace_id` for E4 without promoting workspace or remote-execution surfaces; the existing 39 hard-error unsupported surfaces remain unchanged.
+- Contract notes: [`docs/V1.2_E0_OPERATION_CONTRACT.md`](./docs/V1.2_E0_OPERATION_CONTRACT.md).
+- Beta notes: [`docs/RELEASE_NOTES_v1.2.0-beta.1.md`](./docs/RELEASE_NOTES_v1.2.0-beta.1.md).
+
 ## v1.1.3 — deterministic release gate
 
 - Carry forward the v1.1.2 portable-installer repair without changing its security or compatibility scope.
