@@ -162,7 +162,7 @@ impl StateCustody {
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
             FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
-            WRITE_DAC,
+            WRITE_DAC, WRITE_OWNER,
         };
 
         let mut handles = Vec::new();
@@ -181,7 +181,7 @@ impl StateCustody {
             let access = FILE_READ_ATTRIBUTES
                 | READ_CONTROL
                 | if index == 0 && harden_state_dir {
-                    WRITE_DAC
+                    WRITE_DAC | WRITE_OWNER
                 } else {
                     0
                 };
@@ -208,12 +208,22 @@ impl StateCustody {
             // requiring that would be unsound on real Windows systems and is an
             // explicit non-claim (identity pin only for ancestors).
             if index == 0 {
-                revalidate_pinned_handle_security(file.as_raw_handle(), ancestor, false)?;
+                let repair_token_owner = if harden_state_dir {
+                    revalidate_pinned_handle_prepare_owner(file.as_raw_handle(), ancestor)?
+                } else {
+                    revalidate_pinned_handle_security(file.as_raw_handle(), ancestor, false)?;
+                    false
+                };
                 if harden_state_dir {
                     // Owner attestation above must precede mutation. Apply the DACL
                     // through this same no-delete-share handle so a path replacement
                     // cannot redirect the security change to another object.
-                    restrict_open_windows_owner_only(file.as_raw_handle(), ancestor, true)?;
+                    restrict_open_windows_owner_only(
+                        file.as_raw_handle(),
+                        ancestor,
+                        true,
+                        repair_token_owner,
+                    )?;
                 }
                 revalidate_pinned_handle_security(file.as_raw_handle(), ancestor, true)?;
             }
@@ -1348,6 +1358,117 @@ fn revalidate_pinned_handle_security(
     result
 }
 
+/// Attest the pre-hardening owner on the pinned state directory.
+///
+/// Returns `true` only when the owner is the process token's stable `TokenOwner`
+/// rather than `TokenUser`; that one elevated-token creation case may be repaired
+/// to `TokenUser`. No unrelated SID is accepted or reassigned.
+#[cfg(windows)]
+fn revalidate_pinned_handle_prepare_owner(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    path: &Path,
+) -> IpcResult<bool> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    fn token_information(
+        token: HANDLE,
+        class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
+    ) -> IpcResult<Vec<usize>> {
+        use windows_sys::Win32::Security::GetTokenInformation;
+
+        let mut required = 0_u32;
+        unsafe {
+            let _ = GetTokenInformation(token, class, std::ptr::null_mut(), 0, &raw mut required);
+        }
+        if required == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0_usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &raw mut required,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(buffer)
+    }
+
+    let mut object_owner: PSID = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &raw mut object_owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(IpcError::Unauthorized(format!(
+            "credential state custody cannot attest pre-hardening owner for {}: {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(status.cast_signed())
+        )));
+    }
+
+    let result = (|| -> IpcResult<bool> {
+        let mut token: HANDLE = ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0
+            || token.is_null()
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let token_result = (|| -> IpcResult<bool> {
+            let user_buffer = token_information(token, TokenUser)?;
+            let owner_buffer = token_information(token, TokenOwner)?;
+            let token_user = unsafe { &*user_buffer.as_ptr().cast::<TOKEN_USER>() };
+            let token_owner = unsafe { &*owner_buffer.as_ptr().cast::<TOKEN_OWNER>() };
+            if object_owner.is_null() || token_owner.Owner.is_null() {
+                return Err(IpcError::Unauthorized(format!(
+                    "credential state directory has no attestable owner: {}",
+                    path.display()
+                )));
+            }
+            if unsafe { EqualSid(object_owner, token_user.User.Sid) } != 0 {
+                return Ok(false);
+            }
+            if unsafe { EqualSid(object_owner, token_owner.Owner) } != 0 {
+                return Ok(true);
+            }
+            Err(IpcError::Unauthorized(format!(
+                "credential state directory owner is neither TokenUser nor TokenOwner: {}",
+                path.display()
+            )))
+        })();
+        unsafe {
+            CloseHandle(token);
+        }
+        token_result
+    })();
+    unsafe {
+        let _ = LocalFree(descriptor);
+    }
+    result
+}
+
 /// Return whether `path` has a protected owner-only DACL (Windows) / mode 0600 or 0700 (Unix).
 #[cfg(test)]
 fn path_has_owner_only_protection(path: &Path, directory: bool) -> IpcResult<bool> {
@@ -1490,6 +1611,7 @@ fn restrict_open_windows_owner_only(
     handle: windows_sys::Win32::Foundation::HANDLE,
     path: &Path,
     directory: bool,
+    repair_token_owner: bool,
 ) -> IpcResult<()> {
     use std::ptr;
     use windows_sys::Win32::Foundation::LocalFree;
@@ -1498,8 +1620,9 @@ fn restrict_open_windows_owner_only(
         SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID,
     };
 
     let sddl_text = current_process_owner_only_sddl(directory)?;
@@ -1517,6 +1640,15 @@ fn restrict_open_windows_owner_only(
         return Err(std::io::Error::last_os_error().into());
     }
     let result = (|| -> IpcResult<()> {
+        let mut owner: PSID = ptr::null_mut();
+        let mut owner_defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted)
+        } == 0
+            || owner.is_null()
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
         let mut dacl_present = 0;
         let mut dacl_defaulted = 0;
         let mut dacl = ptr::null_mut();
@@ -1537,8 +1669,18 @@ fn restrict_open_windows_owner_only(
             SetSecurityInfo(
                 handle,
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION
+                    | if repair_token_owner {
+                        OWNER_SECURITY_INFORMATION
+                    } else {
+                        0
+                    },
+                if repair_token_owner {
+                    owner
+                } else {
+                    ptr::null_mut()
+                },
                 ptr::null_mut(),
                 dacl,
                 ptr::null_mut(),
@@ -2445,15 +2587,101 @@ mod tests {
             CloseHandle, GetLastError, LocalFree, SetLastError, ERROR_NOT_ALL_ASSIGNED, HANDLE,
         };
         use windows_sys::Win32::Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SDDL_REVISION_1,
         };
         use windows_sys::Win32::Security::{
-            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-            TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+            AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenOwner,
+            LUID_AND_ATTRIBUTES, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_OWNER, TOKEN_PRIVILEGES, TOKEN_QUERY,
         };
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        fn create_directory_with_sddl(path: &Path, sddl_text: &str) {
+            let sddl: Vec<u16> = format!("{sddl_text}\0").encode_utf16().collect();
+            let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        sddl.as_ptr(),
+                        SDDL_REVISION_1,
+                        &raw mut descriptor,
+                        ptr::null_mut(),
+                    )
+                },
+                0,
+                "SDDL convert failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut attrs = SECURITY_ATTRIBUTES {
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                    .unwrap_or(u32::MAX),
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let created = unsafe { CreateDirectoryW(wide.as_ptr(), &raw mut attrs) };
+            unsafe {
+                let _ = LocalFree(descriptor);
+            }
+            assert_ne!(
+                created,
+                0,
+                "privileged owner regression setup must succeed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        fn token_owner_sid_string(token: HANDLE) -> String {
+            let mut required = 0_u32;
+            unsafe {
+                let _ =
+                    GetTokenInformation(token, TokenOwner, ptr::null_mut(), 0, &raw mut required);
+            }
+            assert_ne!(required, 0, "TokenOwner size query failed");
+            let words = (required as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0_usize; words];
+            assert_ne!(
+                unsafe {
+                    GetTokenInformation(
+                        token,
+                        TokenOwner,
+                        buffer.as_mut_ptr().cast(),
+                        required,
+                        &raw mut required,
+                    )
+                },
+                0,
+                "TokenOwner query failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let token_owner = unsafe { &*buffer.as_ptr().cast::<TOKEN_OWNER>() };
+            let mut sid_text = ptr::null_mut();
+            assert_ne!(
+                unsafe { ConvertSidToStringSidW(token_owner.Owner, &raw mut sid_text) },
+                0,
+                "TokenOwner SID conversion failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let len = unsafe {
+                let mut len = 0usize;
+                while *sid_text.add(len) != 0 {
+                    len += 1;
+                }
+                len
+            };
+            let value =
+                String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_text, len) });
+            unsafe {
+                let _ = LocalFree(sid_text.cast());
+            }
+            value
+        }
 
         // GitHub's Windows runner has the administrative token privilege required
         // to assign a deliberately foreign owner. The dedicated CI step runs this
@@ -2509,50 +2737,35 @@ mod tests {
             ERROR_NOT_ALL_ASSIGNED,
             "dedicated CI runner lacks SeRestorePrivilege"
         );
+        let token_owner_sid = token_owner_sid_string(token);
+        let token_user_sid = current_process_user_sid_string().unwrap();
+        assert_ne!(
+            token_owner_sid, token_user_sid,
+            "dedicated CI must exercise a distinct elevated TokenOwner"
+        );
         unsafe {
             CloseHandle(token);
         }
 
         let dir = tempdir().unwrap();
+        let token_owner_state = dir.path().join("token-owner-state");
+        create_directory_with_sddl(
+            &token_owner_state,
+            &format!("O:{token_owner_sid}D:P(A;OICI;FA;;;WD)"),
+        );
+        assert!(validate_state_dir_owner(&token_owner_state, false).is_err());
+        let token_owner_registry = CredentialRegistry::open(&token_owner_state)
+            .expect("stable TokenOwner directory must be repaired through its pinned handle");
+        drop(token_owner_registry);
+        validate_state_dir_owner(&token_owner_state, true)
+            .expect("TokenOwner repair must finish as protected TokenUser ownership");
+
         let state = dir.path().join("foreign-owned-state");
-        // BUILTIN\Administrators owns the directory while Everyone has full access.
+        // LocalSystem owns the directory while Everyone has full access. LocalSystem
+        // is neither this process's TokenUser nor its stable TokenOwner.
         // This gives the daemon enough rights to reproduce the old owner-claim bug:
         // the vulnerable preparation path rewrote owner/DACL before attestation.
-        let sddl: Vec<u16> = "O:BAD:P(A;OICI;FA;;;WD)\0".encode_utf16().collect();
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        assert_ne!(
-            unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_ptr(),
-                    SDDL_REVISION_1,
-                    &raw mut descriptor,
-                    ptr::null_mut(),
-                )
-            },
-            0,
-            "SDDL convert failed: {}",
-            std::io::Error::last_os_error()
-        );
-        let mut attrs = SECURITY_ATTRIBUTES {
-            nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
-            lpSecurityDescriptor: descriptor,
-            bInheritHandle: 0,
-        };
-        let wide: Vec<u16> = state
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let created = unsafe { CreateDirectoryW(wide.as_ptr(), &raw mut attrs) };
-        unsafe {
-            let _ = LocalFree(descriptor);
-        }
-        assert_ne!(
-            created,
-            0,
-            "foreign-owner regression setup must succeed: {}",
-            std::io::Error::last_os_error()
-        );
+        create_directory_with_sddl(&state, "O:SYD:P(A;OICI;FA;;;WD)");
         assert!(validate_state_dir_owner(&state, false).is_err());
 
         let err = CredentialRegistry::open(&state).unwrap_err();
