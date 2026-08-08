@@ -175,6 +175,11 @@
           "minLength": 1,
           "maxLength": 256
         },
+        "payload_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "Server-computed SHA-256 hex of the canonical authorized action"
+        },
         "arguments": {
           "type": "object"
         }

@@ -1,7 +1,7 @@
 /** Shared helpers for the OwnMesh control plane. */
 
 export const SERVICE_NAME = "ownmesh-control-plane";
-export const SERVICE_VERSION = "1.2.0-beta.3";
+export const SERVICE_VERSION = "1.2.0-beta.4";
 
 /** OAuth/token/device responses must not be stored by shared caches (RFC 9700). */
 export const NO_STORE_CACHE_CONTROL = "no-store, no-cache";
@@ -76,22 +76,113 @@ export function bearer(req: Request): string | null {
   return m ? m[1]!.trim() : null;
 }
 
+/** Application-level request body budget (MCP / DO inject). */
+export const MAX_REQUEST_BODY_BYTES = 1_000_000;
+
+export class BodyTooLargeError extends Error {
+  readonly status = 413;
+  constructor(message = `request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes`) {
+    super(message);
+    this.name = "BodyTooLargeError";
+  }
+}
+
+/**
+ * Read a request body with a hard byte cap enforced before JSON parse.
+ * Prefers Content-Length; otherwise streams until the cap is hit.
+ */
+export async function readRequestTextLimited(
+  req: Request,
+  maxBytes: number = MAX_REQUEST_BODY_BYTES,
+): Promise<string> {
+  const cl = req.headers.get("content-length");
+  if (cl != null && cl !== "") {
+    const n = Number(cl);
+    if (Number.isFinite(n) && n > maxBytes) {
+      throw new BodyTooLargeError();
+    }
+  }
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      throw new BodyTooLargeError();
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
+export async function readRequestJsonLimited<
+  T = unknown,
+>(req: Request, maxBytes: number = MAX_REQUEST_BODY_BYTES): Promise<T> {
+  const text = await readRequestTextLimited(req, maxBytes);
+  if (!text) return {} as T;
+  return JSON.parse(text) as T;
+}
+
 export async function readBody(req: Request): Promise<Record<string, string>> {
   const ct = req.headers.get("content-type") || "";
   const out: Record<string, string> = {};
   if (ct.includes("application/json")) {
-    const body = (await req.json()) as Record<string, unknown>;
+    const body = await readRequestJsonLimited<Record<string, unknown>>(req);
     for (const [k, v] of Object.entries(body)) {
       if (v === undefined || v === null) continue;
       out[k] = typeof v === "string" ? v : JSON.stringify(v);
     }
     return out;
   }
+  // formData path still bounded by the platform; reject obviously oversized CL.
+  const cl = req.headers.get("content-length");
+  if (cl != null && Number(cl) > MAX_REQUEST_BODY_BYTES) {
+    throw new BodyTooLargeError();
+  }
   const form = await req.formData();
   form.forEach((v, k) => {
     out[k] = String(v);
   });
   return out;
+}
+
+/** Stable JSON stringify with sorted object keys (canonical action digest). */
+export function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => stableStringify(v)).join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  const parts: string[] = [];
+  for (const k of keys) {
+    const v = obj[k];
+    if (v === undefined) continue;
+    parts.push(`${JSON.stringify(k)}:${stableStringify(v)}`);
+  }
+  return `{${parts.join(",")}}`;
+}
+
+/** SHA-256 hex of a canonical action object. */
+export async function hashCanonicalAction(action: unknown): Promise<string> {
+  return sha256Hex(stableStringify(action));
 }
 
 export function parseScope(scope: string): Set<string> {

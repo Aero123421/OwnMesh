@@ -528,8 +528,8 @@ def main() -> int:
             if int(state1["last_server_seq"]) <= int(state0["last_server_seq"]):
                 raise RuntimeError("server resume sequence did not advance across binary reconnect")
 
-            # Re-issue the same idempotency key. Control plane mints a new operation_id,
-            # but the device runtime journal should return replayed=true without rewrite.
+            # Re-issue the same idempotency key + identical action. Control plane must
+            # replay the prior authoritative row without re-dispatch (disk stays mutated).
             rewrite_sc = structured(
                 mcp_call(
                     issuer,
@@ -538,7 +538,7 @@ def main() -> int:
                     {
                         "device_id": device_id,
                         "path": "e2-marker.txt",
-                        "content": f"should-not-apply-{marker}",
+                        "content": f"e2-ok-{marker}",
                         "async": True,
                         "idempotency_key": f"idem_write_{marker}",
                     },
@@ -546,20 +546,27 @@ def main() -> int:
                 )
             )
             rewrite_op = str(rewrite_sc.get("operation_id") or "")
-            rewrite_done = wait_operation(issuer, access_token, rewrite_op, want={"completed"})
+            if rewrite_op != write_op:
+                raise RuntimeError(
+                    f"identical action should replay prior operation_id={write_op}, got {rewrite_op}"
+                )
+            if str(rewrite_sc.get("status") or "") != "completed":
+                rewrite_done = wait_operation(issuer, access_token, rewrite_op, want={"completed"})
+            else:
+                rewrite_done = rewrite_sc
             after = (workspace_dir / "e2-marker.txt").read_text(encoding="utf-8")
             if after != f"post-restart-{marker}":
                 raise RuntimeError(
                     f"idempotent write re-executed side effect: disk={after!r} op={rewrite_done}"
                 )
 
-            # Cancel path: start a long-ish command and cancel (best-effort acknowledge).
+            # Cancel path: start a long command and require terminal cancelled promptly.
             if os.name == "nt":
                 long_program = "cmd.exe"
-                long_args = ["/c", "ping", "-n", "5", "127.0.0.1"]
+                long_args = ["/c", "ping", "-n", "60", "127.0.0.1"]
             else:
                 long_program = "/bin/sleep"
-                long_args = ["5"]
+                long_args = ["60"]
             long_sc = structured(
                 mcp_call(
                     issuer,
@@ -576,6 +583,7 @@ def main() -> int:
                 )
             )
             long_op = str(long_sc.get("operation_id") or "")
+            time.sleep(0.8)
             cancel_sc = structured(
                 mcp_call(
                     issuer,
@@ -586,12 +594,50 @@ def main() -> int:
                 )
             )
             cancel_status = str(cancel_sc.get("status") or "")
-            if cancel_status not in {"cancel_requested", "cancelled", "completed", "failed"}:
+            if cancel_status not in {"cancel_requested", "cancelled", "completed"}:
                 raise RuntimeError(f"unexpected cancel status: {cancel_sc}")
+            long_done = wait_operation(
+                issuer,
+                access_token,
+                long_op,
+                want={"cancelled", "failed", "completed"},
+                timeout_s=20,
+            )
+            long_status = str(long_done.get("status") or "")
+            if long_status not in {"cancelled", "failed"}:
+                # completed only acceptable if the short window already finished; still fail closed.
+                raise RuntimeError(
+                    f"long command was not cancelled promptly: status={long_status} op={long_done}"
+                )
+
+            # E3: same idempotency key with different content must not reuse prior result.
+            mismatch_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_write",
+                    {
+                        "device_id": device_id,
+                        "path": "e2-marker.txt",
+                        "content": f"mismatched-action-{marker}",
+                        "async": True,
+                        "idempotency_key": f"idem_write_{marker}",
+                    },
+                    rpc_id=8,
+                )
+            )
+            mismatch_status = str(mismatch_sc.get("status") or "")
+            mismatch_data = mismatch_sc.get("data") or {}
+            mismatch_err = (mismatch_data.get("error") or {}) if isinstance(mismatch_data, dict) else {}
+            if mismatch_status != "failed" or str(mismatch_err.get("code") or "") != "OWNMESH_E_IDEMPOTENCY_MISMATCH":
+                raise RuntimeError(
+                    f"expected idempotency mismatch fail-closed, got: {mismatch_sc}"
+                )
 
             print(
-                "E2 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
-                f"resume+idempotency held (write_op={write_op}, read_op={read_op}, cmd_op={cmd_op})"
+                "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
+                f"resume+idempotency+cancel+mismatch held "
+                f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op})"
             )
             return 0
         finally:

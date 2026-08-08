@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::process::Command;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 /// Stable crate name used by diagnostics and tests.
 #[must_use]
@@ -700,6 +702,19 @@ impl IdempotencyJournal {
         Ok(())
     }
 
+    /// Drop an in-progress reservation after cancel so a later authorized retry
+    /// may re-run. Completed entries are never removed.
+    pub fn clear_in_progress(&mut self, key: &str) -> ExecResult<()> {
+        if !matches!(self.entries.get(key), Some(JournalEntry::InProgress(_))) {
+            return Ok(());
+        }
+        let mut updated = self.entries.clone();
+        updated.remove(key);
+        self.flush(&updated)?;
+        self.entries = updated;
+        Ok(())
+    }
+
     fn flush(&self, entries: &HashMap<String, JournalEntry>) -> ExecResult<()> {
         let raw =
             serde_json::to_string_pretty(entries).map_err(|e| ExecError::Journal(e.to_string()))?;
@@ -782,19 +797,199 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     Ok(cmd)
 }
 
-fn truncate_bytes(mut data: Vec<u8>, max: usize) -> (String, bool) {
-    let truncated = data.len() > max;
-    if truncated {
-        data.truncate(max);
+fn bytes_to_text(data: &[u8]) -> String {
+    String::from_utf8_lossy(data).into_owned()
+}
+
+/// Best-effort process-tree containment after timeout/cancel/limit.
+/// Returns the exit code when `wait` completes within the grace period.
+async fn kill_child(child: &mut Child) -> Option<i32> {
+    let _ = child.start_kill();
+    match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => status.code(),
+        _ => None,
     }
-    let text = String::from_utf8_lossy(&data).into_owned();
-    (text, truncated)
+}
+
+/// Stream stdout/stderr into independently capped rings. Never `read_to_end`
+/// an attacker-controlled pipe. Apply backpressure by stopping reads and killing
+/// the process when the aggregate byte budget is exhausted.
+#[allow(unused_assignments)] // terminal branches assign flags then break.
+#[allow(clippy::too_many_lines)]
+async fn collect_bounded_output(
+    child: &mut Child,
+    max_output_bytes: usize,
+    timeout: Option<Duration>,
+    mut cancel: Option<watch::Receiver<bool>>,
+) -> ExecResult<(Option<i32>, Vec<u8>, Vec<u8>, bool, bool, bool)> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let mut stdout_done = stdout.is_none();
+    let mut stderr_done = stderr.is_none();
+    let mut truncated = false;
+    let mut cancelled = false;
+    let mut timed_out = false;
+    let mut exit_code: Option<i32> = None;
+    let mut status_done = false;
+    let mut stdout_chunk = [0_u8; 8192];
+    let mut stderr_chunk = [0_u8; 8192];
+    let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+
+    loop {
+        if cancelled || timed_out {
+            break;
+        }
+        if status_done && stdout_done && stderr_done {
+            break;
+        }
+
+        let budget_left = max_output_bytes
+            .saturating_sub(stdout_buf.len())
+            .saturating_sub(stderr_buf.len());
+        if budget_left == 0 && !(stdout_done && stderr_done) {
+            truncated = true;
+            // Drop pipes before kill so producers unblock, then contain the tree.
+            stdout = None;
+            stderr = None;
+            stdout_done = true;
+            stderr_done = true;
+            if !status_done {
+                exit_code = kill_child(child).await;
+                status_done = true;
+            }
+            break;
+        }
+
+        tokio::select! {
+            biased;
+
+            changed = async {
+                if let Some(rx) = cancel.as_mut() {
+                    if *rx.borrow() {
+                        return true;
+                    }
+                    let _ = rx.changed().await;
+                    *rx.borrow()
+                } else {
+                    std::future::pending::<bool>().await
+                }
+            } => {
+                if changed {
+                    cancelled = true;
+                    stdout = None;
+                    stderr = None;
+                    stdout_done = true;
+                    stderr_done = true;
+                    if !status_done {
+                        exit_code = kill_child(child).await;
+                        status_done = true;
+                    }
+                }
+            }
+
+            () = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if deadline.is_some() && !timed_out => {
+                timed_out = true;
+                stdout = None;
+                stderr = None;
+                stdout_done = true;
+                stderr_done = true;
+                if !status_done {
+                    exit_code = kill_child(child).await;
+                    status_done = true;
+                }
+            }
+
+            read = async {
+                match stdout.as_mut() {
+                    Some(pipe) => pipe.read(&mut stdout_chunk).await,
+                    None => std::future::pending().await,
+                }
+            }, if !stdout_done => {
+                match read {
+                    Ok(0) | Err(_) => stdout_done = true,
+                    Ok(n) => {
+                        let take = n.min(budget_left);
+                        stdout_buf.extend_from_slice(&stdout_chunk[..take]);
+                        if take < n || stdout_buf.len() + stderr_buf.len() >= max_output_bytes {
+                            truncated = true;
+                            stdout = None;
+                            stderr = None;
+                            stdout_done = true;
+                            stderr_done = true;
+                            if !status_done {
+                                exit_code = kill_child(child).await;
+                                status_done = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            read = async {
+                match stderr.as_mut() {
+                    Some(pipe) => pipe.read(&mut stderr_chunk).await,
+                    None => std::future::pending().await,
+                }
+            }, if !stderr_done => {
+                match read {
+                    Ok(0) | Err(_) => stderr_done = true,
+                    Ok(n) => {
+                        let take = n.min(budget_left);
+                        stderr_buf.extend_from_slice(&stderr_chunk[..take]);
+                        if take < n || stdout_buf.len() + stderr_buf.len() >= max_output_bytes {
+                            truncated = true;
+                            stdout = None;
+                            stderr = None;
+                            stdout_done = true;
+                            stderr_done = true;
+                            if !status_done {
+                                exit_code = kill_child(child).await;
+                                status_done = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            status = child.wait(), if !status_done => {
+                match status {
+                    Ok(st) => {
+                        exit_code = st.code();
+                        status_done = true;
+                    }
+                    Err(err) => return Err(ExecError::Io(err)),
+                }
+            }
+        }
+    }
+
+    Ok((
+        exit_code, stdout_buf, stderr_buf, truncated, timed_out, cancelled,
+    ))
 }
 
 /// Run a command, optionally consulting/updating an idempotency journal.
 pub async fn run_command(
     req: &RunRequest,
+    journal: Option<&mut IdempotencyJournal>,
+) -> ExecResult<RunResult> {
+    Box::pin(run_command_cancellable(req, journal, None)).await
+}
+
+/// Like [`run_command`], but observes an external cancel signal and kills the
+/// process tree without waiting for natural exit.
+pub async fn run_command_cancellable(
+    req: &RunRequest,
     mut journal: Option<&mut IdempotencyJournal>,
+    cancel: Option<watch::Receiver<bool>>,
 ) -> ExecResult<RunResult> {
     // Request validation/building has no external side effect and happens before
     // reserving the key. Spawn remains strictly after the durable marker.
@@ -819,47 +1014,56 @@ pub async fn run_command(
     if let Some(input) = &req.stdin {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            stdin.write_all(input.as_bytes()).await?;
+            let _ = stdin.write_all(input.as_bytes()).await;
+            drop(stdin);
         }
     }
 
     let timeout = req.timeout_ms.map(Duration::from_millis);
-    let wait_fut = child.wait_with_output();
-    let output = if let Some(dur) = timeout {
-        match tokio::time::timeout(dur, wait_fut).await {
-            Ok(res) => Some(res?),
-            // Best-effort kill; kill_on_drop also helps. The timeout result is
-            // still journaled so retry cannot start a second process.
-            Err(_) => None,
-        }
-    } else {
-        Some(wait_fut.await?)
-    };
+    // Box the select-heavy collector so callers stay under clippy large_futures.
+    let (exit_code, stdout_raw, stderr_raw, truncated, timed_out, cancelled) = Box::pin(
+        collect_bounded_output(&mut child, req.max_output_bytes, timeout, cancel),
+    )
+    .await?;
 
-    let result = if let Some(output) = output {
-        let (stdout, t1) = truncate_bytes(output.stdout, req.max_output_bytes);
-        let remain = req.max_output_bytes.saturating_sub(stdout.len());
-        let (stderr, t2) = truncate_bytes(output.stderr, remain);
+    if cancelled {
+        // Do not journal a cancelled attempt as a successful side effect; a
+        // retry with the same key may legitimately re-run after cancel.
+        if let (Some(key), Some(j)) = (req.idempotency_key.as_deref(), journal.as_mut()) {
+            let _ = j.clear_in_progress(key);
+        }
+        return Err(ExecError::Cancelled);
+    }
+
+    let result = if timed_out {
         RunResult {
-            exit_code: output.status.code(),
-            stdout,
-            stderr,
-            timed_out: false,
+            exit_code: None,
+            stdout: bytes_to_text(&stdout_raw),
+            stderr: {
+                let mut msg = format!(
+                    "command timed out after {:?}",
+                    timeout.expect("timeout result requires configured duration")
+                );
+                let err = bytes_to_text(&stderr_raw);
+                if !err.is_empty() {
+                    msg.push('\n');
+                    msg.push_str(&err);
+                }
+                msg
+            },
+            timed_out: true,
             duration_ms: start.elapsed().as_millis() as u64,
-            truncated: t1 || t2,
+            truncated,
             replayed: false,
         }
     } else {
         RunResult {
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!(
-                "command timed out after {:?}",
-                timeout.expect("timeout result requires configured duration")
-            ),
-            timed_out: true,
+            exit_code,
+            stdout: bytes_to_text(&stdout_raw),
+            stderr: bytes_to_text(&stderr_raw),
+            timed_out: false,
             duration_ms: start.elapsed().as_millis() as u64,
-            truncated: false,
+            truncated,
             replayed: false,
         }
     };
@@ -959,6 +1163,89 @@ mod tests {
         let second = run_command(&req, Some(&mut j)).await.unwrap();
         assert!(second.replayed);
         assert_eq!(first.stdout, second.stdout);
+    }
+
+    #[tokio::test]
+    async fn infinite_output_is_byte_capped_without_read_to_end() {
+        // A writer that would fill memory if collected unbounded.
+        #[cfg(windows)]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "cmd.exe".into(),
+            // Keep producing lines without waiting for the full command script to end.
+            args: vec![
+                "/C".into(),
+                "for /L %i in (1,1,1000000) do @echo xxxxxxxxxxxxxxxx".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(10_000),
+            max_output_bytes: 8 * 1024,
+            idempotency_key: None,
+        };
+        #[cfg(not(windows))]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "while true; do printf '%s\\n' 'xxxxxxxx'; done".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(10_000),
+            max_output_bytes: 8 * 1024,
+            idempotency_key: None,
+        };
+        let res = tokio::time::timeout(Duration::from_secs(12), run_command(&req, None))
+            .await
+            .expect("bounded output collection must finish promptly")
+            .unwrap();
+        assert!(
+            res.truncated || res.timed_out,
+            "expected truncation or timeout, got {res:?}"
+        );
+        assert!(res.stdout.len() + res.stderr.len() <= 8 * 1024 + 1024);
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_long_running_command() {
+        let (tx, rx) = watch::channel(false);
+        #[cfg(windows)]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "cmd.exe".into(),
+            args: vec!["/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(60_000),
+            max_output_bytes: 4096,
+            idempotency_key: None,
+        };
+        #[cfg(not(windows))]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(60_000),
+            max_output_bytes: 4096,
+            idempotency_key: None,
+        };
+        let join = tokio::spawn(async move { run_command_cancellable(&req, None, Some(rx)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let err = tokio::time::timeout(Duration::from_secs(5), join)
+            .await
+            .expect("cancel should finish promptly")
+            .expect("join")
+            .expect_err("expected Cancelled");
+        assert!(matches!(err, ExecError::Cancelled));
     }
 
     #[test]

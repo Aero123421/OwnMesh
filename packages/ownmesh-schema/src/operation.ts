@@ -32,6 +32,11 @@ export interface OperationRequestPayload {
   capability: string;
   workspace_id?: string;
   idempotency_key: string;
+  /**
+   * Server-computed SHA-256 hex of the canonical authorized action.
+   * Client-supplied values are never authority and must be stripped before minting.
+   */
+  payload_hash?: string;
   arguments: Record<string, unknown>;
 }
 
@@ -199,6 +204,7 @@ function parseRequest(payload: Record<string, unknown>): OperationRequestPayload
       "capability",
       "workspace_id",
       "idempotency_key",
+      "payload_hash",
       "arguments",
     ]),
     "operation.request payload",
@@ -213,6 +219,13 @@ function parseRequest(payload: Record<string, unknown>): OperationRequestPayload
   };
   const workspace = workspaceId(payload.workspace_id);
   if (workspace !== undefined) parsed.workspace_id = workspace;
+  const payloadHash = optionalString(payload.payload_hash, "payload_hash", 128);
+  if (payloadHash !== undefined) {
+    if (!/^[0-9a-f]{64}$/i.test(payloadHash)) {
+      bad("payload_hash must be a 64-char hex SHA-256 digest");
+    }
+    parsed.payload_hash = payloadHash.toLowerCase();
+  }
   return parsed;
 }
 

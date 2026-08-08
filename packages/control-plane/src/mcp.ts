@@ -19,9 +19,13 @@
 import type { ControlPlaneStore, McpOperationRecord } from "./store.ts";
 import {
   bearer,
+  BodyTooLargeError,
+  hashCanonicalAction,
   html,
   json,
+  MAX_REQUEST_BODY_BYTES,
   randomToken,
+  readRequestJsonLimited,
   requireScope,
   sha256Hex,
 } from "./util.ts";
@@ -235,6 +239,77 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         content: str,
+        idempotency_key: str,
+      },
+      required: ["device_id", "path", "content"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+      idempotentHint: false,
+    },
+    scope: "ownmesh.write",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_fs_stat",
+    description: "Stat a path on a device workspace (size, type, optional SHA-256)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        path: str,
+        hash: { type: "boolean", default: false },
+        workspace_id: str,
+        idempotency_key: str,
+      },
+      required: ["device_id", "path"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
+  },
+  {
+    name: "ownmesh_fs_delete",
+    description: "Delete a file or directory on a device. Subject to OwnMesh policy.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        path: str,
+        recursive: { type: "boolean", default: false },
+        workspace_id: str,
+        idempotency_key: str,
+      },
+      required: ["device_id", "path"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+      idempotentHint: false,
+    },
+    scope: "ownmesh.write",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_fs_patch",
+    description:
+      "Replace a whole file when expected_sha256 matches (hash-checked write). Bounded unified-diff apply remains a later E7 surface.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        path: str,
+        content: str,
+        expected_sha256: str,
+        workspace_id: str,
         idempotency_key: str,
       },
       required: ["device_id", "path", "content"],
@@ -491,6 +566,12 @@ export type TrackedOperation = OwnMeshResultEnvelope & {
   tool: string;
   principal: string;
   tenant_id: string;
+  payload_hash?: string | null;
+  idempotency_key?: string | null;
+  workspace_id?: string | null;
+  expires_at?: string | null;
+  claim_version?: number;
+  action?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 };
@@ -546,6 +627,12 @@ function trackedFromRecord(rec: McpOperationRecord): TrackedOperation {
     tool: rec.tool,
     principal: rec.principal_id,
     tenant_id: rec.tenant_id,
+    payload_hash: rec.payload_hash ?? null,
+    idempotency_key: rec.idempotency_key ?? null,
+    workspace_id: rec.workspace_id ?? null,
+    expires_at: rec.expires_at ?? null,
+    claim_version: rec.claim_version ?? 0,
+    action: rec.action ?? null,
     created_at: rec.created_at,
     updated_at: rec.updated_at,
   };
@@ -569,6 +656,12 @@ function recordFromTracked(op: TrackedOperation): McpOperationRecord {
     session_id: op.session_id ?? null,
     warnings: op.warnings || [],
     correlation_id: op.correlation_id,
+    payload_hash: op.payload_hash ?? null,
+    idempotency_key: op.idempotency_key ?? null,
+    workspace_id: op.workspace_id ?? null,
+    expires_at: op.expires_at ?? null,
+    claim_version: op.claim_version ?? 0,
+    action: op.action ?? null,
     policy_authority: "ownmesh_device",
     created_at: op.created_at,
     updated_at: op.updated_at,
@@ -960,20 +1053,84 @@ const CLIENT_AUTHORITY_KEYS = new Set([
 ]);
 
 /**
+ * Build the canonical authorized-action object used for payload_hash.
+ * Content bodies are digested so large writes stay bounded in the hash input.
+ */
+export async function buildCanonicalAction(opts: {
+  toolName: string;
+  args: Record<string, unknown>;
+  deviceId: string;
+  principalId: string;
+  tenantId: string;
+}): Promise<Record<string, unknown>> {
+  const action = toolAction(opts.toolName);
+  const capability = toolCapability(opts.toolName);
+  const workspaceId =
+    typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== ""
+      ? String(opts.args.workspace_id)
+      : undefined;
+
+  const facts: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(opts.args)) {
+    if (
+      key === "device_id" ||
+      key === "async" ||
+      key === "idempotency_key" ||
+      key === "intent_summary" ||
+      key === "risk_note" ||
+      key === "workspace_id" ||
+      CLIENT_AUTHORITY_KEYS.has(key)
+    ) {
+      continue;
+    }
+    if (key === "content" && typeof value === "string") {
+      facts.content_sha256 = await sha256Hex(value);
+      facts.content_bytes = new TextEncoder().encode(value).byteLength;
+      continue;
+    }
+    facts[key] = value;
+  }
+
+  return {
+    capability,
+    action,
+    tool: opts.toolName,
+    device_id: opts.deviceId,
+    principal_id: opts.principalId,
+    tenant_id: opts.tenantId,
+    workspace_id: workspaceId ?? null,
+    facts,
+  };
+}
+
+/**
  * Build a device-routed operation that satisfies ownmesh.operation/1.0.
  * correlation_id === operation_id === payload.operation_id (exact-once binding).
  * Client-supplied authorization fields are stripped and never treated as authority.
+ * payload_hash is always server-computed.
  */
-export function buildDeviceOperation(opts: {
+export async function buildDeviceOperation(opts: {
   toolName: string;
   args: Record<string, unknown>;
   operationId: string;
+  deviceId: string;
+  principalId: string;
+  tenantId: string;
+  expiresAt: string;
   injectionAttempt?: boolean;
-}): {
+  /** Optional precomputed canonical action / hash (avoids double work). */
+  canonicalAction?: Record<string, unknown>;
+  payloadHash?: string;
+}): Promise<{
   type: string;
   payload: Record<string, unknown>;
   correlation_id: string;
-} {
+  payload_hash: string;
+  canonical_action: Record<string, unknown>;
+  idempotency_key: string;
+  workspace_id?: string;
+  expires_at: string;
+}> {
   const action = toolAction(opts.toolName);
   const capability = toolCapability(opts.toolName);
   const idempotencyKey =
@@ -1004,15 +1161,29 @@ export function buildDeviceOperation(opts: {
     injection_attempt: Boolean(opts.injectionAttempt),
   };
 
+  const canonicalAction =
+    opts.canonicalAction ??
+    (await buildCanonicalAction({
+      toolName: opts.toolName,
+      args: opts.args,
+      deviceId: opts.deviceId,
+      principalId: opts.principalId,
+      tenantId: opts.tenantId,
+    }));
+  const payloadHash = opts.payloadHash ?? (await hashCanonicalAction(canonicalAction));
+
   const payload: Record<string, unknown> = {
     operation_contract: OPERATION_CONTRACT_V1,
     operation_id: opts.operationId,
     capability,
     idempotency_key: idempotencyKey,
+    payload_hash: payloadHash,
     arguments: argumentsBody,
   };
+  let workspaceId: string | undefined;
   if (typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== "") {
-    payload.workspace_id = String(opts.args.workspace_id);
+    workspaceId = String(opts.args.workspace_id);
+    payload.workspace_id = workspaceId;
   }
 
   return {
@@ -1020,6 +1191,11 @@ export function buildDeviceOperation(opts: {
     payload,
     // E0/E2 binding: correlation_id must equal payload.operation_id.
     correlation_id: opts.operationId,
+    payload_hash: payloadHash,
+    canonical_action: canonicalAction,
+    idempotency_key: idempotencyKey,
+    workspace_id: workspaceId,
+    expires_at: opts.expiresAt,
   };
 }
 
@@ -1119,8 +1295,13 @@ export async function handleMcp(
   const token = bearer(req);
   let body: JsonRpc;
   try {
-    body = (await req.json()) as JsonRpc;
-  } catch {
+    body = await readRequestJsonLimited<JsonRpc>(req, MAX_REQUEST_BODY_BYTES);
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) {
+      return mcpError(null, -32600, "request body too large", {
+        max_bytes: MAX_REQUEST_BODY_BYTES,
+      });
+    }
     return mcpError(null, -32700, "parse error");
   }
   const method = body.method || "";
@@ -1410,10 +1591,14 @@ export async function handleMcp(
           try {
             // Cancel uses a fresh operation_id for the cancel request itself, but
             // arguments.target_operation_id binds the original side-effect identity.
-            const cancelOp = buildDeviceOperation({
+            const cancelOp = await buildDeviceOperation({
               toolName: "ownmesh_cancel_operation",
               args: { target_operation_id: oid },
               operationId: correlation,
+              deviceId: cancelDeviceId,
+              principalId: rec.principal,
+              tenantId: rec.tenant_id,
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
             });
             routed = await router.routeToDevice(cancelDeviceId, cancelOp);
           } catch (err) {
@@ -1526,16 +1711,79 @@ export async function handleMcp(
     const wantAsync = args.async === true;
     const opType = normalizeOpType(name);
     const isMutating = tool.risk === "write" || tool.risk === "exec";
+    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
 
     // High-risk tools: still route to device, but default path surfaces approval
     // when device is offline or returns ask. Control plane NEVER auto-approves
     // based on model text. Client-supplied allow/force/skip fields are not authority.
-    const deviceOp = buildDeviceOperation({
+    const deviceOp = await buildDeviceOperation({
       toolName: name,
       args,
       operationId,
+      deviceId,
+      principalId: rec.principal,
+      tenantId: rec.tenant_id,
+      expiresAt,
       injectionAttempt,
     });
+
+    // E3 exact-once: same idempotency key + same payload_hash replays the prior
+    // operation; a different hash is an action mismatch (never silent reuse).
+    if (deviceOp.idempotency_key && deviceOp.idempotency_key !== operationId) {
+      const prior = await store.getMcpOperationByIdempotency({
+        principalId: rec.principal,
+        tenantId: rec.tenant_id,
+        deviceId,
+        idempotencyKey: deviceOp.idempotency_key,
+      });
+      if (prior) {
+        if (prior.payload_hash && prior.payload_hash !== deviceOp.payload_hash) {
+          const env = makeEnvelope({
+            operation_id: operationId,
+            status: "failed",
+            device_id: deviceId,
+            summary: "idempotency key reused with a different authorized action",
+            data: {
+              error: {
+                code: "OWNMESH_E_IDEMPOTENCY_MISMATCH",
+                message:
+                  "idempotency_key is bound to a different payload_hash; reauthorize with a new key or identical action",
+                retryable: false,
+                operation_id: operationId,
+                details: {
+                  idempotency_key: deviceOp.idempotency_key,
+                  prior_operation_id: prior.operation_id,
+                  prior_payload_hash: prior.payload_hash,
+                  requested_payload_hash: deviceOp.payload_hash,
+                },
+              },
+            },
+            correlation_id: correlation,
+            warnings: injectWarnings,
+          });
+          // Do not store the conflicting idempotency_key on the failure row — that
+          // would shadow the authorized binding and break later identical retries.
+          await persistOp(store, tracker, {
+            ...env,
+            tool: name,
+            principal: rec.principal,
+            tenant_id: rec.tenant_id,
+            payload_hash: deviceOp.payload_hash,
+            idempotency_key: null,
+            workspace_id: deviceOp.workspace_id ?? null,
+            expires_at: expiresAt,
+            claim_version: 0,
+            action: deviceOp.canonical_action,
+            created_at: nowIso(),
+            updated_at: nowIso(),
+          });
+          return mcpResult(id, toolContent(env));
+        }
+        const replayed = trackedFromRecord(prior);
+        tracker.put(replayed);
+        return mcpResult(id, toolContent(replayed));
+      }
+    }
 
     const trackBase: TrackedOperation = {
       ...makeEnvelope({
@@ -1543,13 +1791,24 @@ export async function handleMcp(
         status: wantAsync ? "pending" : "running",
         device_id: deviceId,
         summary: wantAsync ? "operation accepted (async)" : "routing to device",
-        data: { tool: name, op: opType, capability: deviceOp.payload.capability },
+        data: {
+          tool: name,
+          op: opType,
+          capability: deviceOp.payload.capability,
+          payload_hash: deviceOp.payload_hash,
+        },
         correlation_id: correlation,
         warnings: injectWarnings,
       }),
       tool: name,
       principal: rec.principal,
       tenant_id: rec.tenant_id,
+      payload_hash: deviceOp.payload_hash,
+      idempotency_key: deviceOp.idempotency_key,
+      workspace_id: deviceOp.workspace_id ?? null,
+      expires_at: expiresAt,
+      claim_version: 1,
+      action: deviceOp.canonical_action,
       created_at: nowIso(),
       updated_at: nowIso(),
     };
@@ -1967,7 +2226,7 @@ export async function handleApprove(
     let csrfToken = "";
     let operationId = url.searchParams.get("operation_id") || "";
     if (ct.includes("application/json")) {
-      const body = (await req.json()) as Record<string, unknown>;
+      const body = await readRequestJsonLimited<Record<string, unknown>>(req);
       decision = String(body.decision || "");
       transactionId = String(body.transaction_id || "");
       csrfToken = String(body.csrf_token || "");

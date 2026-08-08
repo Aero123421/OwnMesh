@@ -176,6 +176,17 @@ export type McpOperationRecord = {
   session_id?: string | null;
   warnings: string[];
   correlation_id?: string;
+  /** Server-computed SHA-256 of the canonical authorized action (E3). */
+  payload_hash?: string | null;
+  /** Client/server idempotency key bound to payload_hash. */
+  idempotency_key?: string | null;
+  workspace_id?: string | null;
+  /** ISO expiry bound into the authorized action. */
+  expires_at?: string | null;
+  /** Monotonic claim generation for prepare/claim/dispatch. */
+  claim_version?: number;
+  /** Canonical action JSON used to compute payload_hash. */
+  action?: Record<string, unknown> | null;
   policy_authority: "ownmesh_device";
   created_at: string;
   updated_at: string;
@@ -326,6 +337,16 @@ export interface ControlPlaneStore {
   getMcpOperation(operationId: string): Promise<McpOperationRecord | null>;
   getMcpOperationByCorrelation(correlationId: string): Promise<McpOperationRecord | null>;
   /**
+   * Lookup by principal/tenant/device/idempotency_key for exact-action reuse.
+   * Newest row wins when multiple historical rows exist.
+   */
+  getMcpOperationByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }): Promise<McpOperationRecord | null>;
+  /**
    * Patch MCP operation. When `fromStatuses` is set, CAS: only updates if current
    * status is in that set (returns null on miss / CAS loss).
    */
@@ -422,7 +443,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0007). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0008). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -439,7 +460,7 @@ export type SchemaReadiness = {
     device_verification_transactions: boolean;
     /** 0004 authorize consent transactions */
     authorize_transactions: boolean;
-    /** 0005 MCP ops + 0006 claimed_at + 0007 claim ownership */
+    /** 0005 MCP ops + 0006 claimed_at + 0007 claim ownership + 0008 action binding */
     mcp_operations: boolean;
     mcp_approval_transactions: boolean;
     mcp_approval_outbox: boolean;
@@ -578,6 +599,12 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "session_id",
       "warnings_json",
       "correlation_id",
+      "payload_hash",
+      "idempotency_key",
+      "workspace_id",
+      "expires_at",
+      "claim_version",
+      "action_json",
       "created_at",
       "updated_at",
     ],
@@ -586,6 +613,8 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "idx_mcp_ops_device",
       "idx_mcp_ops_correlation",
       "idx_mcp_ops_updated",
+      "idx_mcp_ops_idempotency",
+      "idx_mcp_ops_payload_hash",
     ],
   },
   mcp_approval_transactions: {
@@ -1075,6 +1104,32 @@ export class MemoryStore implements ControlPlaneStore {
     }
     return null;
   }
+  async getMcpOperationByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }): Promise<McpOperationRecord | null> {
+    let best: McpOperationRecord | null = null;
+    for (const op of this.mcpOperations.values()) {
+      if (
+        op.principal_id === opts.principalId &&
+        op.tenant_id === opts.tenantId &&
+        (op.device_id || "") === opts.deviceId &&
+        (op.idempotency_key || "") === opts.idempotencyKey
+      ) {
+        if (!best || op.created_at > best.created_at) best = op;
+      }
+    }
+    return best
+      ? {
+          ...best,
+          data: { ...best.data },
+          warnings: [...best.warnings],
+          action: best.action ? { ...best.action } : best.action,
+        }
+      : null;
+  }
   async updateMcpOperation(
     operationId: string,
     patch: Partial<McpOperationRecord>,
@@ -1091,11 +1146,23 @@ export class MemoryStore implements ControlPlaneStore {
       tenant_id: patch.tenant_id ?? cur.tenant_id,
       data: patch.data ? { ...patch.data } : { ...cur.data },
       warnings: patch.warnings ? [...patch.warnings] : [...cur.warnings],
+      action: patch.action !== undefined
+        ? patch.action
+          ? { ...patch.action }
+          : patch.action
+        : cur.action
+          ? { ...cur.action }
+          : cur.action,
       policy_authority: "ownmesh_device",
       updated_at: patch.updated_at || nowIso(),
     };
     this.mcpOperations.set(operationId, next);
-    return { ...next, data: { ...next.data }, warnings: [...next.warnings] };
+    return {
+      ...next,
+      data: { ...next.data },
+      warnings: [...next.warnings],
+      action: next.action ? { ...next.action } : next.action,
+    };
   }
 
   async putMcpApprovalTransaction(tx: McpApprovalTransaction): Promise<void> {
@@ -1348,7 +1415,7 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async schemaReadiness(): Promise<SchemaReadiness> {
-    // In-memory store always carries the full logical 0002–0007 schema.
+    // In-memory store always carries the full logical 0002–0008 schema.
     const checks = Object.fromEntries(
       Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, true]),
     ) as SchemaReadiness["checks"];
@@ -2462,8 +2529,9 @@ export class SqlStore implements ControlPlaneStore {
         `INSERT INTO mcp_operations
          (operation_id, tenant_id, principal_id, device_id, tool, status, summary,
           data_json, truncated, next_cursor, approval_required, approval_url, approval_id,
-          session_id, warnings_json, correlation_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          session_id, warnings_json, correlation_id, payload_hash, idempotency_key,
+          workspace_id, expires_at, claim_version, action_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(operation_id) DO NOTHING`,
       )
       .bind(
@@ -2483,6 +2551,12 @@ export class SqlStore implements ControlPlaneStore {
         op.session_id ?? null,
         JSON.stringify(op.warnings || []),
         op.correlation_id ?? null,
+        op.payload_hash ?? null,
+        op.idempotency_key ?? null,
+        op.workspace_id ?? null,
+        op.expires_at ?? null,
+        Number(op.claim_version ?? 0),
+        JSON.stringify(op.action || {}),
         op.created_at,
         op.updated_at,
       )
@@ -2515,6 +2589,24 @@ export class SqlStore implements ControlPlaneStore {
     return row ? rowToMcpOperation(row) : null;
   }
 
+  async getMcpOperationByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }): Promise<McpOperationRecord | null> {
+    const row = await this.db
+      .prepare(
+        `SELECT * FROM mcp_operations
+         WHERE principal_id = ? AND tenant_id = ? AND IFNULL(device_id, '') = ?
+           AND IFNULL(idempotency_key, '') = ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .bind(opts.principalId, opts.tenantId, opts.deviceId, opts.idempotencyKey)
+      .first<Record<string, unknown>>();
+    return row ? rowToMcpOperation(row) : null;
+  }
+
   async updateMcpOperation(
     operationId: string,
     patch: Partial<McpOperationRecord>,
@@ -2532,6 +2624,7 @@ export class SqlStore implements ControlPlaneStore {
       tenant_id: patch.tenant_id ?? cur.tenant_id,
       data: patch.data ?? cur.data,
       warnings: patch.warnings ?? cur.warnings,
+      action: patch.action !== undefined ? patch.action : cur.action,
       policy_authority: "ownmesh_device",
       updated_at: patch.updated_at || nowIso(),
     };
@@ -2545,7 +2638,8 @@ export class SqlStore implements ControlPlaneStore {
              tenant_id = ?, principal_id = ?, device_id = ?, tool = ?, status = ?, summary = ?,
              data_json = ?, truncated = ?, next_cursor = ?, approval_required = ?,
              approval_url = ?, approval_id = ?, session_id = ?, warnings_json = ?,
-             correlation_id = ?, updated_at = ?
+             correlation_id = ?, payload_hash = ?, idempotency_key = ?, workspace_id = ?,
+             expires_at = ?, claim_version = ?, action_json = ?, updated_at = ?
            WHERE operation_id = ? AND status IN (${placeholders})`,
         )
         .bind(
@@ -2564,6 +2658,12 @@ export class SqlStore implements ControlPlaneStore {
           next.session_id ?? null,
           JSON.stringify(next.warnings || []),
           next.correlation_id ?? null,
+          next.payload_hash ?? null,
+          next.idempotency_key ?? null,
+          next.workspace_id ?? null,
+          next.expires_at ?? null,
+          Number(next.claim_version ?? 0),
+          JSON.stringify(next.action || {}),
           next.updated_at,
           operationId,
           ...fromStatuses,
@@ -2583,7 +2683,8 @@ export class SqlStore implements ControlPlaneStore {
            tenant_id = ?, principal_id = ?, device_id = ?, tool = ?, status = ?, summary = ?,
            data_json = ?, truncated = ?, next_cursor = ?, approval_required = ?,
            approval_url = ?, approval_id = ?, session_id = ?, warnings_json = ?,
-           correlation_id = ?, updated_at = ?
+           correlation_id = ?, payload_hash = ?, idempotency_key = ?, workspace_id = ?,
+           expires_at = ?, claim_version = ?, action_json = ?, updated_at = ?
          WHERE operation_id = ?`,
       )
       .bind(
@@ -2602,6 +2703,12 @@ export class SqlStore implements ControlPlaneStore {
         next.session_id ?? null,
         JSON.stringify(next.warnings || []),
         next.correlation_id ?? null,
+        next.payload_hash ?? null,
+        next.idempotency_key ?? null,
+        next.workspace_id ?? null,
+        next.expires_at ?? null,
+        Number(next.claim_version ?? 0),
+        JSON.stringify(next.action || {}),
         next.updated_at,
         operationId,
       )
@@ -3078,7 +3185,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Probe 0002–0007 tables, required columns (SELECT projections), and indexes
+   * Probe 0002–0008 tables, required columns (SELECT projections), and indexes
    * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {
@@ -3187,6 +3294,7 @@ function rowToMcpApprovalOutbox(row: Record<string, unknown>): McpApprovalOutbox
 function rowToMcpOperation(row: Record<string, unknown>): McpOperationRecord {
   let data: Record<string, unknown> = {};
   let warnings: string[] = [];
+  let action: Record<string, unknown> | null = null;
   try {
     data = JSON.parse(String(row.data_json || "{}")) as Record<string, unknown>;
   } catch {
@@ -3197,6 +3305,12 @@ function rowToMcpOperation(row: Record<string, unknown>): McpOperationRecord {
     if (!Array.isArray(warnings)) warnings = [];
   } catch {
     warnings = [];
+  }
+  try {
+    const parsed = JSON.parse(String(row.action_json || "{}")) as Record<string, unknown>;
+    action = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    action = null;
   }
   return {
     operation_id: String(row.operation_id),
@@ -3215,6 +3329,12 @@ function rowToMcpOperation(row: Record<string, unknown>): McpOperationRecord {
     session_id: row.session_id == null ? null : String(row.session_id),
     warnings,
     correlation_id: row.correlation_id ? String(row.correlation_id) : undefined,
+    payload_hash: row.payload_hash == null ? null : String(row.payload_hash),
+    idempotency_key: row.idempotency_key == null ? null : String(row.idempotency_key),
+    workspace_id: row.workspace_id == null ? null : String(row.workspace_id),
+    expires_at: row.expires_at == null ? null : String(row.expires_at),
+    claim_version: Number(row.claim_version || 0),
+    action,
     policy_authority: "ownmesh_device",
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),

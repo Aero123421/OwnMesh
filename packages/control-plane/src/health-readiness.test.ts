@@ -370,10 +370,13 @@ test("schema ready but SESSION_SECRET unbound → /health 503 not_ready", async 
 });
 
 test("missing 0005 MCP objects → schema_ready:false while 0003/0004 retained", async () => {
-  // Through 0004 only — MCP tables absent (also skip 0006/0007 which ALTER those tables).
+  // Through 0004 only — MCP tables absent (also skip later MCP ALTERs).
   const files = allMigrationFiles().filter(
     (f) =>
-      !f.startsWith("0005") && !f.startsWith("0006") && !f.startsWith("0007"),
+      !f.startsWith("0005") &&
+      !f.startsWith("0006") &&
+      !f.startsWith("0007") &&
+      !f.startsWith("0008"),
   );
   const { store } = openStoreWith(files);
   const readiness = await store.schemaReadiness();
@@ -494,6 +497,7 @@ test("missing required 0002 index → schema_ready:false and /health 503", async
 
 test("missing 0007 claim columns → schema_ready:false and /health 503", async () => {
   // Through 0006 only — claimed_at present, claim_token/version absent.
+  // Keep 0008 (mcp_operations action binding) so only outbox claim columns fail.
   const files = allMigrationFiles().filter((f) => !f.startsWith("0007"));
   const { store } = openStoreWith(files);
   const readiness = await store.schemaReadiness();
@@ -525,6 +529,7 @@ test("missing 0007 claim columns → schema_ready:false and /health 503", async 
 });
 
 test("missing 0006 claimed_at column → schema_ready:false", async () => {
+  // Drop 0006/0007 outbox claim columns; keep 0008 action-binding on mcp_operations.
   const files = allMigrationFiles().filter(
     (f) => !f.startsWith("0006") && !f.startsWith("0007"),
   );
@@ -536,7 +541,7 @@ test("missing 0006 claimed_at column → schema_ready:false", async () => {
   assert.equal(readiness.checks.mcp_approval_transactions, true);
 });
 
-test("MemoryStore and SqlStore both report full 0002–0007 readiness", async () => {
+test("MemoryStore and SqlStore both report full 0002–0008 readiness", async () => {
   const mem = new MemoryStore();
   const memR = await mem.schemaReadiness();
   assert.equal(memR.schema_ready, true);

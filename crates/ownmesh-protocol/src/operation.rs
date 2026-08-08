@@ -80,6 +80,10 @@ pub struct OperationRequestPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<WorkspaceId>,
     pub idempotency_key: String,
+    /// Server-computed SHA-256 hex of the canonical authorized action.
+    /// Client-supplied values are never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_hash: Option<String>,
     pub arguments: Value,
 }
 
@@ -208,6 +212,14 @@ fn validate_request(payload: &OperationRequestPayload) -> Result<(), DomainError
         return Err(bad_envelope(
             "operation.request requires non-empty capability/idempotency_key and object arguments",
         ));
+    }
+    if let Some(hash) = payload.payload_hash.as_deref() {
+        let valid = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if !valid {
+            return Err(bad_envelope(
+                "operation.request payload_hash must be a 64-char hex SHA-256 digest",
+            ));
+        }
     }
     Ok(())
 }

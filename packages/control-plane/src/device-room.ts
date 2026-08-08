@@ -36,6 +36,36 @@ export const OPERATION_CONTRACT_V1 = "ownmesh.operation/1.0";
 /** Default operation.request lifetime when the caller does not supply expires_at. */
 export const OPERATION_REQUEST_TTL_MS = 60_000;
 
+/** Stream a request body with a hard cap. Returns null when oversized. */
+async function readTextLimited(request: Request, maxBytes: number): Promise<string | null> {
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* ignore */
+      }
+      return null;
+    }
+    chunks.push(value);
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(c, offset);
+    offset += c.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
 /** Per-session replay-id hard cap (FIFO after TTL prune). */
 export const MAX_SEEN_MESSAGE_IDS = 4096;
 /** Drop seen message_ids older than this window. */
@@ -691,7 +721,7 @@ export class DeviceRoomRouter {
       if (operationId !== correlationId) {
         // Fail closed later at inject; keep identity consistent here.
       }
-      return {
+      const normalized: Record<string, unknown> = {
         ...payload,
         operation_contract: OPERATION_CONTRACT_V1,
         operation_id: operationId,
@@ -702,6 +732,10 @@ export class DeviceRoomRouter {
             ? (payload.arguments as Record<string, unknown>)
             : {},
       };
+      if (typeof payload.payload_hash === "string" && payload.payload_hash.trim() !== "") {
+        normalized.payload_hash = String(payload.payload_hash).toLowerCase();
+      }
+      return normalized;
     }
 
     const legacyOp = String(payload.op || opType || "");
@@ -1673,7 +1707,24 @@ export class DeviceRoom {
       const broken = this.refuseIfStorageBroken();
       if (broken) return broken;
       // Read body once so method/path/body_sha256 bind matches exact bytes sent.
-      const rawBody = await request.text();
+      // Enforce the application byte cap before allocating/parsing JSON.
+      const clHeader = request.headers.get("content-length");
+      if (clHeader != null && clHeader !== "") {
+        const n = Number(clHeader);
+        if (Number.isFinite(n) && n > MAX_PAYLOAD_BYTES) {
+          return json(
+            { error: "payload_too_large", max_bytes: MAX_PAYLOAD_BYTES },
+            { status: 413 },
+          );
+        }
+      }
+      const rawBody = await readTextLimited(request, MAX_PAYLOAD_BYTES);
+      if (rawBody === null) {
+        return json(
+          { error: "payload_too_large", max_bytes: MAX_PAYLOAD_BYTES },
+          { status: 413 },
+        );
+      }
       const bodySha256 = await sha256Hex(rawBody);
       // Canonical internal path (Worker mints path:"/operation").
       const opPath = "/operation";
@@ -2040,7 +2091,35 @@ export class DeviceRoom {
       return;
     }
 
-    const text = typeof message === "string" ? message : new TextDecoder().decode(message);
+    // Reject oversized frames before decoding/parsing JSON.
+    let text: string;
+    if (typeof message === "string") {
+      text = message;
+      if (new TextEncoder().encode(text).byteLength > MAX_PAYLOAD_BYTES) {
+        try {
+          ws.close(1009, "payload too large");
+        } catch {
+          /* closed */
+        }
+        this.router.unregisterSession(sessionId);
+        this.wsSessions.delete(ws);
+        return;
+      }
+    } else {
+      // Hibernation API delivers binary frames as ArrayBuffer.
+      const raw = message as ArrayBuffer;
+      if (raw.byteLength > MAX_PAYLOAD_BYTES) {
+        try {
+          ws.close(1009, "payload too large");
+        } catch {
+          /* closed */
+        }
+        this.router.unregisterSession(sessionId);
+        this.wsSessions.delete(ws);
+        return;
+      }
+      text = new TextDecoder().decode(raw);
+    }
 
     // Pre-parse type so we can force an extra credential check on critical ops
     // (revalidate already ran; this documents the acceptance gate explicitly).

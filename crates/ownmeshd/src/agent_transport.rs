@@ -19,12 +19,12 @@ use ownmesh_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -485,6 +485,43 @@ async fn wait_for_type(
     .map_err(|_| format!("timed out waiting for handshake message '{expected}'"))?
 }
 
+/// In-flight remote operation cancellation handles live outside the runtime mutex
+/// so cancel can interrupt a long command without waiting for dispatch to finish.
+#[derive(Default)]
+struct CancelRegistry {
+    inner: Mutex<HashMap<String, watch::Sender<bool>>>,
+}
+
+impl CancelRegistry {
+    async fn register(&self, operation_id: &str) -> watch::Receiver<bool> {
+        let (tx, rx) = watch::channel(false);
+        let mut guard = self.inner.lock().await;
+        if let Some(prev) = guard.insert(operation_id.to_owned(), tx) {
+            let _ = prev.send(true);
+        }
+        rx
+    }
+
+    async fn cancel(&self, operation_id: &str) -> bool {
+        let guard = self.inner.lock().await;
+        if let Some(tx) = guard.get(operation_id) {
+            let _ = tx.send(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn forget(&self, operation_id: &str) {
+        let mut guard = self.inner.lock().await;
+        guard.remove(operation_id);
+    }
+}
+
+struct FinishedRemoteOp {
+    completed: CompletedReply,
+}
+
 async fn live_loop(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
@@ -496,6 +533,8 @@ async fn live_loop(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
     let mut last_receive = Instant::now();
+    let cancel_registry = Arc::new(CancelRegistry::default());
+    let (finish_tx, mut finish_rx) = mpsc::unbounded_channel::<FinishedRemoteOp>();
 
     loop {
         tokio::select! {
@@ -518,13 +557,27 @@ async fn live_loop(
                     None,
                 ).await?;
             }
+            Some(finished) = finish_rx.recv() => {
+                // Durable completion before network send (same as sync path).
+                state.remember_completed(finished.completed.clone());
+                state.save(&config.state_path)?;
+                send_cached_result(socket, config, state, &finished.completed).await?;
+            }
             message = socket.next() => {
                 let message = message
                     .ok_or_else(|| "WebSocket stream ended".to_owned())?
                     .map_err(|error| format!("WebSocket receive failed: {error}"))?;
                 last_receive = Instant::now();
                 if let Some(frame) = handle_wire_message(socket, config, state, message).await? {
-                    handle_live_frame(socket, config, runtime, state, frame).await?;
+                    handle_live_frame(
+                        socket,
+                        config,
+                        runtime,
+                        state,
+                        frame,
+                        &cancel_registry,
+                        &finish_tx,
+                    ).await?;
                 }
             }
         }
@@ -633,6 +686,8 @@ async fn handle_live_frame(
     runtime: Option<&Arc<Mutex<DaemonRuntime>>>,
     state: &mut AgentTransportState,
     frame: InboundFrame,
+    cancel_registry: &Arc<CancelRegistry>,
+    finish_tx: &mpsc::UnboundedSender<FinishedRemoteOp>,
 ) -> Result<(), String> {
     let (raw, envelope) = match frame {
         InboundFrame::New { raw, envelope } => (Some(raw), envelope),
@@ -671,20 +726,89 @@ async fn handle_live_frame(
             let OperationPayload::Request(request) = operation.payload else {
                 return Err("operation.request parsed as a different payload type".into());
             };
-            let payload = match runtime {
-                Some(runtime) => dispatch_remote_operation(runtime, config, &request).await,
-                None => unsupported_surface_payload(&request.operation_id),
+
+            // Cancel must run on the live loop so it can signal an in-flight op
+            // without waiting for that op's runtime lock.
+            let action = action_of(&request);
+            if request.capability == "operation.cancel"
+                || action == "cancel"
+                || action == "ownmesh_cancel_operation"
+            {
+                let target = request
+                    .arguments
+                    .get("target_operation_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let signalled = if target.is_empty() {
+                    false
+                } else {
+                    cancel_registry.cancel(&target).await
+                };
+                let payload = json!({
+                    "operation_contract": OPERATION_CONTRACT_V1,
+                    "operation_id": request.operation_id.to_string(),
+                    "status": "completed",
+                    "result": {
+                        "cancelled": signalled,
+                        "target_operation_id": target,
+                        "signal_delivered": signalled,
+                        "note": if signalled {
+                            "cancel delivered to in-flight process tree"
+                        } else {
+                            "no matching in-flight operation; target may have already finished"
+                        }
+                    }
+                });
+                let completed = CompletedReply {
+                    correlation_id: correlation.to_owned(),
+                    operation_id: request.operation_id.to_string(),
+                    payload,
+                };
+                state.remember_completed(completed.clone());
+                state.save(&config.state_path)?;
+                return send_cached_result(socket, config, state, &completed).await;
+            }
+
+            let Some(runtime) = runtime.map(Arc::clone) else {
+                let payload = unsupported_surface_payload(&request.operation_id);
+                let completed = CompletedReply {
+                    correlation_id: correlation.to_owned(),
+                    operation_id: request.operation_id.to_string(),
+                    payload,
+                };
+                state.remember_completed(completed.clone());
+                state.save(&config.state_path)?;
+                return send_cached_result(socket, config, state, &completed).await;
             };
-            let completed = CompletedReply {
-                correlation_id: correlation.to_owned(),
-                operation_id: request.operation_id.to_string(),
-                payload,
-            };
-            // Completion is durable before the response is sent. A reconnect or
-            // duplicate correlation receives a freshly sequenced replay.
-            state.remember_completed(completed.clone());
-            state.save(&config.state_path)?;
-            send_cached_result(socket, config, state, &completed).await
+
+            // Register cancel before spawn so a concurrent cancel cannot miss the
+            // window between accept and dispatch start.
+            let operation_id = request.operation_id.to_string();
+            let cancel_rx = cancel_registry.register(&operation_id).await;
+            let correlation_owned = correlation.to_owned();
+            let cancel_registry = Arc::clone(cancel_registry);
+            let finish_tx = finish_tx.clone();
+            let device_id = config.device_id.clone();
+            tokio::spawn(async move {
+                let payload = dispatch_remote_operation(
+                    &runtime,
+                    &device_id,
+                    &request,
+                    &cancel_registry,
+                    Some(cancel_rx),
+                )
+                .await;
+                cancel_registry.forget(&operation_id).await;
+                let _ = finish_tx.send(FinishedRemoteOp {
+                    completed: CompletedReply {
+                        correlation_id: correlation_owned,
+                        operation_id,
+                        payload,
+                    },
+                });
+            });
+            Ok(())
         }
         "error" => Err("control plane returned an Agent protocol error".into()),
         other => Err(format!("unsupported control-plane message type '{other}'")),
@@ -786,6 +910,10 @@ fn map_request_to_method(
         ("filesystem.write", "fs.write" | "ownmesh_fs_write" | "ownmesh_write_file") => {
             methods::OPS_FS_WRITE
         }
+        ("filesystem.write", "fs.patch" | "ownmesh_fs_patch") => {
+            // Hash-checked whole-file replacement (bounded unified-diff is E7).
+            methods::OPS_FS_WRITE
+        }
         ("filesystem.write", "fs.delete" | "ownmesh_fs_delete" | "ownmesh_delete_file")
         | ("filesystem.delete", _) => methods::OPS_FS_DELETE,
         ("command.run", "command.shell" | "ownmesh_command_shell" | "ownmesh_run_shell") => {
@@ -853,8 +981,10 @@ fn bound_result_object(value: Value) -> Value {
 
 async fn dispatch_remote_operation(
     runtime: &Arc<Mutex<DaemonRuntime>>,
-    config: &AgentTransportConfig,
+    device_id: &DeviceId,
     request: &OperationRequestPayload,
+    cancel_registry: &CancelRegistry,
+    cancel_rx: Option<watch::Receiver<bool>>,
 ) -> Value {
     let operation_id = request.operation_id.to_string();
     let mapped = match map_request_to_method(request) {
@@ -874,14 +1004,26 @@ async fn dispatch_remote_operation(
     };
 
     if mapped.0 == "__cancel__" {
+        // Cancel is handled on the live loop; this branch is defensive only.
+        let target = mapped
+            .1
+            .get("target_operation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let signalled = if target.is_empty() {
+            false
+        } else {
+            cancel_registry.cancel(target).await
+        };
         return json!({
             "operation_contract": OPERATION_CONTRACT_V1,
             "operation_id": operation_id,
             "status": "completed",
             "result": {
-                "cancelled": true,
+                "cancelled": signalled,
                 "target_operation_id": mapped.1.get("target_operation_id").cloned().unwrap_or(Value::Null),
-                "note": "cancel acknowledged; concurrent process-tree cancel is applied when a matching in-flight operation exists"
+                "signal_delivered": signalled,
+                "note": "cancel delivered via dispatch fallback"
             }
         });
     }
@@ -900,10 +1042,12 @@ async fn dispatch_remote_operation(
         });
     }
 
-    let client = remote_agent_client(&config.device_id);
+    let client = remote_agent_client(device_id);
     let outcome = {
         let mut guard = runtime.lock().await;
-        guard.dispatch(mapped.0, Some(mapped.1), &client).await
+        guard
+            .dispatch_cancellable(mapped.0, Some(mapped.1), &client, cancel_rx)
+            .await
     };
 
     match outcome {
@@ -936,7 +1080,17 @@ async fn dispatch_remote_operation(
             })
         }
         Err(error) => {
-            let (code, message) = match &error {
+            let (status, code, message) = match &error {
+                ownmesh_ipc::IpcError::Remote { code, message }
+                    if *code == ownmesh_ipc::app_error::CONFLICT
+                        && message.to_ascii_lowercase().contains("cancelled") =>
+                {
+                    (
+                        "cancelled",
+                        "OWNMESH_E_CANCELLED".to_owned(),
+                        message.clone(),
+                    )
+                }
                 ownmesh_ipc::IpcError::Remote { code, message } => {
                     let mapped = match *code {
                         ownmesh_ipc::app_error::POLICY_DENIED => "OWNMESH_E_POLICY_DENIED",
@@ -948,14 +1102,14 @@ async fn dispatch_remote_operation(
                         ownmesh_ipc::app_error::CONFLICT => "OWNMESH_E_CONFLICT",
                         _ => "OWNMESH_E_INTERNAL",
                     };
-                    (mapped.to_owned(), message.clone())
+                    ("failed", mapped.to_owned(), message.clone())
                 }
-                other => ("OWNMESH_E_INTERNAL".to_owned(), other.to_string()),
+                other => ("failed", "OWNMESH_E_INTERNAL".to_owned(), other.to_string()),
             };
             json!({
                 "operation_contract": OPERATION_CONTRACT_V1,
                 "operation_id": operation_id,
-                "status": "failed",
+                "status": status,
                 "error": {
                     "code": code,
                     "message": message,

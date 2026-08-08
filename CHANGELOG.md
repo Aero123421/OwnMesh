@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.0-beta.4 — E3 action binding + bounded I/O
+
+- Server-computed `payload_hash` and durable MCP operation action binding (E3 slice)
+- Idempotency key reuse with drifted content fails closed; identical action replays
+- Command output streamed into capped rings; cancel kills in-flight process trees
+- MCP/DeviceRoom ingress byte caps before JSON parse; oversized WS frames rejected early
+- MCP `ownmesh_fs_stat` / `ownmesh_fs_delete` / `ownmesh_fs_patch`; cursor-paginated `fs.list`
+- Honest docs: E4–E9 and E10 remain open
+
 ## v1.2.0-beta.3 — E2 remote routing candidate
 
 - Wire public Streamable HTTP `/mcp` through DeviceRoom to the real ownmeshd Agent and shared policy-gated `DaemonRuntime`.

@@ -214,18 +214,71 @@ pub struct FileStat {
     pub sha256: Option<String>,
 }
 
+/// One page of directory listing results with a stable name-ordered cursor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirListPage {
+    pub entries: Vec<DirEntryInfo>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    /// Total entries considered after sorting (not necessarily returned).
+    pub total_matched: usize,
+}
+
+const MAX_NAME_CHARS: usize = 512;
+const MAX_PATH_CHARS: usize = 4096;
+
+fn encode_list_cursor(name: &str) -> String {
+    // Cursor is the exclusive lower bound name (UTF-8, name-ordered).
+    format!("name:{name}")
+}
+
+fn decode_list_cursor(cursor: Option<&str>) -> Option<String> {
+    let raw = cursor?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.strip_prefix("name:")
+        .map(str::to_owned)
+        .or_else(|| Some(raw.to_owned()))
+}
+
+fn entry_within_budgets(entry: &DirEntryInfo) -> bool {
+    entry.name.chars().count() <= MAX_NAME_CHARS && entry.path.chars().count() <= MAX_PATH_CHARS
+}
+
 /// List directory (non-recursive by default).
 ///
 /// # Errors
 ///
 /// Returns an error when the path cannot be resolved or read, is not a directory,
-/// or when the requested entry limit is reached.
+/// or when the requested entry limit is reached (legacy fail-closed behavior).
 pub fn list_dir(
     ws: &WorkspaceRoot,
     rel: impl AsRef<Path>,
     recursive: bool,
     max_entries: usize,
 ) -> FsResult<Vec<DirEntryInfo>> {
+    let page = list_dir_page(ws, rel, recursive, max_entries, None)?;
+    if page.truncated {
+        return Err(FsError::EntryLimit);
+    }
+    Ok(page.entries)
+}
+
+/// Cursor-paginated directory listing. Entries are sorted by name; `cursor` is an
+/// exclusive lower-bound on that name. Name/path character budgets drop oversized
+/// entries rather than allocating unbounded JSON.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved or read, or is not a directory.
+pub fn list_dir_page(
+    ws: &WorkspaceRoot,
+    rel: impl AsRef<Path>,
+    recursive: bool,
+    max_entries: usize,
+    cursor: Option<&str>,
+) -> FsResult<DirListPage> {
     let path = ws.resolve(rel)?;
     if !path.exists() {
         return Err(FsError::NotFound(path));
@@ -233,24 +286,32 @@ pub fn list_dir(
     if !path.is_dir() {
         return Err(FsError::NotADirectory(path));
     }
-    let mut out = Vec::new();
+    let after = decode_list_cursor(cursor);
+    let limit = max_entries.max(1);
+    // Hard scan budget prevents unbounded WalkDir collection before paging.
+    let scan_budget = limit.saturating_mul(32).max(limit).min(50_000);
+
+    let mut collected = Vec::new();
     if recursive {
         for entry in WalkDir::new(&path).min_depth(1) {
+            if collected.len() >= scan_budget {
+                break;
+            }
             let entry = entry.map_err(|e| FsError::Io {
                 path: Some(path.clone()),
                 source: std::io::Error::other(e.to_string()),
             })?;
-            if out.len() >= max_entries {
-                return Err(FsError::EntryLimit);
-            }
             let meta = entry.metadata().ok();
-            out.push(DirEntryInfo {
+            let info = DirEntryInfo {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: entry.path().to_string_lossy().into_owned(),
                 is_dir: entry.file_type().is_dir(),
                 is_symlink: entry.file_type().is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
-            });
+            };
+            if entry_within_budgets(&info) {
+                collected.push(info);
+            }
         }
     } else {
         let rd = fs::read_dir(&path).map_err(|source| FsError::Io {
@@ -258,29 +319,50 @@ pub fn list_dir(
             source,
         })?;
         for entry in rd {
+            if collected.len() >= scan_budget {
+                break;
+            }
             let entry = entry.map_err(|source| FsError::Io {
                 path: Some(path.clone()),
                 source,
             })?;
-            if out.len() >= max_entries {
-                return Err(FsError::EntryLimit);
-            }
             let ft = entry.file_type().map_err(|source| FsError::Io {
                 path: Some(entry.path()),
                 source,
             })?;
             let meta = entry.metadata().ok();
-            out.push(DirEntryInfo {
+            let info = DirEntryInfo {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path: entry.path().to_string_lossy().into_owned(),
                 is_dir: ft.is_dir(),
                 is_symlink: ft.is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
-            });
+            };
+            if entry_within_budgets(&info) {
+                collected.push(info);
+            }
         }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    collected.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    if let Some(after_name) = after.as_deref() {
+        collected.retain(|e| e.name.as_str() > after_name);
+    }
+    let total_matched = collected.len();
+    let truncated = total_matched > limit;
+    if truncated {
+        collected.truncate(limit);
+    }
+    let next_cursor = if truncated {
+        collected.last().map(|e| encode_list_cursor(&e.name))
+    } else {
+        None
+    };
+    Ok(DirListPage {
+        entries: collected,
+        next_cursor,
+        truncated,
+        total_matched,
+    })
 }
 
 /// Stat a path; optionally compute SHA-256 for files.

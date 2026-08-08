@@ -24,12 +24,12 @@
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
-    classify_from_request_in_dir, pin_executable, resolve_executable_path, run_command,
+    classify_from_request_in_dir, pin_executable, resolve_executable_path, run_command_cancellable,
     verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
 };
 use ownmesh_fs::{
-    delete_path, git_diff, git_status, list_dir, stat_path, write_file, GitDiffOpts, GitStatusOpts,
-    WorkspaceRoot,
+    apply_patch, delete_path, git_diff, git_status, list_dir_page, stat_path, write_file,
+    GitDiffOpts, GitStatusOpts, WorkspaceRoot,
 };
 use ownmesh_ipc::{
     app_error, canonicalize_principal_key, is_credentialed_client_principal, is_human_os_principal,
@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
 /// Session IPC method names (owned here; ipc crate methods table is ms1-stable).
@@ -161,6 +161,9 @@ pub struct FsListParams {
     pub recursive: bool,
     #[serde(default)]
     pub max_entries: Option<usize>,
+    /// Stable name-ordered exclusive lower-bound cursor from a prior page.
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -191,6 +194,9 @@ pub struct FsWriteParams {
     pub path: String,
     /// UTF-8 text body (binary via base64 can land later).
     pub content: String,
+    /// When set, refuse the write unless the current file hash matches (fs.patch).
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -290,6 +296,9 @@ pub struct DaemonRuntime {
     sessions_path: PathBuf,
     broker_endpoint: Option<BrokerEndpoint>,
     broker_secret: Option<BrokerSecret>,
+    /// Optional cancel signal for the currently executing remote command.
+    /// Lives only for the duration of `dispatch_cancellable`.
+    active_cancel: Option<watch::Receiver<bool>>,
     #[cfg(test)]
     op_journal_persist_fault: AtomicUsize,
     #[cfg(test)]
@@ -363,6 +372,7 @@ impl DaemonRuntime {
             sessions_path,
             broker_endpoint,
             broker_secret,
+            active_cancel: None,
             #[cfg(test)]
             op_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
@@ -881,14 +891,26 @@ impl DaemonRuntime {
         // Approved operations are journaled by `op_journal` as part of the approval
         // transaction. Do not also mutate `exec_journal`, which cannot participate in
         // that transaction's in-memory rollback.
+        let cancel = self.active_cancel.clone();
         let result: RunResult = if use_exec_journal {
-            run_command(&req, Some(&mut self.exec_journal)).await
+            Box::pin(run_command_cancellable(
+                &req,
+                Some(&mut self.exec_journal),
+                cancel,
+            ))
+            .await
         } else {
-            run_command(&req, None).await
+            Box::pin(run_command_cancellable(&req, None, cancel)).await
         }
-        .map_err(|e| IpcError::Remote {
-            code: app_error::INTERNAL,
-            message: e.to_string(),
+        .map_err(|e| {
+            let code = match &e {
+                ownmesh_exec::ExecError::Cancelled => app_error::CONFLICT,
+                _ => app_error::INTERNAL,
+            };
+            IpcError::Remote {
+                code,
+                message: e.to_string(),
+            }
         })?;
         serde_json::to_value(result).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
@@ -908,9 +930,20 @@ impl DaemonRuntime {
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        let entries =
-            list_dir(&ws, &p.path, p.recursive, p.max_entries.unwrap_or(1000)).map_err(fs_err)?;
-        Ok(json!({ "entries": entries }))
+        let page = list_dir_page(
+            &ws,
+            &p.path,
+            p.recursive,
+            p.max_entries.unwrap_or(200),
+            p.cursor.as_deref(),
+        )
+        .map_err(fs_err)?;
+        Ok(json!({
+            "entries": page.entries,
+            "next_cursor": page.next_cursor,
+            "truncated": page.truncated,
+            "total_matched": page.total_matched,
+        }))
     }
 
     fn execute_fs_stat(&self, p: &FsStatParams) -> IpcResult<Value> {
@@ -959,6 +992,16 @@ impl DaemonRuntime {
 
     fn execute_fs_write(&self, p: &FsWriteParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
+        if let Some(expected) = p.expected_sha256.as_deref() {
+            let new_hash =
+                apply_patch(&ws, &p.path, p.content.as_bytes(), Some(expected)).map_err(fs_err)?;
+            return Ok(json!({
+                "path": p.path,
+                "bytes_written": p.content.len(),
+                "sha256": new_hash,
+                "patched": true,
+            }));
+        }
         write_file(&ws, &p.path, p.content.as_bytes()).map_err(fs_err)?;
         Ok(json!({ "path": p.path, "bytes_written": p.content.len() }))
     }
@@ -1715,6 +1758,20 @@ impl DaemonRuntime {
             format!("revoked principal {principal}"),
         );
         Ok(json!({ "revoked": principal, "ok": true }))
+    }
+
+    /// Dispatch with an optional cancel receiver for interrupting in-flight exec.
+    pub async fn dispatch_cancellable(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        client: &ClientIdentity,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> IpcResult<Value> {
+        self.active_cancel = cancel;
+        let outcome = self.dispatch(method, params, client).await;
+        self.active_cancel = None;
+        outcome
     }
 
     /// Dispatch one authenticated RPC method bound to `client` identity.
