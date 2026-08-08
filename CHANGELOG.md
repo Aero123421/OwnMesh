@@ -1,12 +1,15 @@
 # Changelog
 
-## v1.2.0-beta.5+ — E3 crash-safe dispatch + durable bounds
+## v1.2.0-beta.5+ — E2/E3 dispatch integrity + bounded Agent completions
 
+- Post-send DeviceRoom route timeout/throw is `dispatch_uncertain` (not terminal `failed`): MCP ops stay pending, dispatch outbox stays redeliverable, delayed Agent results can still CAS-finalize; DeviceRoom correlation dedup prevents double send
+- Agent remote completion path: bounded mpsc completion queue (8) + in-flight semaphore (32); slow WSS consumers backpressure instead of unbounded RSS; `OWNMESH_E_AGENT_BACKPRESSURE` when saturated
 - Durable MCP dispatch outbox: claim stores exact route body; retries redeliver when Worker dies after claim and before DeviceRoom inject; clients never see the outbox
 - Idempotency tombstones are never evicted under quota pressure before the 30-day window; overflow fails closed
 - Agent transport completed-reply aggregate byte budget + compact durable receipts; transport state file size cap
 - ownmeshd op-journal entry/file/value budgets with fail-closed capacity (no unbounded `read_to_string`)
 - Directory list cursors bind full `(name, path)` sort tuple so recursive duplicate basenames are not skipped
+- Docs honesty: ChatGPT connection guide no longer implies cloud PTY sessions are production-ready (E5 open)
 - Gate entrypoint: `scripts/tests/test_v12_e2_e9_workerd_loopback.py` (runs real E2/E3 binary×workerd proof)
 - E4–E9 remain open (workspace CRUD/TOCTOU, cloud PTY, profiles, patch/Git, broker, transfer)
 

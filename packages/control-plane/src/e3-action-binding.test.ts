@@ -36,6 +36,8 @@ import {
   type SqlStatement,
 } from "./store.ts";
 import { hashCanonicalAction, nowIso } from "./util.ts";
+import { applyMcpOperationResult } from "./device-room.ts";
+import { __test } from "./index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const migrationsDir = join(here, "..", "migrations");
@@ -756,6 +758,208 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
   const retry2Body = (await retry2.json()) as { error?: unknown };
   assert.equal(retry2Body.error, undefined);
   assert.equal(routeCalls, 1, "dispatched outbox must not re-route");
+});
+
+test("dispatch_uncertain: timeout keeps pending outbox; delayed result finalizes; retry does not rerun", async () => {
+  const store = new MemoryStore();
+  const token = await seedAuthed(store);
+  const deviceId = "dev_dispatch_uncertain";
+  await putActiveDevice(store, deviceId);
+
+  const TEST_SECRET = "test-session-secret-dispatch-uncertain-01";
+  let acceptCount = 0;
+  // Delayed accept: Worker race times out before the DO HTTP response returns,
+  // but the body is treated as potentially durable (post-send).
+  const delayedRoom = {
+    idFromName: () => ({}) as DurableObjectId,
+    get: () =>
+      ({
+        fetch: async () => {
+          acceptCount += 1;
+          await new Promise((r) => setTimeout(r, 40));
+          return Response.json({
+            status: "routed_to_device",
+            detail: { recipients: 1, accepted_after_ms: 40 },
+          });
+        },
+      }) as unknown as DurableObjectStub,
+  } as unknown as DurableObjectNamespace;
+
+  const router: OperationRouter = {
+    routeToDevice: (id, op) =>
+      __test.routeToDeviceRoom(
+        {
+          DEVICE_ROOM: delayedRoom,
+          SESSION_SECRET: TEST_SECRET,
+          OWNMESH_DEVICE_ROUTE_TIMEOUT_MS: "5",
+        },
+        id,
+        op,
+        { principal_id: "prin_dev", tenant_id: "ten_default" },
+      ),
+  };
+
+  const callWrite = async (id: number) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_fs_write",
+            arguments: {
+              device_id: deviceId,
+              path: "uncertain.txt",
+              content: "once-only",
+              async: true,
+              idempotency_key: "idem_uncertain_dispatch",
+            },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      { routeToDevice: router.routeToDevice },
+      { issuer: "https://cp.test" },
+    );
+
+  const first = await callWrite(1);
+  const firstBody = (await first.json()) as {
+    result?: {
+      structuredContent?: {
+        status?: string;
+        operation_id?: string;
+        summary?: string;
+        correlation_id?: string;
+        data?: { dispatch?: string };
+      };
+    };
+    error?: unknown;
+  };
+  assert.equal(firstBody.error, undefined);
+  const sc = firstBody.result?.structuredContent;
+  assert.equal(sc?.status, "pending");
+  assert.equal(sc?.summary, "dispatch_uncertain");
+  assert.equal(sc?.data?.dispatch, "uncertain");
+  assert.ok(sc?.operation_id);
+  assert.ok(acceptCount >= 1, "DO fetch must have been initiated before timeout");
+
+  const opId = sc!.operation_id!;
+  const storedPending = await store.getMcpOperation(opId);
+  assert.equal(storedPending?.status, "pending");
+  const boxPending = readDispatchOutbox(storedPending?.data || {});
+  assert.equal(boxPending?.state, "pending", "uncertain must not mark outbox dispatched");
+  assert.equal(needsDispatchRedelivery(storedPending!), true);
+
+  // Delayed agent completion must still CAS-finalize the pending operation.
+  const applied = await applyMcpOperationResult(store, {
+    operationId: opId,
+    correlationId: storedPending!.correlation_id,
+    deviceId,
+    payload: {
+      operation_id: opId,
+      status: "completed",
+      summary: "write completed after uncertain dispatch",
+      result: { path: "uncertain.txt", bytes_written: 9 },
+    },
+  });
+  assert.equal(applied.ok, true);
+  if (applied.ok && applied.record) {
+    assert.equal(applied.record.status, "completed");
+  }
+  assert.equal((await store.getMcpOperation(opId))?.status, "completed");
+
+  // Identical idempotent retry must replay completed receipt — no second side effect.
+  const acceptsBeforeRetry = acceptCount;
+  const retry = await callWrite(2);
+  const retryBody = (await retry.json()) as {
+    result?: { structuredContent?: { status?: string; operation_id?: string } };
+    error?: unknown;
+  };
+  assert.equal(retryBody.error, undefined);
+  assert.equal(retryBody.result?.structuredContent?.status, "completed");
+  assert.equal(retryBody.result?.structuredContent?.operation_id, opId);
+  assert.equal(
+    acceptCount,
+    acceptsBeforeRetry,
+    "completed ops must not redeliver / re-accept on same idempotency key",
+  );
+});
+
+test("dispatch_uncertain: pending outbox is redelivered on identical retry", async () => {
+  const store = new MemoryStore();
+  const token = await seedAuthed(store);
+  const deviceId = "dev_uncertain_redeliver";
+  await putActiveDevice(store, deviceId);
+
+  let routeCalls = 0;
+  const statuses: string[] = [];
+  const router: OperationRouter = {
+    async routeToDevice(_id, _op) {
+      routeCalls += 1;
+      if (routeCalls === 1) {
+        statuses.push("dispatch_uncertain");
+        return {
+          status: "dispatch_uncertain",
+          detail: { error: "device_room_fetch_timeout", timeout_ms: 5 },
+        };
+      }
+      statuses.push("routed_to_device");
+      return { status: "routed_to_device", detail: { recipients: 1 } };
+    },
+  };
+
+  const callList = async (id: number) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_fs_list",
+            arguments: {
+              device_id: deviceId,
+              path: ".",
+              async: true,
+              idempotency_key: "idem_uncertain_redeliver",
+            },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      { routeToDevice: router.routeToDevice },
+      { issuer: "https://cp.test" },
+    );
+
+  const first = await callList(1);
+  const firstBody = (await first.json()) as {
+    result?: { structuredContent?: { status?: string; operation_id?: string } };
+  };
+  assert.equal(firstBody.result?.structuredContent?.status, "pending");
+  const opId = firstBody.result!.structuredContent!.operation_id!;
+  assert.equal(readDispatchOutbox((await store.getMcpOperation(opId))?.data || {})?.state, "pending");
+
+  const retry = await callList(2);
+  const retryBody = (await retry.json()) as {
+    result?: { structuredContent?: { status?: string; operation_id?: string } };
+  };
+  assert.equal(retryBody.result?.structuredContent?.operation_id, opId);
+  assert.equal(routeCalls, 2, "pending uncertain outbox must redeliver");
+  assert.deepEqual(statuses, ["dispatch_uncertain", "routed_to_device"]);
+  assert.equal(readDispatchOutbox((await store.getMcpOperation(opId))?.data || {})?.state, "dispatched");
 });
 
 test("idempotency tombstones are retained under quota until 30-day window closes", async () => {

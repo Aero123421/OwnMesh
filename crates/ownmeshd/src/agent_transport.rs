@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -49,6 +49,11 @@ const MAX_TRANSPORT_STATE_FILE_BYTES: usize = 8 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+/// Bounded completion queue between worker tasks and the live WebSocket loop.
+/// Prevents unbounded memory growth when the WSS consumer is slow.
+const MAX_COMPLETION_QUEUE: usize = 8;
+/// Cap concurrent remote dispatches (running + waiting to send a result).
+const MAX_IN_FLIGHT_REMOTE_OPS: usize = 32;
 
 type AgentSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -632,7 +637,9 @@ async fn live_loop(
     heartbeat.tick().await;
     let mut last_receive = Instant::now();
     let cancel_registry = Arc::new(CancelRegistry::default());
-    let (finish_tx, mut finish_rx) = mpsc::unbounded_channel::<FinishedRemoteOp>();
+    // Bounded queue + semaphore: slow WSS consumers must not grow RSS without limit.
+    let (finish_tx, mut finish_rx) = mpsc::channel::<FinishedRemoteOp>(MAX_COMPLETION_QUEUE);
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REMOTE_OPS));
 
     loop {
         tokio::select! {
@@ -675,6 +682,7 @@ async fn live_loop(
                         frame,
                         &cancel_registry,
                         &finish_tx,
+                        &in_flight,
                     ).await?;
                 }
             }
@@ -791,7 +799,8 @@ async fn handle_live_frame(
     state: &mut AgentTransportState,
     frame: InboundFrame,
     cancel_registry: &Arc<CancelRegistry>,
-    finish_tx: &mpsc::UnboundedSender<FinishedRemoteOp>,
+    finish_tx: &mpsc::Sender<FinishedRemoteOp>,
+    in_flight: &Arc<Semaphore>,
 ) -> Result<(), String> {
     let (raw, envelope) = match frame {
         InboundFrame::New { raw, envelope } => (Some(raw), envelope),
@@ -916,6 +925,23 @@ async fn handle_live_frame(
                 return send_cached_result(socket, config, state, &completed).await;
             };
 
+            // Fail closed under backpressure rather than enqueueing unbounded work.
+            // try_acquire avoids blocking the live loop (which would deadlock finish_rx).
+            let permit = match Arc::clone(in_flight).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let payload = agent_backpressure_payload(&request.operation_id);
+                    let completed = CompletedReply {
+                        correlation_id: correlation.to_owned(),
+                        operation_id: request.operation_id.to_string(),
+                        payload,
+                    };
+                    state.remember_completed(completed.clone());
+                    state.save(&config.state_path)?;
+                    return send_cached_result(socket, config, state, &completed).await;
+                }
+            };
+
             // Register cancel before spawn so a concurrent cancel cannot miss the
             // window between accept and dispatch start.
             let operation_id = request.operation_id.to_string();
@@ -930,6 +956,7 @@ async fn handle_live_frame(
                 .as_ref()
                 .map(|exp| exp.at.to_rfc3339());
             tokio::spawn(async move {
+                let _permit: OwnedSemaphorePermit = permit;
                 let payload = dispatch_remote_operation(
                     &runtime,
                     &device_id,
@@ -940,13 +967,14 @@ async fn handle_live_frame(
                 )
                 .await;
                 cancel_registry.forget(&operation_id).await;
-                let _ = finish_tx.send(FinishedRemoteOp {
-                    completed: CompletedReply {
-                        correlation_id: correlation_owned,
-                        operation_id,
-                        payload,
-                    },
-                });
+                let completed = CompletedReply {
+                    correlation_id: correlation_owned,
+                    operation_id,
+                    payload,
+                };
+                // Backpressure: wait for the live loop to drain rather than drop
+                // or grow an unbounded queue while the WebSocket consumer is slow.
+                let _ = finish_tx.send(FinishedRemoteOp { completed }).await;
             });
             Ok(())
         }
@@ -989,6 +1017,25 @@ fn unsupported_surface_payload(operation_id: &ownmesh_domain::OperationId) -> Va
             "code": "OWNMESH_E_UNSUPPORTED_SURFACE",
             "message": "remote operation routing is unavailable without a local runtime handle",
             "retryable": false
+        }
+    })
+}
+
+fn agent_backpressure_payload(operation_id: &ownmesh_domain::OperationId) -> Value {
+    json!({
+        "operation_contract": OPERATION_CONTRACT_V1,
+        "operation_id": operation_id,
+        "status": "failed",
+        "error": {
+            "code": "OWNMESH_E_AGENT_BACKPRESSURE",
+            "message": format!(
+                "agent in-flight remote operation limit reached ({MAX_IN_FLIGHT_REMOTE_OPS}); retry after drain"
+            ),
+            "retryable": true,
+            "details": {
+                "max_in_flight": MAX_IN_FLIGHT_REMOTE_OPS,
+                "max_completion_queue": MAX_COMPLETION_QUEUE
+            }
         }
     })
 }
@@ -2212,5 +2259,83 @@ mod tests {
         let mut bad = Map::new();
         bad.insert("env".into(), json!({"BAD=KEY": "x"}));
         assert!(recompute_action_facts(&bad).is_err());
+    }
+
+    #[test]
+    fn completion_queue_and_inflight_bounds_are_small_and_positive() {
+        // Slow WSS consumers must not accumulate unbounded completed results.
+        const {
+            assert!(MAX_COMPLETION_QUEUE >= 1);
+            assert!(MAX_COMPLETION_QUEUE <= 64);
+            assert!(MAX_IN_FLIGHT_REMOTE_OPS >= MAX_COMPLETION_QUEUE);
+            assert!(MAX_IN_FLIGHT_REMOTE_OPS <= 128);
+        }
+        // Rough worst-case queued payload budget stays well under prior unbounded risk
+        // (1024 × ~700 KiB). Keep the product intentionally small.
+        let worst_case_queued_mib = (MAX_IN_FLIGHT_REMOTE_OPS * MAX_PAYLOAD_BYTES) / (1024 * 1024);
+        assert!(
+            worst_case_queued_mib <= 32,
+            "worst_case_mib={worst_case_queued_mib}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_completion_channel_applies_backpressure() {
+        let (tx, mut rx) = mpsc::channel::<FinishedRemoteOp>(MAX_COMPLETION_QUEUE);
+        // Fill the queue to capacity without a consumer drain.
+        for i in 0..MAX_COMPLETION_QUEUE {
+            tx.try_send(FinishedRemoteOp {
+                completed: CompletedReply {
+                    correlation_id: format!("cor_{i}"),
+                    operation_id: format!("op_{i}"),
+                    payload: json!({ "status": "completed", "i": i }),
+                },
+            })
+            .expect("queue should accept up to capacity");
+        }
+        assert!(
+            tx.try_send(FinishedRemoteOp {
+                completed: CompletedReply {
+                    correlation_id: "cor_overflow".into(),
+                    operation_id: "op_overflow".into(),
+                    payload: json!({ "status": "completed" }),
+                },
+            })
+            .is_err(),
+            "bounded channel must refuse beyond capacity"
+        );
+
+        // Drain one slot; capacity returns without sequence rewind of unread items.
+        let first = rx.recv().await.expect("queued item");
+        assert_eq!(first.completed.correlation_id, "cor_0");
+        tx.try_send(FinishedRemoteOp {
+            completed: CompletedReply {
+                correlation_id: "cor_after_drain".into(),
+                operation_id: "op_after_drain".into(),
+                payload: json!({ "status": "completed" }),
+            },
+        })
+        .expect("capacity after drain");
+
+        // Remaining items stay ordered (no rewind/drop of live entries).
+        let second = rx.recv().await.expect("second");
+        assert_eq!(second.completed.correlation_id, "cor_1");
+    }
+
+    #[test]
+    fn backpressure_payload_is_retryable_and_bounded() {
+        let op = ownmesh_domain::OperationId::parse("op_bp_1").unwrap();
+        let payload = agent_backpressure_payload(&op);
+        assert_eq!(payload["status"], "failed");
+        assert_eq!(payload["error"]["code"], "OWNMESH_E_AGENT_BACKPRESSURE");
+        assert_eq!(payload["error"]["retryable"], true);
+        assert_eq!(
+            payload["error"]["details"]["max_in_flight"],
+            MAX_IN_FLIGHT_REMOTE_OPS as u64
+        );
+        assert_eq!(
+            payload["error"]["details"]["max_completion_queue"],
+            MAX_COMPLETION_QUEUE as u64
+        );
     }
 }

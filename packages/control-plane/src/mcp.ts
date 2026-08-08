@@ -2215,7 +2215,25 @@ export async function handleMcp(
         const box = readDispatchOutbox(replayed.data || {});
         if (box) {
           const redelivered = await router.routeToDevice(deviceId, box.body);
-          if (
+          // dispatch_uncertain: leave outbox pending for another identical retry;
+          // DeviceRoom correlation dedup prevents a second side-effect send.
+          if (redelivered.status === "dispatch_uncertain") {
+            const noted = await patchOp(
+              store,
+              tracker,
+              replayed.operation_id,
+              {
+                data: {
+                  ...(replayed.data || {}),
+                  route: redelivered,
+                  dispatch: "uncertain",
+                },
+                summary: "dispatch_uncertain",
+              },
+              ["pending", "running", "cancel_requested"],
+            );
+            if (noted) replayed = noted;
+          } else if (
             redelivered.status === "routed_to_device" ||
             redelivered.status === "pending" ||
             redelivered.status === "running" ||
@@ -2338,6 +2356,53 @@ export async function handleMcp(
         },
         correlation_id: correlation,
         warnings: injectWarnings,
+      });
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: env.approval_required,
+        approval_url: env.approval_url,
+        approval_id: env.approval_id,
+      });
+      return mcpResult(id, toolContent(finalOp));
+    }
+
+    // Post-send timeout/throw: DeviceRoom may already own the body. Keep the
+    // durable outbox pending so identical retries redeliver; DeviceRoom dedups.
+    // Never terminal-fail here or a delayed agent result cannot CAS-finalize.
+    if (routed.status === "dispatch_uncertain") {
+      const uncertainOutbox = readDispatchOutbox(trackBase.data) || dispatchOutbox;
+      const uncertainData = withDispatchOutbox(
+        {
+          op: name,
+          route: routed,
+          dispatch: "uncertain",
+          next: "Poll ownmesh_get_operation. Identical idempotent retry may redeliver the bound body; DeviceRoom correlation dedup prevents double dispatch.",
+          tool: name,
+          capability: deviceOp.payload.capability,
+          payload_hash: deviceOp.payload_hash,
+        },
+        { ...uncertainOutbox, state: "pending" },
+      );
+      const env = makeEnvelope({
+        operation_id: operationId,
+        status: "pending",
+        device_id: deviceId,
+        summary: "dispatch_uncertain",
+        data: uncertainData,
+        correlation_id: correlation,
+        approval_required: false,
+        warnings: [
+          ...injectWarnings,
+          "device_room_route_uncertain: left pending for durable finalize (timeout or post-send throw)",
+        ],
       });
       const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
         status: env.status,

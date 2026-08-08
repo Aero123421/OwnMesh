@@ -106,10 +106,10 @@ async function putRunningOp(
 }
 
 // ---------------------------------------------------------------------------
-// routeToDeviceRoom — stub.fetch throw → unavailable (never throws out)
+// routeToDeviceRoom — post-send throw/timeout → dispatch_uncertain (never throws)
 // ---------------------------------------------------------------------------
 
-test("routeToDeviceRoom: stub.fetch throw → unavailable (not thrown)", async () => {
+test("routeToDeviceRoom: stub.fetch throw → dispatch_uncertain (not thrown)", async () => {
   const routed = await __test.routeToDeviceRoom(
     {
       DEVICE_ROOM: throwingDeviceRoom("simulated_do_crash"),
@@ -123,15 +123,15 @@ test("routeToDeviceRoom: stub.fetch throw → unavailable (not thrown)", async (
     },
     { principal_id: "prin_dev", tenant_id: "ten_default" },
   );
-  assert.equal(routed.status, "unavailable");
+  assert.equal(routed.status, "dispatch_uncertain");
   assert.notEqual(routed.status, "routed_to_device");
-  assert.notEqual(routed.status, "pending");
+  assert.notEqual(routed.status, "failed");
   const detail = (routed.detail || {}) as { error?: string; message?: string };
   assert.equal(detail.error, "device_room_fetch_failed");
   assert.match(String(detail.message || ""), /simulated_do_crash/);
 });
 
-test("routeToDeviceRoom: unresolved stub fetch → explicit unavailable timeout", async () => {
+test("routeToDeviceRoom: unresolved stub fetch → dispatch_uncertain timeout", async () => {
   const routed = await __test.routeToDeviceRoom(
     {
       DEVICE_ROOM: hangingDeviceRoom(),
@@ -146,18 +146,22 @@ test("routeToDeviceRoom: unresolved stub fetch → explicit unavailable timeout"
     },
     { principal_id: "prin_dev", tenant_id: "ten_default" },
   );
-  assert.equal(routed.status, "unavailable");
-  assert.deepEqual(routed.detail, {
-    error: "device_room_fetch_timeout",
-    timeout_ms: 5,
-  });
+  assert.equal(routed.status, "dispatch_uncertain");
+  const detail = (routed.detail || {}) as {
+    error?: string;
+    timeout_ms?: number;
+    note?: string;
+  };
+  assert.equal(detail.error, "device_room_fetch_timeout");
+  assert.equal(detail.timeout_ms, 5);
+  assert.match(String(detail.note || ""), /may already be durable/i);
 });
 
 // ---------------------------------------------------------------------------
-// DO stub throw → persistent op CAS to failed (no permanent running)
+// DO stub throw/timeout → durable pending (not terminal failed)
 // ---------------------------------------------------------------------------
 
-test("DO stub fetch throw → MCP op CAS failed (running must not remain)", async () => {
+test("DO stub fetch throw → MCP op stays pending (dispatch_uncertain)", async () => {
   const { store, token } = await seedAuthed();
   const deviceId = "dev_throw_cas_fail_01ab";
   await putActiveDevice(store, deviceId);
@@ -188,24 +192,24 @@ test("DO stub fetch throw → MCP op CAS failed (running must not remain)", asyn
       structuredContent?: {
         status?: string;
         operation_id?: string;
-        data?: { error?: { code?: string; details?: { error?: string } } };
+        summary?: string;
+        data?: { dispatch?: string; route?: { status?: string; detail?: { error?: string } } };
       };
     };
   };
   const sc = body.result?.structuredContent;
   assert.ok(sc);
-  assert.equal(sc!.status, "failed");
-  assert.notEqual(sc!.status, "running");
-  assert.notEqual(sc!.status, "pending");
-  assert.equal(sc!.data?.error?.code, "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE");
-  assert.equal(sc!.data?.error?.details?.error, "device_room_fetch_failed");
+  assert.equal(sc!.status, "pending");
+  assert.equal(sc!.summary, "dispatch_uncertain");
+  assert.equal(sc!.data?.dispatch, "uncertain");
+  assert.equal(sc!.data?.route?.status, "dispatch_uncertain");
+  assert.equal(sc!.data?.route?.detail?.error, "device_room_fetch_failed");
 
   const opId = sc!.operation_id!;
   const stored = await store.getMcpOperation(opId);
   assert.ok(stored);
-  assert.equal(stored!.status, "failed");
-  assert.notEqual(stored!.status, "running");
-  assert.notEqual(stored!.status, "pending");
+  assert.equal(stored!.status, "pending");
+  assert.notEqual(stored!.status, "failed");
 });
 
 // ---------------------------------------------------------------------------
@@ -349,7 +353,7 @@ test("cancel: route throw → original state kept + error envelope", async () =>
   assert.equal((await store.getMcpOperation(opId))?.status, "pending");
 });
 
-test("cancel: unavailable route (DO throw via routeToDeviceRoom) keeps running", async () => {
+test("cancel: uncertain route (DO throw via routeToDeviceRoom) keeps running", async () => {
   const { store, token } = await seedAuthed();
   const deviceId = "dev_cancel_unavail_01ab";
   const opId = randomId("op_");
@@ -390,7 +394,8 @@ test("cancel: unavailable route (DO throw via routeToDeviceRoom) keeps running",
     body.result?.structuredContent?.data?.error?.code,
     "OWNMESH_E_CANCEL_ROUTE_FAILED",
   );
-  assert.equal(body.result?.structuredContent?.data?.route_status, "unavailable");
+  // Cancel is only cancel_requested after confirmed route; uncertain ≠ confirmed.
+  assert.equal(body.result?.structuredContent?.data?.route_status, "dispatch_uncertain");
   assert.equal((await store.getMcpOperation(opId))?.status, "running");
 });
 
@@ -437,7 +442,7 @@ test("cancel: timed-out DO route keeps original state + explicit timeout error",
   assert.equal(sc?.data?.error?.code, "OWNMESH_E_CANCEL_ROUTE_FAILED");
   assert.equal(sc?.data?.error?.details?.error, "device_room_fetch_timeout");
   assert.equal(sc?.data?.error?.details?.timeout_ms, 5);
-  assert.equal(sc?.data?.route_status, "unavailable");
+  assert.equal(sc?.data?.route_status, "dispatch_uncertain");
   assert.equal(sc?.data?.previous?.status, "approval_required");
   assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
 });

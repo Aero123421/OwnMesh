@@ -218,22 +218,28 @@ async function routeToDeviceRoom(
       }),
     ]);
     if (outcome === timedOut) {
+      // Post-send timeout is not proof of rejection: DeviceRoom may already have
+      // durably accepted and dispatched the body. Leave the operation non-terminal
+      // so a delayed result can still CAS-finalize (E2/E3 exact-once).
       return {
-        status: "unavailable",
+        status: "dispatch_uncertain",
         detail: {
           error: "device_room_fetch_timeout",
           timeout_ms: timeoutMs,
+          note: "request may already be durable in DeviceRoom; keep pending and await result or redeliver identical body",
         },
       };
     }
     res = outcome;
   } catch (err) {
-    // Fail closed: never let DO stub/network throws leave MCP ops stuck in running.
+    // Post-send throw is also uncertain: the DO may have accepted before the
+    // Worker observed failure. Do not terminal-fail the MCP operation.
     return {
-      status: "unavailable",
+      status: "dispatch_uncertain",
       detail: {
         error: "device_room_fetch_failed",
         message: err instanceof Error ? err.message : String(err),
+        note: "post-send failure is not proof of rejection; keep pending for redelivery/dedup",
       },
     };
   } finally {
