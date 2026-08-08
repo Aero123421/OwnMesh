@@ -30,7 +30,11 @@ import {
   sha256Hex,
 } from "./util.ts";
 import { SERVICE_NAME, SERVICE_VERSION } from "./util.ts";
-import { randomId, nowIso } from "./store.ts";
+import {
+  MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
+  randomId,
+  nowIso,
+} from "./store.ts";
 
 // ---------------------------------------------------------------------------
 // Tool catalog (annotations are UX hints only — not authorization)
@@ -60,9 +64,20 @@ const deviceProp = {
 };
 /** Hard server-side ceilings (schema maximums are not authority alone). */
 export const MCP_MAX_TIMEOUT_MS = 300_000;
-export const MCP_MAX_OUTPUT_BYTES = 1_000_000;
+/**
+ * Aggregate stdout+stderr budget for a single durable MCP result hop.
+ * Kept under the 256 KiB durable data_json ceiling (with JSON framing).
+ * Larger command output must be requested with a smaller cap or re-run is refused;
+ * Full Access still retrieves content via repeated bounded calls, never one giant JSON.
+ */
+export const MCP_MAX_OUTPUT_BYTES = 200_000;
 export const MCP_MAX_LIST_ENTRIES = 500;
-export const MCP_MAX_READ_BYTES = 512_000;
+/**
+ * Per-call file read ceiling. Sized so Base64(~4/3) + metadata fits the durable
+ * 256 KiB store and the 750 KiB Agent envelope. A 512 KiB+ file is retrieved by
+ * paging offset/max_bytes (and next_offset), never one unbounded result.
+ */
+export const MCP_MAX_READ_BYTES = 160_000;
 /** Command environment overlay budgets (exact-action / policy facts). */
 export const MCP_MAX_ENV_ENTRIES = 32;
 export const MCP_MAX_ENV_KEY_BYTES = 128;
@@ -579,14 +594,23 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_cancel_operation",
-    description: "Request cancellation of a pending/running operation",
+    description:
+      "Request cancellation of a pending/running operation (durable exact-once cancel claim bound to target)",
     inputSchema: {
       type: "object",
       properties: {
         operation_id: str,
         device_id: str,
+        idempotency_key: {
+          type: "string",
+          minLength: 1,
+          maxLength: 256,
+          description:
+            "Optional cancel claim key; defaults to cancel:<operation_id> for exact-once retries",
+        },
       },
       required: ["operation_id"],
+      additionalProperties: false,
     },
     annotations: {
       readOnlyHint: false,
@@ -1041,6 +1065,36 @@ export function withDispatchOutbox(
   return { ...data, [DISPATCH_OUTBOX_KEY]: outbox };
 }
 
+/**
+ * After DeviceRoom accepts the body, compact the durable outbox: keep identity
+ * facts for audit/dedup but drop large inline content so data_json can host the
+ * eventual result without blowing the client-visible budget. Pending outboxes
+ * always retain the full body for crash redelivery.
+ */
+export function compactDispatchOutboxBody(body: DispatchOutboxBody): DispatchOutboxBody {
+  const payload = { ...(body.payload || {}) };
+  const args =
+    payload.arguments && typeof payload.arguments === "object" && !Array.isArray(payload.arguments)
+      ? { ...(payload.arguments as Record<string, unknown>) }
+      : undefined;
+  if (args && typeof args.content === "string" && args.content.length > 256) {
+    const bytes = new TextEncoder().encode(args.content).byteLength;
+    args.content = undefined;
+    args.content_omitted = true;
+    args.content_bytes = bytes;
+    // sha256 of content is already bound into payload_hash / bound_action facts.
+  }
+  if (args) payload.arguments = args;
+  return {
+    type: body.type,
+    payload,
+    correlation_id: body.correlation_id,
+    expires_at: body.expires_at,
+    claim_version: body.claim_version,
+    oauth_client_id: body.oauth_client_id ?? null,
+  };
+}
+
 export function markDispatchOutboxDispatched(
   data: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> {
@@ -1051,6 +1105,7 @@ export function markDispatchOutboxDispatched(
     ...box,
     state: "dispatched",
     attempts: (box.attempts || 0) + 1,
+    body: compactDispatchOutboxBody(box.body),
   };
   return base;
 }
@@ -1883,118 +1938,54 @@ export async function handleMcp(
         candidate?.principal === rec.principal && candidate.tenant_id === rec.tenant_id
           ? candidate
           : undefined;
-      if (tracked && (tracked.status === "pending" || tracked.status === "running" || tracked.status === "approval_required")) {
-        // Device-bound cancel: only patch to cancel_requested AFTER successful route.
-        // Route reject/throw keeps the original store state and returns an error envelope.
-        // No device: cancel locally → cancelled.
-        if (tracked.device_id) {
-          const cancelDeviceId = tracked.device_id;
-          const gate = await store.assertDeviceOperableForMcp(
-            cancelDeviceId,
-            rec.principal,
-            rec.tenant_id,
-          );
-          if (!gate.ok) {
-            return mcpError(id, -32004, gate.error, { device_id: cancelDeviceId, operation_id: oid });
-          }
-          if (!router) {
-            const env = makeEnvelope({
-              operation_id: oid || operationId,
-              status: "failed",
-              device_id: cancelDeviceId,
-              summary: "cancel route failed: device room unavailable",
-              data: {
-                error: {
-                  code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
-                  message: "DEVICE_ROOM binding is required to route cancel to device",
-                  retryable: true,
-                  operation_id: oid,
-                },
-                previous: tracked,
-              },
-              correlation_id: tracked.correlation_id,
-            });
-            return mcpResult(id, toolContent(env));
-          }
-          let routed: { status: string; detail?: unknown };
-          try {
-            // Cancel uses a fresh operation_id for the cancel request itself, but
-            // arguments.target_operation_id binds the original side-effect identity.
-            const cancelOp = await buildDeviceOperation({
-              toolName: "ownmesh_cancel_operation",
-              args: { target_operation_id: oid },
-              operationId: correlation,
-              deviceId: cancelDeviceId,
-              principalId: rec.principal,
-              tenantId: rec.tenant_id,
-              expiresAt: new Date(Date.now() + 60_000).toISOString(),
-            });
-            routed = await router.routeToDevice(cancelDeviceId, cancelOp);
-          } catch (err) {
-            // Keep original op state; never pretend cancel succeeded.
-            const env = makeEnvelope({
-              operation_id: oid || operationId,
-              status: "failed",
-              device_id: cancelDeviceId,
-              summary: "cancel route failed",
-              data: {
-                error: {
-                  code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
-                  message: err instanceof Error ? err.message : "cancel route threw",
-                  retryable: true,
-                  operation_id: oid,
-                },
-                previous: tracked,
-              },
-              correlation_id: tracked.correlation_id,
-            });
-            return mcpResult(id, toolContent(env));
-          }
-          if (routed.status !== "routed_to_device") {
-            const env = makeEnvelope({
-              operation_id: oid || operationId,
-              status: "failed",
-              device_id: cancelDeviceId,
-              summary: "cancel route rejected",
-              data: {
-                error: {
-                  code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
-                  message: `cancel was not delivered to device (route status=${routed.status})`,
-                  retryable: true,
-                  operation_id: oid,
-                  details: routed.detail ?? { status: routed.status },
-                },
-                previous: tracked,
-                route_status: routed.status,
-              },
-              correlation_id: tracked.correlation_id,
-            });
-            return mcpResult(id, toolContent(env));
-          }
-          const updated = await patchOp(
-            store,
-            tracker,
-            oid,
-            {
-              status: "cancel_requested",
-              summary: "cancel requested on device",
-              approval_required: false,
-            },
-            ["pending", "running", "approval_required"],
-          );
-          if (!updated) {
-            const env = makeEnvelope({
-              operation_id: oid || operationId,
-              status: "failed",
-              summary: "operation not cancellable in current state",
-              data: { previous: tracked },
-            });
-            return mcpResult(id, toolContent(env));
-          }
-          return mcpResult(id, toolContent(updated));
-        }
+      if (!tracked) {
+        const env = makeEnvelope({
+          operation_id: oid || operationId,
+          status: "failed",
+          summary: "unknown operation",
+          data: { previous: null },
+        });
+        return mcpResult(id, toolContent(env));
+      }
 
-        // No device binding: local cancel is authoritative.
+      // Already terminal on the target — return current state (idempotent).
+      const terminalTarget = new Set([
+        "completed",
+        "failed",
+        "denied",
+        "cancelled",
+        "device_offline",
+        "tombstone",
+      ]);
+      if (terminalTarget.has(tracked.status)) {
+        const env = makeEnvelope({
+          operation_id: oid,
+          status: tracked.status,
+          summary: tracked.summary || "operation not cancellable in current state",
+          data: { previous: publicTrackedView(tracked) },
+          device_id: tracked.device_id,
+          correlation_id: tracked.correlation_id,
+        });
+        return mcpResult(id, toolContent(env));
+      }
+
+      if (
+        tracked.status !== "pending" &&
+        tracked.status !== "running" &&
+        tracked.status !== "approval_required" &&
+        tracked.status !== "cancel_requested"
+      ) {
+        const env = makeEnvelope({
+          operation_id: oid,
+          status: tracked.status,
+          summary: "operation not cancellable in current state",
+          data: { previous: publicTrackedView(tracked) },
+        });
+        return mcpResult(id, toolContent(env));
+      }
+
+      // No device binding: local cancel is authoritative (still durable via target CAS).
+      if (!tracked.device_id) {
         const updated = await patchOp(
           store,
           tracker,
@@ -2004,24 +1995,327 @@ export async function handleMcp(
             summary: "cancelled by client",
             approval_required: false,
           },
-          ["pending", "running", "approval_required"],
+          ["pending", "running", "approval_required", "cancel_requested"],
         );
         if (!updated) {
           const env = makeEnvelope({
-            operation_id: oid || operationId,
+            operation_id: oid,
             status: "failed",
             summary: "operation not cancellable in current state",
-            data: { previous: tracked },
+            data: { previous: publicTrackedView(tracked) },
           });
           return mcpResult(id, toolContent(env));
         }
         return mcpResult(id, toolContent(updated));
       }
+
+      const cancelDeviceId = tracked.device_id;
+      const gate = await store.assertDeviceOperableForMcp(
+        cancelDeviceId,
+        rec.principal,
+        rec.tenant_id,
+      );
+      if (!gate.ok) {
+        return mcpError(id, -32004, gate.error, { device_id: cancelDeviceId, operation_id: oid });
+      }
+      if (!router) {
+        const env = makeEnvelope({
+          operation_id: oid,
+          status: "failed",
+          device_id: cancelDeviceId,
+          summary: "cancel route failed: device room unavailable",
+          data: {
+            error: {
+              code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
+              message: "DEVICE_ROOM binding is required to route cancel to device",
+              retryable: true,
+              operation_id: oid,
+            },
+            previous: publicTrackedView(tracked),
+          },
+          correlation_id: tracked.correlation_id,
+        });
+        return mcpResult(id, toolContent(env));
+      }
+
+      // E3 durable cancel claim: principal/tenant/device/target-bound idempotency key
+      // with a crash-safe dispatch outbox. Retries redeliver; never mint a fresh
+      // unbound cancel identity for the same target claim key.
+      const callerCancelKey =
+        typeof args.idempotency_key === "string" ? args.idempotency_key.trim() : "";
+      const cancelIdem =
+        callerCancelKey.length > 0 && callerCancelKey.length <= 256
+          ? callerCancelKey
+          : `cancel:${oid}`;
+      const cancelExpiresAt = new Date(Date.now() + 60_000).toISOString();
+      const cancelOpId = operationId; // fresh id only used if claim creates
+      const cancelDeviceOp = await buildDeviceOperation({
+        toolName: "ownmesh_cancel_operation",
+        args: {
+          target_operation_id: oid,
+          idempotency_key: cancelIdem,
+        },
+        operationId: cancelOpId,
+        deviceId: cancelDeviceId,
+        principalId: rec.principal,
+        tenantId: rec.tenant_id,
+        expiresAt: cancelExpiresAt,
+        claimVersion: 1,
+        oauthClientId: rec.client_id,
+      });
+      const cancelOutbox = buildDispatchOutbox(cancelDeviceOp);
+      const cancelTrack: TrackedOperation = {
+        ...makeEnvelope({
+          operation_id: cancelOpId,
+          status: "pending",
+          device_id: cancelDeviceId,
+          summary: "cancel claim accepted",
+          data: withDispatchOutbox(
+            {
+              tool: "ownmesh_cancel_operation",
+              target_operation_id: oid,
+              payload_hash: cancelDeviceOp.payload_hash,
+              cancel_claim: true,
+            },
+            cancelOutbox,
+          ),
+          correlation_id: cancelOpId,
+        }),
+        tool: "ownmesh_cancel_operation",
+        principal: rec.principal,
+        tenant_id: rec.tenant_id,
+        payload_hash: cancelDeviceOp.payload_hash,
+        idempotency_key: cancelIdem,
+        workspace_id: tracked.workspace_id ?? null,
+        expires_at: cancelExpiresAt,
+        claim_version: 1,
+        action: cancelDeviceOp.canonical_action,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      };
+
+      let cancelClaim: Awaited<ReturnType<ControlPlaneStore["claimMcpOperationByIdempotency"]>>;
+      try {
+        cancelClaim = await store.claimMcpOperationByIdempotency({
+          operation_id: cancelTrack.operation_id,
+          tenant_id: cancelTrack.tenant_id,
+          principal_id: cancelTrack.principal,
+          device_id: cancelTrack.device_id,
+          tool: "ownmesh_cancel_operation",
+          status: cancelTrack.status,
+          summary: cancelTrack.summary || "",
+          data: cancelTrack.data || {},
+          truncated: false,
+          next_cursor: null,
+          approval_required: false,
+          warnings: [],
+          correlation_id: cancelTrack.correlation_id,
+          payload_hash: cancelTrack.payload_hash ?? null,
+          idempotency_key: cancelIdem,
+          workspace_id: cancelTrack.workspace_id ?? null,
+          expires_at: cancelExpiresAt,
+          claim_version: 1,
+          action: cancelTrack.action ?? null,
+          policy_authority: "ownmesh_device",
+          created_at: cancelTrack.created_at || nowIso(),
+          updated_at: cancelTrack.updated_at || nowIso(),
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.startsWith("mcp_operation_quota_exceeded")) {
+          return mcpError(id, -32005, "tenant MCP operation quota exceeded", {
+            code: "OWNMESH_E_MCP_OP_QUOTA",
+            detail: message,
+          });
+        }
+        throw err;
+      }
+
+      let cancelRow = trackedFromRecord(cancelClaim.op);
+      tracker.put(cancelRow);
+
+      // Action-binding guard on cancel claim reuse.
+      if (cancelClaim.outcome === "existing") {
+        const priorHash = cancelClaim.op.action
+          ? await hashCanonicalAction(cancelClaim.op.action)
+          : cancelClaim.op.payload_hash || "";
+        const wantHash = await hashCanonicalAction(cancelDeviceOp.canonical_action);
+        if (priorHash && priorHash !== wantHash) {
+          const env = makeEnvelope({
+            operation_id: cancelOpId,
+            status: "failed",
+            device_id: cancelDeviceId,
+            summary: "cancel idempotency key reused with a different target action",
+            data: {
+              error: {
+                code: "OWNMESH_E_IDEMPOTENCY_MISMATCH",
+                message:
+                  "cancel idempotency_key is bound to a different authorized cancel action",
+                retryable: false,
+                operation_id: cancelOpId,
+              },
+            },
+          });
+          return mcpResult(id, toolContent(env));
+        }
+      }
+
+      const routeCancelBody = async (row: TrackedOperation) => {
+        const box = readDispatchOutbox(row.data || {});
+        const body = box?.body ?? cancelDeviceOp;
+        try {
+          return await router.routeToDevice(cancelDeviceId, body);
+        } catch (err) {
+          return {
+            status: "error",
+            detail: {
+              message: err instanceof Error ? err.message : "cancel route threw",
+            },
+          };
+        }
+      };
+
+      // Redeliver pending cancel outbox; or first dispatch for a new claim.
+      const shouldRoute =
+        cancelClaim.outcome === "created" || needsDispatchRedelivery(cancelRow);
+      let routed: { status: string; detail?: unknown } = {
+        status: "routed_to_device",
+        detail: { replayed: true },
+      };
+      if (shouldRoute) {
+        routed = await routeCancelBody(cancelRow);
+        if (
+          routed.status === "routed_to_device" ||
+          routed.status === "pending" ||
+          routed.status === "running" ||
+          routed.status === "completed"
+        ) {
+          const marked = await patchOp(
+            store,
+            tracker,
+            cancelRow.operation_id,
+            {
+              data: markDispatchOutboxDispatched(cancelRow.data || {}),
+              status: "completed",
+              summary: "cancel delivered to device",
+            },
+            ["pending", "running", "cancel_requested"],
+          );
+          if (marked) cancelRow = marked;
+        } else if (routed.status === "dispatch_uncertain") {
+          // Body may already be durable in DeviceRoom — keep cancel outbox pending
+          // for identical retry redelivery. Do NOT mark the target cancel_requested
+          // until a confirmed route (uncertain ≠ confirmed).
+          const noted = await patchOp(
+            store,
+            tracker,
+            cancelRow.operation_id,
+            {
+              data: {
+                ...(cancelRow.data || {}),
+                route: routed,
+                dispatch: "uncertain",
+                target_operation_id: oid,
+              },
+              summary: "cancel dispatch_uncertain",
+            },
+            ["pending", "running", "cancel_requested"],
+          );
+          if (noted) cancelRow = noted;
+          const env = makeEnvelope({
+            operation_id: oid,
+            status: "failed",
+            device_id: cancelDeviceId,
+            summary: "cancel route uncertain",
+            data: {
+              error: {
+                code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
+                message: "cancel delivery is uncertain; retry with the same cancel claim",
+                retryable: true,
+                operation_id: oid,
+                details: routed.detail ?? { status: routed.status },
+              },
+              cancel_operation_id: cancelRow.operation_id,
+              previous: publicTrackedView(tracked),
+              route_status: "dispatch_uncertain",
+            },
+            correlation_id: tracked.correlation_id,
+          });
+          return mcpResult(id, toolContent(env));
+        } else {
+          // Reject/error: keep cancel claim pending with outbox for retry; do not
+          // mutate the target operation.
+          const detailObj =
+            routed.detail && typeof routed.detail === "object"
+              ? (routed.detail as Record<string, unknown>)
+              : {};
+          const detailMsg =
+            typeof detailObj.message === "string"
+              ? detailObj.message
+              : typeof detailObj.error === "string"
+                ? detailObj.error
+                : "";
+          const env = makeEnvelope({
+            operation_id: oid,
+            status: "failed",
+            device_id: cancelDeviceId,
+            summary: "cancel route rejected",
+            data: {
+              error: {
+                code: "OWNMESH_E_CANCEL_ROUTE_FAILED",
+                message:
+                  detailMsg ||
+                  `cancel was not delivered to device (route status=${routed.status})`,
+                retryable: true,
+                operation_id: oid,
+                details: routed.detail ?? { status: routed.status },
+              },
+              cancel_operation_id: cancelRow.operation_id,
+              previous: publicTrackedView(tracked),
+              route_status: routed.status,
+            },
+            correlation_id: tracked.correlation_id,
+          });
+          return mcpResult(id, toolContent(env));
+        }
+      }
+
+      // Confirmed delivery (or prior successful cancel claim): mark target.
+      const updatedTarget = await patchOp(
+        store,
+        tracker,
+        oid,
+        {
+          status: "cancel_requested",
+          summary: "cancel requested on device",
+          approval_required: false,
+        },
+        ["pending", "running", "approval_required", "cancel_requested"],
+      );
+      if (updatedTarget) {
+        return mcpResult(
+          id,
+          toolContent({
+            ...updatedTarget,
+            data: {
+              ...stripDispatchOutbox(updatedTarget.data || {}),
+              cancel_operation_id: cancelRow.operation_id,
+              cancel_claim_status: cancelRow.status,
+            },
+          }),
+        );
+      }
+      // Target already terminal between claim and patch — surface current target.
+      const latest = await loadOp(store, tracker, oid);
       const env = makeEnvelope({
-        operation_id: oid || operationId,
-        status: tracked?.status || "failed",
-        summary: tracked ? "operation not cancellable in current state" : "unknown operation",
-        data: { previous: tracked || null },
+        operation_id: oid,
+        status: latest?.status || "failed",
+        summary: latest?.summary || "operation not cancellable in current state",
+        data: {
+          previous: latest ? publicTrackedView(latest) : null,
+          cancel_operation_id: cancelRow.operation_id,
+        },
+        device_id: cancelDeviceId,
       });
       return mcpResult(id, toolContent(env));
     }
@@ -2082,6 +2376,20 @@ export async function handleMcp(
     const actionHash = await hashCanonicalAction(deviceOp.canonical_action);
 
     const dispatchOutbox = buildDispatchOutbox(deviceOp);
+    // Fail closed before claim when the immutable dispatch body cannot be stored
+    // durably (large write/argv). Callers must chunk content or shrink the payload.
+    {
+      const outboxBytes = new TextEncoder().encode(JSON.stringify(dispatchOutbox)).byteLength;
+      if (outboxBytes > MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES) {
+        return mcpError(id, -32602, "dispatch payload exceeds durable outbox budget", {
+          tool: name,
+          code: "OWNMESH_E_DISPATCH_OUTBOX_TOO_LARGE",
+          bytes: outboxBytes,
+          max_bytes: MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
+          hint: "split file writes into smaller content chunks or reduce argv/env payload",
+        });
+      }
+    }
     const trackBase: TrackedOperation = {
       ...makeEnvelope({
         operation_id: operationId,
@@ -2152,6 +2460,13 @@ export async function handleMcp(
       if (message.startsWith("mcp_operation_quota_exceeded")) {
         return mcpError(id, -32005, "tenant MCP operation quota exceeded", {
           code: "OWNMESH_E_MCP_OP_QUOTA",
+          detail: message,
+        });
+      }
+      if (message.startsWith("mcp_dispatch_outbox_too_large")) {
+        return mcpError(id, -32602, "dispatch payload exceeds durable outbox budget", {
+          tool: name,
+          code: "OWNMESH_E_DISPATCH_OUTBOX_TOO_LARGE",
           detail: message,
         });
       }

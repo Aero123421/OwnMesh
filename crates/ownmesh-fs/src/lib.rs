@@ -365,6 +365,10 @@ pub fn list_dir_page(
     let after = decode_list_cursor(cursor);
     // Server-side ceiling independent of caller-supplied max_entries.
     const MAX_PAGE_ENTRIES: usize = 500;
+    /// UTF-8 JSON page budget so Agent/DeviceRoom envelopes never lose the
+    /// directory cursor to a generic truncation stand-in. Sized under the
+    /// durable MCP data_json ceiling with headroom for framing.
+    const MAX_PAGE_JSON_BYTES: usize = 96_000;
     let limit = max_entries.clamp(1, MAX_PAGE_ENTRIES);
     // Hard scan budget prevents unbounded WalkDir collection before paging.
     let scan_budget = limit.saturating_mul(8).max(limit).min(4_000);
@@ -430,19 +434,61 @@ pub fn list_dir_page(
         });
     }
     let total_matched = collected.len();
-    let truncated = total_matched > limit;
-    if truncated {
-        collected.truncate(limit);
+
+    // Build the page under both entry-count and UTF-8 JSON byte budgets so a
+    // long workspace path + many legal names cannot exceed the Agent envelope.
+    let mut page_entries: Vec<DirEntryInfo> = Vec::new();
+    let mut page_bytes: usize = 2; // []
+    let mut hit_entry_cap = false;
+    let mut hit_byte_cap = false;
+    for entry in collected {
+        if page_entries.len() >= limit {
+            hit_entry_cap = true;
+            break;
+        }
+        let entry_json_len = match serde_json::to_vec(&entry) {
+            Ok(v) => v.len(),
+            Err(_) => {
+                // Fail closed on serialization surprises: count a conservative ceiling.
+                entry
+                    .name
+                    .len()
+                    .saturating_add(entry.path.len())
+                    .saturating_add(64)
+            }
+        };
+        let comma = usize::from(!page_entries.is_empty());
+        let next_bytes = page_bytes
+            .saturating_add(comma)
+            .saturating_add(entry_json_len);
+        if !page_entries.is_empty() && next_bytes > MAX_PAGE_JSON_BYTES {
+            hit_byte_cap = true;
+            // Stop before this entry; cursor is the last accepted (name, path).
+            break;
+        }
+        // Always accept the first entry even if it alone is large so progress is
+        // possible; callers still see truncated + cursor.
+        page_bytes = if page_entries.is_empty() {
+            entry_json_len.saturating_add(2)
+        } else {
+            next_bytes
+        };
+        page_entries.push(entry);
     }
+    // If we stopped early due to entry cap, remaining scanned names still count.
+    if !hit_byte_cap && total_matched > page_entries.len() {
+        hit_entry_cap = true;
+    }
+    let truncated = hit_entry_cap || hit_byte_cap || total_matched > page_entries.len();
     let next_cursor = if truncated {
-        collected
+        page_entries
             .last()
             .map(|e| encode_list_cursor(&e.name, &e.path))
     } else {
         None
     };
     Ok(DirListPage {
-        entries: collected,
+        entries: page_entries,
         next_cursor,
         truncated,
         total_matched,
@@ -809,6 +855,52 @@ mod tests {
         assert!(looks_sensitive(Path::new("/tmp/.key")));
         assert!(looks_sensitive(Path::new("/tmp/.pem")));
         assert!(!looks_sensitive(Path::new("/tmp/readme.md")));
+    }
+
+    #[test]
+    fn list_page_byte_budget_retains_stable_cursor() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        // Windows component limit is 255 chars — use many medium basenames so the
+        // serialized absolute path page exceeds MAX_PAGE_JSON_BYTES before the
+        // 500-entry cap. Entry count alone would allow all of them.
+        let stem = "n".repeat(200);
+        let n = 400_usize;
+        for i in 0..n {
+            let name = format!("{stem}_{i:04}.txt");
+            assert!(name.len() < 240, "keep under Windows component limit");
+            write_file(&ws, &name, b"x").unwrap();
+        }
+        let page1 = list_dir_page(&ws, "", false, 500, None).unwrap();
+        let page_json = serde_json::to_vec(&page1.entries).expect("serialize page");
+        assert!(
+            page1.truncated,
+            "expected byte/entry truncation; entries={} total_matched={} json_bytes={}",
+            page1.entries.len(),
+            page1.total_matched,
+            page_json.len()
+        );
+        assert!(!page1.entries.is_empty());
+        assert!(
+            page1.entries.len() < n,
+            "byte budget should stop before all {n} entries, got {}",
+            page1.entries.len()
+        );
+        assert!(
+            page_json.len() <= 96_000 + 8_192,
+            "page JSON should stay near the 96 KiB budget, got {}",
+            page_json.len()
+        );
+        let cursor = page1.next_cursor.expect("cursor required when truncated");
+        assert!(cursor.starts_with("v1:"), "cursor={cursor}");
+        let page2 = list_dir_page(&ws, "", false, 500, Some(cursor.as_str())).unwrap();
+        assert!(!page2.entries.is_empty(), "second page must make progress");
+        if let (Some(a), Some(b)) = (page1.entries.last(), page2.entries.first()) {
+            assert!(
+                (a.name.as_str(), a.path.as_str()) < (b.name.as_str(), b.path.as_str()),
+                "cursor did not advance: last={a:?} first={b:?}"
+            );
+        }
     }
 
     #[test]

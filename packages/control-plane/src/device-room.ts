@@ -2659,6 +2659,23 @@ export async function applyMcpOperationResult(
     (payload.approval_id ? String(payload.approval_id) : undefined) ||
     op.approval_id;
 
+  // Preserve continuation cursors on the durable row so clients can page after a
+  // large result is bounded by the store (never silently drop next_offset).
+  let nextCursor =
+    typeof data.next_cursor === "string"
+      ? data.next_cursor
+      : op.next_cursor ?? null;
+  if (
+    (nextCursor == null || nextCursor === "") &&
+    data.next_offset !== undefined &&
+    data.next_offset !== null &&
+    `${data.next_offset}` !== ""
+  ) {
+    nextCursor = `off_${String(data.next_offset)}`;
+  }
+  const truncatedFlag =
+    data.truncated === true || data.durable_truncated === true || op.truncated === true;
+
   const updated = await store.updateMcpOperation(
     op.operation_id,
     {
@@ -2672,6 +2689,8 @@ export async function applyMcpOperationResult(
           status,
       ),
       data,
+      truncated: truncatedFlag,
+      next_cursor: nextCursor,
       approval_required: status === "approval_required",
       approval_id: approvalId,
       session_id: payload.session_id != null ? String(payload.session_id) : op.session_id,

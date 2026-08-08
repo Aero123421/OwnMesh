@@ -20,6 +20,7 @@ import {
   stripDispatchOutbox,
   withDispatchOutbox,
   MCP_MAX_OUTPUT_BYTES,
+  MCP_MAX_READ_BYTES,
   MCP_MAX_TIMEOUT_MS,
   DISPATCH_OUTBOX_KEY,
   type OperationRouter,
@@ -28,9 +29,11 @@ import {
   MemoryStore,
   SqlStore,
   MCP_OPS_MAX_DATA_JSON_BYTES,
+  MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
   MCP_OPS_MAX_PER_TENANT,
   MCP_OPS_RESULT_TTL_MS,
   MCP_OPS_TOMBSTONE_TTL_MS,
+  boundClientVisibleOperationData,
   boundMcpOperationRecord,
   type SqlDatabase,
   type SqlStatement,
@@ -229,7 +232,7 @@ test("sanitizeMcpArgs enforces hard ceilings", () => {
   assert.equal(out.timeout_ms, MCP_MAX_TIMEOUT_MS);
   assert.equal(out.max_output_bytes, MCP_MAX_OUTPUT_BYTES);
   assert.equal(out.max_entries, 500);
-  assert.equal(out.max_bytes, 512_000);
+  assert.equal(out.max_bytes, MCP_MAX_READ_BYTES);
 });
 
 test("MCP idempotency mismatch fails closed without routing", async () => {
@@ -556,7 +559,16 @@ test("durable MCP operation records bound oversized data and enforce tenant quot
     tool: "ownmesh_fs_read",
     status: "completed",
     summary: "ok",
-    data: { content: huge },
+    data: {
+      content: huge,
+      encoding: "utf-8",
+      path: "big.txt",
+      sha256: "abc",
+      next_offset: 160000,
+      returned_bytes: 160000,
+      total_bytes: 512000,
+      truncated: true,
+    },
     truncated: false,
     next_cursor: null,
     approval_required: false,
@@ -568,6 +580,11 @@ test("durable MCP operation records bound oversized data and enforce tenant quot
   assert.equal(bounded.truncated, true);
   assert.ok(bounded.warnings.includes("durable_result_truncated"));
   assert.notEqual((bounded.data as { content?: string }).content, huge);
+  // Cursor / integrity facts must survive durable truncation.
+  assert.equal((bounded.data as { next_offset?: number }).next_offset, 160000);
+  assert.equal((bounded.data as { sha256?: string }).sha256, "abc");
+  assert.equal((bounded.data as { path?: string }).path, "big.txt");
+  assert.equal(bounded.next_cursor, "off_160000");
 
   for (let i = 0; i < MCP_OPS_MAX_PER_TENANT; i++) {
     await store.putMcpOperation({
@@ -1059,4 +1076,228 @@ test("idempotency tombstones are retained under quota until 30-day window closes
 
   // Hard-expired tombstone (>30d) may be deleted; prove window constant is authoritative.
   assert.ok(MCP_OPS_TOMBSTONE_TTL_MS > MCP_OPS_RESULT_TTL_MS);
+});
+
+test("dispatch outbox survives large write claim (~300 KiB) and redelivers after crash", async () => {
+  const store = new MemoryStore();
+  const token = await seedAuthed(store);
+  const deviceId = "dev_large_outbox";
+  await putActiveDevice(store, deviceId);
+
+  const largeContent = "L".repeat(300 * 1024);
+  let routeCalls = 0;
+  let lastBody = "";
+  const router: OperationRouter = {
+    async routeToDevice(_id, op) {
+      routeCalls += 1;
+      lastBody = JSON.stringify(op.payload ?? op);
+      return { status: "routed_to_device", detail: { recipients: 1 } };
+    },
+  };
+
+  const deviceOp = await buildDeviceOperation({
+    toolName: "ownmesh_fs_write",
+    args: {
+      device_id: deviceId,
+      path: "large.bin.txt",
+      content: largeContent,
+      idempotency_key: "idem_large_outbox",
+    },
+    operationId: "op_large_outbox_1",
+    deviceId,
+    principalId: "prin_dev",
+    tenantId: "ten_default",
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+    claimVersion: 1,
+    oauthClientId: "client_mcp",
+  });
+  const outbox = buildDispatchOutbox(deviceOp);
+  const outboxBytes = new TextEncoder().encode(JSON.stringify(outbox)).byteLength;
+  assert.ok(
+    outboxBytes > MCP_OPS_MAX_DATA_JSON_BYTES,
+    `expected outbox > client data budget (${outboxBytes} > ${MCP_OPS_MAX_DATA_JSON_BYTES})`,
+  );
+  assert.ok(
+    outboxBytes <= MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
+    `outbox must fit dispatch ceiling (${outboxBytes} <= ${MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES})`,
+  );
+
+  // Simulate claim-then-crash: pending outbox stored without ever routing.
+  await store.putMcpOperation({
+    operation_id: "op_large_outbox_1",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "pending",
+    summary: "operation accepted (async)",
+    data: withDispatchOutbox(
+      {
+        tool: "ownmesh_fs_write",
+        payload_hash: deviceOp.payload_hash,
+      },
+      outbox,
+    ),
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_large_outbox_1",
+    payload_hash: deviceOp.payload_hash,
+    idempotency_key: "idem_large_outbox",
+    expires_at: deviceOp.expires_at,
+    claim_version: 1,
+    action: deviceOp.canonical_action,
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  const storedAfterClaim = await store.getMcpOperation("op_large_outbox_1");
+  const boxAfterClaim = readDispatchOutbox(storedAfterClaim?.data || {});
+  assert.equal(boxAfterClaim?.state, "pending");
+  assert.ok(
+    JSON.stringify(boxAfterClaim?.body || {}).includes(largeContent.slice(0, 64)),
+    "pending outbox must retain large content for redelivery",
+  );
+
+  const retry = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token.access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "ownmesh_fs_write",
+          arguments: {
+            device_id: deviceId,
+            path: "large.bin.txt",
+            content: largeContent,
+            async: true,
+            idempotency_key: "idem_large_outbox",
+          },
+        },
+      }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    { routeToDevice: router.routeToDevice },
+    { issuer: "https://cp.test" },
+  );
+  const retryBody = (await retry.json()) as { error?: unknown };
+  assert.equal(retryBody.error, undefined);
+  assert.equal(routeCalls, 1, "large pending outbox must redeliver once");
+  assert.match(lastBody, /LLLL/);
+
+  const storedAfter = await store.getMcpOperation("op_large_outbox_1");
+  const boxAfter = readDispatchOutbox(storedAfter?.data || {});
+  assert.equal(boxAfter?.state, "dispatched");
+});
+
+test("boundClientVisibleOperationData preserves command exit_code and list cursor", () => {
+  const oversized = {
+    stdout: "o".repeat(MCP_OPS_MAX_DATA_JSON_BYTES),
+    stderr: "e".repeat(1024),
+    exit_code: 0,
+    timed_out: false,
+    truncated: true,
+    next_cursor: "v1:abc.def",
+  };
+  const bounded = boundClientVisibleOperationData(
+    oversized,
+    new TextEncoder().encode(JSON.stringify(oversized)).byteLength,
+  );
+  assert.equal(bounded.exit_code, 0);
+  assert.equal(bounded.next_cursor, "v1:abc.def");
+  assert.equal(bounded.truncated, true);
+  assert.ok(typeof bounded.stdout_preview === "string");
+});
+
+test("cancel claim: concurrent retries share one outbox and redeliver once path", async () => {
+  const store = new MemoryStore();
+  const token = await seedAuthed(store);
+  const deviceId = "dev_cancel_claim";
+  await putActiveDevice(store, deviceId);
+
+  await store.putMcpOperation({
+    operation_id: "op_target_long",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_command_run",
+    status: "running",
+    summary: "running",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_target_long",
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  let routes = 0;
+  const router: OperationRouter = {
+    async routeToDevice(_id, op) {
+      routes += 1;
+      const payload = (op as { payload?: Record<string, unknown> }).payload || {};
+      const args = (payload.arguments || {}) as Record<string, unknown>;
+      assert.equal(args.target_operation_id, "op_target_long");
+      return { status: "routed_to_device" };
+    },
+  };
+
+  const callCancel = (id: number) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_cancel_operation",
+            arguments: { operation_id: "op_target_long" },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      { routeToDevice: router.routeToDevice },
+      { issuer: "https://cp.test" },
+    );
+
+  const first = await callCancel(1);
+  const firstBody = (await first.json()) as {
+    result?: { structuredContent?: { status?: string; data?: { cancel_operation_id?: string } } };
+  };
+  assert.equal(firstBody.result?.structuredContent?.status, "cancel_requested");
+  const cancelOpId = firstBody.result?.structuredContent?.data?.cancel_operation_id;
+  assert.ok(cancelOpId);
+  assert.equal(routes, 1);
+  assert.equal((await store.getMcpOperation("op_target_long"))?.status, "cancel_requested");
+
+  const second = await callCancel(2);
+  const secondBody = (await second.json()) as {
+    result?: { structuredContent?: { status?: string; data?: { cancel_operation_id?: string } } };
+  };
+  assert.equal(secondBody.result?.structuredContent?.status, "cancel_requested");
+  assert.equal(secondBody.result?.structuredContent?.data?.cancel_operation_id, cancelOpId);
+  assert.equal(routes, 1, "second cancel must not mint a second device route");
+
+  const cancelRow = await store.getMcpOperation(cancelOpId!);
+  assert.ok(cancelRow);
+  assert.equal(cancelRow?.idempotency_key, "cancel:op_target_long");
+  assert.equal(readDispatchOutbox(cancelRow?.data || {})?.state, "dispatched");
 });

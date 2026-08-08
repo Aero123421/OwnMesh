@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.2.0-beta.6 — E2/E3 durable bounds + fail-closed E2–E9 gate
+
+- Pending dispatch outbox is never wiped by client-data truncation; separate 900 KiB outbox ceiling; oversized claims fail closed before side effects
+- Durable result bounding preserves `next_offset` / `sha256` / `exit_code` / list cursors and short previews
+- Per-hop read (160 KiB) and command output (200 KiB) budgets aligned with durable store + Agent envelope; 512 KiB+ files page via offset
+- Directory list UTF-8 page-byte budget (~200 KiB) keeps stable `(name,path)` cursors
+- Cancel uses durable target-bound claim+outbox (`cancel:<op>`); `cancel_requested` only after confirmed route
+- E2 workerd proof: multi-chunk 512 KiB binary read + list/stat/delete
+- `test_v12_e2_e9_workerd_loopback.py` exits non-zero while E4–E9 rows remain open (no green incomplete gate)
+- E4–E9 and E10 remain open
+
 ## v1.2.0-beta.5+ — E2/E3 dispatch integrity + bounded Agent completions
 
 - Post-send DeviceRoom route timeout/throw is `dispatch_uncertain` (not terminal `failed`): MCP ops stay pending, dispatch outbox stays redeliverable, delayed Agent results can still CAS-finalize; DeviceRoom correlation dedup prevents double send

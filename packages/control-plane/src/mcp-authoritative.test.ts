@@ -881,14 +881,24 @@ test("cancel owner path updates store and is CAS-safe", async () => {
     `cancel route type should be cancel action, got ${routed[0]}`,
   );
 
-  // Second cancel: not cancellable
+  // Second cancel: durable claim replay — no second device route, target stays cancel_requested.
+  let secondRoutes = 0;
   const res2 = await handleMcp(
     rpc("ownmesh_cancel_operation", { operation_id: opId }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
-    { routeToDevice: async () => ({ status: "should_not" }) },
+    {
+      routeToDevice: async () => {
+        secondRoutes += 1;
+        return { status: "should_not" };
+      },
+    },
     { tracker: new OperationTracker() },
   );
-  const body2 = (await res2.json()) as { result: { structuredContent: { summary: string } } };
-  assert.match(body2.result.structuredContent.summary, /not cancellable/i);
+  const body2 = (await res2.json()) as {
+    result: { structuredContent: { status: string; summary: string } };
+  };
+  assert.equal(body2.result.structuredContent.status, "cancel_requested");
+  assert.equal(secondRoutes, 0, "idempotent cancel claim must not re-route");
+  assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
 });

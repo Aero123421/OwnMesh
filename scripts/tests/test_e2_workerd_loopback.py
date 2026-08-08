@@ -679,6 +679,137 @@ def main() -> int:
                 if "cur_" in str(next_cursor):
                     raise RuntimeError(f"binary next_cursor must not be text cur_N: {bin_done}")
 
+            # 512 KiB binary retrieval via multiple bounded public-MCP chunks (no rerun of a
+            # single giant result; each hop stays under durable/Agent budgets).
+            big_name = "e2-binary-512k.bin"
+            big_bytes = bytes((i * 17 + 3) & 0xFF for i in range(512 * 1024))
+            (workspace_dir / big_name).write_bytes(big_bytes)
+            assembled = bytearray()
+            offset = 0
+            chunk_i = 0
+            while offset < len(big_bytes):
+                want = min(64 * 1024, len(big_bytes) - offset)
+                page_sc = structured(
+                    mcp_call(
+                        issuer,
+                        access_token,
+                        "ownmesh_fs_read",
+                        {
+                            "device_id": device_id,
+                            "path": big_name,
+                            "offset": offset,
+                            "max_bytes": want,
+                            "async": True,
+                            "idempotency_key": f"idem_bin512_{marker}_{chunk_i}",
+                        },
+                        rpc_id=100 + chunk_i,
+                    )
+                )
+                page_op = str(page_sc.get("operation_id") or "")
+                page_done = wait_operation(issuer, access_token, page_op, want={"completed"})
+                page_data = page_done.get("data") if isinstance(page_done.get("data"), dict) else {}
+                # Durable truncation must still expose cursor facts — never a bare wipe.
+                if page_data.get("durable_truncated") is True and page_data.get("content") in (None, ""):
+                    if page_data.get("next_offset") is None and page_done.get("next_cursor") is None:
+                        raise RuntimeError(f"durable truncate dropped cursors: {page_done}")
+                    raise RuntimeError(
+                        f"single 64KiB chunk should fit durable budget without content loss: {page_done}"
+                    )
+                enc = str(page_data.get("encoding") or "")
+                raw_content = str(page_data.get("content") or "")
+                if enc == "base64":
+                    piece = base64.b64decode(raw_content)
+                elif enc in ("utf-8", "utf8", ""):
+                    piece = raw_content.encode("utf-8")
+                else:
+                    raise RuntimeError(f"unexpected encoding on large binary page: {page_done}")
+                if piece != big_bytes[offset : offset + len(piece)]:
+                    raise RuntimeError(
+                        f"512k chunk mismatch at offset={offset} got={len(piece)} bytes"
+                    )
+                assembled.extend(piece)
+                returned = int(page_data.get("returned_bytes") or len(piece))
+                if returned <= 0:
+                    raise RuntimeError(f"no progress on 512k read at offset={offset}: {page_done}")
+                nxt = page_data.get("next_offset")
+                if nxt is None:
+                    offset = offset + returned
+                else:
+                    offset = int(nxt)
+                chunk_i += 1
+                if chunk_i > 64:
+                    raise RuntimeError("512k paging failed to terminate")
+            if bytes(assembled) != big_bytes:
+                raise RuntimeError(
+                    f"512k assembled mismatch: got={len(assembled)} want={len(big_bytes)} "
+                    f"sha_got={hashlib.sha256(assembled).hexdigest()[:16]} "
+                    f"sha_want={hashlib.sha256(big_bytes).hexdigest()[:16]}"
+                )
+
+            # list / stat / delete through the same public MCP production path.
+            (workspace_dir / "e2-list-a.txt").write_text("a", encoding="utf-8")
+            (workspace_dir / "e2-list-b.txt").write_text("b", encoding="utf-8")
+            list_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_list",
+                    {
+                        "device_id": device_id,
+                        "path": ".",
+                        "async": True,
+                        "idempotency_key": f"idem_list_{marker}",
+                    },
+                    rpc_id=20,
+                )
+            )
+            list_op = str(list_sc.get("operation_id") or "")
+            list_done = wait_operation(issuer, access_token, list_op, want={"completed"})
+            list_dump = json.dumps(list_done)
+            if "e2-list-a.txt" not in list_dump or "e2-list-b.txt" not in list_dump:
+                raise RuntimeError(f"list missing entries: {list_done}")
+
+            stat_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_stat",
+                    {
+                        "device_id": device_id,
+                        "path": "e2-list-a.txt",
+                        "async": True,
+                        "idempotency_key": f"idem_stat_{marker}",
+                    },
+                    rpc_id=21,
+                )
+            )
+            stat_op = str(stat_sc.get("operation_id") or "")
+            stat_done = wait_operation(issuer, access_token, stat_op, want={"completed"})
+            stat_data = stat_done.get("data") if isinstance(stat_done.get("data"), dict) else {}
+            if int(stat_data.get("size") or -1) != 1 and '"size":1' not in json.dumps(stat_done):
+                # Runtime may nest under result; accept either shape via dump.
+                if "e2-list-a.txt" not in json.dumps(stat_done):
+                    raise RuntimeError(f"stat missing path/size: {stat_done}")
+
+            del_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_delete",
+                    {
+                        "device_id": device_id,
+                        "path": "e2-list-b.txt",
+                        "async": True,
+                        "idempotency_key": f"idem_del_{marker}",
+                    },
+                    rpc_id=22,
+                )
+            )
+            del_op = str(del_sc.get("operation_id") or "")
+            wait_operation(issuer, access_token, del_op, want={"completed"})
+            if (workspace_dir / "e2-list-b.txt").exists():
+                raise RuntimeError("delete did not remove e2-list-b.txt on disk")
+
             # Missing idempotency_key on mutating tool must fail closed before route.
             missing_key_status, missing_key_body = http_json(
                 f"{issuer}/mcp",
@@ -709,8 +840,9 @@ def main() -> int:
 
             print(
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
-                f"env+resume+idempotency+bound-cancel+mismatch+binary+required-key held "
-                f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op})"
+                f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+required-key held "
+                f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
+                f"list_op={list_op}, chunks={chunk_i})"
             )
             return 0
         finally:

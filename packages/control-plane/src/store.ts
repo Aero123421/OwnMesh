@@ -216,12 +216,66 @@ export const MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS = 30_000;
 
 /** Per-tenant durable MCP operation budgets (D1 / Memory). */
 export const MCP_OPS_MAX_PER_TENANT = 2_000;
-/** Hard cap on serialized operation data_json / action_json payload. */
+/** Hard cap on serialized client-visible operation data_json (results / metadata). */
 export const MCP_OPS_MAX_DATA_JSON_BYTES = 256_000;
+/**
+ * Separate ceiling for the crash-safe dispatch outbox body embedded under
+ * `__ownmesh_dispatch_outbox`. Must fit under the public MCP request body cap
+ * (~1 MiB) with headroom for JSON framing. Never silently drop a pending body.
+ */
+export const MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES = 900_000;
 /** Terminal ops older than this may be compacted to idempotency tombstones. */
 export const MCP_OPS_RESULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Tombstones older than this may be hard-deleted (idempotency window closed). */
 export const MCP_OPS_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Internal durable-outbox key — must match mcp.ts DISPATCH_OUTBOX_KEY. */
+const DISPATCH_OUTBOX_DATA_KEY = "__ownmesh_dispatch_outbox";
+
+/** Result / list / command cursor facts that must survive durable truncation. */
+const DURABLE_RESULT_PRESERVE_KEYS = [
+  "path",
+  "encoding",
+  "offset",
+  "bytes",
+  "returned_bytes",
+  "total_bytes",
+  "truncated",
+  "sha256",
+  "next_offset",
+  "next_cursor",
+  "exit_code",
+  "timed_out",
+  "duration_ms",
+  "replayed",
+  "cancelled",
+  "signal_delivered",
+  "target_operation_id",
+  "stdout_truncated",
+  "stderr_truncated",
+  "stdout_bytes",
+  "stderr_bytes",
+  "total_matched",
+  "entries_returned",
+  "program",
+  "command",
+  "cwd",
+  "status",
+  "error",
+  "code",
+  "message",
+  "retryable",
+  "tool",
+  "op",
+  "capability",
+  "payload_hash",
+  "oauth_client_id",
+  "claim_version",
+  "expires_at",
+  "route",
+  "dispatch",
+  "next",
+] as const;
 
 const MCP_OPS_TERMINAL = new Set([
   "completed",
@@ -236,7 +290,62 @@ function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
-/** Bound operation data/action JSON and mark visible truncation. */
+function previewText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}…`;
+}
+
+/**
+ * Build a bounded, cursor-preserving stand-in when result data exceeds the
+ * durable store budget. Never invent success; never drop next_offset / sha256 /
+ * exit_code / list cursors when they were present.
+ */
+export function boundClientVisibleOperationData(
+  data: Record<string, unknown>,
+  originalBytes: number,
+): Record<string, unknown> {
+  const preserved: Record<string, unknown> = {
+    truncated: true,
+    durable_truncated: true,
+    returned_bytes: 0,
+    total_bytes: originalBytes,
+    message:
+      "operation result exceeded durable store budget; use range/pagination or smaller max_bytes/max_output_bytes — cursors and integrity facts are preserved when known",
+  };
+  for (const key of DURABLE_RESULT_PRESERVE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(data, key) && data[key] !== undefined) {
+      preserved[key] = data[key];
+    }
+  }
+  // Keep short previews so operators can see *that* content existed without
+  // re-running, while staying well under the durable budget.
+  const contentPreview = previewText(data.content, 256);
+  if (contentPreview !== undefined) preserved.content_preview = contentPreview;
+  const stdoutPreview = previewText(data.stdout, 256);
+  if (stdoutPreview !== undefined) preserved.stdout_preview = stdoutPreview;
+  const stderrPreview = previewText(data.stderr, 256);
+  if (stderrPreview !== undefined) preserved.stderr_preview = stderrPreview;
+  if (Array.isArray(data.entries)) {
+    preserved.entries_returned = data.entries.length;
+    // Do not embed the oversized page; caller must re-list with a smaller limit.
+  }
+  // Prefer explicit next_cursor on the record when present in data.
+  if (typeof data.next_cursor === "string") {
+    preserved.next_cursor = data.next_cursor;
+  }
+  return preserved;
+}
+
+/**
+ * Bound operation data/action JSON and mark visible truncation.
+ *
+ * Critical E3 invariant: a pending `__ownmesh_dispatch_outbox` body is never
+ * replaced by a generic truncation object. Client-visible result bytes are
+ * bounded separately; the outbox is validated against its own ceiling and
+ * re-attached. Oversized outbox bodies fail closed (throw) rather than claim
+ * without a redeliverable body.
+ */
 export function boundMcpOperationRecord(op: McpOperationRecord): McpOperationRecord {
   const next: McpOperationRecord = {
     ...op,
@@ -245,21 +354,49 @@ export function boundMcpOperationRecord(op: McpOperationRecord): McpOperationRec
     action: op.action ? { ...op.action } : op.action,
     policy_authority: "ownmesh_device",
   };
-  let dataJson = JSON.stringify(next.data || {});
-  if (utf8Bytes(dataJson) > MCP_OPS_MAX_DATA_JSON_BYTES) {
-    next.data = {
-      truncated: true,
-      returned_bytes: 0,
-      total_bytes: utf8Bytes(dataJson),
-      message:
-        "operation result exceeded durable store budget; use range/pagination tools for full content",
-    };
+
+  const outbox = Object.prototype.hasOwnProperty.call(next.data, DISPATCH_OUTBOX_DATA_KEY)
+    ? next.data[DISPATCH_OUTBOX_DATA_KEY]
+    : undefined;
+  const clientData: Record<string, unknown> = { ...next.data };
+  delete clientData[DISPATCH_OUTBOX_DATA_KEY];
+
+  let clientJson = JSON.stringify(clientData || {});
+  if (utf8Bytes(clientJson) > MCP_OPS_MAX_DATA_JSON_BYTES) {
+    const originalBytes = utf8Bytes(clientJson);
+    next.data = boundClientVisibleOperationData(clientData, originalBytes);
     next.truncated = true;
     if (!next.warnings.includes("durable_result_truncated")) {
       next.warnings.push("durable_result_truncated");
     }
-    dataJson = JSON.stringify(next.data);
+    // Surface list/file continuation on the row when the bounded payload carries it.
+    if (typeof next.data.next_cursor === "string" && !next.next_cursor) {
+      next.next_cursor = next.data.next_cursor;
+    }
+    if (
+      next.data.next_offset !== undefined &&
+      next.data.next_offset !== null &&
+      !next.next_cursor
+    ) {
+      next.next_cursor = `off_${String(next.data.next_offset)}`;
+    }
+    clientJson = JSON.stringify(next.data);
+  } else {
+    next.data = clientData;
   }
+
+  if (outbox !== undefined) {
+    const outboxJson = JSON.stringify(outbox);
+    const outboxBytes = utf8Bytes(outboxJson);
+    if (outboxBytes > MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES) {
+      throw new Error(
+        `mcp_dispatch_outbox_too_large:bytes=${outboxBytes}:max=${MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES}`,
+      );
+    }
+    // Re-attach after client-data bounding so crash recovery always has the body.
+    next.data = { ...next.data, [DISPATCH_OUTBOX_DATA_KEY]: outbox };
+  }
+
   if (next.action) {
     const actionJson = JSON.stringify(next.action);
     if (utf8Bytes(actionJson) > MCP_OPS_MAX_DATA_JSON_BYTES) {

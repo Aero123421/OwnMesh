@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Mandatory v1.2 E2–E9 real binary × local Wrangler/workerd proof entrypoint.
+"""Mandatory v1.2 E2-E9 real binary x local Wrangler/workerd proof entrypoint.
 
-The SFH verify gate requires this exact path. It runs the production-path E2/E3
-loopback (public /mcp → DeviceRoom → Agent WSS → ownmeshd runtime) and prints an
-honest acceptance summary for surfaces that remain fail-closed/unsupported.
+The SFH verify gate requires this exact path. It always runs the production-path
+E2/E3 loopback (public /mcp -> DeviceRoom -> Agent WSS -> ownmeshd runtime).
 
-This file must not weaken gates: any failure of the underlying E2/E3 proof exits
-non-zero. E4–E9 rows that are not yet production-proven are reported as open
-without claiming success.
+This file must not weaken gates:
+  * any failure of the underlying E2/E3 proof exits non-zero
+  * E4-E9 rows without real binary x workerd proof keep this entrypoint red
+  * exit 0 is reserved for a complete E2-E9 acceptance set
+
+Partial E2/E3 progress is reported honestly on stdout, but is never treated as
+E2-E9 completion.
 """
 
 from __future__ import annotations
@@ -22,6 +25,35 @@ ROOT = Path(__file__).resolve().parents[2]
 E2 = ROOT / "scripts" / "tests" / "test_e2_workerd_loopback.py"
 SURFACES = ROOT / "release" / "SUPPORTED_SURFACES.json"
 
+# Acceptance rows that each require the same real binary x local workerd path.
+# Do not mark complete from unit tests, parsers, schemas, or markers alone.
+E4_E9_ACCEPTANCE_ROWS: tuple[tuple[str, str], ...] = (
+    ("E4", "workspace CRUD/enforcement + handle-rooted custody"),
+    ("E5", "cloud PTY sessions + controller lease + replay/spool"),
+    ("E6", "nine official profile adapters + generic tool execution"),
+    ("E7", "bounded unified-diff patch + Git review (no auto-merge)"),
+    ("E8", "networkless elevated broker Full Access mint/custody"),
+    ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
+)
+
+
+def _registry_open_rows() -> list[str]:
+    if not SURFACES.is_file():
+        return []
+    try:
+        data = json.loads(SURFACES.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    open_rows: list[str] = []
+    unsupported = data.get("explicit_unsupported") or data.get("unsupported") or []
+    if isinstance(unsupported, list):
+        for row in unsupported:
+            if isinstance(row, str):
+                open_rows.append(row)
+            elif isinstance(row, dict):
+                open_rows.append(str(row.get("id") or row.get("surface") or row))
+    return open_rows
+
 
 def main() -> int:
     if not E2.is_file():
@@ -34,42 +66,46 @@ def main() -> int:
         print("E2/E3 workerd loopback failed; v1.2 E2-E9 gate red", file=sys.stderr)
         return result.returncode
 
-    # Honest remaining-surface report (does not fail the gate by itself once E2/E3
-    # real-path proof is green). Promotion of E4–E9 still requires real binary proof.
-    open_rows: list[str] = []
-    if SURFACES.is_file():
-        try:
-            data = json.loads(SURFACES.read_text(encoding="utf-8"))
-            notes = str(data.get("notes") or "")
-            unsupported = data.get("explicit_unsupported") or data.get("unsupported") or []
-            if isinstance(unsupported, list):
-                for row in unsupported:
-                    if isinstance(row, str):
-                        open_rows.append(row)
-                    elif isinstance(row, dict):
-                        open_rows.append(str(row.get("id") or row.get("surface") or row))
-            # Keep a short marker from notes for reviewers.
-            if "E4" in notes or "workspace" in notes.lower():
-                pass
-        except json.JSONDecodeError as error:
-            print(f"SUPPORTED_SURFACES.json unreadable: {error}", file=sys.stderr)
-            return 1
+    print(
+        "E2/E3 workerd path PASSED (public MCP write/read/command, resume, "
+        "idempotency, cancel, binary cursor, bounds). "
+        "This is necessary but not sufficient for E2-E9 completion."
+    )
 
-    print(
-        "E2-E9 workerd gate: E2/E3 real binary × local Wrangler/workerd path PASSED "
-        "(public MCP write/read/command, resume, idempotency, cancel, binary cursor)."
-    )
-    print(
-        "E4-E9 acceptance rows still open until each has the same real-path proof: "
-        "workspace CRUD/enforcement, cloud PTY sessions, nine profile adapters, "
-        "bounded unified-diff patch + Git review, elevated broker Full Access, "
-        "authenticated resumable transfer."
-    )
+    # Proven real-path rows for this entrypoint. Only list rows with an actual
+    # binary x workerd proof script that this gate invokes. Do not paper over.
+    proven_rows = {
+        "E2": "public MCP fs/command via real ownmeshd (partial surface set)",
+        "E3": "exact-action hash + durable idempotency/cancel claim (partial)",
+    }
+    open_acceptance = list(E4_E9_ACCEPTANCE_ROWS)
+
+    print("Acceptance matrix:")
+    for key, detail in sorted(proven_rows.items()):
+        print(f"  [partial] {key}: {detail}")
+    for key, detail in open_acceptance:
+        print(f"  [OPEN]    {key}: {detail}")
+
+    open_rows = _registry_open_rows()
     if open_rows:
         preview = ", ".join(open_rows[:12])
         more = "" if len(open_rows) <= 12 else f" (+{len(open_rows) - 12} more)"
         print(f"Registry unsupported snapshot: {preview}{more}")
-    print("v1.2 E2-E9 workerd loopback entrypoint completed (E2/E3 evidenced; E4-E9 not claimed)")
+
+    if open_acceptance:
+        print(
+            "E2-E9 workerd gate RED: E4-E9 real binary x local Wrangler/workerd "
+            "proofs are not yet complete. Refusing exit 0 so incomplete work "
+            "cannot look green.",
+            file=sys.stderr,
+        )
+        print(
+            "v1.2 E2-E9 workerd loopback entrypoint: E2/E3 evidenced (partial); "
+            "E4-E9 NOT claimed; gate fail-closed"
+        )
+        return 2
+
+    print("v1.2 E2-E9 workerd loopback entrypoint completed (all rows evidenced)")
     return 0
 
 

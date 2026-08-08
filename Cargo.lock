@@ -505,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-utils"
-version = "0.8.22"
+version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossterm"
@@ -1422,9 +1422,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.104"
+version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0c1080212aad755ea003d18543e8768dd432c48819efd73a7bf1e39b7a5a3a"
+checksum = "53b44bfcdb3f8d5837a46dae1ca9660a837176eee74a28b229bc626816589102"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -1831,7 +1831,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "ownmesh"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "anyhow",
  "base64",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-broker"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "clap",
  "hex",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-broker-client"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1903,7 +1903,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-config"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "ownmesh-domain",
  "ownmesh-persist",
@@ -1917,7 +1917,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-diagnostics"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-domain"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "jsonschema",
  "serde",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-exec"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "hex",
  "ownmesh-domain",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-fs"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "hex",
  "ownmesh-domain",
@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-identity"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "argon2",
  "base64",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-ipc"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "bytes",
  "ownmesh-domain",
@@ -2004,7 +2004,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-logs"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2014,14 +2014,14 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-persist"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "ownmesh-policy"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "ownmesh-domain",
  "serde",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-profiles"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-protocol"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "jsonschema",
  "ownmesh-domain",
@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-session"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "ownmesh-domain",
  "ownmesh-persist",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-session-host"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "clap",
  "crossterm",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-transfer"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "hex",
  "serde",
@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-tui"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "clap",
  "crossterm",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-update"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "flate2",
  "hex",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "ownmeshd"
-version = "1.2.0-beta.5"
+version = "1.2.0-beta.6"
 dependencies = [
  "clap",
  "futures-util",
@@ -3704,9 +3704,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.127"
+version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b70935747edd64d89de3efa29d73789b806c15798f8e7dca4d8ac356b50ce70"
+checksum = "4b067c0c11094aef6b7a801c1e34a26affafdf3d051dba08456b868789aaf9a4"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -3717,9 +3717,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.77"
+version = "0.4.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b7777d5cc23d0e91404e53ce2d5e8ec7acae3026b16233dba62cd3246457950"
+checksum = "c62df1340f32221cb9c54d6a27b030e3dba64361d4a95bed55f9aacb44da291d"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -3727,9 +3727,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.127"
+version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77775f8f3f7217702089053b94958f8f54061a3f663417df76e19cbdcca29bc1"
+checksum = "167ce5e579f6bcf889c4f7175a8a5a585de84e8ff93976ce393efa5f2837aab1"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -3737,9 +3737,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.127"
+version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e11d33f857dc2fb11b8bc75aee111aa9cbeb12cd9f25efd3d4c2a3dd4e235284"
+checksum = "f3997c7839262f4ef12cf90b818d6340c18e80f263f1a94bf157d0ec4420380e"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -3750,9 +3750,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.127"
+version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
+checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
 ]
@@ -3772,9 +3772,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.104"
+version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c435338968042f4f59a557f690a253676d47ce13ceb55d70100e7facf6620a30"
+checksum = "8622dcb61c0bcc9fffa6938bed81210af2da9a7e4a1a834b2e37a59b6dfb6141"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

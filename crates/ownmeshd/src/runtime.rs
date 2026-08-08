@@ -910,7 +910,10 @@ impl DaemonRuntime {
         // Policy already used server-side classification in handle_exec.
         // Hard ceilings are enforced here even if a caller bypasses MCP schema.
         let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
-        let max_output_bytes = p.max_output_bytes.unwrap_or(256 * 1024).clamp(1, 1_000_000);
+        // Keep a single durable hop under the control-plane data_json budget
+        // (~256 KiB) after JSON framing. Larger captures require an explicit
+        // smaller max or a future spool cursor — never one giant unbounded JSON.
+        let max_output_bytes = p.max_output_bytes.unwrap_or(128 * 1024).clamp(1, 200_000);
         let env = sanitize_exec_env(&p.env)?;
         let req = RunRequest {
             kind,
@@ -986,9 +989,11 @@ impl DaemonRuntime {
     }
 
     fn execute_fs_read(&self, p: &FsReadParams) -> IpcResult<Value> {
-        // Hard cap per hop so Agent/DeviceRoom envelopes stay within 1_000_000 bytes
-        // even after Base64 expansion (~4/3).
-        const MAX_READ_BYTES: u64 = 512 * 1024;
+        // Hard cap per hop so Base64(~4/3) + metadata fits:
+        // - Agent envelope 750 KiB JSON
+        // - Durable MCP data_json 256 KiB
+        // Larger files are retrieved by paging offset/max_bytes (next_offset).
+        const MAX_READ_BYTES: u64 = 160 * 1024;
         let ws = self.workspace()?;
         let offset = p.offset.unwrap_or(0);
         let want = p.max_bytes.unwrap_or(64 * 1024).min(MAX_READ_BYTES);

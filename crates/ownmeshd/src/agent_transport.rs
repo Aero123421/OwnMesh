@@ -1432,6 +1432,8 @@ fn map_request_to_method(
 
 fn bound_result_object(value: Value) -> Value {
     // Keep Agent → DeviceRoom envelopes inside the 1_000_000-byte frame budget.
+    // Prefer preserving cursor / integrity facts over a generic stand-in so clients
+    // can continue paging without re-running a side effect.
     const MAX_RESULT_JSON_BYTES: usize = 750_000;
     let Ok(serialized) = serde_json::to_vec(&value) else {
         return json!({
@@ -1446,13 +1448,63 @@ fn bound_result_object(value: Value) -> Value {
     if serialized.len() <= MAX_RESULT_JSON_BYTES {
         return value;
     }
-    json!({
-        "truncated": true,
-        "returned_bytes": 0,
-        "total_bytes": serialized.len(),
-        "message": "operation result exceeded the Agent envelope budget; request a smaller range or use pagination",
-        "preview": String::from_utf8_lossy(&serialized[..MAX_RESULT_JSON_BYTES.min(256)]).into_owned(),
-    })
+
+    let mut preserved = serde_json::Map::new();
+    preserved.insert("truncated".into(), json!(true));
+    preserved.insert("agent_envelope_truncated".into(), json!(true));
+    preserved.insert("returned_bytes".into(), json!(0));
+    preserved.insert("total_bytes".into(), json!(serialized.len()));
+    preserved.insert(
+        "message".into(),
+        json!("operation result exceeded the Agent envelope budget; request a smaller range or use pagination — cursors and integrity facts are preserved when known"),
+    );
+    if let Some(obj) = value.as_object() {
+        for key in [
+            "path",
+            "encoding",
+            "offset",
+            "bytes",
+            "returned_bytes",
+            "total_bytes",
+            "sha256",
+            "next_offset",
+            "next_cursor",
+            "exit_code",
+            "timed_out",
+            "duration_ms",
+            "replayed",
+            "cancelled",
+            "signal_delivered",
+            "target_operation_id",
+            "total_matched",
+            "entries_returned",
+            "program",
+            "command",
+            "cwd",
+            "status",
+            "error",
+        ] {
+            if let Some(v) = obj.get(key) {
+                preserved.insert(key.to_owned(), v.clone());
+            }
+        }
+        if let Some(Value::String(content)) = obj.get("content") {
+            let preview: String = content.chars().take(256).collect();
+            preserved.insert("content_preview".into(), json!(preview));
+        }
+        if let Some(Value::String(stdout)) = obj.get("stdout") {
+            let preview: String = stdout.chars().take(256).collect();
+            preserved.insert("stdout_preview".into(), json!(preview));
+        }
+        if let Some(Value::String(stderr)) = obj.get("stderr") {
+            let preview: String = stderr.chars().take(256).collect();
+            preserved.insert("stderr_preview".into(), json!(preview));
+        }
+        if let Some(Value::Array(entries)) = obj.get("entries") {
+            preserved.insert("entries_returned".into(), json!(entries.len()));
+        }
+    }
+    Value::Object(preserved)
 }
 
 async fn dispatch_remote_operation(
