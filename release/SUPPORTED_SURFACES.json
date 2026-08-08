@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "release_train": "1.2.0-beta.9",
+  "release_train": "1.2.0-beta.10",
   "completeness_claim": false,
   "supported": [
     "status",
@@ -63,5 +63,5 @@
     "privileged broker uninstall"
   ],
   "total_unsupported_surfaces": 39,
-  "notes": "v1.2.0-beta.9 integrity visit: E3 remote runtime principal from verified bound_action (client:remote:<tenant>:<principal>) + principal-namespaced local op journal; minimal tenant_members for multi-principal device operate + session.give handoff; E4 session.list/show require workspace_id bind/filter (no cross-workspace metadata leak); E5 monotonic input_seq/resize_seq with gap/stale reject through public MCP. SERVICE_VERSION 1.2.0-beta.9. CLI workspace/profile/transfer CRUD and privileged broker install remain explicit unsupported (32 explicit / 39 total). scripts/tests/test_v12_e2_e9_workerd_loopback.py gate stays RED (exit 2) until each E4\u2013E9 row is fully evidenced. E6 profile adapters, E7 unified-diff review, E8 elevated broker mint, E9 resumable transfer, and live-account E10 remain open."
+  "notes": "v1.2.0-beta.10 integrity visit: MCP per-tool arg allowlist strips hidden session command/cwd; session.open denied under workspace_only/recommended (same confinement posture as command.run); E5 input/resize reserve payload digest before PTY mutation with durable exact-once receipt; E4 dir-list v2 spool cursors bound to root/recursive identity + pre-append byte budget. SERVICE_VERSION 1.2.0-beta.10. CLI workspace/profile/transfer CRUD and privileged broker install remain explicit unsupported (32 explicit / 39 total). scripts/tests/test_v12_e2_e9_workerd_loopback.py gate stays RED (exit 2) until each E4\u2013E9 row is fully evidenced. E6 profile adapters, E7 unified-diff review, E8 elevated broker mint, E9 resumable transfer, and live-account E10 remain open."
 }

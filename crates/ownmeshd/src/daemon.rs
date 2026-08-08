@@ -1386,7 +1386,12 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
-        let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+        let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+        {
+            let mut g = runtime.lock().await;
+            // Sessions require full_user/full_access until OS confinement exists.
+            g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        }
 
         let chatgpt_cred = server.issue_client_credential("chatgpt").unwrap();
         let human_cred = server.issue_client_credential("human").unwrap();
@@ -1545,7 +1550,11 @@ mod tests {
         let paths = OwnMeshPaths::for_base(dir.path());
 
         let sid = {
-            let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+            let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+            {
+                let mut g = runtime.lock().await;
+                g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+            }
             let chatgpt_cred = server.issue_client_credential("chatgpt").unwrap();
             let chatgpt = named_client(
                 endpoint,
@@ -2021,6 +2030,31 @@ mod tests {
                 g.set_policy_for_test(preset_document(preset));
             }
 
+            // Interactive session launch is also denied (stdin escapes workspace).
+            let err = client
+                .call(
+                    crate::runtime::session_methods::OPEN,
+                    Some(json!({
+                        "title": "escape-session",
+                        "kind": "pty",
+                        "command": ["/bin/sh", "-c", "touch /tmp/ownmesh-policy-bypass"],
+                        "cwd": if cfg!(windows) { "C:\\" } else { "/tmp" },
+                    })),
+                )
+                .await
+                .expect_err("restricted session.open must deny");
+            match err {
+                IpcError::Remote { code, message } => {
+                    assert_eq!(code, app_error::POLICY_DENIED, "{preset:?}: {message}");
+                    assert!(
+                        message.to_ascii_lowercase().contains("session.open")
+                            || message.to_ascii_lowercase().contains("confinement"),
+                        "{preset:?}: {message}"
+                    );
+                }
+                other => panic!("{preset:?}: unexpected {other:?}"),
+            }
+
             // Absolute cwd escape attempt.
             let err = client
                 .call(
@@ -2081,7 +2115,11 @@ mod tests {
     async fn session_observer_attach_cannot_write() {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
-        let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+        let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+        {
+            let mut g = runtime.lock().await;
+            g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        }
         let client = test_client(endpoint, paths.runtime_dir.clone());
 
         let opened = client

@@ -46,7 +46,7 @@ ChatGPT notes that matter:
 2. D1 migrations applied; DeviceRoom DO bound
 3. Local agent: `ownmeshd run`
 4. Device enrolled: `ownmesh device enroll --issuer https://<your-worker>`
-5. Access preset chosen (`workspace_only` / `recommended` confine FS; arbitrary `command.run` requires `full_user_access` or `full_access` until OS process confinement exists; `full_access` adds elevated broker when E8 lands)
+5. Access preset chosen (`workspace_only` / `recommended` confine FS; arbitrary `command.run` **and** interactive `session.open` / PTY require `full_user_access` or `full_access` until OS process confinement exists — session scope alone cannot launch a shell under restricted presets; `full_access` adds elevated broker when E8 lands)
 6. Browser can reach `https://<your-worker>/health` and `/.well-known/oauth-authorization-server`
 
 ---
@@ -79,7 +79,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
    | `ownmesh.read` / `ownmesh.device` | `ownmesh_list_devices`, `ownmesh_fs_list` / `ownmesh_list_files`, `ownmesh_fs_read` / `ownmesh_read_file`, `ownmesh_get_operation`, `ownmesh_list_profiles` |
    | `ownmesh.write` | `ownmesh_fs_write` / `ownmesh_write_file` |
    | `ownmesh.exec` | `ownmesh_command_run` / `ownmesh_run_command`, `ownmesh_command_shell` / `ownmesh_run_shell`, `ownmesh_cancel_operation` |
-   | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` (E5 partial: reconnect/handoff matrix still open); always pass `workspace_id` |
+   | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` under `full_user_access`/`full_access` only (denied in `workspace_only`/`recommended` until OS confinement); controller `input_seq`/`resize_seq` exact-once; E5 partial: reconnect matrix still open; always pass `workspace_id` |
    | `offline_access` | refresh tokens for long-lived ChatGPT connector |
 
 6. Complete OAuth in the browser when ChatGPT prompts.
@@ -95,7 +95,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
 | Write | “Write `hello.txt` with content `hi` on that device” |
 | Structured command | “Run `git status` via OwnMesh structured command (not shell)” |
 | Long op | “Start a long command with async and poll operation status” |
-| Session (E5 partial) | “Open a session on device `dev_…` in workspace `ws_default` and replay output” (live PTY; controller reconnect matrix still open) |
+| Session (E5 partial) | “Open a session on device `dev_…` in workspace `ws_default` and replay output” (requires full_user/full_access preset; live PTY; controller reconnect matrix still open) |
 
 ---
 

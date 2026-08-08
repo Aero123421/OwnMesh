@@ -28,6 +28,7 @@ mod runtime;
 
 use ownmesh_config::OwnMeshPaths;
 use ownmesh_ipc::{app_error, ClientIdentity, IpcError};
+use ownmesh_policy::{preset_document, AccessPreset};
 use ownmesh_session::SessionManager;
 use runtime::{session_methods, DaemonRuntime};
 use serde_json::{json, Value};
@@ -59,6 +60,8 @@ fn block_atomic_write(path: &Path) {
 }
 
 async fn open_session(rt: &mut DaemonRuntime, who: &str, title: &str) -> String {
+    // Sessions require unrestricted access modes until OS confinement exists.
+    rt.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
     let v = rt
         .dispatch(
             session_methods::OPEN,

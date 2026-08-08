@@ -73,8 +73,31 @@ pub enum SessionError {
         got: u64,
         expected: u64,
     },
+    #[error("{kind} sequence {seq} payload digest mismatch (exact-once receipt already bound)")]
+    SequenceConflict { kind: String, seq: u64 },
     #[error("{0} sequence required")]
     SequenceRequired(String),
+}
+
+/// Outcome of reserving a controller input/resize sequence before side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqReserveOutcome {
+    /// First time this sequence is seen; caller must deliver then finalize.
+    Deliver { seq: u64 },
+    /// Prior attempt reserved but may not have finalized; caller may re-deliver once.
+    RetryPending { seq: u64 },
+    /// Durable applied receipt matches; caller must not re-deliver.
+    Replayed { seq: u64 },
+}
+
+/// Durable receipt state for the last reserved controller sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SeqReceiptState {
+    #[default]
+    None,
+    Pending,
+    Applied,
 }
 
 pub type SessionResult<T> = Result<T, SessionError>;
@@ -192,12 +215,24 @@ pub struct SessionInfo {
     /// Always recorded for audit; enforced as a path boundary only in restricted modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
-    /// Last applied controller input sequence (0 = none). Monotonic, gap-free.
+    /// Last reserved/applied controller input sequence (0 = none). Monotonic, gap-free.
     #[serde(default)]
     pub last_input_seq: u64,
-    /// Last applied controller resize sequence (0 = none). Monotonic, gap-free.
+    /// SHA-256 hex of the last reserved input payload (exact-once binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_input_digest: Option<String>,
+    /// Durable receipt state for `last_input_seq`.
+    #[serde(default)]
+    pub last_input_state: SeqReceiptState,
+    /// Last reserved/applied controller resize sequence (0 = none). Monotonic, gap-free.
     #[serde(default)]
     pub last_resize_seq: u64,
+    /// Digest of last resize facts (`cols:rows`) as a short stable string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resize_digest: Option<String>,
+    /// Durable receipt state for `last_resize_seq`.
+    #[serde(default)]
+    pub last_resize_state: SeqReceiptState,
 }
 
 impl SessionInfo {
@@ -354,7 +389,11 @@ impl SessionManager {
             cwd,
             workspace_id,
             last_input_seq: 0,
+            last_input_digest: None,
+            last_input_state: SeqReceiptState::None,
             last_resize_seq: 0,
+            last_resize_digest: None,
+            last_resize_state: SeqReceiptState::None,
         };
         self.sessions.insert(
             id,
@@ -673,23 +712,74 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Advance the controller input sequence. Requires `seq == last + 1` (reject stale/gap).
+    /// Legacy helper: reserve+finalize input seq without a payload digest.
+    /// Prefer [`Self::reserve_input_seq`] + [`Self::finalize_input_seq`] on the
+    /// remote path so delivery cannot precede a durable receipt.
     pub fn advance_input_seq(&mut self, id: &str, seq: u64) -> SessionResult<u64> {
-        self.advance_controller_seq(id, seq, "input", true)
+        match self.reserve_input_seq(id, seq, "")? {
+            SeqReserveOutcome::Deliver { seq } | SeqReserveOutcome::RetryPending { seq } => {
+                self.finalize_input_seq(id, seq)?;
+                Ok(seq)
+            }
+            SeqReserveOutcome::Replayed { seq } => Ok(seq),
+        }
     }
 
-    /// Advance the controller resize sequence. Requires `seq == last + 1` (reject stale/gap).
+    /// Legacy helper: reserve+finalize resize seq without a payload digest.
     pub fn advance_resize_seq(&mut self, id: &str, seq: u64) -> SessionResult<u64> {
-        self.advance_controller_seq(id, seq, "resize", false)
+        match self.reserve_resize_seq(id, seq, "")? {
+            SeqReserveOutcome::Deliver { seq } | SeqReserveOutcome::RetryPending { seq } => {
+                self.finalize_resize_seq(id, seq)?;
+                Ok(seq)
+            }
+            SeqReserveOutcome::Replayed { seq } => Ok(seq),
+        }
     }
 
-    fn advance_controller_seq(
+    /// Durably reserve the next controller input sequence **before** PTY mutation.
+    ///
+    /// - `seq == last+1` → `Deliver` (caller writes stdin, then finalizes)
+    /// - same `seq` + same digest + `Applied` → `Replayed` (no write)
+    /// - same `seq` + same digest + `Pending` → `RetryPending` (may re-write once)
+    /// - same `seq` + different digest → `SequenceConflict`
+    /// - stale/gap → error
+    pub fn reserve_input_seq(
         &mut self,
         id: &str,
         seq: u64,
+        digest: &str,
+    ) -> SessionResult<SeqReserveOutcome> {
+        self.reserve_controller_seq(id, seq, digest, "input", true)
+    }
+
+    /// Mark a previously reserved input sequence as applied (after successful delivery).
+    pub fn finalize_input_seq(&mut self, id: &str, seq: u64) -> SessionResult<()> {
+        self.finalize_controller_seq(id, seq, "input", true)
+    }
+
+    /// Durably reserve the next controller resize sequence **before** PTY mutation.
+    pub fn reserve_resize_seq(
+        &mut self,
+        id: &str,
+        seq: u64,
+        digest: &str,
+    ) -> SessionResult<SeqReserveOutcome> {
+        self.reserve_controller_seq(id, seq, digest, "resize", false)
+    }
+
+    /// Mark a previously reserved resize sequence as applied.
+    pub fn finalize_resize_seq(&mut self, id: &str, seq: u64) -> SessionResult<()> {
+        self.finalize_controller_seq(id, seq, "resize", false)
+    }
+
+    fn reserve_controller_seq(
+        &mut self,
+        id: &str,
+        seq: u64,
+        digest: &str,
         kind: &str,
         input: bool,
-    ) -> SessionResult<u64> {
+    ) -> SessionResult<SeqReserveOutcome> {
         if seq == 0 {
             return Err(SessionError::Invalid(format!("{kind}_seq must be >= 1")));
         }
@@ -697,11 +787,38 @@ impl SessionManager {
         if s.info.state == SessionState::Closed {
             return Err(SessionError::Closed);
         }
-        let last = if input {
-            s.info.last_input_seq
+        let (last, last_digest, last_state) = if input {
+            (
+                s.info.last_input_seq,
+                s.info.last_input_digest.clone(),
+                s.info.last_input_state,
+            )
         } else {
-            s.info.last_resize_seq
+            (
+                s.info.last_resize_seq,
+                s.info.last_resize_digest.clone(),
+                s.info.last_resize_state,
+            )
         };
+
+        // Exact-once receipt for the current reserved/applied sequence.
+        if last > 0 && seq == last {
+            let prior = last_digest.unwrap_or_default();
+            // Empty digest on either side only matches empty (legacy helper path).
+            if prior == digest {
+                return Ok(match last_state {
+                    SeqReceiptState::Applied => SeqReserveOutcome::Replayed { seq },
+                    SeqReceiptState::Pending | SeqReceiptState::None => {
+                        SeqReserveOutcome::RetryPending { seq }
+                    }
+                });
+            }
+            return Err(SessionError::SequenceConflict {
+                kind: kind.to_owned(),
+                seq,
+            });
+        }
+
         let expected = last.saturating_add(1);
         if seq < expected {
             return Err(SessionError::SequenceStale {
@@ -717,12 +834,44 @@ impl SessionManager {
                 expected,
             });
         }
+
+        // Reserve before side effects. Digest is bound into the durable receipt.
         if input {
             s.info.last_input_seq = seq;
+            s.info.last_input_digest = Some(digest.to_owned());
+            s.info.last_input_state = SeqReceiptState::Pending;
         } else {
             s.info.last_resize_seq = seq;
+            s.info.last_resize_digest = Some(digest.to_owned());
+            s.info.last_resize_state = SeqReceiptState::Pending;
         }
-        Ok(seq)
+        Ok(SeqReserveOutcome::Deliver { seq })
+    }
+
+    fn finalize_controller_seq(
+        &mut self,
+        id: &str,
+        seq: u64,
+        kind: &str,
+        input: bool,
+    ) -> SessionResult<()> {
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        let last = if input {
+            s.info.last_input_seq
+        } else {
+            s.info.last_resize_seq
+        };
+        if last != seq {
+            return Err(SessionError::Invalid(format!(
+                "{kind}_seq finalize mismatch: reserved {last}, got {seq}"
+            )));
+        }
+        if input {
+            s.info.last_input_state = SeqReceiptState::Applied;
+        } else {
+            s.info.last_resize_state = SeqReceiptState::Applied;
+        }
+        Ok(())
     }
 
     /// Set view mode; active controller only.
@@ -1107,14 +1256,8 @@ mod tests {
         let ses = mgr.open(SessionKind::Pty, "t", "a", 1, None).unwrap();
         assert_eq!(mgr.advance_input_seq(&ses.id, 1).unwrap(), 1);
         assert_eq!(mgr.advance_input_seq(&ses.id, 2).unwrap(), 2);
-        assert_eq!(
-            mgr.advance_input_seq(&ses.id, 2).unwrap_err(),
-            SessionError::SequenceStale {
-                kind: "input".into(),
-                got: 2,
-                last: 2,
-            }
-        );
+        // Same seq + empty digest after apply is an exact-once replay, not stale.
+        assert_eq!(mgr.advance_input_seq(&ses.id, 2).unwrap(), 2);
         assert_eq!(
             mgr.advance_input_seq(&ses.id, 4).unwrap_err(),
             SessionError::SequenceGap {
@@ -1135,5 +1278,38 @@ mod tests {
         let info = mgr.get(&ses.id).unwrap();
         assert_eq!(info.last_input_seq, 2);
         assert_eq!(info.last_resize_seq, 1);
+    }
+
+    #[test]
+    fn input_seq_binds_payload_digest_before_side_effects() {
+        let mut mgr = SessionManager::new();
+        let ses = mgr.open(SessionKind::Pty, "t", "a", 1, None).unwrap();
+        assert_eq!(
+            mgr.reserve_input_seq(&ses.id, 1, "digest-a").unwrap(),
+            SeqReserveOutcome::Deliver { seq: 1 }
+        );
+        // Stale/gap still rejected while pending.
+        assert!(matches!(
+            mgr.reserve_input_seq(&ses.id, 1, "digest-b").unwrap_err(),
+            SessionError::SequenceConflict { seq: 1, .. }
+        ));
+        assert_eq!(
+            mgr.reserve_input_seq(&ses.id, 1, "digest-a").unwrap(),
+            SeqReserveOutcome::RetryPending { seq: 1 }
+        );
+        mgr.finalize_input_seq(&ses.id, 1).unwrap();
+        assert_eq!(
+            mgr.reserve_input_seq(&ses.id, 1, "digest-a").unwrap(),
+            SeqReserveOutcome::Replayed { seq: 1 }
+        );
+        assert!(matches!(
+            mgr.reserve_input_seq(&ses.id, 1, "digest-other")
+                .unwrap_err(),
+            SessionError::SequenceConflict { .. }
+        ));
+        assert_eq!(
+            mgr.reserve_input_seq(&ses.id, 2, "digest-c").unwrap(),
+            SeqReserveOutcome::Deliver { seq: 2 }
+        );
     }
 }

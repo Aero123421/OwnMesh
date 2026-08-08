@@ -2096,6 +2096,11 @@ full_user_access/full_access for arbitrary commands",
             profile_id: Option<String>,
             #[serde(default)]
             command: Option<Vec<String>>,
+            /// MCP schema uses program/args; agent_transport maps them to command.
+            #[serde(default)]
+            program: Option<String>,
+            #[serde(default)]
+            args: Option<Vec<String>>,
             #[serde(default)]
             cwd: Option<String>,
             #[serde(default)]
@@ -2103,6 +2108,22 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        // Restricted presets cannot confine an interactive shell/process tree to
+        // registered workspace roots. session.open is classified as command
+        // execution: deny PTY/shell launch until OS process confinement exists
+        // (same posture as command.run). full_user_access / full_access keep
+        // sessions available; workspace remains audit/cwd context only there.
+        if self.enforce_workspace {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!(
+                    "session.open denied under {} until OS process confinement is available; \
+interactive shells bypass workspace path enforcement via stdin. Use filesystem.* tools \
+within a registered workspace, or switch access mode to full_user_access/full_access",
+                    preset_name(self.policy.preset)
+                ),
+            });
+        }
         // Bind workspace identity at open: validates id/ownership against the
         // device workspace registry. Restricted modes also pin the cwd root;
         // full_access modes keep workspace as audit/context metadata only.
@@ -2127,16 +2148,33 @@ full_user_access/full_access for arbitrary commands",
         };
         let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
-        // Resolve cwd against the selected workspace for PTY spawn context.
+        // Resolve/pin cwd under the selected workspace (custody when enforce is on;
+        // absolute resolve when unrestricted). Never accept an unbound external cwd
+        // without going through workspace resolution.
         let ws_root = self.workspace_for(Some(workspace_id.as_str()))?;
-        let cwd = p
-            .cwd
+        let cwd = if let Some(raw) = p.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let resolved = ws_root.resolve(Path::new(raw)).map_err(fs_err)?;
+            Some(resolved.to_string_lossy().into_owned())
+        } else {
+            Some(ws_root.root().to_string_lossy().into_owned())
+        };
+        // Accept either explicit argv (`command`) or MCP program/args shape.
+        let command = if let Some(cmd) = p.command.clone().filter(|c| !c.is_empty()) {
+            Some(cmd)
+        } else if let Some(program) = p
+            .program
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .or_else(|| Some(ws_root.root().to_string_lossy().into_owned()));
-        let command = p.command.clone();
+        {
+            let mut argv = vec![program.to_owned()];
+            if let Some(args) = p.args.clone() {
+                argv.extend(args);
+            }
+            Some(argv)
+        } else {
+            None
+        };
         let snapshot = self.sessions.clone();
         let info = self
             .sessions
@@ -2735,13 +2773,59 @@ full_user_access/full_access for arbitrary commands",
                 message: "session.write requires input_seq for remote principals".into(),
             });
         }
+        if !self.live_hosts.contains_key(&p.id) {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "session {} has no live PTY host (restarted daemon or non-PTY kind)",
+                    p.id
+                ),
+            });
+        }
+
+        // E5/E3: durably reserve (session, seq, payload digest) BEFORE any PTY write.
+        // Stale/gap/conflict never reach the process; exact-once retries replay.
+        let input_digest = sha256_hex(p.data.as_bytes());
+        let snapshot = self.sessions.clone();
+        let (applied_seq, replayed, should_deliver) = if let Some(seq) = p.input_seq {
+            let outcome = self
+                .sessions
+                .reserve_input_seq(&p.id, seq, &input_digest)
+                .map_err(session_err)?;
+            match outcome {
+                ownmesh_session::SeqReserveOutcome::Replayed { seq } => (Some(seq), true, false),
+                ownmesh_session::SeqReserveOutcome::Deliver { seq }
+                | ownmesh_session::SeqReserveOutcome::RetryPending { seq } => {
+                    (Some(seq), false, true)
+                }
+            }
+        } else {
+            (None, false, true)
+        };
+        // Persist reservation before mutation so a crash leaves a durable receipt
+        // and retries cannot rewind sequences.
+        self.commit_sessions(snapshot)?;
+
+        if !should_deliver {
+            return Ok(json!({
+                "accepted": true,
+                "replayed": true,
+                "bytes": p.data.len(),
+                "live_pty": true,
+                "live_drained_bytes": 0,
+                "workspace_id": bound_ws,
+                "input_seq": applied_seq,
+            }));
+        }
+
         // Deliver bytes to the live PTY when owned; never pretend success on echo alone.
         if let Some(host) = self.live_hosts.get(&p.id) {
-            host.write_stdin(p.data.as_bytes())
-                .map_err(|e| IpcError::Remote {
+            if let Err(e) = host.write_stdin(p.data.as_bytes()) {
+                return Err(IpcError::Remote {
                     code: app_error::INTERNAL,
                     message: format!("live PTY stdin write failed: {e}"),
-                })?;
+                });
+            }
         } else {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -2751,17 +2835,14 @@ full_user_access/full_access for arbitrary commands",
                 ),
             });
         }
-        // Bounded system receipt for observers (not a substitute for process I/O).
+
+        // Finalize receipt + bounded system observation after successful delivery.
         let snapshot = self.sessions.clone();
-        let applied_seq = if let Some(seq) = p.input_seq {
-            Some(
-                self.sessions
-                    .advance_input_seq(&p.id, seq)
-                    .map_err(session_err)?,
-            )
-        } else {
-            None
-        };
+        if let Some(seq) = applied_seq {
+            self.sessions
+                .finalize_input_seq(&p.id, seq)
+                .map_err(session_err)?;
+        }
         let receipt = if p.data.len() <= 64 {
             format!("[stdin-accepted] {}", p.data.replace('\n', "\\n"))
         } else {
@@ -2773,8 +2854,10 @@ full_user_access/full_access for arbitrary commands",
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
         let drained = self.drain_live_output_into_session(&p.id)?;
+        let _ = replayed;
         Ok(json!({
             "accepted": true,
+            "replayed": false,
             "chunk": chunk,
             "bytes": p.data.len(),
             "live_pty": true,
@@ -2810,29 +2893,47 @@ full_user_access/full_access for arbitrary commands",
                 message: "session.resize requires resize_seq for remote principals".into(),
             });
         }
-        if let Some(host) = self.live_hosts.get(&p.id) {
-            host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: format!("live PTY resize failed: {e}"),
-            })?;
-        }
-        let principal = client.client_name.as_str();
+
+        // Reserve seq+digest before PTY resize mutation (same exact-once rules as write).
+        let resize_digest = format!("{}:{}", p.cols, p.rows);
         let snapshot = self.sessions.clone();
-        let applied_seq = if let Some(seq) = p.resize_seq {
-            Some(
-                self.sessions
-                    .advance_resize_seq(&p.id, seq)
-                    .map_err(session_err)?,
-            )
+        let (applied_seq, should_deliver) = if let Some(seq) = p.resize_seq {
+            let outcome = self
+                .sessions
+                .reserve_resize_seq(&p.id, seq, &resize_digest)
+                .map_err(session_err)?;
+            match outcome {
+                ownmesh_session::SeqReserveOutcome::Replayed { seq } => (Some(seq), false),
+                ownmesh_session::SeqReserveOutcome::Deliver { seq }
+                | ownmesh_session::SeqReserveOutcome::RetryPending { seq } => (Some(seq), true),
+            }
         } else {
-            None
+            (None, true)
         };
-        self.sessions
-            .resize(&p.id, principal, p.cols, p.rows, now)
-            .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
+
+        if should_deliver {
+            if let Some(host) = self.live_hosts.get(&p.id) {
+                host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("live PTY resize failed: {e}"),
+                })?;
+            }
+            let principal = client.client_name.as_str();
+            let snapshot = self.sessions.clone();
+            if let Some(seq) = applied_seq {
+                self.sessions
+                    .finalize_resize_seq(&p.id, seq)
+                    .map_err(session_err)?;
+            }
+            self.sessions
+                .resize(&p.id, principal, p.cols, p.rows, now)
+                .map_err(session_err)?;
+            self.commit_sessions(snapshot)?;
+        }
         Ok(json!({
             "resized": true,
+            "replayed": !should_deliver,
             "cols": p.cols,
             "rows": p.rows,
             "workspace_id": bound_ws,
@@ -3278,7 +3379,8 @@ fn session_err(err: ownmesh_session::SessionError) -> IpcError {
         | ownmesh_session::SessionError::ChunkTooLarge
         | ownmesh_session::SessionError::SequenceRequired(_)
         | ownmesh_session::SessionError::SequenceStale { .. }
-        | ownmesh_session::SessionError::SequenceGap { .. } => app_error::INVALID_PARAMS,
+        | ownmesh_session::SessionError::SequenceGap { .. }
+        | ownmesh_session::SessionError::SequenceConflict { .. } => app_error::INVALID_PARAMS,
         ownmesh_session::SessionError::NotReader => app_error::POLICY_DENIED,
         ownmesh_session::SessionError::SessionLimit
         | ownmesh_session::SessionError::ReplayBudget

@@ -338,6 +338,22 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                             .into(),
                     ),
                 },
+                // Interactive PTY/shell sessions are command execution: stdin can run
+                // arbitrary commands outside workspace custody. Deny until confinement.
+                PolicyRule {
+                    id: "ws-deny-session-open-until-confinement".into(),
+                    decision: Decision::Deny,
+                    priority: 95,
+                    capability: "session.open".into(),
+                    when_elevated: None,
+                    when_kind: None,
+                    path_prefix: None,
+                    program_equals: None,
+                    description: Some(
+                        "session.open denied in workspace_only until OS process confinement"
+                            .into(),
+                    ),
+                },
                 PolicyRule {
                     id: "ws-ask-write".into(),
                     decision: Decision::Ask,
@@ -382,6 +398,19 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     program_equals: None,
                     description: Some(
                         "command.run denied in recommended until OS process confinement".into(),
+                    ),
+                },
+                PolicyRule {
+                    id: "rec-deny-session-open-until-confinement".into(),
+                    decision: Decision::Deny,
+                    priority: 95,
+                    capability: "session.open".into(),
+                    when_elevated: None,
+                    when_kind: None,
+                    path_prefix: None,
+                    program_equals: None,
+                    description: Some(
+                        "session.open denied in recommended until OS process confinement".into(),
                     ),
                 },
                 PolicyRule {
@@ -634,6 +663,17 @@ mod tests {
     fn restricted_presets_deny_command_until_os_confinement() {
         for preset in [AccessPreset::WorkspaceOnly, AccessPreset::Recommended] {
             let doc = preset_document(preset);
+            let session_facts = OperationFacts {
+                capability: "session.open".into(),
+                kind: "session".into(),
+                ..Default::default()
+            };
+            let session_v = evaluate(&doc, &session_facts);
+            assert_eq!(
+                session_v.decision,
+                Decision::Deny,
+                "{preset:?} must deny session.open until confinement"
+            );
             for kind in ["structured", "raw_shell"] {
                 let facts = OperationFacts {
                     capability: "command.run".into(),

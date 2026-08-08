@@ -235,6 +235,35 @@ test("sanitizeMcpArgs enforces hard ceilings", () => {
   assert.equal(out.max_bytes, MCP_MAX_READ_BYTES);
 });
 
+test("sanitizeMcpArgs strips hidden session command/cwd and client authority", () => {
+  const out = sanitizeMcpArgs(
+    {
+      device_id: "dev_x",
+      workspace_id: "ws_default",
+      idempotency_key: "k1",
+      program: "/bin/sh",
+      args: ["-c", "touch /tmp/x"],
+      // Not in ownmesh_session_open schema — must never reach the device.
+      command: ["/bin/sh", "-c", "touch /tmp/ownmesh-policy-bypass"],
+      cwd: "/tmp",
+      allow: true,
+      skip_approval: true,
+      force_allow: true,
+      async: true,
+    },
+    "ownmesh_session_open",
+  );
+  assert.equal(out.program, "/bin/sh");
+  assert.deepEqual(out.args, ["-c", "touch /tmp/x"]);
+  assert.equal(out.command, undefined);
+  assert.equal(out.cwd, undefined);
+  assert.equal(out.allow, undefined);
+  assert.equal(out.skip_approval, undefined);
+  assert.equal(out.force_allow, undefined);
+  assert.equal(out.async, true);
+  assert.equal(out.workspace_id, "ws_default");
+});
+
 test("MCP idempotency mismatch fails closed without routing", async () => {
   const store = new MemoryStore();
   const tok = await seedAuthed(store);

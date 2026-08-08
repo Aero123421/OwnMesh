@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.0-beta.10 — session policy authority + PTY exact-once + dir spool bind
+
+- E3: MCP per-tool argument allowlist strips hidden session `command`/`cwd` and client authority keys before hash/route
+- E3/E5: `session.open` denied under `workspace_only`/`recommended` (same confinement posture as `command.run`); public MCP regression under recommended creates no external marker
+- E5: controller `input_seq`/`resize_seq` reserve payload digest **before** PTY mutation; durable exact-once receipt; stale/gap/conflict never reach the process
+- E4: directory v2 spool cursors bound to root/recursive request identity; aggregate name/path byte budget checked before append
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
 ## v1.2.0-beta.9 — E3 principal bind + E4 session workspace + E5 ordered input
 
 - E3: ownmeshd derives runtime principal from verified `bound_action` (`client:remote:<tenant>:<principal>`); local idempotency journal namespaced per principal

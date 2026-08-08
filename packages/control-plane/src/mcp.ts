@@ -1720,11 +1720,54 @@ const CLIENT_AUTHORITY_KEYS = new Set([
 ]);
 
 /**
- * Clamp untrusted numeric tool args to server hard ceilings before hash/route.
- * Schema maximums are not relied on as the sole enforcement.
+ * Transport / control-plane keys accepted on every tool in addition to the
+ * tool's declared inputSchema properties. Never authority for policy.
  */
-export function sanitizeMcpArgs(args: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...args };
+const MCP_COMMON_ARG_KEYS = new Set([
+  "device_id",
+  "async",
+  "workspace_id",
+  "idempotency_key",
+  "intent_summary",
+  "risk_note",
+]);
+
+/**
+ * Resolve the declared argument allowlist for a tool from its inputSchema.
+ * Unknown tools get only the common transport keys (fail closed on extras).
+ */
+export function allowedMcpArgKeys(toolName: string): Set<string> {
+  const canonical = normalizeOpType(toolName);
+  const tool =
+    MCP_TOOLS.find((t) => t.name === toolName) ||
+    MCP_TOOLS.find((t) => t.name === canonical);
+  const keys = new Set<string>(MCP_COMMON_ARG_KEYS);
+  const props = tool?.inputSchema?.properties;
+  if (props && typeof props === "object" && !Array.isArray(props)) {
+    for (const key of Object.keys(props as Record<string, unknown>)) {
+      keys.add(key);
+    }
+  }
+  return keys;
+}
+
+/**
+ * Clamp untrusted numeric tool args to server hard ceilings before hash/route,
+ * and drop any key outside the per-tool schema allowlist. Schema maximums are
+ * not relied on as the sole enforcement; hidden fields like session `command`
+ * / `cwd` / client authority never reach the device.
+ */
+export function sanitizeMcpArgs(
+  args: Record<string, unknown>,
+  toolName?: string,
+): Record<string, unknown> {
+  const allow = toolName ? allowedMcpArgKeys(toolName) : null;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(args)) {
+    if (CLIENT_AUTHORITY_KEYS.has(key)) continue;
+    if (allow && !allow.has(key)) continue;
+    out[key] = value;
+  }
   const clampInt = (key: string, min: number, max: number) => {
     const v = out[key];
     if (typeof v === "number" && Number.isFinite(v)) {
@@ -2747,7 +2790,7 @@ export async function handleMcp(
       return mcpError(id, -32004, operable.error, { device_id: deviceId });
     }
 
-    const safeArgs = sanitizeMcpArgs(args);
+    const safeArgs = sanitizeMcpArgs(args, name);
     const wantAsync = safeArgs.async === true;
     const opType = normalizeOpType(name);
     const isMutating = tool.risk === "write" || tool.risk === "exec";

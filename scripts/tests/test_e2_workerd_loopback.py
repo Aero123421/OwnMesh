@@ -112,7 +112,9 @@ def wait_for_ready(process: subprocess.Popen[bytes], log_path: Path) -> dict[str
             raise RuntimeError(f"ownmeshd exited before ready ({process.returncode})\n{text[-4000:]}")
         text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
         if "Agent WebSocket authenticated and ready" in text:
-            return json.loads((log_path.parent / "state" / "agent-transport-state.json").read_text())
+            state_path = log_path.parent / "state" / "agent-transport-state.json"
+            # State is JSON UTF-8; never decode with the Windows ANSI code page.
+            return json.loads(state_path.read_text(encoding="utf-8"))
         time.sleep(0.2)
     text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     raise RuntimeError(f"timed out waiting for ownmeshd ready\n{text[-4000:]}")
@@ -1607,6 +1609,92 @@ def main() -> int:
                     f"handoff recipient must write with next input_seq: {other_ctrl_done}"
                 )
 
+            # E3/E4/E5: session scope must NOT bypass command policy in Recommended.
+            # Restart ownmeshd under recommended; session.open with external marker
+            # command must fail closed and must not create the marker file.
+            (config_dir / "policy.toml").write_text(
+                "\n".join(
+                    [
+                        "schema_version = 1",
+                        'preset = "recommended"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            stop_process(daemon_process)
+            daemon_process = None
+            if os.name == "nt":
+                bypass_marker = Path(tempfile.gettempdir()) / f"ownmesh-policy-bypass-{marker}.txt"
+                bypass_cmd = str(bypass_marker)
+                ses_bypass_program = "cmd.exe"
+                ses_bypass_args = ["/C", "echo", "bypass", ">", bypass_cmd]
+            else:
+                bypass_marker = Path(f"/tmp/ownmesh-policy-bypass-{marker}")
+                ses_bypass_program = "/bin/sh"
+                ses_bypass_args = ["-c", f"touch '{bypass_marker}'"]
+            if bypass_marker.exists():
+                bypass_marker.unlink()
+            log_path_rec = temp / "ownmeshd-recommended.log"
+            with log_path_rec.open("wb") as log_rec:
+                daemon_process = subprocess.Popen(
+                    [str(binary), "run"],
+                    cwd=ROOT,
+                    env=base_env,
+                    stdout=log_rec,
+                    stderr=subprocess.STDOUT,
+                )
+                wait_for_ready(daemon_process, log_path_rec)
+            # Hidden command/cwd args must be stripped by MCP allowlist and never authorize.
+            bypass_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_open",
+                    {
+                        "device_id": device_id,
+                        "workspace_id": "ws_default",
+                        "idempotency_key": f"idem_ses_bypass_{marker}",
+                        "async": True,
+                        "command": [ses_bypass_program, *ses_bypass_args],
+                        "cwd": str(Path(tempfile.gettempdir())),
+                        "program": ses_bypass_program,
+                        "args": ses_bypass_args,
+                        "title": f"bypass-{marker}",
+                    },
+                    rpc_id=90,
+                )
+            )
+            bypass_op = str(bypass_sc.get("operation_id") or "")
+            bypass_done = wait_operation(
+                issuer, access_token, bypass_op, want={"failed", "denied"}, timeout_s=30
+            )
+            if str(bypass_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(
+                    f"session.open under recommended must fail closed: {bypass_done}"
+                )
+            if bypass_marker.exists():
+                raise RuntimeError(
+                    f"session scope bypassed policy and created external marker: {bypass_marker}"
+                )
+            dump_bypass = json.dumps(bypass_done).lower()
+            if "session.open denied" not in dump_bypass and "confinement" not in dump_bypass and "policy" not in dump_bypass:
+                # Accept any fail-closed deny/failed surface that did not spawn.
+                if str(bypass_done.get("status")) not in {"failed", "denied"}:
+                    raise RuntimeError(f"unexpected session bypass result: {bypass_done}")
+
+            # Restore full_user_access for any later local inspection (cleanup path).
+            (config_dir / "policy.toml").write_text(
+                "\n".join(
+                    [
+                        "schema_version = 1",
+                        'preset = "full_user_access"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
             # Missing idempotency_key on mutating tool must fail closed before route.
             missing_key_status, missing_key_body = http_json(
                 f"{issuer}/mcp",
@@ -1639,7 +1727,7 @@ def main() -> int:
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
                 f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
                 f"patch+shell+workspace-select+live-pty+session-open+observer-deny-write+"
-                f"workspace-list/show+input_seq+two-principal-handoff+required-key held "
+                f"workspace-list/show+input_seq+two-principal-handoff+required-key+session-policy-deny held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )

@@ -115,6 +115,8 @@ async fn enqueue_write(rt: &mut DaemonRuntime, key: Option<&str>) -> String {
 }
 
 async fn open_session(rt: &mut DaemonRuntime, who: &str, title: &str) -> String {
+    // Sessions require unrestricted access modes until OS confinement exists.
+    rt.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
     rt.dispatch(
         session_methods::OPEN,
         Some(json!({ "title": title })),
@@ -710,6 +712,7 @@ async fn every_session_mutation_handler_restores_complete_manager_on_persist_fai
         let paths = OwnMeshPaths::for_base(dir.path());
         paths.ensure_layout().unwrap();
         let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
         let (method, params, who) = match case {
             Case::Open => (
                 session_methods::OPEN,

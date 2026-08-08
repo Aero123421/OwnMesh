@@ -82,22 +82,24 @@ def main() -> int:
             "+ raw shell + binary cursor via real ownmeshd"
         ),
         "E3": (
-            "exact-action hash + durable idempotency/cancel claim; runtime principal "
-            "from bound_action; principal-namespaced journal; tenant_members handoff "
+            "exact-action hash + durable idempotency/cancel claim; MCP per-tool arg "
+            "allowlist; runtime principal from bound_action; principal-namespaced journal; "
+            "session.open denied under recommended/workspace_only; tenant_members handoff "
             "(partial - team admin UI still out of scope)"
         ),
         "E4": (
             "device workspaces.json + workspace_id selection + handle/hardlink "
             "custody; component-wise parent create with held-handle rename; "
             "session.open/list/show workspace bind+filter; directory full "
-            "snapshot-then-sort cursors; restricted command.run fail-closed; "
+            "snapshot-then-sort cursors + v2 spool root/recursive bind + pre-append "
+            "byte budget; restricted command.run/session.open fail-closed; "
             "CLI CRUD still unsupported"
         ),
         "E5": (
-            "remote session.open owns live PTY/ConPTY in ownmeshd; public MCP replay "
-            "surfaces real process output; attach(observer demote)/write-deny + workspace bind; "
-            "input_seq/resize_seq gap/stale reject; two-principal give handoff; "
-            "controller lease reconnect matrix still partial"
+            "remote session.open owns live PTY/ConPTY in ownmeshd (full_user/full_access); "
+            "public MCP replay surfaces real process output; attach(observer demote)/write-deny "
+            "+ workspace bind; input_seq/resize_seq reserve-before-write with payload digest; "
+            "two-principal give handoff; controller lease reconnect matrix still partial"
         ),
         "E7": (
             "MCP git status/diff + private integrity-bound diff spool + fsmonitor off; "

@@ -547,7 +547,11 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
 async fn self_reported_principal_rejected_on_all_session_ops() {
     let dir = tempdir().unwrap();
     let paths = OwnMeshPaths::for_base(dir.path());
-    let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    {
+        let mut g = runtime.lock().await;
+        g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+    }
     let owner_cred = server.issue_client_credential("chatgpt").unwrap();
     let attacker_cred = server.issue_client_credential("attacker").unwrap();
     let owner = named_client_with_cred(
@@ -968,7 +972,11 @@ async fn attack_rehello_cannot_switch_principal_or_bypass_revoke() {
 async fn attack_shared_token_and_name_spoof_cannot_impersonate() {
     let dir = tempdir().unwrap();
     let paths = OwnMeshPaths::for_base(dir.path());
-    let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    {
+        let mut g = runtime.lock().await;
+        g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+    }
 
     // Victim principal exists as a server-managed credential.
     let victim_cred = server.issue_client_credential("victim-admin").unwrap();

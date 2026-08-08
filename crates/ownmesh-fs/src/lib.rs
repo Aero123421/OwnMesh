@@ -392,8 +392,10 @@ pub fn list_dir_page(
     let limit = max_entries.clamp(1, MAX_PAGE_ENTRIES);
 
     // Resume from a durable spool cursor without re-walking the tree.
+    // Cursor is bound to this request's canonical root + recursive flag so a
+    // workspace-A spool cannot be substituted into a workspace-B listing.
     if let Some((spool_id, after)) = decode_v2_list_cursor(cursor) {
-        let snapshot = load_dir_spool(&spool_id)?;
+        let snapshot = load_dir_spool(&spool_id, &path, recursive)?;
         return Ok(page_sorted_snapshot(
             snapshot,
             after.as_ref(),
@@ -406,13 +408,26 @@ pub fn list_dir_page(
     let after = decode_list_cursor(cursor);
 
     // Phase 1: walk. Stay in RAM until memory bound, then spill to durable spool.
+    // Byte budget is checked before every append (never only after full serialize).
     let mut snapshot: Vec<DirEntryInfo> = Vec::new();
     let mut spool_entries: Vec<DirEntryInfo> = Vec::new();
     let mut spilled = false;
+    let mut aggregate_bytes: usize = 0;
 
     let mut push_entry = |info: DirEntryInfo| -> FsResult<()> {
         if !entry_within_budgets(&info) {
             return Ok(());
+        }
+        // Conservative JSON/object overhead per entry (keys + punctuation + bools).
+        const ENTRY_JSON_OVERHEAD: usize = 96;
+        let entry_bytes = info
+            .name
+            .len()
+            .saturating_add(info.path.len())
+            .saturating_add(ENTRY_JSON_OVERHEAD);
+        let next_aggregate = aggregate_bytes.saturating_add(entry_bytes);
+        if next_aggregate > MAX_DIR_SPOOL_FILE_BYTES {
+            return Err(FsError::EntryLimit);
         }
         if !spilled {
             if snapshot.len() >= MAX_DIR_MEMORY_SNAPSHOT {
@@ -422,6 +437,7 @@ pub fn list_dir_page(
                 spilled = true;
             } else {
                 snapshot.push(info);
+                aggregate_bytes = next_aggregate;
                 return Ok(());
             }
         }
@@ -429,6 +445,7 @@ pub fn list_dir_page(
             return Err(FsError::EntryLimit);
         }
         spool_entries.push(info);
+        aggregate_bytes = next_aggregate;
         Ok(())
     };
 
@@ -725,7 +742,11 @@ fn persist_dir_spool(root: &Path, recursive: bool, entries: &[DirEntryInfo]) -> 
     Ok(spool_id)
 }
 
-fn load_dir_spool(spool_id: &str) -> FsResult<Vec<DirEntryInfo>> {
+fn load_dir_spool(
+    spool_id: &str,
+    expected_root: &Path,
+    expected_recursive: bool,
+) -> FsResult<Vec<DirEntryInfo>> {
     if spool_id.len() != 32 || !spool_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(FsError::InvalidPath(
             "invalid directory list spool id".to_owned(),
@@ -778,6 +799,12 @@ fn load_dir_spool(spool_id: &str) -> FsResult<Vec<DirEntryInfo>> {
     if recomputed != spool.content_sha256 || spool.entry_count != spool.entries.len() {
         let _ = fs::remove_file(&path);
         return Err(FsError::InvalidPath("dir spool integrity failure".into()));
+    }
+    let expected_key = expected_root.to_string_lossy();
+    if spool.root_key != expected_key || spool.recursive != expected_recursive {
+        return Err(FsError::InvalidPath(
+            "directory list cursor does not match request root/recursive identity".into(),
+        ));
     }
     Ok(spool.entries)
 }
@@ -1130,7 +1157,11 @@ pub fn looks_sensitive(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// OWNMESH_STATE_DIR is process-global; serialize spool tests that mutate it.
+    static DIR_SPOOL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn rejects_escape_when_enforced() {
@@ -1316,6 +1347,9 @@ mod tests {
     /// fully retrievable via durable spool cursors (Full Access chunking).
     #[test]
     fn list_page_retrieves_all_entries_beyond_memory_snapshot_via_spool() {
+        let _guard = DIR_SPOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempdir().unwrap();
         // Isolate spool IO under the test temp dir.
         std::env::set_var("OWNMESH_STATE_DIR", dir.path().join("state"));
@@ -1427,5 +1461,68 @@ mod tests {
             "sorted snapshot must page from a*, got {:?}",
             first.entries[0].name
         );
+    }
+
+    #[test]
+    fn list_page_v2_cursor_bound_to_root_rejects_cross_workspace_substitution() {
+        let _guard = DIR_SPOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempdir().unwrap();
+        std::env::set_var("OWNMESH_STATE_DIR", dir.path().join("state"));
+        let ws_a = WorkspaceRoot::new(dir.path().join("a"), true).unwrap();
+        let ws_b = WorkspaceRoot::new(dir.path().join("b"), true).unwrap();
+        std::fs::create_dir_all(ws_a.root()).unwrap();
+        std::fs::create_dir_all(ws_b.root()).unwrap();
+        // Force durable spool on A.
+        const N: usize = 25_050;
+        for i in 0..N {
+            write_file(&ws_a, format!("a{i:05}.txt"), b"x").unwrap();
+        }
+        write_file(&ws_b, "only-b.txt", b"b").unwrap();
+        let page_a = list_dir_page(&ws_a, "", false, 10, None).unwrap();
+        assert!(page_a.truncated);
+        let cursor = page_a.next_cursor.expect("v2 cursor");
+        assert!(cursor.starts_with("v2:"), "cursor={cursor}");
+        // Same cursor against workspace B must fail closed (not return A's snapshot).
+        let err = list_dir_page(&ws_b, "", false, 10, Some(cursor.as_str())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match") || msg.contains("cursor"),
+            "expected request-identity bind failure, got {msg}"
+        );
+        // Control: continuation on A still works.
+        let page_a2 = list_dir_page(&ws_a, "", false, 10, Some(cursor.as_str())).unwrap();
+        assert!(!page_a2.entries.is_empty());
+    }
+
+    #[test]
+    fn list_page_rejects_oversized_name_path_aggregate_budget() {
+        let _guard = DIR_SPOOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempdir().unwrap();
+        std::env::set_var("OWNMESH_STATE_DIR", dir.path().join("state"));
+        let ws = WorkspaceRoot::new(dir.path().join("tree"), true).unwrap();
+        std::fs::create_dir_all(ws.root()).unwrap();
+        // Long-but-legal basenames: aggregate byte budget is enforced before
+        // serialize, so huge transient JSON allocations cannot accumulate unbounded.
+        const M: usize = 8_000;
+        for i in 0..M {
+            // Stay under Windows 255-char component limit.
+            let name = format!("N{i:05}_{}.txt", "x".repeat(200));
+            write_file(&ws, &name, b"x").unwrap();
+        }
+        match list_dir_page(&ws, "", false, 50, None) {
+            Ok(page) => {
+                let json = serde_json::to_vec(&page.entries).unwrap();
+                assert!(json.len() <= 96_000 + 8_192);
+                assert!(!page.entries.is_empty());
+            }
+            Err(FsError::EntryLimit) => {
+                // Fail-closed on aggregate budget is acceptable and preferred.
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+        }
     }
 }
