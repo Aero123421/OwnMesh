@@ -422,7 +422,12 @@ async function connectAgentReady(opts: {
 
   await room.webSocketMessage(
     agentWs as unknown as WebSocket,
-    JSON.stringify(frame("ready", { capabilities: ["fs", "exec"] })),
+    JSON.stringify(
+      frame("ready", {
+        capabilities: ["filesystem.read", "filesystem.write", "command.run"],
+        remote_routing_enabled: true,
+      }),
+    ),
   );
   assert.equal(drainSocket(agentWs)[0]?.type, "ready.ack");
   // Phase ready only via handshake above — never assigned in the test.
@@ -1607,9 +1612,21 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       agentInbox.some(
         (m) =>
           m.type === "operation.request" &&
-          (m.payload.op === "approval.decision" || m.payload.decision === "approve"),
+          m.payload.capability === "approval.decision" ||
+            m.payload.op === "approval.decision" ||
+            m.payload.decision === "approve" ||
+            (m.payload.arguments as { action?: string; decision?: string } | undefined)?.action ===
+              "approval.decision" ||
+            (m.payload.arguments as { decision?: string } | undefined)?.decision === "approve",
       ),
-      `agent must receive approval.decision, got ${JSON.stringify(agentInbox.map((m) => m.type + ":" + m.payload.op))}`,
+      `agent must receive approval.decision, got ${JSON.stringify(
+        agentInbox.map(
+          (m) =>
+            m.type +
+            ":" +
+            String(m.payload.capability || m.payload.op || m.payload.decision || ""),
+        ),
+      )}`,
     );
 
     // Authoritative transition only after successful delivery.

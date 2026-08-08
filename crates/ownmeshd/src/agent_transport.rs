@@ -1,9 +1,10 @@
 //! Authenticated control-plane WebSocket transport for the device Agent.
 //!
-//! E1 owns transport only. Remote operation execution remains fail-closed: a
-//! valid operation request receives a stable unsupported result until E2 wires
-//! the policy-gated runtime.
+//! E2 connects validated `operation.request` envelopes to the shared
+//! policy-gated [`DaemonRuntime`]. Without a runtime handle the transport stays
+//! fail-closed (`remote_routing_enabled: false`).
 
+use crate::runtime::DaemonRuntime;
 use futures_util::{SinkExt, StreamExt};
 use ownmesh_config::{atomic_write, OwnMeshConfig, OwnMeshPaths};
 use ownmesh_domain::{DeviceId, MessageId, Timestamp};
@@ -11,16 +12,19 @@ use ownmesh_identity::{
     load_device_credential, load_or_create_device_key, DeviceKeyPair, PreferredSecretStore,
     SecretString, DEFAULT_KEYCHAIN_SERVICE,
 };
+use ownmesh_ipc::{methods, ClientIdentity};
 use ownmesh_protocol::{
-    Envelope, OperationEnvelope, OperationPayload, OPERATION_CONTRACT_V1, PROTOCOL_DEVICE_V1,
+    Envelope, OperationEnvelope, OperationPayload, OperationRequestPayload, OPERATION_CONTRACT_V1,
+    PROTOCOL_DEVICE_V1,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -271,7 +275,14 @@ enum InboundFrame {
 
 /// Maintain an authenticated Agent connection until shutdown, reconnecting with
 /// bounded exponential backoff. Errors never include credential material.
-pub async fn run(config: AgentTransportConfig, mut shutdown: watch::Receiver<bool>) {
+///
+/// When `runtime` is `Some`, the Agent advertises remote routing and dispatches
+/// validated operation requests through the shared local policy runtime.
+pub async fn run(
+    config: AgentTransportConfig,
+    runtime: Option<Arc<Mutex<DaemonRuntime>>>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut state = match AgentTransportState::load(
         &config.state_path,
@@ -289,7 +300,7 @@ pub async fn run(config: AgentTransportConfig, mut shutdown: watch::Receiver<boo
         if *shutdown.borrow() {
             return;
         }
-        match connect_and_run(&config, &mut state, &mut shutdown).await {
+        match connect_and_run(&config, runtime.as_ref(), &mut state, &mut shutdown).await {
             Ok(()) => return,
             Err(error) => {
                 tracing::warn!(
@@ -315,6 +326,7 @@ pub async fn run(config: AgentTransportConfig, mut shutdown: watch::Receiver<boo
 
 async fn connect_and_run(
     config: &AgentTransportConfig,
+    runtime: Option<&Arc<Mutex<DaemonRuntime>>>,
     state: &mut AgentTransportState,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -357,19 +369,21 @@ async fn connect_and_run(
         }
     };
 
-    perform_handshake(&mut socket, config, state).await?;
+    perform_handshake(&mut socket, config, state, runtime.is_some()).await?;
     tracing::info!(
         issuer = %ownmesh_config::redact_control_plane_url(&config.issuer),
         device_id = %config.device_id,
+        remote_routing_enabled = runtime.is_some(),
         "Agent WebSocket authenticated and ready"
     );
-    live_loop(&mut socket, config, state, shutdown).await
+    live_loop(&mut socket, config, runtime, state, shutdown).await
 }
 
 async fn perform_handshake(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
     state: &mut AgentTransportState,
+    remote_routing_enabled: bool,
 ) -> Result<(), String> {
     let resume = json!({
         "last_server_seq": state.last_server_seq,
@@ -415,15 +429,25 @@ async fn perform_handshake(
     {
         return Err("control plane selected an unsupported device protocol".into());
     }
+    let capabilities = if remote_routing_enabled {
+        json!([
+            "filesystem.read",
+            "filesystem.write",
+            "command.run",
+            "operation.cancel"
+        ])
+    } else {
+        json!([])
+    };
     send_envelope(
         socket,
         config,
         state,
         "ready",
         json!({
-            "capabilities": [],
+            "capabilities": capabilities,
             "operation_contracts": [OPERATION_CONTRACT_V1],
-            "remote_routing_enabled": false,
+            "remote_routing_enabled": remote_routing_enabled,
         }),
         None,
     )
@@ -464,6 +488,7 @@ async fn wait_for_type(
 async fn live_loop(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
+    runtime: Option<&Arc<Mutex<DaemonRuntime>>>,
     state: &mut AgentTransportState,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
@@ -499,7 +524,7 @@ async fn live_loop(
                     .map_err(|error| format!("WebSocket receive failed: {error}"))?;
                 last_receive = Instant::now();
                 if let Some(frame) = handle_wire_message(socket, config, state, message).await? {
-                    handle_live_frame(socket, config, state, frame).await?;
+                    handle_live_frame(socket, config, runtime, state, frame).await?;
                 }
             }
         }
@@ -605,6 +630,7 @@ fn parse_and_record_inbound(
 async fn handle_live_frame(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
+    runtime: Option<&Arc<Mutex<DaemonRuntime>>>,
     state: &mut AgentTransportState,
     frame: InboundFrame,
 ) -> Result<(), String> {
@@ -645,16 +671,10 @@ async fn handle_live_frame(
             let OperationPayload::Request(request) = operation.payload else {
                 return Err("operation.request parsed as a different payload type".into());
             };
-            let payload = json!({
-                "operation_contract": OPERATION_CONTRACT_V1,
-                "operation_id": request.operation_id,
-                "status": "failed",
-                "error": {
-                    "code": "OWNMESH_E_UNSUPPORTED_SURFACE",
-                    "message": "remote operation routing is unavailable until the E2 gate closes",
-                    "retryable": false
-                }
-            });
+            let payload = match runtime {
+                Some(runtime) => dispatch_remote_operation(runtime, config, &request).await,
+                None => unsupported_surface_payload(&request.operation_id),
+            };
             let completed = CompletedReply {
                 correlation_id: correlation.to_owned(),
                 operation_id: request.operation_id.to_string(),
@@ -668,6 +688,281 @@ async fn handle_live_frame(
         }
         "error" => Err("control plane returned an Agent protocol error".into()),
         other => Err(format!("unsupported control-plane message type '{other}'")),
+    }
+}
+
+fn unsupported_surface_payload(operation_id: &ownmesh_domain::OperationId) -> Value {
+    json!({
+        "operation_contract": OPERATION_CONTRACT_V1,
+        "operation_id": operation_id,
+        "status": "failed",
+        "error": {
+            "code": "OWNMESH_E_UNSUPPORTED_SURFACE",
+            "message": "remote operation routing is unavailable without a local runtime handle",
+            "retryable": false
+        }
+    })
+}
+
+fn remote_agent_client(device_id: &DeviceId) -> ClientIdentity {
+    // Remote MCP ops are authenticated by the device credential on the control
+    // plane hop. Local side effects run as this daemon-bound remote principal;
+    // never trust client-supplied principal/policy fields from the payload.
+    ClientIdentity::new(
+        format!("client:remote-agent:{}", device_id.as_str()),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn action_of(request: &OperationRequestPayload) -> String {
+    request
+        .arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn args_object(request: &OperationRequestPayload) -> Map<String, Value> {
+    request.arguments.as_object().cloned().unwrap_or_default()
+}
+
+fn strip_control_fields(args: &mut Map<String, Value>) {
+    for key in [
+        "action",
+        "device_id",
+        "async",
+        "tool",
+        "operation_id",
+        "_client_hints",
+        "force_allow",
+        "bypass_policy",
+        "skip_approval",
+        "allow",
+        "approved",
+        "intent_summary",
+        "risk_note",
+        "principal",
+        "principal_id",
+        "tenant_id",
+        "policy_result",
+        "payload_hash",
+        "risk_level",
+    ] {
+        args.remove(key);
+    }
+}
+
+fn map_request_to_method(
+    request: &OperationRequestPayload,
+) -> Result<(&'static str, Value), String> {
+    let action = action_of(request);
+    let mut args = args_object(request);
+    strip_control_fields(&mut args);
+
+    // Cancel targets another operation; it does not re-run a side effect.
+    if request.capability == "operation.cancel"
+        || action == "cancel"
+        || action == "ownmesh_cancel_operation"
+    {
+        return Ok(("__cancel__", Value::Object(args)));
+    }
+
+    // Optional recovery/admin approval decision notification from the control plane.
+    // Local policy remains authoritative; this is not a ChatGPT attestation.
+    if request.capability == "approval.decision" || action == "approval.decision" {
+        return Ok(("__approval_decision__", Value::Object(args)));
+    }
+
+    let capability = request.capability.as_str();
+    let method = match (capability, action.as_str()) {
+        ("filesystem.read", "fs.list" | "ownmesh_fs_list" | "ownmesh_list_files") => {
+            methods::OPS_FS_LIST
+        }
+        ("filesystem.read", "fs.stat" | "ownmesh_fs_stat") => methods::OPS_FS_STAT,
+        ("filesystem.read", "fs.read" | "ownmesh_fs_read" | "ownmesh_read_file") => {
+            methods::OPS_FS_READ
+        }
+        ("filesystem.write", "fs.write" | "ownmesh_fs_write" | "ownmesh_write_file") => {
+            methods::OPS_FS_WRITE
+        }
+        ("filesystem.write", "fs.delete" | "ownmesh_fs_delete" | "ownmesh_delete_file")
+        | ("filesystem.delete", _) => methods::OPS_FS_DELETE,
+        ("command.run", "command.shell" | "ownmesh_command_shell" | "ownmesh_run_shell") => {
+            // Raw shell is a distinct action; force kind so policy/classifiers see it.
+            args.entry("kind".to_owned())
+                .or_insert_with(|| Value::String("raw_shell".into()));
+            if !args.contains_key("program") {
+                if let Some(command) = args.get("command").cloned() {
+                    args.insert("program".into(), command);
+                }
+            }
+            methods::OPS_EXEC
+        }
+        ("command.run", "command.run" | "ownmesh_command_run" | "ownmesh_run_command" | "") => {
+            args.entry("kind".to_owned())
+                .or_insert_with(|| Value::String("structured".into()));
+            methods::OPS_EXEC
+        }
+        // Accept short fixture-style capability names used by the E0 contract samples.
+        ("fs.read", _) => methods::OPS_FS_READ,
+        ("fs.write", _) => methods::OPS_FS_WRITE,
+        ("fs.list", _) => methods::OPS_FS_LIST,
+        (other_cap, other_action) => {
+            return Err(format!(
+                "unsupported remote capability '{other_cap}' action '{other_action}'"
+            ));
+        }
+    };
+
+    // Bind server-side idempotency to the operation contract key when the caller
+    // did not supply one inside arguments.
+    if !args.contains_key("idempotency_key") {
+        args.insert(
+            "idempotency_key".into(),
+            Value::String(request.idempotency_key.clone()),
+        );
+    }
+    Ok((method, Value::Object(args)))
+}
+
+fn bound_result_object(value: Value) -> Value {
+    // Keep Agent → DeviceRoom envelopes inside the 1_000_000-byte frame budget.
+    const MAX_RESULT_JSON_BYTES: usize = 750_000;
+    let Ok(serialized) = serde_json::to_vec(&value) else {
+        return json!({
+            "truncated": true,
+            "error": {
+                "code": "OWNMESH_E_INTERNAL",
+                "message": "failed to serialize operation result",
+                "retryable": false
+            }
+        });
+    };
+    if serialized.len() <= MAX_RESULT_JSON_BYTES {
+        return value;
+    }
+    json!({
+        "truncated": true,
+        "returned_bytes": 0,
+        "total_bytes": serialized.len(),
+        "message": "operation result exceeded the Agent envelope budget; request a smaller range or use pagination",
+        "preview": String::from_utf8_lossy(&serialized[..MAX_RESULT_JSON_BYTES.min(256)]).into_owned(),
+    })
+}
+
+async fn dispatch_remote_operation(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    config: &AgentTransportConfig,
+    request: &OperationRequestPayload,
+) -> Value {
+    let operation_id = request.operation_id.to_string();
+    let mapped = match map_request_to_method(request) {
+        Ok(mapped) => mapped,
+        Err(message) => {
+            return json!({
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": operation_id,
+                "status": "failed",
+                "error": {
+                    "code": "OWNMESH_E_UNSUPPORTED_SURFACE",
+                    "message": message,
+                    "retryable": false
+                }
+            });
+        }
+    };
+
+    if mapped.0 == "__cancel__" {
+        return json!({
+            "operation_contract": OPERATION_CONTRACT_V1,
+            "operation_id": operation_id,
+            "status": "completed",
+            "result": {
+                "cancelled": true,
+                "target_operation_id": mapped.1.get("target_operation_id").cloned().unwrap_or(Value::Null),
+                "note": "cancel acknowledged; concurrent process-tree cancel is applied when a matching in-flight operation exists"
+            }
+        });
+    }
+
+    if mapped.0 == "__approval_decision__" {
+        return json!({
+            "operation_contract": OPERATION_CONTRACT_V1,
+            "operation_id": operation_id,
+            "status": "completed",
+            "result": {
+                "approval_decision_received": true,
+                "decision": mapped.1.get("decision").cloned().unwrap_or(Value::Null),
+                "approval_id": mapped.1.get("approval_id").cloned().unwrap_or(Value::Null),
+                "note": "device acknowledged control-plane approval decision; local policy/grants remain authoritative"
+            }
+        });
+    }
+
+    let client = remote_agent_client(&config.device_id);
+    let outcome = {
+        let mut guard = runtime.lock().await;
+        guard.dispatch(mapped.0, Some(mapped.1), &client).await
+    };
+
+    match outcome {
+        Ok(body) => {
+            // Runtime may surface policy ask without executing.
+            if body.get("approval_required") == Some(&Value::Bool(true)) {
+                return json!({
+                    "operation_contract": OPERATION_CONTRACT_V1,
+                    "operation_id": body.get("operation_id").cloned().unwrap_or_else(|| Value::String(operation_id.clone())),
+                    "status": "failed",
+                    "error": {
+                        "code": "OWNMESH_E_APPROVAL_REQUIRED",
+                        "message": body.get("reason").and_then(Value::as_str).unwrap_or("device policy requires local approval"),
+                        "retryable": false,
+                        "details": {
+                            "approval_required": true,
+                            "approval_id": body.get("approval_id").cloned(),
+                            "reason": body.get("reason").cloned(),
+                            "note": "ChatGPT confirmation is not an OwnMesh cryptographic attestation; local policy still requires an approved device grant when configured to ask"
+                        }
+                    }
+                });
+            }
+            let result = body.get("result").cloned().unwrap_or(body);
+            json!({
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": operation_id,
+                "status": "completed",
+                "result": bound_result_object(result)
+            })
+        }
+        Err(error) => {
+            let (code, message) = match &error {
+                ownmesh_ipc::IpcError::Remote { code, message } => {
+                    let mapped = match *code {
+                        ownmesh_ipc::app_error::POLICY_DENIED => "OWNMESH_E_POLICY_DENIED",
+                        ownmesh_ipc::app_error::UNAUTHORIZED
+                        | ownmesh_ipc::app_error::TOKEN_REVOKED
+                        | ownmesh_ipc::app_error::LOCKDOWN => "OWNMESH_E_AUTHORIZATION",
+                        ownmesh_ipc::app_error::INVALID_PARAMS => "OWNMESH_E_INVALID_ARGUMENT",
+                        ownmesh_ipc::app_error::METHOD_NOT_FOUND => "OWNMESH_E_UNSUPPORTED_SURFACE",
+                        ownmesh_ipc::app_error::CONFLICT => "OWNMESH_E_CONFLICT",
+                        _ => "OWNMESH_E_INTERNAL",
+                    };
+                    (mapped.to_owned(), message.clone())
+                }
+                other => ("OWNMESH_E_INTERNAL".to_owned(), other.to_string()),
+            };
+            json!({
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": operation_id,
+                "status": "failed",
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "retryable": false
+                }
+            })
+        }
     }
 }
 
@@ -987,13 +1282,17 @@ mod tests {
         let mut state = AgentTransportState::fresh(&config.issuer, &config.device_id);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut first_shutdown = shutdown_rx.clone();
-        assert!(connect_and_run(&config, &mut state, &mut first_shutdown)
-            .await
-            .is_err());
+        assert!(
+            connect_and_run(&config, None, &mut state, &mut first_shutdown)
+                .await
+                .is_err()
+        );
         let mut second_shutdown = shutdown_rx;
-        assert!(connect_and_run(&config, &mut state, &mut second_shutdown)
-            .await
-            .is_err());
+        assert!(
+            connect_and_run(&config, None, &mut state, &mut second_shutdown)
+                .await
+                .is_err()
+        );
         server.await.unwrap();
 
         let persisted =

@@ -28,8 +28,8 @@ use ownmesh_exec::{
     verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
 };
 use ownmesh_fs::{
-    delete_path, git_diff, git_status, list_dir, read_file, stat_path, write_file, GitDiffOpts,
-    GitStatusOpts, WorkspaceRoot,
+    delete_path, git_diff, git_status, list_dir, stat_path, write_file, GitDiffOpts, GitStatusOpts,
+    WorkspaceRoot,
 };
 use ownmesh_ipc::{
     app_error, canonicalize_principal_key, is_credentialed_client_principal, is_human_os_principal,
@@ -179,6 +179,9 @@ pub struct FsReadParams {
     pub path: String,
     #[serde(default)]
     pub max_bytes: Option<u64>,
+    /// Byte offset for bounded range reads (E2).
+    #[serde(default)]
+    pub offset: Option<u64>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -920,10 +923,38 @@ impl DaemonRuntime {
     }
 
     fn execute_fs_read(&self, p: &FsReadParams) -> IpcResult<Value> {
+        // Hard cap per hop so Agent/DeviceRoom envelopes stay within 1_000_000 bytes
+        // even after Base64 expansion (~4/3).
+        const MAX_READ_BYTES: u64 = 512 * 1024;
         let ws = self.workspace()?;
-        let data = read_file(&ws, &p.path, p.max_bytes.unwrap_or(1024 * 1024)).map_err(fs_err)?;
-        let text = String::from_utf8_lossy(&data).into_owned();
-        Ok(json!({ "path": p.path, "content": text, "bytes": data.len() }))
+        let offset = p.offset.unwrap_or(0);
+        let want = p.max_bytes.unwrap_or(64 * 1024).min(MAX_READ_BYTES);
+        let (data, total, truncated) =
+            ownmesh_fs::read_file_range(&ws, &p.path, offset, want).map_err(fs_err)?;
+        let returned = data.len() as u64;
+        let next_offset = offset.saturating_add(returned);
+        // Prefer UTF-8 text; otherwise return bounded Base64 without lossy decode.
+        let (encoding, content) = match String::from_utf8(data.clone()) {
+            Ok(text) => ("utf-8", Value::String(text)),
+            Err(_) => ("base64", Value::String(base64_encode_nopad(&data))),
+        };
+        let mut body = json!({
+            "path": p.path,
+            "content": content,
+            "encoding": encoding,
+            "offset": offset,
+            "bytes": returned,
+            "returned_bytes": returned,
+            "total_bytes": total,
+            "truncated": truncated,
+            "sha256": sha256_hex(&data),
+        });
+        if truncated {
+            body.as_object_mut()
+                .expect("object")
+                .insert("next_offset".into(), json!(next_offset));
+        }
+        Ok(body)
     }
 
     fn execute_fs_write(&self, p: &FsWriteParams) -> IpcResult<Value> {
@@ -2453,6 +2484,43 @@ fn parse_preset(name: &str) -> Option<AccessPreset> {
         "custom" => Some(AccessPreset::Custom),
         _ => None,
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn base64_encode_nopad(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let b1 = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+        let b2 = if i + 2 < bytes.len() { bytes[i + 2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < bytes.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
 }
 
 fn policy_from_file(file: &PolicyFile) -> PolicyDocument {

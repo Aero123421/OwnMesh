@@ -321,6 +321,31 @@ pub fn stat_path(ws: &WorkspaceRoot, rel: impl AsRef<Path>, hash: bool) -> FsRes
 /// Returns an error when the path cannot be resolved or read, does not identify a
 /// file, or exceeds `max_bytes`.
 pub fn read_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, max_bytes: u64) -> FsResult<Vec<u8>> {
+    let (bytes, _total, truncated) = read_file_range(ws, rel, 0, max_bytes)?;
+    if truncated {
+        // Preserve historical whole-file semantics: refuse rather than silently clip.
+        return Err(FsError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Read a bounded byte range from a file.
+///
+/// Returns `(bytes, total_size, truncated)` where `truncated` is true when more
+/// bytes remain after the returned range. Never loads the whole file when only a
+/// window is requested.
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be resolved or read, or is not a file.
+pub fn read_file_range(
+    ws: &WorkspaceRoot,
+    rel: impl AsRef<Path>,
+    offset: u64,
+    max_bytes: u64,
+) -> FsResult<(Vec<u8>, u64, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+
     let path = ws.resolve(rel)?;
     let meta = fs::metadata(&path).map_err(|source| FsError::Io {
         path: Some(path.clone()),
@@ -329,13 +354,38 @@ pub fn read_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, max_bytes: u64) -> F
     if !meta.is_file() {
         return Err(FsError::NotAFile(path));
     }
-    if meta.len() > max_bytes {
-        return Err(FsError::TooLarge);
+    let total = meta.len();
+    if offset >= total {
+        return Ok((Vec::new(), total, false));
     }
-    fs::read(&path).map_err(|source| FsError::Io {
-        path: Some(path),
+    let remaining = total - offset;
+    let take = remaining.min(max_bytes);
+    let mut file = fs::File::open(&path).map_err(|source| FsError::Io {
+        path: Some(path.clone()),
         source,
-    })
+    })?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| FsError::Io {
+            path: Some(path.clone()),
+            source,
+        })?;
+    let mut buf = vec![0_u8; usize::try_from(take).unwrap_or(usize::MAX)];
+    let mut read_total = 0_usize;
+    while read_total < buf.len() {
+        match file.read(&mut buf[read_total..]) {
+            Ok(0) => break,
+            Ok(n) => read_total += n,
+            Err(source) => {
+                return Err(FsError::Io {
+                    path: Some(path),
+                    source,
+                });
+            }
+        }
+    }
+    buf.truncate(read_total);
+    let truncated = offset.saturating_add(read_total as u64) < total;
+    Ok((buf, total, truncated))
 }
 
 /// Write file atomically (temp + rename) when possible.

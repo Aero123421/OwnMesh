@@ -31,6 +31,10 @@ import {
 import { createStore, type ControlPlaneStore, type McpOperationRecord } from "./store.ts";
 
 export const PROTOCOL = "ownmesh.device/1.0";
+/** Independent operation payload contract (must match Rust/TS schema packages). */
+export const OPERATION_CONTRACT_V1 = "ownmesh.operation/1.0";
+/** Default operation.request lifetime when the caller does not supply expires_at. */
+export const OPERATION_REQUEST_TTL_MS = 60_000;
 
 /** Per-session replay-id hard cap (FIFO after TTL prune). */
 export const MAX_SEEN_MESSAGE_IDS = 4096;
@@ -66,6 +70,93 @@ if (MAX_PENDING_PAYLOAD_BYTES <= 0) {
   throw new Error("pending_payload_budget_non_positive");
 }
 
+function legacyAction(op: string): string {
+  switch (op) {
+    case "ownmesh_fs_list":
+    case "ownmesh_list_files":
+      return "fs.list";
+    case "ownmesh_fs_stat":
+      return "fs.stat";
+    case "ownmesh_fs_read":
+    case "ownmesh_read_file":
+      return "fs.read";
+    case "ownmesh_fs_write":
+    case "ownmesh_write_file":
+      return "fs.write";
+    case "ownmesh_fs_delete":
+    case "ownmesh_delete_file":
+      return "fs.delete";
+    case "ownmesh_command_run":
+    case "ownmesh_run_command":
+      return "command.run";
+    case "ownmesh_command_shell":
+    case "ownmesh_run_shell":
+      return "command.shell";
+    case "ownmesh_cancel_operation":
+    case "cancel":
+      return "cancel";
+    case "approval.decision":
+      return "approval.decision";
+    default:
+      return op || "unknown";
+  }
+}
+
+function legacyCapability(op: string, payload: Record<string, unknown>): string {
+  if (typeof payload.capability === "string" && payload.capability.trim() !== "") {
+    return String(payload.capability);
+  }
+  const action = legacyAction(op);
+  if (action.startsWith("fs.read") || action === "fs.list" || action === "fs.stat") {
+    return "filesystem.read";
+  }
+  if (action === "fs.write" || action === "fs.delete" || action === "fs.patch") {
+    return "filesystem.write";
+  }
+  if (action.startsWith("command.")) return "command.run";
+  if (action === "cancel") return "operation.cancel";
+  if (action.startsWith("session")) return "session.open";
+  if (op.startsWith("ownmesh_fs_write") || op.startsWith("ownmesh_fs_delete")) {
+    return "filesystem.write";
+  }
+  if (op.startsWith("ownmesh_fs_") || op.startsWith("ownmesh_profile")) {
+    return "filesystem.read";
+  }
+  if (op.startsWith("ownmesh_command") || op === "ownmesh_cancel_operation") {
+    return op === "ownmesh_cancel_operation" ? "operation.cancel" : "command.run";
+  }
+  if (op.startsWith("ownmesh_session")) return "session.open";
+  return op || "unknown";
+}
+
+function requiredScopeForCapability(capability: string, actionOrOp: string): string {
+  if (capability === "filesystem.write" || actionOrOp.startsWith("ownmesh_fs_write") || actionOrOp === "fs.write" || actionOrOp === "fs.delete") {
+    return "ownmesh.write";
+  }
+  if (
+    capability === "command.run" ||
+    capability === "operation.cancel" ||
+    actionOrOp.startsWith("ownmesh_command") ||
+    actionOrOp === "ownmesh_cancel_operation" ||
+    actionOrOp.startsWith("command.") ||
+    actionOrOp === "cancel"
+  ) {
+    return "ownmesh.exec";
+  }
+  if (capability.startsWith("session") || actionOrOp.startsWith("ownmesh_session") || actionOrOp.startsWith("session")) {
+    return "ownmesh.session";
+  }
+  if (
+    capability === "filesystem.read" ||
+    actionOrOp.startsWith("ownmesh_fs_") ||
+    actionOrOp.startsWith("ownmesh_profile") ||
+    actionOrOp.startsWith("fs.")
+  ) {
+    return "ownmesh.read";
+  }
+  return "";
+}
+
 /** Durable Object storage key for hibernation-safe room state. */
 export const ROOM_STATE_STORAGE_KEY = "ownmesh:device-room:v1";
 
@@ -82,6 +173,12 @@ export type SessionAttachment = {
   scope?: string;
   /** Mirrored lastSeq for attachment-level recovery (storage is authoritative). */
   lastSeq?: number;
+  /**
+   * Set from agent `ready.remote_routing_enabled`. Inject/dispatch only counts
+   * agents that explicitly enable remote routing (E2+). Harness tests must set
+   * this when forcing phase=ready.
+   */
+  remote_routing_enabled?: boolean;
 };
 
 export type DeviceEnvelope = {
@@ -550,6 +647,7 @@ export class DeviceRoomRouter {
     type: string,
     payload: Record<string, unknown>,
     correlationId?: string,
+    opts?: { expiresAt?: string },
   ): DeviceEnvelope {
     this.seqOut += 1;
     const env: DeviceEnvelope = {
@@ -562,7 +660,92 @@ export class DeviceRoomRouter {
       payload,
     };
     if (correlationId) env.correlation_id = correlationId;
+    if (opts?.expiresAt) {
+      env.expires_at = opts.expiresAt;
+    } else if (type === "operation.request") {
+      env.expires_at = nowIso(Date.now() + OPERATION_REQUEST_TTL_MS);
+    }
     return env;
+  }
+
+  /** True when an agent is authenticated, ready, and advertises remote routing. */
+  isRemoteRoutingAgent(session: SessionAttachment): boolean {
+    return (
+      session.role === "agent" &&
+      session.phase === "ready" &&
+      session.remote_routing_enabled === true
+    );
+  }
+
+  /**
+   * Normalize HTTP/WS inject payloads into ownmesh.operation/1.0.
+   * Already-valid contracts pass through; legacy flat `{op,...}` shapes are wrapped.
+   */
+  buildOperationRequestPayload(
+    opType: string,
+    payload: Record<string, unknown>,
+    correlationId: string,
+  ): Record<string, unknown> {
+    if (payload.operation_contract === OPERATION_CONTRACT_V1) {
+      const operationId = String(payload.operation_id || correlationId);
+      if (operationId !== correlationId) {
+        // Fail closed later at inject; keep identity consistent here.
+      }
+      return {
+        ...payload,
+        operation_contract: OPERATION_CONTRACT_V1,
+        operation_id: operationId,
+        capability: String(payload.capability || ""),
+        idempotency_key: String(payload.idempotency_key || operationId),
+        arguments:
+          payload.arguments && typeof payload.arguments === "object" && !Array.isArray(payload.arguments)
+            ? (payload.arguments as Record<string, unknown>)
+            : {},
+      };
+    }
+
+    const legacyOp = String(payload.op || opType || "");
+    const capability = legacyCapability(legacyOp, payload);
+    const {
+      op: _op,
+      tool: _tool,
+      operation_id: legacyOpId,
+      idempotency_key: legacyIdem,
+      workspace_id: legacyWorkspace,
+      _client_hints: clientHints,
+      force_allow: _fa,
+      bypass_policy: _bp,
+      skip_approval: _sa,
+      allow: _allow,
+      approved: _approved,
+      async: _async,
+      device_id: _deviceId,
+      intent_summary: _intent,
+      risk_note: _risk,
+      principal: _prin,
+      principal_id: _pid,
+      tenant_id: _tid,
+      policy_result: _pr,
+      payload_hash: _ph,
+      risk_level: _rl,
+      ...rest
+    } = payload;
+    const argumentsBody: Record<string, unknown> = {
+      action: legacyAction(legacyOp),
+      ...rest,
+    };
+    if (clientHints !== undefined) argumentsBody._client_hints = clientHints;
+    const built: Record<string, unknown> = {
+      operation_contract: OPERATION_CONTRACT_V1,
+      operation_id: String(legacyOpId || correlationId),
+      capability,
+      idempotency_key: String(legacyIdem || legacyOpId || correlationId),
+      arguments: argumentsBody,
+    };
+    if (typeof legacyWorkspace === "string" && legacyWorkspace.trim() !== "") {
+      built.workspace_id = legacyWorkspace;
+    }
+    return built;
   }
 
   /** Handle an inbound WS text message from a known session. */
@@ -671,6 +854,7 @@ export class DeviceRoomRouter {
       case "ready": {
         if (att.role !== "agent" || att.phase !== "proven") return { ok: false, error: "invalid_state" };
         att.phase = "ready";
+        att.remote_routing_enabled = msg.payload.remote_routing_enabled === true;
         this.sessions.set(sessionId, att);
         const ack = this.nextEnvelope(
           "ready.ack",
@@ -682,45 +866,67 @@ export class DeviceRoomRouter {
           kind: "device.ready",
           summary: "agent ready",
           device_id: this.deviceId,
-          meta: { capabilities: msg.payload },
+          meta: {
+            capabilities: msg.payload,
+            remote_routing_enabled: att.remote_routing_enabled === true,
+          },
         });
         return { ok: true };
       }
       case "operation.request": {
         if (att.role !== "client") return { ok: false, error: "invalid_role" };
-        const operation = String(msg.payload.op || "");
-        const requiredScope = operation.startsWith("ownmesh_fs_write") ? "ownmesh.write"
-          : operation.startsWith("ownmesh_command") || operation === "ownmesh_cancel_operation" ? "ownmesh.exec"
-          : operation.startsWith("ownmesh_session") ? "ownmesh.session"
-          : operation.startsWith("ownmesh_fs_") || operation.startsWith("ownmesh_profile") ? "ownmesh.read"
-          : "";
-        if (!requiredScope || !requireScope(att.scope || "", requiredScope)) return { ok: false, error: "insufficient_scope" };
+        const pendingKey = msg.correlation_id || msg.message_id;
+        if (!pendingKey) return { ok: false, error: "missing_correlation" };
+        const normalized = this.buildOperationRequestPayload(
+          String(msg.payload.op || msg.payload.capability || ""),
+          msg.payload || {},
+          pendingKey,
+        );
+        if (String(normalized.operation_id) !== pendingKey) {
+          this.sendError(
+            sessionId,
+            "OWNMESH_E_BAD_ENVELOPE",
+            "correlation_id must equal payload operation_id",
+            pendingKey,
+          );
+          return { ok: false, error: "operation_id_mismatch" };
+        }
+        const capability = String(normalized.capability || "");
+        const action = String(
+          (normalized.arguments as Record<string, unknown> | undefined)?.action ||
+            msg.payload.op ||
+            "",
+        );
+        const requiredScope = requiredScopeForCapability(capability, action);
+        if (!requiredScope || !requireScope(att.scope || "", requiredScope)) {
+          return { ok: false, error: "insufficient_scope" };
+        }
         this.pruneExpiredPending();
         if (this.pending.size >= MAX_PENDING_OPERATIONS) {
-          this.sendError(sessionId, "OWNMESH_E_PENDING_LIMIT", "too many pending operations", msg.correlation_id);
+          this.sendError(sessionId, "OWNMESH_E_PENDING_LIMIT", "too many pending operations", pendingKey);
           return { ok: false, error: "pending_limit" };
         }
-        const pendingPayload = msg.payload || {};
-        const addBytes = new TextEncoder().encode(JSON.stringify(pendingPayload)).byteLength;
+        const addBytes = new TextEncoder().encode(JSON.stringify(normalized)).byteLength;
         if (this.totalPendingPayloadBytes() + addBytes > MAX_PENDING_PAYLOAD_BYTES) {
-          this.sendError(sessionId, "OWNMESH_E_PENDING_PAYLOAD_LIMIT", "pending payload budget exceeded", msg.correlation_id);
+          this.sendError(sessionId, "OWNMESH_E_PENDING_PAYLOAD_LIMIT", "pending payload budget exceeded", pendingKey);
           return { ok: false, error: "pending_payload_limit" };
         }
         // Client -> ready agent: stage pending only. DO persists then dispatches;
         // harness finalizes deferred_dispatch immediately. No direct sends here.
-        const pendingKey = msg.correlation_id || msg.message_id;
         const recipients: string[] = [];
         for (const [sid, session] of this.sessions) {
-          if (session.role === "agent" && session.phase === "ready") recipients.push(sid);
+          if (this.isRemoteRoutingAgent(session)) recipients.push(sid);
         }
+        const agentFrame = this.nextEnvelope("operation.request", normalized, pendingKey);
         void this.audit.append({
           kind: "operation.route",
           summary: "operation.request routed to agent",
           device_id: this.deviceId,
           meta: {
-            correlation_id: msg.correlation_id,
+            correlation_id: pendingKey,
             agent_recipients: recipients.length,
-            op: msg.payload.op,
+            capability,
+            action,
             deferred: true,
           },
         });
@@ -729,8 +935,14 @@ export class DeviceRoomRouter {
           const offline = this.nextEnvelope(
             "operation.result",
             {
+              operation_contract: OPERATION_CONTRACT_V1,
+              operation_id: pendingKey,
               status: "device_offline",
-              code: "OWNMESH_E_DEVICE_OFFLINE",
+              error: {
+                code: "OWNMESH_E_DEVICE_OFFLINE",
+                message: "No remote-routing-ready agent is connected",
+                retryable: true,
+              },
             },
             pendingKey,
           );
@@ -747,15 +959,15 @@ export class DeviceRoomRouter {
         // (mirrors prepareInjectOperation).
         this.pending.set(pendingKey, {
           correlation_id: pendingKey,
-          type: String(msg.payload.op || msg.type),
+          type: action || capability || "operation.request",
           from_session: sessionId,
           created_at: Date.now(),
-          payload: pendingPayload,
+          payload: normalized,
         });
         return {
           ok: true,
           deferred_dispatch: {
-            frame: JSON.stringify(msg),
+            frame: JSON.stringify(agentFrame),
             recipients,
             pending_key: pendingKey,
             client_session_id: sessionId,
@@ -857,9 +1069,9 @@ export class DeviceRoomRouter {
   finalizeDeferredDispatch(deferred: DeferredDispatch): number {
     let n = 0;
     if (deferred.pending_key) {
-      // Agent path: deliver to currently-ready agents (socket may have died).
+      // Agent path: deliver only to remote-routing-ready agents (socket may have died).
       for (const [sid, session] of this.sessions) {
-        if (session.role === "agent" && session.phase === "ready" && this.sendToSession(sid, deferred.frame)) {
+        if (this.isRemoteRoutingAgent(session) && this.sendToSession(sid, deferred.frame)) {
           n++;
         }
       }
@@ -870,8 +1082,14 @@ export class DeviceRoomRouter {
           const offline = this.nextEnvelope(
             "operation.result",
             {
+              operation_contract: OPERATION_CONTRACT_V1,
+              operation_id: deferred.pending_key,
               status: "device_offline",
-              code: "OWNMESH_E_DEVICE_OFFLINE",
+              error: {
+                code: "OWNMESH_E_DEVICE_OFFLINE",
+                message: "No remote-routing-ready agent is connected",
+                retryable: true,
+              },
             },
             deferred.pending_key,
           );
@@ -920,9 +1138,10 @@ export class DeviceRoomRouter {
       };
     }
     // Fail closed on offline before mutating pending/seq (no half-prepared state).
+    // Only agents that advertised remote_routing_enabled=true count as ready for E2.
     let readyAgents = 0;
     for (const session of this.sessions.values()) {
-      if (session.role === "agent" && session.phase === "ready") readyAgents++;
+      if (this.isRemoteRoutingAgent(session)) readyAgents++;
     }
     if (readyAgents === 0) {
       return {
@@ -948,17 +1167,39 @@ export class DeviceRoomRouter {
       }
       created_session_id = from;
     }
+    const normalized = this.buildOperationRequestPayload(op.type, payload, op.correlation_id);
+    if (String(normalized.operation_id) !== op.correlation_id) {
+      return {
+        ok: false,
+        result: {
+          status: "rejected",
+          detail: {
+            code: "OWNMESH_E_BAD_ENVELOPE",
+            message: "correlation_id must equal payload operation_id",
+          },
+        },
+      };
+    }
+    if (!String(normalized.capability || "").trim()) {
+      return {
+        ok: false,
+        result: {
+          status: "rejected",
+          detail: { code: "OWNMESH_E_BAD_ENVELOPE", message: "capability is required" },
+        },
+      };
+    }
     const envelope = this.nextEnvelope(
       "operation.request",
-      { op: op.type, ...payload },
+      normalized,
       op.correlation_id,
     );
     this.pending.set(op.correlation_id, {
       correlation_id: op.correlation_id,
-      type: op.type,
+      type: op.type || String((normalized.arguments as Record<string, unknown> | undefined)?.action || normalized.capability),
       from_session: from,
       created_at: Date.now(),
-      payload,
+      payload: normalized,
     });
     return {
       ok: true,
@@ -996,7 +1237,7 @@ export class DeviceRoomRouter {
     const raw = JSON.stringify(prepared.envelope);
     let n = 0;
     for (const [sid, session] of this.sessions) {
-      if (session.role === "agent" && session.phase === "ready" && this.sendToSession(sid, raw)) n++;
+      if (this.isRemoteRoutingAgent(session) && this.sendToSession(sid, raw)) n++;
     }
     void this.audit.append({
       kind: "operation.route",
@@ -1005,7 +1246,8 @@ export class DeviceRoomRouter {
       meta: {
         correlation_id: prepared.correlation_id,
         agent_recipients: n,
-        op: prepared.envelope.payload?.op,
+        capability: prepared.envelope.payload?.capability,
+        action: (prepared.envelope.payload?.arguments as Record<string, unknown> | undefined)?.action,
       },
     });
     if (n === 0) {
@@ -2097,6 +2339,24 @@ export async function applyMcpOperationResult(
   let status = String(payload.status || "completed");
   if (payload.decision === "deny") status = "denied";
   if (status === "ok") status = "completed";
+  // Device policy ask is reported as a failed operation.result with a stable code
+  // (operation.result has no approval_required status in ownmesh.operation/1.0).
+  const errObj =
+    payload.error && typeof payload.error === "object"
+      ? (payload.error as Record<string, unknown>)
+      : undefined;
+  const errCode = errObj?.code != null ? String(errObj.code) : "";
+  const errDetails =
+    errObj?.details && typeof errObj.details === "object"
+      ? (errObj.details as Record<string, unknown>)
+      : undefined;
+  if (
+    errCode === "OWNMESH_E_APPROVAL_REQUIRED" ||
+    payload.approval_required === true ||
+    errDetails?.approval_required === true
+  ) {
+    status = "approval_required";
+  }
   const terminal = new Set([
     "completed",
     "failed",
@@ -2116,15 +2376,35 @@ export async function applyMcpOperationResult(
     payload.result && typeof payload.result === "object"
       ? (payload.result as Record<string, unknown>)
       : { ...payload };
+  if (status === "approval_required" && errDetails) {
+    Object.assign(data, {
+      approval_required: true,
+      approval_id: errDetails.approval_id ?? payload.approval_id,
+      reason: errDetails.reason ?? errObj?.message,
+      error: errObj,
+    });
+  }
+
+  const approvalId =
+    (errDetails?.approval_id != null ? String(errDetails.approval_id) : undefined) ||
+    (payload.approval_id ? String(payload.approval_id) : undefined) ||
+    op.approval_id;
 
   const updated = await store.updateMcpOperation(
     op.operation_id,
     {
       status,
-      summary: String(payload.summary || payload.reason || op.summary || status),
+      summary: String(
+        payload.summary ||
+          (errDetails?.reason != null ? String(errDetails.reason) : undefined) ||
+          (errObj?.message != null ? String(errObj.message) : undefined) ||
+          payload.reason ||
+          op.summary ||
+          status,
+      ),
       data,
       approval_required: status === "approval_required",
-      approval_id: payload.approval_id ? String(payload.approval_id) : op.approval_id,
+      approval_id: approvalId,
       session_id: payload.session_id != null ? String(payload.session_id) : op.session_id,
     },
     fromStatuses,

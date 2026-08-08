@@ -48,6 +48,7 @@ function rpc(
 function connectTestAgent(room: DeviceRoomHarness): string {
   const id = room.connect("agent");
   room.router.sessions.get(id)!.phase = "ready";
+  room.router.sessions.get(id)!.remote_routing_enabled = true;
   return id;
 }
 
@@ -540,11 +541,17 @@ test("prompt-injection in write content cannot force allow or skip approval", as
   const router = createHarnessRouter({
     inject: (_id, op) => {
       // Device still evaluates policy on facts — injection in content is irrelevant
-      const content = String(op.payload.content || "");
+      const args =
+        op.payload.arguments && typeof op.payload.arguments === "object"
+          ? (op.payload.arguments as Record<string, unknown>)
+          : op.payload;
+      const content = String(args.content || op.payload.content || "");
       assert.ok(content.toLowerCase().includes("ignore previous"));
-      // Ensure force_allow was stripped if present
+      // Ensure force_allow was stripped if present (root and nested arguments)
       assert.equal(op.payload.force_allow, undefined);
       assert.equal(op.payload.bypass_policy, undefined);
+      assert.equal(args.force_allow, undefined);
+      assert.equal(args.bypass_policy, undefined);
       return {
         status: "routed_to_device",
         detail: {

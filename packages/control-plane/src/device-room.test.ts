@@ -93,7 +93,13 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
     "accepted",
   );
 
-  await room.send(agent, envFor(agent, "ready", deviceId, { capabilities: ["fs", "exec"] }));
+  await room.send(
+    agent,
+    envFor(agent, "ready", deviceId, {
+      capabilities: ["filesystem.read", "filesystem.write", "command.run"],
+      remote_routing_enabled: true,
+    }),
+  );
   assert.equal((JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope).type, "ready.ack");
 
   // client operation -> agent
@@ -112,7 +118,14 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
   assert.equal(agentInbox.length, 1);
   assert.equal(agentInbox[0]!.type, "operation.request");
   assert.equal(agentInbox[0]!.correlation_id, corr);
-  assert.equal(agentInbox[0]!.payload.op, "ownmesh_fs_list");
+  assert.equal(agentInbox[0]!.payload.operation_contract, "ownmesh.operation/1.0");
+  assert.equal(agentInbox[0]!.payload.operation_id, corr);
+  assert.equal(agentInbox[0]!.payload.capability, "filesystem.read");
+  assert.equal(
+    (agentInbox[0]!.payload.arguments as { action?: string } | undefined)?.action,
+    "fs.list",
+  );
+  assert.ok(agentInbox[0]!.expires_at, "operation.request requires expires_at");
 
   // agent result -> client
   await room.send(
@@ -143,6 +156,7 @@ test("DeviceRoom fails closed on unknown types and unmatched agent results", asy
   const room = new DeviceRoomHarness("dev_fail_closed", () => true);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const unknown = await room.send(agent, envFor(agent, "accepted", "dev_fail_closed", {}));
   assert.equal(unknown.error, "unsupported_message_type");
   const unmatched = await room.send(
@@ -178,6 +192,7 @@ test("injectOperation routes to connected agent", () => {
   const room = new DeviceRoomHarness(deviceId);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const corr = randomId("op_");
   const r = room.router.injectOperation({
     type: "ownmesh_fs_list",

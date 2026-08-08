@@ -366,11 +366,17 @@ test("concurrent /approve: exactly one delivery; duplicate returns authoritative
     let routes = 0;
     const routeToDevice = async (
       _d: string,
-      op: { correlation_id: string },
+      op: { type: string; correlation_id: string; payload: Record<string, unknown> },
     ) => {
       routes += 1;
-      // Stable correlation from outbox id.
-      assert.equal(op.correlation_id, `cor_${txId}`);
+      // Decision notification uses a fresh op_* identity; target binds the original op.
+      assert.equal(op.type, "approval.decision");
+      assert.match(op.correlation_id, /^op_/);
+      assert.equal(
+        op.payload.target_operation_id ||
+          (op.payload.arguments as { target_operation_id?: string } | undefined)?.target_operation_id,
+        opId,
+      );
       return { status: "routed_to_device" as const, detail: { recipients: 1 } };
     };
 

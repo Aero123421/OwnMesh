@@ -191,6 +191,7 @@ test("exportState/importState restores lastSeq, seenMessageIds, pending across h
   const agent = room.connect("agent");
   const client = room.connect("client");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
 
   await room.send(agent, envFor(agent, "ping", deviceId, {}, undefined, { seq: 3, message_id: "mid_a" }));
   await room.send(agent, envFor(agent, "ping", deviceId, {}, undefined, { seq: 7, message_id: "mid_b" }));
@@ -218,6 +219,7 @@ test("exportState/importState restores lastSeq, seenMessageIds, pending across h
     session_id: agent,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   woken.router.registerSession({
     role: "client",
@@ -273,6 +275,7 @@ test("seenMessageIds TTL and hard cap are force-pruned", () => {
     session_id: "ags_1",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   const guard = router.ingressGuards.get("ags_1")!;
   const now = Date.now();
@@ -338,6 +341,7 @@ test("operation.request rejects when pending hard cap reached", async () => {
   const agent = room.connect("agent");
   const client = room.connect("client");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const now = Date.now();
   for (let i = 0; i < MAX_PENDING_OPERATIONS; i++) {
     room.router.pending.set(`fill_${i}`, {
@@ -450,6 +454,7 @@ test("DeviceRoom persists lastSeq/seen/pending to storage and restores on new in
     session_id: "ags_p1",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   room1.router.registerSession({
     role: "client",
@@ -500,6 +505,7 @@ test("env.DB missing fails closed: /operation 503 and existing WS closed", async
     session_id: "ags_nodb",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: "deadbeef",
     lastSeq: 1,
   };
@@ -568,6 +574,7 @@ test("revoked / expired device credential is rejected on important ops", async (
     session_id: "ags_cred",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
     lastSeq: 0,
   };
@@ -619,6 +626,7 @@ test("revoked / expired device credential is rejected on important ops", async (
     session_id: "ags_exp",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: hash2,
     lastSeq: 0,
   };
@@ -679,6 +687,7 @@ test("attachment lastSeq mirrors guard and survives register after import", () =
     session_id: "ags_x",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     lastSeq: 5, // attachment stale — must not rewind storage
   });
   assert.equal(router.ingressGuards.get("ags_x")!.lastSeq, 9);
@@ -696,6 +705,7 @@ test("storage restore error fails closed: refuse /operation and close sockets", 
     session_id: "ags_rf",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: "ab".repeat(32),
     lastSeq: 1,
   };
@@ -755,6 +765,7 @@ test("persist failure fails closed: no success response after storage put error"
     session_id: "ags_pf",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   // Force send success without real WS.
   room.router.sendToSession = () => true;
@@ -860,6 +871,7 @@ test("pending payload byte budget rejects inject beyond TTL/count caps", () => {
     session_id: "ags_pb",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   const fat = { blob: "z".repeat(Math.floor(MAX_PENDING_PAYLOAD_BYTES / 2) + 100) };
   const r1 = router.injectOperation({
@@ -978,6 +990,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: "ab".repeat(32),
   });
   room.router.sendToSession = (sid, data) => {
@@ -1041,6 +1054,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
     lastSeq: 1,
   });
@@ -1141,6 +1155,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
   });
   room.router.pending.set(corr, {
@@ -1156,6 +1171,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
     lastSeq: 0,
   });
@@ -1219,6 +1235,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: hash2,
   });
   room2.router.pending.set(corr, {
@@ -1234,6 +1251,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: hash2,
     lastSeq: 0,
   });

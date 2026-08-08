@@ -237,7 +237,10 @@ test("cancel: successful device route → cancel_requested (not cancelled)", asy
   };
   assert.equal(body.result?.structuredContent?.status, "cancel_requested");
   assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
-  assert.ok(routed[0]?.includes("ownmesh_cancel_operation"));
+  assert.ok(
+    routed[0]?.includes("cancel") || routed[0]?.includes("ownmesh_cancel_operation"),
+    `cancel route type should be cancel action, got ${routed[0]}`,
+  );
 });
 
 test("cancel: no device_id → direct cancelled", async () => {

@@ -30,8 +30,12 @@ ChatGPT notes that matter:
 
 - Full MCP (including write actions) is rolling out for Business / Enterprise / Edu (plan availability changes — check OpenAI help)
 - Admin enables **developer mode**, then creates a custom MCP app/connector with your Worker URL
-- ChatGPT may ask for its own confirmation on write tools — **that is not a substitute for OwnMesh local `ask` / approval**
+- After one-time OwnMesh CLI/TUI setup, **ChatGPT normal Chat is the primary operational UI** for device control
+- ChatGPT may ask for its own product confirmation on write tools based on app permissions; OpenAI does **not** document a cryptographic confirmation attestation passed to the MCP server
+- OwnMesh treats the authenticated, scoped MCP invocation as the exact requested action (bound to operation id, device, expiry, and one-time execution state)
+- A second OwnMesh browser/CLI approval page is **not** required for normal use when device policy allows the action; it remains an optional recovery/admin path when policy is configured to `ask`
 - Prefer `offline_access` in OAuth scopes so refresh tokens keep the connector alive
+- E2 routing notes: [V1.2_E2_REMOTE_ROUTING.md](./V1.2_E2_REMOTE_ROUTING.md)
 
 ---
 

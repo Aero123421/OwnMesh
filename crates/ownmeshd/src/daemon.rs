@@ -67,7 +67,7 @@ async fn run_async() -> Result<(), ExitCode> {
         }
     }
 
-    let (handler, revoked) = build_handler(&paths).map_err(|err| {
+    let (handler, revoked, runtime) = build_handler(&paths).map_err(|err| {
         tracing::error!(error = %err, "runtime bootstrap failed");
         ExitCode::Internal
     })?;
@@ -100,6 +100,7 @@ async fn run_async() -> Result<(), ExitCode> {
     let transport_task = match agent_transport::configured_transport(&paths, &cfg) {
         Ok(Some(config)) => Some(tokio::spawn(agent_transport::run(
             config,
+            Some(runtime),
             transport_shutdown_rx,
         ))),
         Ok(None) => {
@@ -136,10 +137,22 @@ fn remove_legacy_token(path: &std::path::Path) -> std::io::Result<bool> {
 
 fn build_handler(
     paths: &OwnMeshPaths,
-) -> Result<(MethodHandler, ownmesh_ipc::RevokedClients), String> {
-    let runtime = DaemonRuntime::open(paths)?;
-    let revoked = runtime.revoked_clients_handle();
-    Ok((runtime_handler(Arc::new(Mutex::new(runtime))), revoked))
+) -> Result<
+    (
+        MethodHandler,
+        ownmesh_ipc::RevokedClients,
+        Arc<Mutex<DaemonRuntime>>,
+    ),
+    String,
+> {
+    let runtime = Arc::new(Mutex::new(DaemonRuntime::open(paths)?));
+    let revoked = {
+        let guard = runtime
+            .try_lock()
+            .map_err(|_| "runtime lock unavailable during bootstrap".to_owned())?;
+        guard.revoked_clients_handle()
+    };
+    Ok((runtime_handler(Arc::clone(&runtime)), revoked, runtime))
 }
 
 /// Resolve the daemon IPC endpoint + `AuthGate` from `config.service_socket`.

@@ -331,6 +331,7 @@ function attachLiveAgent(
     session_id: sessionId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
     lastSeq: 0,
   };

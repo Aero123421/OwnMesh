@@ -190,6 +190,7 @@ test("store is authoritative: empty tracker still polls after isolate restart", 
   const room = new DeviceRoomHarness(deviceId);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
 
   const tracker1 = new OperationTracker();
   const router = createHarnessRouter({
@@ -332,6 +333,7 @@ test("revoked/expired device credential fails create/poll/cancel (MCP path)", as
   const room = new DeviceRoomHarness(deviceId);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const router = createHarnessRouter({
     inject: (_id, op) => room.router.injectOperation(op),
   });
@@ -530,7 +532,13 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
   assert.equal(deliveries.length, 1);
   assert.equal(deliveries[0]!.type, "approval.decision");
   assert.equal(deliveries[0]!.payload.decision, "approve");
-  assert.equal(deliveries[0]!.payload.operation_id, opId);
+  // Decision frame has its own operation_id; original op is target_operation_id.
+  assert.equal(
+    deliveries[0]!.payload.target_operation_id ||
+      (deliveries[0]!.payload.arguments as { target_operation_id?: string } | undefined)
+        ?.target_operation_id,
+    opId,
+  );
 
   // Double approve with same tx rejected (already delivered)
   const second = await postOnce();
@@ -667,7 +675,12 @@ test("/approve delivery failure is retryable non-success; retry delivers exactly
     assert.equal(retryBody.ok, true);
     assert.equal(retryBody.status, "pending");
     assert.equal(deliveries.length, 1);
-    assert.equal(deliveries[0]!.payload.operation_id, opId);
+    assert.equal(
+      deliveries[0]!.payload.target_operation_id ||
+        (deliveries[0]!.payload.arguments as { target_operation_id?: string } | undefined)
+          ?.target_operation_id,
+      opId,
+    );
 
     const after = await store.getMcpOperation(opId);
     assert.equal(after?.status, "pending");
@@ -863,7 +876,10 @@ test("cancel owner path updates store and is CAS-safe", async () => {
   // Device-bound cancel only advances to cancel_requested after successful route.
   assert.equal(body.result.structuredContent.status, "cancel_requested");
   assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
-  assert.ok(routed[0]?.includes("ownmesh_cancel_operation"));
+  assert.ok(
+    routed[0]?.includes("cancel") || routed[0]?.includes("ownmesh_cancel_operation"),
+    `cancel route type should be cancel action, got ${routed[0]}`,
+  );
 
   // Second cancel: not cancellable
   const res2 = await handleMcp(

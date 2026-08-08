@@ -221,6 +221,7 @@ test("persist failure before dispatch: zero sends, no pending mutation, 503", as
     session_id: "ags_race_pf",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   } satisfies SessionAttachment);
 
   let sendCount = 0;
@@ -281,6 +282,7 @@ test("prepare+dispatch: successful path persists pending+nonce before send", asy
     session_id: "ags_race_ok",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
 
   const events: string[] = [];
@@ -335,6 +337,7 @@ test("hibernation restore: same internal-context nonce rejected (room-level, uti
     session_id: "ags_nonce_h1",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   room1.router.sendToSession = () => true;
 
@@ -379,6 +382,7 @@ test("hibernation restore: same internal-context nonce rejected (room-level, uti
     session_id: "ags_nonce_h2",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   let sendsAfterRestore = 0;
   room2.router.sendToSession = () => {
@@ -427,6 +431,7 @@ test("router prepare rolls back without dispatch; injectOperation still prepare+
     session_id: "ags_r",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
 
   let sends = 0;
