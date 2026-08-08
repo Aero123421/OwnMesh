@@ -14,6 +14,7 @@
     clippy::too_many_lines
 )]
 
+mod custody;
 mod git;
 
 pub use git::{
@@ -64,6 +65,8 @@ pub enum FsError {
     NotAFile(PathBuf),
     #[error("not a directory: {0}")]
     NotADirectory(PathBuf),
+    #[error("symlink or reparse point not permitted in restricted workspace: {0}")]
+    SymlinkOrReparse(PathBuf),
     #[error("entry limit exceeded")]
     EntryLimit,
     #[error("file too large")]
@@ -77,8 +80,8 @@ pub type FsResult<T> = Result<T, FsError>;
 #[derive(Debug, Clone)]
 pub struct WorkspaceRoot {
     root: PathBuf,
-    /// When false, paths outside root are rejected.
-    enforce: bool,
+    /// When true, restricted-mode handle-rooted custody is enforced.
+    pub(crate) enforce: bool,
 }
 
 impl WorkspaceRoot {
@@ -182,7 +185,7 @@ impl WorkspaceRoot {
     }
 }
 
-fn dunce_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn dunce_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     let c = fs::canonicalize(path)?;
     // Strip Windows \\?\ prefix for stable comparisons.
     let s = c.to_string_lossy();
@@ -355,13 +358,18 @@ pub fn list_dir_page(
     max_entries: usize,
     cursor: Option<&str>,
 ) -> FsResult<DirListPage> {
-    let path = ws.resolve(rel)?;
-    if !path.exists() {
-        return Err(FsError::NotFound(path));
-    }
-    if !path.is_dir() {
-        return Err(FsError::NotADirectory(path));
-    }
+    let path = if ws.enforce {
+        custody::resolve_dir_enforced(ws, rel.as_ref())?
+    } else {
+        let path = ws.resolve(rel)?;
+        if !path.exists() {
+            return Err(FsError::NotFound(path));
+        }
+        if !path.is_dir() {
+            return Err(FsError::NotADirectory(path));
+        }
+        path
+    };
     let after = decode_list_cursor(cursor);
     // Server-side ceiling independent of caller-supplied max_entries.
     const MAX_PAGE_ENTRIES: usize = 500;
@@ -502,6 +510,9 @@ pub fn list_dir_page(
 /// Returns an error when the path cannot be resolved, inspected, or read for
 /// hashing.
 pub fn stat_path(ws: &WorkspaceRoot, rel: impl AsRef<Path>, hash: bool) -> FsResult<FileStat> {
+    if ws.enforce {
+        return custody::stat_enforced(ws, rel.as_ref(), hash);
+    }
     let path = ws.resolve(rel)?;
     let meta = fs::symlink_metadata(&path).map_err(|source| FsError::Io {
         path: Some(path.clone()),
@@ -558,6 +569,12 @@ pub fn read_file_range(
 ) -> FsResult<(Vec<u8>, u64, bool)> {
     use std::io::{Read, Seek, SeekFrom};
 
+    if ws.enforce {
+        let (bytes, total, truncated, _path) =
+            custody::read_range_enforced(ws, rel.as_ref(), offset, max_bytes)?;
+        return Ok((bytes, total, truncated));
+    }
+
     let path = ws.resolve(rel)?;
     let meta = fs::metadata(&path).map_err(|source| FsError::Io {
         path: Some(path.clone()),
@@ -607,22 +624,16 @@ pub fn read_file_range(
 /// Returns an error when the path cannot be resolved or its parent, temporary
 /// file, or final destination cannot be written.
 pub fn write_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, data: &[u8]) -> FsResult<()> {
+    if ws.enforce {
+        let _final = custody::write_file_enforced(ws, rel.as_ref(), data)?;
+        return Ok(());
+    }
     let path = ws.resolve(rel)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| FsError::Io {
             path: Some(parent.to_path_buf()),
             source,
         })?;
-        // Re-validate parent identity after create_dir_all (replacement race).
-        if ws.enforce {
-            let parent_canon = dunce_canonicalize(parent).map_err(|source| FsError::Io {
-                path: Some(parent.to_path_buf()),
-                source,
-            })?;
-            if !parent_canon.starts_with(ws.root()) {
-                return Err(FsError::EscapesWorkspace(parent_canon));
-            }
-        }
     }
     // Exclusive randomized temp name resists predictable *.ownmesh-tmp swap races.
     let token = {
@@ -669,15 +680,6 @@ pub fn write_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, data: &[u8]) -> FsR
             source,
         }
     })?;
-    // Final identity check after rename for restricted workspaces.
-    if ws.enforce {
-        if let Ok(final_canon) = dunce_canonicalize(&path) {
-            if !final_canon.starts_with(ws.root()) {
-                let _ = fs::remove_file(&path);
-                return Err(FsError::EscapesWorkspace(final_canon));
-            }
-        }
-    }
     Ok(())
 }
 
@@ -688,6 +690,9 @@ pub fn write_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, data: &[u8]) -> FsR
 /// Returns an error when the path cannot be resolved, does not exist, or cannot be
 /// removed.
 pub fn delete_path(ws: &WorkspaceRoot, rel: impl AsRef<Path>, recursive: bool) -> FsResult<()> {
+    if ws.enforce {
+        return custody::delete_enforced(ws, rel.as_ref(), recursive);
+    }
     let path = ws.resolve(rel)?;
     if !path.exists() {
         return Err(FsError::NotFound(path));
@@ -719,23 +724,48 @@ pub fn apply_patch(
     new_content: &[u8],
     expected_sha256: Option<&str>,
 ) -> FsResult<String> {
-    let path = ws.resolve(rel.as_ref())?;
     if let Some(expected) = expected_sha256 {
-        if path.exists() {
-            let actual = hash_file(&path)?;
-            if actual != expected {
+        if ws.enforce {
+            match custody::open_regular_file_read(ws, rel.as_ref()) {
+                Ok((mut file, path)) => {
+                    let actual = custody::hash_open_file(&mut file, &path)?;
+                    if actual != expected {
+                        return Err(FsError::HashMismatch {
+                            path,
+                            expected: expected.to_string(),
+                            actual,
+                        });
+                    }
+                }
+                Err(FsError::NotFound(path)) => {
+                    if expected != empty_hash() {
+                        return Err(FsError::HashMismatch {
+                            path,
+                            expected: expected.to_string(),
+                            actual: empty_hash().to_string(),
+                        });
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            let path = ws.resolve(rel.as_ref())?;
+            if path.exists() {
+                let actual = hash_file(&path)?;
+                if actual != expected {
+                    return Err(FsError::HashMismatch {
+                        path,
+                        expected: expected.to_string(),
+                        actual,
+                    });
+                }
+            } else if expected != empty_hash() {
                 return Err(FsError::HashMismatch {
                     path,
                     expected: expected.to_string(),
-                    actual,
+                    actual: empty_hash().to_string(),
                 });
             }
-        } else if expected != empty_hash() {
-            return Err(FsError::HashMismatch {
-                path,
-                expected: expected.to_string(),
-                actual: empty_hash().to_string(),
-            });
         }
     }
     write_file(ws, rel, new_content)?;

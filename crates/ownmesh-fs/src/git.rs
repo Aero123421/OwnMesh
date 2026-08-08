@@ -189,18 +189,27 @@ fn cursor_to_index(cursor: Option<u64>) -> usize {
 }
 
 fn resolve_repo_cwd(ws: &WorkspaceRoot, rel: &Path) -> FsResult<PathBuf> {
-    let path = if rel.as_os_str().is_empty() {
+    let path = if ws.enforce {
+        crate::custody::resolve_dir_enforced(ws, rel)?
+    } else if rel.as_os_str().is_empty() {
         ws.root().to_path_buf()
     } else {
         ws.resolve(rel)?
     };
-    if !path.exists() {
+    if !ws.enforce && !path.exists() {
         return Err(FsError::NotFound(path));
     }
     // Discover toplevel so status works from a subdirectory.
     let toplevel = run_git(&path, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(toplevel.trim());
     // Re-validate against workspace boundary (absolute resolve honors enforce).
+    if ws.enforce {
+        // Git toplevel is absolute; require it to sit under the workspace root and
+        // re-pin the directory handle before returning it as cwd.
+        let checked = ws.resolve(&root)?;
+        let dir = crate::custody::resolve_dir_enforced(ws, &checked)?;
+        return Ok(dir);
+    }
     let checked = ws.resolve(&root)?;
     Ok(checked)
 }

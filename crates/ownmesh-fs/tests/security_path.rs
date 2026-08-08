@@ -20,6 +20,7 @@
 )]
 
 use ownmesh_fs::{looks_sensitive, read_file, write_file, FsError, WorkspaceRoot};
+// FsError variants used by restricted-mode symlink custody assertions.
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -103,7 +104,7 @@ fn symlink_escape_rejected_when_enforced() {
 
 #[cfg(unix)]
 #[test]
-fn symlink_inside_workspace_ok() {
+fn symlink_inside_workspace_not_followed_for_read() {
     use std::os::unix::fs::symlink;
 
     let root = tempdir().unwrap();
@@ -112,8 +113,55 @@ fn symlink_inside_workspace_ok() {
     symlink(root.path().join("real"), root.path().join("link")).unwrap();
 
     let ws = WorkspaceRoot::new(root.path(), true).unwrap();
-    let p = ws.resolve("link/a.txt").unwrap();
-    assert_eq!(fs::read(p).unwrap(), b"ok");
+    // Lexical resolve may still see the link target for path building, but the
+    // restricted read path must not treat symlink components as authority.
+    let err = read_file(&ws, "link/a.txt", 1024).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FsError::SymlinkOrReparse(_)
+                | FsError::EscapesWorkspace(_)
+                | FsError::NotAFile(_)
+                | FsError::NotADirectory(_)
+                | FsError::Io { .. }
+        ),
+        "restricted mode must not follow internal symlink components: {err:?}"
+    );
+    // Direct read of the real file remains allowed.
+    assert_eq!(read_file(&ws, "real/a.txt", 1024).unwrap(), b"ok");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_fails_closed_when_file_replaced_with_escape_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::write(outside.path().join("secret.txt"), b"top-secret").unwrap();
+    fs::write(root.path().join("safe.txt"), b"safe-bytes").unwrap();
+
+    let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+    assert_eq!(read_file(&ws, "safe.txt", 1024).unwrap(), b"safe-bytes");
+
+    fs::remove_file(root.path().join("safe.txt")).unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        root.path().join("safe.txt"),
+    )
+    .unwrap();
+
+    let err = read_file(&ws, "safe.txt", 1024).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FsError::SymlinkOrReparse(_)
+                | FsError::EscapesWorkspace(_)
+                | FsError::NotAFile(_)
+                | FsError::Io { .. }
+        ),
+        "post-resolve symlink replacement must fail closed: {err:?}"
+    );
 }
 
 #[test]

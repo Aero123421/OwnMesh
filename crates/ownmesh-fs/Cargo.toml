@@ -10,8 +10,13 @@ authors.workspace = true
 description = "ownmesh-fs"
 readme = "README.md"
 
-[lints]
-workspace = true
+# Windows GetFinalPathNameByHandleW is required for handle-rooted custody.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
 ownmesh-domain = { path = "../ownmesh-domain" }
@@ -21,6 +26,12 @@ thiserror = "2"
 sha2 = "0.10"
 hex = "0.4"
 walkdir = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -335,7 +335,7 @@ impl DaemonRuntime {
             std::fs::write(&log_path, b"").map_err(|e| e.to_string())?;
         }
         let op_journal = load_op_journal(&paths.state_dir.join("op-journal.json"))?;
-        let grants = load_grants(&paths.state_dir.join("grants.json"));
+        let grants = load_grants(&paths.state_dir.join("grants.json"))?;
         let approvals = load_approvals(&paths.state_dir.join("approvals.json"))?;
         let lockdown = paths.state_dir.join("lockdown.flag").exists();
         let revoked_clients = Arc::new(RwLock::new(load_revoked(
@@ -2676,6 +2676,17 @@ const MAX_OP_JOURNAL_ENTRIES: usize = 4_096;
 const MAX_OP_JOURNAL_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OP_JOURNAL_VALUE_BYTES: usize = 64 * 1024;
 
+/// Hard ceilings for durable grants / approvals / revoked-principal state.
+/// Stat-before-read + entry budgets keep startup fail-closed under oversized
+/// or corrupt local state (no unbounded `read_to_string`).
+const MAX_GRANTS_FILE_BYTES: usize = 1024 * 1024;
+const MAX_GRANTS_ENTRIES: usize = 4_096;
+const MAX_APPROVALS_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_APPROVALS_ENTRIES: usize = 4_096;
+const MAX_APPROVAL_VALUE_BYTES: usize = 64 * 1024;
+const MAX_REVOKED_FILE_BYTES: usize = 1024 * 1024;
+const MAX_REVOKED_ENTRIES: usize = 16_384;
+
 fn load_op_journal(path: &Path) -> Result<HashMap<String, Value>, String> {
     if !path.exists() {
         return Ok(HashMap::new());
@@ -2747,33 +2758,101 @@ fn bound_op_journal(mut journal: HashMap<String, Value>) -> Result<HashMap<Strin
     Ok(journal)
 }
 
-fn load_grants(path: &Path) -> Vec<TemporaryGrant> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+fn read_bounded_state_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("failed to stat {label} {}: {e}", path.display()))?;
+    if meta.len() as usize > max_bytes {
+        return Err(format!(
+            "{label} {} exceeds {max_bytes} byte budget ({})",
+            path.display(),
+            meta.len()
+        ));
+    }
+    let raw = std::fs::read(path)
+        .map_err(|e| format!("failed to read {label} {}: {e}", path.display()))?;
+    if raw.len() > max_bytes {
+        return Err(format!(
+            "{label} {} exceeds {max_bytes} byte budget after read",
+            path.display()
+        ));
+    }
+    Ok(raw)
+}
+
+fn load_grants(path: &Path) -> Result<Vec<TemporaryGrant>, String> {
+    let raw = read_bounded_state_file(path, MAX_GRANTS_FILE_BYTES, "grants state")?;
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let grants: Vec<TemporaryGrant> = serde_json::from_slice(&raw)
+        .map_err(|e| format!("corrupt grants state {}: {e}", path.display()))?;
+    if grants.len() > MAX_GRANTS_ENTRIES {
+        return Err(format!(
+            "grants state {} exceeds {MAX_GRANTS_ENTRIES} entry budget ({})",
+            path.display(),
+            grants.len()
+        ));
+    }
+    Ok(grants)
 }
 
 fn load_approvals(path: &Path) -> Result<HashMap<String, ApprovalRecord>, String> {
-    if !path.exists() {
+    let raw = read_bounded_state_file(path, MAX_APPROVALS_FILE_BYTES, "approval state")?;
+    if raw.is_empty() {
         return Ok(HashMap::new());
     }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| format!("corrupt approval state {}: {e}", path.display()))
+    let parsed: HashMap<String, ApprovalRecord> = serde_json::from_slice(&raw)
+        .map_err(|e| format!("corrupt approval state {}: {e}", path.display()))?;
+    if parsed.len() > MAX_APPROVALS_ENTRIES {
+        return Err(format!(
+            "approval state {} exceeds {MAX_APPROVALS_ENTRIES} entry budget ({})",
+            path.display(),
+            parsed.len()
+        ));
+    }
+    for (key, value) in &parsed {
+        let bytes = serde_json::to_vec(value).map_err(|e| {
+            format!(
+                "approval state {} entry {key} re-serialize failed: {e}",
+                path.display()
+            )
+        })?;
+        if bytes.len() > MAX_APPROVAL_VALUE_BYTES {
+            return Err(format!(
+                "approval state {} entry {key} exceeds {MAX_APPROVAL_VALUE_BYTES} byte budget ({})",
+                path.display(),
+                bytes.len()
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 fn load_revoked(path: &Path) -> Result<HashSet<String>, String> {
-    if !path.exists() {
+    let raw = read_bounded_state_file(path, MAX_REVOKED_FILE_BYTES, "revoked client state")?;
+    if raw.is_empty() {
         return Ok(HashSet::new());
     }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let list: Vec<String> = serde_json::from_str(&raw)
+    let list: Vec<String> = serde_json::from_slice(&raw)
         .map_err(|e| format!("corrupt revoked client state {}: {e}", path.display()))?;
+    if list.len() > MAX_REVOKED_ENTRIES {
+        return Err(format!(
+            "revoked client state {} exceeds {MAX_REVOKED_ENTRIES} entry budget ({})",
+            path.display(),
+            list.len()
+        ));
+    }
     let mut canonical = HashSet::with_capacity(list.len());
     for stored in &list {
+        if stored.len() > 1024 {
+            return Err(format!(
+                "corrupt revoked client state {}: principal exceeds 1024 bytes",
+                path.display()
+            ));
+        }
         let principal = canonicalize_principal_key(stored);
         if principal.is_empty() {
             return Err(format!(

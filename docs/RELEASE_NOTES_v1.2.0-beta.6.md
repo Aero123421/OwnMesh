@@ -35,10 +35,20 @@ additional hard-error surfaces (**39 total**), recorded in
 - **E2 workerd proof expanded**: 512 KiB multi-chunk binary read, list/stat/delete.
 - **E2–E9 gate fail-closed**: `test_v12_e2_e9_workerd_loopback.py` exits
   non-zero while E4–E9 real-path rows remain open (even when E2/E3 passes).
+- **E4 foundation — handle-rooted FS custody (partial)**: restricted-mode
+  list/stat/read/write/delete/patch open targets (or parents) with no-follow
+  semantics, revalidate the opened handle's final path against the workspace
+  root before content I/O or commit, and fail closed on symlink/junction/
+  reparse authority. Internal symlink following is intentionally not treated
+  as a restricted-mode capability.
+- **Bounded durable grants/approvals/revocations**: ownmeshd stats before
+  read, enforces byte/entry budgets, and fails closed on oversized or corrupt
+  local policy state (no unbounded `read_to_string`).
 
 ## What remains unsupported / open
 
-- E4 workspace CRUD + descriptor-rooted TOCTOU custody
+- E4 workspace CRUD + multi-workspace `workspace_id` product wiring (custody
+  foundation above is necessary but not sufficient for E4 completion)
 - E5 cloud PTY sessions / controller leases
 - E6 nine profile adapters end-to-end
 - E7 bounded unified-diff patch + Git review workflow
@@ -51,4 +61,5 @@ additional hard-error surfaces (**39 total**), recorded in
 
 - [`docs/V1.2_E2_REMOTE_ROUTING.md`](./V1.2_E2_REMOTE_ROUTING.md)
 - [`docs/V1.2_E3_ACTION_BINDING.md`](./V1.2_E3_ACTION_BINDING.md)
+- [`docs/V1.2_E4_WORKSPACE_CUSTODY.md`](./V1.2_E4_WORKSPACE_CUSTODY.md)
 - [`docs/chatgpt-connection.md`](./chatgpt-connection.md)

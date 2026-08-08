@@ -1654,6 +1654,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_approvals_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        // Just over the 4 MiB approval-state budget; must fail closed before deserialize.
+        let oversized = vec![b'A'; 4 * 1024 * 1024 + 64];
+        std::fs::write(paths.state_dir.join("approvals.json"), &oversized).unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("oversized approvals must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("approval state") && err.contains("byte budget"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_grants_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let oversized = vec![b'['; 1024 * 1024 + 32];
+        std::fs::write(paths.state_dir.join("grants.json"), &oversized).unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("oversized grants must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("grants state") && err.contains("byte budget"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_revoked_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let oversized = vec![b'['; 1024 * 1024 + 16];
+        std::fs::write(paths.state_dir.join("revoked-clients.json"), &oversized).unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("oversized revoked must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("revoked client state") && err.contains("byte budget"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_approvals_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        std::fs::write(paths.state_dir.join("approvals.json"), b"{not-json").unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("corrupt approvals must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("corrupt approval state") || err.contains("approval state"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
     async fn logs_providers_and_git_ops_e2e() {
         use crate::runtime::ops_methods;
         use std::process::Command;
