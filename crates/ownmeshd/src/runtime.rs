@@ -140,6 +140,10 @@ pub struct ExecParams {
     pub args: Vec<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Optional bounded environment overlay (exact-action / policy fact).
+    /// Keys/values are validated before spawn; never trusted as authority alone.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
@@ -880,12 +884,13 @@ impl DaemonRuntime {
         // Hard ceilings are enforced here even if a caller bypasses MCP schema.
         let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
         let max_output_bytes = p.max_output_bytes.unwrap_or(256 * 1024).clamp(1, 1_000_000);
+        let env = sanitize_exec_env(&p.env)?;
         let req = RunRequest {
             kind,
             program: execution_program,
             args: p.args.clone(),
             cwd: p.cwd.as_ref().map(PathBuf::from),
-            env: HashMap::new(),
+            env,
             stdin: None,
             timeout_ms: Some(timeout_ms),
             max_output_bytes,
@@ -2442,6 +2447,50 @@ fn with_rollback_errors(primary: IpcError, rollback_errors: Vec<IpcError>) -> Ip
             message: format!("{other}; rollback persistence also failed: {details}"),
         },
     }
+}
+
+/// Bound environment overlay for structured/raw command execution.
+/// Rejects oversized or malformed keys/values before process spawn.
+fn sanitize_exec_env(raw: &HashMap<String, String>) -> IpcResult<HashMap<String, String>> {
+    const MAX_ENV_ENTRIES: usize = 32;
+    const MAX_ENV_KEY_BYTES: usize = 128;
+    const MAX_ENV_VALUE_BYTES: usize = 4_096;
+    const MAX_ENV_TOTAL_BYTES: usize = 16_384;
+    if raw.len() > MAX_ENV_ENTRIES {
+        return Err(IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: format!("env exceeds {MAX_ENV_ENTRIES} entries"),
+        });
+    }
+    let mut out = HashMap::with_capacity(raw.len());
+    let mut total = 0usize;
+    for (key, value) in raw {
+        if key.is_empty()
+            || key.len() > MAX_ENV_KEY_BYTES
+            || key.contains('\0')
+            || key.contains('=')
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "env key is empty, too long, or contains NUL/=".into(),
+            });
+        }
+        if value.len() > MAX_ENV_VALUE_BYTES || value.contains('\0') {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "env value is too long or contains NUL".into(),
+            });
+        }
+        total = total.saturating_add(key.len()).saturating_add(value.len());
+        if total > MAX_ENV_TOTAL_BYTES {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("env exceeds {MAX_ENV_TOTAL_BYTES} total bytes"),
+            });
+        }
+        out.insert(key.clone(), value.clone());
+    }
+    Ok(out)
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> IpcResult<T> {

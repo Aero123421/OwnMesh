@@ -12,6 +12,7 @@ import {
   buildCanonicalAction,
   buildDeviceOperation,
   handleMcp,
+  normalizeCommandEnv,
   sanitizeMcpArgs,
   MCP_MAX_OUTPUT_BYTES,
   MCP_MAX_TIMEOUT_MS,
@@ -20,6 +21,9 @@ import {
 import {
   MemoryStore,
   SqlStore,
+  MCP_OPS_MAX_DATA_JSON_BYTES,
+  MCP_OPS_MAX_PER_TENANT,
+  boundMcpOperationRecord,
   type SqlDatabase,
   type SqlStatement,
 } from "./store.ts";
@@ -480,4 +484,143 @@ test("mutating tools reject missing idempotency_key before route", async () => {
   assert.equal(body.error?.code, -32602);
   assert.match(String(body.error?.message || ""), /idempotency_key required/i);
   assert.equal(body.error?.data?.code, "OWNMESH_E_IDEMPOTENCY_KEY_REQUIRED");
+});
+
+test("command env is normalized into canonical action facts", async () => {
+  const safe = sanitizeMcpArgs({
+    program: "echo",
+    env: { Z_LAST: "z", A_FIRST: "a", BAD: 1 as unknown as string },
+  });
+  // Malformed env (non-string) is dropped entirely.
+  assert.equal(safe.env, undefined);
+
+  const ok = sanitizeMcpArgs({
+    program: "echo",
+    env: { Z_LAST: "z", A_FIRST: "a" },
+  });
+  assert.deepEqual(ok.env, { A_FIRST: "a", Z_LAST: "z" });
+  assert.equal(normalizeCommandEnv({ "BAD=KEY": "x" }), undefined);
+
+  const canonical = await buildCanonicalAction({
+    toolName: "ownmesh_command_run",
+    args: { program: "echo", args: ["hi"], env: { B: "2", A: "1" } },
+    deviceId: "dev_env",
+    principalId: "prin_env",
+    tenantId: "ten_env",
+  });
+  assert.deepEqual((canonical.facts as { env?: Record<string, string> }).env, {
+    A: "1",
+    B: "2",
+  });
+
+  const op = await buildDeviceOperation({
+    toolName: "ownmesh_command_run",
+    args: {
+      program: "echo",
+      args: ["hi"],
+      env: { OWNMESH_E2_ENV: "bound-ok" },
+      idempotency_key: "idem_env_bind",
+    },
+    operationId: "op_env_bind",
+    deviceId: "dev_env",
+    principalId: "prin_env",
+    tenantId: "ten_env",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const facts = (op.bound_action.facts as { env?: Record<string, string> }).env;
+  assert.deepEqual(facts, { OWNMESH_E2_ENV: "bound-ok" });
+  assert.equal(
+    (op.payload.arguments as { env?: Record<string, string> }).env?.OWNMESH_E2_ENV,
+    "bound-ok",
+  );
+});
+
+test("durable MCP operation records bound oversized data and enforce tenant quota", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const huge = "x".repeat(MCP_OPS_MAX_DATA_JSON_BYTES + 1024);
+  const bounded = boundMcpOperationRecord({
+    operation_id: "op_bound_data",
+    tenant_id: "ten_quota",
+    principal_id: "prin_quota",
+    tool: "ownmesh_fs_read",
+    status: "completed",
+    summary: "ok",
+    data: { content: huge },
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  assert.equal(bounded.truncated, true);
+  assert.ok(bounded.warnings.includes("durable_result_truncated"));
+  assert.notEqual((bounded.data as { content?: string }).content, huge);
+
+  for (let i = 0; i < MCP_OPS_MAX_PER_TENANT; i++) {
+    await store.putMcpOperation({
+      operation_id: `op_q_${i}`,
+      tenant_id: "ten_quota",
+      principal_id: "prin_quota",
+      device_id: "dev_q",
+      tool: "ownmesh_fs_stat",
+      status: "completed",
+      summary: "fill",
+      data: { i },
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: `idem_q_${i}`,
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+  }
+  await assert.rejects(
+    () =>
+      store.putMcpOperation({
+        operation_id: "op_q_overflow",
+        tenant_id: "ten_quota",
+        principal_id: "prin_quota",
+        device_id: "dev_q",
+        tool: "ownmesh_fs_stat",
+        status: "pending",
+        summary: "overflow",
+        data: {},
+        truncated: false,
+        next_cursor: null,
+        approval_required: false,
+        warnings: [],
+        idempotency_key: "idem_q_overflow",
+        policy_authority: "ownmesh_device",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }),
+    /mcp_operation_quota_exceeded/,
+  );
+
+  // Same-key claim still works under quota pressure (replay safety).
+  const claim = await store.claimMcpOperationByIdempotency({
+    operation_id: "op_q_0_retry",
+    tenant_id: "ten_quota",
+    principal_id: "prin_quota",
+    device_id: "dev_q",
+    tool: "ownmesh_fs_stat",
+    status: "pending",
+    summary: "retry",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    idempotency_key: "idem_q_0",
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  assert.equal(claim.outcome, "existing");
+  assert.equal(claim.op.operation_id, "op_q_0");
 });

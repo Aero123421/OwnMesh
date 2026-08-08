@@ -477,13 +477,14 @@ def main() -> int:
             if content != marker:
                 raise RuntimeError(f"read content mismatch: {read_done}")
 
-            # Structured command through the same production path.
+            # Structured command through the same production path, with a bound env fact.
+            env_marker = f"E2ENV_{marker}"
             if os.name == "nt":
                 program = "cmd.exe"
-                args = ["/c", "echo", marker]
+                args = ["/c", "echo", f"{marker}-%OWNMESH_E2_ENV%"]
             else:
-                program = "/bin/echo"
-                args = [marker]
+                program = "/bin/sh"
+                args = ["-c", f'printf "%s" "{marker}-$OWNMESH_E2_ENV"']
             cmd_sc = structured(
                 mcp_call(
                     issuer,
@@ -493,6 +494,7 @@ def main() -> int:
                         "device_id": device_id,
                         "program": program,
                         "args": args,
+                        "env": {"OWNMESH_E2_ENV": env_marker},
                         "async": True,
                         "idempotency_key": f"idem_cmd_{marker}",
                     },
@@ -505,6 +507,8 @@ def main() -> int:
             dumped = json.dumps(cmd_done)
             if marker not in dumped:
                 raise RuntimeError(f"command result missing marker: {cmd_done}")
+            if env_marker not in dumped:
+                raise RuntimeError(f"command result missing bound env marker: {cmd_done}")
 
             # Idempotent replay of the same write key must not rewrite after completion.
             # Restart binary and prove completed correlation is replayed, not re-executed.
@@ -705,7 +709,7 @@ def main() -> int:
 
             print(
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
-                f"resume+idempotency+cancel+mismatch+binary+required-key held "
+                f"env+resume+idempotency+bound-cancel+mismatch+binary+required-key held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op})"
             )
             return 0

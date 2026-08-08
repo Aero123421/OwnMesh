@@ -63,6 +63,11 @@ export const MCP_MAX_TIMEOUT_MS = 300_000;
 export const MCP_MAX_OUTPUT_BYTES = 1_000_000;
 export const MCP_MAX_LIST_ENTRIES = 500;
 export const MCP_MAX_READ_BYTES = 512_000;
+/** Command environment overlay budgets (exact-action / policy facts). */
+export const MCP_MAX_ENV_ENTRIES = 32;
+export const MCP_MAX_ENV_KEY_BYTES = 128;
+export const MCP_MAX_ENV_VALUE_BYTES = 4_096;
+export const MCP_MAX_ENV_TOTAL_BYTES = 16_384;
 
 const cursorProps = {
   cursor: { type: "string", description: "Opaque pagination cursor" },
@@ -87,6 +92,12 @@ const execBoundProps = {
     minimum: 1,
     maximum: MCP_MAX_OUTPUT_BYTES,
     description: "Aggregate stdout+stderr budget (server-capped)",
+  },
+  env: {
+    type: "object",
+    description:
+      "Optional bounded string environment overlay (max 32 entries; bound into exact-action hash)",
+    additionalProperties: { type: "string", maxLength: MCP_MAX_ENV_VALUE_BYTES },
   },
 };
 
@@ -1137,6 +1148,45 @@ export function sanitizeMcpArgs(args: Record<string, unknown>): Record<string, u
   clampInt("max_bytes", 1, MCP_MAX_READ_BYTES);
   clampInt("limit", 1, MCP_MAX_LIST_ENTRIES);
   clampInt("offset", 0, Number.MAX_SAFE_INTEGER);
+  if (out.env !== undefined) {
+    const normalized = normalizeCommandEnv(out.env);
+    if (normalized === undefined) {
+      delete out.env;
+    } else {
+      out.env = normalized;
+    }
+  }
+  return out;
+}
+
+/**
+ * Normalize a caller-supplied command environment overlay into a bounded,
+ * order-stable string map. Malformed overlays are dropped (not authority).
+ */
+export function normalizeCommandEnv(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const entries = Object.entries(raw as Record<string, unknown>);
+  if (entries.length === 0) return undefined;
+  if (entries.length > MCP_MAX_ENV_ENTRIES) return undefined;
+  const out: Record<string, string> = {};
+  let total = 0;
+  const keys = entries.map(([k]) => k).sort();
+  for (const key of keys) {
+    if (
+      !key ||
+      key.length > MCP_MAX_ENV_KEY_BYTES ||
+      key.includes("\0") ||
+      key.includes("=")
+    ) {
+      return undefined;
+    }
+    const value = (raw as Record<string, unknown>)[key];
+    if (typeof value !== "string") return undefined;
+    if (value.length > MCP_MAX_ENV_VALUE_BYTES || value.includes("\0")) return undefined;
+    total += key.length + value.length;
+    if (total > MCP_MAX_ENV_TOTAL_BYTES) return undefined;
+    out[key] = value;
+  }
   return out;
 }
 
@@ -1178,6 +1228,11 @@ export async function buildCanonicalAction(opts: {
     if (key === "content" && typeof value === "string") {
       facts.content_sha256 = await sha256Hex(value);
       facts.content_bytes = new TextEncoder().encode(value).byteLength;
+      continue;
+    }
+    if (key === "env") {
+      const normalized = normalizeCommandEnv(value);
+      if (normalized) facts.env = normalized;
       continue;
     }
     facts[key] = value;
@@ -1927,33 +1982,45 @@ export async function handleMcp(
 
     // E3 exact-once: atomic create-or-claim on the idempotency key. Same action
     // facts replay the prior owner; drifted facts fail closed before any route.
-    const claim = await store.claimMcpOperationByIdempotency({
-      operation_id: trackBase.operation_id,
-      tenant_id: trackBase.tenant_id,
-      principal_id: trackBase.principal,
-      device_id: trackBase.device_id,
-      tool: trackBase.tool || name,
-      status: trackBase.status,
-      summary: trackBase.summary || "",
-      data: trackBase.data || {},
-      truncated: Boolean(trackBase.truncated),
-      next_cursor: trackBase.next_cursor ?? null,
-      approval_required: Boolean(trackBase.approval_required),
-      approval_url: trackBase.approval_url,
-      approval_id: trackBase.approval_id,
-      session_id: trackBase.session_id,
-      warnings: trackBase.warnings || [],
-      correlation_id: trackBase.correlation_id,
-      payload_hash: trackBase.payload_hash ?? null,
-      idempotency_key: trackBase.idempotency_key ?? null,
-      workspace_id: trackBase.workspace_id ?? null,
-      expires_at: trackBase.expires_at ?? null,
-      claim_version: trackBase.claim_version ?? claimVersion,
-      action: trackBase.action ?? null,
-      policy_authority: "ownmesh_device",
-      created_at: trackBase.created_at || nowIso(),
-      updated_at: trackBase.updated_at || nowIso(),
-    });
+    let claim: Awaited<ReturnType<ControlPlaneStore["claimMcpOperationByIdempotency"]>>;
+    try {
+      claim = await store.claimMcpOperationByIdempotency({
+        operation_id: trackBase.operation_id,
+        tenant_id: trackBase.tenant_id,
+        principal_id: trackBase.principal,
+        device_id: trackBase.device_id,
+        tool: trackBase.tool || name,
+        status: trackBase.status,
+        summary: trackBase.summary || "",
+        data: trackBase.data || {},
+        truncated: Boolean(trackBase.truncated),
+        next_cursor: trackBase.next_cursor ?? null,
+        approval_required: Boolean(trackBase.approval_required),
+        approval_url: trackBase.approval_url,
+        approval_id: trackBase.approval_id,
+        session_id: trackBase.session_id,
+        warnings: trackBase.warnings || [],
+        correlation_id: trackBase.correlation_id,
+        payload_hash: trackBase.payload_hash ?? null,
+        idempotency_key: trackBase.idempotency_key ?? null,
+        workspace_id: trackBase.workspace_id ?? null,
+        expires_at: trackBase.expires_at ?? null,
+        claim_version: trackBase.claim_version ?? claimVersion,
+        action: trackBase.action ?? null,
+        policy_authority: "ownmesh_device",
+        created_at: trackBase.created_at || nowIso(),
+        updated_at: trackBase.updated_at || nowIso(),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.startsWith("mcp_operation_quota_exceeded")) {
+        return mcpError(id, -32005, "tenant MCP operation quota exceeded", {
+          code: "OWNMESH_E_MCP_OP_QUOTA",
+          detail: message,
+        });
+      }
+      throw err;
+    }
 
     if (claim.outcome === "existing") {
       const prior = claim.op;

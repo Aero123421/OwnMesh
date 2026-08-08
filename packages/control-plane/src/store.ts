@@ -214,6 +214,79 @@ export type McpApprovalTransaction = {
  */
 export const MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS = 30_000;
 
+/** Per-tenant durable MCP operation budgets (D1 / Memory). */
+export const MCP_OPS_MAX_PER_TENANT = 2_000;
+/** Hard cap on serialized operation data_json / action_json payload. */
+export const MCP_OPS_MAX_DATA_JSON_BYTES = 256_000;
+/** Terminal ops older than this may be compacted to idempotency tombstones. */
+export const MCP_OPS_RESULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Tombstones older than this may be hard-deleted (idempotency window closed). */
+export const MCP_OPS_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const MCP_OPS_TERMINAL = new Set([
+  "completed",
+  "failed",
+  "denied",
+  "cancelled",
+  "device_offline",
+  "tombstone",
+]);
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+/** Bound operation data/action JSON and mark visible truncation. */
+export function boundMcpOperationRecord(op: McpOperationRecord): McpOperationRecord {
+  const next: McpOperationRecord = {
+    ...op,
+    data: { ...(op.data || {}) },
+    warnings: [...(op.warnings || [])],
+    action: op.action ? { ...op.action } : op.action,
+    policy_authority: "ownmesh_device",
+  };
+  let dataJson = JSON.stringify(next.data || {});
+  if (utf8Bytes(dataJson) > MCP_OPS_MAX_DATA_JSON_BYTES) {
+    next.data = {
+      truncated: true,
+      returned_bytes: 0,
+      total_bytes: utf8Bytes(dataJson),
+      message:
+        "operation result exceeded durable store budget; use range/pagination tools for full content",
+    };
+    next.truncated = true;
+    if (!next.warnings.includes("durable_result_truncated")) {
+      next.warnings.push("durable_result_truncated");
+    }
+    dataJson = JSON.stringify(next.data);
+  }
+  if (next.action) {
+    const actionJson = JSON.stringify(next.action);
+    if (utf8Bytes(actionJson) > MCP_OPS_MAX_DATA_JSON_BYTES) {
+      // Action binding must stay small; drop oversized client residue rather than store it.
+      next.action = {
+        truncated: true,
+        message: "canonical action exceeded durable store budget",
+      };
+    }
+  }
+  // Keep summary bounded too.
+  if (typeof next.summary === "string" && next.summary.length > 2_000) {
+    next.summary = `${next.summary.slice(0, 2_000)}…`;
+  }
+  return next;
+}
+
+function isTerminalMcpStatus(status: string): boolean {
+  return MCP_OPS_TERMINAL.has(status);
+}
+
+function mcpOpAgeMs(op: Pick<McpOperationRecord, "updated_at" | "created_at">, now = Date.now()): number {
+  const stamp = Date.parse(op.updated_at || op.created_at || "");
+  if (!Number.isFinite(stamp)) return 0;
+  return Math.max(0, now - stamp);
+}
+
 export type McpApprovalOutbox = {
   id: string;
   operation_id: string;
@@ -1092,6 +1165,50 @@ export class MemoryStore implements ControlPlaneStore {
       .reverse();
   }
 
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private enforceMcpOperationQuota(tenantId: string): void {
+    const now = Date.now();
+    const tenantOps = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
+    for (const op of tenantOps) {
+      const age = mcpOpAgeMs(op, now);
+      if (op.status === "tombstone" && age > MCP_OPS_TOMBSTONE_TTL_MS) {
+        this.mcpOperations.delete(op.operation_id);
+        continue;
+      }
+      if (isTerminalMcpStatus(op.status) && op.status !== "tombstone" && age > MCP_OPS_RESULT_TTL_MS) {
+        this.mcpOperations.set(op.operation_id, {
+          ...op,
+          status: "tombstone",
+          summary: "tombstone: result TTL expired; idempotency retained",
+          data: {
+            tombstone: true,
+            prior_status: op.status,
+            payload_hash: op.payload_hash ?? null,
+          },
+          truncated: true,
+          warnings: ["durable_result_tombstoned"],
+          updated_at: nowIso(),
+        });
+      }
+    }
+    const remaining = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
+    if (remaining.length < MCP_OPS_MAX_PER_TENANT) return;
+    // Prefer deleting oldest hard-expired tombstones first, then fail closed.
+    const tombstones = remaining
+      .filter((o) => o.status === "tombstone")
+      .sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at)));
+    for (const t of tombstones) {
+      if ([...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId).length < MCP_OPS_MAX_PER_TENANT) {
+        break;
+      }
+      this.mcpOperations.delete(t.operation_id);
+    }
+    const finalCount = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId).length;
+    if (finalCount >= MCP_OPS_MAX_PER_TENANT) {
+      throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+    }
+  }
+
   /** Create-only: refuses to overwrite an existing operation_id or idempotency binding. */
   async putMcpOperation(op: McpOperationRecord): Promise<void> {
     if (this.mcpOperations.has(op.operation_id)) {
@@ -1108,12 +1225,9 @@ export class MemoryStore implements ControlPlaneStore {
         throw new Error(`mcp_operation_idempotency_exists:${op.idempotency_key}`);
       }
     }
-    this.mcpOperations.set(op.operation_id, {
-      ...op,
-      data: { ...(op.data || {}) },
-      warnings: [...(op.warnings || [])],
-      policy_authority: "ownmesh_device",
-    });
+    this.enforceMcpOperationQuota(op.tenant_id);
+    const bounded = boundMcpOperationRecord(op);
+    this.mcpOperations.set(op.operation_id, bounded);
   }
   async getMcpOperation(operationId: string): Promise<McpOperationRecord | null> {
     const op = this.mcpOperations.get(operationId);
@@ -1188,13 +1302,8 @@ export class MemoryStore implements ControlPlaneStore {
     if (this.mcpOperations.has(op.operation_id)) {
       throw new Error(`mcp_operation_exists:${op.operation_id}`);
     }
-    const stored: McpOperationRecord = {
-      ...op,
-      data: { ...(op.data || {}) },
-      warnings: [...(op.warnings || [])],
-      action: op.action ? { ...op.action } : op.action,
-      policy_authority: "ownmesh_device",
-    };
+    this.enforceMcpOperationQuota(op.tenant_id);
+    const stored = boundMcpOperationRecord(op);
     this.mcpOperations.set(op.operation_id, stored);
     return {
       outcome: "created",
@@ -1214,7 +1323,7 @@ export class MemoryStore implements ControlPlaneStore {
     const cur = this.mcpOperations.get(operationId);
     if (!cur) return null;
     if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
-    const next: McpOperationRecord = {
+    const next: McpOperationRecord = boundMcpOperationRecord({
       ...cur,
       ...patch,
       operation_id: cur.operation_id,
@@ -1231,7 +1340,7 @@ export class MemoryStore implements ControlPlaneStore {
           : cur.action,
       policy_authority: "ownmesh_device",
       updated_at: patch.updated_at || nowIso(),
-    };
+    });
     this.mcpOperations.set(operationId, next);
     return {
       ...next,
@@ -2598,8 +2707,76 @@ export class SqlStore implements ControlPlaneStore {
     return res.results || [];
   }
 
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private async enforceMcpOperationQuota(tenantId: string): Promise<void> {
+    const now = Date.now();
+    const resultCutoff = new Date(now - MCP_OPS_RESULT_TTL_MS).toISOString();
+    const tombstoneCutoff = new Date(now - MCP_OPS_TOMBSTONE_TTL_MS).toISOString();
+
+    // Hard-delete ancient tombstones first (idempotency window closed).
+    await this.db
+      .prepare(
+        `DELETE FROM mcp_operations
+         WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?`,
+      )
+      .bind(tenantId, tombstoneCutoff)
+      .run();
+
+    // Compact terminal results past TTL into idempotency tombstones.
+    // Keep payload_hash/idempotency_key columns; clear large result bodies only.
+    await this.db
+      .prepare(
+        `UPDATE mcp_operations
+         SET status = 'tombstone',
+             summary = 'tombstone: result TTL expired; idempotency retained',
+             data_json = '{"tombstone":true}',
+             truncated = 1,
+             warnings_json = '["durable_result_tombstoned"]',
+             updated_at = ?
+         WHERE tenant_id = ?
+           AND status IN ('completed','failed','denied','cancelled','device_offline')
+           AND updated_at < ?`,
+      )
+      .bind(new Date(now).toISOString(), tenantId, resultCutoff)
+      .run();
+
+    const countRow = await this.db
+      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
+      .bind(tenantId)
+      .first<{ c: number }>();
+    const count = Number(countRow?.c ?? 0);
+    if (count < MCP_OPS_MAX_PER_TENANT) return;
+
+    // Under pressure, drop oldest tombstones only (never live/non-terminal).
+    const overflow = count - MCP_OPS_MAX_PER_TENANT + 1;
+    if (overflow > 0) {
+      await this.db
+        .prepare(
+          `DELETE FROM mcp_operations
+           WHERE operation_id IN (
+             SELECT operation_id FROM mcp_operations
+             WHERE tenant_id = ? AND status = 'tombstone'
+             ORDER BY updated_at ASC
+             LIMIT ?
+           )`,
+        )
+        .bind(tenantId, overflow)
+        .run();
+    }
+
+    const after = await this.db
+      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
+      .bind(tenantId)
+      .first<{ c: number }>();
+    if (Number(after?.c ?? 0) >= MCP_OPS_MAX_PER_TENANT) {
+      throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+    }
+  }
+
   /** Create-only INSERT. Conflict (existing operation_id) fails — never REPLACE. */
   async putMcpOperation(op: McpOperationRecord): Promise<void> {
+    await this.enforceMcpOperationQuota(op.tenant_id);
+    const bounded = boundMcpOperationRecord(op);
     const result = await this.db
       .prepare(
         `INSERT INTO mcp_operations
@@ -2611,30 +2788,30 @@ export class SqlStore implements ControlPlaneStore {
          ON CONFLICT(operation_id) DO NOTHING`,
       )
       .bind(
-        op.operation_id,
-        op.tenant_id,
-        op.principal_id,
-        op.device_id ?? null,
-        op.tool,
-        op.status,
-        op.summary,
-        JSON.stringify(op.data || {}),
-        op.truncated ? 1 : 0,
-        op.next_cursor ?? null,
-        op.approval_required ? 1 : 0,
-        op.approval_url ?? null,
-        op.approval_id ?? null,
-        op.session_id ?? null,
-        JSON.stringify(op.warnings || []),
-        op.correlation_id ?? null,
-        op.payload_hash ?? null,
-        op.idempotency_key ?? null,
-        op.workspace_id ?? null,
-        op.expires_at ?? null,
-        Number(op.claim_version ?? 0),
-        JSON.stringify(op.action || {}),
-        op.created_at,
-        op.updated_at,
+        bounded.operation_id,
+        bounded.tenant_id,
+        bounded.principal_id,
+        bounded.device_id ?? null,
+        bounded.tool,
+        bounded.status,
+        bounded.summary,
+        JSON.stringify(bounded.data || {}),
+        bounded.truncated ? 1 : 0,
+        bounded.next_cursor ?? null,
+        bounded.approval_required ? 1 : 0,
+        bounded.approval_url ?? null,
+        bounded.approval_id ?? null,
+        bounded.session_id ?? null,
+        JSON.stringify(bounded.warnings || []),
+        bounded.correlation_id ?? null,
+        bounded.payload_hash ?? null,
+        bounded.idempotency_key ?? null,
+        bounded.workspace_id ?? null,
+        bounded.expires_at ?? null,
+        Number(bounded.claim_version ?? 0),
+        JSON.stringify(bounded.action || {}),
+        bounded.created_at,
+        bounded.updated_at,
       )
       .run();
     const changes = Number(
@@ -2689,7 +2866,22 @@ export class SqlStore implements ControlPlaneStore {
     | { outcome: "created"; op: McpOperationRecord }
     | { outcome: "existing"; op: McpOperationRecord }
   > {
+    // Idempotent reuse must not be blocked by quota pressure on other keys.
+    if (op.idempotency_key) {
+      const existing = await this.getMcpOperationByIdempotency({
+        principalId: op.principal_id,
+        tenantId: op.tenant_id,
+        deviceId: op.device_id || "",
+        idempotencyKey: op.idempotency_key,
+      });
+      if (existing) return { outcome: "existing", op: existing };
+    }
+    const byIdEarly = await this.getMcpOperation(op.operation_id);
+    if (byIdEarly) return { outcome: "existing", op: byIdEarly };
+
     // INSERT OR IGNORE respects PK + partial unique idempotency index.
+    await this.enforceMcpOperationQuota(op.tenant_id);
+    const bounded = boundMcpOperationRecord(op);
     const result = await this.db
       .prepare(
         `INSERT INTO mcp_operations
@@ -2701,30 +2893,30 @@ export class SqlStore implements ControlPlaneStore {
          ON CONFLICT DO NOTHING`,
       )
       .bind(
-        op.operation_id,
-        op.tenant_id,
-        op.principal_id,
-        op.device_id ?? null,
-        op.tool,
-        op.status,
-        op.summary,
-        JSON.stringify(op.data || {}),
-        op.truncated ? 1 : 0,
-        op.next_cursor ?? null,
-        op.approval_required ? 1 : 0,
-        op.approval_url ?? null,
-        op.approval_id ?? null,
-        op.session_id ?? null,
-        JSON.stringify(op.warnings || []),
-        op.correlation_id ?? null,
-        op.payload_hash ?? null,
-        op.idempotency_key ?? null,
-        op.workspace_id ?? null,
-        op.expires_at ?? null,
-        Number(op.claim_version ?? 0),
-        JSON.stringify(op.action || {}),
-        op.created_at,
-        op.updated_at,
+        bounded.operation_id,
+        bounded.tenant_id,
+        bounded.principal_id,
+        bounded.device_id ?? null,
+        bounded.tool,
+        bounded.status,
+        bounded.summary,
+        JSON.stringify(bounded.data || {}),
+        bounded.truncated ? 1 : 0,
+        bounded.next_cursor ?? null,
+        bounded.approval_required ? 1 : 0,
+        bounded.approval_url ?? null,
+        bounded.approval_id ?? null,
+        bounded.session_id ?? null,
+        JSON.stringify(bounded.warnings || []),
+        bounded.correlation_id ?? null,
+        bounded.payload_hash ?? null,
+        bounded.idempotency_key ?? null,
+        bounded.workspace_id ?? null,
+        bounded.expires_at ?? null,
+        Number(bounded.claim_version ?? 0),
+        JSON.stringify(bounded.action || {}),
+        bounded.created_at,
+        bounded.updated_at,
       )
       .run();
     const changes = Number(
@@ -2761,7 +2953,7 @@ export class SqlStore implements ControlPlaneStore {
     if (!cur) return null;
     if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
 
-    const next: McpOperationRecord = {
+    const next: McpOperationRecord = boundMcpOperationRecord({
       ...cur,
       ...patch,
       operation_id: cur.operation_id,
@@ -2772,7 +2964,7 @@ export class SqlStore implements ControlPlaneStore {
       action: patch.action !== undefined ? patch.action : cur.action,
       policy_authority: "ownmesh_device",
       updated_at: patch.updated_at || nowIso(),
-    };
+    });
 
     // CAS via conditional UPDATE when fromStatuses provided.
     if (fromStatuses && fromStatuses.length > 0) {

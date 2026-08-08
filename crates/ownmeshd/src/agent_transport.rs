@@ -734,12 +734,42 @@ async fn handle_live_frame(
             };
 
             // Cancel must run on the live loop so it can signal an in-flight op
-            // without waiting for that op's runtime lock.
+            // without waiting for that op's runtime lock. Exact-action binding is
+            // still mandatory: unsigned/expired/mismatched cancels must not signal.
             let action = action_of(&request);
             if request.capability == "operation.cancel"
                 || action == "cancel"
                 || action == "ownmesh_cancel_operation"
             {
+                let envelope_expires_at = operation
+                    .envelope
+                    .expires_at
+                    .as_ref()
+                    .map(|exp| exp.at.to_rfc3339());
+                if let Err(message) = verify_exact_action_binding(
+                    &config.device_id,
+                    &request,
+                    envelope_expires_at.as_deref(),
+                ) {
+                    let payload = json!({
+                        "operation_contract": OPERATION_CONTRACT_V1,
+                        "operation_id": request.operation_id.to_string(),
+                        "status": "failed",
+                        "error": {
+                            "code": "OWNMESH_E_ACTION_BINDING_MISMATCH",
+                            "message": message,
+                            "retryable": false
+                        }
+                    });
+                    let completed = CompletedReply {
+                        correlation_id: correlation.to_owned(),
+                        operation_id: request.operation_id.to_string(),
+                        payload,
+                    };
+                    state.remember_completed(completed.clone());
+                    state.save(&config.state_path)?;
+                    return send_cached_result(socket, config, state, &completed).await;
+                }
                 let target = request
                     .arguments
                     .get("target_operation_id")
@@ -959,14 +989,57 @@ fn recompute_action_facts(arguments: &Map<String, Value>) -> Result<Map<String, 
                 facts.insert("content_sha256".into(), Value::String(sha256_hex_str(text)));
                 facts.insert(
                     "content_bytes".into(),
-                    Value::Number(serde_json::Number::from(text.as_bytes().len() as u64)),
+                    Value::Number(serde_json::Number::from(text.len() as u64)),
                 );
                 continue;
             }
         }
+        if key == "env" {
+            facts.insert("env".into(), normalize_env_fact(value)?);
+            continue;
+        }
         facts.insert(key.clone(), value.clone());
     }
     Ok(facts)
+}
+
+/// Bound + order-stable environment fact used in exact-action binding.
+fn normalize_env_fact(value: &Value) -> Result<Value, String> {
+    const MAX_ENV_ENTRIES: usize = 32;
+    const MAX_ENV_KEY_BYTES: usize = 128;
+    const MAX_ENV_VALUE_BYTES: usize = 4_096;
+    const MAX_ENV_TOTAL_BYTES: usize = 16_384;
+    let Some(obj) = value.as_object() else {
+        return Err("env must be an object of string values".into());
+    };
+    if obj.len() > MAX_ENV_ENTRIES {
+        return Err(format!("env exceeds {MAX_ENV_ENTRIES} entries"));
+    }
+    let mut keys: Vec<&String> = obj.keys().collect();
+    keys.sort();
+    let mut out = Map::new();
+    let mut total = 0usize;
+    for key in keys {
+        if key.is_empty()
+            || key.len() > MAX_ENV_KEY_BYTES
+            || key.contains('\0')
+            || key.contains('=')
+        {
+            return Err("env key is empty, too long, or contains NUL/=".into());
+        }
+        let Some(raw) = obj.get(key).and_then(Value::as_str) else {
+            return Err("env values must be strings".into());
+        };
+        if raw.len() > MAX_ENV_VALUE_BYTES || raw.contains('\0') {
+            return Err("env value is too long or contains NUL".into());
+        }
+        total = total.saturating_add(key.len()).saturating_add(raw.len());
+        if total > MAX_ENV_TOTAL_BYTES {
+            return Err(format!("env exceeds {MAX_ENV_TOTAL_BYTES} total bytes"));
+        }
+        out.insert(key.clone(), Value::String(raw.to_owned()));
+    }
+    Ok(Value::Object(out))
 }
 
 /// Verify control-plane exact-action binding immediately before side effects.
@@ -980,15 +1053,11 @@ fn verify_exact_action_binding(
     envelope_expires_at: Option<&str>,
 ) -> Result<(), String> {
     let Some(authorization) = request.authorization.as_ref() else {
-        // Cancel without binding is allowed only for non-side-effect recovery paths
-        // that never reach DaemonRuntime file/exec handlers with mutable args.
+        // Cancel is a live control plane action: binding is mandatory so an
+        // unauthenticated/unsigned cancel cannot signal process trees.
+        // approval.decision remains an optional recovery notification only.
         let action = action_of(request);
-        if request.capability == "operation.cancel"
-            || action == "cancel"
-            || action == "ownmesh_cancel_operation"
-            || request.capability == "approval.decision"
-            || action == "approval.decision"
-        {
+        if request.capability == "approval.decision" || action == "approval.decision" {
             return Ok(());
         }
         return Err(
@@ -1830,7 +1899,7 @@ mod tests {
             facts.insert("content_sha256".into(), Value::String(sha256_hex_str(text)));
             facts.insert(
                 "content_bytes".into(),
-                Value::Number(serde_json::Number::from(text.as_bytes().len() as u64)),
+                Value::Number(serde_json::Number::from(text.len() as u64)),
             );
         }
         let mut bound = Map::new();
@@ -1913,5 +1982,137 @@ mod tests {
         };
         let err = verify_exact_action_binding(&device, &request, None).unwrap_err();
         assert!(err.contains("authorization"), "{err}");
+    }
+
+    fn sample_bound_cancel(
+        device_id: &str,
+        target_operation_id: &str,
+        expires_skew_secs: i64,
+    ) -> (OperationRequestPayload, String) {
+        use ownmesh_protocol::OperationAuthorizationBinding;
+        let expires = if expires_skew_secs >= 0 {
+            Timestamp::now()
+                .checked_add(Duration::from_secs(expires_skew_secs as u64))
+                .unwrap()
+                .to_rfc3339()
+        } else {
+            Timestamp::now()
+                .checked_sub(Duration::from_secs((-expires_skew_secs) as u64))
+                .unwrap()
+                .to_rfc3339()
+        };
+        let mut facts = Map::new();
+        facts.insert(
+            "target_operation_id".into(),
+            Value::String(target_operation_id.into()),
+        );
+        let mut bound = Map::new();
+        bound.insert("capability".into(), json!("operation.cancel"));
+        bound.insert("action".into(), json!("cancel"));
+        bound.insert("tool".into(), json!("ownmesh_cancel_operation"));
+        bound.insert("device_id".into(), json!(device_id));
+        bound.insert("principal_id".into(), json!("prin_dev"));
+        bound.insert("tenant_id".into(), json!("ten_default"));
+        bound.insert("oauth_client_id".into(), Value::Null);
+        bound.insert("workspace_id".into(), Value::Null);
+        bound.insert("facts".into(), Value::Object(facts));
+        bound.insert("operation_id".into(), json!("op_cancel_bind"));
+        bound.insert("expires_at".into(), json!(expires.clone()));
+        bound.insert("claim_version".into(), json!(1));
+        let bound_value = Value::Object(bound);
+        let hash = sha256_hex_str(&stable_stringify(&bound_value));
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_cancel_bind").unwrap(),
+            capability: "operation.cancel".into(),
+            workspace_id: None,
+            idempotency_key: "idem_cancel_bind".into(),
+            payload_hash: Some(hash),
+            authorization: Some(OperationAuthorizationBinding {
+                bound_action: bound_value,
+            }),
+            arguments: json!({
+                "action": "cancel",
+                "target_operation_id": target_operation_id
+            }),
+        };
+        (request, expires)
+    }
+
+    #[test]
+    fn cancel_binding_accepts_matching_target() {
+        let device = DeviceId::parse("dev_cancel_ok").unwrap();
+        let (request, expires) = sample_bound_cancel(device.as_str(), "op_target_1", 120);
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+    }
+
+    #[test]
+    fn cancel_binding_rejects_unsigned_cancel() {
+        let device = DeviceId::parse("dev_cancel_unsigned").unwrap();
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_cancel_unsigned").unwrap(),
+            capability: "operation.cancel".into(),
+            workspace_id: None,
+            idempotency_key: "idem_cancel_unsigned".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({
+                "action": "cancel",
+                "target_operation_id": "op_victim"
+            }),
+        };
+        let err = verify_exact_action_binding(&device, &request, None).unwrap_err();
+        assert!(err.contains("authorization"), "{err}");
+    }
+
+    #[test]
+    fn cancel_binding_rejects_mismatched_target() {
+        let device = DeviceId::parse("dev_cancel_mismatch").unwrap();
+        let (mut request, expires) = sample_bound_cancel(device.as_str(), "op_target_a", 120);
+        request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("target_operation_id".into(), json!("op_target_b"));
+        let err = verify_exact_action_binding(&device, &request, Some(&expires)).unwrap_err();
+        assert!(err.contains("facts"), "{err}");
+    }
+
+    #[test]
+    fn cancel_binding_rejects_expired_envelope_mismatch() {
+        let device = DeviceId::parse("dev_cancel_expired").unwrap();
+        let (request, bound_expires) = sample_bound_cancel(device.as_str(), "op_target_exp", -30);
+        // Envelope claims a fresh expiry while the bound action is already stale.
+        let envelope_expires = Timestamp::now()
+            .checked_add(Duration::from_secs(120))
+            .unwrap()
+            .to_rfc3339();
+        let err =
+            verify_exact_action_binding(&device, &request, Some(&envelope_expires)).unwrap_err();
+        assert!(
+            err.contains("expires_at") || err.contains("mismatch"),
+            "bound={bound_expires} err={err}"
+        );
+    }
+
+    #[test]
+    fn env_fact_normalizes_and_bounds_entries() {
+        let mut args = Map::new();
+        args.insert(
+            "env".into(),
+            json!({
+                "B": "two",
+                "A": "one"
+            }),
+        );
+        let facts = recompute_action_facts(&args).unwrap();
+        let env = facts.get("env").and_then(Value::as_object).unwrap();
+        let keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["A", "B"]);
+
+        let mut bad = Map::new();
+        bad.insert("env".into(), json!({"BAD=KEY": "x"}));
+        assert!(recompute_action_facts(&bad).is_err());
     }
 }
