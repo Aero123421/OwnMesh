@@ -418,6 +418,25 @@ impl DaemonRuntime {
     fn persist_op_journal(&self) -> IpcResult<()> {
         #[cfg(test)]
         self.maybe_inject_persist_fault(&self.op_journal_persist_fault, "op journal")?;
+        let encoded =
+            serde_json::to_vec_pretty(&self.op_journal).map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("failed to serialize op journal: {e}"),
+            })?;
+        if encoded.len() > MAX_OP_JOURNAL_FILE_BYTES {
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!(
+                    "op journal exceeds {MAX_OP_JOURNAL_FILE_BYTES} durable byte budget"
+                ),
+            });
+        }
+        if self.op_journal.len() > MAX_OP_JOURNAL_ENTRIES {
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("op journal exceeds {MAX_OP_JOURNAL_ENTRIES} entry budget"),
+            });
+        }
         write_json(
             &self.paths.state_dir.join("op-journal.json"),
             &self.op_journal,
@@ -657,6 +676,14 @@ impl DaemonRuntime {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: format!("idempotency key {key} is already reserved"),
+            });
+        }
+        if self.op_journal.len() >= MAX_OP_JOURNAL_ENTRIES {
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!(
+                    "op journal at capacity ({MAX_OP_JOURNAL_ENTRIES}); refuse new idempotency key"
+                ),
             });
         }
         let snapshot = self.op_journal.clone();
@@ -2639,14 +2666,80 @@ fn policy_from_file(file: &PolicyFile) -> PolicyDocument {
     preset_document(preset)
 }
 
+/// Hard ceilings for durable op-journal state (count + file bytes).
+const MAX_OP_JOURNAL_ENTRIES: usize = 4_096;
+const MAX_OP_JOURNAL_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OP_JOURNAL_VALUE_BYTES: usize = 64 * 1024;
+
 fn load_op_journal(path: &Path) -> Result<HashMap<String, Value>, String> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let raw = std::fs::read_to_string(path)
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("failed to stat operation journal {}: {e}", path.display()))?;
+    if meta.len() as usize > MAX_OP_JOURNAL_FILE_BYTES {
+        return Err(format!(
+            "operation journal {} exceeds {MAX_OP_JOURNAL_FILE_BYTES} byte budget ({})",
+            path.display(),
+            meta.len()
+        ));
+    }
+    let raw = std::fs::read(path)
         .map_err(|e| format!("failed to read operation journal {}: {e}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| format!("corrupt operation journal {}: {e}", path.display()))
+    if raw.len() > MAX_OP_JOURNAL_FILE_BYTES {
+        return Err(format!(
+            "operation journal {} exceeds {MAX_OP_JOURNAL_FILE_BYTES} byte budget",
+            path.display()
+        ));
+    }
+    let parsed: HashMap<String, Value> = serde_json::from_slice(&raw)
+        .map_err(|e| format!("corrupt operation journal {}: {e}", path.display()))?;
+    bound_op_journal(parsed)
+}
+
+fn bound_op_journal(mut journal: HashMap<String, Value>) -> Result<HashMap<String, Value>, String> {
+    if journal.len() > MAX_OP_JOURNAL_ENTRIES {
+        return Err(format!(
+            "operation journal exceeds {MAX_OP_JOURNAL_ENTRIES} entry budget ({})",
+            journal.len()
+        ));
+    }
+    for (key, value) in &mut journal {
+        let bytes = serde_json::to_vec(value)
+            .map_err(|e| format!("operation journal value serialize failed for {key}: {e}"))?;
+        if bytes.len() > MAX_OP_JOURNAL_VALUE_BYTES {
+            // Retain a compact non-retriable receipt so exact-once is preserved.
+            let status = value
+                .get("status")
+                .cloned()
+                .unwrap_or_else(|| json!("completed"));
+            let operation_id = value.get("operation_id").cloned();
+            let state = value.get(OP_JOURNAL_STATE_FIELD).cloned();
+            let mut compact = json!({
+                "durable_receipt": true,
+                "truncated": true,
+                "status": status,
+                "note": "op-journal entry exceeded durable value budget"
+            });
+            if let Some(obj) = compact.as_object_mut() {
+                if let Some(oid) = operation_id {
+                    obj.insert("operation_id".into(), oid);
+                }
+                if let Some(st) = state {
+                    obj.insert(OP_JOURNAL_STATE_FIELD.into(), st);
+                }
+            }
+            *value = compact;
+        }
+    }
+    let encoded = serde_json::to_vec(&journal)
+        .map_err(|e| format!("operation journal re-encode failed: {e}"))?;
+    if encoded.len() > MAX_OP_JOURNAL_FILE_BYTES {
+        return Err(format!(
+            "operation journal exceeds {MAX_OP_JOURNAL_FILE_BYTES} byte budget after compaction"
+        ));
+    }
+    Ok(journal)
 }
 
 fn load_grants(path: &Path) -> Vec<TemporaryGrant> {

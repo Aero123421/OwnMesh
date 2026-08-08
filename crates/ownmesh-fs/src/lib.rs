@@ -227,19 +227,95 @@ pub struct DirListPage {
 const MAX_NAME_CHARS: usize = 512;
 const MAX_PATH_CHARS: usize = 4096;
 
-fn encode_list_cursor(name: &str) -> String {
-    // Cursor is the exclusive lower bound name (UTF-8, name-ordered).
-    format!("name:{name}")
+/// Opaque cursor binding the full sort tuple `(name, path)` plus a version tag.
+/// Format: `v1:<base64url(name)>.<base64url(path)>` so duplicate names across
+/// directories do not skip later entries when paging recursively.
+fn encode_list_cursor(name: &str, path: &str) -> String {
+    format!(
+        "v1:{}.{}",
+        base64url_nopad(name.as_bytes()),
+        base64url_nopad(path.as_bytes())
+    )
 }
 
-fn decode_list_cursor(cursor: Option<&str>) -> Option<String> {
+fn decode_list_cursor(cursor: Option<&str>) -> Option<(String, String)> {
     let raw = cursor?.trim();
     if raw.is_empty() {
         return None;
     }
-    raw.strip_prefix("name:")
-        .map(str::to_owned)
-        .or_else(|| Some(raw.to_owned()))
+    if let Some(rest) = raw.strip_prefix("v1:") {
+        let (name_b64, path_b64) = rest.split_once('.')?;
+        let name = String::from_utf8(base64url_decode_nopad(name_b64)?).ok()?;
+        let path = String::from_utf8(base64url_decode_nopad(path_b64)?).ok()?;
+        return Some((name, path));
+    }
+    // Legacy name-only cursors: treat path as empty so comparison still advances
+    // past the name, accepting that duplicate names may have been skipped before.
+    if let Some(name) = raw.strip_prefix("name:") {
+        return Some((name.to_owned(), String::new()));
+    }
+    Some((raw.to_owned(), String::new()))
+}
+
+fn base64url_nopad(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let b1 = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+        let b2 = if i + 2 < bytes.len() { bytes[i + 2] } else { 0 };
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if i + 2 < bytes.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        }
+        i += 3;
+    }
+    out
+}
+
+fn base64url_decode_nopad(input: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(bytes.len().div_ceil(4) * 3);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        if remaining == 1 {
+            return None;
+        }
+        let s0 = sextet(bytes[offset])?;
+        let s1 = sextet(bytes[offset + 1])?;
+        out.push((s0 << 2) | (s1 >> 4));
+        if remaining == 2 {
+            break;
+        }
+        let s2 = sextet(bytes[offset + 2])?;
+        out.push(((s1 & 0x0f) << 4) | (s2 >> 2));
+        if remaining == 3 {
+            break;
+        }
+        let s3 = sextet(bytes[offset + 3])?;
+        out.push(((s2 & 0x03) << 6) | s3);
+        offset += 4;
+    }
+    Some(out)
 }
 
 fn entry_within_budgets(entry: &DirEntryInfo) -> bool {
@@ -346,8 +422,12 @@ pub fn list_dir_page(
         }
     }
     collected.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
-    if let Some(after_name) = after.as_deref() {
-        collected.retain(|e| e.name.as_str() > after_name);
+    if let Some((after_name, after_path)) = after.as_ref() {
+        collected.retain(|e| {
+            // Exclusive lower bound on the full (name, path) sort tuple.
+            e.name.as_str() > after_name.as_str()
+                || (e.name.as_str() == after_name.as_str() && e.path.as_str() > after_path.as_str())
+        });
     }
     let total_matched = collected.len();
     let truncated = total_matched > limit;
@@ -355,7 +435,9 @@ pub fn list_dir_page(
         collected.truncate(limit);
     }
     let next_cursor = if truncated {
-        collected.last().map(|e| encode_list_cursor(&e.name))
+        collected
+            .last()
+            .map(|e| encode_list_cursor(&e.name, &e.path))
     } else {
         None
     };
@@ -727,5 +809,41 @@ mod tests {
         assert!(looks_sensitive(Path::new("/tmp/.key")));
         assert!(looks_sensitive(Path::new("/tmp/.pem")));
         assert!(!looks_sensitive(Path::new("/tmp/readme.md")));
+    }
+
+    #[test]
+    fn list_page_cursor_preserves_duplicate_names_across_dirs() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        // Same basename in two directories — sort is (name, path).
+        write_file(&ws, "dir_a/dup.txt", b"a").unwrap();
+        write_file(&ws, "dir_b/dup.txt", b"b").unwrap();
+        write_file(&ws, "zzz.txt", b"z").unwrap();
+
+        let page1 = list_dir_page(&ws, "", true, 1, None).unwrap();
+        assert_eq!(page1.entries.len(), 1);
+        assert!(page1.truncated);
+        let cursor = page1.next_cursor.expect("page1 cursor");
+        assert!(cursor.starts_with("v1:"), "cursor={cursor}");
+
+        let page2 = list_dir_page(&ws, "", true, 10, Some(cursor.as_str())).unwrap();
+        // Must still see the second dup.txt and zzz.txt (not drop same-named entry).
+        let names: Vec<&str> = page2.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"dup.txt"),
+            "second page lost duplicate name: {names:?} page1={:?}",
+            page1.entries
+        );
+        let all_paths: std::collections::HashSet<String> = page1
+            .entries
+            .iter()
+            .chain(page2.entries.iter())
+            .map(|e| e.path.clone())
+            .collect();
+        assert!(
+            all_paths.iter().any(|p| p.contains("dir_a"))
+                && all_paths.iter().any(|p| p.contains("dir_b")),
+            "both dup paths must appear across pages: {all_paths:?}"
+        );
     }
 }

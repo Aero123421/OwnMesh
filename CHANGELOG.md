@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.0-beta.5+ — E3 crash-safe dispatch + durable bounds
+
+- Durable MCP dispatch outbox: claim stores exact route body; retries redeliver when Worker dies after claim and before DeviceRoom inject; clients never see the outbox
+- Idempotency tombstones are never evicted under quota pressure before the 30-day window; overflow fails closed
+- Agent transport completed-reply aggregate byte budget + compact durable receipts; transport state file size cap
+- ownmeshd op-journal entry/file/value budgets with fail-closed capacity (no unbounded `read_to_string`)
+- Directory list cursors bind full `(name, path)` sort tuple so recursive duplicate basenames are not skipped
+- Gate entrypoint: `scripts/tests/test_v12_e2_e9_workerd_loopback.py` (runs real E2/E3 binary×workerd proof)
+- E4–E9 remain open (workspace CRUD/TOCTOU, cloud PTY, profiles, patch/Git, broker, transfer)
+
 ## v1.2.0-beta.4 — E3 action binding + bounded I/O (integrity hardening)
 
 - Server-computed `payload_hash` binds action facts + operation_id + expires_at + claim_version + OAuth client

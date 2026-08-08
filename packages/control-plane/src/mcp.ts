@@ -945,22 +945,154 @@ function mcpError(
   return json({ jsonrpc: "2.0", id: id ?? null, error: { code, message, data } });
 }
 
+/** Durable prepare→dispatch outbox key (never returned to MCP clients). */
+export const DISPATCH_OUTBOX_KEY = "__ownmesh_dispatch_outbox";
+
+export type DispatchOutboxBody = {
+  type: string;
+  payload: Record<string, unknown>;
+  correlation_id: string;
+  expires_at?: string;
+  claim_version?: number;
+  oauth_client_id?: string | null;
+};
+
+export type DispatchOutbox = {
+  state: "pending" | "dispatched";
+  body: DispatchOutboxBody;
+  attempts?: number;
+};
+
+export function buildDispatchOutbox(deviceOp: {
+  type: string;
+  payload: Record<string, unknown>;
+  correlation_id: string;
+  expires_at?: string;
+  claim_version?: number;
+  oauth_client_id?: string | null;
+}): DispatchOutbox {
+  return {
+    state: "pending",
+    attempts: 0,
+    body: {
+      type: deviceOp.type,
+      payload: deviceOp.payload,
+      correlation_id: deviceOp.correlation_id,
+      expires_at: deviceOp.expires_at,
+      claim_version: deviceOp.claim_version,
+      oauth_client_id: deviceOp.oauth_client_id ?? null,
+    },
+  };
+}
+
+export function readDispatchOutbox(data: Record<string, unknown> | null | undefined): DispatchOutbox | null {
+  if (!data || typeof data !== "object") return null;
+  const raw = data[DISPATCH_OUTBOX_KEY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const state = obj.state === "dispatched" ? "dispatched" : obj.state === "pending" ? "pending" : null;
+  const body = obj.body;
+  if (!state || !body || typeof body !== "object" || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  if (typeof b.type !== "string" || typeof b.correlation_id !== "string") return null;
+  if (!b.payload || typeof b.payload !== "object" || Array.isArray(b.payload)) return null;
+  return {
+    state,
+    attempts: Number.isFinite(Number(obj.attempts)) ? Number(obj.attempts) : 0,
+    body: {
+      type: b.type,
+      payload: { ...(b.payload as Record<string, unknown>) },
+      correlation_id: b.correlation_id,
+      expires_at: typeof b.expires_at === "string" ? b.expires_at : undefined,
+      claim_version: Number.isFinite(Number(b.claim_version)) ? Number(b.claim_version) : undefined,
+      oauth_client_id:
+        b.oauth_client_id === null || typeof b.oauth_client_id === "string"
+          ? (b.oauth_client_id as string | null)
+          : null,
+    },
+  };
+}
+
+/** True when a non-terminal claim still needs (re)dispatch of the bound body. */
+export function needsDispatchRedelivery(op: {
+  status: string;
+  data?: Record<string, unknown> | null;
+}): boolean {
+  const terminal = new Set([
+    "completed",
+    "failed",
+    "denied",
+    "cancelled",
+    "device_offline",
+    "tombstone",
+    "approval_required",
+  ]);
+  if (terminal.has(op.status)) return false;
+  const box = readDispatchOutbox(op.data || {});
+  // Missing outbox on legacy rows is not redelivered (cannot reconstruct body).
+  if (!box) return false;
+  return box.state === "pending";
+}
+
+export function withDispatchOutbox(
+  data: Record<string, unknown>,
+  outbox: DispatchOutbox,
+): Record<string, unknown> {
+  return { ...data, [DISPATCH_OUTBOX_KEY]: outbox };
+}
+
+export function markDispatchOutboxDispatched(
+  data: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  const base = { ...(data || {}) };
+  const box = readDispatchOutbox(base);
+  if (!box) return base;
+  base[DISPATCH_OUTBOX_KEY] = {
+    ...box,
+    state: "dispatched",
+    attempts: (box.attempts || 0) + 1,
+  };
+  return base;
+}
+
+/** Strip internal dispatch outbox before any client-facing envelope. */
+export function stripDispatchOutbox(
+  data: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  if (!data || typeof data !== "object") return {};
+  const next = { ...data };
+  delete next[DISPATCH_OUTBOX_KEY];
+  return next;
+}
+
+function publicTrackedView(op: TrackedOperation): TrackedOperation {
+  return {
+    ...op,
+    data: stripDispatchOutbox(op.data || {}),
+  };
+}
+
 function toolContent(envelope: OwnMeshResultEnvelope) {
   // structuredContent is the source of truth; text is a short summary for humans.
+  // Never leak the durable dispatch outbox body to MCP clients.
+  const publicEnvelope: OwnMeshResultEnvelope = {
+    ...envelope,
+    data: stripDispatchOutbox(envelope.data || {}),
+  };
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify(envelope),
+        text: JSON.stringify(publicEnvelope),
       },
     ],
-    structuredContent: envelope,
-    isError: envelope.status === "failed" || envelope.status === "denied",
+    structuredContent: publicEnvelope,
+    isError: publicEnvelope.status === "failed" || publicEnvelope.status === "denied",
     _meta: {
       ownmesh: {
-        approval_required: envelope.approval_required,
+        approval_required: publicEnvelope.approval_required,
         policy_authority: "ownmesh_device",
-        operation_id: envelope.operation_id,
+        operation_id: publicEnvelope.operation_id,
       },
     },
   };
@@ -1949,21 +2081,25 @@ export async function handleMcp(
     });
     const actionHash = await hashCanonicalAction(deviceOp.canonical_action);
 
+    const dispatchOutbox = buildDispatchOutbox(deviceOp);
     const trackBase: TrackedOperation = {
       ...makeEnvelope({
         operation_id: operationId,
         status: wantAsync ? "pending" : "running",
         device_id: deviceId,
         summary: wantAsync ? "operation accepted (async)" : "routing to device",
-        data: {
-          tool: name,
-          op: opType,
-          capability: deviceOp.payload.capability,
-          payload_hash: deviceOp.payload_hash,
-          oauth_client_id: deviceOp.oauth_client_id,
-          claim_version: deviceOp.claim_version,
-          expires_at: deviceOp.expires_at,
-        },
+        data: withDispatchOutbox(
+          {
+            tool: name,
+            op: opType,
+            capability: deviceOp.payload.capability,
+            payload_hash: deviceOp.payload_hash,
+            oauth_client_id: deviceOp.oauth_client_id,
+            claim_version: deviceOp.claim_version,
+            expires_at: deviceOp.expires_at,
+          },
+          dispatchOutbox,
+        ),
         correlation_id: correlation,
         warnings: injectWarnings,
       }),
@@ -2071,9 +2207,51 @@ export async function handleMcp(
         });
         return mcpResult(id, toolContent(env));
       }
-      const replayed = trackedFromRecord(prior);
+      let replayed = trackedFromRecord(prior);
       tracker.put(replayed);
-      return mcpResult(id, toolContent(replayed));
+      // E3 crash-safe dispatch: if the claim was accepted but never marked
+      // dispatched, redeliver the original bound body exactly once per retry.
+      if (router && needsDispatchRedelivery(replayed)) {
+        const box = readDispatchOutbox(replayed.data || {});
+        if (box) {
+          const redelivered = await router.routeToDevice(deviceId, box.body);
+          if (
+            redelivered.status === "routed_to_device" ||
+            redelivered.status === "pending" ||
+            redelivered.status === "running" ||
+            redelivered.status === "completed" ||
+            redelivered.status === "approval_required" ||
+            redelivered.status === "denied" ||
+            redelivered.status === "device_offline"
+          ) {
+            const marked = await patchOp(
+              store,
+              tracker,
+              replayed.operation_id,
+              {
+                data: markDispatchOutboxDispatched(replayed.data || {}),
+                status:
+                  redelivered.status === "device_offline"
+                    ? "device_offline"
+                    : redelivered.status === "approval_required"
+                      ? "approval_required"
+                      : redelivered.status === "denied"
+                        ? "denied"
+                        : redelivered.status === "completed"
+                          ? "completed"
+                          : replayed.status,
+                summary:
+                  redelivered.status === "device_offline"
+                    ? "device offline"
+                    : replayed.summary || "routing to device",
+              },
+              ["pending", "running", "cancel_requested"],
+            );
+            if (marked) replayed = marked;
+          }
+        }
+      }
+      return mcpResult(id, toolContent(publicTrackedView(replayed)));
     }
 
     tracker.put(trackBase);
@@ -2115,6 +2293,28 @@ export async function handleMcp(
     }
 
     const routed = await router.routeToDevice(deviceId, deviceOp);
+    // Mark durable outbox dispatched only after the DeviceRoom inject attempt returns
+    // a status that means the body was accepted into the routing surface (or terminal).
+    if (
+      routed.status === "routed_to_device" ||
+      routed.status === "pending" ||
+      routed.status === "running" ||
+      routed.status === "completed" ||
+      routed.status === "approval_required" ||
+      routed.status === "denied"
+    ) {
+      const marked = await patchOp(
+        store,
+        tracker,
+        operationId,
+        { data: markDispatchOutboxDispatched(trackBase.data || {}) },
+        ["pending", "running"],
+      );
+      if (marked) {
+        trackBase.data = marked.data;
+        tracker.put({ ...trackBase, data: marked.data, updated_at: marked.updated_at });
+      }
+    }
 
     if (
       routed.status === "unavailable" ||
@@ -2336,16 +2536,28 @@ export async function handleMcp(
 
     // Default: accepted / routed — async pattern
     const status: OpStatus = wantAsync || isMutating ? "pending" : "pending";
+    // Preserve durable dispatch outbox (already marked dispatched) under the
+    // public route metadata so crash recovery never loses the bound body.
+    const pendingData = withDispatchOutbox(
+      {
+        op: name,
+        route: routed,
+        next: "Poll ownmesh_get_operation or wait for device result. Device policy is final.",
+        tool: name,
+        capability: deviceOp.payload.capability,
+        payload_hash: deviceOp.payload_hash,
+      },
+      {
+        ...(readDispatchOutbox(trackBase.data) || dispatchOutbox),
+        state: "dispatched",
+      },
+    );
     const env = makeEnvelope({
       operation_id: operationId,
       status,
       device_id: deviceId,
       summary: "routed_to_device",
-      data: {
-        op: name,
-        route: routed,
-        next: "Poll ownmesh_get_operation or wait for device result. Device policy is final.",
-      },
+      data: pendingData,
       correlation_id: correlation,
       approval_required: false,
       warnings: injectWarnings,

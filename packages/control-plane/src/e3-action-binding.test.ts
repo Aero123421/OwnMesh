@@ -11,11 +11,17 @@ import {
   bindCanonicalAction,
   buildCanonicalAction,
   buildDeviceOperation,
+  buildDispatchOutbox,
   handleMcp,
+  needsDispatchRedelivery,
   normalizeCommandEnv,
+  readDispatchOutbox,
   sanitizeMcpArgs,
+  stripDispatchOutbox,
+  withDispatchOutbox,
   MCP_MAX_OUTPUT_BYTES,
   MCP_MAX_TIMEOUT_MS,
+  DISPATCH_OUTBOX_KEY,
   type OperationRouter,
 } from "./mcp.ts";
 import {
@@ -23,6 +29,8 @@ import {
   SqlStore,
   MCP_OPS_MAX_DATA_JSON_BYTES,
   MCP_OPS_MAX_PER_TENANT,
+  MCP_OPS_RESULT_TTL_MS,
+  MCP_OPS_TOMBSTONE_TTL_MS,
   boundMcpOperationRecord,
   type SqlDatabase,
   type SqlStatement,
@@ -623,4 +631,228 @@ test("durable MCP operation records bound oversized data and enforce tenant quot
   });
   assert.equal(claim.outcome, "existing");
   assert.equal(claim.op.operation_id, "op_q_0");
+});
+
+test("dispatch outbox: crash after claim before route is redelivered on retry", async () => {
+  const store = new MemoryStore();
+  const token = await seedAuthed(store);
+  const deviceId = "dev_dispatch_outbox";
+  await putActiveDevice(store, deviceId);
+
+  let routeCalls = 0;
+  const bodies: string[] = [];
+  const router: OperationRouter = {
+    async routeToDevice(_id, op) {
+      routeCalls += 1;
+      bodies.push(JSON.stringify(op.payload));
+      return { status: "routed_to_device", detail: { recipients: 1 } };
+    },
+  };
+
+  // Pre-seed an accepted claim with pending dispatch outbox (Worker died post-claim).
+  const deviceOp = await buildDeviceOperation({
+    toolName: "ownmesh_fs_write",
+    args: {
+      device_id: deviceId,
+      path: "crash.txt",
+      content: "after-crash",
+      idempotency_key: "idem_crash_dispatch",
+    },
+    operationId: "op_crash_dispatch_1",
+    deviceId,
+    principalId: "prin_dev",
+    tenantId: "ten_default",
+    expiresAt: new Date(Date.now() + 300_000).toISOString(),
+    claimVersion: 1,
+    oauthClientId: "client_mcp",
+  });
+  const outbox = buildDispatchOutbox(deviceOp);
+  assert.equal(outbox.state, "pending");
+  assert.equal(needsDispatchRedelivery({ status: "pending", data: withDispatchOutbox({}, outbox) }), true);
+
+  await store.putMcpOperation({
+    operation_id: deviceOp.correlation_id,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "pending",
+    summary: "operation accepted (async)",
+    data: withDispatchOutbox(
+      {
+        tool: "ownmesh_fs_write",
+        payload_hash: deviceOp.payload_hash,
+      },
+      outbox,
+    ),
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: deviceOp.correlation_id,
+    payload_hash: deviceOp.payload_hash,
+    idempotency_key: "idem_crash_dispatch",
+    expires_at: deviceOp.expires_at,
+    claim_version: 1,
+    action: deviceOp.canonical_action,
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  const callWrite = async (id: number) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_fs_write",
+            arguments: {
+              device_id: deviceId,
+              path: "crash.txt",
+              content: "after-crash",
+              async: true,
+              idempotency_key: "idem_crash_dispatch",
+            },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      { routeToDevice: router.routeToDevice },
+      { issuer: "https://cp.test" },
+    );
+
+  // Retry identical action — must redeliver the bound body exactly once path.
+  const retry = await callWrite(1);
+  const retryBody = (await retry.json()) as {
+    result?: { structuredContent?: { operation_id?: string; data?: Record<string, unknown> } };
+    error?: unknown;
+  };
+  assert.equal(retryBody.error, undefined);
+  assert.equal(routeCalls, 1, "pending outbox must be redelivered on retry");
+  assert.equal(bodies.length, 1);
+  assert.match(bodies[0]!, /after-crash/);
+
+  const sc = retryBody.result?.structuredContent;
+  assert.equal(sc?.operation_id, "op_crash_dispatch_1");
+  // Client must never see the internal outbox key.
+  assert.equal(sc?.data?.[DISPATCH_OUTBOX_KEY], undefined);
+  assert.equal(stripDispatchOutbox(sc?.data || {})[DISPATCH_OUTBOX_KEY], undefined);
+
+  const stored = await store.getMcpOperation("op_crash_dispatch_1");
+  const storedBox = readDispatchOutbox(stored?.data || {});
+  assert.equal(storedBox?.state, "dispatched");
+
+  // Second retry must NOT re-route (already dispatched).
+  const retry2 = await callWrite(2);
+  const retry2Body = (await retry2.json()) as { error?: unknown };
+  assert.equal(retry2Body.error, undefined);
+  assert.equal(routeCalls, 1, "dispatched outbox must not re-route");
+});
+
+test("idempotency tombstones are retained under quota until 30-day window closes", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const tenant = "ten_tomb";
+  const principal = "prin_tomb";
+  const device = "dev_tomb";
+  const now = Date.now();
+
+  // Fill tenant to capacity with completed ops aged >7d so they compact to tombstones.
+  for (let i = 0; i < MCP_OPS_MAX_PER_TENANT; i++) {
+    const created = new Date(now - MCP_OPS_RESULT_TTL_MS - 60_000).toISOString();
+    await store.putMcpOperation({
+      operation_id: `op_tomb_${i}`,
+      tenant_id: tenant,
+      principal_id: principal,
+      device_id: device,
+      tool: "ownmesh_fs_write",
+      status: "completed",
+      summary: "done",
+      data: { i },
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      payload_hash: `ph_${i}`,
+      idempotency_key: `idem_tomb_${i}`,
+      action: { tool: "ownmesh_fs_write", i },
+      policy_authority: "ownmesh_device",
+      created_at: created,
+      updated_at: created,
+    });
+  }
+
+  // Trigger compaction via a same-tenant claim attempt that must fail closed on quota
+  // without deleting unexpired tombstones.
+  await assert.rejects(
+    () =>
+      store.putMcpOperation({
+        operation_id: "op_tomb_overflow",
+        tenant_id: tenant,
+        principal_id: principal,
+        device_id: device,
+        tool: "ownmesh_fs_stat",
+        status: "pending",
+        summary: "no",
+        data: {},
+        truncated: false,
+        next_cursor: null,
+        approval_required: false,
+        warnings: [],
+        idempotency_key: "idem_tomb_overflow",
+        policy_authority: "ownmesh_device",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }),
+    /mcp_operation_quota_exceeded/,
+  );
+
+  // Original key still resolves (tombstone retained inside 30d window).
+  const existing = await store.getMcpOperationByIdempotency({
+    principalId: principal,
+    tenantId: tenant,
+    deviceId: device,
+    idempotencyKey: "idem_tomb_0",
+  });
+  assert.ok(existing, "unexpired idempotency receipt must survive quota pressure");
+  assert.ok(
+    existing.status === "tombstone" || existing.status === "completed",
+    `status=${existing.status}`,
+  );
+  assert.equal(existing.idempotency_key, "idem_tomb_0");
+
+  // Same-key claim still returns the owner rather than minting a new side effect.
+  const claim = await store.claimMcpOperationByIdempotency({
+    operation_id: "op_tomb_0_retry",
+    tenant_id: tenant,
+    principal_id: principal,
+    device_id: device,
+    tool: "ownmesh_fs_write",
+    status: "pending",
+    summary: "retry",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    idempotency_key: "idem_tomb_0",
+    action: { tool: "ownmesh_fs_write", i: 0 },
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  assert.equal(claim.outcome, "existing");
+  assert.equal(claim.op.operation_id, "op_tomb_0");
+
+  // Hard-expired tombstone (>30d) may be deleted; prove window constant is authoritative.
+  assert.ok(MCP_OPS_TOMBSTONE_TTL_MS > MCP_OPS_RESULT_TTL_MS);
 });

@@ -1171,6 +1171,7 @@ export class MemoryStore implements ControlPlaneStore {
     const tenantOps = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
     for (const op of tenantOps) {
       const age = mcpOpAgeMs(op, now);
+      // Only hard-delete tombstones past the full idempotency window (30d).
       if (op.status === "tombstone" && age > MCP_OPS_TOMBSTONE_TTL_MS) {
         this.mcpOperations.delete(op.operation_id);
         continue;
@@ -1184,6 +1185,8 @@ export class MemoryStore implements ControlPlaneStore {
             tombstone: true,
             prior_status: op.status,
             payload_hash: op.payload_hash ?? null,
+            // Preserve compact action binding for same-key retry within 30d window.
+            idempotency_key: op.idempotency_key ?? null,
           },
           truncated: true,
           warnings: ["durable_result_tombstoned"],
@@ -1193,20 +1196,10 @@ export class MemoryStore implements ControlPlaneStore {
     }
     const remaining = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
     if (remaining.length < MCP_OPS_MAX_PER_TENANT) return;
-    // Prefer deleting oldest hard-expired tombstones first, then fail closed.
-    const tombstones = remaining
-      .filter((o) => o.status === "tombstone")
-      .sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at)));
-    for (const t of tombstones) {
-      if ([...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId).length < MCP_OPS_MAX_PER_TENANT) {
-        break;
-      }
-      this.mcpOperations.delete(t.operation_id);
-    }
-    const finalCount = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId).length;
-    if (finalCount >= MCP_OPS_MAX_PER_TENANT) {
-      throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
-    }
+    // E3: never evict unexpired idempotency receipts under quota pressure.
+    // Only hard-expired tombstones (already removed above) free capacity; otherwise
+    // reject new distinct operations fail-closed.
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
   }
 
   /** Create-only: refuses to overwrite an existing operation_id or idempotency binding. */
@@ -2747,30 +2740,10 @@ export class SqlStore implements ControlPlaneStore {
     const count = Number(countRow?.c ?? 0);
     if (count < MCP_OPS_MAX_PER_TENANT) return;
 
-    // Under pressure, drop oldest tombstones only (never live/non-terminal).
-    const overflow = count - MCP_OPS_MAX_PER_TENANT + 1;
-    if (overflow > 0) {
-      await this.db
-        .prepare(
-          `DELETE FROM mcp_operations
-           WHERE operation_id IN (
-             SELECT operation_id FROM mcp_operations
-             WHERE tenant_id = ? AND status = 'tombstone'
-             ORDER BY updated_at ASC
-             LIMIT ?
-           )`,
-        )
-        .bind(tenantId, overflow)
-        .run();
-    }
-
-    const after = await this.db
-      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
-      .bind(tenantId)
-      .first<{ c: number }>();
-    if (Number(after?.c ?? 0) >= MCP_OPS_MAX_PER_TENANT) {
-      throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
-    }
+    // E3: never evict unexpired idempotency receipts (including <30d tombstones)
+    // under quota pressure. Ancient tombstones were already hard-deleted above;
+    // remaining overflow must fail closed rather than enable side-effect replay.
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
   }
 
   /** Create-only INSERT. Conflict (existing operation_id) fails — never REPLACE. */

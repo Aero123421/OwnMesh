@@ -38,8 +38,14 @@ const TRANSPORT_STATE_FILE: &str = "agent-transport-state.json";
 const LOOPBACK_TEST_KEYCHAIN_SERVICE_ENV: &str = "OWNMESH_LOOPBACK_TEST_KEYCHAIN_SERVICE";
 const MAX_REPLAY_ENTRIES: usize = 4096;
 const MAX_COMPLETED_REPLIES: usize = 1024;
+/// Aggregate UTF-8 budget for durable completed_replies payloads (not per-entry).
+const MAX_COMPLETED_REPLIES_BYTES: usize = 4 * 1024 * 1024;
+/// Per-entry compact receipt when a full result would blow the aggregate budget.
+const MAX_COMPLETED_REPLY_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PAYLOAD_BYTES: usize = 1_000_000;
+/// Reject transport state files larger than this before deserialize.
+const MAX_TRANSPORT_STATE_FILE_BYTES: usize = 8 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
@@ -201,6 +207,11 @@ impl AgentTransportState {
             }
             Err(error) => return Err(format!("read transport state: {error}")),
         };
+        if bytes.len() > MAX_TRANSPORT_STATE_FILE_BYTES {
+            return Err(format!(
+                "transport state exceeds {MAX_TRANSPORT_STATE_FILE_BYTES} byte budget"
+            ));
+        }
         let mut state: Self = serde_json::from_slice(&bytes)
             .map_err(|error| format!("transport state is corrupt: {error}"))?;
         if state.version != TRANSPORT_STATE_VERSION {
@@ -219,12 +230,18 @@ impl AgentTransportState {
         }
         trim_front(&mut state.seen_message_ids, MAX_REPLAY_ENTRIES);
         trim_front(&mut state.completed_replies, MAX_COMPLETED_REPLIES);
+        state.enforce_completed_reply_budgets();
         Ok(state)
     }
 
     fn save(&self, path: &Path) -> Result<(), String> {
         let mut bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| format!("serialize transport state: {error}"))?;
+        if bytes.len() > MAX_TRANSPORT_STATE_FILE_BYTES {
+            return Err(format!(
+                "transport state serialize exceeds {MAX_TRANSPORT_STATE_FILE_BYTES} byte budget"
+            ));
+        }
         bytes.push(b'\n');
         atomic_write(path, &bytes).map_err(|error| format!("persist transport state: {error}"))
     }
@@ -255,10 +272,91 @@ impl AgentTransportState {
     }
 
     fn remember_completed(&mut self, reply: CompletedReply) {
+        let compact = compact_completed_reply(reply);
         self.completed_replies
-            .retain(|candidate| candidate.correlation_id != reply.correlation_id);
-        self.completed_replies.push_back(reply);
+            .retain(|candidate| candidate.correlation_id != compact.correlation_id);
+        self.completed_replies.push_back(compact);
         trim_front(&mut self.completed_replies, MAX_COMPLETED_REPLIES);
+        self.enforce_completed_reply_budgets();
+    }
+
+    /// Compact oversize entries, then drop oldest until aggregate bytes fit.
+    /// Compact receipts retain status/operation_id for exact-once replay.
+    fn enforce_completed_reply_budgets(&mut self) {
+        let mut compacted = VecDeque::with_capacity(self.completed_replies.len());
+        while let Some(reply) = self.completed_replies.pop_front() {
+            compacted.push_back(compact_completed_reply(reply));
+        }
+        self.completed_replies = compacted;
+        while completed_replies_bytes(&self.completed_replies) > MAX_COMPLETED_REPLIES_BYTES {
+            let Some(oldest) = self.completed_replies.pop_front() else {
+                break;
+            };
+            let receipt = completion_receipt(&oldest);
+            let already_receipt = oldest.payload.get("durable_receipt") == Some(&Value::Bool(true));
+            if already_receipt {
+                // Oldest is already minimal; drop it to free budget.
+                continue;
+            }
+            // Re-queue compacted receipt at the front and re-check; if still over,
+            // next iteration drops it.
+            self.completed_replies.push_front(receipt);
+            if completed_replies_bytes(&self.completed_replies) > MAX_COMPLETED_REPLIES_BYTES {
+                let _ = self.completed_replies.pop_front();
+            }
+        }
+        trim_front(&mut self.completed_replies, MAX_COMPLETED_REPLIES);
+    }
+}
+
+fn completed_replies_bytes(replies: &VecDeque<CompletedReply>) -> usize {
+    replies
+        .iter()
+        .map(|reply| {
+            serde_json::to_vec(&reply.payload)
+                .map(|b| b.len())
+                .unwrap_or(0)
+                + reply.correlation_id.len()
+                + reply.operation_id.len()
+        })
+        .sum()
+}
+
+fn compact_completed_reply(reply: CompletedReply) -> CompletedReply {
+    let payload_bytes = serde_json::to_vec(&reply.payload)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if payload_bytes <= MAX_COMPLETED_REPLY_PAYLOAD_BYTES {
+        return reply;
+    }
+    completion_receipt(&reply)
+}
+
+fn completion_receipt(reply: &CompletedReply) -> CompletedReply {
+    let status = reply
+        .payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed")
+        .to_owned();
+    let error = reply.payload.get("error").cloned();
+    let mut payload = json!({
+        "operation_contract": OPERATION_CONTRACT_V1,
+        "operation_id": reply.operation_id,
+        "status": status,
+        "durable_receipt": true,
+        "truncated": true,
+        "note": "full result exceeded durable Agent reply budget; completion retained for exact-once replay"
+    });
+    if let Some(err) = error {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("error".into(), err);
+        }
+    }
+    CompletedReply {
+        correlation_id: reply.correlation_id.clone(),
+        operation_id: reply.operation_id.clone(),
+        payload,
     }
 }
 
