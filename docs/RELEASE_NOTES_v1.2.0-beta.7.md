@@ -16,13 +16,20 @@ Public MCP → local Wrangler/workerd → DeviceRoom → Agent WSS → ownmeshd:
 - Binary range + 512 KiB multi-chunk read
 - Resume / idempotency / cancel / required-key fail-closed
 - **workspace_id** selection (`ws_default` / `ws_alt`) with cross-root denial
-- **session.open** (metadata + controller lease; live PTY host still partial)
+- **session.open** + **session.attach(observer)** write-deny (metadata/lease; live PTY host still partial)
 
 ## Custody / bounds
 
 - Hardlink and cross-mount fail-closed in restricted mode
 - Directory pagination past 4_000+ entries without silent omission
-- Git capture streamed with stdout/stderr ceilings
+- Git capture concurrently drains stdout/stderr with hard caps + kill-on-timeout
+- Restricted presets (`workspace_only` / `recommended`) **deny `command.run`** until
+  OS process confinement exists (interpreter/absolute-path escape fail-closed)
+- Session attach `role=observer` demotes controller and cannot write/resize
+- Session replay/push enforce chunk, aggregate-byte, session-count, and file budgets
+- OAuth AS metadata omits `registration_endpoint` unless
+  `ALLOW_DYNAMIC_CLIENT_REGISTRATION=true` (docs match production default)
+- Package versions aligned to `1.2.0-beta.7` (schema included); release checker enforces
 
 ## Explicitly not claimed
 

@@ -352,7 +352,32 @@ def main() -> int:
     version_match = re.search(r'^version = "([^"]+)"', cargo, re.MULTILINE)
     require(version_match is not None, "workspace version is missing")
     if version_match:
-        current_notes = f"docs/RELEASE_NOTES_v{version_match.group(1)}.md"
+        ver = version_match.group(1)
+        # Keep package milestone versions aligned with the workspace release train.
+        root_pkg = read("package.json")
+        cp_pkg = read("packages/control-plane/package.json")
+        schema_pkg = read("packages/ownmesh-schema/package.json")
+        surfaces_txt = read("release/SUPPORTED_SURFACES.json")
+        for label, body in (
+            ("package.json", root_pkg),
+            ("packages/control-plane/package.json", cp_pkg),
+            ("packages/ownmesh-schema/package.json", schema_pkg),
+        ):
+            m = re.search(r'"version"\s*:\s*"([^"]+)"', body)
+            require(m is not None, f"{label} version missing")
+            if m:
+                require(
+                    m.group(1) == ver,
+                    f"{label} version {m.group(1)} must match workspace {ver}",
+                )
+        train = re.search(r'"release_train"\s*:\s*"([^"]+)"', surfaces_txt)
+        require(train is not None, "release/SUPPORTED_SURFACES.json release_train missing")
+        if train:
+            require(
+                train.group(1) == ver,
+                f"release_train {train.group(1)} must match workspace {ver}",
+            )
+        current_notes = f"docs/RELEASE_NOTES_v{ver}.md"
         require((ROOT / current_notes).is_file(), f"missing current release notes: {current_notes}")
         explicit_n = len(surfaces)
         total_n = explicit_n + len(additional)

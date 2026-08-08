@@ -2008,4 +2008,122 @@ mod tests {
         server.request_shutdown();
         let _ = handle.await;
     }
+
+    #[tokio::test]
+    async fn restricted_presets_fail_closed_on_command_escape() {
+        for preset in [AccessPreset::WorkspaceOnly, AccessPreset::Recommended] {
+            let dir = tempdir().unwrap();
+            let paths = OwnMeshPaths::for_base(dir.path());
+            let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+            let client = test_client(endpoint, paths.runtime_dir.clone());
+            {
+                let mut g = runtime.lock().await;
+                g.set_policy_for_test(preset_document(preset));
+            }
+
+            // Absolute cwd escape attempt.
+            let err = client
+                .call(
+                    methods::OPS_EXEC,
+                    Some(json!({
+                        "program": "echo",
+                        "args": ["escape"],
+                        "cwd": if cfg!(windows) { "C:\\" } else { "/" },
+                        "idempotency_key": format!("escape-cwd-{preset:?}"),
+                    })),
+                )
+                .await
+                .expect_err("restricted command must deny");
+            match err {
+                IpcError::Remote { code, message } => {
+                    assert_eq!(code, app_error::POLICY_DENIED, "{preset:?}: {message}");
+                    let lower = message.to_ascii_lowercase();
+                    assert!(
+                        lower.contains("confinement")
+                            || lower.contains("denied")
+                            || lower.contains("workspace"),
+                        "{preset:?}: {message}"
+                    );
+                }
+                other => panic!("{preset:?}: unexpected {other:?}"),
+            }
+
+            // Interpreter-style structured command with absolute path arg.
+            let err = client
+                .call(
+                    methods::OPS_EXEC,
+                    Some(json!({
+                        "kind": "structured",
+                        "program": if cfg!(windows) { "cmd" } else { "python3" },
+                        "args": if cfg!(windows) {
+                            json!(["/c", "type", "C:\\Windows\\win.ini"])
+                        } else {
+                            json!(["-c", "open('/etc/passwd').read()"])
+                        },
+                        "idempotency_key": format!("escape-interp-{preset:?}"),
+                    })),
+                )
+                .await
+                .expect_err("interpreter escape must deny");
+            match err {
+                IpcError::Remote { code, .. } => {
+                    assert_eq!(code, app_error::POLICY_DENIED, "{preset:?}");
+                }
+                other => panic!("{preset:?}: unexpected {other:?}"),
+            }
+
+            server.request_shutdown();
+            let _ = handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_observer_attach_cannot_write() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+        let client = test_client(endpoint, paths.runtime_dir.clone());
+
+        let opened = client
+            .call(
+                crate::runtime::session_methods::OPEN,
+                Some(json!({ "title": "obs-test", "kind": "pty" })),
+            )
+            .await
+            .expect("open");
+        let sid = opened["id"].as_str().unwrap().to_owned();
+
+        let attached = client
+            .call(
+                crate::runtime::session_methods::ATTACH,
+                Some(json!({
+                    "id": sid,
+                    "role": "observer",
+                })),
+            )
+            .await
+            .expect("observer attach");
+        assert_eq!(attached["read_only"], true);
+        assert_eq!(attached["role"], "observer");
+
+        let err = client
+            .call(
+                crate::runtime::session_methods::WRITE,
+                Some(json!({ "id": sid, "data": "nope" })),
+            )
+            .await
+            .expect_err("observer write");
+        match err {
+            IpcError::Remote { code, message } => {
+                assert!(
+                    code == app_error::CONFLICT || code == app_error::POLICY_DENIED,
+                    "code={code} message={message}"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        server.request_shutdown();
+        let _ = handle.await;
+    }
 }

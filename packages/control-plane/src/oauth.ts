@@ -63,12 +63,14 @@ function validScope(scope: string): boolean {
   return values.length > 0 && values.every((s) => SUPPORTED_SCOPES.has(s));
 }
 
-export function oauthMetadata(issuer: string) {
-  return {
+export function oauthMetadata(
+  issuer: string,
+  opts: { allowDynamicRegistration?: boolean } = {},
+) {
+  const meta: Record<string, unknown> = {
     issuer,
     authorization_endpoint: `${issuer}/oauth/authorize`,
     token_endpoint: `${issuer}/oauth/token`,
-    registration_endpoint: `${issuer}/oauth/register`,
     revocation_endpoint: `${issuer}/oauth/revoke`,
     device_authorization_endpoint: `${issuer}/oauth/device_authorization`,
     scopes_supported: [
@@ -89,6 +91,13 @@ export function oauthMetadata(issuer: string) {
     // Public clients + PKCE only. client_secret_post is neither advertised nor accepted.
     token_endpoint_auth_methods_supported: ["none"],
   };
+  // Only advertise DCR when the operator explicitly enables it. Production
+  // defaults keep registration_disabled so ChatGPT setup must use a pre-provisioned
+  // public client (or flip ALLOW_DYNAMIC_CLIENT_REGISTRATION=true).
+  if (opts.allowDynamicRegistration) {
+    meta.registration_endpoint = `${issuer}/oauth/register`;
+  }
+  return meta;
 }
 
 export function protectedResourceMetadata(resource: string) {

@@ -361,7 +361,9 @@ export default {
     }
 
     if (url.pathname === "/.well-known/oauth-authorization-server") {
-      return json(oauthMetadata(issuer));
+      return json(oauthMetadata(issuer, {
+        allowDynamicRegistration: env.ALLOW_DYNAMIC_CLIENT_REGISTRATION === "true",
+      }));
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") {
       return json(protectedResourceMetadata(issuer));

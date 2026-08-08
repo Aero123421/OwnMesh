@@ -1675,7 +1675,11 @@ export async function bindCanonicalAction(
 
 /** True when the tool can produce a side effect that must not silently re-run. */
 export function toolRequiresIdempotencyKey(tool: McpToolDef): boolean {
-  return tool.risk === "write" || tool.risk === "exec";
+  // Session mutations (open/attach/write/resize/close) need exact-once keys too.
+  // Read-only session.replay keeps risk=session but annotations.readOnlyHint=true.
+  if (tool.risk === "write" || tool.risk === "exec") return true;
+  if (tool.risk === "session" && !tool.annotations.readOnlyHint) return true;
+  return false;
 }
 
 /**

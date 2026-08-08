@@ -84,11 +84,12 @@ def main() -> int:
         "E3": "exact-action hash + durable idempotency/cancel claim (partial)",
         "E4": (
             "device workspaces.json + workspace_id selection + handle/hardlink "
-            "custody; CLI CRUD still unsupported"
+            "custody; restricted presets fail-closed on command.run until OS "
+            "confinement; CLI CRUD still unsupported"
         ),
         "E5": (
-            "remote session.open mapped through public MCP (metadata/lease); "
-            "live PTY host ownership still partial"
+            "remote session.open/attach(observer demote)/write-deny via public MCP; "
+            "bounded replay/chunk budgets; live PTY host ownership still partial"
         ),
         "E7": (
             "MCP git status/diff tools + bounded git capture foundation; "

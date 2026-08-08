@@ -1437,6 +1437,27 @@ fn map_request_to_method(
             if let Some(sid) = args.get("session_id").cloned() {
                 args.entry("id".to_owned()).or_insert(sid);
             }
+            // Normalize MCP role into a bound semantic field. Observer must never
+            // default into a controller claim (exact-action integrity).
+            match args.get("role").and_then(|v| v.as_str()).map(str::trim) {
+                Some("observer") => {
+                    args.insert("read_only".into(), Value::Bool(true));
+                }
+                Some("controller") => {
+                    args.insert("read_only".into(), Value::Bool(false));
+                }
+                Some(other) if !other.is_empty() => {
+                    return Err(format!(
+                        "session.attach role must be observer|controller (got '{other}')"
+                    ));
+                }
+                Some(_) | None => {
+                    // Accept explicit read_only only when role omitted (legacy IPC).
+                    if !args.contains_key("read_only") {
+                        return Err("session.attach requires role=observer|controller".into());
+                    }
+                }
+            }
             crate::runtime::session_methods::ATTACH
         }
         ("session.list" | "session", "session.list" | "ownmesh_session_list" | "list") => {
@@ -2495,5 +2516,53 @@ mod tests {
             payload["error"]["details"]["max_completion_queue"],
             MAX_COMPLETION_QUEUE as u64
         );
+    }
+
+    fn session_attach_request(role: Option<&str>) -> OperationRequestPayload {
+        let mut arguments = Map::new();
+        arguments.insert("action".into(), json!("session.attach"));
+        arguments.insert("session_id".into(), json!("ses_test1"));
+        if let Some(role) = role {
+            arguments.insert("role".into(), json!(role));
+        }
+        OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_ses_attach_1").unwrap(),
+            capability: "session.attach".into(),
+            workspace_id: None,
+            idempotency_key: "idem_ses_attach".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: Value::Object(arguments),
+        }
+    }
+
+    #[test]
+    fn session_attach_observer_maps_to_read_only_true() {
+        let (method, args) =
+            map_request_to_method(&session_attach_request(Some("observer"))).unwrap();
+        assert_eq!(method, crate::runtime::session_methods::ATTACH);
+        assert_eq!(args.get("read_only"), Some(&Value::Bool(true)));
+        assert_eq!(args.get("id"), Some(&json!("ses_test1")));
+    }
+
+    #[test]
+    fn session_attach_controller_maps_to_read_only_false() {
+        let (method, args) =
+            map_request_to_method(&session_attach_request(Some("controller"))).unwrap();
+        assert_eq!(method, crate::runtime::session_methods::ATTACH);
+        assert_eq!(args.get("read_only"), Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn session_attach_missing_role_fail_closed() {
+        let err = map_request_to_method(&session_attach_request(None)).unwrap_err();
+        assert!(err.contains("role"), "{err}");
+    }
+
+    #[test]
+    fn session_attach_invalid_role_fail_closed() {
+        let err = map_request_to_method(&session_attach_request(Some("admin"))).unwrap_err();
+        assert!(err.contains("observer|controller"), "{err}");
     }
 }

@@ -116,7 +116,7 @@ pub struct ApprovalRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PendingRequest {
-    Exec(ExecParams),
+    Exec(Box<ExecParams>),
     FsList(FsListParams),
     FsStat(FsStatParams),
     FsRead(FsReadParams),
@@ -140,6 +140,9 @@ pub struct ExecParams {
     pub args: Vec<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Registered device workspace id (cwd context / audit; confinement gate).
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     /// Optional bounded environment overlay (exact-action / policy fact).
     /// Keys/values are validated before spawn; never trusted as authority alone.
     #[serde(default)]
@@ -1322,8 +1325,34 @@ impl DaemonRuntime {
                 message: "program is required".into(),
             });
         }
+        // Restricted presets (workspace_only / recommended) cannot confine arbitrary
+        // process trees to registered workspace roots. Interpreters and absolute-path
+        // args escape cwd binding. Fail closed until OS-level confinement exists;
+        // filesystem.* tools remain the confined path. full_user_access / full_access
+        // intentionally allow user-scoped commands.
+        if self.enforce_workspace {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!(
+                    "command.run denied under {} until OS process confinement is available; \
+use filesystem.* tools within a registered workspace, or switch access mode to \
+full_user_access/full_access for arbitrary commands",
+                    preset_name(self.policy.preset)
+                ),
+            });
+        }
         // Resolve argv executables once, before classification, and persist that exact
         // canonical path with approvals/execution. Raw-shell command strings are not paths.
+        // Bind optional cwd to the selected workspace root as context when provided.
+        if let Some(ws_id) = p.workspace_id.clone() {
+            let ws = self.workspace_for(Some(ws_id.as_str()))?;
+            if let Some(cwd) = p.cwd.as_deref() {
+                let resolved = ws.resolve(Path::new(cwd)).map_err(fs_err)?;
+                p.cwd = Some(resolved.to_string_lossy().into_owned());
+            } else {
+                p.cwd = Some(ws.root().to_string_lossy().into_owned());
+            }
+        }
         let cwd = p.cwd.as_deref().map(Path::new);
         if matches!(
             CommandKind::parse_requested(p.kind.as_deref()),
@@ -1356,11 +1385,12 @@ impl DaemonRuntime {
             program: Some(p.program.clone()),
             elevated: p.elevated,
             path: p.cwd.clone(),
+            workspace_relative: false,
             executable_identity: p.executable_pin.as_ref().map(executable_identity_from_pin),
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::Exec(p), client)
+        self.gate_and_run(facts, key, PendingRequest::Exec(Box::new(p)), client)
             .await
     }
 
@@ -2064,17 +2094,20 @@ impl DaemonRuntime {
         let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
         let snapshot = self.sessions.clone();
-        let info = self.sessions.open_with(
-            kind,
-            title,
-            principal,
-            Self::now(),
-            p.profile_id,
-            None,
-            p.command,
-            p.cwd,
-            None,
-        );
+        let info = self
+            .sessions
+            .open_with(
+                kind,
+                title,
+                principal,
+                Self::now(),
+                p.profile_id,
+                None,
+                p.command,
+                p.cwd,
+                None,
+            )
+            .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
         serde_json::to_value(info).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
@@ -2124,18 +2157,57 @@ impl DaemonRuntime {
             id: String,
             #[serde(default)]
             principal: Option<String>,
+            /// MCP `role: observer|controller` (preferred exact-action field).
             #[serde(default)]
-            read_only: bool,
+            role: Option<String>,
+            /// Legacy boolean; ignored when `role` is present.
+            #[serde(default)]
+            read_only: Option<bool>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        // Normalize role into a bound semantic field. Missing/invalid roles fail closed
+        // so observer attach cannot silently escalate to controller claim.
+        let read_only = match p.role.as_deref().map(str::trim) {
+            Some("observer") => true,
+            Some("controller") => false,
+            Some(other) if !other.is_empty() => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: format!(
+                        "session.attach role must be observer|controller (got '{other}')"
+                    ),
+                });
+            }
+            Some(_) | None => match p.read_only {
+                Some(v) => v,
+                None => {
+                    return Err(IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: "session.attach requires role=observer|controller (or read_only)"
+                            .into(),
+                    });
+                }
+            },
+        };
         let now = self.prepare_session_access()?;
         // Session IDs are identifiers, not bearer capabilities. Attaching cannot
         // grant a new principal access; delegation must happen through session.give.
         self.require_reader(&p.id, &client.client_name, now)?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
-        if p.read_only {
+        if read_only {
+            // Exact-action: observer attach must not leave an active controller lease
+            // on the same principal (would silently keep write/resize rights).
+            if self
+                .sessions
+                .is_controller(&p.id, &principal, now)
+                .map_err(session_err)?
+            {
+                self.sessions
+                    .release_controller(&p.id, &principal, now)
+                    .map_err(session_err)?;
+            }
             self.sessions
                 .attach_observer(&p.id, principal.clone(), now)
                 .map_err(session_err)?;
@@ -2150,7 +2222,8 @@ impl DaemonRuntime {
         Ok(json!({
             "session": info,
             "principal": principal,
-            "read_only": p.read_only,
+            "role": if read_only { "observer" } else { "controller" },
+            "read_only": read_only,
             "readers": self.sessions.readers(&p.id, now).map_err(session_err)?.into_iter().collect::<Vec<_>>(),
         }))
     }
@@ -2317,6 +2390,10 @@ impl DaemonRuntime {
             id: String,
             #[serde(default)]
             from_seq: Option<u64>,
+            #[serde(default)]
+            limit: Option<usize>,
+            #[serde(default)]
+            max_bytes: Option<usize>,
             /// Ignored: read ACL uses authenticated client identity.
             #[serde(default)]
             principal: Option<String>,
@@ -2325,11 +2402,26 @@ impl DaemonRuntime {
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
         let now = self.prepare_session_access()?;
         self.require_reader(&p.id, &client.client_name, now)?;
-        let chunks = self
+        let page = self
             .sessions
-            .replay_from(&p.id, &client.client_name, p.from_seq.unwrap_or(1), now)
+            .replay_from_bounded(
+                &p.id,
+                &client.client_name,
+                p.from_seq.unwrap_or(1),
+                now,
+                p.limit
+                    .unwrap_or(ownmesh_session::DEFAULT_REPLAY_PAGE_LIMIT),
+                p.max_bytes
+                    .unwrap_or(ownmesh_session::MAX_REPLAY_PAGE_BYTES),
+            )
             .map_err(session_err)?;
-        Ok(json!({ "chunks": chunks, "session_id": p.id }))
+        Ok(json!({
+            "chunks": page.chunks,
+            "session_id": p.id,
+            "truncated": page.truncated,
+            "next_seq": page.next_seq,
+            "returned_bytes": page.returned_bytes,
+        }))
     }
 
     fn handle_session_push_output(
@@ -2375,23 +2467,37 @@ impl DaemonRuntime {
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        if p.data.len() > ownmesh_session::MAX_CHUNK_BYTES {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!(
+                    "session.write data exceeds {} byte chunk budget",
+                    ownmesh_session::MAX_CHUNK_BYTES
+                ),
+            });
+        }
         let now = self.prepare_session_access()?;
         let principal = client.client_name.clone();
         self.sessions
             .authorize_stdin(&p.id, &principal, now)
             .map_err(session_err)?;
-        // Record input echo for observers (controller write path).
+        // Record a bounded input receipt for observers (never echo multi-MB payloads).
         let snapshot = self.sessions.clone();
+        let echo = if p.data.len() <= 256 {
+            format!("[stdin] {}", p.data)
+        } else {
+            format!("[stdin] <{} bytes>", p.data.len())
+        };
         let chunk = self
             .sessions
-            .push_output(
-                &p.id,
-                format!("[stdin] {}", p.data),
-                SessionStreamKind::System,
-            )
+            .push_output(&p.id, echo, SessionStreamKind::System)
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
-        Ok(json!({ "accepted": true, "chunk": chunk }))
+        Ok(json!({
+            "accepted": true,
+            "chunk": chunk,
+            "bytes": p.data.len(),
+        }))
     }
 
     fn handle_session_resize(
@@ -2719,13 +2825,17 @@ fn fs_err(err: ownmesh_fs::FsError) -> IpcError {
 
 fn session_err(err: ownmesh_session::SessionError) -> IpcError {
     let code = match err {
-        ownmesh_session::SessionError::NotFound => app_error::INVALID_PARAMS,
+        ownmesh_session::SessionError::NotFound
+        | ownmesh_session::SessionError::Invalid(_)
+        | ownmesh_session::SessionError::ChunkTooLarge => app_error::INVALID_PARAMS,
         ownmesh_session::SessionError::NotReader => app_error::POLICY_DENIED,
-        ownmesh_session::SessionError::LeaseHeld(_)
+        ownmesh_session::SessionError::SessionLimit
+        | ownmesh_session::SessionError::ReplayBudget
+        | ownmesh_session::SessionError::LeaseHeld(_)
         | ownmesh_session::SessionError::NotController
         | ownmesh_session::SessionError::ObserverCannotWrite
         | ownmesh_session::SessionError::Closed => app_error::CONFLICT,
-        _ => app_error::INTERNAL,
+        ownmesh_session::SessionError::Persist(_) => app_error::INTERNAL,
     };
     IpcError::Remote {
         code,

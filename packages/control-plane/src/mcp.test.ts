@@ -513,7 +513,12 @@ test("session_open routes to device room", async () => {
     store,
     token,
     "ownmesh_session_open",
-    { device_id: deviceId, program: "bash", title: "t" },
+    {
+      device_id: deviceId,
+      program: "bash",
+      title: "t",
+      idempotency_key: "idem_session_open_1",
+    },
     router,
   );
   const sc = body.result!.structuredContent!;

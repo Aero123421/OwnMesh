@@ -265,12 +265,28 @@ test("dynamic client registration returns policy", async () => {
 });
 
 test("AS metadata does not advertise client_secret_post", () => {
-  const meta = oauthMetadata("https://cp.test");
+  const meta = oauthMetadata("https://cp.test") as {
+    token_endpoint_auth_methods_supported: string[];
+    registration_endpoint?: string;
+  };
   assert.deepEqual(meta.token_endpoint_auth_methods_supported, ["none"]);
   assert.equal(
     meta.token_endpoint_auth_methods_supported.includes("client_secret_post"),
     false,
   );
+  // Production default: DCR disabled → endpoint omitted from metadata.
+  assert.equal(meta.registration_endpoint, undefined);
+});
+
+test("AS metadata advertises registration_endpoint only when DCR enabled", () => {
+  const off = oauthMetadata("https://cp.test", { allowDynamicRegistration: false }) as {
+    registration_endpoint?: string;
+  };
+  const on = oauthMetadata("https://cp.test", { allowDynamicRegistration: true }) as {
+    registration_endpoint?: string;
+  };
+  assert.equal(off.registration_endpoint, undefined);
+  assert.equal(on.registration_endpoint, "https://cp.test/oauth/register");
 });
 
 test("register rejects token_endpoint_auth_method=client_secret_post", async () => {
@@ -425,7 +441,9 @@ test("token endpoint rejects token_endpoint_auth_method=client_secret_post", asy
 });
 
 test("AS metadata advertises only token_endpoint_auth_method none", () => {
-  const meta = oauthMetadata("https://cp.test");
+  const meta = oauthMetadata("https://cp.test") as {
+    token_endpoint_auth_methods_supported: string[];
+  };
   assert.deepEqual(meta.token_endpoint_auth_methods_supported, ["none"]);
   assert.equal(meta.token_endpoint_auth_methods_supported.length, 1);
   for (const method of [

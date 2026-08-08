@@ -59,9 +59,32 @@ pub enum SessionError {
     Invalid(String),
     #[error("persist: {0}")]
     Persist(String),
+    #[error("session limit exceeded")]
+    SessionLimit,
+    #[error("chunk too large")]
+    ChunkTooLarge,
+    #[error("replay budget exceeded")]
+    ReplayBudget,
 }
 
 pub type SessionResult<T> = Result<T, SessionError>;
+
+/// Hard cap on concurrent sessions retained by one manager (memory + disk).
+pub const MAX_SESSIONS: usize = 64;
+/// Default max replay chunks retained per session (ring).
+pub const DEFAULT_REPLAY_CHUNK_LIMIT: usize = 256;
+/// Hard cap on a single push/write chunk payload (UTF-8 bytes).
+pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
+/// Aggregate UTF-8 byte budget for one session's replay ring.
+pub const MAX_REPLAY_BYTES: usize = 1024 * 1024;
+/// Default max chunks returned from one replay call.
+pub const DEFAULT_REPLAY_PAGE_LIMIT: usize = 64;
+/// Hard cap on chunks returned from one replay call.
+pub const MAX_REPLAY_PAGE_LIMIT: usize = 256;
+/// Hard cap on aggregate UTF-8 bytes returned from one replay call.
+pub const MAX_REPLAY_PAGE_BYTES: usize = 256 * 1024;
+/// Refuse to load a sessions file larger than this (fail closed).
+pub const MAX_SESSIONS_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Session lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +111,19 @@ pub struct OutputChunk {
     pub seq: u64,
     pub data: String,
     pub stream: StreamKind,
+}
+
+/// Bounded replay page (never builds an unbounded Vec of attacker-controlled data).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayPage {
+    pub chunks: Vec<OutputChunk>,
+    /// True when more chunks exist beyond this page (use `next_seq`).
+    pub truncated: bool,
+    /// Inclusive sequence cursor for the next page when truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_seq: Option<u64>,
+    /// Aggregate UTF-8 bytes in `chunks`.
+    pub returned_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +194,9 @@ struct Session {
     info: SessionInfo,
     replay: VecDeque<OutputChunk>,
     replay_limit: usize,
+    /// Aggregate UTF-8 bytes currently held in `replay`.
+    #[serde(default)]
+    replay_bytes: usize,
 }
 
 /// Session manager (process-local; daemon owns one; can persist to disk).
@@ -166,6 +205,20 @@ pub struct SessionManager {
     sessions: HashMap<String, Session>,
     default_replay_limit: usize,
     default_lease_ttl_secs: i64,
+    /// Max concurrent sessions (open refuses beyond this).
+    #[serde(default = "default_max_sessions")]
+    max_sessions: usize,
+    /// Aggregate replay byte budget per session.
+    #[serde(default = "default_max_replay_bytes")]
+    max_replay_bytes: usize,
+}
+
+fn default_max_sessions() -> usize {
+    MAX_SESSIONS
+}
+
+fn default_max_replay_bytes() -> usize {
+    MAX_REPLAY_BYTES
 }
 
 impl Default for SessionManager {
@@ -179,8 +232,47 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
-            default_replay_limit: 10_000,
+            default_replay_limit: DEFAULT_REPLAY_CHUNK_LIMIT,
             default_lease_ttl_secs: 3600,
+            max_sessions: MAX_SESSIONS,
+            max_replay_bytes: MAX_REPLAY_BYTES,
+        }
+    }
+
+    /// Enforce load-time caps after deserializing untrusted durable state.
+    pub fn enforce_loaded_budgets(&mut self) {
+        self.max_sessions = self.max_sessions.clamp(1, MAX_SESSIONS);
+        self.max_replay_bytes = self.max_replay_bytes.clamp(1, MAX_REPLAY_BYTES);
+        self.default_replay_limit = self
+            .default_replay_limit
+            .clamp(1, DEFAULT_REPLAY_CHUNK_LIMIT.max(1024));
+        // Drop excess sessions deterministically (oldest by id order).
+        if self.sessions.len() > self.max_sessions {
+            let mut ids: Vec<String> = self.sessions.keys().cloned().collect();
+            ids.sort();
+            let drop_n = self.sessions.len() - self.max_sessions;
+            for id in ids.into_iter().take(drop_n) {
+                self.sessions.remove(&id);
+            }
+        }
+        for session in self.sessions.values_mut() {
+            session.replay_limit = session
+                .replay_limit
+                .clamp(1, self.default_replay_limit.max(DEFAULT_REPLAY_CHUNK_LIMIT));
+            // Recompute byte total and trim ring to chunk + byte budgets.
+            session.replay_bytes = session.replay.iter().map(|c| c.data.len()).sum();
+            while session.replay.len() > session.replay_limit {
+                if let Some(front) = session.replay.pop_front() {
+                    session.replay_bytes = session.replay_bytes.saturating_sub(front.data.len());
+                }
+            }
+            while session.replay_bytes > self.max_replay_bytes {
+                if let Some(front) = session.replay.pop_front() {
+                    session.replay_bytes = session.replay_bytes.saturating_sub(front.data.len());
+                } else {
+                    break;
+                }
+            }
         }
     }
 
@@ -192,7 +284,7 @@ impl SessionManager {
         creator: impl Into<String>,
         now_unix: i64,
         profile_id: Option<String>,
-    ) -> SessionInfo {
+    ) -> SessionResult<SessionInfo> {
         self.open_with(
             kind, title, creator, now_unix, profile_id, None, None, None, None,
         )
@@ -211,7 +303,10 @@ impl SessionManager {
         command: Option<Vec<String>>,
         cwd: Option<String>,
         size: Option<PtySize>,
-    ) -> SessionInfo {
+    ) -> SessionResult<SessionInfo> {
+        if self.sessions.len() >= self.max_sessions {
+            return Err(SessionError::SessionLimit);
+        }
         let id = format!("ses_{}", Uuid::new_v4().simple());
         let creator = creator.into();
         let lease = ControllerLease {
@@ -243,9 +338,10 @@ impl SessionManager {
                 info: info.clone(),
                 replay: VecDeque::new(),
                 replay_limit: self.default_replay_limit,
+                replay_bytes: 0,
             },
         );
-        info
+        Ok(info)
     }
 
     pub fn get(&self, id: &str) -> SessionResult<&SessionInfo> {
@@ -396,25 +492,47 @@ impl SessionManager {
     }
 
     /// Append output visible to controller + observers.
+    ///
+    /// Chunks larger than [`MAX_CHUNK_BYTES`] are rejected (fail closed, never
+    /// silently truncated). The ring is trimmed by chunk count and aggregate bytes.
     pub fn push_output(
         &mut self,
         id: &str,
         data: impl Into<String>,
         stream: StreamKind,
     ) -> SessionResult<OutputChunk> {
+        let data = data.into();
+        if data.len() > MAX_CHUNK_BYTES {
+            return Err(SessionError::ChunkTooLarge);
+        }
+        let max_bytes = self.max_replay_bytes;
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         if s.info.state == SessionState::Closed {
             return Err(SessionError::Closed);
         }
+        // Single chunk larger than the whole budget cannot be retained.
+        if data.len() > max_bytes {
+            return Err(SessionError::ReplayBudget);
+        }
         let chunk = OutputChunk {
             seq: s.info.next_seq,
-            data: data.into(),
+            data,
             stream,
         };
         s.info.next_seq += 1;
+        s.replay_bytes = s.replay_bytes.saturating_add(chunk.data.len());
         s.replay.push_back(chunk.clone());
         while s.replay.len() > s.replay_limit {
-            s.replay.pop_front();
+            if let Some(front) = s.replay.pop_front() {
+                s.replay_bytes = s.replay_bytes.saturating_sub(front.data.len());
+            }
+        }
+        while s.replay_bytes > max_bytes {
+            if let Some(front) = s.replay.pop_front() {
+                s.replay_bytes = s.replay_bytes.saturating_sub(front.data.len());
+            } else {
+                break;
+            }
         }
         Ok(chunk)
     }
@@ -459,6 +577,9 @@ impl SessionManager {
     }
 
     /// Replay from sequence (inclusive). Requires read ACL at `now_unix`.
+    ///
+    /// Always bounded: `limit` caps chunk count and aggregate page bytes are capped
+    /// by [`MAX_REPLAY_PAGE_BYTES`]. Callers page with the next missing `seq`.
     pub fn replay_from(
         &self,
         id: &str,
@@ -466,13 +587,50 @@ impl SessionManager {
         from_seq: u64,
         now_unix: i64,
     ) -> SessionResult<Vec<OutputChunk>> {
+        self.replay_from_bounded(
+            id,
+            principal,
+            from_seq,
+            now_unix,
+            DEFAULT_REPLAY_PAGE_LIMIT,
+            MAX_REPLAY_PAGE_BYTES,
+        )
+        .map(|page| page.chunks)
+    }
+
+    /// Bounded replay page with explicit limits and visible truncation facts.
+    pub fn replay_from_bounded(
+        &self,
+        id: &str,
+        principal: &str,
+        from_seq: u64,
+        now_unix: i64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> SessionResult<ReplayPage> {
         self.authorize_reader(id, principal, now_unix)?;
         let s = self.sessions.get(id).ok_or(SessionError::NotFound)?;
-        Ok(s.replay
-            .iter()
-            .filter(|c| c.seq >= from_seq)
-            .cloned()
-            .collect())
+        let limit = limit.clamp(1, MAX_REPLAY_PAGE_LIMIT);
+        let max_bytes = max_bytes.clamp(1, MAX_REPLAY_PAGE_BYTES);
+        let mut chunks = Vec::new();
+        let mut bytes = 0usize;
+        let mut truncated = false;
+        let mut next_seq = None;
+        for c in s.replay.iter().filter(|c| c.seq >= from_seq) {
+            if chunks.len() >= limit || bytes.saturating_add(c.data.len()) > max_bytes {
+                truncated = true;
+                next_seq = Some(c.seq);
+                break;
+            }
+            bytes = bytes.saturating_add(c.data.len());
+            chunks.push(c.clone());
+        }
+        Ok(ReplayPage {
+            chunks,
+            truncated,
+            next_seq,
+            returned_bytes: bytes,
+        })
     }
 
     /// Resize terminal; active controller only.
@@ -642,7 +800,9 @@ mod tests {
     fn handoff_human_claims_while_agent_observes() {
         let mut mgr = SessionManager::new();
         let now = 1_700_000_000;
-        let ses = mgr.open(SessionKind::Pty, "agent-work", "chatgpt", now, None);
+        let ses = mgr
+            .open(SessionKind::Pty, "agent-work", "chatgpt", now, None)
+            .unwrap();
         mgr.push_output(&ses.id, "hello from agent\n", StreamKind::Stdout)
             .unwrap();
 
@@ -669,7 +829,7 @@ mod tests {
     fn give_and_release() {
         let mut mgr = SessionManager::new();
         let now = 100;
-        let ses = mgr.open(SessionKind::Process, "t", "a", now, None);
+        let ses = mgr.open(SessionKind::Process, "t", "a", now, None).unwrap();
         mgr.give_controller(&ses.id, "a", "b", now).unwrap();
         assert_eq!(
             mgr.get(&ses.id)
@@ -688,7 +848,7 @@ mod tests {
     #[test]
     fn stale_lease_recovery() {
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(SessionKind::Pty, "t", "a", 0, None);
+        let ses = mgr.open(SessionKind::Pty, "t", "a", 0, None).unwrap();
         let n = mgr.expire_stale_leases(10_000_000);
         assert_eq!(n, 1);
         assert!(mgr.get(&ses.id).unwrap().controller.is_none());
@@ -699,7 +859,9 @@ mod tests {
     fn expired_controller_loses_mutations_and_stdin_fail_closed() {
         let mut mgr = SessionManager::new();
         let open_at = 1_000i64;
-        let ses = mgr.open(SessionKind::Pty, "t", "ctrl", open_at, None);
+        let ses = mgr
+            .open(SessionKind::Pty, "t", "ctrl", open_at, None)
+            .unwrap();
         mgr.attach_observer(&ses.id, "obs", open_at).unwrap();
         mgr.push_output(&ses.id, "line\n", StreamKind::Stdout)
             .unwrap();
@@ -759,19 +921,58 @@ mod tests {
     }
 
     #[test]
+    fn push_output_rejects_oversized_chunk_and_bounds_replay_page() {
+        let mut mgr = SessionManager::new();
+        let now = 1i64;
+        let ses = mgr.open(SessionKind::Pty, "bound", "a", now, None).unwrap();
+        let huge = "x".repeat(MAX_CHUNK_BYTES + 1);
+        assert_eq!(
+            mgr.push_output(&ses.id, huge, StreamKind::Stdout),
+            Err(SessionError::ChunkTooLarge)
+        );
+        // Fill with many medium chunks; ring must not retain unbounded memory.
+        for i in 0..500 {
+            let data = format!("{i}:{}", "y".repeat(4096));
+            let _ = mgr.push_output(&ses.id, data, StreamKind::Stdout);
+        }
+        let page = mgr
+            .replay_from_bounded(&ses.id, "a", 1, now, 10_000, 10 * 1024 * 1024)
+            .unwrap();
+        assert!(page.chunks.len() <= MAX_REPLAY_PAGE_LIMIT);
+        assert!(page.returned_bytes <= MAX_REPLAY_PAGE_BYTES);
+        // Manager ring itself stays under budgets.
+        let total: usize = page.chunks.iter().map(|c| c.data.len()).sum();
+        assert!(total <= MAX_REPLAY_PAGE_BYTES);
+    }
+
+    #[test]
+    fn session_count_limit_fail_closed() {
+        let mut mgr = SessionManager::new();
+        mgr.max_sessions = 2;
+        mgr.open(SessionKind::Pty, "a", "p", 1, None).unwrap();
+        mgr.open(SessionKind::Pty, "b", "p", 1, None).unwrap();
+        assert_eq!(
+            mgr.open(SessionKind::Pty, "c", "p", 1, None).unwrap_err(),
+            SessionError::SessionLimit
+        );
+    }
+
+    #[test]
     fn persistence_survives_restart_and_observer_reads() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         let now = 1_000i64;
 
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(
-            SessionKind::Pty,
-            "persist-me",
-            "chatgpt",
-            now,
-            Some("codex".into()),
-        );
+        let ses = mgr
+            .open(
+                SessionKind::Pty,
+                "persist-me",
+                "chatgpt",
+                now,
+                Some("codex".into()),
+            )
+            .unwrap();
         mgr.push_output(&ses.id, "line-1\n", StreamKind::Stdout)
             .unwrap();
         mgr.give_controller(&ses.id, "chatgpt", "human", now + 1)
@@ -814,7 +1015,7 @@ mod tests {
     fn resize_and_view_mode() {
         let mut mgr = SessionManager::new();
         let now = 1i64;
-        let ses = mgr.open(SessionKind::Pty, "t", "a", now, None);
+        let ses = mgr.open(SessionKind::Pty, "t", "a", now, None).unwrap();
         mgr.resize(&ses.id, "a", 120, 40, now).unwrap();
         mgr.set_view_mode(&ses.id, "a", PtyViewMode::Cooked, now)
             .unwrap();

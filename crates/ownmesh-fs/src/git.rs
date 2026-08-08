@@ -7,7 +7,10 @@ use crate::{FsError, FsResult, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// One porcelain status entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +107,8 @@ fn default_diff_limit(n: usize) -> usize {
 /// outputs must be retrieved via cursor pages; never `read_to_end` unbounded.
 const GIT_STDOUT_HARD_CAP: usize = 2 * 1024 * 1024;
 const GIT_STDERR_HARD_CAP: usize = 64 * 1024;
+/// Wall-clock ceiling for a single git subprocess (fail closed; kill on exceed).
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Run read-only `git status --porcelain=v1 -b` with entry pagination.
 ///
@@ -273,16 +278,30 @@ fn run_git(cwd: &Path, args: &[&str]) -> FsResult<String> {
     Ok(out)
 }
 
-/// Spawn git with piped stdout/stderr and read at most `max_stdout` / stderr cap.
+/// Spawn git with piped stdout/stderr, concurrent capped drains, and a hard timeout.
 /// Returns `(lossy_utf8_stdout, truncated)` where truncated means more stdout bytes
 /// were available than returned (visible to callers; never silent).
+///
+/// Drains stdout and stderr on separate threads so a process that fills stderr before
+/// stdout cannot deadlock the pipes. On timeout the child process tree is killed.
 fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> FsResult<(String, bool)> {
     let max_stdout = max_stdout.clamp(1, GIT_STDOUT_HARD_CAP);
+    // Point global/system config at a guaranteed-empty path so untrusted
+    // includeIf/fsmonitor/hooks from the operator home directory cannot run.
+    #[cfg(windows)]
+    let empty_config = "NUL";
+    #[cfg(not(windows))]
+    let empty_config = "/dev/null";
     let mut child = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        // Reduce untrusted-repo execution surface for read-only captures.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", empty_config)
+        .env("GIT_CONFIG_SYSTEM", empty_config)
+        .env("GIT_PROTOCOL_FROM_USER", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -292,73 +311,93 @@ fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> FsResult<(Str
             source,
         })?;
 
-    let mut stdout = child.stdout.take().ok_or_else(|| FsError::Io {
+    let stdout = child.stdout.take().ok_or_else(|| FsError::Io {
         path: Some(cwd.to_path_buf()),
         source: std::io::Error::other("git stdout pipe missing"),
     })?;
-    let mut stderr = child.stderr.take().ok_or_else(|| FsError::Io {
+    let stderr = child.stderr.take().ok_or_else(|| FsError::Io {
         path: Some(cwd.to_path_buf()),
         source: std::io::Error::other("git stderr pipe missing"),
     })?;
 
-    let mut out_buf = vec![0_u8; 0];
-    out_buf
-        .try_reserve(max_stdout.min(64 * 1024))
-        .map_err(|e| FsError::Io {
+    let (out_tx, out_rx) = mpsc::channel::<(Vec<u8>, bool)>();
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>();
+
+    thread::spawn(move || {
+        let _ = out_tx.send(read_capped(stdout, max_stdout));
+    });
+    thread::spawn(move || {
+        let (buf, _truncated) = read_capped(stderr, GIT_STDERR_HARD_CAP);
+        let _ = err_tx.send(buf);
+    });
+
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    let mut out_buf = None;
+    let mut err_buf = None;
+    let mut timed_out = false;
+
+    // Wait for both drains or timeout; kill child on timeout so pipes unblock.
+    while out_buf.is_none() || err_buf.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            timed_out = true;
+            kill_git_child(&mut child);
+            break;
+        }
+        if out_buf.is_none() {
+            match out_rx.recv_timeout(Duration::from_millis(50).min(remaining)) {
+                Ok(v) => out_buf = Some(v),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    out_buf = Some((Vec::new(), false));
+                }
+            }
+        }
+        if err_buf.is_none() {
+            match err_rx.recv_timeout(
+                Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+            ) {
+                Ok(v) => err_buf = Some(v),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    err_buf = Some(Vec::new());
+                }
+            }
+        }
+    }
+
+    // Collect any late drain results after kill (bounded wait).
+    if out_buf.is_none() {
+        out_buf = out_rx.recv_timeout(Duration::from_secs(2)).ok();
+    }
+    if err_buf.is_none() {
+        err_buf = err_rx.recv_timeout(Duration::from_secs(2)).ok();
+    }
+
+    let status = if timed_out {
+        let _ = child.try_wait();
+        None
+    } else {
+        Some(child.wait().map_err(|source| FsError::Io {
             path: Some(cwd.to_path_buf()),
-            source: std::io::Error::other(format!("stdout reserve: {e}")),
-        })?;
-    let mut tmp = [0_u8; 8192];
-    let mut truncated = false;
-    loop {
-        if out_buf.len() >= max_stdout {
-            // Drain and discard remainder so the child can exit, but mark truncated.
-            truncated = true;
-            let mut discard = [0_u8; 8192];
-            while stdout.read(&mut discard).unwrap_or(0) > 0 {}
-            break;
-        }
-        let want = (max_stdout - out_buf.len()).min(tmp.len());
-        let n = stdout
-            .read(&mut tmp[..want])
-            .map_err(|source| FsError::Io {
-                path: Some(cwd.to_path_buf()),
-                source,
-            })?;
-        if n == 0 {
-            break;
-        }
-        out_buf.extend_from_slice(&tmp[..n]);
+            source,
+        })?)
+    };
+
+    if timed_out {
+        return Err(FsError::Io {
+            path: Some(cwd.to_path_buf()),
+            source: std::io::Error::other(format!(
+                "git {} exceeded {}s wall-clock capture timeout and was killed",
+                args.first().unwrap_or(&""),
+                GIT_TIMEOUT.as_secs()
+            )),
+        });
     }
 
-    let mut err_buf = Vec::new();
-    {
-        let mut read = 0_usize;
-        loop {
-            if read >= GIT_STDERR_HARD_CAP {
-                let mut discard = [0_u8; 8192];
-                while stderr.read(&mut discard).unwrap_or(0) > 0 {}
-                break;
-            }
-            let want = (GIT_STDERR_HARD_CAP - read).min(tmp.len());
-            let n = stderr
-                .read(&mut tmp[..want])
-                .map_err(|source| FsError::Io {
-                    path: Some(cwd.to_path_buf()),
-                    source,
-                })?;
-            if n == 0 {
-                break;
-            }
-            err_buf.extend_from_slice(&tmp[..n]);
-            read += n;
-        }
-    }
-
-    let status = child.wait().map_err(|source| FsError::Io {
-        path: Some(cwd.to_path_buf()),
-        source,
-    })?;
+    let (out_buf, truncated) = out_buf.unwrap_or_default();
+    let err_buf = err_buf.unwrap_or_default();
+    let status = status.expect("status set when not timed out");
     if !status.success() {
         let stderr = String::from_utf8_lossy(&err_buf);
         return Err(FsError::Io {
@@ -372,6 +411,53 @@ fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> FsResult<(Str
         });
     }
     Ok((String::from_utf8_lossy(&out_buf).into_owned(), truncated))
+}
+
+fn read_capped(mut pipe: impl Read, max_bytes: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut tmp = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        if buf.len() >= max_bytes {
+            truncated = true;
+            let mut discard = [0_u8; 8192];
+            while pipe.read(&mut discard).unwrap_or(0) > 0 {}
+            break;
+        }
+        let want = (max_bytes - buf.len()).min(tmp.len());
+        match pipe.read(&mut tmp[..want]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+        }
+    }
+    (buf, truncated)
+}
+
+fn kill_git_child(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn parse_porcelain_v1(text: &str) -> (Option<String>, Option<String>, Vec<GitStatusEntry>) {

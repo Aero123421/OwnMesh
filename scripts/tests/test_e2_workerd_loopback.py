@@ -1034,6 +1034,74 @@ def main() -> int:
             ses_dump = json.dumps(ses_done)
             if "ses_" not in ses_dump:
                 raise RuntimeError(f"session open missing session id: {ses_done}")
+            # Extract session id from completed result payload.
+            ses_id = None
+            for node in (ses_done, ses_done.get("data") if isinstance(ses_done.get("data"), dict) else {}):
+                if not isinstance(node, dict):
+                    continue
+                for key in ("id", "session_id"):
+                    val = node.get(key)
+                    if isinstance(val, str) and val.startswith("ses_"):
+                        ses_id = val
+                        break
+                if ses_id:
+                    break
+                nested = node.get("session") if isinstance(node.get("session"), dict) else None
+                if nested and isinstance(nested.get("id"), str) and nested["id"].startswith("ses_"):
+                    ses_id = nested["id"]
+                    break
+            if not ses_id:
+                # Fallback: scan dump for ses_ token.
+                import re as _re
+                m = _re.search(r"ses_[0-9a-fA-F]+", ses_dump)
+                if not m:
+                    raise RuntimeError(f"could not parse session id from {ses_done}")
+                ses_id = m.group(0)
+
+            # E5: observer attach must not retain controller rights (exact-action).
+            obs_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_attach",
+                    {
+                        "device_id": device_id,
+                        "session_id": ses_id,
+                        "role": "observer",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_obs_{marker}",
+                    },
+                    rpc_id=38,
+                )
+            )
+            obs_op = str(obs_sc.get("operation_id") or "")
+            obs_done = wait_operation(issuer, access_token, obs_op, want={"completed"})
+            obs_dump = json.dumps(obs_done).lower()
+            if "observer" not in obs_dump and '"read_only": true' not in obs_dump and '"read_only":true' not in obs_dump:
+                raise RuntimeError(f"observer attach must report observer/read_only: {obs_done}")
+
+            # Observer must not be able to write stdin / resize.
+            bad_write = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": ses_id,
+                        "data": "should-deny",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_write_obs_{marker}",
+                    },
+                    rpc_id=39,
+                )
+            )
+            bad_write_op = str(bad_write.get("operation_id") or "")
+            bad_write_done = wait_operation(
+                issuer, access_token, bad_write_op, want={"failed", "denied"}, timeout_s=20
+            )
+            if str(bad_write_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(f"observer session.write must fail closed: {bad_write_done}")
 
             # Missing idempotency_key on mutating tool must fail closed before route.
             missing_key_status, missing_key_body = http_json(
@@ -1066,7 +1134,7 @@ def main() -> int:
             print(
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
                 f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
-                f"patch+shell+workspace-select+session-open+required-key held "
+                f"patch+shell+workspace-select+session-open+observer-deny-write+required-key held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )

@@ -46,7 +46,7 @@ ChatGPT notes that matter:
 2. D1 migrations applied; DeviceRoom DO bound
 3. Local agent: `ownmeshd run`
 4. Device enrolled: `ownmesh device enroll --issuer https://<your-worker>`
-5. Access preset chosen (`workspace_only` → `recommended` → `full_user_access` → `full_access`)
+5. Access preset chosen (`workspace_only` / `recommended` confine FS; arbitrary `command.run` requires `full_user_access` or `full_access` until OS process confinement exists; `full_access` adds elevated broker when E8 lands)
 6. Browser can reach `https://<your-worker>/health` and `/.well-known/oauth-authorization-server`
 
 ---
@@ -61,7 +61,13 @@ Exact menu labels move as OpenAI iterates; the flow is:
 4. **Authentication:** OAuth  
    - Authorization server metadata: `https://<your-worker>/.well-known/oauth-authorization-server`  
    - Protected resource metadata: `https://<your-worker>/.well-known/oauth-protected-resource`  
-   - Dynamic client registration: `POST /oauth/register` (public client + PKCE)
+   - **Client registration (production default):** Dynamic Client Registration is **disabled**.
+     Pre-provision a public OAuth client (`token_endpoint_auth_method=none` + PKCE) in the
+     control-plane store / bootstrap, then enter that `client_id` in ChatGPT.
+   - **Optional DCR:** operators may set Worker env `ALLOW_DYNAMIC_CLIENT_REGISTRATION=true`
+     to advertise `registration_endpoint` and accept authenticated `POST /oauth/register`
+     (Bearer with `ownmesh.device` scope; public client + PKCE only). Production defaults
+     omit the endpoint from AS metadata so ChatGPT does not attempt a failing DCR hop.
 5. Request scopes (minimum useful set):
 
    ```text

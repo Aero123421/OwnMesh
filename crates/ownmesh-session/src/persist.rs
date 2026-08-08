@@ -9,7 +9,7 @@
 //!   custom DACL here; callers should keep session state under a per-user directory.
 //!   This is best-effort parity with Unix owner-only access.
 
-use crate::SessionManager;
+use crate::{SessionManager, MAX_SESSIONS_FILE_BYTES};
 use std::path::Path;
 use thiserror::Error;
 
@@ -70,6 +70,12 @@ pub fn save_manager(path: &Path, mgr: &SessionManager) -> Result<(), PersistErro
         }
     }
     let raw = serde_json::to_string_pretty(mgr).map_err(|e| PersistError::Serde(e.to_string()))?;
+    if raw.len() as u64 > MAX_SESSIONS_FILE_BYTES {
+        return Err(PersistError::Io(format!(
+            "sessions snapshot exceeds {MAX_SESSIONS_FILE_BYTES} byte budget ({})",
+            raw.len()
+        )));
+    }
     // Permissions are applied to the sibling temp before its contents are
     // written. Any chmod/write/sync error therefore occurs before commit.
     // The pinned Rust 1.92 Windows rename replaces in one operation; the
@@ -81,14 +87,24 @@ pub fn save_manager(path: &Path, mgr: &SessionManager) -> Result<(), PersistErro
 /// Load manager; missing file yields an empty manager.
 ///
 /// Corrupt JSON or unreadable content returns [`PersistError`] — never silently
-/// replaced with an empty manager.
+/// replaced with an empty manager. Oversized files fail closed before allocation.
 pub fn load_manager(path: &Path) -> Result<SessionManager, PersistError> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(SessionManager::new());
         }
         Err(err) => return Err(PersistError::Io(err.to_string())),
     };
-    serde_json::from_str(&raw).map_err(|e| PersistError::Serde(e.to_string()))
+    if meta.len() > MAX_SESSIONS_FILE_BYTES {
+        return Err(PersistError::Io(format!(
+            "sessions file exceeds {MAX_SESSIONS_FILE_BYTES} byte budget ({})",
+            meta.len()
+        )));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| PersistError::Io(e.to_string()))?;
+    let mut mgr: SessionManager =
+        serde_json::from_str(&raw).map_err(|e| PersistError::Serde(e.to_string()))?;
+    mgr.enforce_loaded_budgets();
+    Ok(mgr)
 }
