@@ -229,8 +229,12 @@ def main() -> int:
     credential_hash = hashlib.sha256(credential.encode()).hexdigest()
     access_token = f"atk_{secrets.token_urlsafe(24)}"
     access_hash = hashlib.sha256(access_token.encode()).hexdigest()
+    access_token_other = f"atk_{secrets.token_urlsafe(24)}"
+    access_hash_other = hashlib.sha256(access_token_other.encode()).hexdigest()
     refresh_token = f"rtk_{secrets.token_urlsafe(24)}"
     refresh_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+    refresh_token_other = f"rtk_{secrets.token_urlsafe(24)}"
+    refresh_hash_other = hashlib.sha256(refresh_token_other.encode()).hexdigest()
     service = f"dev.ownmesh.loopback-test.{uuid.uuid4().hex}"
     session_secret = secrets.token_hex(32)
     password = secrets.token_urlsafe(32)
@@ -359,10 +363,19 @@ def main() -> int:
                     "INSERT OR IGNORE INTO principals (id,tenant_id,kind,display_name,created_at) VALUES ('prin_dev','ten_default','human','Dev User',"
                     + repr(now)
                     + ");",
+                    "INSERT OR IGNORE INTO principals (id,tenant_id,kind,display_name,created_at) VALUES ('prin_other','ten_default','human','Other User',"
+                    + repr(now)
+                    + ");",
                     "INSERT OR IGNORE INTO oauth_clients (client_id,tenant_id,client_name,redirect_uris,created_at) VALUES ("
                     + "'client_ownmesh_cli','ten_default','OwnMesh CLI',"
                     + repr(json.dumps(["http://127.0.0.1:8750/callback"]))
                     + ","
+                    + repr(now)
+                    + ");",
+                    "INSERT OR IGNORE INTO tenant_members (tenant_id,principal_id,role,created_at) VALUES ('ten_default','prin_dev','owner',"
+                    + repr(now)
+                    + ");",
+                    "INSERT OR IGNORE INTO tenant_members (tenant_id,principal_id,role,created_at) VALUES ('ten_default','prin_other','member',"
                     + repr(now)
                     + ");",
                     "INSERT INTO oauth_tokens (access_token_hash,refresh_token_hash,client_id,principal_id,scope,refresh_family,refresh_used,revoked,expires_at,created_at) VALUES ("
@@ -372,6 +385,17 @@ def main() -> int:
                     + ",'client_ownmesh_cli','prin_dev',"
                     + repr(scope)
                     + ",'fam_e2',0,0,"
+                    + repr(expires)
+                    + ","
+                    + repr(now)
+                    + ");",
+                    "INSERT INTO oauth_tokens (access_token_hash,refresh_token_hash,client_id,principal_id,scope,refresh_family,refresh_used,revoked,expires_at,created_at) VALUES ("
+                    + repr(access_hash_other)
+                    + ","
+                    + repr(refresh_hash_other)
+                    + ",'client_ownmesh_cli','prin_other',"
+                    + repr(scope)
+                    + ",'fam_e2_other',0,0,"
                     + repr(expires)
                     + ","
                     + repr(now)
@@ -1169,6 +1193,7 @@ def main() -> int:
                         "session_id": lease_ses_id,
                         "workspace_id": "ws_default",
                         "data": "should-deny",
+                        "input_seq": 1,
                         "async": True,
                         "idempotency_key": f"idem_ses_write_obs_{marker}",
                     },
@@ -1193,6 +1218,7 @@ def main() -> int:
                         "session_id": lease_ses_id,
                         "workspace_id": "ws_does_not_match",
                         "data": "x",
+                        "input_seq": 1,
                         "async": True,
                         "idempotency_key": f"idem_ses_ws_mismatch_{marker}",
                     },
@@ -1206,6 +1232,379 @@ def main() -> int:
             if str(bad_ws_write_done.get("status")) not in {"failed", "denied"}:
                 raise RuntimeError(
                     f"session.write workspace mismatch must fail closed: {bad_ws_write_done}"
+                )
+
+            # E4: session list/show must bind workspace — alt session is invisible under default.
+            alt_ses_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_open",
+                    {
+                        "device_id": device_id,
+                        "title": f"e2-ses-alt-{marker}",
+                        "workspace_id": "ws_alt",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_alt_{marker}",
+                    },
+                    rpc_id=57,
+                )
+            )
+            alt_ses_op = str(alt_ses_sc.get("operation_id") or "")
+            alt_ses_done = wait_operation(issuer, access_token, alt_ses_op, want={"completed"})
+            alt_ses_dump = json.dumps(alt_ses_done)
+            m_alt = _re2.search(r"ses_[0-9a-fA-F]+", alt_ses_dump)
+            if not m_alt:
+                raise RuntimeError(f"could not parse alt session id from {alt_ses_done}")
+            alt_ses_id = m_alt.group(0)
+
+            list_default_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_list",
+                    {
+                        "device_id": device_id,
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_list_def_{marker}",
+                    },
+                    rpc_id=58,
+                )
+            )
+            list_default_done = wait_operation(
+                issuer, access_token, str(list_default_sc.get("operation_id") or ""), want={"completed"}
+            )
+            list_default_dump = json.dumps(list_default_done)
+            if alt_ses_id in list_default_dump:
+                raise RuntimeError(
+                    f"session.list(ws_default) must not expose alt workspace session: {list_default_done}"
+                )
+
+            bad_show_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_show",
+                    {
+                        "device_id": device_id,
+                        "session_id": alt_ses_id,
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_show_mismatch_{marker}",
+                    },
+                    rpc_id=59,
+                )
+            )
+            bad_show_done = wait_operation(
+                issuer,
+                access_token,
+                str(bad_show_sc.get("operation_id") or ""),
+                want={"failed", "denied"},
+                timeout_s=20,
+            )
+            if str(bad_show_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(
+                    f"session.show cross-workspace must fail closed: {bad_show_done}"
+                )
+
+            # E5: ordered controller input_seq — gap/stale rejected; seq=1 then 2 accepted.
+            # Open a short-lived interactive shell for write/resize sequence proof.
+            if _sys.platform.startswith("win"):
+                seq_program = "cmd.exe"
+                seq_args = ["/K"]
+            else:
+                seq_program = "/bin/sh"
+                seq_args = []
+            seq_open_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_open",
+                    {
+                        "device_id": device_id,
+                        "title": f"e2-ses-seq-{marker}",
+                        "workspace_id": "ws_default",
+                        "program": seq_program,
+                        "args": seq_args,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_seq_open_{marker}",
+                    },
+                    rpc_id=60,
+                )
+            )
+            seq_open_done = wait_operation(
+                issuer, access_token, str(seq_open_sc.get("operation_id") or ""), want={"completed"}
+            )
+            m_seq = _re2.search(r"ses_[0-9a-fA-F]+", json.dumps(seq_open_done))
+            if not m_seq:
+                raise RuntimeError(f"could not parse seq session id from {seq_open_done}")
+            seq_ses_id = m_seq.group(0)
+
+            # Gap: input_seq=2 before 1 must fail.
+            gap_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "data": "gap\n",
+                        "input_seq": 2,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_seq_gap_{marker}",
+                    },
+                    rpc_id=61,
+                )
+            )
+            gap_done = wait_operation(
+                issuer,
+                access_token,
+                str(gap_sc.get("operation_id") or ""),
+                want={"failed", "denied"},
+                timeout_s=20,
+            )
+            if str(gap_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(f"input_seq gap must fail closed: {gap_done}")
+
+            w1_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "data": "first\n",
+                        "input_seq": 1,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_seq_w1_{marker}",
+                    },
+                    rpc_id=62,
+                )
+            )
+            w1_done = wait_operation(
+                issuer, access_token, str(w1_sc.get("operation_id") or ""), want={"completed"}
+            )
+            if "accepted" not in json.dumps(w1_done).lower() and str(w1_done.get("status")) != "completed":
+                raise RuntimeError(f"input_seq=1 write must complete: {w1_done}")
+
+            # Stale replay of seq=1 must fail (outer idempotency key differs).
+            stale_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "data": "stale\n",
+                        "input_seq": 1,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_seq_stale_{marker}",
+                    },
+                    rpc_id=63,
+                )
+            )
+            stale_done = wait_operation(
+                issuer,
+                access_token,
+                str(stale_sc.get("operation_id") or ""),
+                want={"failed", "denied"},
+                timeout_s=20,
+            )
+            if str(stale_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(f"stale input_seq must fail closed: {stale_done}")
+
+            w2_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "data": "second\n",
+                        "input_seq": 2,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_seq_w2_{marker}",
+                    },
+                    rpc_id=64,
+                )
+            )
+            w2_done = wait_operation(
+                issuer, access_token, str(w2_sc.get("operation_id") or ""), want={"completed"}
+            )
+            if str(w2_done.get("status")) != "completed":
+                raise RuntimeError(f"input_seq=2 write must complete: {w2_done}")
+
+            rz_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_resize",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "cols": 100,
+                        "rows": 30,
+                        "resize_seq": 1,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_rz1_{marker}",
+                    },
+                    rpc_id=65,
+                )
+            )
+            rz_done = wait_operation(
+                issuer, access_token, str(rz_sc.get("operation_id") or ""), want={"completed"}
+            )
+            if str(rz_done.get("status")) != "completed":
+                raise RuntimeError(f"resize_seq=1 must complete: {rz_done}")
+
+            # E3/E5: second tenant member is not controller until give; cannot write.
+            other_write_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token_other,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "data": "intruder\n",
+                        "input_seq": 3,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_other_write_{marker}",
+                    },
+                    rpc_id=66,
+                )
+            )
+            other_write_done = wait_operation(
+                issuer,
+                access_token_other,
+                str(other_write_sc.get("operation_id") or ""),
+                want={"failed", "denied"},
+                timeout_s=20,
+            )
+            if str(other_write_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(
+                    f"non-controller principal must not write session: {other_write_done}"
+                )
+
+            # Cross-principal operation get must not leak owner's op result.
+            foreign_status, foreign_body = http_json(
+                f"{issuer}/mcp",
+                method="POST",
+                headers={"authorization": f"Bearer {access_token_other}"},
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 67,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "ownmesh_get_operation",
+                        "arguments": {"operation_id": ses_op},
+                    },
+                },
+            )
+            if foreign_status != 200:
+                raise RuntimeError(f"foreign get_operation HTTP {foreign_status}: {foreign_body}")
+            foreign_dump = json.dumps(foreign_body).lower()
+            if "e5_live_pty" in foreign_dump or (
+                isinstance(foreign_body, dict)
+                and "completed" in foreign_dump
+                and ses_id
+                and ses_id.lower() in foreign_dump
+            ):
+                # Accept only explicit not-found / denied shapes.
+                if "not found" not in foreign_dump and "denied" not in foreign_dump and "failed" not in foreign_dump:
+                    raise RuntimeError(
+                        f"cross-principal get_operation must not leak owner result: {foreign_body}"
+                    )
+
+            give_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_give",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "to": "prin_other",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_give_{marker}",
+                    },
+                    rpc_id=68,
+                )
+            )
+            give_done = wait_operation(
+                issuer, access_token, str(give_sc.get("operation_id") or ""), want={"completed"}
+            )
+            if str(give_done.get("status")) != "completed":
+                raise RuntimeError(f"session.give to member must complete: {give_done}")
+
+            # After handoff, former controller cannot write; new controller can (seq continues).
+            owner_after_give_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "data": "owner-after\n",
+                        "input_seq": 3,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_owner_after_{marker}",
+                    },
+                    rpc_id=69,
+                )
+            )
+            owner_after_give_done = wait_operation(
+                issuer,
+                access_token,
+                str(owner_after_give_sc.get("operation_id") or ""),
+                want={"failed", "denied"},
+                timeout_s=20,
+            )
+            if str(owner_after_give_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(
+                    f"former controller must lose write after give: {owner_after_give_done}"
+                )
+
+            other_ctrl_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token_other,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "data": "member-ctrl\n",
+                        "input_seq": 3,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_other_ctrl_{marker}",
+                    },
+                    rpc_id=70,
+                )
+            )
+            other_ctrl_done = wait_operation(
+                issuer,
+                access_token_other,
+                str(other_ctrl_sc.get("operation_id") or ""),
+                want={"completed"},
+            )
+            if str(other_ctrl_done.get("status")) != "completed":
+                raise RuntimeError(
+                    f"handoff recipient must write with next input_seq: {other_ctrl_done}"
                 )
 
             # Missing idempotency_key on mutating tool must fail closed before route.
@@ -1239,7 +1638,8 @@ def main() -> int:
             print(
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
                 f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
-                f"patch+shell+workspace-select+live-pty+session-open+observer-deny-write+required-key held "
+                f"patch+shell+workspace-select+live-pty+session-open+observer-deny-write+"
+                f"workspace-list/show+input_seq+two-principal-handoff+required-key held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )

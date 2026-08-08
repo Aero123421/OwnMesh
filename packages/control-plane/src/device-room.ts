@@ -1883,17 +1883,23 @@ export class DeviceRoom {
       if (!security.ok) {
         return json({ error: security.error }, { status: security.status });
       }
-      // Binding: principal/tenant on the device must match signed claims when device is known.
+      // Binding: caller must be device owner or explicit tenant member (same tenant).
       if (this.env.DB) {
         try {
           const storeForBind = createStore(this.env);
           const boundDevice = await storeForBind.getDevice(this.deviceId);
-          if (
-            boundDevice &&
-            (boundDevice.principal_id !== opCtx.claims.principal_id ||
-              boundDevice.tenant_id !== opCtx.claims.tenant_id)
-          ) {
-            return json({ error: "binding_mismatch" }, { status: 403 });
+          if (boundDevice) {
+            if (boundDevice.tenant_id !== opCtx.claims.tenant_id) {
+              return json({ error: "binding_mismatch" }, { status: 403 });
+            }
+            const allowed = await storeForBind.canOperateDevice(
+              this.deviceId,
+              opCtx.claims.principal_id,
+              opCtx.claims.tenant_id,
+            );
+            if (!allowed) {
+              return json({ error: "binding_mismatch" }, { status: 403 });
+            }
           }
         } catch {
           // D1 bind lookup throw: tear down existing WS, refuse op.
@@ -2080,24 +2086,33 @@ export class DeviceRoom {
         if (!device || device.revoked || device.status !== "active") {
           return json({ error: "device_not_active" }, { status: 403 });
         }
-        if (
-          device.principal_id !== wsCtx.claims.principal_id ||
-          device.tenant_id !== wsCtx.claims.tenant_id
-        ) {
+        if (device.tenant_id !== wsCtx.claims.tenant_id) {
           return json({ error: "binding_mismatch" }, { status: 403 });
         }
         if (role === "agent") {
+          // Agent enrollment remains owner-bound: the device credential principal
+          // must match the device owner and the signed internal-context claims.
+          if (
+            device.principal_id !== wsCtx.claims.principal_id ||
+            device.tenant_id !== wsCtx.claims.tenant_id
+          ) {
+            return json({ error: "binding_mismatch" }, { status: 403 });
+          }
           const credential = token ? await store.getDeviceCredential(token) : null;
           if (!credential || credential.device_id !== this.deviceId) {
             return json({ error: "invalid_device_credential" }, { status: 401 });
           }
         } else {
           const access = token ? await store.getAccess(token) : null;
-          if (
-            !access ||
-            access.principal !== device.principal_id ||
-            access.tenant_id !== device.tenant_id
-          ) {
+          if (!access || access.tenant_id !== device.tenant_id) {
+            return json({ error: "unauthorized" }, { status: 401 });
+          }
+          const allowed = await store.canOperateDevice(
+            this.deviceId,
+            access.principal,
+            access.tenant_id,
+          );
+          if (!allowed || access.principal !== wsCtx.claims.principal_id) {
             return json({ error: "unauthorized" }, { status: 401 });
           }
           clientScope = access.scope;

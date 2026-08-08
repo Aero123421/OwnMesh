@@ -644,8 +644,8 @@ export interface ControlPlaneStore {
 
   /**
    * Fail-closed device gate for MCP create/poll/cancel.
-   * Rejects when device missing/inactive/revoked, owner mismatch, or when the
-   * device has credentials and none remain valid (all revoked/expired).
+   * Rejects when device missing/inactive/revoked, caller is neither owner nor
+   * tenant member, or when the device has credentials and none remain valid.
    * Credential schema/query failures fail closed (never treated as no credentials).
    */
   assertDeviceOperableForMcp(
@@ -653,6 +653,22 @@ export interface ControlPlaneStore {
     principalId: string,
     tenantId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }>;
+
+  /** True when principal is the device owner or an explicit tenant member. */
+  canOperateDevice(
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean>;
+
+  /** Upsert a tenant membership row (owner/admin/member). */
+  putTenantMember(
+    tenantId: string,
+    principalId: string,
+    role: "owner" | "admin" | "member",
+  ): Promise<void>;
+
+  isTenantMember(tenantId: string, principalId: string): Promise<boolean>;
 
   appliedMigrations(): Promise<string[]>;
   markMigration(id: string): Promise<void>;
@@ -904,6 +920,8 @@ export class MemoryStore implements ControlPlaneStore {
   mcpApprovalTransactions = new Map<string, McpApprovalTransaction>();
   mcpApprovalOutbox = new Map<string, McpApprovalOutbox>();
   grants = new Map<string, GrantRecord>();
+  /** key = `${tenant_id}\0${principal_id}` */
+  tenantMembers = new Map<string, { tenant_id: string; principal_id: string; role: "owner" | "admin" | "member"; created_at: string }>();
   audits: AuditEvent[] = [];
   migrations = new Set<string>();
 
@@ -1700,13 +1718,47 @@ export class MemoryStore implements ControlPlaneStore {
     return updated;
   }
 
+  async putTenantMember(
+    tenantId: string,
+    principalId: string,
+    role: "owner" | "admin" | "member",
+  ): Promise<void> {
+    const key = `${tenantId}\0${principalId}`;
+    this.tenantMembers.set(key, {
+      tenant_id: tenantId,
+      principal_id: principalId,
+      role,
+      created_at: nowIso(),
+    });
+  }
+
+  async isTenantMember(tenantId: string, principalId: string): Promise<boolean> {
+    return this.tenantMembers.has(`${tenantId}\0${principalId}`);
+  }
+
+  async canOperateDevice(
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.tenant_id !== tenantId) return false;
+    if (device.principal_id === principalId) return true;
+    return this.isTenantMember(tenantId, principalId);
+  }
+
   async assertDeviceOperableForMcp(
     deviceId: string,
     principalId: string,
     tenantId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const device = await this.getDevice(deviceId);
-    if (!device || device.principal_id !== principalId || device.tenant_id !== tenantId) {
+    if (!device || device.tenant_id !== tenantId) {
+      return { ok: false, error: "device_not_available" };
+    }
+    const allowed =
+      device.principal_id === principalId || (await this.isTenantMember(tenantId, principalId));
+    if (!allowed) {
       return { ok: false, error: "device_not_available" };
     }
     if (device.revoked || device.status !== "active") {
@@ -3576,13 +3628,59 @@ export class SqlStore implements ControlPlaneStore {
     return this.getMcpOperation(outbox.operation_id);
   }
 
+  async putTenantMember(
+    tenantId: string,
+    principalId: string,
+    role: "owner" | "admin" | "member",
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO tenant_members (tenant_id, principal_id, role, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(tenant_id, principal_id) DO UPDATE SET role = excluded.role`,
+      )
+      .bind(tenantId, principalId, role, nowIso())
+      .run();
+  }
+
+  async isTenantMember(tenantId: string, principalId: string): Promise<boolean> {
+    try {
+      const row = await this.db
+        .prepare(
+          `SELECT 1 AS ok FROM tenant_members WHERE tenant_id = ? AND principal_id = ? LIMIT 1`,
+        )
+        .bind(tenantId, principalId)
+        .first<{ ok: number }>();
+      return !!row;
+    } catch {
+      // Missing table/schema fails closed (not a member).
+      return false;
+    }
+  }
+
+  async canOperateDevice(
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.tenant_id !== tenantId) return false;
+    if (device.principal_id === principalId) return true;
+    return this.isTenantMember(tenantId, principalId);
+  }
+
   async assertDeviceOperableForMcp(
     deviceId: string,
     principalId: string,
     tenantId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const device = await this.getDevice(deviceId);
-    if (!device || device.principal_id !== principalId || device.tenant_id !== tenantId) {
+    if (!device || device.tenant_id !== tenantId) {
+      return { ok: false, error: "device_not_available" };
+    }
+    const allowed =
+      device.principal_id === principalId || (await this.isTenantMember(tenantId, principalId));
+    if (!allowed) {
       return { ok: false, error: "device_not_available" };
     }
     if (device.revoked || device.status !== "active") {

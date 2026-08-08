@@ -596,12 +596,25 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         session_id: str,
         data: str,
         workspace_id: str,
+        input_seq: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Monotonic per-session controller input sequence (start at 1; gaps/stale rejected)",
+        },
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once input",
         },
       },
-      required: ["device_id", "session_id", "data", "workspace_id", "idempotency_key"],
+      required: [
+        "device_id",
+        "session_id",
+        "data",
+        "workspace_id",
+        "input_seq",
+        "idempotency_key",
+      ],
     },
     annotations: {
       readOnlyHint: false,
@@ -623,12 +636,26 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         cols: { type: "integer", minimum: 1, maximum: 512 },
         rows: { type: "integer", minimum: 1, maximum: 512 },
         workspace_id: str,
+        resize_seq: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Monotonic per-session controller resize sequence (start at 1; gaps/stale rejected)",
+        },
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once resize",
         },
       },
-      required: ["device_id", "session_id", "cols", "rows", "workspace_id", "idempotency_key"],
+      required: [
+        "device_id",
+        "session_id",
+        "cols",
+        "rows",
+        "workspace_id",
+        "resize_seq",
+        "idempotency_key",
+      ],
     },
     annotations: {
       readOnlyHint: false,
@@ -704,7 +731,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description: "Required caller idempotency key",
         },
       },
-      required: ["device_id", "idempotency_key"],
+      required: ["device_id", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: true,
@@ -1712,6 +1739,10 @@ export function sanitizeMcpArgs(args: Record<string, unknown>): Record<string, u
   clampInt("max_bytes", 1, MCP_MAX_READ_BYTES);
   clampInt("limit", 1, MCP_MAX_LIST_ENTRIES);
   clampInt("offset", 0, Number.MAX_SAFE_INTEGER);
+  clampInt("input_seq", 1, Number.MAX_SAFE_INTEGER);
+  clampInt("resize_seq", 1, Number.MAX_SAFE_INTEGER);
+  clampInt("cols", 1, 512);
+  clampInt("rows", 1, 512);
   if (out.env !== undefined) {
     const normalized = normalizeCommandEnv(out.env);
     if (normalized === undefined) {
@@ -2200,7 +2231,11 @@ export async function handleMcp(
 
     if (name === "ownmesh_get_device") {
       const d = await store.getDevice(deviceId);
-      if (!d || d.principal_id !== rec.principal || d.tenant_id !== rec.tenant_id) {
+      const operable =
+        d &&
+        d.tenant_id === rec.tenant_id &&
+        (await store.canOperateDevice(deviceId, rec.principal, rec.tenant_id));
+      if (!d || !operable) {
         // Leave envelope.device_id unset so get_operation remains pollable for a
         // never-enrolled id (operable-gate would otherwise return -32004).
         // Requested id is retained in the error payload.

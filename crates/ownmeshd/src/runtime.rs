@@ -887,14 +887,19 @@ impl DaemonRuntime {
         request: PendingRequest,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        if let Some(prev) = self.lookup_idempotent(idempotency_key.as_ref())? {
+        let requester_principal = canonicalize_principal_key(client.principal_key());
+        // Namespace receipts by principal so one MCP caller cannot replay another's
+        // local side-effect journal entry via a colliding idempotency_key.
+        let journal_key = idempotency_key
+            .as_ref()
+            .map(|k| principal_journal_key(&requester_principal, k));
+        if let Some(prev) = self.lookup_idempotent(journal_key.as_ref())? {
             let mut replayed = prev;
             if let Some(obj) = replayed.as_object_mut() {
                 obj.insert("replayed".into(), json!(true));
             }
             return Ok(replayed);
         }
-        let requester_principal = canonicalize_principal_key(client.principal_key());
 
         let verdict = self.evaluate(&facts, &requester_principal);
         let operation_id = Self::new_id("op_");
@@ -960,7 +965,7 @@ impl DaemonRuntime {
                 }))
             }
             Decision::Allow => {
-                self.begin_idempotent(idempotency_key.as_ref(), &operation_id)?;
+                self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
                 // Once the durable marker exists, every execution/finalization error
                 // deliberately leaves it in place. Retrying an uncertain external
                 // side effect is less safe than requiring operator reconciliation.
@@ -973,7 +978,7 @@ impl DaemonRuntime {
                     "decision": "allow",
                     "reason": verdict.reason,
                 });
-                self.store_idempotent(idempotency_key.as_ref(), &body)?;
+                self.store_idempotent(journal_key.as_ref(), &body)?;
                 self.append_audit(
                     "operation.completed",
                     Some(&facts.capability),
@@ -1609,7 +1614,7 @@ full_user_access/full_access for arbitrary commands",
         let requester_principal = rec.requester_principal.clone();
         // Server-captured policy facts only — never trust client-supplied grant scope.
         let approved_facts = rec.facts.clone();
-        let idem_key = match &request {
+        let raw_idem_key = match &request {
             PendingRequest::Exec(x) => x.idempotency_key.clone(),
             PendingRequest::FsList(x) => x.idempotency_key.clone(),
             PendingRequest::FsStat(x) => x.idempotency_key.clone(),
@@ -1620,6 +1625,10 @@ full_user_access/full_access for arbitrary commands",
             PendingRequest::GitStatus(x) => x.idempotency_key.clone(),
             PendingRequest::GitDiff(x) => x.idempotency_key.clone(),
         };
+        // Same principal namespace as gate_and_run so approve + direct retry share one slot.
+        let idem_key = raw_idem_key
+            .as_ref()
+            .map(|k| principal_journal_key(&requester_principal, k));
 
         // Build (or refuse) the temporary grant before mutating durable approval state.
         let pending_grant = if p.temporary_grant {
@@ -2050,7 +2059,7 @@ full_user_access/full_access for arbitrary commands",
             methods::DAEMON_UNLOCK => self.handle_unlock(),
             methods::TOKEN_REVOKE => self.handle_token_revoke(params),
             session_methods::OPEN => self.handle_session_open(params, client),
-            session_methods::LIST => self.handle_session_list(client),
+            session_methods::LIST => self.handle_session_list(params, client),
             session_methods::SHOW => self.handle_session_show(params, client),
             session_methods::ATTACH => self.handle_session_attach(params, client),
             session_methods::CLAIM => self.handle_session_claim(params, client),
@@ -2214,21 +2223,79 @@ full_user_access/full_access for arbitrary commands",
         Ok(value)
     }
 
-    fn handle_session_list(&mut self, client: &ClientIdentity) -> IpcResult<Value> {
+    fn handle_session_list(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
         let principal = &client.client_name;
+        // Remote MCP always supplies workspace_id. Restricted modes refuse an
+        // unbound list so cross-workspace session metadata cannot leak.
+        let filter_ws = match p
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => {
+                let want = if raw == "default" { "ws_default" } else { raw };
+                // Validate the workspace id exists on this device.
+                let _ = self.workspace_for(Some(want))?;
+                Some(want.to_owned())
+            }
+            // Remote MCP always binds workspace; local IPC recovery may omit.
+            None if is_remote_runtime_principal(principal) => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "session.list requires workspace_id for remote MCP callers".into(),
+                });
+            }
+            None => None,
+        };
         let sessions: Vec<_> = self
             .sessions
             .list()
             .into_iter()
             .filter(|info| {
-                self.sessions
+                let readable = self
+                    .sessions
                     .readers(&info.id, now)
                     .map(|r| r.contains(principal))
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if !readable {
+                    return false;
+                }
+                match filter_ws.as_deref() {
+                    None => true,
+                    Some(want) => {
+                        let bound = info
+                            .workspace_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("ws_default");
+                        let bound = if bound == "default" {
+                            "ws_default"
+                        } else {
+                            bound
+                        };
+                        bound == want
+                    }
+                }
             })
             .collect();
-        Ok(json!({ "sessions": sessions }))
+        Ok(json!({
+            "sessions": sessions,
+            "workspace_id": filter_ws,
+            "filtered_by_workspace": filter_ws.is_some(),
+        }))
     }
 
     fn handle_session_show(
@@ -2236,14 +2303,39 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
-        let id = require_id(params, "id")?;
-        self.require_reader(&id, &client.client_name, now)?;
-        let info = self.sessions.get(&id).map_err(session_err)?;
-        serde_json::to_value(info).map_err(|e| IpcError::Remote {
+        self.require_reader(&p.id, &client.client_name, now)?;
+        // Remote MCP must bind workspace; local IPC recovery may omit but cannot
+        // spoof a mismatched id when one is supplied.
+        if p.workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+            && is_remote_runtime_principal(&client.client_name)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.show requires workspace_id for remote MCP callers".into(),
+            });
+        }
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        let info = self.sessions.get(&p.id).map_err(session_err)?;
+        let mut value = serde_json::to_value(info).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
-        })
+        })?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("workspace_id".into(), json!(bound_ws));
+        }
+        Ok(value)
     }
 
     fn handle_session_attach(
@@ -2419,10 +2511,13 @@ full_user_access/full_access for arbitrary commands",
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let from = client.client_name.clone();
+        // Normalize bare principal ids into the remote runtime form when the
+        // controller is a remote MCP principal (same tenant namespace).
+        let to = normalize_handoff_target(&from, &p.to)?;
         let snapshot = self.sessions.clone();
         let lease = self
             .sessions
-            .give_controller(&p.id, &from, p.to, now)
+            .give_controller(&p.id, &from, to, now)
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
         let readers: Vec<String> = self
@@ -2612,6 +2707,9 @@ full_user_access/full_access for arbitrary commands",
             principal: Option<String>,
             #[serde(default)]
             workspace_id: Option<String>,
+            /// Monotonic controller input sequence (required on remote MCP path).
+            #[serde(default)]
+            input_seq: Option<u64>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
@@ -2630,6 +2728,13 @@ full_user_access/full_access for arbitrary commands",
             .authorize_stdin(&p.id, &principal, now)
             .map_err(session_err)?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        // Validate sequence before side effects; advance only with the durable commit.
+        if p.input_seq.is_none() && is_remote_runtime_principal(&principal) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.write requires input_seq for remote principals".into(),
+            });
+        }
         // Deliver bytes to the live PTY when owned; never pretend success on echo alone.
         if let Some(host) = self.live_hosts.get(&p.id) {
             host.write_stdin(p.data.as_bytes())
@@ -2648,6 +2753,15 @@ full_user_access/full_access for arbitrary commands",
         }
         // Bounded system receipt for observers (not a substitute for process I/O).
         let snapshot = self.sessions.clone();
+        let applied_seq = if let Some(seq) = p.input_seq {
+            Some(
+                self.sessions
+                    .advance_input_seq(&p.id, seq)
+                    .map_err(session_err)?,
+            )
+        } else {
+            None
+        };
         let receipt = if p.data.len() <= 64 {
             format!("[stdin-accepted] {}", p.data.replace('\n', "\\n"))
         } else {
@@ -2666,6 +2780,7 @@ full_user_access/full_access for arbitrary commands",
             "live_pty": true,
             "live_drained_bytes": drained,
             "workspace_id": bound_ws,
+            "input_seq": applied_seq,
         }))
     }
 
@@ -2681,11 +2796,20 @@ full_user_access/full_access for arbitrary commands",
             rows: u16,
             #[serde(default)]
             workspace_id: Option<String>,
+            /// Monotonic controller resize sequence (required on remote MCP path).
+            #[serde(default)]
+            resize_seq: Option<u64>,
         }
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
         self.require_controller(&p.id, &client.client_name, now)?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        if p.resize_seq.is_none() && is_remote_runtime_principal(&client.client_name) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.resize requires resize_seq for remote principals".into(),
+            });
+        }
         if let Some(host) = self.live_hosts.get(&p.id) {
             host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
                 code: app_error::INTERNAL,
@@ -2694,6 +2818,15 @@ full_user_access/full_access for arbitrary commands",
         }
         let principal = client.client_name.as_str();
         let snapshot = self.sessions.clone();
+        let applied_seq = if let Some(seq) = p.resize_seq {
+            Some(
+                self.sessions
+                    .advance_resize_seq(&p.id, seq)
+                    .map_err(session_err)?,
+            )
+        } else {
+            None
+        };
         self.sessions
             .resize(&p.id, principal, p.cols, p.rows, now)
             .map_err(session_err)?;
@@ -2704,6 +2837,7 @@ full_user_access/full_access for arbitrary commands",
             "rows": p.rows,
             "workspace_id": bound_ws,
             "live_pty": self.live_hosts.contains_key(&p.id),
+            "resize_seq": applied_seq,
         }))
     }
 
@@ -2899,11 +3033,16 @@ full_user_access/full_access for arbitrary commands",
     }
 
     /// Test helper: whether an idempotency key is present in the op journal.
+    /// Accepts either a raw caller key or a principal-namespaced journal key.
     #[cfg(test)]
     #[allow(dead_code)]
     #[must_use]
     pub fn has_op_journal_key_for_test(&self, key: &str) -> bool {
-        self.op_journal.contains_key(key)
+        if self.op_journal.contains_key(key) {
+            return true;
+        }
+        let suffix = format!("\u{1f}{key}");
+        self.op_journal.keys().any(|k| k.ends_with(&suffix))
     }
 
     /// Test helper: whether a key is retained as non-retriable/uncertain.
@@ -2911,9 +3050,17 @@ full_user_access/full_access for arbitrary commands",
     #[allow(dead_code)]
     #[must_use]
     pub fn op_journal_key_is_in_progress_for_test(&self, key: &str) -> bool {
-        self.op_journal
+        if self
+            .op_journal
             .get(key)
             .is_some_and(is_op_journal_in_progress)
+        {
+            return true;
+        }
+        let suffix = format!("\u{1f}{key}");
+        self.op_journal
+            .iter()
+            .any(|(k, v)| k.ends_with(&suffix) && is_op_journal_in_progress(v))
     }
 
     /// Fault the nth future op-journal persist without touching the durable file.
@@ -3125,10 +3272,13 @@ fn fs_err(err: ownmesh_fs::FsError) -> IpcError {
 }
 
 fn session_err(err: ownmesh_session::SessionError) -> IpcError {
-    let code = match err {
+    let code = match &err {
         ownmesh_session::SessionError::NotFound
         | ownmesh_session::SessionError::Invalid(_)
-        | ownmesh_session::SessionError::ChunkTooLarge => app_error::INVALID_PARAMS,
+        | ownmesh_session::SessionError::ChunkTooLarge
+        | ownmesh_session::SessionError::SequenceRequired(_)
+        | ownmesh_session::SessionError::SequenceStale { .. }
+        | ownmesh_session::SessionError::SequenceGap { .. } => app_error::INVALID_PARAMS,
         ownmesh_session::SessionError::NotReader => app_error::POLICY_DENIED,
         ownmesh_session::SessionError::SessionLimit
         | ownmesh_session::SessionError::ReplayBudget
@@ -3142,6 +3292,79 @@ fn session_err(err: ownmesh_session::SessionError) -> IpcError {
         code,
         message: err.to_string(),
     }
+}
+
+/// Remote MCP principals are namespaced `client:remote:<tenant>:<principal>`.
+fn is_remote_runtime_principal(principal: &str) -> bool {
+    let p = canonicalize_principal_key(principal);
+    p.starts_with("client:remote:") || p.starts_with("client:remote-agent:")
+}
+
+/// Map a session.give `to` target into the authenticated runtime principal space.
+///
+/// Accepts a full `client:remote:<tenant>:<principal>` key (must share the caller's
+/// tenant) or a bare principal id which is bound to the caller's tenant.
+fn normalize_handoff_target(from: &str, to: &str) -> IpcResult<String> {
+    let to = to.trim();
+    if to.is_empty() || to.len() > 128 {
+        return Err(IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: "session.give to must be a non-empty principal id (<=128 chars)".into(),
+        });
+    }
+    if to
+        .chars()
+        .any(|c| c.is_control() || c == '/' || c == '\\' || c == ' ')
+    {
+        return Err(IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: "session.give to contains invalid characters".into(),
+        });
+    }
+    let from_canon = canonicalize_principal_key(from);
+    if let Some(rest) = from_canon.strip_prefix("client:remote:") {
+        let mut parts = rest.splitn(2, ':');
+        let tenant = parts.next().unwrap_or("");
+        if tenant.is_empty() {
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "authenticated remote principal missing tenant".into(),
+            });
+        }
+        let to_canon = canonicalize_principal_key(to);
+        if let Some(to_rest) = to_canon.strip_prefix("client:remote:") {
+            let mut to_parts = to_rest.splitn(2, ':');
+            let to_tenant = to_parts.next().unwrap_or("");
+            let to_prin = to_parts.next().unwrap_or("");
+            if to_tenant != tenant || to_prin.is_empty() {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: "session.give target must share the controller tenant".into(),
+                });
+            }
+            return Ok(format!("client:remote:{tenant}:{to_prin}"));
+        }
+        // Bare principal id — bind to controller tenant.
+        if to_canon.contains(':') {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.give to must be a bare principal id or client:remote:... key"
+                    .into(),
+            });
+        }
+        return Ok(format!("client:remote:{tenant}:{to_canon}"));
+    }
+    // Local IPC path: keep the supplied principal as-is (canonicalized).
+    Ok(canonicalize_principal_key(to))
+}
+
+/// Build the durable local journal key so receipts never cross principals.
+fn principal_journal_key(principal: &str, idempotency_key: &str) -> String {
+    format!(
+        "{}\u{1f}{}",
+        canonicalize_principal_key(principal),
+        idempotency_key
+    )
 }
 
 /// Production elevated broker loading is disabled until a secure mint authority

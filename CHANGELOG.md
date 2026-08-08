@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.0-beta.9 — E3 principal bind + E4 session workspace + E5 ordered input
+
+- E3: ownmeshd derives runtime principal from verified `bound_action` (`client:remote:<tenant>:<principal>`); local idempotency journal namespaced per principal
+- E3/E5: minimal `tenant_members` table + `canOperateDevice` so same-tenant members can operate devices; `session.give` normalizes bare principal ids into the remote runtime namespace; public two-principal handoff proof
+- E4: `ownmesh_session_list` requires `workspace_id`; list/show filter/reject cross-workspace session metadata
+- E5: MCP `input_seq` / `resize_seq` required on write/resize; ownmeshd persists last-applied and rejects gaps/stale through the real workerd path
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
 ## v1.2.0-beta.8 — E5 live PTY + E3 crash outbox + large dir spool + session lifecycle
 
 - E3: Agent transport durable pending dispatch outbox; crash/reconnect resumes or emits terminal `OWNMESH_E_DISPATCH_LOST` (no stranded seen-without-completion); capacity rejects without live eviction

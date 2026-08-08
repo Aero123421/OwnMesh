@@ -1508,14 +1508,51 @@ fn verify_exact_action_binding(
     Ok(())
 }
 
-fn remote_agent_client(device_id: &DeviceId) -> ClientIdentity {
-    // Remote MCP ops are authenticated by the device credential on the control
-    // plane hop. Local side effects run as this daemon-bound remote principal;
-    // never trust client-supplied principal/policy fields from the payload.
-    ClientIdentity::new(
-        format!("client:remote-agent:{}", device_id.as_str()),
-        env!("CARGO_PKG_VERSION"),
-    )
+/// Derive the runtime principal from the already-verified bound_action.
+///
+/// Format: `client:remote:<tenant_id>:<principal_id>`. Never trust client-supplied
+/// principal fields from free-form arguments — only the server-hashed binding.
+fn remote_agent_client_from_bound(
+    request: &OperationRequestPayload,
+) -> Result<ClientIdentity, String> {
+    let bound = request
+        .authorization
+        .as_ref()
+        .and_then(|a| a.bound_action.as_object())
+        .ok_or_else(|| {
+            "remote principal requires verified authorization.bound_action".to_owned()
+        })?;
+    let principal_id = bound
+        .get("principal_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "bound_action.principal_id missing".to_owned())?;
+    let tenant_id = bound
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "bound_action.tenant_id missing".to_owned())?;
+    if principal_id.len() > 128 || tenant_id.len() > 128 {
+        return Err("bound principal_id/tenant_id exceed 128-char budget".into());
+    }
+    if principal_id
+        .chars()
+        .any(|c| c.is_control() || c == ':' || c == '/' || c == '\\')
+        || tenant_id
+            .chars()
+            .any(|c| c.is_control() || c == ':' || c == '/' || c == '\\')
+    {
+        return Err("bound principal_id/tenant_id contain invalid characters".into());
+    }
+    // Lowercase via canonicalize path on the runtime side; keep the label stable here.
+    let key = format!(
+        "client:remote:{}:{}",
+        tenant_id.to_ascii_lowercase(),
+        principal_id.to_ascii_lowercase()
+    );
+    Ok(ClientIdentity::new(key, env!("CARGO_PKG_VERSION")))
 }
 
 fn action_of(request: &OperationRequestPayload) -> String {
@@ -1923,7 +1960,21 @@ async fn dispatch_remote_operation(
         });
     }
 
-    let client = remote_agent_client(device_id);
+    let client = match remote_agent_client_from_bound(request) {
+        Ok(c) => c,
+        Err(message) => {
+            return json!({
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": operation_id,
+                "status": "failed",
+                "error": {
+                    "code": "OWNMESH_E_ACTION_BINDING_MISMATCH",
+                    "message": message,
+                    "retryable": false
+                }
+            });
+        }
+    };
     let outcome = {
         let mut guard = runtime.lock().await;
         guard

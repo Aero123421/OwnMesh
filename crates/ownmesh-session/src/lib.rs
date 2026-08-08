@@ -65,6 +65,16 @@ pub enum SessionError {
     ChunkTooLarge,
     #[error("replay budget exceeded")]
     ReplayBudget,
+    #[error("stale {kind} sequence {got} (last applied {last})")]
+    SequenceStale { kind: String, got: u64, last: u64 },
+    #[error("gap in {kind} sequence: got {got}, expected {expected}")]
+    SequenceGap {
+        kind: String,
+        got: u64,
+        expected: u64,
+    },
+    #[error("{0} sequence required")]
+    SequenceRequired(String),
 }
 
 pub type SessionResult<T> = Result<T, SessionError>;
@@ -182,6 +192,12 @@ pub struct SessionInfo {
     /// Always recorded for audit; enforced as a path boundary only in restricted modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// Last applied controller input sequence (0 = none). Monotonic, gap-free.
+    #[serde(default)]
+    pub last_input_seq: u64,
+    /// Last applied controller resize sequence (0 = none). Monotonic, gap-free.
+    #[serde(default)]
+    pub last_resize_seq: u64,
 }
 
 impl SessionInfo {
@@ -337,6 +353,8 @@ impl SessionManager {
             command,
             cwd,
             workspace_id,
+            last_input_seq: 0,
+            last_resize_seq: 0,
         };
         self.sessions.insert(
             id,
@@ -653,6 +671,58 @@ impl SessionManager {
         s.info.cols = cols;
         s.info.rows = rows;
         Ok(())
+    }
+
+    /// Advance the controller input sequence. Requires `seq == last + 1` (reject stale/gap).
+    pub fn advance_input_seq(&mut self, id: &str, seq: u64) -> SessionResult<u64> {
+        self.advance_controller_seq(id, seq, "input", true)
+    }
+
+    /// Advance the controller resize sequence. Requires `seq == last + 1` (reject stale/gap).
+    pub fn advance_resize_seq(&mut self, id: &str, seq: u64) -> SessionResult<u64> {
+        self.advance_controller_seq(id, seq, "resize", false)
+    }
+
+    fn advance_controller_seq(
+        &mut self,
+        id: &str,
+        seq: u64,
+        kind: &str,
+        input: bool,
+    ) -> SessionResult<u64> {
+        if seq == 0 {
+            return Err(SessionError::Invalid(format!("{kind}_seq must be >= 1")));
+        }
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        if s.info.state == SessionState::Closed {
+            return Err(SessionError::Closed);
+        }
+        let last = if input {
+            s.info.last_input_seq
+        } else {
+            s.info.last_resize_seq
+        };
+        let expected = last.saturating_add(1);
+        if seq < expected {
+            return Err(SessionError::SequenceStale {
+                kind: kind.to_owned(),
+                got: seq,
+                last,
+            });
+        }
+        if seq > expected {
+            return Err(SessionError::SequenceGap {
+                kind: kind.to_owned(),
+                got: seq,
+                expected,
+            });
+        }
+        if input {
+            s.info.last_input_seq = seq;
+        } else {
+            s.info.last_resize_seq = seq;
+        }
+        Ok(seq)
     }
 
     /// Set view mode; active controller only.
@@ -1029,5 +1099,41 @@ mod tests {
         assert_eq!(info.cols, 120);
         assert_eq!(info.rows, 40);
         assert_eq!(info.view_mode, PtyViewMode::Cooked);
+    }
+
+    #[test]
+    fn input_and_resize_sequences_are_monotonic_gap_free() {
+        let mut mgr = SessionManager::new();
+        let ses = mgr.open(SessionKind::Pty, "t", "a", 1, None).unwrap();
+        assert_eq!(mgr.advance_input_seq(&ses.id, 1).unwrap(), 1);
+        assert_eq!(mgr.advance_input_seq(&ses.id, 2).unwrap(), 2);
+        assert_eq!(
+            mgr.advance_input_seq(&ses.id, 2).unwrap_err(),
+            SessionError::SequenceStale {
+                kind: "input".into(),
+                got: 2,
+                last: 2,
+            }
+        );
+        assert_eq!(
+            mgr.advance_input_seq(&ses.id, 4).unwrap_err(),
+            SessionError::SequenceGap {
+                kind: "input".into(),
+                got: 4,
+                expected: 3,
+            }
+        );
+        assert_eq!(mgr.advance_resize_seq(&ses.id, 1).unwrap(), 1);
+        assert_eq!(
+            mgr.advance_resize_seq(&ses.id, 3).unwrap_err(),
+            SessionError::SequenceGap {
+                kind: "resize".into(),
+                got: 3,
+                expected: 2,
+            }
+        );
+        let info = mgr.get(&ses.id).unwrap();
+        assert_eq!(info.last_input_seq, 2);
+        assert_eq!(info.last_resize_seq, 1);
     }
 }
