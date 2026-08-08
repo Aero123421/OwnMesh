@@ -1156,6 +1156,8 @@ export class DeviceRoomRouter {
     payload: Record<string, unknown>;
     correlation_id: string;
     from_session?: string;
+    /** Immutable control-plane expiry for the outbound operation.request envelope. */
+    expires_at?: string;
   }):
     | { ok: true; prepared: PreparedInjectOperation }
     | { ok: false; result: { status: string; detail?: unknown } } {
@@ -1223,10 +1225,41 @@ export class DeviceRoomRouter {
         },
       };
     }
+    // E3: prefer the immutable control-plane expiry from inject metadata (not a
+    // protocol payload field — ownmesh.operation/1.0 request denies unknown keys).
+    // Reject already-expired bindings before staging pending/seq.
+    let boundExpiresAt: string | undefined;
+    const injectExpiry =
+      typeof op.expires_at === "string" && op.expires_at.trim() !== ""
+        ? String(op.expires_at)
+        : undefined;
+    if (injectExpiry) {
+      const expMs = Date.parse(injectExpiry);
+      if (!Number.isFinite(expMs)) {
+        return {
+          ok: false,
+          result: {
+            status: "rejected",
+            detail: { code: "OWNMESH_E_BAD_ENVELOPE", message: "expires_at is not a valid timestamp" },
+          },
+        };
+      }
+      if (expMs <= Date.now()) {
+        return {
+          ok: false,
+          result: {
+            status: "rejected",
+            detail: { code: "OWNMESH_E_ENVELOPE_EXPIRED", message: "operation expires_at already elapsed" },
+          },
+        };
+      }
+      boundExpiresAt = injectExpiry;
+    }
     const envelope = this.nextEnvelope(
       "operation.request",
       normalized,
       op.correlation_id,
+      boundExpiresAt ? { expiresAt: boundExpiresAt } : undefined,
     );
     this.pending.set(op.correlation_id, {
       correlation_id: op.correlation_id,
@@ -1305,6 +1338,7 @@ export class DeviceRoomRouter {
     payload: Record<string, unknown>;
     correlation_id: string;
     from_session?: string;
+    expires_at?: string;
   }): { status: string; detail?: unknown } {
     const prep = this.prepareInjectOperation(op);
     if (!prep.ok) return prep.result;
@@ -1772,6 +1806,7 @@ export class DeviceRoom {
         type: string;
         payload?: Record<string, unknown>;
         correlation_id?: string;
+        expires_at?: string;
       };
       try {
         body = JSON.parse(rawBody) as typeof body;
@@ -1842,6 +1877,10 @@ export class DeviceRoom {
         type: body.type,
         payload: body.payload || {},
         correlation_id: correlationId,
+        expires_at:
+          typeof body.expires_at === "string" && body.expires_at.trim() !== ""
+            ? String(body.expires_at)
+            : undefined,
       });
       if (!prep.ok) {
         return json(prep.result, {

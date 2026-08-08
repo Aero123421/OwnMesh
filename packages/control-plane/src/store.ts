@@ -347,6 +347,17 @@ export interface ControlPlaneStore {
     idempotencyKey: string;
   }): Promise<McpOperationRecord | null>;
   /**
+   * Atomic create-or-return for an idempotency-bound MCP operation.
+   * Exactly one caller wins the insert for a given
+   * (principal, tenant, device, idempotency_key). Losers reload the winner
+   * and must compare action binding before any device route.
+   * When `idempotency_key` is null/empty, behaves as create-only putMcpOperation.
+   */
+  claimMcpOperationByIdempotency(op: McpOperationRecord): Promise<
+    | { outcome: "created"; op: McpOperationRecord }
+    | { outcome: "existing"; op: McpOperationRecord }
+  >;
+  /**
    * Patch MCP operation. When `fromStatuses` is set, CAS: only updates if current
    * status is in that set (returns null on miss / CAS loss).
    */
@@ -615,6 +626,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "idx_mcp_ops_updated",
       "idx_mcp_ops_idempotency",
       "idx_mcp_ops_payload_hash",
+      "uq_mcp_ops_idempotency",
     ],
   },
   mcp_approval_transactions: {
@@ -1080,10 +1092,21 @@ export class MemoryStore implements ControlPlaneStore {
       .reverse();
   }
 
-  /** Create-only: refuses to overwrite an existing operation_id. */
+  /** Create-only: refuses to overwrite an existing operation_id or idempotency binding. */
   async putMcpOperation(op: McpOperationRecord): Promise<void> {
     if (this.mcpOperations.has(op.operation_id)) {
       throw new Error(`mcp_operation_exists:${op.operation_id}`);
+    }
+    if (op.idempotency_key) {
+      const existing = await this.getMcpOperationByIdempotency({
+        principalId: op.principal_id,
+        tenantId: op.tenant_id,
+        deviceId: op.device_id || "",
+        idempotencyKey: op.idempotency_key,
+      });
+      if (existing) {
+        throw new Error(`mcp_operation_idempotency_exists:${op.idempotency_key}`);
+      }
     }
     this.mcpOperations.set(op.operation_id, {
       ...op,
@@ -1129,6 +1152,59 @@ export class MemoryStore implements ControlPlaneStore {
           action: best.action ? { ...best.action } : best.action,
         }
       : null;
+  }
+  async claimMcpOperationByIdempotency(
+    op: McpOperationRecord,
+  ): Promise<
+    | { outcome: "created"; op: McpOperationRecord }
+    | { outcome: "existing"; op: McpOperationRecord }
+  > {
+    // Synchronous check+insert window (no await) so concurrent MemoryStore
+    // callers cannot both observe absence and both insert.
+    if (op.idempotency_key) {
+      let best: McpOperationRecord | null = null;
+      for (const existing of this.mcpOperations.values()) {
+        if (
+          existing.principal_id === op.principal_id &&
+          existing.tenant_id === op.tenant_id &&
+          (existing.device_id || "") === (op.device_id || "") &&
+          (existing.idempotency_key || "") === op.idempotency_key
+        ) {
+          if (!best || existing.created_at > best.created_at) best = existing;
+        }
+      }
+      if (best) {
+        return {
+          outcome: "existing",
+          op: {
+            ...best,
+            data: { ...best.data },
+            warnings: [...best.warnings],
+            action: best.action ? { ...best.action } : best.action,
+          },
+        };
+      }
+    }
+    if (this.mcpOperations.has(op.operation_id)) {
+      throw new Error(`mcp_operation_exists:${op.operation_id}`);
+    }
+    const stored: McpOperationRecord = {
+      ...op,
+      data: { ...(op.data || {}) },
+      warnings: [...(op.warnings || [])],
+      action: op.action ? { ...op.action } : op.action,
+      policy_authority: "ownmesh_device",
+    };
+    this.mcpOperations.set(op.operation_id, stored);
+    return {
+      outcome: "created",
+      op: {
+        ...stored,
+        data: { ...stored.data },
+        warnings: [...stored.warnings],
+        action: stored.action ? { ...stored.action } : stored.action,
+      },
+    };
   }
   async updateMcpOperation(
     operationId: string,
@@ -2605,6 +2681,75 @@ export class SqlStore implements ControlPlaneStore {
       .bind(opts.principalId, opts.tenantId, opts.deviceId, opts.idempotencyKey)
       .first<Record<string, unknown>>();
     return row ? rowToMcpOperation(row) : null;
+  }
+
+  async claimMcpOperationByIdempotency(
+    op: McpOperationRecord,
+  ): Promise<
+    | { outcome: "created"; op: McpOperationRecord }
+    | { outcome: "existing"; op: McpOperationRecord }
+  > {
+    // INSERT OR IGNORE respects PK + partial unique idempotency index.
+    const result = await this.db
+      .prepare(
+        `INSERT INTO mcp_operations
+         (operation_id, tenant_id, principal_id, device_id, tool, status, summary,
+          data_json, truncated, next_cursor, approval_required, approval_url, approval_id,
+          session_id, warnings_json, correlation_id, payload_hash, idempotency_key,
+          workspace_id, expires_at, claim_version, action_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING`,
+      )
+      .bind(
+        op.operation_id,
+        op.tenant_id,
+        op.principal_id,
+        op.device_id ?? null,
+        op.tool,
+        op.status,
+        op.summary,
+        JSON.stringify(op.data || {}),
+        op.truncated ? 1 : 0,
+        op.next_cursor ?? null,
+        op.approval_required ? 1 : 0,
+        op.approval_url ?? null,
+        op.approval_id ?? null,
+        op.session_id ?? null,
+        JSON.stringify(op.warnings || []),
+        op.correlation_id ?? null,
+        op.payload_hash ?? null,
+        op.idempotency_key ?? null,
+        op.workspace_id ?? null,
+        op.expires_at ?? null,
+        Number(op.claim_version ?? 0),
+        JSON.stringify(op.action || {}),
+        op.created_at,
+        op.updated_at,
+      )
+      .run();
+    const changes = Number(
+      (result as { meta?: { changes?: number }; changes?: number }).meta?.changes
+        ?? (result as { changes?: number }).changes
+        ?? 0,
+    );
+    if (changes >= 1) {
+      const created = await this.getMcpOperation(op.operation_id);
+      if (!created) throw new Error(`mcp_operation_claim_missing:${op.operation_id}`);
+      return { outcome: "created", op: created };
+    }
+    // Conflict: prefer idempotency owner, then same operation_id.
+    if (op.idempotency_key) {
+      const existing = await this.getMcpOperationByIdempotency({
+        principalId: op.principal_id,
+        tenantId: op.tenant_id,
+        deviceId: op.device_id || "",
+        idempotencyKey: op.idempotency_key,
+      });
+      if (existing) return { outcome: "existing", op: existing };
+    }
+    const byId = await this.getMcpOperation(op.operation_id);
+    if (byId) return { outcome: "existing", op: byId };
+    throw new Error(`mcp_operation_claim_conflict:${op.operation_id}`);
   }
 
   async updateMcpOperation(

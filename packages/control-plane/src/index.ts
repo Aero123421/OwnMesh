@@ -135,6 +135,9 @@ async function routeToDeviceRoom(
     type: string;
     payload: Record<string, unknown>;
     correlation_id: string;
+    expires_at?: string;
+    claim_version?: number;
+    oauth_client_id?: string | null;
   },
   bind?: { principal_id?: string; tenant_id?: string },
 ): Promise<{ status: string; detail?: unknown }> {

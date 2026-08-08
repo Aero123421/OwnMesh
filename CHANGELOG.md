@@ -1,12 +1,14 @@
 # Changelog
 
-## v1.2.0-beta.4 — E3 action binding + bounded I/O
+## v1.2.0-beta.4 — E3 action binding + bounded I/O (integrity hardening)
 
-- Server-computed `payload_hash` and durable MCP operation action binding (E3 slice)
-- Idempotency key reuse with drifted content fails closed; identical action replays
-- Command output streamed into capped rings; cancel kills in-flight process trees
-- MCP/DeviceRoom ingress byte caps before JSON parse; oversized WS frames rejected early
-- MCP `ownmesh_fs_stat` / `ownmesh_fs_delete` / `ownmesh_fs_patch`; cursor-paginated `fs.list`
+- Server-computed `payload_hash` binds action facts + operation_id + expires_at + claim_version + OAuth client
+- Atomic `claimMcpOperationByIdempotency` + partial unique D1 index (one owner per idempotency key)
+- Concurrent same-key differing actions fail closed; identical actions replay without re-route
+- DeviceRoom stamps control-plane `expires_at` onto the operation.request envelope; agents reject expiry
+- Server-side clamp of timeout/output/list/read budgets at MCP and ownmeshd/exec
+- Cancel kills process trees (Unix process group / Windows taskkill /T); exclusive randomized write temps
+- E2 workerd loopback: byte-identical idempotent replay + separate mismatch assertion
 - Honest docs: E4–E9 and E10 remain open
 
 ## v1.2.0-beta.3 — E2 remote routing candidate

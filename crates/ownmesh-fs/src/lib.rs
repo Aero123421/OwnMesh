@@ -287,9 +287,11 @@ pub fn list_dir_page(
         return Err(FsError::NotADirectory(path));
     }
     let after = decode_list_cursor(cursor);
-    let limit = max_entries.max(1);
+    // Server-side ceiling independent of caller-supplied max_entries.
+    const MAX_PAGE_ENTRIES: usize = 500;
+    let limit = max_entries.clamp(1, MAX_PAGE_ENTRIES);
     // Hard scan budget prevents unbounded WalkDir collection before paging.
-    let scan_budget = limit.saturating_mul(32).max(limit).min(50_000);
+    let scan_budget = limit.saturating_mul(8).max(limit).min(4_000);
 
     let mut collected = Vec::new();
     if recursive {
@@ -470,7 +472,7 @@ pub fn read_file_range(
     Ok((buf, total, truncated))
 }
 
-/// Write file atomically (temp + rename) when possible.
+/// Write file atomically (exclusive random temp + rename) when possible.
 ///
 /// # Errors
 ///
@@ -483,23 +485,71 @@ pub fn write_file(ws: &WorkspaceRoot, rel: impl AsRef<Path>, data: &[u8]) -> FsR
             path: Some(parent.to_path_buf()),
             source,
         })?;
+        // Re-validate parent identity after create_dir_all (replacement race).
+        if ws.enforce {
+            let parent_canon = dunce_canonicalize(parent).map_err(|source| FsError::Io {
+                path: Some(parent.to_path_buf()),
+                source,
+            })?;
+            if !parent_canon.starts_with(ws.root()) {
+                return Err(FsError::EscapesWorkspace(parent_canon));
+            }
+        }
     }
-    let tmp = path.with_extension("ownmesh-tmp");
+    // Exclusive randomized temp name resists predictable *.ownmesh-tmp swap races.
+    let token = {
+        let mut hasher = Sha256::new();
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos().to_le_bytes())
+                .unwrap_or([0; 16]),
+        );
+        hasher.update((data.len() as u64).to_le_bytes());
+        hex::encode(hasher.finalize())
+    };
+    let tmp = match path.parent() {
+        Some(parent) => parent.join(format!(
+            ".ownmesh-{}.tmp",
+            token.get(..16).unwrap_or(token.as_str())
+        )),
+        None => path.with_extension(format!(
+            "ownmesh-{}.tmp",
+            token.get(..16).unwrap_or(token.as_str())
+        )),
+    };
     {
-        let mut f = fs::File::create(&tmp).map_err(|source| FsError::Io {
-            path: Some(tmp.clone()),
-            source,
-        })?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|source| FsError::Io {
+                path: Some(tmp.clone()),
+                source,
+            })?;
         f.write_all(data).map_err(|source| FsError::Io {
             path: Some(tmp.clone()),
             source,
         })?;
         f.sync_all().ok();
     }
-    fs::rename(&tmp, &path).map_err(|source| FsError::Io {
-        path: Some(path),
-        source,
+    fs::rename(&tmp, &path).map_err(|source| {
+        let _ = fs::remove_file(&tmp);
+        FsError::Io {
+            path: Some(path.clone()),
+            source,
+        }
     })?;
+    // Final identity check after rename for restricted workspaces.
+    if ws.enforce {
+        if let Ok(final_canon) = dunce_canonicalize(&path) {
+            if !final_canon.starts_with(ws.root()) {
+                let _ = fs::remove_file(&path);
+                return Err(FsError::EscapesWorkspace(final_canon));
+            }
+        }
+    }
     Ok(())
 }
 

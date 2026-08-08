@@ -370,13 +370,14 @@ test("schema ready but SESSION_SECRET unbound → /health 503 not_ready", async 
 });
 
 test("missing 0005 MCP objects → schema_ready:false while 0003/0004 retained", async () => {
-  // Through 0004 only — MCP tables absent (also skip later MCP ALTERs).
+  // Through 0004 only — MCP tables absent (also skip later MCP ALTERs/indexes).
   const files = allMigrationFiles().filter(
     (f) =>
       !f.startsWith("0005") &&
       !f.startsWith("0006") &&
       !f.startsWith("0007") &&
-      !f.startsWith("0008"),
+      !f.startsWith("0008") &&
+      !f.startsWith("0009"),
   );
   const { store } = openStoreWith(files);
   const readiness = await store.schemaReadiness();
@@ -541,7 +542,7 @@ test("missing 0006 claimed_at column → schema_ready:false", async () => {
   assert.equal(readiness.checks.mcp_approval_transactions, true);
 });
 
-test("MemoryStore and SqlStore both report full 0002–0008 readiness", async () => {
+test("MemoryStore and SqlStore both report full 0002–0009 readiness", async () => {
   const mem = new MemoryStore();
   const memR = await mem.schemaReadiness();
   assert.equal(memR.schema_ready, true);

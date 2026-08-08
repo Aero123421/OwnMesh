@@ -58,14 +58,35 @@ const str = { type: "string" as const };
 const deviceProp = {
   device_id: { type: "string", description: "Enrolled device id (dev_...)" },
 };
+/** Hard server-side ceilings (schema maximums are not authority alone). */
+export const MCP_MAX_TIMEOUT_MS = 300_000;
+export const MCP_MAX_OUTPUT_BYTES = 1_000_000;
+export const MCP_MAX_LIST_ENTRIES = 500;
+export const MCP_MAX_READ_BYTES = 512_000;
+
 const cursorProps = {
   cursor: { type: "string", description: "Opaque pagination cursor" },
   limit: { type: "integer", minimum: 1, maximum: 500, default: 50 },
   max_bytes: {
     type: "integer",
     minimum: 256,
-    maximum: 2_000_000,
+    maximum: MCP_MAX_READ_BYTES,
     description: "Soft max payload size before truncation",
+  },
+};
+
+const execBoundProps = {
+  timeout_ms: {
+    type: "integer",
+    minimum: 1,
+    maximum: MCP_MAX_TIMEOUT_MS,
+    description: "Wall-clock timeout (server-capped)",
+  },
+  max_output_bytes: {
+    type: "integer",
+    minimum: 1,
+    maximum: MCP_MAX_OUTPUT_BYTES,
+    description: "Aggregate stdout+stderr budget (server-capped)",
   },
 };
 
@@ -131,6 +152,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         ...cursorProps,
+        max_entries: {
+          type: "integer",
+          minimum: 1,
+          maximum: MCP_MAX_LIST_ENTRIES,
+          default: 200,
+        },
       },
       required: ["device_id", "path"],
     },
@@ -152,6 +179,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         ...cursorProps,
+        max_entries: {
+          type: "integer",
+          minimum: 1,
+          maximum: MCP_MAX_LIST_ENTRIES,
+          default: 200,
+        },
       },
       required: ["device_id", "path"],
     },
@@ -336,6 +369,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         cwd: str,
         idempotency_key: str,
         async: { type: "boolean", description: "Return immediately with operation_id" },
+        ...execBoundProps,
       },
       required: ["device_id", "program"],
     },
@@ -360,6 +394,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         cwd: str,
         idempotency_key: str,
         async: { type: "boolean" },
+        ...execBoundProps,
       },
       required: ["device_id", "program"],
     },
@@ -384,6 +419,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         cwd: str,
         idempotency_key: str,
         async: { type: "boolean" },
+        ...execBoundProps,
       },
       required: ["device_id", "command"],
     },
@@ -407,6 +443,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         cwd: str,
         idempotency_key: str,
         async: { type: "boolean" },
+        ...execBoundProps,
       },
       required: ["device_id", "command"],
     },
@@ -938,6 +975,10 @@ export type OperationRouter = {
       type: string;
       payload: Record<string, unknown>;
       correlation_id: string;
+      /** Immutable E3 expiry bound into the DeviceRoom envelope. */
+      expires_at?: string;
+      claim_version?: number;
+      oauth_client_id?: string | null;
     },
   ): Promise<{ status: string; detail?: unknown }>;
 };
@@ -1053,8 +1094,33 @@ const CLIENT_AUTHORITY_KEYS = new Set([
 ]);
 
 /**
- * Build the canonical authorized-action object used for payload_hash.
+ * Clamp untrusted numeric tool args to server hard ceilings before hash/route.
+ * Schema maximums are not relied on as the sole enforcement.
+ */
+export function sanitizeMcpArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...args };
+  const clampInt = (key: string, min: number, max: number) => {
+    const v = out[key];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      out[key] = Math.min(max, Math.max(min, Math.floor(v)));
+    } else if (v !== undefined) {
+      delete out[key];
+    }
+  };
+  clampInt("timeout_ms", 1, MCP_MAX_TIMEOUT_MS);
+  clampInt("max_output_bytes", 1, MCP_MAX_OUTPUT_BYTES);
+  clampInt("max_entries", 1, MCP_MAX_LIST_ENTRIES);
+  clampInt("max_bytes", 1, MCP_MAX_READ_BYTES);
+  clampInt("limit", 1, MCP_MAX_LIST_ENTRIES);
+  clampInt("offset", 0, Number.MAX_SAFE_INTEGER);
+  return out;
+}
+
+/**
+ * Build the canonical authorized-action object used for action matching.
  * Content bodies are digested so large writes stay bounded in the hash input.
+ * Binding fields (operation_id / expires_at / claim_version) are applied later
+ * via {@link bindCanonicalAction} so idempotent retries compare action facts.
  */
 export async function buildCanonicalAction(opts: {
   toolName: string;
@@ -1062,6 +1128,8 @@ export async function buildCanonicalAction(opts: {
   deviceId: string;
   principalId: string;
   tenantId: string;
+  /** Authenticated OAuth client id (never client-supplied). */
+  oauthClientId?: string;
 }): Promise<Record<string, unknown>> {
   const action = toolAction(opts.toolName);
   const capability = toolCapability(opts.toolName);
@@ -1098,16 +1166,34 @@ export async function buildCanonicalAction(opts: {
     device_id: opts.deviceId,
     principal_id: opts.principalId,
     tenant_id: opts.tenantId,
+    oauth_client_id: opts.oauthClientId ?? null,
     workspace_id: workspaceId ?? null,
     facts,
   };
 }
 
 /**
+ * Bind immutable dispatch facts into the exact payload hash after claim ownership
+ * of operation_id / expires_at / claim_version is decided.
+ */
+export async function bindCanonicalAction(
+  canonicalAction: Record<string, unknown>,
+  binding: { operationId: string; expiresAt: string; claimVersion: number },
+): Promise<{ bound: Record<string, unknown>; payload_hash: string }> {
+  const bound = {
+    ...canonicalAction,
+    operation_id: binding.operationId,
+    expires_at: binding.expiresAt,
+    claim_version: binding.claimVersion,
+  };
+  return { bound, payload_hash: await hashCanonicalAction(bound) };
+}
+
+/**
  * Build a device-routed operation that satisfies ownmesh.operation/1.0.
  * correlation_id === operation_id === payload.operation_id (exact-once binding).
  * Client-supplied authorization fields are stripped and never treated as authority.
- * payload_hash is always server-computed.
+ * payload_hash is always server-computed and includes operation/expiry/claim binding.
  */
 export async function buildDeviceOperation(opts: {
   toolName: string;
@@ -1117,6 +1203,8 @@ export async function buildDeviceOperation(opts: {
   principalId: string;
   tenantId: string;
   expiresAt: string;
+  claimVersion?: number;
+  oauthClientId?: string;
   injectionAttempt?: boolean;
   /** Optional precomputed canonical action / hash (avoids double work). */
   canonicalAction?: Record<string, unknown>;
@@ -1126,13 +1214,17 @@ export async function buildDeviceOperation(opts: {
   payload: Record<string, unknown>;
   correlation_id: string;
   payload_hash: string;
+  /** Action facts only (no operation_id/expiry/claim); used for idempotency match. */
   canonical_action: Record<string, unknown>;
   idempotency_key: string;
   workspace_id?: string;
   expires_at: string;
+  claim_version: number;
+  oauth_client_id: string | null;
 }> {
   const action = toolAction(opts.toolName);
   const capability = toolCapability(opts.toolName);
+  const claimVersion = Number.isFinite(opts.claimVersion) ? Number(opts.claimVersion) : 1;
   const idempotencyKey =
     typeof opts.args.idempotency_key === "string" && opts.args.idempotency_key.trim() !== ""
       ? String(opts.args.idempotency_key)
@@ -1169,9 +1261,21 @@ export async function buildDeviceOperation(opts: {
       deviceId: opts.deviceId,
       principalId: opts.principalId,
       tenantId: opts.tenantId,
+      oauthClientId: opts.oauthClientId,
     }));
-  const payloadHash = opts.payloadHash ?? (await hashCanonicalAction(canonicalAction));
+  const payloadHash =
+    opts.payloadHash ??
+    (
+      await bindCanonicalAction(canonicalAction, {
+        operationId: opts.operationId,
+        expiresAt: opts.expiresAt,
+        claimVersion,
+      })
+    ).payload_hash;
 
+  // Wire payload stays within ownmesh.operation/1.0 request fields (deny_unknown).
+  // Binding facts (expires_at/claim_version/oauth_client_id/operation_id) are hashed
+  // into payload_hash and carried on the inject envelope / D1 row.
   const payload: Record<string, unknown> = {
     operation_contract: OPERATION_CONTRACT_V1,
     operation_id: opts.operationId,
@@ -1195,7 +1299,10 @@ export async function buildDeviceOperation(opts: {
     canonical_action: canonicalAction,
     idempotency_key: idempotencyKey,
     workspace_id: workspaceId,
+    // Top-level inject metadata (not inside protocol payload object).
     expires_at: opts.expiresAt,
+    claim_version: claimVersion,
+    oauth_client_id: opts.oauthClientId ?? null,
   };
 }
 
@@ -1708,82 +1815,29 @@ export async function handleMcp(
       return mcpError(id, -32004, operable.error, { device_id: deviceId });
     }
 
-    const wantAsync = args.async === true;
+    const safeArgs = sanitizeMcpArgs(args);
+    const wantAsync = safeArgs.async === true;
     const opType = normalizeOpType(name);
     const isMutating = tool.risk === "write" || tool.risk === "exec";
     const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    const claimVersion = 1;
 
     // High-risk tools: still route to device, but default path surfaces approval
     // when device is offline or returns ask. Control plane NEVER auto-approves
     // based on model text. Client-supplied allow/force/skip fields are not authority.
     const deviceOp = await buildDeviceOperation({
       toolName: name,
-      args,
+      args: safeArgs,
       operationId,
       deviceId,
       principalId: rec.principal,
       tenantId: rec.tenant_id,
       expiresAt,
+      claimVersion,
+      oauthClientId: rec.client_id,
       injectionAttempt,
     });
-
-    // E3 exact-once: same idempotency key + same payload_hash replays the prior
-    // operation; a different hash is an action mismatch (never silent reuse).
-    if (deviceOp.idempotency_key && deviceOp.idempotency_key !== operationId) {
-      const prior = await store.getMcpOperationByIdempotency({
-        principalId: rec.principal,
-        tenantId: rec.tenant_id,
-        deviceId,
-        idempotencyKey: deviceOp.idempotency_key,
-      });
-      if (prior) {
-        if (prior.payload_hash && prior.payload_hash !== deviceOp.payload_hash) {
-          const env = makeEnvelope({
-            operation_id: operationId,
-            status: "failed",
-            device_id: deviceId,
-            summary: "idempotency key reused with a different authorized action",
-            data: {
-              error: {
-                code: "OWNMESH_E_IDEMPOTENCY_MISMATCH",
-                message:
-                  "idempotency_key is bound to a different payload_hash; reauthorize with a new key or identical action",
-                retryable: false,
-                operation_id: operationId,
-                details: {
-                  idempotency_key: deviceOp.idempotency_key,
-                  prior_operation_id: prior.operation_id,
-                  prior_payload_hash: prior.payload_hash,
-                  requested_payload_hash: deviceOp.payload_hash,
-                },
-              },
-            },
-            correlation_id: correlation,
-            warnings: injectWarnings,
-          });
-          // Do not store the conflicting idempotency_key on the failure row — that
-          // would shadow the authorized binding and break later identical retries.
-          await persistOp(store, tracker, {
-            ...env,
-            tool: name,
-            principal: rec.principal,
-            tenant_id: rec.tenant_id,
-            payload_hash: deviceOp.payload_hash,
-            idempotency_key: null,
-            workspace_id: deviceOp.workspace_id ?? null,
-            expires_at: expiresAt,
-            claim_version: 0,
-            action: deviceOp.canonical_action,
-            created_at: nowIso(),
-            updated_at: nowIso(),
-          });
-          return mcpResult(id, toolContent(env));
-        }
-        const replayed = trackedFromRecord(prior);
-        tracker.put(replayed);
-        return mcpResult(id, toolContent(replayed));
-      }
-    }
+    const actionHash = await hashCanonicalAction(deviceOp.canonical_action);
 
     const trackBase: TrackedOperation = {
       ...makeEnvelope({
@@ -1796,6 +1850,9 @@ export async function handleMcp(
           op: opType,
           capability: deviceOp.payload.capability,
           payload_hash: deviceOp.payload_hash,
+          oauth_client_id: deviceOp.oauth_client_id,
+          claim_version: deviceOp.claim_version,
+          expires_at: deviceOp.expires_at,
         },
         correlation_id: correlation,
         warnings: injectWarnings,
@@ -1807,12 +1864,97 @@ export async function handleMcp(
       idempotency_key: deviceOp.idempotency_key,
       workspace_id: deviceOp.workspace_id ?? null,
       expires_at: expiresAt,
-      claim_version: 1,
+      claim_version: claimVersion,
       action: deviceOp.canonical_action,
       created_at: nowIso(),
       updated_at: nowIso(),
     };
-    await persistOp(store, tracker, trackBase);
+
+    // E3 exact-once: atomic create-or-claim on the idempotency key. Same action
+    // facts replay the prior owner; drifted facts fail closed before any route.
+    const claim = await store.claimMcpOperationByIdempotency({
+      operation_id: trackBase.operation_id,
+      tenant_id: trackBase.tenant_id,
+      principal_id: trackBase.principal,
+      device_id: trackBase.device_id,
+      tool: trackBase.tool || name,
+      status: trackBase.status,
+      summary: trackBase.summary || "",
+      data: trackBase.data || {},
+      truncated: Boolean(trackBase.truncated),
+      next_cursor: trackBase.next_cursor ?? null,
+      approval_required: Boolean(trackBase.approval_required),
+      approval_url: trackBase.approval_url,
+      approval_id: trackBase.approval_id,
+      session_id: trackBase.session_id,
+      warnings: trackBase.warnings || [],
+      correlation_id: trackBase.correlation_id,
+      payload_hash: trackBase.payload_hash ?? null,
+      idempotency_key: trackBase.idempotency_key ?? null,
+      workspace_id: trackBase.workspace_id ?? null,
+      expires_at: trackBase.expires_at ?? null,
+      claim_version: trackBase.claim_version ?? claimVersion,
+      action: trackBase.action ?? null,
+      policy_authority: "ownmesh_device",
+      created_at: trackBase.created_at || nowIso(),
+      updated_at: trackBase.updated_at || nowIso(),
+    });
+
+    if (claim.outcome === "existing") {
+      const prior = claim.op;
+      const priorActionHash = prior.action
+        ? await hashCanonicalAction(prior.action)
+        : prior.payload_hash || "";
+      if (priorActionHash && priorActionHash !== actionHash) {
+        const env = makeEnvelope({
+          operation_id: operationId,
+          status: "failed",
+          device_id: deviceId,
+          summary: "idempotency key reused with a different authorized action",
+          data: {
+            error: {
+              code: "OWNMESH_E_IDEMPOTENCY_MISMATCH",
+              message:
+                "idempotency_key is bound to a different authorized action; reauthorize with a new key or identical action",
+              retryable: false,
+              operation_id: operationId,
+              details: {
+                idempotency_key: deviceOp.idempotency_key,
+                prior_operation_id: prior.operation_id,
+                prior_payload_hash: prior.payload_hash,
+                requested_payload_hash: deviceOp.payload_hash,
+                prior_action_hash: priorActionHash,
+                requested_action_hash: actionHash,
+              },
+            },
+          },
+          correlation_id: correlation,
+          warnings: injectWarnings,
+        });
+        // Do not store the conflicting idempotency_key on the failure row — that
+        // would shadow the authorized binding and break later identical retries.
+        await persistOp(store, tracker, {
+          ...env,
+          tool: name,
+          principal: rec.principal,
+          tenant_id: rec.tenant_id,
+          payload_hash: deviceOp.payload_hash,
+          idempotency_key: null,
+          workspace_id: deviceOp.workspace_id ?? null,
+          expires_at: expiresAt,
+          claim_version: 0,
+          action: deviceOp.canonical_action,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        });
+        return mcpResult(id, toolContent(env));
+      }
+      const replayed = trackedFromRecord(prior);
+      tracker.put(replayed);
+      return mcpResult(id, toolContent(replayed));
+    }
+
+    tracker.put(trackBase);
 
     if (!router) {
       // Fail closed: no router means DEVICE_ROOM is unbound / unavailable.

@@ -877,6 +877,12 @@ impl DaemonRuntime {
         }
         // Spawn mode follows the client request shape (argv vs shell-string).
         // Policy already used server-side classification in handle_exec.
+        // Hard ceilings are enforced here even if a caller bypasses MCP schema.
+        let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
+        let max_output_bytes = p
+            .max_output_bytes
+            .unwrap_or(256 * 1024)
+            .clamp(1, 1_000_000);
         let req = RunRequest {
             kind,
             program: execution_program,
@@ -884,8 +890,8 @@ impl DaemonRuntime {
             cwd: p.cwd.as_ref().map(PathBuf::from),
             env: HashMap::new(),
             stdin: None,
-            timeout_ms: p.timeout_ms.or(Some(30_000)),
-            max_output_bytes: p.max_output_bytes.unwrap_or(1024 * 1024),
+            timeout_ms: Some(timeout_ms),
+            max_output_bytes,
             idempotency_key: p.idempotency_key.clone(),
         };
         // Approved operations are journaled by `op_journal` as part of the approval
@@ -930,14 +936,9 @@ impl DaemonRuntime {
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
         let ws = self.workspace()?;
-        let page = list_dir_page(
-            &ws,
-            &p.path,
-            p.recursive,
-            p.max_entries.unwrap_or(200),
-            p.cursor.as_deref(),
-        )
-        .map_err(fs_err)?;
+        let max_entries = p.max_entries.unwrap_or(200).clamp(1, 500);
+        let page = list_dir_page(&ws, &p.path, p.recursive, max_entries, p.cursor.as_deref())
+            .map_err(fs_err)?;
         Ok(json!({
             "entries": page.entries,
             "next_cursor": page.next_cursor,

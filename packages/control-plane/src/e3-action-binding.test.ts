@@ -1,20 +1,89 @@
 /**
- * E3 exact-action binding: server payload_hash + idempotency mismatch.
+ * E3 exact-action binding: server payload_hash + idempotency mismatch + atomic claim.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import {
+  bindCanonicalAction,
   buildCanonicalAction,
   buildDeviceOperation,
   handleMcp,
+  sanitizeMcpArgs,
+  MCP_MAX_OUTPUT_BYTES,
+  MCP_MAX_TIMEOUT_MS,
   type OperationRouter,
 } from "./mcp.ts";
-import { MemoryStore } from "./store.ts";
+import {
+  MemoryStore,
+  SqlStore,
+  type SqlDatabase,
+  type SqlStatement,
+} from "./store.ts";
 import { hashCanonicalAction, nowIso } from "./util.ts";
 
-async function seedAuthed(store: MemoryStore, principal = "prin_dev") {
+const here = dirname(fileURLToPath(import.meta.url));
+const migrationsDir = join(here, "..", "migrations");
+
+function adaptSqlite(db: DatabaseSync): SqlDatabase {
+  type SqlVal = null | number | string | bigint | Uint8Array;
+  return {
+    prepare(query: string): SqlStatement {
+      const stmt = db.prepare(query);
+      let bound: SqlVal[] = [];
+      const api: SqlStatement = {
+        bind(...values: unknown[]) {
+          bound = values.map((v) => (v === undefined ? null : (v as SqlVal)));
+          return api;
+        },
+        async first<T = Record<string, unknown>>(colName?: string) {
+          const row = stmt.get(...bound) as Record<string, unknown> | undefined;
+          if (!row) return null;
+          if (colName) return (row[colName] as T) ?? null;
+          return row as T;
+        },
+        async run() {
+          const info = stmt.run(...bound) as { changes: number };
+          return { success: true, meta: { changes: Number(info.changes || 0) } };
+        },
+        async all<T = Record<string, unknown>>() {
+          return { results: stmt.all(...bound) as T[] };
+        },
+      };
+      return api;
+    },
+    exec(query: string) {
+      db.exec(query);
+    },
+    async batch<T = unknown>(statements: SqlStatement[]) {
+      const out: T[] = [];
+      for (const s of statements) out.push((await s.run()) as T);
+      return out;
+    },
+  };
+}
+
+function openSqlStore(): SqlStore {
+  const db = new DatabaseSync(":memory:");
+  for (const f of readdirSync(migrationsDir).filter((x) => x.endsWith(".sql")).sort()) {
+    db.exec(readFileSync(join(migrationsDir, f), "utf8"));
+  }
+  return new SqlStore(adaptSqlite(db), "sqlite");
+}
+
+async function seedAuthed(store: MemoryStore | SqlStore, principal = "prin_dev") {
   await store.ensureBootstrap();
   await store.ensurePrincipal(principal, "Dev", "human", "ten_default");
+  await store.putClient({
+    client_id: "client_mcp",
+    tenant_id: "ten_default",
+    client_name: "MCP test",
+    redirect_uris: ["https://cp.test/cb"],
+    created_at: nowIso(),
+  });
   return store.issueTokens(
     "client_mcp",
     principal,
@@ -22,7 +91,7 @@ async function seedAuthed(store: MemoryStore, principal = "prin_dev") {
   );
 }
 
-async function putActiveDevice(store: MemoryStore, id: string, principal = "prin_dev") {
+async function putActiveDevice(store: MemoryStore | SqlStore, id: string, principal = "prin_dev") {
   await store.putDevice({
     id,
     tenant_id: "ten_default",
@@ -47,6 +116,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     deviceId: "dev_x",
     principalId: "prin_a",
     tenantId: "ten_a",
+    oauthClientId: "client_mcp",
   });
   const b = await buildCanonicalAction({
     toolName: "ownmesh_fs_write",
@@ -54,10 +124,12 @@ test("canonical action hash is stable and content-digest based", async () => {
     deviceId: "dev_x",
     principalId: "prin_a",
     tenantId: "ten_a",
+    oauthClientId: "client_mcp",
   });
   assert.equal(await hashCanonicalAction(a), await hashCanonicalAction(b));
   assert.equal((a.facts as { content_sha256: string }).content_sha256.length, 64);
   assert.equal((a.facts as { content?: string }).content, undefined);
+  assert.equal(a.oauth_client_id, "client_mcp");
 
   const c = await buildCanonicalAction({
     toolName: "ownmesh_fs_write",
@@ -65,11 +137,35 @@ test("canonical action hash is stable and content-digest based", async () => {
     deviceId: "dev_x",
     principalId: "prin_a",
     tenantId: "ten_a",
+    oauthClientId: "client_mcp",
   });
   assert.notEqual(await hashCanonicalAction(a), await hashCanonicalAction(c));
 });
 
-test("buildDeviceOperation always sets server payload_hash and strips client hash", async () => {
+test("bindCanonicalAction includes operation_id, expires_at, claim_version", async () => {
+  const base = await buildCanonicalAction({
+    toolName: "ownmesh_fs_write",
+    args: { path: "a.txt", content: "hello" },
+    deviceId: "dev_x",
+    principalId: "prin_a",
+    tenantId: "ten_a",
+    oauthClientId: "client_a",
+  });
+  const expiresAt = "2030-01-01T00:00:00.000Z";
+  const bound = await bindCanonicalAction(base, {
+    operationId: "op_bind1",
+    expiresAt,
+    claimVersion: 1,
+  });
+  assert.equal(bound.bound.operation_id, "op_bind1");
+  assert.equal(bound.bound.expires_at, expiresAt);
+  assert.equal(bound.bound.claim_version, 1);
+  assert.equal(bound.payload_hash.length, 64);
+  assert.notEqual(bound.payload_hash, await hashCanonicalAction(base));
+});
+
+test("buildDeviceOperation always sets server payload_hash and wire binding fields", async () => {
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
   const op = await buildDeviceOperation({
     toolName: "ownmesh_command_run",
     args: {
@@ -77,18 +173,42 @@ test("buildDeviceOperation always sets server payload_hash and strips client has
       args: ["x"],
       payload_hash: "0".repeat(64),
       allow: true,
+      timeout_ms: 999_999_999,
+      max_output_bytes: 50_000_000,
     },
     operationId: "op_test1",
     deviceId: "dev_1",
     principalId: "prin_1",
     tenantId: "ten_1",
-    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    expiresAt,
+    claimVersion: 1,
+    oauthClientId: "client_mcp",
   });
   assert.equal(typeof op.payload_hash, "string");
   assert.equal(op.payload_hash.length, 64);
   assert.notEqual(op.payload_hash, "0".repeat(64));
   assert.equal(op.payload.payload_hash, op.payload_hash);
+  // Binding lives on inject metadata + payload_hash, not unknown protocol payload keys.
+  assert.equal(op.expires_at, expiresAt);
+  assert.equal(op.claim_version, 1);
+  assert.equal(op.oauth_client_id, "client_mcp");
+  assert.equal(op.payload.expires_at, undefined);
   assert.equal((op.payload.arguments as Record<string, unknown>).allow, undefined);
+  // Unsanitized build keeps raw numbers; sanitizeMcpArgs is applied at handleMcp.
+  assert.equal(typeof (op.payload.arguments as Record<string, unknown>).timeout_ms, "number");
+});
+
+test("sanitizeMcpArgs enforces hard ceilings", () => {
+  const out = sanitizeMcpArgs({
+    timeout_ms: 9_999_999,
+    max_output_bytes: 99_999_999,
+    max_entries: 50_000,
+    max_bytes: 9_000_000,
+  });
+  assert.equal(out.timeout_ms, MCP_MAX_TIMEOUT_MS);
+  assert.equal(out.max_output_bytes, MCP_MAX_OUTPUT_BYTES);
+  assert.equal(out.max_entries, 500);
+  assert.equal(out.max_bytes, 512_000);
 });
 
 test("MCP idempotency mismatch fails closed without routing", async () => {
@@ -106,15 +226,20 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
     },
   };
 
-  const firstHash = await hashCanonicalAction(
-    await buildCanonicalAction({
-      toolName: "ownmesh_fs_write",
-      args: { path: "x.txt", content: "v1" },
-      deviceId,
-      principalId: "prin_dev",
-      tenantId: "ten_default",
-    }),
-  );
+  const firstAction = await buildCanonicalAction({
+    toolName: "ownmesh_fs_write",
+    args: { path: "x.txt", content: "v1" },
+    deviceId,
+    principalId: "prin_dev",
+    tenantId: "ten_default",
+    oauthClientId: "client_mcp",
+  });
+  const firstHash = await hashCanonicalAction(firstAction);
+  const bound = await bindCanonicalAction(firstAction, {
+    operationId: "op_prior_e3",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    claimVersion: 1,
+  });
   await store.putMcpOperation({
     operation_id: "op_prior_e3",
     tenant_id: "ten_default",
@@ -129,14 +254,15 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
     approval_required: false,
     warnings: [],
     correlation_id: "op_prior_e3",
-    payload_hash: firstHash,
+    payload_hash: bound.payload_hash,
     idempotency_key: "idem_e3_1",
     claim_version: 1,
-    action: { path: "x.txt" },
+    action: firstAction,
     policy_authority: "ownmesh_device",
     created_at: nowIso(),
     updated_at: nowIso(),
   });
+  assert.equal(firstHash.length, 64);
 
   const call = async (content: string, id: number) => {
     const res = await handleMcp(
@@ -182,4 +308,119 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
   assert.equal(same.operation_id, "op_prior_e3");
   assert.equal(same.status, "completed");
   assert.equal(routed, 0);
+});
+
+test("concurrent identical idempotency keys claim one owner (MemoryStore)", async () => {
+  const store = new MemoryStore();
+  const tok = await seedAuthed(store);
+  const deviceId = "dev_e3race_m";
+  await putActiveDevice(store, deviceId);
+  await store.issueDeviceCredential((await store.getDevice(deviceId))!, 3_600_000);
+
+  let routed = 0;
+  const router: OperationRouter = {
+    async routeToDevice() {
+      routed += 1;
+      return { status: "routed_to_device" };
+    },
+  };
+
+  const call = (id: number) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tok.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_fs_write",
+            arguments: {
+              device_id: deviceId,
+              path: "race.txt",
+              content: "same-body",
+              async: true,
+              idempotency_key: "idem_race_same",
+            },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      router,
+    );
+
+  const [r1, r2] = await Promise.all([call(1), call(2)]);
+  const b1 = (await r1.json()) as { result?: { structuredContent?: Record<string, unknown> } };
+  const b2 = (await r2.json()) as { result?: { structuredContent?: Record<string, unknown> } };
+  const s1 = b1.result?.structuredContent || {};
+  const s2 = b2.result?.structuredContent || {};
+  assert.equal(s1.operation_id, s2.operation_id);
+  assert.equal(routed, 1);
+});
+
+test("concurrent differing actions with same key: one owner, one mismatch (SqlStore)", async () => {
+  const store = openSqlStore();
+  const tok = await seedAuthed(store);
+  const deviceId = "dev_e3race_s";
+  await putActiveDevice(store, deviceId);
+  await store.issueDeviceCredential((await store.getDevice(deviceId))!, 3_600_000);
+
+  let routed = 0;
+  const router: OperationRouter = {
+    async routeToDevice() {
+      routed += 1;
+      return { status: "routed_to_device" };
+    },
+  };
+
+  const call = (content: string, id: number) =>
+    handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tok.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_fs_write",
+            arguments: {
+              device_id: deviceId,
+              path: "race.txt",
+              content,
+              async: true,
+              idempotency_key: "idem_race_diff",
+            },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      router,
+    );
+
+  const [r1, r2] = await Promise.all([call("body-a", 1), call("body-b", 2)]);
+  const b1 = (await r1.json()) as { result?: { structuredContent?: Record<string, unknown> } };
+  const b2 = (await r2.json()) as { result?: { structuredContent?: Record<string, unknown> } };
+  const s1 = b1.result?.structuredContent || {};
+  const s2 = b2.result?.structuredContent || {};
+  const statuses = [String(s1.status || ""), String(s2.status || "")].sort();
+  // Exactly one routes (pending), the other is mismatch failed — never two routes.
+  assert.equal(routed, 1);
+  assert.ok(statuses.includes("pending") || statuses.includes("running"));
+  assert.ok(
+    statuses.includes("failed"),
+    `expected one failed mismatch, got ${JSON.stringify([s1, s2])}`,
+  );
+  const failed = [s1, s2].find((s) => s.status === "failed");
+  const err = (failed?.data as { error?: { code?: string } } | undefined)?.error;
+  assert.equal(err?.code, "OWNMESH_E_IDEMPOTENCY_MISMATCH");
 });

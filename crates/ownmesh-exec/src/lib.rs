@@ -597,8 +597,13 @@ pub struct RunRequest {
 }
 
 fn default_max_output() -> usize {
-    1024 * 1024
+    256 * 1024
 }
+
+/// Absolute ceiling for captured stdout+stderr (bytes).
+pub const HARD_MAX_OUTPUT_BYTES: usize = 1_000_000;
+/// Absolute ceiling for wall-clock timeout (ms).
+pub const HARD_MAX_TIMEOUT_MS: u64 = 300_000;
 
 /// Captured command result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -790,6 +795,13 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     for (k, v) in &req.env {
         cmd.env(k, v);
     }
+    // Put the child in its own process group (Unix) so cancel/timeout can kill
+    // the whole tree, including backgrounded descendants of shells.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -801,11 +813,43 @@ fn bytes_to_text(data: &[u8]) -> String {
     String::from_utf8_lossy(data).into_owned()
 }
 
+/// Kill a process tree. Unix uses process-group signal; Windows uses taskkill /T.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // Negative PID = process group (spawned with process_group(0)).
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// Best-effort process-tree containment after timeout/cancel/limit.
 /// Returns the exit code when `wait` completes within the grace period.
 async fn kill_child(child: &mut Child) -> Option<i32> {
+    if let Some(pid) = child.id() {
+        kill_process_tree(pid);
+    }
     let _ = child.start_kill();
-    match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
         Ok(Ok(status)) => status.code(),
         _ => None,
     }
@@ -991,10 +1035,17 @@ pub async fn run_command_cancellable(
     mut journal: Option<&mut IdempotencyJournal>,
     cancel: Option<watch::Receiver<bool>>,
 ) -> ExecResult<RunResult> {
+    // Clamp untrusted ceilings before any allocation or spawn.
+    let max_output_bytes = req.max_output_bytes.clamp(1, HARD_MAX_OUTPUT_BYTES);
+    let timeout_ms = req.timeout_ms.map(|ms| ms.clamp(1, HARD_MAX_TIMEOUT_MS));
+    let mut capped = req.clone();
+    capped.max_output_bytes = max_output_bytes;
+    capped.timeout_ms = timeout_ms;
+
     // Request validation/building has no external side effect and happens before
     // reserving the key. Spawn remains strictly after the durable marker.
-    let mut cmd = build_command(req)?;
-    if let (Some(key), Some(j)) = (req.idempotency_key.as_deref(), journal.as_deref_mut()) {
+    let mut cmd = build_command(&capped)?;
+    if let (Some(key), Some(j)) = (capped.idempotency_key.as_deref(), journal.as_deref_mut()) {
         if let Some(prev) = j.get(key) {
             let mut replayed = prev.clone();
             replayed.replayed = true;
@@ -1011,7 +1062,7 @@ pub async fn run_command_cancellable(
     let start = Instant::now();
     let mut child = cmd.spawn()?;
 
-    if let Some(input) = &req.stdin {
+    if let Some(input) = &capped.stdin {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
             let _ = stdin.write_all(input.as_bytes()).await;
@@ -1019,10 +1070,10 @@ pub async fn run_command_cancellable(
         }
     }
 
-    let timeout = req.timeout_ms.map(Duration::from_millis);
+    let timeout = capped.timeout_ms.map(Duration::from_millis);
     // Box the select-heavy collector so callers stay under clippy large_futures.
     let (exit_code, stdout_raw, stderr_raw, truncated, timed_out, cancelled) = Box::pin(
-        collect_bounded_output(&mut child, req.max_output_bytes, timeout, cancel),
+        collect_bounded_output(&mut child, max_output_bytes, timeout, cancel),
     )
     .await?;
 
@@ -1246,6 +1297,86 @@ mod tests {
             .expect("join")
             .expect_err("expected Cancelled");
         assert!(matches!(err, ExecError::Cancelled));
+    }
+
+    /// Prove cancel kills descendants, not only the direct shell child.
+    #[tokio::test]
+    async fn cancel_kills_process_tree_descendants() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join(format!(
+            "child-alive-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let marker_s = marker.to_string_lossy().replace('"', "");
+
+        #[cfg(windows)]
+        let req = {
+            // Nested cmd is a real child process of the outer cmd (not `start /b`
+            // which can detach). Child rewrites the marker every second.
+            let inner = format!(
+                "for /l %i in (1,1,60) do @((echo alive)>{marker_s} & ping -n 2 127.0.0.1 >NUL)"
+            );
+            RunRequest {
+                kind: CommandKind::Structured,
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), format!("cmd.exe /C {inner}")],
+                cwd: Some(dir.path().to_path_buf()),
+                env: HashMap::new(),
+                stdin: None,
+                timeout_ms: Some(60_000),
+                max_output_bytes: 4096,
+                idempotency_key: None,
+            }
+        };
+        #[cfg(not(windows))]
+        let req = {
+            let script =
+                format!("(while true; do echo alive > '{marker_s}'; sleep 0.2; done) & sleep 30");
+            RunRequest {
+                kind: CommandKind::RawShell,
+                program: script,
+                args: vec![],
+                cwd: Some(dir.path().to_path_buf()),
+                env: HashMap::new(),
+                stdin: None,
+                timeout_ms: Some(60_000),
+                max_output_bytes: 4096,
+                idempotency_key: None,
+            }
+        };
+
+        let (tx, rx) = watch::channel(false);
+        let join = tokio::spawn(async move { run_command_cancellable(&req, None, Some(rx)).await });
+        // Wait until the descendant has written the marker at least once.
+        let mut saw = false;
+        for _ in 0..80 {
+            if marker.exists() {
+                saw = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(saw, "descendant never wrote marker before cancel");
+        let before = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        let _ = tx.send(true);
+        let err = tokio::time::timeout(Duration::from_secs(8), join)
+            .await
+            .expect("tree cancel should finish")
+            .expect("join")
+            .expect_err("expected Cancelled");
+        assert!(matches!(err, ExecError::Cancelled));
+        // After cancel, the background writer must stop updating the marker.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let after = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        assert_eq!(
+            before, after,
+            "descendant kept writing after cancel — process tree not contained"
+        );
     }
 
     #[test]

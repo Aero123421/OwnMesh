@@ -528,8 +528,9 @@ def main() -> int:
             if int(state1["last_server_seq"]) <= int(state0["last_server_seq"]):
                 raise RuntimeError("server resume sequence did not advance across binary reconnect")
 
-            # Re-issue the same idempotency key + identical action. Control plane must
+            # Re-issue the same idempotency key + byte-identical action. Control plane must
             # replay the prior authoritative row without re-dispatch (disk stays mutated).
+            # Changed-content mismatch is asserted separately below (rpc_id=8).
             rewrite_sc = structured(
                 mcp_call(
                     issuer,
@@ -538,7 +539,7 @@ def main() -> int:
                     {
                         "device_id": device_id,
                         "path": "e2-marker.txt",
-                        "content": f"e2-ok-{marker}",
+                        "content": marker,
                         "async": True,
                         "idempotency_key": f"idem_write_{marker}",
                     },
