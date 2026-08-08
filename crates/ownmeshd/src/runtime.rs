@@ -103,6 +103,13 @@ pub struct ApprovalRecord {
     pub created_at_unix: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decided_at_unix: Option<i64>,
+    /// Absolute unix expiry inherited from the remote MCP operation (when any).
+    /// Recovery approvals after this instant fail closed and never execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+    /// Server-computed payload_hash of the original exact action (when remote).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_payload_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule_id: Option<String>,
     /// Authenticated principal that enqueued the deferred operation (server-assigned).
@@ -362,6 +369,10 @@ pub struct DaemonRuntime {
     /// Remote MCP/control-plane operation id for the active dispatch (when any).
     /// Ask/allow receipts must echo this id so DeviceRoom correlation binding holds.
     active_remote_operation_id: Option<String>,
+    /// Bound expiry (unix seconds) of the active remote operation, if any.
+    active_remote_expires_at_unix: Option<i64>,
+    /// Server payload_hash of the active remote exact action, if any.
+    active_remote_payload_hash: Option<String>,
     #[cfg(test)]
     op_journal_persist_fault: AtomicUsize,
     #[cfg(test)]
@@ -444,6 +455,8 @@ impl DaemonRuntime {
             broker_secret,
             active_cancel: None,
             active_remote_operation_id: None,
+            active_remote_expires_at_unix: None,
+            active_remote_payload_hash: None,
             #[cfg(test)]
             op_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
@@ -962,6 +975,11 @@ impl DaemonRuntime {
                     reason: verdict.reason.clone(),
                     created_at_unix: Self::now(),
                     decided_at_unix: None,
+                    // Inherit remote exact-action expiry/hash so delayed recovery
+                    // cannot approve a stale deferred request after the original
+                    // MCP operation window closed.
+                    expires_at_unix: self.active_remote_expires_at_unix,
+                    target_payload_hash: self.active_remote_payload_hash.clone(),
                     matched_rule_id: verdict.matched_rule_id.clone(),
                     requester_principal: requester_principal.clone(),
                     facts: Some(facts.clone()),
@@ -2066,7 +2084,13 @@ full_user_access/full_access for arbitrary commands",
     /// Dispatch with an optional cancel receiver for interrupting in-flight exec.
     ///
     /// When `remote_operation_id` is set (Agent/MCP path), Ask/Allow receipts echo
-    /// that id so DeviceRoom correlation/operation_id binding holds.
+    /// that id so DeviceRoom correlation/operation_id binding holds. Optional
+    /// `remote_expires_at_unix` / `remote_payload_hash` are captured onto any
+    /// deferred ApprovalRecord so recovery decisions remain exact-action bound.
+    ///
+    /// Production Agent path uses [`Self::dispatch_cancellable_bound`]; this thin
+    /// wrapper remains for integration tests that do not supply binding facts.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn dispatch_cancellable(
         &mut self,
         method: &str,
@@ -2075,13 +2099,42 @@ full_user_access/full_access for arbitrary commands",
         cancel: Option<watch::Receiver<bool>>,
         remote_operation_id: Option<String>,
     ) -> IpcResult<Value> {
+        self.dispatch_cancellable_bound(
+            method,
+            params,
+            client,
+            cancel,
+            remote_operation_id,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`dispatch_cancellable`] with explicit remote exact-action binding facts.
+    pub async fn dispatch_cancellable_bound(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        client: &ClientIdentity,
+        cancel: Option<watch::Receiver<bool>>,
+        remote_operation_id: Option<String>,
+        remote_expires_at_unix: Option<i64>,
+        remote_payload_hash: Option<String>,
+    ) -> IpcResult<Value> {
         self.active_cancel = cancel;
         self.active_remote_operation_id = remote_operation_id
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        self.active_remote_expires_at_unix = remote_expires_at_unix.filter(|&t| t > 0);
+        self.active_remote_payload_hash = remote_payload_hash
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
         let outcome = self.dispatch(method, params, client).await;
         self.active_cancel = None;
         self.active_remote_operation_id = None;
+        self.active_remote_expires_at_unix = None;
+        self.active_remote_payload_hash = None;
         outcome
     }
 
@@ -2106,9 +2159,18 @@ full_user_access/full_access for arbitrary commands",
             decision: String,
             #[serde(default)]
             tool: Option<String>,
+            #[serde(default)]
+            target_tool: Option<String>,
+            #[serde(default)]
+            target_payload_hash: Option<String>,
+            #[serde(default)]
+            target_expires_at: Option<String>,
+            /// Authenticated approver principal from verified bound_action (server-set).
+            #[serde(default)]
+            approver_principal: Option<String>,
         }
         let p: P = parse_params(params)?;
-        let _ = p.tool;
+        let _ = (p.tool, p.target_tool);
         let decision = p.decision.trim().to_ascii_lowercase();
         if decision != "approve" && decision != "deny" {
             return Err(IpcError::Remote {
@@ -2124,6 +2186,24 @@ full_user_access/full_access for arbitrary commands",
             .map(str::to_owned);
         let target_operation_id = p
             .target_operation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let decision_target_hash = p
+            .target_payload_hash
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let decision_target_expires = p
+            .target_expires_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let approver_principal = p
+            .approver_principal
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -2188,7 +2268,8 @@ full_user_access/full_access for arbitrary commands",
             .ok_or_else(|| IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
                 message: format!("approval not found: {resolved_id}"),
-            })?;
+            })?
+            .clone();
         if let Some(target) = target_operation_id.as_ref() {
             if &rec.operation_id != target {
                 return Err(IpcError::Remote {
@@ -2213,11 +2294,61 @@ full_user_access/full_access for arbitrary commands",
             }));
         }
 
-        // Synthetic human principal for the recovery path. Distinct from any
-        // `client:remote:…` requester so independent-approver checks pass. The
-        // control plane already authenticated the human via OAuth + CSRF claim.
-        let recovery =
-            ClientIdentity::new("user:control-plane-recovery", env!("CARGO_PKG_VERSION"));
+        // E3: fail closed when the original remote action window has elapsed.
+        if let Some(exp) = rec.expires_at_unix {
+            if Self::now() > exp {
+                return Err(IpcError::Remote {
+                    code: app_error::UNAUTHORIZED,
+                    message: format!(
+                        "approval {resolved_id} expired at unix {exp}; re-authorize the original action"
+                    ),
+                });
+            }
+        }
+        // Decision must cite the same target payload hash recorded at Ask (when known).
+        if let (Some(stored), Some(cited)) = (
+            rec.target_payload_hash.as_ref(),
+            decision_target_hash.as_ref(),
+        ) {
+            if !stored.eq_ignore_ascii_case(cited) {
+                return Err(IpcError::Remote {
+                    code: app_error::UNAUTHORIZED,
+                    message: "target_payload_hash does not match deferred approval binding".into(),
+                });
+            }
+        }
+        // When the deferred record has a hash, the decision must present it.
+        if rec.target_payload_hash.is_some() && decision_target_hash.is_none() {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "target_payload_hash required for bound recovery approval".into(),
+            });
+        }
+        // Optional RFC3339 target_expires_at on the decision must not disagree
+        // with the stored unix expiry (when both present).
+        if let (Some(stored_unix), Some(cited)) =
+            (rec.expires_at_unix, decision_target_expires.as_ref())
+        {
+            if let Ok(ts) = ownmesh_domain::Timestamp::parse(cited) {
+                let cited_unix = ts.date_time().unix_timestamp();
+                if cited_unix != stored_unix {
+                    return Err(IpcError::Remote {
+                        code: app_error::UNAUTHORIZED,
+                        message: "target_expires_at does not match deferred approval binding"
+                            .into(),
+                    });
+                }
+            }
+        }
+
+        // Prefer the authenticated control-plane approver principal from the
+        // verified bound_action. Fall back to a synthetic recovery identity so
+        // independent-approver checks still pass for legacy local paths.
+        let recovery_key = approver_principal
+            .as_deref()
+            .map(|p| format!("user:control-plane:{p}"))
+            .unwrap_or_else(|| "user:control-plane-recovery".to_owned());
+        let recovery = ClientIdentity::new(&recovery_key, env!("CARGO_PKG_VERSION"));
 
         if decision == "deny" {
             let body = self.handle_approval_deny(Some(json!({ "id": resolved_id })), &recovery)?;

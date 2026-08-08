@@ -125,15 +125,23 @@ Annotations are **UX hints only**. They do not authorize.
 | `deny` | `status: "denied"` with `OWNMESH_E_POLICY_DENIED` |
 | Device offline | `status: "device_offline"` with `OWNMESH_E_DEVICE_OFFLINE` |
 
-**Approve OwnMesh `ask` via:**
+**Approve OwnMesh `ask` via (optional recovery/admin only):**
 
 - OwnMesh TUI → Approvals
 - `ownmesh approvals …` CLI
 - One-time browser page: `https://<your-worker>/approve?operation_id=op_…`
 
+The browser recovery page binds the **exact action hash**, **original operation
+`expires_at`**, device approval id, and authenticated human principal into a
+server-hashed `approval.decision` frame. Stale deferred requests whose original
+MCP expiry elapsed cannot be approved by a freshly minted transaction. The Agent
+rejects unsigned or tampered decision frames (`OWNMESH_E_ACTION_BINDING_MISMATCH`)
+and expired deferred approvals fail closed on-device.
+
 Then poll `ownmesh_get_operation` with the same `operation_id`.
 
-ChatGPT’s confirmation card **must not** be treated as OwnMesh local approval.
+ChatGPT’s confirmation card **must not** be treated as OwnMesh local approval or
+as a cryptographic attestation OwnMesh can verify.
 
 ### Recommended matrix for first-time setup
 

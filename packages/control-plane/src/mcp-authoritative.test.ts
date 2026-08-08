@@ -414,6 +414,8 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
 
   const opId = randomId("op_");
   const corr = randomId("cor_");
+  const targetExpires = new Date(Date.now() + 5 * 60_000).toISOString();
+  const targetHash = "a".repeat(64);
   await store.putMcpOperation({
     operation_id: opId,
     tenant_id: "ten_default",
@@ -430,16 +432,38 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     warnings: [],
     correlation_id: corr,
     policy_authority: "ownmesh_device",
+    payload_hash: targetHash,
+    expires_at: targetExpires,
+    claim_version: 1,
+    action: {
+      capability: "filesystem.write",
+      action: "fs.write",
+      tool: "ownmesh_fs_write",
+      path: "secret.txt",
+    },
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
 
-  const deliveries: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  const deliveries: Array<{
+    type: string;
+    payload: Record<string, unknown>;
+    expires_at?: string;
+  }> = [];
   const routeToDevice = async (
     _deviceId: string,
-    operation: { type: string; payload: Record<string, unknown>; correlation_id: string },
+    operation: {
+      type: string;
+      payload: Record<string, unknown>;
+      correlation_id: string;
+      expires_at?: string;
+    },
   ) => {
-    deliveries.push({ type: operation.type, payload: operation.payload });
+    deliveries.push({
+      type: operation.type,
+      payload: operation.payload,
+      expires_at: operation.expires_at,
+    });
     return { status: "routed_to_device", detail: { recipients: 1 } };
   };
 
@@ -531,13 +555,43 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
   assert.equal(firstBody.status, "pending");
   assert.equal(deliveries.length, 1);
   assert.equal(deliveries[0]!.type, "approval.decision");
-  assert.equal(deliveries[0]!.payload.decision, "approve");
+  // Strict ownmesh.operation/1.0 nests decision under arguments (not flat payload).
+  const decisionArgs = deliveries[0]!.payload.arguments as
+    | {
+        decision?: string;
+        target_operation_id?: string;
+        action?: string;
+        approval_id?: string;
+      }
+    | undefined;
+  assert.equal(decisionArgs?.decision, "approve");
+  assert.equal(decisionArgs?.action, "approval.decision");
   // Decision frame has its own operation_id; original op is target_operation_id.
   assert.equal(
-    deliveries[0]!.payload.target_operation_id ||
-      (deliveries[0]!.payload.arguments as { target_operation_id?: string } | undefined)
-        ?.target_operation_id,
+    deliveries[0]!.payload.target_operation_id || decisionArgs?.target_operation_id,
     opId,
+  );
+  // E3: recovery decision must carry server-bound exact-action authorization.
+  assert.equal(deliveries[0]!.payload.capability, "approval.decision");
+  assert.ok(
+    typeof deliveries[0]!.payload.payload_hash === "string" &&
+      String(deliveries[0]!.payload.payload_hash).length === 64,
+    "approval.decision must include server payload_hash",
+  );
+  const auth = deliveries[0]!.payload.authorization as
+    | { bound_action?: Record<string, unknown> }
+    | undefined;
+  assert.ok(auth?.bound_action && typeof auth.bound_action === "object");
+  assert.equal(auth!.bound_action!.action, "approval.decision");
+  assert.equal(auth!.bound_action!.principal_id, "prin_dev");
+  assert.equal(
+    (auth!.bound_action!.facts as { decision?: string } | undefined)?.decision,
+    "approve",
+  );
+  assert.ok(
+    typeof deliveries[0]!.expires_at === "string" ||
+      typeof auth!.bound_action!.expires_at === "string",
+    "decision must bind expires_at",
   );
 
   // Double approve with same tx rejected (already delivered)
@@ -555,6 +609,59 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     },
   );
   assert.equal(get2.status, 409);
+});
+
+test("/approve rejects expired target operation (no decision delivery)", async () => {
+  const store = new MemoryStore();
+  await seedAuthed(store);
+  const deviceId = "dev_approve_expired_01ab";
+  await putActiveDevice(store, deviceId);
+  const opId = randomId("op_");
+  const past = new Date(Date.now() - 60_000).toISOString();
+  await store.putMcpOperation({
+    operation_id: opId,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "approval_required",
+    summary: "stale",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: true,
+    approval_url: `https://cp.test/approve?operation_id=${opId}`,
+    warnings: [],
+    correlation_id: randomId("cor_"),
+    policy_authority: "ownmesh_device",
+    payload_hash: "b".repeat(64),
+    expires_at: past,
+    claim_version: 1,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const deliveries: unknown[] = [];
+  const getRes = await handleApprove(
+    new Request(`https://cp.test/approve?operation_id=${opId}`),
+    store,
+    {
+      issuer: "https://cp.test",
+      principal: { id: "prin_dev", tenant_id: "ten_default" },
+      authSource: "browser",
+      routeToDevice: async () => {
+        deliveries.push("should_not_run");
+        return { status: "routed_to_device" };
+      },
+    },
+  );
+  assert.equal(getRes.status, 409, await getRes.clone().text());
+  assert.equal(
+    ((await getRes.json()) as { error?: string }).error,
+    "expired",
+  );
+  assert.equal(deliveries.length, 0);
+  assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
 });
 
 test("/approve delivery failure is retryable non-success; retry delivers exactly once", async () => {

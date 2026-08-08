@@ -2290,4 +2290,69 @@ mod tests {
             .join("deny-me.txt")
             .exists());
     }
+
+    #[tokio::test]
+    async fn remote_ask_expired_binding_rejects_recovery_approve() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let remote_op = "op_mcp_ask_expired_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let past = chrono_lite_unix_now().saturating_sub(120);
+        let ask = rt
+            .dispatch_cancellable_bound(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "expired.txt",
+                    "content": "too-late",
+                    "idempotency_key": "expired-ask-1",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+                Some(past),
+                Some("d".repeat(64)),
+            )
+            .await
+            .expect("ask");
+        assert_eq!(ask["approval_required"], true);
+        let approval_id = ask["approval_id"].as_str().unwrap().to_owned();
+
+        let err = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "decision": "approve",
+                "target_payload_hash": "d".repeat(64),
+            })))
+            .await
+            .expect_err("expired must fail closed");
+        match err {
+            IpcError::Remote { code, message } => {
+                assert_eq!(code, app_error::UNAUTHORIZED);
+                assert!(
+                    message.to_ascii_lowercase().contains("expired"),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            !paths
+                .state_dir
+                .join("workspace")
+                .join("expired.txt")
+                .exists(),
+            "expired approve must not execute"
+        );
+    }
+
+    fn chrono_lite_unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
 }

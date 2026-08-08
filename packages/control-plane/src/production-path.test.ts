@@ -1463,6 +1463,8 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
 
     const opId = randomId("op_");
     const corr = randomId("cor_");
+    const targetExpires = new Date(Date.now() + 5 * 60_000).toISOString();
+    const targetHash = "c".repeat(64);
     await store.putMcpOperation({
       operation_id: opId,
       tenant_id: TENANT_ID,
@@ -1479,6 +1481,15 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       warnings: [],
       correlation_id: corr,
       policy_authority: "ownmesh_device",
+      payload_hash: targetHash,
+      expires_at: targetExpires,
+      claim_version: 1,
+      action: {
+        capability: "filesystem.write",
+        action: "fs.write",
+        tool: "ownmesh_fs_write",
+        path: "secret.txt",
+      },
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     });
@@ -1606,19 +1617,17 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     assert.equal(firstBody.status, "pending");
     assert.equal(firstBody.route?.status, "routed_to_device");
 
-    // Real DeviceRoom delivered approval.decision to the agent frame.
+    // Real DeviceRoom delivered bound approval.decision to the agent frame.
     const agentInbox = drainSocket(agentWs);
+    const decisionFrame = agentInbox.find(
+      (m) =>
+        m.type === "operation.request" &&
+        (m.payload.capability === "approval.decision" ||
+          (m.payload.arguments as { action?: string } | undefined)?.action ===
+            "approval.decision"),
+    );
     assert.ok(
-      agentInbox.some(
-        (m) =>
-          m.type === "operation.request" &&
-          m.payload.capability === "approval.decision" ||
-            m.payload.op === "approval.decision" ||
-            m.payload.decision === "approve" ||
-            (m.payload.arguments as { action?: string; decision?: string } | undefined)?.action ===
-              "approval.decision" ||
-            (m.payload.arguments as { decision?: string } | undefined)?.decision === "approve",
-      ),
+      decisionFrame,
       `agent must receive approval.decision, got ${JSON.stringify(
         agentInbox.map(
           (m) =>
@@ -1627,6 +1636,27 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
             String(m.payload.capability || m.payload.op || m.payload.decision || ""),
         ),
       )}`,
+    );
+    assert.equal(
+      (decisionFrame!.payload.arguments as { decision?: string } | undefined)?.decision,
+      "approve",
+    );
+    assert.ok(
+      typeof decisionFrame!.payload.payload_hash === "string" &&
+        String(decisionFrame!.payload.payload_hash).length === 64,
+      "decision frame must carry server payload_hash",
+    );
+    const bound = (
+      decisionFrame!.payload.authorization as
+        | { bound_action?: Record<string, unknown> }
+        | undefined
+    )?.bound_action;
+    assert.ok(bound && typeof bound === "object", "decision must carry bound_action");
+    assert.equal(bound!.action, "approval.decision");
+    assert.equal(bound!.principal_id, PRINCIPAL_ID);
+    assert.equal(
+      (bound!.facts as { target_payload_hash?: string } | undefined)?.target_payload_hash,
+      targetHash,
     );
 
     // Authoritative transition only after successful delivery.

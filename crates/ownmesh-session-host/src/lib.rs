@@ -21,4 +21,5 @@ mod pty_host;
 
 pub use pty_host::{
     default_shell_command, read_until, spawn_pty, LiveHost, PtySession, LIVE_OUTPUT_RING_BYTES,
+    PIPE_FALLBACK_MAX_BYTES, READ_UNTIL_MAX_BYTES,
 };

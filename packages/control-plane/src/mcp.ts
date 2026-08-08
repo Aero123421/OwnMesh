@@ -3930,6 +3930,111 @@ export async function handleApprove(
             ? String((op.data as { approval_id: unknown }).approval_id)
             : "") ||
           claimed.id;
+
+        // E3: bind the recovery decision to the original exact action + expiry.
+        // A newly minted browser tx must not resurrect a stale deferred request.
+        const nowMs = Date.now();
+        const targetExpiresAt =
+          typeof op.expires_at === "string" && op.expires_at.trim() !== ""
+            ? String(op.expires_at)
+            : null;
+        if (targetExpiresAt) {
+          const targetMs = Date.parse(targetExpiresAt);
+          if (Number.isFinite(targetMs) && targetMs <= nowMs) {
+            await store.releaseMcpApprovalOutboxClaim(
+              claimed.id,
+              claimToken,
+              claimVersion,
+              "target_operation_expired",
+            );
+            claimSettled = true;
+            return json(
+              {
+                error: "expired",
+                error_description:
+                  "original operation expires_at elapsed; re-authorize the action",
+                operation_id: op.operation_id,
+                expires_at: targetExpiresAt,
+                retryable: false,
+              },
+              { status: 409 },
+            );
+          }
+        }
+        // Decision envelope lifetime: short default, never past original action or tx.
+        const decisionDefaultMs = nowMs + 60_000;
+        let decisionExpiresMs = decisionDefaultMs;
+        if (targetExpiresAt) {
+          const t = Date.parse(targetExpiresAt);
+          if (Number.isFinite(t)) decisionExpiresMs = Math.min(decisionExpiresMs, t);
+        }
+        // Approval transaction expires_at is epoch ms (bound at GET mint).
+        if (typeof tx.expires_at === "number" && Number.isFinite(tx.expires_at)) {
+          decisionExpiresMs = Math.min(decisionExpiresMs, tx.expires_at);
+        }
+        if (decisionExpiresMs <= nowMs) {
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            claimToken,
+            claimVersion,
+            "decision_window_expired",
+          );
+          claimSettled = true;
+          return json(
+            {
+              error: "expired",
+              error_description: "approval decision window elapsed",
+              operation_id: op.operation_id,
+              retryable: false,
+            },
+            { status: 409 },
+          );
+        }
+        const decisionExpiresAt = nowIso(decisionExpiresMs);
+        const targetPayloadHash =
+          typeof op.payload_hash === "string" && op.payload_hash.trim() !== ""
+            ? String(op.payload_hash)
+            : null;
+        const decisionClaimVersion = Number(claimed.claim_version ?? 1);
+        const decisionArgs: Record<string, unknown> = {
+          action: "approval.decision",
+          target_operation_id: op.operation_id,
+          decision,
+          approval_id: deviceApprovalId,
+          target_tool: op.tool || "",
+        };
+        if (targetPayloadHash) decisionArgs.target_payload_hash = targetPayloadHash;
+        if (targetExpiresAt) decisionArgs.target_expires_at = targetExpiresAt;
+
+        // Facts mirror arguments (minus action) so Agent recompute_action_facts matches.
+        // Approver principal/tenant live on bound_action top-level (not facts).
+        const decisionFacts: Record<string, unknown> = {
+          target_operation_id: op.operation_id,
+          decision,
+          approval_id: deviceApprovalId,
+          target_tool: op.tool || "",
+        };
+        if (targetPayloadHash) decisionFacts.target_payload_hash = targetPayloadHash;
+        if (targetExpiresAt) decisionFacts.target_expires_at = targetExpiresAt;
+
+        const boundAction: Record<string, unknown> = {
+          capability: "approval.decision",
+          action: "approval.decision",
+          tool: "ownmesh_approval_decision",
+          device_id: deviceId,
+          principal_id: principal.id,
+          tenant_id: principal.tenant_id,
+          oauth_client_id: null,
+          workspace_id: op.workspace_id ?? null,
+          facts: decisionFacts,
+          operation_id: decisionOpId,
+          expires_at: decisionExpiresAt,
+          claim_version: decisionClaimVersion,
+          // Immutable linkage to the deferred target (also in facts for Agent match).
+          outbox_id: claimed.id,
+        };
+        const payloadHash = await hashCanonicalAction(boundAction);
+
         route = await opts.routeToDevice(deviceId, {
           type: "approval.decision",
           payload: {
@@ -3939,15 +4044,14 @@ export async function handleApprove(
             operation_id: decisionOpId,
             capability: "approval.decision",
             idempotency_key: claimed.id || decisionOpId,
-            arguments: {
-              action: "approval.decision",
-              target_operation_id: op.operation_id,
-              decision,
-              approval_id: deviceApprovalId,
-              tool: op.tool,
-            },
+            payload_hash: payloadHash,
+            authorization: { bound_action: boundAction },
+            arguments: decisionArgs,
+            ...(op.workspace_id ? { workspace_id: op.workspace_id } : {}),
           },
           correlation_id: decisionOpId,
+          expires_at: decisionExpiresAt,
+          claim_version: decisionClaimVersion,
         });
         if (route.status !== "routed_to_device") {
           await store.releaseMcpApprovalOutboxClaim(
@@ -4098,6 +4202,28 @@ export async function handleApprove(
     }
   }
 
+  // E3: transaction must not outlive the original remote action expiry.
+  const nowMs = Date.now();
+  let txExpiresMs = nowMs + 15 * 60 * 1000;
+  if (typeof op.expires_at === "string" && op.expires_at.trim() !== "") {
+    const targetMs = Date.parse(op.expires_at);
+    if (Number.isFinite(targetMs)) {
+      if (targetMs <= nowMs) {
+        return json(
+          {
+            error: "expired",
+            error_description:
+              "original operation expires_at elapsed; re-authorize the action",
+            operation_id: op.operation_id,
+            expires_at: op.expires_at,
+          },
+          { status: 409 },
+        );
+      }
+      txExpiresMs = Math.min(txExpiresMs, targetMs);
+    }
+  }
+
   const csrf = randomToken("csrf_");
   const txId = randomId("apr_");
   // Bind one-time tx to the authenticated human only (never client-supplied identity).
@@ -4108,17 +4234,22 @@ export async function handleApprove(
     principal_id: principal.id,
     tenant_id: principal.tenant_id,
     device_id: op.device_id,
-    expires_at: Date.now() + 15 * 60 * 1000,
+    expires_at: txExpiresMs,
     consumed: false,
     created_at: nowIso(),
   });
 
+  const actionPreview = op.action
+    ? escapeHtml(JSON.stringify(op.action, null, 2))
+    : escapeHtml(op.summary || "");
   const page = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Approve</title></head>
 <body><h1>OwnMesh operation approval</h1>
 <p>Operation <code>${escapeHtml(op.operation_id)}</code></p>
 <p>Tool: <code>${escapeHtml(op.tool || "")}</code></p>
 <p>Device: <code>${escapeHtml(op.device_id || "")}</code></p>
-<p>${escapeHtml(op.summary || "")}</p>
+<p>Expires: <code>${escapeHtml(op.expires_at || nowIso(txExpiresMs))}</code></p>
+<p>Payload hash: <code>${escapeHtml(op.payload_hash || "(none)")}</code></p>
+<pre>${actionPreview}</pre>
 <form method="post" action="/approve?operation_id=${encodeURIComponent(op.operation_id)}">
 <input type="hidden" name="transaction_id" value="${escapeHtml(txId)}"/>
 <input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"/>
@@ -4126,7 +4257,7 @@ export async function handleApprove(
 <button name="decision" value="approve">Approve</button>
 <button name="decision" value="deny">Deny</button>
 </form>
-<p><small>Issuer ${escapeHtml(issuer)}. ChatGPT confirmation is not a substitute for OwnMesh local policy.</small></p>
+<p><small>Issuer ${escapeHtml(issuer)}. ChatGPT confirmation is not an OwnMesh cryptographic attestation. This recovery path binds the exact action hash and expiry before device execution.</small></p>
 </body></html>`;
   return html(page, { status: 200, noStore: true });
 }

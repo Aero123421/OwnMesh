@@ -1341,7 +1341,7 @@ fn recompute_action_facts(arguments: &Map<String, Value>) -> Result<Map<String, 
                 | "policy_result"
                 | "payload_hash"
                 | "risk_level"
-                | "decision"
+                // "decision" is intentionally NOT skipped: approval.decision binds it.
                 | "idempotency_key"
                 | "workspace_id"
         ) {
@@ -1416,13 +1416,8 @@ fn verify_exact_action_binding(
     envelope_expires_at: Option<&str>,
 ) -> Result<(), String> {
     let Some(authorization) = request.authorization.as_ref() else {
-        // Cancel is a live control plane action: binding is mandatory so an
-        // unauthenticated/unsigned cancel cannot signal process trees.
-        // approval.decision remains an optional recovery notification only.
-        let action = action_of(request);
-        if request.capability == "approval.decision" || action == "approval.decision" {
-            return Ok(());
-        }
+        // Cancel and approval.decision are live control-plane actions: binding is
+        // mandatory so an unauthenticated/unsigned frame cannot approve or signal.
         return Err(
             "remote side-effect operations require authorization.bound_action and payload_hash"
                 .into(),
@@ -1990,13 +1985,28 @@ async fn dispatch_remote_operation(
     }
 
     if mapped.0 == "__approval_decision__" {
-        // Optional recovery/admin path: resolve the deferred device approval and
-        // execute/deny exactly once. ChatGPT confirmation is not an OwnMesh
-        // attestation; this path runs only after control-plane OAuth+CSRF claim.
+        // Recovery/admin path: resolve the deferred device approval and
+        // execute/deny exactly once. Binding was already verified above.
+        // ChatGPT confirmation is not an OwnMesh attestation; this path runs
+        // only after control-plane OAuth+CSRF claim + exact-action binding.
+        let mut decision_params = mapped.1.clone();
+        if let Some(obj) = decision_params.as_object_mut() {
+            // Inject verified approver identity from bound_action (never client free-form).
+            if let Some(bound) = request
+                .authorization
+                .as_ref()
+                .and_then(|a| a.bound_action.as_object())
+            {
+                if let Some(pid) = bound.get("principal_id").and_then(Value::as_str) {
+                    obj.entry("approver_principal".to_owned())
+                        .or_insert_with(|| Value::String(pid.to_owned()));
+                }
+            }
+        }
         let outcome = {
             let mut guard = runtime.lock().await;
             guard
-                .apply_control_plane_approval_decision(Some(mapped.1.clone()))
+                .apply_control_plane_approval_decision(Some(decision_params))
                 .await
         };
         return match outcome {
@@ -2056,15 +2066,24 @@ async fn dispatch_remote_operation(
             });
         }
     };
+    // Capture remote exact-action expiry/hash onto any deferred ApprovalRecord.
+    let remote_expires_unix = envelope_expires_at.and_then(|raw| {
+        ownmesh_domain::Timestamp::parse(raw)
+            .ok()
+            .map(|ts| ts.date_time().unix_timestamp())
+    });
+    let remote_payload_hash = request.payload_hash.clone();
     let outcome = {
         let mut guard = runtime.lock().await;
         guard
-            .dispatch_cancellable(
+            .dispatch_cancellable_bound(
                 mapped.0,
                 Some(mapped.1),
                 &client,
                 cancel_rx,
                 Some(operation_id.clone()),
+                remote_expires_unix,
+                remote_payload_hash,
             )
             .await
     };
@@ -2875,6 +2894,118 @@ mod tests {
             err.contains("expires_at") || err.contains("mismatch"),
             "bound={bound_expires} err={err}"
         );
+    }
+
+    fn sample_bound_approval_decision(
+        device_id: &str,
+        target_operation_id: &str,
+        decision: &str,
+        target_payload_hash: &str,
+    ) -> (OperationRequestPayload, String) {
+        use ownmesh_protocol::OperationAuthorizationBinding;
+        let expires = Timestamp::now()
+            .checked_add(Duration::from_secs(60))
+            .unwrap()
+            .to_rfc3339();
+        let mut facts = Map::new();
+        facts.insert(
+            "target_operation_id".into(),
+            Value::String(target_operation_id.into()),
+        );
+        facts.insert("decision".into(), Value::String(decision.into()));
+        facts.insert("approval_id".into(), json!("apr_test1"));
+        facts.insert("target_tool".into(), json!("ownmesh_fs_write"));
+        facts.insert(
+            "target_payload_hash".into(),
+            Value::String(target_payload_hash.into()),
+        );
+        let mut bound = Map::new();
+        bound.insert("capability".into(), json!("approval.decision"));
+        bound.insert("action".into(), json!("approval.decision"));
+        bound.insert("tool".into(), json!("ownmesh_approval_decision"));
+        bound.insert("device_id".into(), json!(device_id));
+        bound.insert("principal_id".into(), json!("prin_dev"));
+        bound.insert("tenant_id".into(), json!("ten_default"));
+        bound.insert("oauth_client_id".into(), Value::Null);
+        bound.insert("workspace_id".into(), Value::Null);
+        bound.insert("facts".into(), Value::Object(facts));
+        bound.insert("operation_id".into(), json!("op_apr_decision"));
+        bound.insert("expires_at".into(), json!(expires.clone()));
+        bound.insert("claim_version".into(), json!(1));
+        let bound_value = Value::Object(bound);
+        let hash = sha256_hex_str(&stable_stringify(&bound_value));
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_apr_decision").unwrap(),
+            capability: "approval.decision".into(),
+            workspace_id: None,
+            idempotency_key: "idem_apr_decision".into(),
+            payload_hash: Some(hash),
+            authorization: Some(OperationAuthorizationBinding {
+                bound_action: bound_value,
+            }),
+            arguments: json!({
+                "action": "approval.decision",
+                "target_operation_id": target_operation_id,
+                "decision": decision,
+                "approval_id": "apr_test1",
+                "target_tool": "ownmesh_fs_write",
+                "target_payload_hash": target_payload_hash,
+            }),
+        };
+        (request, expires)
+    }
+
+    #[test]
+    fn approval_decision_binding_required_and_accepts_match() {
+        let device = DeviceId::parse("dev_apr_ok").unwrap();
+        let (request, expires) = sample_bound_approval_decision(
+            device.as_str(),
+            "op_target_write",
+            "approve",
+            &"ab".repeat(32),
+        );
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+    }
+
+    #[test]
+    fn approval_decision_rejects_unsigned() {
+        let device = DeviceId::parse("dev_apr_unsigned").unwrap();
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_apr_unsigned").unwrap(),
+            capability: "approval.decision".into(),
+            workspace_id: None,
+            idempotency_key: "idem_apr_unsigned".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({
+                "action": "approval.decision",
+                "target_operation_id": "op_victim",
+                "decision": "approve",
+                "approval_id": "apr_x",
+            }),
+        };
+        let err = verify_exact_action_binding(&device, &request, None).unwrap_err();
+        assert!(err.contains("authorization"), "{err}");
+    }
+
+    #[test]
+    fn approval_decision_rejects_decision_tamper() {
+        let device = DeviceId::parse("dev_apr_tamper").unwrap();
+        let (mut request, expires) = sample_bound_approval_decision(
+            device.as_str(),
+            "op_target_write",
+            "approve",
+            &"cd".repeat(32),
+        );
+        request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("decision".into(), json!("deny"));
+        let err = verify_exact_action_binding(&device, &request, Some(&expires)).unwrap_err();
+        assert!(err.contains("facts"), "{err}");
     }
 
     #[test]

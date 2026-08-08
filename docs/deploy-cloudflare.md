@@ -108,7 +108,7 @@ durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
 | `POST /v1/devices/revoke` or `DELETE /v1/devices?id=` | Revoke device |
 | `GET /agent/connect?device_id=&role=agent\|client` | WebSocket → `DeviceRoom` DO |
 | `POST /mcp` | Streamable HTTP MCP |
-| `GET\|POST /approve` | Authenticated but currently unimplemented; returns 501 fail-closed |
+| `GET\|POST /approve` | Optional recovery/admin approval (human browser auth + one-time CSRF). Binds exact action hash, original `expires_at`, and approver principal into a device-routed `approval.decision` frame. Not required for normal ChatGPT use when device policy allows. |
 
 ### Enrollment response shape (for CLI)
 

@@ -677,16 +677,31 @@ fn read_pipe_capped(mut reader: impl Read, max_bytes: usize) -> (String, bool) {
     (String::from_utf8_lossy(&acc).into_owned(), truncated)
 }
 
+/// Aggregate byte budget for one-shot `read_until` collection (CLI helper).
+pub const READ_UNTIL_MAX_BYTES: usize = 256 * 1024;
+/// Bounded channel depth for reader→collector chunks (4 KiB each).
+const READ_UNTIL_CHANNEL_CHUNKS: usize = 64;
+
 /// Read PTY output until child exits or `max_ms` elapses (0 = 5s default for safety).
+///
+/// Collection is strictly bounded: fixed-size chunks over a bounded channel and a
+/// single aggregate byte cap (`READ_UNTIL_MAX_BYTES`). Never clones a growing
+/// accumulator per read. Truncation is visible via the returned UTF-8 lossy text
+/// length being capped; the child is always terminated before return.
 ///
 /// The child is terminated and reaped before this function returns, including when
 /// acquiring or reading PTY state fails.
+#[allow(clippy::too_many_lines)] // bounded channel collector + terminate path stay collocated
 pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
     let read_result = (|| -> Result<String, String> {
         match &session.kind {
             SessionKindInner::Pipe { output } => {
                 let mut g = output.lock().map_err(|e| e.to_string())?;
-                Ok(g.take().unwrap_or_default())
+                let mut s = g.take().unwrap_or_default();
+                if s.len() > READ_UNTIL_MAX_BYTES {
+                    s.truncate(READ_UNTIL_MAX_BYTES);
+                }
+                Ok(s)
             }
             SessionKindInner::Pty { reader, child, .. } => {
                 let max = if max_ms == 0 { 5_000 } else { max_ms };
@@ -694,40 +709,74 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                 let Some(mut rdr) = reader_opt.take() else {
                     return Ok(String::new());
                 };
-                let (tx, rx) = mpsc::channel::<Vec<u8>>();
+                // Bounded channel of fixed chunks — backpressure stalls the reader
+                // instead of retaining hundreds of MiB of intermediate clones.
+                let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(READ_UNTIL_CHANNEL_CHUNKS);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
-                    let mut acc = Vec::new();
+                    let mut total = 0usize;
                     loop {
+                        if total >= READ_UNTIL_MAX_BYTES {
+                            break;
+                        }
                         match rdr.read(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                acc.extend_from_slice(&buf[..n]);
-                                if acc.len() > 2 * 1024 * 1024 {
+                                let take = n.min(READ_UNTIL_MAX_BYTES - total);
+                                if take == 0 {
                                     break;
                                 }
-                                let _ = tx.send(acc.clone());
+                                total = total.saturating_add(take);
+                                // Blocking send applies backpressure under a stalled collector.
+                                if tx.send(buf[..take].to_vec()).is_err() {
+                                    break;
+                                }
+                                if take < n {
+                                    break; // hit aggregate cap mid-read
+                                }
                             }
                             Err(_) => break,
                         }
                     }
-                    let _ = tx.send(acc);
+                    // Dropping tx closes the channel.
                 });
 
                 let deadline = std::time::Instant::now() + Duration::from_millis(max);
-                let mut last = Vec::new();
+                let mut acc = Vec::with_capacity(4096);
                 loop {
+                    if acc.len() >= READ_UNTIL_MAX_BYTES {
+                        break;
+                    }
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
                     match rx.recv_timeout(Duration::from_millis(50).min(remaining)) {
-                        Ok(chunk) => last = chunk,
+                        Ok(chunk) => {
+                            let room = READ_UNTIL_MAX_BYTES.saturating_sub(acc.len());
+                            if room == 0 {
+                                break;
+                            }
+                            let take = chunk.len().min(room);
+                            acc.extend_from_slice(&chunk[..take]);
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             if let Ok(mut ch) = child.lock() {
                                 if let Ok(Some(_)) = ch.try_wait() {
-                                    if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
-                                        last = chunk;
+                                    // Drain any remaining queued chunks briefly.
+                                    while acc.len() < READ_UNTIL_MAX_BYTES {
+                                        match rx.recv_timeout(Duration::from_millis(50)) {
+                                            Ok(chunk) => {
+                                                let room =
+                                                    READ_UNTIL_MAX_BYTES.saturating_sub(acc.len());
+                                                let take = chunk.len().min(room);
+                                                acc.extend_from_slice(&chunk[..take]);
+                                                if take < chunk.len() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(_) => break,
+                                        }
                                     }
                                     break;
                                 }
@@ -735,7 +784,7 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
-                    if !last.is_empty() {
+                    if !acc.is_empty() {
                         if let Ok(mut ch) = child.lock() {
                             if let Ok(Some(_)) = ch.try_wait() {
                                 break;
@@ -743,7 +792,7 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                         }
                     }
                 }
-                Ok(String::from_utf8_lossy(&last).into_owned())
+                Ok(String::from_utf8_lossy(&acc).into_owned())
             }
         }
     })();

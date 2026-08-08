@@ -11,8 +11,16 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 - Control-plane `/approve` recovery decisions are applied on-device: deferred
   request executes or denies exactly once; results fold onto the original MCP
   operation via `target_operation_id`.
+- Recovery `approval.decision` frames now carry server-computed `payload_hash` +
+  `authorization.bound_action` (decision, target op/hash/expiry, approver
+  principal/tenant, claim version). The Agent no longer bypasses exact-action
+  verification for this path. Browser transaction and decision envelope expiry
+  never outlive the original MCP `expires_at`; expired deferred approvals fail
+  closed on-device without side effects.
 - ChatGPT confirmation is still not claimed as a cryptographic OwnMesh attestation.
   Browser/CLI recovery remains the optional path when device policy is configured to ask.
+- CLI one-shot `read_until` PTY helper uses a bounded sync channel + aggregate byte
+  cap (no per-read accumulator clones under output pressure).
 
 ### E5 — live PTY integrity
 - Process-tree terminate for cloud sessions (`taskkill /T` on Windows; Unix session + process-group kill) so background shell descendants do not survive `session.terminate`.
