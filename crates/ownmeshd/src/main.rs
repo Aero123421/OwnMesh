@@ -26,6 +26,7 @@
     clippy::unused_self
 )]
 
+mod agent_transport;
 mod daemon;
 mod runtime;
 

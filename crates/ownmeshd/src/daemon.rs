@@ -1,9 +1,10 @@
 //! Foreground daemon loop: local IPC + policy-gated operations.
 
+use crate::agent_transport;
 use crate::runtime::{runtime_handler, DaemonRuntime};
 use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_identity::{load_or_create_device_key, PreferredSecretStore, DEFAULT_KEYCHAIN_SERVICE};
+use ownmesh_identity::{load_or_create_device_key, PreferredSecretStore};
 use ownmesh_ipc::{
     methods, read_management_credential, AuthGate, BootstrapStatus, ClientIdentity, ClientOptions,
     CredentialSecretResult, Endpoint, IpcClient, IpcError, IpcServer, LocalListener, MethodHandler,
@@ -12,7 +13,7 @@ use ownmesh_ipc::{
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 /// Run ownmeshd until Ctrl-C / shutdown signal.
 pub fn run_foreground() -> Result<(), ExitCode> {
@@ -42,7 +43,7 @@ async fn run_async() -> Result<(), ExitCode> {
     })?;
     tracing::info!(lang = %cfg.lang, "config loaded");
 
-    let public = ensure_device_identity(&paths).map_err(|err| {
+    let public = ensure_device_identity(&paths, &cfg).map_err(|err| {
         tracing::error!(error = %err, "device identity bootstrap failed");
         ExitCode::Internal
     })?;
@@ -95,10 +96,32 @@ async fn run_async() -> Result<(), ExitCode> {
         }
     });
 
+    let (transport_shutdown, transport_shutdown_rx) = watch::channel(false);
+    let transport_task = match agent_transport::configured_transport(&paths, &cfg) {
+        Ok(Some(config)) => Some(tokio::spawn(agent_transport::run(
+            config,
+            transport_shutdown_rx,
+        ))),
+        Ok(None) => {
+            tracing::info!("no active enrolled device credential; remote Agent transport disabled");
+            None
+        }
+        Err(err) => {
+            // Fail closed for remote connectivity while keeping the local IPC
+            // boundary available for repair/re-enrollment.
+            tracing::error!(error = %err, "remote Agent transport configuration rejected");
+            None
+        }
+    };
+
     wait_for_shutdown().await?;
 
+    let _ = transport_shutdown.send(true);
     server.request_shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(2), serve_task).await;
+    if let Some(task) = transport_task {
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
     tracing::info!("ownmeshd stopped");
     Ok(())
 }
@@ -334,9 +357,11 @@ fn map_credential_rpc_error(err: IpcError) -> ExitCode {
 
 fn ensure_device_identity(
     paths: &OwnMeshPaths,
+    cfg: &ownmesh_config::OwnMeshConfig,
 ) -> Result<ownmesh_identity::DevicePublicIdentity, String> {
-    let store = PreferredSecretStore::open(DEFAULT_KEYCHAIN_SERVICE, paths.keystore_dir())
-        .map_err(|e| e.to_string())?;
+    let store =
+        PreferredSecretStore::open(agent_transport::keychain_service(cfg), paths.keystore_dir())
+            .map_err(|e| e.to_string())?;
     let key = load_or_create_device_key(&store).map_err(|e| e.to_string())?;
     Ok(key.public_identity())
 }

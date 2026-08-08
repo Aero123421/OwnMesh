@@ -5,6 +5,8 @@ Device protocol envelopes, version negotiation, and parser fuzz harness for OwnM
 ## Features
 
 - `Envelope` serialize/parse with structure + expiry validation
+- `OperationEnvelope` request/progress/event/result parsing with the independent
+  `ownmesh.operation/1.0` payload contract and correlation binding
 - `ProtocolVersion` negotiation (major-compatible, highest common minor)
 - `fuzz_parse_envelope` panic-free entry (cargo-fuzz + stable test harness)
 

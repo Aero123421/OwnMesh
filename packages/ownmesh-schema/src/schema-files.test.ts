@@ -10,6 +10,7 @@ const REQUIRED_SCHEMAS = [
   "common-types.schema.json",
   "errors.schema.json",
   "protocol-envelope.schema.json",
+  "operation-envelope.schema.json",
 ];
 
 describe("JSON Schema corpus", () => {

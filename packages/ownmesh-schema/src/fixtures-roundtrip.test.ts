@@ -8,6 +8,11 @@ import {
   PROTOCOL_DEVICE_V1,
 } from "./envelope.ts";
 import {
+  OPERATION_CONTRACT_V1,
+  parseOperationEnvelope,
+  serializeOperationEnvelope,
+} from "./operation.ts";
+import {
   parseApprovalId,
   parseCursor,
   parseDeviceId,
@@ -156,5 +161,78 @@ describe("shared fixture round-trip", () => {
     assert.deepEqual(again, env);
     const original = JSON.parse(raw) as ProtocolEnvelope;
     assert.deepEqual(env, original);
+  });
+
+  for (const name of [
+    "operation_request_envelope.json",
+    "operation_progress_envelope.json",
+    "operation_event_envelope.json",
+    "operation_result_envelope.json",
+  ]) {
+    it(name.replace(".json", ""), () => {
+      const raw = fs.readFileSync(path.join(FIXTURES_DIR, name), "utf8");
+      const env = parseOperationEnvelope(raw);
+      assert.equal(env.payload.operation_contract, OPERATION_CONTRACT_V1);
+      assert.equal(env.correlation_id, env.payload.operation_id);
+      const pretty = serializeOperationEnvelope(env);
+      assert.deepEqual(parseOperationEnvelope(pretty), env);
+      assert.deepEqual(env, JSON.parse(raw));
+    });
+  }
+
+  it("operation contract rejects unknown fields and binding drift", () => {
+    const raw = readJson("operation_request_envelope.json") as Record<string, unknown>;
+    const unknown = structuredClone(raw);
+    (unknown.payload as Record<string, unknown>).force_allow = true;
+    assert.throws(() => parseOperationEnvelope(unknown), /unknown field 'force_allow'/);
+
+    const mismatch = structuredClone(raw);
+    mismatch.correlation_id = "op_different";
+    assert.throws(() => parseOperationEnvelope(mismatch), /correlation_id must equal/);
+
+    const noExpiry = structuredClone(raw);
+    delete noExpiry.expires_at;
+    assert.throws(() => parseOperationEnvelope(noExpiry), /requires expires_at/);
+
+    const nullExpiry = structuredClone(raw);
+    nullExpiry.expires_at = null;
+    assert.throws(() => parseOperationEnvelope(nullExpiry), /expires_at/);
+
+    for (const invalidTimestamp of ["2026-02-30T00:00:00Z", "2026-01-01T24:00:00Z"]) {
+      const invalid = structuredClone(raw);
+      invalid.sent_at = invalidTimestamp;
+      assert.throws(() => parseOperationEnvelope(invalid), /RFC3339 timestamp/);
+    }
+
+    const oversizedCapability = structuredClone(raw);
+    (oversizedCapability.payload as Record<string, unknown>).capability = "x".repeat(129);
+    assert.throws(() => parseOperationEnvelope(oversizedCapability), /exceeds 128/);
+
+    const unsafeSeq = structuredClone(raw);
+    unsafeSeq.seq = Number.MAX_SAFE_INTEGER + 1;
+    assert.throws(() => parseOperationEnvelope(unsafeSeq), /safe integer/);
+
+    const completed = readJson("operation_result_envelope.json") as Record<string, unknown>;
+    (completed.payload as Record<string, unknown>).error = {
+      code: "OWNMESH_E_INTERNAL",
+      message: "must not accompany success",
+      retryable: false,
+    };
+    assert.throws(() => parseOperationEnvelope(completed), /forbids error/);
+
+    const nullWorkspace = structuredClone(raw);
+    (nullWorkspace.payload as Record<string, unknown>).workspace_id = null;
+    assert.throws(() => parseOperationEnvelope(nullWorkspace), /workspace_id/);
+
+    const progress = readJson("operation_progress_envelope.json") as Record<string, unknown>;
+    for (const field of ["summary", "details"]) {
+      const invalid = structuredClone(progress);
+      (invalid.payload as Record<string, unknown>)[field] = null;
+      assert.throws(() => parseOperationEnvelope(invalid), new RegExp(field));
+    }
+
+    const nullResult = readJson("operation_result_envelope.json") as Record<string, unknown>;
+    (nullResult.payload as Record<string, unknown>).result = null;
+    assert.throws(() => parseOperationEnvelope(nullResult), /result/);
   });
 });
