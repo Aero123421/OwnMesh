@@ -669,24 +669,101 @@ pub(crate) fn read_range_enforced(
     Ok((buf, total, truncated, final_path))
 }
 
-/// Ensure parent directory exists and is still inside the workspace (handle-checked).
+/// Ensure parent directory exists via component-wise mkdir + handle revalidation.
+///
+/// Never uses a single `create_dir_all` over an untrusted multi-component path:
+/// each intermediate directory is created (if missing), opened nofollow, and
+/// revalidated against the workspace root before descending. Returns the pinned
+/// parent path **and** a held directory handle so the caller can re-check identity
+/// immediately before rename (narrows TOCTOU vs drop-then-path-ops).
+#[allow(dead_code)] // retained API for callers that only need the pinned path
 pub(crate) fn ensure_parent_enforced(ws: &WorkspaceRoot, file_path: &Path) -> FsResult<PathBuf> {
+    let (path, _dir) = ensure_parent_held(ws, file_path)?;
+    Ok(path)
+}
+
+fn ensure_parent_held(ws: &WorkspaceRoot, file_path: &Path) -> FsResult<(PathBuf, File)> {
     let parent = file_path.parent().ok_or_else(|| {
         FsError::InvalidPath(format!("file path has no parent: {}", file_path.display()))
     })?;
-    fs::create_dir_all(parent).map_err(|source| FsError::Io {
-        path: Some(parent.to_path_buf()),
-        source,
-    })?;
-    let dir = open_dir_nofollow(parent).map_err(|source| FsError::Io {
-        path: Some(parent.to_path_buf()),
-        source,
-    })?;
-    ensure_not_reparse_handle(&dir, parent)?;
-    ensure_handle_under_workspace(&dir, ws)
+    ensure_dir_tree_held(ws, parent)
 }
 
-/// Write bytes via exclusive temp + rename with parent/final handle revalidation.
+/// Component-wise ensure `dir_path` exists under the workspace; return pinned path + handle.
+fn ensure_dir_tree_held(ws: &WorkspaceRoot, dir_path: &Path) -> FsResult<(PathBuf, File)> {
+    // Resolve dir_path relative to the workspace root when possible.
+    let root = strip_extended_prefix(ws.root().to_path_buf());
+    let root_cmp = dunce_canonicalize(&root).unwrap_or(root.clone());
+    let target = if dir_path.starts_with(&root_cmp) || dir_path.starts_with(ws.root()) {
+        dir_path.to_path_buf()
+    } else {
+        // Lexical join under root for relative parents produced by join_enforced_path.
+        ws.root().join(dir_path)
+    };
+
+    let rel = target
+        .strip_prefix(&root_cmp)
+        .or_else(|_| target.strip_prefix(ws.root()))
+        .unwrap_or(Path::new(""));
+    let comps = relative_components(rel)?;
+
+    let root_dir = open_dir_nofollow(ws.root()).map_err(|source| FsError::Io {
+        path: Some(ws.root().to_path_buf()),
+        source,
+    })?;
+    ensure_not_reparse_handle(&root_dir, ws.root())?;
+    let mut cur = ensure_handle_under_workspace(&root_dir, ws)?;
+    // Keep the current directory handle open while descending.
+    let mut held = root_dir;
+
+    for comp in comps {
+        let next = cur.join(&comp);
+        match open_dir_nofollow(&next) {
+            Ok(dir) => {
+                ensure_not_reparse_handle(&dir, &next)?;
+                let meta = dir.metadata().map_err(|source| FsError::Io {
+                    path: Some(next.clone()),
+                    source,
+                })?;
+                if !meta.is_dir() {
+                    return Err(FsError::NotADirectory(next));
+                }
+                cur = ensure_handle_under_workspace(&dir, ws)?;
+                held = dir;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Single-component create only — never multi-level create_dir_all.
+                fs::create_dir(&next).map_err(|source| FsError::Io {
+                    path: Some(next.clone()),
+                    source,
+                })?;
+                let dir = open_dir_nofollow(&next).map_err(|source| FsError::Io {
+                    path: Some(next.clone()),
+                    source,
+                })?;
+                ensure_not_reparse_handle(&dir, &next)?;
+                let meta = dir.metadata().map_err(|source| FsError::Io {
+                    path: Some(next.clone()),
+                    source,
+                })?;
+                if !meta.is_dir() || is_reparse_or_symlink(&meta) {
+                    return Err(FsError::SymlinkOrReparse(next));
+                }
+                cur = ensure_handle_under_workspace(&dir, ws)?;
+                held = dir;
+            }
+            Err(source) => {
+                return Err(FsError::Io {
+                    path: Some(next),
+                    source,
+                });
+            }
+        }
+    }
+    Ok((cur, held))
+}
+
+/// Write bytes via exclusive temp + rename with parent handle held across the side effect.
 pub(crate) fn write_file_enforced(
     ws: &WorkspaceRoot,
     rel: &Path,
@@ -697,7 +774,7 @@ pub(crate) fn write_file_enforced(
     } else {
         join_enforced_path(ws, rel)?
     };
-    let parent_final = ensure_parent_enforced(ws, &path)?;
+    let (parent_final, parent_handle) = ensure_parent_held(ws, &path)?;
 
     let token = {
         use sha2::{Digest, Sha256};
@@ -712,10 +789,8 @@ pub(crate) fn write_file_enforced(
         hasher.update((data.len() as u64).to_le_bytes());
         hex::encode(hasher.finalize())
     };
-    let tmp = parent_final.join(format!(
-        ".ownmesh-{}.tmp",
-        token.get(..16).unwrap_or(token.as_str())
-    ));
+    let tmp_name = format!(".ownmesh-{}.tmp", token.get(..16).unwrap_or(token.as_str()));
+    let tmp = parent_final.join(&tmp_name);
 
     {
         // Create exclusive temp; open without following reparse.
@@ -746,41 +821,128 @@ pub(crate) fn write_file_enforced(
         f.sync_all().ok();
     }
 
-    fs::rename(&tmp, &path).map_err(|source| {
+    // Revalidate the *held* parent handle immediately before rename so a racing
+    // replacement of an intermediate directory is observed when the OS updates
+    // the handle's final path (and fail closed before publishing).
+    if let Err(err) = ensure_not_reparse_handle(&parent_handle, &parent_final) {
         let _ = fs::remove_file(&tmp);
-        FsError::Io {
-            path: Some(path.clone()),
-            source,
+        return Err(err);
+    }
+    let parent_now = match ensure_handle_under_workspace(&parent_handle, ws) {
+        Ok(p) => p,
+        Err(err) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
         }
-    })?;
+    };
+    // Prefer the live parent path for the destination name.
+    let dest_name = path.file_name().map_or_else(|| path.clone(), PathBuf::from);
+    let dest = parent_now.join(dest_name);
+
+    // Unix: renameat via /proc self paths still uses path strings from held final
+    // paths; Windows uses the same parent_now-derived destination. Holding the
+    // parent handle across this call is the portable custody narrow.
+    let rename_result = rename_nofollow_under_parent(&tmp, &dest, &parent_handle, ws);
+    if let Err(source) = rename_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(FsError::Io {
+            path: Some(dest.clone()),
+            source,
+        });
+    }
 
     // Revalidate the published path: open nofollow and require final path under root.
-    match open_existing_nofollow(&path, true, false) {
+    match open_existing_nofollow(&dest, true, false) {
         Ok(published) => {
-            if let Err(err) = ensure_not_reparse_handle(&published, &path) {
-                let _ = fs::remove_file(&path);
+            if let Err(err) = ensure_not_reparse_handle(&published, &dest) {
+                let _ = fs::remove_file(&dest);
                 return Err(err);
             }
             match ensure_handle_under_workspace(&published, ws) {
                 Ok(final_path) => {
                     if let Err(err) = ensure_no_cross_boundary_alias(&published, &final_path, ws) {
-                        let _ = fs::remove_file(&path);
+                        let _ = fs::remove_file(&dest);
                         return Err(err);
                     }
                     Ok(final_path)
                 }
                 Err(err) => {
-                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(&dest);
                     Err(err)
                 }
             }
         }
         Err(source) => Err(FsError::Io {
-            path: Some(path),
+            path: Some(dest),
             source,
         }),
     }
 }
+
+/// Rename after parent-handle revalidation. Uses `renameat` on Linux when the
+/// parent directory file descriptor is available; falls back to path rename with
+/// the already-pinned parent_final-derived paths elsewhere.
+fn rename_nofollow_under_parent(
+    tmp: &Path,
+    dest: &Path,
+    parent_handle: &File,
+    ws: &WorkspaceRoot,
+) -> std::io::Result<()> {
+    // Final custody gate on the parent before the side effect.
+    let _ = ensure_handle_under_workspace(parent_handle, ws)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string()))?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let dirfd = parent_handle.as_raw_fd();
+        let tmp_name = tmp.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "tmp has no file name")
+        })?;
+        let dest_name = dest.file_name().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "dest has no file name")
+        })?;
+        let tmp_c = std::ffi::CString::new(tmp_name.as_encoded_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "tmp name contains NUL")
+        })?;
+        let dest_c = std::ffi::CString::new(dest_name.as_encoded_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "dest name contains NUL")
+        })?;
+        // renameat(dirfd, tmp, dirfd, dest)
+        let rc = unsafe { libc_renameat(dirfd, tmp_c.as_ptr(), dirfd, dest_c.as_ptr()) };
+        if rc == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = parent_handle;
+        fs::rename(tmp, dest)
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn libc_renameat(
+    olddirfd: i32,
+    oldpath: *const libc_char,
+    newdirfd: i32,
+    newpath: *const libc_char,
+) -> i32 {
+    extern "C" {
+        fn renameat(
+            olddirfd: i32,
+            oldpath: *const libc_char,
+            newdirfd: i32,
+            newpath: *const libc_char,
+        ) -> i32;
+    }
+    renameat(olddirfd, oldpath, newdirfd, newpath)
+}
+
+#[cfg(target_os = "linux")]
+type libc_char = i8;
 
 /// Delete a path after handle identity revalidation in restricted mode.
 pub(crate) fn delete_enforced(ws: &WorkspaceRoot, rel: &Path, recursive: bool) -> FsResult<()> {
@@ -1024,5 +1186,80 @@ mod tests {
             matches!(err, FsError::CrossBoundaryHardlink(_)),
             "multi-link inode must fail closed in restricted mode: {err:?}"
         );
+    }
+
+    #[test]
+    fn write_nested_creates_parents_component_wise_under_root() {
+        let root = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+        let final_path =
+            write_file_enforced(&ws, Path::new("a/b/c.txt"), b"nested-ok").expect("write");
+        assert!(final_path.starts_with(root.path()) || final_path.starts_with(ws.root()));
+        assert_eq!(
+            fs::read(root.path().join("a/b/c.txt")).unwrap(),
+            b"nested-ok"
+        );
+    }
+
+    #[test]
+    fn write_rejects_when_parent_replaced_by_symlink_before_publish() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("safe")).unwrap();
+        let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+
+        // First write establishes custody path.
+        write_file_enforced(&ws, Path::new("safe/file.txt"), b"v1").unwrap();
+
+        // Replace parent dir with a symlink/junction pointing outside.
+        let _ = fs::remove_file(root.path().join("safe/file.txt"));
+        let _ = fs::remove_dir_all(root.path().join("safe"));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root.path().join("safe")).unwrap();
+            let err = write_file_enforced(&ws, Path::new("safe/file.txt"), b"pwned").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FsError::SymlinkOrReparse(_)
+                        | FsError::EscapesWorkspace(_)
+                        | FsError::Io { .. }
+                ),
+                "symlink parent must fail closed: {err:?}"
+            );
+            // Outside must not receive the payload.
+            assert!(
+                fs::read_dir(outside.path()).unwrap().next().is_none()
+                    || fs::read(outside.path().join("file.txt")).is_err(),
+                "must not write outside workspace"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let link = root.path().join("safe");
+            let target = outside.path();
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &target.to_string_lossy(),
+                ])
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                let err =
+                    write_file_enforced(&ws, Path::new("safe/file.txt"), b"pwned").unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        FsError::SymlinkOrReparse(_)
+                            | FsError::EscapesWorkspace(_)
+                            | FsError::Io { .. }
+                    ),
+                    "junction parent must fail closed: {err:?}"
+                );
+            }
+        }
     }
 }

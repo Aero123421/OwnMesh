@@ -43,7 +43,9 @@ use ownmesh_policy::{
     temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
     ExecutableIdentityBinding, OperationFacts, PolicyDocument, TemporaryGrant,
 };
+use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{SessionKind, SessionManager, StreamKind as SessionStreamKind};
+use ownmesh_session_host::{default_shell_command, LiveHost};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -339,6 +341,9 @@ pub struct DaemonRuntime {
     log_path: PathBuf,
     sessions: SessionManager,
     sessions_path: PathBuf,
+    /// Process-local live PTY hosts keyed by session id (not persisted).
+    /// Metadata/leases survive restart; live hosts are re-created only on open.
+    live_hosts: HashMap<String, LiveHost>,
     broker_endpoint: Option<BrokerEndpoint>,
     broker_secret: Option<BrokerSecret>,
     /// Optional cancel signal for the currently executing remote command.
@@ -419,6 +424,7 @@ impl DaemonRuntime {
             log_path,
             sessions,
             sessions_path,
+            live_hosts: HashMap::new(),
             broker_endpoint,
             broker_secret,
             active_cancel: None,
@@ -2112,6 +2118,16 @@ full_user_access/full_access for arbitrary commands",
         };
         let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
+        // Resolve cwd against the selected workspace for PTY spawn context.
+        let ws_root = self.workspace_for(Some(workspace_id.as_str()))?;
+        let cwd = p
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| Some(ws_root.root().to_string_lossy().into_owned()));
+        let command = p.command.clone();
         let snapshot = self.sessions.clone();
         let info = self
             .sessions
@@ -2122,17 +2138,80 @@ full_user_access/full_access for arbitrary commands",
                 Self::now(),
                 p.profile_id,
                 None,
-                p.command,
-                p.cwd,
+                command.clone(),
+                cwd.clone(),
                 None,
-                Some(workspace_id),
+                Some(workspace_id.clone()),
             )
             .map_err(session_err)?;
+        // Own a live PTY for interactive sessions (E5). Process/profile kinds stay
+        // metadata-only until their adapters land; failure to spawn is fail-closed
+        // so ChatGPT never sees a fake echo-only "session".
+        if kind == SessionKind::Pty {
+            let pty_cmd = match command.as_ref() {
+                Some(argv) if !argv.is_empty() => PtyCommand {
+                    program: argv[0].clone(),
+                    args: argv[1..].to_vec(),
+                    cwd: cwd.clone(),
+                    env: vec![("TERM".into(), "xterm-256color".into())],
+                },
+                _ => {
+                    let mut shell = default_shell_command();
+                    shell.cwd.clone_from(&cwd);
+                    shell
+                }
+            };
+            let size = PtySize {
+                cols: info.cols,
+                rows: info.rows,
+            };
+            match LiveHost::spawn(&pty_cmd, size) {
+                Ok(host) => {
+                    let pid = host.handle.pid;
+                    let backend = format!("{:?}", host.handle.backend);
+                    if let Err(e) = self.sessions.set_host_pid(&info.id, pid) {
+                        drop(host);
+                        self.sessions = snapshot;
+                        return Err(session_err(e));
+                    }
+                    if let Err(e) = self.commit_sessions(snapshot) {
+                        drop(host);
+                        return Err(e);
+                    }
+                    self.live_hosts.insert(info.id.clone(), host);
+                    // Drain any initial banner into the replay ring (bounded).
+                    // Avoid blocking the open path on a noisy interactive shell banner;
+                    // callers pull output via session.replay.
+                    let _ = pid;
+                    let info = self.sessions.get(&info.id).map_err(session_err)?;
+                    let mut value = serde_json::to_value(info).map_err(|e| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: e.to_string(),
+                    })?;
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("live_pty".into(), json!(true));
+                        obj.insert("pty_backend".into(), json!(backend));
+                    }
+                    return Ok(value);
+                }
+                Err(err) => {
+                    self.sessions = snapshot;
+                    return Err(IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: format!("failed to spawn live PTY host: {err}"),
+                    });
+                }
+            }
+        }
         self.commit_sessions(snapshot)?;
-        serde_json::to_value(info).map_err(|e| IpcError::Remote {
+        let mut value = serde_json::to_value(info).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
-        })
+        })?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("live_pty".into(), json!(false));
+        }
+        Ok(value)
     }
 
     fn handle_session_list(&mut self, client: &ClientIdentity) -> IpcResult<Value> {
@@ -2216,7 +2295,7 @@ full_user_access/full_access for arbitrary commands",
         // Session IDs are identifiers, not bearer capabilities. Attaching cannot
         // grant a new principal access; delegation must happen through session.give.
         self.require_reader(&p.id, &client.client_name, now)?;
-        self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
         if read_only {
@@ -2241,12 +2320,16 @@ full_user_access/full_access for arbitrary commands",
                 .map_err(session_err)?;
         }
         self.commit_sessions(snapshot)?;
+        // Pull any pending live PTY output into the durable replay ring.
+        let _ = self.drain_live_output_into_session(&p.id);
         let info = self.sessions.get(&p.id).map_err(session_err)?;
         Ok(json!({
             "session": info,
             "principal": principal,
             "role": if read_only { "observer" } else { "controller" },
             "read_only": read_only,
+            "workspace_id": bound_ws,
+            "live_pty": self.live_hosts.contains_key(&p.id),
             "readers": self.sessions.readers(&p.id, now).map_err(session_err)?.into_iter().collect::<Vec<_>>(),
         }))
     }
@@ -2350,9 +2433,13 @@ full_user_access/full_access for arbitrary commands",
         let now = self.prepare_session_access()?;
         let id = require_id(params, "id")?;
         self.require_controller(&id, &client.client_name, now)?;
+        let _ = self.drain_live_output_into_session(&id);
+        // Snapshot before host teardown so a failed sessions persist rolls back
+        // the complete manager (including host_pid) transactionally.
         let snapshot = self.sessions.clone();
         self.sessions.close(&id).map_err(session_err)?;
         self.commit_sessions(snapshot)?;
+        self.stop_live_host(&id);
         Ok(json!({ "closed": true, "session_id": id }))
     }
 
@@ -2383,13 +2470,21 @@ full_user_access/full_access for arbitrary commands",
                 })
                 .map(|info| info.id)
                 .collect();
+            let mut drained = Vec::new();
+            for id in &controlled {
+                let _ = self.drain_live_output_into_session(id);
+                drained.push(id.clone());
+            }
             let snapshot = self.sessions.clone();
             let mut n = 0usize;
-            for id in controlled {
-                self.sessions.terminate(&id).map_err(session_err)?;
+            for id in &controlled {
+                self.sessions.terminate(id).map_err(session_err)?;
                 n += 1;
             }
             self.commit_sessions(snapshot)?;
+            for id in drained {
+                self.stop_live_host(&id);
+            }
             return Ok(json!({ "terminated": n, "all": true }));
         }
         let id = p.id.ok_or_else(|| IpcError::Remote {
@@ -2397,9 +2492,11 @@ full_user_access/full_access for arbitrary commands",
             message: "id or all required".into(),
         })?;
         self.require_controller(&id, &client.client_name, now)?;
+        let _ = self.drain_live_output_into_session(&id);
         let snapshot = self.sessions.clone();
         self.sessions.terminate(&id).map_err(session_err)?;
         self.commit_sessions(snapshot)?;
+        self.stop_live_host(&id);
         Ok(json!({ "terminated": 1, "session_id": id }))
     }
 
@@ -2420,11 +2517,16 @@ full_user_access/full_access for arbitrary commands",
             /// Ignored: read ACL uses authenticated client identity.
             #[serde(default)]
             principal: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
         let now = self.prepare_session_access()?;
         self.require_reader(&p.id, &client.client_name, now)?;
+        let _bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        // Fold live host output into the durable spool before serving the page.
+        let drained = self.drain_live_output_into_session(&p.id)?;
         let page = self
             .sessions
             .replay_from_bounded(
@@ -2444,6 +2546,8 @@ full_user_access/full_access for arbitrary commands",
             "truncated": page.truncated,
             "next_seq": page.next_seq,
             "returned_bytes": page.returned_bytes,
+            "live_drained_bytes": drained,
+            "live_pty": self.live_hosts.contains_key(&p.id),
         }))
     }
 
@@ -2506,23 +2610,43 @@ full_user_access/full_access for arbitrary commands",
         self.sessions
             .authorize_stdin(&p.id, &principal, now)
             .map_err(session_err)?;
-        self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
-        // Record a bounded input receipt for observers (never echo multi-MB payloads).
-        let snapshot = self.sessions.clone();
-        let echo = if p.data.len() <= 256 {
-            format!("[stdin] {}", p.data)
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        // Deliver bytes to the live PTY when owned; never pretend success on echo alone.
+        if let Some(host) = self.live_hosts.get(&p.id) {
+            host.write_stdin(p.data.as_bytes())
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("live PTY stdin write failed: {e}"),
+                })?;
         } else {
-            format!("[stdin] <{} bytes>", p.data.len())
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "session {} has no live PTY host (restarted daemon or non-PTY kind)",
+                    p.id
+                ),
+            });
+        }
+        // Bounded system receipt for observers (not a substitute for process I/O).
+        let snapshot = self.sessions.clone();
+        let receipt = if p.data.len() <= 64 {
+            format!("[stdin-accepted] {}", p.data.replace('\n', "\\n"))
+        } else {
+            format!("[stdin-accepted] <{} bytes>", p.data.len())
         };
         let chunk = self
             .sessions
-            .push_output(&p.id, echo, SessionStreamKind::System)
+            .push_output(&p.id, receipt, SessionStreamKind::System)
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
+        let drained = self.drain_live_output_into_session(&p.id)?;
         Ok(json!({
             "accepted": true,
             "chunk": chunk,
             "bytes": p.data.len(),
+            "live_pty": true,
+            "live_drained_bytes": drained,
+            "workspace_id": bound_ws,
         }))
     }
 
@@ -2542,14 +2666,26 @@ full_user_access/full_access for arbitrary commands",
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
         self.require_controller(&p.id, &client.client_name, now)?;
-        self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        if let Some(host) = self.live_hosts.get(&p.id) {
+            host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("live PTY resize failed: {e}"),
+            })?;
+        }
         let principal = client.client_name.as_str();
         let snapshot = self.sessions.clone();
         self.sessions
             .resize(&p.id, principal, p.cols, p.rows, now)
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
-        Ok(json!({ "resized": true, "cols": p.cols, "rows": p.rows }))
+        Ok(json!({
+            "resized": true,
+            "cols": p.cols,
+            "rows": p.rows,
+            "workspace_id": bound_ws,
+            "live_pty": self.live_hosts.contains_key(&p.id),
+        }))
     }
 
     fn require_reader(&self, session_id: &str, principal: &str, now_unix: i64) -> IpcResult<()> {
@@ -2585,17 +2721,17 @@ full_user_access/full_access for arbitrary commands",
         }
     }
 
-    /// When a caller supplies `workspace_id`, it must match the session binding.
-    /// Omitting the field is allowed (session-owned binding remains authoritative).
+    /// Resolve the session's immutable workspace binding and optionally check a
+    /// caller-supplied `workspace_id`. Returns the bound id for action/audit use.
+    ///
+    /// Omitting the field is allowed for local IPC recovery paths; the bound value
+    /// is still returned so callers can include it in subsequent exact-action hashes.
+    /// A mismatched supplied id fails closed.
     fn require_session_workspace(
         &self,
         session_id: &str,
         workspace_id: Option<&str>,
-    ) -> IpcResult<()> {
-        let Some(raw) = workspace_id.map(str::trim).filter(|s| !s.is_empty()) else {
-            return Ok(());
-        };
-        let want = if raw == "default" { "ws_default" } else { raw };
+    ) -> IpcResult<String> {
         let info = self.sessions.get(session_id).map_err(session_err)?;
         let bound = info
             .workspace_id
@@ -2607,14 +2743,99 @@ full_user_access/full_access for arbitrary commands",
             "ws_default"
         } else {
             bound
-        };
-        if bound != want {
-            return Err(IpcError::Remote {
-                code: app_error::POLICY_DENIED,
-                message: format!("session {session_id} is bound to workspace {bound}, not {want}"),
-            });
         }
-        Ok(())
+        .to_owned();
+        if let Some(raw) = workspace_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let want = if raw == "default" { "ws_default" } else { raw };
+            if bound != want {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!(
+                        "session {session_id} is bound to workspace {bound}, not {want}"
+                    ),
+                });
+            }
+        }
+        Ok(bound)
+    }
+
+    /// Move pending live-host bytes into the session replay ring (bounded chunks).
+    fn drain_live_output_into_session(&mut self, session_id: &str) -> IpcResult<usize> {
+        let Some(host) = self.live_hosts.get(session_id) else {
+            return Ok(0);
+        };
+        let (text, ring_truncated, exited, exit_code) = host
+            .drain_output(ownmesh_session::MAX_CHUNK_BYTES)
+            .map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("live PTY drain failed: {e}"),
+            })?;
+        let mut drained = 0usize;
+        if !text.is_empty() {
+            let snapshot = self.sessions.clone();
+            // Split oversized text into MAX_CHUNK_BYTES pieces.
+            let mut offset = 0usize;
+            while offset < text.len() {
+                let end = (offset + ownmesh_session::MAX_CHUNK_BYTES).min(text.len());
+                // Prefer char boundaries for UTF-8 safety.
+                let end = if text.is_char_boundary(end) {
+                    end
+                } else {
+                    text.char_indices()
+                        .map(|(i, _)| i)
+                        .take_while(|i| *i <= end)
+                        .last()
+                        .unwrap_or(offset)
+                        .max(offset + 1)
+                        .min(text.len())
+                };
+                if end <= offset {
+                    break;
+                }
+                let piece = &text[offset..end];
+                self.sessions
+                    .push_output(session_id, piece, SessionStreamKind::Stdout)
+                    .map_err(session_err)?;
+                drained = drained.saturating_add(piece.len());
+                offset = end;
+            }
+            if ring_truncated {
+                let _ = self.sessions.push_output(
+                    session_id,
+                    "[live-pty ring truncated under backpressure]",
+                    SessionStreamKind::System,
+                );
+            }
+            self.commit_sessions(snapshot)?;
+        } else if ring_truncated {
+            let snapshot = self.sessions.clone();
+            let _ = self.sessions.push_output(
+                session_id,
+                "[live-pty ring truncated under backpressure]",
+                SessionStreamKind::System,
+            );
+            self.commit_sessions(snapshot)?;
+        }
+        if exited {
+            // Keep host until terminate/close so late drains still work; mark system note once.
+            let note = match exit_code {
+                Some(code) => format!("[live-pty exited code={code}]"),
+                None => "[live-pty exited]".to_owned(),
+            };
+            let snapshot = self.sessions.clone();
+            let _ = self
+                .sessions
+                .push_output(session_id, note, SessionStreamKind::System);
+            let _ = self.commit_sessions(snapshot);
+        }
+        Ok(drained)
+    }
+
+    fn stop_live_host(&mut self, session_id: &str) {
+        if let Some(mut host) = self.live_hosts.remove(session_id) {
+            let _ = host.terminate();
+            let _ = self.sessions.set_host_pid(session_id, None);
+        }
     }
 
     /// Test helper: set policy in-memory without touching disk preset file optionally.

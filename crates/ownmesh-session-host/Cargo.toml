@@ -10,6 +10,10 @@ authors.workspace = true
 description = "OwnMesh detached session host (PTY supervisor)"
 readme = "README.md"
 
+[lib]
+name = "ownmesh_session_host"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ownmesh-session-host"
 path = "src/main.rs"

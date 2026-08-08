@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "release_train": "1.2.0-beta.7",
+  "release_train": "1.2.0-beta.8",
   "completeness_claim": false,
   "supported": [
     "status",
@@ -63,5 +63,5 @@
     "privileged broker uninstall"
   ],
   "total_unsupported_surfaces": 39,
-  "notes": "v1.2.0-beta.7 integrity visit: directory list materializes a full bounded snapshot then sorts before any cursor (fail-closed past 25k entries) so unordered FS enumeration cannot permanently skip early names; git status exposes truncated and never claims exhausted/clean on a capped porcelain capture; git diff pages a durable line spool for forward-progress cursors; session.open persists workspace_id and attach/write/resize reject mismatches; SERVICE_VERSION aligned to 1.2.0-beta.7 with release-checker enforcement. Restricted presets still fail-closed on command.run until OS confinement; session.attach role=observer demotes controller; OAuth AS metadata omits registration_endpoint unless ALLOW_DYNAMIC_CLIENT_REGISTRATION=true. The Rust EXPLICIT_UNSUPPORTED_CLI_SURFACES and ADDITIONAL_UNSUPPORTED_CLI_SURFACES registries are authoritative. Parser/schema/marker presence is not product implementation. CLI workspace/profile/transfer CRUD and privileged broker install remain explicit unsupported. The scripts/tests/test_v12_e2_e9_workerd_loopback.py gate stays RED (exit 2) until each E4\u2013E9 acceptance row is fully evidenced. E5 live PTY host, E6 profile adapters, E7 unified-diff review, E8 elevated broker mint, E9 resumable transfer, and live-account E10 remain open."
+  "notes": "v1.2.0-beta.8 E5 live-PTY + E4/E7 integrity visit: ownmeshd owns long-lived ConPTY/openpty hosts for session.open (kind=pty); session.write delivers real stdin; session.replay drains bounded live output into the durable ring; session workspace_id is required on MCP attach/write/resize/replay and bound in action hashes; restricted write parents are created component-wise with a held directory handle across temp+rename (Linux renameat); git diff spools live under a per-user private state dir with content-hash integrity and core.fsmonitor forced off. SERVICE_VERSION aligned to 1.2.0-beta.8. CLI workspace/profile/transfer CRUD and privileged broker install remain explicit unsupported. The scripts/tests/test_v12_e2_e9_workerd_loopback.py gate stays RED (exit 2) until each E4\u2013E9 acceptance row is fully evidenced. E5 controller reconnect matrix, E6 profile adapters, E7 unified-diff review, E8 elevated broker mint, E9 resumable transfer, and live-account E10 remain open."
 }

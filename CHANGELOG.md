@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.0-beta.8 — E5 live PTY host + E4 write custody + git spool integrity
+
+- `ownmeshd` owns long-lived ConPTY/openpty hosts on `session.open` (kind=pty); write/resize/replay hit real process I/O with bounded drain into the durable ring
+- `ownmesh-session-host` exposes `LiveHost` as a library; reader join never blocks Drop/terminate on stalled ConPTY reads
+- MCP session attach/write/resize/replay require `workspace_id` for exact-action hash binding
+- Restricted write parents are created component-wise with held directory handle across temp+rename (Linux `renameat`)
+- Git diff spools use per-user private state dir + content-hash integrity; `core.fsmonitor` forced off for read-only captures
+- E2 workerd proof asserts live PTY process output via public MCP replay
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
 ## v1.2.0-beta.7 — E4 workspace selection + custody hardlinks + E2 surface proof
 
 - Directory `list_dir_page` is cursor-resumable: after-cursor collection + sort + page; >4_000-entry regression asserts every name once (no silent drop after former 4k scan window)

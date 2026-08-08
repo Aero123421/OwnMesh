@@ -257,6 +257,39 @@ struct DiffSpool {
     content_sha256: String,
 }
 
+fn diff_spool_dir() -> PathBuf {
+    // Per-user private state directory (not the shared world-writable temp root).
+    let base = std::env::var_os("OWNMESH_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs_state_home().map(|h| h.join("OwnMesh").join("state")))
+        .unwrap_or_else(|| {
+            let mut p = std::env::temp_dir();
+            p.push(format!("ownmesh-{}", whoami_fallback()));
+            p.push("state");
+            p
+        });
+    base.join("git-diff-spool")
+}
+
+fn dirs_state_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+    }
+}
+
+fn whoami_fallback() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| format!("uid-{}", std::process::id()))
+}
+
 fn diff_spool_path(cwd: &Path, args: &[&str], max_bytes: usize) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(cwd.to_string_lossy().as_bytes());
@@ -266,27 +299,59 @@ fn diff_spool_path(cwd: &Path, args: &[&str], max_bytes: usize) -> PathBuf {
         hasher.update([0]);
     }
     hasher.update(max_bytes.to_le_bytes());
+    // Bind to the creating process owner identity so cross-user path prediction
+    // alone cannot point at another principal's spool without also matching the dir.
+    hasher.update(whoami_fallback().as_bytes());
     let digest = hex::encode(hasher.finalize());
-    // Owner-only temp area; short TTL files cleaned best-effort on rebuild.
-    std::env::temp_dir().join(format!("ownmesh-git-diff-{digest}.json"))
+    diff_spool_dir().join(format!("{digest}.json"))
+}
+
+fn ensure_private_spool_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(dir)?;
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir, perms)?;
+    }
+    Ok(())
 }
 
 fn load_or_build_diff_spool(cwd: &Path, args: &[&str], max_bytes: usize) -> FsResult<DiffSpool> {
     let path = diff_spool_path(cwd, args, max_bytes);
-    if let Ok(bytes) = std::fs::read(&path) {
-        // Bound spool read so a corrupt/huge file cannot blow memory.
-        if bytes.len() <= GIT_STDOUT_HARD_CAP.saturating_add(256 * 1024) {
-            if let Ok(spool) = serde_json::from_slice::<DiffSpool>(&bytes) {
-                // Reject absurd line counts from tampered spools.
-                if spool.lines.len() <= 500_000
-                    && spool.lines.iter().map(String::len).sum::<usize>()
-                        <= GIT_STDOUT_HARD_CAP.saturating_mul(2)
-                {
-                    return Ok(spool);
+    if let Some(parent) = path.parent() {
+        let _ = ensure_private_spool_dir(parent);
+    }
+
+    // Only trust an existing spool when it is a regular file we can open exclusively
+    // enough to hash, and the embedded content hash matches the line payload.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            let _ = std::fs::remove_file(&path);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            if bytes.len() <= GIT_STDOUT_HARD_CAP.saturating_add(256 * 1024) {
+                if let Ok(spool) = serde_json::from_slice::<DiffSpool>(&bytes) {
+                    let mut hasher = Sha256::new();
+                    for (i, line) in spool.lines.iter().enumerate() {
+                        if i > 0 {
+                            hasher.update(b"\n");
+                        }
+                        hasher.update(line.as_bytes());
+                    }
+                    let recomputed = hex::encode(hasher.finalize());
+                    if spool.lines.len() <= 500_000
+                        && spool.lines.iter().map(String::len).sum::<usize>()
+                            <= GIT_STDOUT_HARD_CAP.saturating_mul(2)
+                        && spool.content_sha256 == recomputed
+                    {
+                        return Ok(spool);
+                    }
                 }
             }
+            let _ = std::fs::remove_file(&path);
         }
-        let _ = std::fs::remove_file(&path);
     }
 
     let (raw, byte_truncated) = run_git_capped(cwd, args, max_bytes)?;
@@ -301,7 +366,12 @@ fn load_or_build_diff_spool(cwd: &Path, args: &[&str], max_bytes: usize) -> FsRe
     };
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let mut hasher = Sha256::new();
-    hasher.update(text.as_bytes());
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(line.as_bytes());
+    }
     let content_sha256 = hex::encode(hasher.finalize());
     let spool = DiffSpool {
         lines,
@@ -309,10 +379,22 @@ fn load_or_build_diff_spool(cwd: &Path, args: &[&str], max_bytes: usize) -> FsRe
         content_sha256,
     };
     if let Ok(encoded) = serde_json::to_vec(&spool) {
-        // Best-effort atomic-ish write; pagination still works in-process if this fails.
-        let tmp = path.with_extension("json.tmp");
+        // Exclusive random temp then rename into place (no predictable preseed window
+        // on the final name beyond the final rename).
+        let mut rand_tok = Sha256::new();
+        rand_tok.update(spool.content_sha256.as_bytes());
+        rand_tok.update(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos().to_le_bytes())
+                .unwrap_or([0; 16]),
+        );
+        rand_tok.update(std::process::id().to_le_bytes());
+        let tok = hex::encode(rand_tok.finalize());
+        let tmp = path.with_extension(format!("json.{}.tmp", &tok[..16]));
         if std::fs::write(&tmp, &encoded).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
+            let _ = std::fs::remove_file(&tmp);
         }
     }
     Ok(spool)
@@ -377,8 +459,22 @@ fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> FsResult<(Str
     let empty_config = "NUL";
     #[cfg(not(windows))]
     let empty_config = "/dev/null";
+    // Force-disable repo-local fsmonitor/hooks helpers even when the target
+    // repository enables them — read-only status/diff must not exec unapproved
+    // helpers from .git/config.
+    let mut git_argv: Vec<&str> = vec![
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.fsmonitorHookVersion=",
+        "-c",
+        "fsmonitor.allowRemote=false",
+        "-c",
+        "core.useBuiltinFSMonitor=false",
+    ];
+    git_argv.extend_from_slice(args);
     let mut child = Command::new("git")
-        .args(args)
+        .args(&git_argv)
         .current_dir(cwd)
         // Reduce untrusted-repo execution surface for read-only captures.
         .env("GIT_OPTIONAL_LOCKS", "0")

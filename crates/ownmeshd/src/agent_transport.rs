@@ -1408,9 +1408,8 @@ fn map_request_to_method(
                 .or_insert_with(|| Value::String("structured".into()));
             methods::OPS_EXEC
         }
-        // Cloud session surface (E5): map to local session IPC methods. Live PTY
-        // host ownership remains partial — open still creates metadata/lease;
-        // write/resize/replay hit the session manager path when a host is attached.
+        // Cloud session surface (E5): map to local session IPC methods. ownmeshd
+        // owns a live PTY host for kind=pty; write/resize/replay drain real I/O.
         ("session.open" | "session", "session.open" | "ownmesh_session_open" | "open") => {
             // MCP uses program/args; session manager expects command argv.
             if !args.contains_key("command") {

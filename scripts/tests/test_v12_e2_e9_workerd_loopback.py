@@ -84,16 +84,18 @@ def main() -> int:
         "E3": "exact-action hash + durable idempotency/cancel claim (partial)",
         "E4": (
             "device workspaces.json + workspace_id selection + handle/hardlink "
-            "custody; session.open persists workspace_id; directory full "
+            "custody; component-wise parent create with held-handle rename; "
+            "session.open persists workspace_id; directory full "
             "snapshot-then-sort cursors; restricted command.run fail-closed; "
             "CLI CRUD still unsupported"
         ),
         "E5": (
-            "remote session.open(workspace-bound)/attach(observer demote)/write-deny "
-            "via public MCP; bounded replay/chunk budgets; live PTY host still partial"
+            "remote session.open owns live PTY/ConPTY in ownmeshd; public MCP replay "
+            "surfaces real process output; attach(observer demote)/write-deny + workspace bind; "
+            "controller lease reconnect matrix still partial"
         ),
         "E7": (
-            "MCP git status/diff + durable diff spool + visible status truncation; "
+            "MCP git status/diff + private integrity-bound diff spool + fsmonitor off; "
             "unified-diff apply + full review flow still open"
         ),
     }
@@ -106,7 +108,7 @@ def main() -> int:
     # E4/E5/E7 remain incomplete acceptance even with partial proof.
     incomplete_acceptance = (
         ("E4", "workspace CLI CRUD + full custody matrix promotion"),
-        ("E5", "live PTY host + controller lease reconnect/replay proof"),
+        ("E5", "controller lease reconnect/handoff + multi-observer replay matrix"),
         ("E7", "bounded unified-diff patch apply + Git review (no auto-merge)"),
         *still_open,
     )

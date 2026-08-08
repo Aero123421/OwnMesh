@@ -1,16 +1,22 @@
-//! Portable PTY/ConPTY spawn + read helpers.
+//! Portable PTY/ConPTY spawn + long-lived host helpers.
 //!
 //! Uses `portable-pty` which selects ConPTY on Windows and openpty on POSIX.
 //! Docs: https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session
 
 use ownmesh_session::{PtyBackend, PtyCommand, PtySize, SessionHostHandle};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize as PortableSize};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize as PortableSize};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Live PTY session (or pipe fallback).
+/// Aggregate byte budget for one live host's unread output ring.
+pub const LIVE_OUTPUT_RING_BYTES: usize = 1024 * 1024;
+
+/// Live PTY session used by the standalone CLI (or pipe fallback).
 pub struct PtySession {
     pub handle: SessionHostHandle,
     kind: SessionKindInner,
@@ -21,7 +27,7 @@ enum SessionKindInner {
         reader: Mutex<Option<Box<dyn Read + Send>>>,
         writer: Mutex<Option<Box<dyn Write + Send>>>,
         child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
-        _master: Box<dyn portable_pty::MasterPty + Send>,
+        _master: Box<dyn MasterPty + Send>,
     },
     Pipe {
         output: Mutex<Option<String>>,
@@ -64,6 +70,204 @@ impl Drop for PtySession {
     }
 }
 
+/// Long-lived PTY owned by `ownmeshd` for a cloud session.
+///
+/// A background reader fills a bounded byte ring. Callers drain the ring into
+/// the session replay spool on attach/replay/write so slow consumers never force
+/// unbounded allocation inside the reader thread.
+pub struct LiveHost {
+    pub handle: SessionHostHandle,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
+    child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    output: Arc<Mutex<ByteRing>>,
+    stop: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
+}
+
+struct ByteRing {
+    buf: VecDeque<u8>,
+    bytes: usize,
+    /// Visible fact: reader dropped oldest bytes under backpressure.
+    truncated: bool,
+    /// Child exited (EOF observed or try_wait succeeded).
+    exited: bool,
+    exit_code: Option<u32>,
+}
+
+impl ByteRing {
+    fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+            bytes: 0,
+            truncated: false,
+            exited: false,
+            exit_code: None,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.buf.extend(chunk.iter().copied());
+        self.bytes = self.bytes.saturating_add(chunk.len());
+        while self.bytes > LIVE_OUTPUT_RING_BYTES {
+            if self.buf.pop_front().is_some() {
+                self.bytes = self.bytes.saturating_sub(1);
+                self.truncated = true;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn drain(&mut self, max_bytes: usize) -> (Vec<u8>, bool) {
+        let take = max_bytes.min(self.bytes);
+        let mut out = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(b) = self.buf.pop_front() {
+                out.push(b);
+                self.bytes = self.bytes.saturating_sub(1);
+            } else {
+                break;
+            }
+        }
+        let truncated = self.truncated;
+        // truncation flag is sticky until a full successful drain observes empty.
+        if self.bytes == 0 {
+            self.truncated = false;
+        }
+        (out, truncated)
+    }
+}
+
+impl LiveHost {
+    /// Spawn a long-lived PTY and start the output reader.
+    ///
+    /// Fails closed when a real PTY/ConPTY cannot be opened — cloud sessions
+    /// must not silently degrade to metadata-only stubs.
+    pub fn spawn(cmd: &PtyCommand, size: PtySize) -> Result<Self, String> {
+        spawn_live_portable(cmd, size)
+    }
+
+    /// Write raw bytes to the child stdin (no forced newline).
+    pub fn write_stdin(&self, data: &[u8]) -> Result<(), String> {
+        let mut guard = self.writer.lock().map_err(|e| e.to_string())?;
+        let writer = guard
+            .as_mut()
+            .ok_or_else(|| "PTY stdin writer is unavailable".to_owned())?;
+        writer.write_all(data).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Resize the live PTY geometry.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        let master = self.master.lock().map_err(|e| e.to_string())?;
+        master
+            .resize(PortableSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("resize: {e}"))
+    }
+
+    /// Drain up to `max_bytes` of pending UTF-8 lossy output.
+    ///
+    /// Returns `(text, ring_truncated, child_exited, exit_code)`.
+    pub fn drain_output(
+        &self,
+        max_bytes: usize,
+    ) -> Result<(String, bool, bool, Option<u32>), String> {
+        // Opportunistically observe child exit without blocking.
+        if let Ok(mut child) = self.child.lock() {
+            if let Ok(Some(status)) = child.try_wait() {
+                if let Ok(mut ring) = self.output.lock() {
+                    ring.exited = true;
+                    // portable-pty ExitStatus exposes success(); keep code optional.
+                    ring.exit_code = if status.success() { Some(0) } else { Some(1) };
+                }
+            }
+        }
+        let mut ring = self.output.lock().map_err(|e| e.to_string())?;
+        let (bytes, truncated) = ring.drain(max_bytes.max(1));
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        Ok((text, truncated, ring.exited, ring.exit_code))
+    }
+
+    /// True when the child has exited (best-effort).
+    pub fn is_exited(&self) -> bool {
+        if let Ok(ring) = self.output.lock() {
+            if ring.exited {
+                return true;
+            }
+        }
+        if let Ok(mut child) = self.child.lock() {
+            matches!(child.try_wait(), Ok(Some(_)))
+        } else {
+            false
+        }
+    }
+
+    /// Kill and reap the child; stop the reader thread.
+    pub fn terminate(&mut self) -> Result<(), String> {
+        self.stop.store(true, Ordering::SeqCst);
+        // Drop writer so the child sees EOF on stdin before kill.
+        if let Ok(mut w) = self.writer.lock() {
+            *w = None;
+        }
+        let kill_result = {
+            let mut child = self
+                .child
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            terminate_child(child.as_mut())
+        };
+        // Never join the reader on the request/Drop path: ConPTY read() can stay
+        // blocked after kill on some Windows hosts and would hang the daemon.
+        // Detach the join into a daemon thread; the stop flag + dropped pipes are
+        // enough for eventual exit.
+        if let Some(handle) = self.reader.take() {
+            let _ = std::thread::Builder::new()
+                .name("ownmesh-pty-reader-join".into())
+                .spawn(move || {
+                    let _ = handle.join();
+                });
+        }
+        kill_result
+    }
+}
+
+impl Drop for LiveHost {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+/// Default interactive shell for the current platform.
+#[must_use]
+pub fn default_shell_command() -> PtyCommand {
+    if cfg!(windows) {
+        PtyCommand {
+            program: "cmd.exe".into(),
+            args: vec!["/Q".into(), "/K".into(), "prompt $G".into()],
+            cwd: None,
+            env: vec![("TERM".into(), "dumb".into())],
+        }
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        PtyCommand {
+            program: shell,
+            args: vec![],
+            cwd: None,
+            env: vec![("TERM".into(), "xterm-256color".into())],
+        }
+    }
+}
+
 fn write_stdin_line(writer: &mut dyn Write, line: &str) -> std::io::Result<()> {
     writer.write_all(line.as_bytes())?;
     writer.write_all(b"\n")?;
@@ -76,8 +280,6 @@ fn terminate_child(child: &mut (dyn portable_pty::Child + Send + Sync)) -> Resul
     }
 
     if let Err(kill_err) = child.kill() {
-        // A kill may race with natural exit. Recheck before reporting failure, but
-        // never block forever in wait when the kill itself did not succeed.
         return match child.try_wait() {
             Ok(Some(_)) => Ok(()),
             Ok(None) => Err(format!("kill child: {kill_err}; child is still running")),
@@ -87,13 +289,19 @@ fn terminate_child(child: &mut (dyn portable_pty::Child + Send + Sync)) -> Resul
         };
     }
 
-    child
-        .wait()
-        .map(|_| ())
-        .map_err(|err| format!("wait for child: {err}"))
+    // Never block indefinitely in Drop/terminate paths (ConPTY can stall wait()).
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(err) => return Err(format!("wait for child: {err}")),
+        }
+    }
+    // Best-effort: child was signaled; accept unreaped state rather than hang the daemon.
+    Ok(())
 }
 
-/// Spawn a PTY-backed process (pipe fallback on failure).
+/// Spawn a PTY-backed process (pipe fallback on failure) for CLI one-shot use.
 pub fn spawn_pty(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String> {
     match spawn_portable(cmd, size) {
         Ok(s) => Ok(s),
@@ -123,8 +331,6 @@ fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String>
         builder.env(k, v);
     }
 
-    // Set up all fallible host-side I/O before spawn so no post-spawn setup error can
-    // lose ownership of a running child.
     let reader = pair
         .master
         .try_clone_reader()
@@ -138,11 +344,9 @@ fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String>
         .slave
         .spawn_command(builder)
         .map_err(|e| format!("spawn: {e}"))?;
-    // Drop slave so child I/O is only via master.
     drop(pair.slave);
 
     let pid = child.process_id();
-
     let backend = PtyBackend::preferred();
     let handle = SessionHostHandle {
         session_id: format!("pty_{}", pid.unwrap_or(0)),
@@ -160,6 +364,101 @@ fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String>
             child: Mutex::new(child),
             _master: pair.master,
         },
+    })
+}
+
+fn spawn_live_portable(cmd: &PtyCommand, size: PtySize) -> Result<LiveHost, String> {
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PortableSize {
+            rows: size.rows,
+            cols: size.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty: {e}"))?;
+
+    let mut builder = CommandBuilder::new(&cmd.program);
+    for a in &cmd.args {
+        builder.arg(a);
+    }
+    if let Some(cwd) = &cmd.cwd {
+        builder.cwd(cwd);
+    }
+    for (k, v) in &cmd.env {
+        builder.env(k, v);
+    }
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("reader: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("writer: {e}"))?;
+
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|e| format!("spawn: {e}"))?;
+    drop(pair.slave);
+
+    let pid = child.process_id();
+    let backend = PtyBackend::preferred();
+    let handle = SessionHostHandle {
+        session_id: format!("pty_{}", pid.unwrap_or(0)),
+        backend,
+        pid,
+        cols: size.cols,
+        rows: size.rows,
+    };
+
+    let output = Arc::new(Mutex::new(ByteRing::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let output_reader = Arc::clone(&output);
+    let stop_reader = Arc::clone(&stop);
+
+    let reader_handle = std::thread::Builder::new()
+        .name("ownmesh-pty-reader".into())
+        .spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop_reader.load(Ordering::Relaxed) {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        if let Ok(mut ring) = output_reader.lock() {
+                            ring.exited = true;
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Ok(mut ring) = output_reader.lock() {
+                            ring.push(&buf[..n]);
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                    Err(_) => {
+                        if let Ok(mut ring) = output_reader.lock() {
+                            ring.exited = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+        .map_err(|e| format!("spawn reader thread: {e}"))?;
+
+    Ok(LiveHost {
+        handle,
+        writer: Mutex::new(Some(writer)),
+        master: Mutex::new(pair.master),
+        child: Mutex::new(child),
+        output,
+        stop,
+        reader: Some(reader_handle),
     })
 }
 
@@ -215,7 +514,6 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
             }
             SessionKindInner::Pty { reader, child, .. } => {
                 let max = if max_ms == 0 { 5_000 } else { max_ms };
-                // Take reader into a background thread so blocking reads cannot hang the caller.
                 let mut reader_opt = reader.lock().map_err(|e| e.to_string())?;
                 let Some(mut rdr) = reader_opt.take() else {
                     return Ok(String::new());
@@ -232,7 +530,6 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                                 if acc.len() > 2 * 1024 * 1024 {
                                     break;
                                 }
-                                // Opportunistic send of progress
                                 let _ = tx.send(acc.clone());
                             }
                             Err(_) => break,
@@ -251,10 +548,8 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                     match rx.recv_timeout(Duration::from_millis(50).min(remaining)) {
                         Ok(chunk) => last = chunk,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Check child exit
                             if let Ok(mut ch) = child.lock() {
                                 if let Ok(Some(_)) = ch.try_wait() {
-                                    // brief drain
                                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
                                         last = chunk;
                                     }
@@ -265,7 +560,6 @@ pub fn read_until(session: &PtySession, max_ms: u64) -> Result<String, String> {
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                     if !last.is_empty() {
-                        // If child already exited and we have data, stop early.
                         if let Ok(mut ch) = child.lock() {
                             if let Ok(Some(_)) = ch.try_wait() {
                                 break;
@@ -333,6 +627,39 @@ mod tests {
         let err = write_stdin_line(&mut FailingWriter { fail_flush: true }, "input")
             .expect_err("flush failure must surface");
         assert!(err.to_string().contains("flush failed"));
+    }
+
+    #[test]
+    fn live_host_echo_roundtrip() {
+        #[cfg(windows)]
+        let cmd = PtyCommand {
+            program: "cmd.exe".into(),
+            args: vec!["/Q".into(), "/C".into(), "echo LIVE_HOST_MARKER_OK".into()],
+            cwd: None,
+            env: vec![],
+        };
+        #[cfg(not(windows))]
+        let cmd = PtyCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'LIVE_HOST_MARKER_OK\\n'".into()],
+            cwd: None,
+            env: vec![],
+        };
+        let mut host = LiveHost::spawn(&cmd, PtySize::default()).expect("spawn live host");
+        let mut acc = String::new();
+        for _ in 0..80 {
+            let (chunk, _trunc, exited, _) = host.drain_output(64 * 1024).expect("drain");
+            acc.push_str(&chunk);
+            if acc.contains("LIVE_HOST_MARKER_OK") || exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = host.terminate();
+        assert!(
+            acc.contains("LIVE_HOST_MARKER_OK"),
+            "live host must capture real process output, got: {acc:?}"
+        );
     }
 
     #[cfg(unix)]

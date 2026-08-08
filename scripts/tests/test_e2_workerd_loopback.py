@@ -1014,8 +1014,15 @@ def main() -> int:
                 if "ws_does_not_exist" not in json.dumps(bad_ws_done):
                     raise RuntimeError(f"unknown workspace_id must fail closed: {bad_ws_done}")
 
-            # E5 session open via public MCP (metadata + controller lease; live PTY host partial).
+            # E5 session open via public MCP with a real live PTY host in ownmeshd.
             # E4: workspace_id is bound onto the session record at open.
+            import sys as _sys
+            if _sys.platform.startswith("win"):
+                ses_program = "cmd.exe"
+                ses_args = ["/Q", "/C", f"echo E5_LIVE_PTY_{marker}"]
+            else:
+                ses_program = "/bin/sh"
+                ses_args = ["-c", f"printf 'E5_LIVE_PTY_{marker}\\n'"]
             ses_sc = structured(
                 mcp_call(
                     issuer,
@@ -1025,6 +1032,8 @@ def main() -> int:
                         "device_id": device_id,
                         "title": f"e2-ses-{marker}",
                         "workspace_id": "ws_default",
+                        "program": ses_program,
+                        "args": ses_args,
                         "async": True,
                         "idempotency_key": f"idem_ses_{marker}",
                     },
@@ -1040,6 +1049,10 @@ def main() -> int:
                 raise RuntimeError(
                     f"session open must persist workspace_id binding: {ses_done}"
                 )
+            if "live_pty" not in ses_dump.lower() and "\"live_pty\":true" not in ses_dump.lower().replace(" ", ""):
+                # Accept host_pid presence as evidence of a live host when live_pty flag is nested.
+                if "host_pid" not in ses_dump and "pty_" not in ses_dump:
+                    raise RuntimeError(f"session open must report live PTY host: {ses_done}")
             # Extract session id from completed result payload.
             ses_id = None
             for node in (ses_done, ses_done.get("data") if isinstance(ses_done.get("data"), dict) else {}):
@@ -1064,6 +1077,64 @@ def main() -> int:
                     raise RuntimeError(f"could not parse session id from {ses_done}")
                 ses_id = m.group(0)
 
+            # E5: replay must surface real process output from the live PTY host.
+            import time as _time
+            live_marker = f"E5_LIVE_PTY_{marker}"
+            saw_live = live_marker in ses_dump
+            if not saw_live:
+                for attempt in range(12):
+                    rep_sc = structured(
+                        mcp_call(
+                            issuer,
+                            access_token,
+                            "ownmesh_session_replay",
+                            {
+                                "device_id": device_id,
+                                "session_id": ses_id,
+                                "workspace_id": "ws_default",
+                                "from_seq": 1,
+                                "async": True,
+                                "idempotency_key": f"idem_ses_rep_{marker}_{attempt}",
+                            },
+                            rpc_id=40 + attempt,
+                        )
+                    )
+                    rep_op = str(rep_sc.get("operation_id") or "")
+                    rep_done = wait_operation(issuer, access_token, rep_op, want={"completed"})
+                    if live_marker in json.dumps(rep_done):
+                        saw_live = True
+                        break
+                    _time.sleep(0.25)
+            if not saw_live:
+                raise RuntimeError(
+                    f"live PTY session must produce real process output containing {live_marker}"
+                )
+
+            # Second session for observer lease checks (interactive shell).
+            lease_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_open",
+                    {
+                        "device_id": device_id,
+                        "title": f"e2-ses-lease-{marker}",
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_lease_{marker}",
+                    },
+                    rpc_id=55,
+                )
+            )
+            lease_op = str(lease_sc.get("operation_id") or "")
+            lease_done = wait_operation(issuer, access_token, lease_op, want={"completed"})
+            lease_dump = json.dumps(lease_done)
+            import re as _re2
+            m2 = _re2.search(r"ses_[0-9a-fA-F]+", lease_dump)
+            if not m2:
+                raise RuntimeError(f"could not parse lease session id from {lease_done}")
+            lease_ses_id = m2.group(0)
+
             # E5: observer attach must not retain controller rights (exact-action).
             obs_sc = structured(
                 mcp_call(
@@ -1072,8 +1143,9 @@ def main() -> int:
                     "ownmesh_session_attach",
                     {
                         "device_id": device_id,
-                        "session_id": ses_id,
+                        "session_id": lease_ses_id,
                         "role": "observer",
+                        "workspace_id": "ws_default",
                         "async": True,
                         "idempotency_key": f"idem_ses_obs_{marker}",
                     },
@@ -1094,7 +1166,8 @@ def main() -> int:
                     "ownmesh_session_write",
                     {
                         "device_id": device_id,
-                        "session_id": ses_id,
+                        "session_id": lease_ses_id,
+                        "workspace_id": "ws_default",
                         "data": "should-deny",
                         "async": True,
                         "idempotency_key": f"idem_ses_write_obs_{marker}",
@@ -1108,6 +1181,32 @@ def main() -> int:
             )
             if str(bad_write_done.get("status")) not in {"failed", "denied"}:
                 raise RuntimeError(f"observer session.write must fail closed: {bad_write_done}")
+
+            # Mismatched workspace_id on session write must fail closed.
+            bad_ws_write = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_write",
+                    {
+                        "device_id": device_id,
+                        "session_id": lease_ses_id,
+                        "workspace_id": "ws_does_not_match",
+                        "data": "x",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_ws_mismatch_{marker}",
+                    },
+                    rpc_id=56,
+                )
+            )
+            bad_ws_write_op = str(bad_ws_write.get("operation_id") or "")
+            bad_ws_write_done = wait_operation(
+                issuer, access_token, bad_ws_write_op, want={"failed", "denied"}, timeout_s=20
+            )
+            if str(bad_ws_write_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(
+                    f"session.write workspace mismatch must fail closed: {bad_ws_write_done}"
+                )
 
             # Missing idempotency_key on mutating tool must fail closed before route.
             missing_key_status, missing_key_body = http_json(
@@ -1140,7 +1239,7 @@ def main() -> int:
             print(
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
                 f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
-                f"patch+shell+workspace-select+session-open+observer-deny-write+required-key held "
+                f"patch+shell+workspace-select+live-pty+session-open+observer-deny-write+required-key held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )

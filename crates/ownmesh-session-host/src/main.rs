@@ -17,8 +17,6 @@
     clippy::needless_pass_by_value
 )]
 
-mod pty_host;
-
 use clap::{Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ownmesh_config::{load_config, OwnMeshPaths};
@@ -27,6 +25,7 @@ use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use ownmesh_session::{
     load_manager, save_manager, PtyCommand, PtySize, SessionError, SessionManager, SessionResult,
 };
+use ownmesh_session_host::{read_until, spawn_pty, PtySession};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode as StdExitCode;
@@ -241,7 +240,7 @@ fn run_serve(
         }
     };
 
-    let handle = match pty_host::spawn_pty(&cmd, size) {
+    let handle = match spawn_pty(&cmd, size) {
         Ok(h) => h,
         Err(err) => {
             eprintln!("pty spawn failed: {err}");
@@ -278,7 +277,7 @@ fn run_serve(
     }
 
     // read_until always terminates and waits for the child, including on read errors.
-    let output = pty_host::read_until(&handle, max_ms).map_err(|err| {
+    let output = read_until(&handle, max_ms).map_err(|err| {
         eprintln!("pty read: {err}");
         ExitCode::Internal
     })?;
@@ -344,7 +343,7 @@ fn register_spawned_session(
     })
 }
 
-fn report_cleanup_error(handle: &pty_host::PtySession) {
+fn report_cleanup_error(handle: &PtySession) {
     if let Err(err) = handle.terminate_and_wait() {
         eprintln!("pty cleanup: {err}");
     }
@@ -476,12 +475,12 @@ mod tests {
                 env: vec![],
             }
         };
-        let handle = pty_host::spawn_pty(&cmd, PtySize::default()).expect("spawn");
+        let handle = spawn_pty(&cmd, PtySize::default()).expect("spawn");
         assert!(matches!(
             handle.handle.backend,
             PtyBackend::ConPty | PtyBackend::PosixPty | PtyBackend::PipeFallback
         ));
-        let out = pty_host::read_until(&handle, 3_000).expect("read");
+        let out = read_until(&handle, 3_000).expect("read");
         // ConPTY may wrap output; accept backend success even if echo text is delayed.
         let ok = out.to_ascii_lowercase().contains("pty-host-ok")
             || handle.handle.backend == PtyBackend::PipeFallback

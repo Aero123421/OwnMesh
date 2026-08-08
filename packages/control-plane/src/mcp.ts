@@ -569,12 +569,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         session_id: str,
         role: { type: "string", enum: ["observer", "controller"] },
+        workspace_id: str,
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once attach retries",
         },
       },
-      required: ["device_id", "session_id", "role", "idempotency_key"],
+      required: ["device_id", "session_id", "role", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -594,12 +595,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         session_id: str,
         data: str,
+        workspace_id: str,
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once input",
         },
       },
-      required: ["device_id", "session_id", "data", "idempotency_key"],
+      required: ["device_id", "session_id", "data", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -620,12 +622,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         session_id: str,
         cols: { type: "integer", minimum: 1, maximum: 512 },
         rows: { type: "integer", minimum: 1, maximum: 512 },
+        workspace_id: str,
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once resize",
         },
       },
-      required: ["device_id", "session_id", "cols", "rows", "idempotency_key"],
+      required: ["device_id", "session_id", "cols", "rows", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -646,12 +649,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         session_id: str,
         from_seq: { type: "integer", minimum: 0 },
         limit: { type: "integer", minimum: 1, maximum: 1000 },
+        workspace_id: str,
         idempotency_key: {
           type: "string",
           description: "Caller idempotency key",
         },
       },
-      required: ["device_id", "session_id", "idempotency_key"],
+      required: ["device_id", "session_id", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: true,

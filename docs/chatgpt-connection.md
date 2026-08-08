@@ -79,7 +79,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
    | `ownmesh.read` / `ownmesh.device` | `ownmesh_list_devices`, `ownmesh_fs_list` / `ownmesh_list_files`, `ownmesh_fs_read` / `ownmesh_read_file`, `ownmesh_get_operation`, `ownmesh_list_profiles` |
    | `ownmesh.write` | `ownmesh_fs_write` / `ownmesh_write_file` |
    | `ownmesh.exec` | `ownmesh_command_run` / `ownmesh_run_command`, `ownmesh_command_shell` / `ownmesh_run_shell`, `ownmesh_cancel_operation` |
-   | `ownmesh.session` | Catalog lists `ownmesh_session_open` / `ownmesh_session_attach` — **E5 cloud PTY path is not production-complete yet** (remote Agent returns unsupported until wired end-to-end) |
+   | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` (E5 partial: reconnect/handoff matrix still open); always pass `workspace_id` |
    | `offline_access` | refresh tokens for long-lived ChatGPT connector |
 
 6. Complete OAuth in the browser when ChatGPT prompts.
@@ -95,7 +95,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
 | Write | “Write `hello.txt` with content `hi` on that device” |
 | Structured command | “Run `git status` via OwnMesh structured command (not shell)” |
 | Long op | “Start a long command with async and poll operation status” |
-| Session (E5 open) | Cloud PTY session open/attach is not yet a supported production path |
+| Session (E5 partial) | “Open a session on device `dev_…` in workspace `ws_default` and replay output” (live PTY; controller reconnect matrix still open) |
 
 ---
 
