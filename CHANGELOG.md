@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.0-beta.7 — E4 workspace selection + custody hardlinks + E2 surface proof
+
+- Directory `list_dir_page` is cursor-resumable: after-cursor collection + sort + page; >4_000-entry regression asserts every name once (no silent drop after former 4k scan window)
+- Restricted custody rejects multi-link hardlinks and cross-volume mounts after handle final-path revalidation (Unix nlink/dev + Windows links/volume serial)
+- Device-local `workspaces.json` registry (`ws_default` + additional `ws_...` roots); MCP `workspace_id` selects the root at ownmeshd side-effect boundary
+- E2 workerd proof extended: `ownmesh_fs_patch`, `ownmesh_command_shell`, workspace cross-denial, `ownmesh_session_open`
+- Agent remote maps session.* and git.status/diff; MCP adds session write/resize/replay/close + git status/diff tools
+- Git status/diff stream stdout/stderr with hard byte caps (no unbounded `Command::output`)
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
 ## v1.2.0-beta.6 — E2/E3 durable bounds + fail-closed E2–E9 gate
 
 - Pending dispatch outbox is never wiped by client-data truncation; separate 900 KiB outbox ceiling; oversized claims fail closed before side effects

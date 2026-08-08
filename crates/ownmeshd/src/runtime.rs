@@ -168,6 +168,9 @@ pub struct FsListParams {
     /// Stable name-ordered exclusive lower-bound cursor from a prior page.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Registered device workspace id (default when omitted).
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -177,6 +180,8 @@ pub struct FsStatParams {
     pub path: String,
     #[serde(default)]
     pub hash: bool,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -190,6 +195,8 @@ pub struct FsReadParams {
     #[serde(default)]
     pub offset: Option<u64>,
     #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -202,6 +209,8 @@ pub struct FsWriteParams {
     #[serde(default)]
     pub expected_sha256: Option<String>,
     #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -210,6 +219,8 @@ pub struct FsDeleteParams {
     pub path: String,
     #[serde(default)]
     pub recursive: bool,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
 }
@@ -249,6 +260,8 @@ pub struct GitStatusParams {
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -267,6 +280,8 @@ pub struct GitDiffParams {
     #[serde(default)]
     pub max_bytes: Option<usize>,
     #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -281,6 +296,22 @@ struct AuditEntry {
     detail: String,
 }
 
+/// One registered device-local workspace root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceEntry {
+    pub id: String,
+    /// Absolute filesystem root for this workspace.
+    pub root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceRegistryFile {
+    schema_version: u32,
+    workspaces: Vec<WorkspaceEntry>,
+}
+
 /// Shared daemon operation state.
 pub struct DaemonRuntime {
     paths: OwnMeshPaths,
@@ -293,7 +324,14 @@ pub struct DaemonRuntime {
     lockdown: bool,
     revoked_clients: RevokedClients,
     audit: Vec<AuditEntry>,
+    /// Default workspace root (also present as id=`ws_default` in the registry).
+    #[allow(dead_code)]
     workspace_root: PathBuf,
+    /// Device-owned workspace registry (id → root). Selection is authoritative
+    /// for restricted modes; Full Access still uses the selected root as cwd/context.
+    workspaces: Vec<WorkspaceEntry>,
+    #[allow(dead_code)]
+    workspaces_path: PathBuf,
     enforce_workspace: bool,
     log_path: PathBuf,
     sessions: SessionManager,
@@ -327,6 +365,8 @@ impl DaemonRuntime {
         );
         let workspace_root = paths.state_dir.join("workspace");
         std::fs::create_dir_all(&workspace_root).map_err(|e| e.to_string())?;
+        let workspaces_path = paths.state_dir.join("workspaces.json");
+        let workspaces = load_or_init_workspaces(&workspaces_path, &workspace_root)?;
         let log_path = paths.state_dir.join("logs").join("audit.log");
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -370,6 +410,8 @@ impl DaemonRuntime {
             revoked_clients,
             audit: Vec::new(),
             workspace_root,
+            workspaces,
+            workspaces_path,
             enforce_workspace,
             log_path,
             sessions,
@@ -603,13 +645,125 @@ impl DaemonRuntime {
         self.audit.push(entry);
     }
 
-    fn workspace(&self) -> IpcResult<WorkspaceRoot> {
-        WorkspaceRoot::new(&self.workspace_root, self.enforce_workspace).map_err(|e| {
-            IpcError::Remote {
+    /// Resolve a registered workspace root by id (default → `ws_default`).
+    ///
+    /// Restricted modes pin and authorize against the selected root only.
+    /// Unknown ids fail closed (never fall back to another tenant/device root).
+    /// Ids follow the domain `ws_...` shape so they round-trip through the
+    /// operation envelope `WorkspaceId` type.
+    fn workspace_for(&self, workspace_id: Option<&str>) -> IpcResult<WorkspaceRoot> {
+        let raw = workspace_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ws_default");
+        // Accept legacy bare "default" as an alias for the built-in root.
+        let id = if raw == "default" { "ws_default" } else { raw };
+        if id.len() > 128
+            || !id.starts_with("ws_")
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("invalid workspace_id: {id} (expected ws_... )"),
+            });
+        }
+        let entry = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == id || (id == "ws_default" && w.id == "default"))
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("unknown workspace_id: {id}"),
+            })?;
+        if !entry.root.exists() {
+            std::fs::create_dir_all(&entry.root).map_err(|e| IpcError::Remote {
                 code: app_error::INTERNAL,
-                message: e.to_string(),
-            }
+                message: format!("workspace root missing and create failed: {e}"),
+            })?;
+        }
+        WorkspaceRoot::new(&entry.root, self.enforce_workspace).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
         })
+    }
+
+    /// Register or update a workspace root (device-local). Roots must be absolute
+    /// existing directories. Does not cross-tenant; ownership is the device itself.
+    #[allow(dead_code)]
+    pub fn upsert_workspace(&mut self, entry: WorkspaceEntry) -> IpcResult<WorkspaceEntry> {
+        let id = entry.id.trim();
+        if id.is_empty()
+            || id.len() > 128
+            || !id.starts_with("ws_")
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "invalid workspace id (expected ws_...)".into(),
+            });
+        }
+        let root = if entry.root.is_absolute() {
+            entry.root.clone()
+        } else {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "workspace root must be absolute".into(),
+            });
+        };
+        std::fs::create_dir_all(&root).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })?;
+        let stored = WorkspaceEntry {
+            id: id.to_owned(),
+            root,
+            label: entry.label.clone(),
+        };
+        if let Some(slot) = self.workspaces.iter_mut().find(|w| w.id == stored.id) {
+            *slot = stored.clone();
+        } else {
+            if self.workspaces.len() >= 64 {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "workspace registry full (max 64)".into(),
+                });
+            }
+            self.workspaces.push(stored.clone());
+        }
+        self.persist_workspaces()?;
+        Ok(stored)
+    }
+
+    #[allow(dead_code)]
+    fn persist_workspaces(&self) -> IpcResult<()> {
+        let file = WorkspaceRegistryFile {
+            schema_version: 1,
+            workspaces: self.workspaces.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })?;
+        if bytes.len() > 256 * 1024 {
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "workspaces.json exceeds 256 KiB budget".into(),
+            });
+        }
+        let tmp = self.workspaces_path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })?;
+        std::fs::rename(&tmp, &self.workspaces_path).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })?;
+        Ok(())
     }
 
     fn check_lockdown(&self, method: &str) -> IpcResult<()> {
@@ -967,7 +1121,7 @@ impl DaemonRuntime {
     }
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
-        let ws = self.workspace()?;
+        let ws = self.workspace_for(p.workspace_id.as_deref())?;
         let max_entries = p.max_entries.unwrap_or(200).clamp(1, 500);
         let page = list_dir_page(&ws, &p.path, p.recursive, max_entries, p.cursor.as_deref())
             .map_err(fs_err)?;
@@ -976,11 +1130,12 @@ impl DaemonRuntime {
             "next_cursor": page.next_cursor,
             "truncated": page.truncated,
             "total_matched": page.total_matched,
+            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
         }))
     }
 
     fn execute_fs_stat(&self, p: &FsStatParams) -> IpcResult<Value> {
-        let ws = self.workspace()?;
+        let ws = self.workspace_for(p.workspace_id.as_deref())?;
         let st = stat_path(&ws, &p.path, p.hash).map_err(fs_err)?;
         serde_json::to_value(st).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
@@ -994,7 +1149,7 @@ impl DaemonRuntime {
         // - Durable MCP data_json 256 KiB
         // Larger files are retrieved by paging offset/max_bytes (next_offset).
         const MAX_READ_BYTES: u64 = 160 * 1024;
-        let ws = self.workspace()?;
+        let ws = self.workspace_for(p.workspace_id.as_deref())?;
         let offset = p.offset.unwrap_or(0);
         let want = p.max_bytes.unwrap_or(64 * 1024).min(MAX_READ_BYTES);
         let (data, total, truncated) =
@@ -1028,7 +1183,7 @@ impl DaemonRuntime {
     }
 
     fn execute_fs_write(&self, p: &FsWriteParams) -> IpcResult<Value> {
-        let ws = self.workspace()?;
+        let ws = self.workspace_for(p.workspace_id.as_deref())?;
         if let Some(expected) = p.expected_sha256.as_deref() {
             let new_hash =
                 apply_patch(&ws, &p.path, p.content.as_bytes(), Some(expected)).map_err(fs_err)?;
@@ -1037,16 +1192,25 @@ impl DaemonRuntime {
                 "bytes_written": p.content.len(),
                 "sha256": new_hash,
                 "patched": true,
+                "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
             }));
         }
         write_file(&ws, &p.path, p.content.as_bytes()).map_err(fs_err)?;
-        Ok(json!({ "path": p.path, "bytes_written": p.content.len() }))
+        Ok(json!({
+            "path": p.path,
+            "bytes_written": p.content.len(),
+            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+        }))
     }
 
     fn execute_fs_delete(&self, p: &FsDeleteParams) -> IpcResult<Value> {
-        let ws = self.workspace()?;
+        let ws = self.workspace_for(p.workspace_id.as_deref())?;
         delete_path(&ws, &p.path, p.recursive).map_err(fs_err)?;
-        Ok(json!({ "path": p.path, "deleted": true }))
+        Ok(json!({
+            "path": p.path,
+            "deleted": true,
+            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+        }))
     }
 
     fn process_log_path(&self) -> PathBuf {
@@ -1107,7 +1271,7 @@ impl DaemonRuntime {
     }
 
     fn execute_git_status(&self, p: &GitStatusParams) -> IpcResult<Value> {
-        let ws = self.workspace()?;
+        let ws = self.workspace_for(p.workspace_id.as_deref())?;
         let page = git_status(
             &ws,
             &GitStatusOpts {
@@ -1124,7 +1288,7 @@ impl DaemonRuntime {
     }
 
     fn execute_git_diff(&self, p: &GitDiffParams) -> IpcResult<Value> {
-        let ws = self.workspace()?;
+        let ws = self.workspace_for(p.workspace_id.as_deref())?;
         let page = git_diff(
             &ws,
             &GitDiffOpts {
@@ -1133,7 +1297,7 @@ impl DaemonRuntime {
                 staged: p.staged,
                 cursor: p.cursor,
                 limit: p.limit.unwrap_or(200),
-                max_bytes: p.max_bytes.unwrap_or(1024 * 1024),
+                max_bytes: p.max_bytes.unwrap_or(256 * 1024),
             },
         )
         .map_err(fs_err)?;
@@ -2686,6 +2850,92 @@ const MAX_APPROVALS_ENTRIES: usize = 4_096;
 const MAX_APPROVAL_VALUE_BYTES: usize = 64 * 1024;
 const MAX_REVOKED_FILE_BYTES: usize = 1024 * 1024;
 const MAX_REVOKED_ENTRIES: usize = 16_384;
+
+fn load_or_init_workspaces(
+    path: &Path,
+    default_root: &Path,
+) -> Result<Vec<WorkspaceEntry>, String> {
+    const MAX_BYTES: u64 = 256 * 1024;
+    const MAX_ENTRIES: usize = 64;
+    let default_entry = WorkspaceEntry {
+        id: "ws_default".into(),
+        root: default_root.to_path_buf(),
+        label: Some("Default workspace".into()),
+    };
+    if !path.exists() {
+        let file = WorkspaceRegistryFile {
+            schema_version: 1,
+            workspaces: vec![default_entry.clone()],
+        };
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+        return Ok(vec![default_entry]);
+    }
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_BYTES {
+        return Err(format!(
+            "workspaces.json exceeds {MAX_BYTES} byte budget ({})",
+            meta.len()
+        ));
+    }
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    let file: WorkspaceRegistryFile =
+        serde_json::from_slice(&raw).map_err(|e| format!("workspaces.json parse: {e}"))?;
+    if file.schema_version != 1 {
+        return Err(format!(
+            "unsupported workspaces.json schema_version {}",
+            file.schema_version
+        ));
+    }
+    if file.workspaces.len() > MAX_ENTRIES {
+        return Err(format!(
+            "workspaces.json has {} entries (max {MAX_ENTRIES})",
+            file.workspaces.len()
+        ));
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for mut entry in file.workspaces {
+        entry.id = entry.id.trim().to_string();
+        if entry.id.is_empty()
+            || entry.id.len() > 128
+            || !(entry.id.starts_with("ws_") || entry.id == "default")
+            || !entry
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!("invalid workspace id in registry: {:?}", entry.id));
+        }
+        if !entry.root.is_absolute() {
+            return Err(format!(
+                "workspace {} root must be absolute: {}",
+                entry.id,
+                entry.root.display()
+            ));
+        }
+        if !seen.insert(entry.id.clone()) {
+            return Err(format!("duplicate workspace id: {}", entry.id));
+        }
+        out.push(entry);
+    }
+    if !out
+        .iter()
+        .any(|w| w.id == "ws_default" || w.id == "default")
+    {
+        out.insert(0, default_entry);
+    }
+    // Normalize legacy bare "default" id to the domain-shaped ws_default.
+    for entry in &mut out {
+        if entry.id == "default" {
+            entry.id = "ws_default".into();
+        }
+    }
+    Ok(out)
+}
 
 fn load_op_journal(path: &Path) -> Result<HashMap<String, Value>, String> {
     if !path.exists() {

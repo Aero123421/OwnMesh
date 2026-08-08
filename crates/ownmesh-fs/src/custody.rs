@@ -363,6 +363,129 @@ fn ensure_not_reparse_handle(file: &File, path: &Path) -> FsResult<()> {
     Ok(())
 }
 
+/// Workspace root device identity used to reject cross-mount opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(windows)]
+    volume_serial: u32,
+}
+
+fn root_identity(ws: &WorkspaceRoot) -> FsResult<RootIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root_meta = fs::metadata(ws.root()).map_err(|source| FsError::Io {
+            path: Some(ws.root().to_path_buf()),
+            source,
+        })?;
+        return Ok(RootIdentity {
+            dev: root_meta.dev(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        // Open the root directory handle to read volume serial via ByHandle info.
+        let dir = open_dir_nofollow(ws.root()).map_err(|source| FsError::Io {
+            path: Some(ws.root().to_path_buf()),
+            source,
+        })?;
+        let serial = volume_serial_of_handle(&dir).map_err(|source| FsError::Io {
+            path: Some(ws.root().to_path_buf()),
+            source,
+        })?;
+        Ok(RootIdentity {
+            volume_serial: serial,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(FsError::InvalidPath(
+            "restricted custody root identity unsupported on this platform".into(),
+        ))
+    }
+}
+
+/// Reject cross-mount opens and multi-link hardlinks in restricted mode.
+///
+/// A hardlink whose final pathname is inside the workspace can still alias an
+/// outside inode. Without a portable "list all names for inode" API we fail
+/// closed on link count > 1. Mount escapes are rejected via device/volume id.
+fn ensure_no_cross_boundary_alias(file: &File, path: &Path, ws: &WorkspaceRoot) -> FsResult<()> {
+    let root_id = root_identity(ws)?;
+    let meta = file.metadata().map_err(|source| FsError::Io {
+        path: Some(path.to_path_buf()),
+        source,
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.dev() != root_id.dev {
+            return Err(FsError::CrossMount(path.to_path_buf()));
+        }
+        // nlink > 1 means the inode is reachable via another directory entry.
+        // That other name may be outside the workspace; fail closed.
+        if meta.nlink() > 1 {
+            return Err(FsError::CrossBoundaryHardlink(path.to_path_buf()));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let info = by_handle_file_info(file).map_err(|source| FsError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+        if info.volume_serial != root_id.volume_serial {
+            return Err(FsError::CrossMount(path.to_path_buf()));
+        }
+        if info.number_of_links > 1 {
+            return Err(FsError::CrossBoundaryHardlink(path.to_path_buf()));
+        }
+    }
+
+    let _ = (&root_id, &meta);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct ByHandleInfo {
+    volume_serial: u32,
+    number_of_links: u32,
+}
+
+#[cfg(windows)]
+fn by_handle_file_info(file: &File) -> std::io::Result<ByHandleInfo> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let ok = unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::from_mut(&mut info),
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ByHandleInfo {
+        volume_serial: info.dwVolumeSerialNumber,
+        number_of_links: info.nNumberOfLinks,
+    })
+}
+
+#[cfg(windows)]
+fn volume_serial_of_handle(file: &File) -> std::io::Result<u32> {
+    Ok(by_handle_file_info(file)?.volume_serial)
+}
+
 /// Open an existing regular file under the workspace for reading.
 pub(crate) fn open_regular_file_read(ws: &WorkspaceRoot, rel: &Path) -> FsResult<(File, PathBuf)> {
     if !ws.enforce {
@@ -400,6 +523,8 @@ pub(crate) fn open_regular_file_read(ws: &WorkspaceRoot, rel: &Path) -> FsResult
         return Err(FsError::NotAFile(path));
     }
     let final_path = ensure_handle_under_workspace(&file, ws)?;
+    // After pathname custody, reject multi-link hardlinks and cross-mount inodes.
+    ensure_no_cross_boundary_alias(&file, &final_path, ws)?;
     Ok((file, final_path))
 }
 
@@ -637,7 +762,13 @@ pub(crate) fn write_file_enforced(
                 return Err(err);
             }
             match ensure_handle_under_workspace(&published, ws) {
-                Ok(final_path) => Ok(final_path),
+                Ok(final_path) => {
+                    if let Err(err) = ensure_no_cross_boundary_alias(&published, &final_path, ws) {
+                        let _ = fs::remove_file(&path);
+                        return Err(err);
+                    }
+                    Ok(final_path)
+                }
                 Err(err) => {
                     let _ = fs::remove_file(&path);
                     Err(err)
@@ -713,7 +844,10 @@ pub(crate) fn delete_enforced(ws: &WorkspaceRoot, rel: &Path, recursive: bool) -
         source,
     })?;
     ensure_not_reparse_handle(&file, &path)?;
-    let _ = ensure_handle_under_workspace(&file, ws)?;
+    let final_path = ensure_handle_under_workspace(&file, ws)?;
+    // Deny deleting multi-link inodes in restricted mode: the other name may be
+    // outside the workspace and the delete would mutate shared content identity.
+    ensure_no_cross_boundary_alias(&file, &final_path, ws)?;
     drop(file);
     fs::remove_file(&path).map_err(|source| FsError::Io {
         path: Some(path),
@@ -823,5 +957,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hardlink_to_outside_file_rejected_when_enforced() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, b"top-secret").unwrap();
+
+        let inside_link = root.path().join("alias.txt");
+        #[cfg(unix)]
+        {
+            std::fs::hard_link(&outside_file, &inside_link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            // CreateHardLinkW via std::fs::hard_link (stable on modern Rust).
+            if let Err(err) = std::fs::hard_link(&outside_file, &inside_link) {
+                // Some Windows environments disallow hardlinks across dirs/volumes.
+                eprintln!("skip hardlink test: {err}");
+                return;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return;
+        }
+
+        let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+        let err = open_regular_file_read(&ws, Path::new("alias.txt")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FsError::CrossBoundaryHardlink(_) | FsError::CrossMount(_)
+            ),
+            "outside hardlink must fail closed: {err:?}"
+        );
+        // Ensure we never returned outside bytes through a successful open.
+        assert!(
+            fs::read(&inside_link).unwrap() == b"top-secret",
+            "fixture hardlink should still resolve on disk"
+        );
+    }
+
+    #[test]
+    fn hardlink_within_workspace_also_fail_closed_when_multi_link() {
+        // Restricted policy is fail-closed on nlink>1 (no portable all-names check).
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("a.txt"), b"shared").unwrap();
+        #[cfg(unix)]
+        std::fs::hard_link(root.path().join("a.txt"), root.path().join("b.txt")).unwrap();
+        #[cfg(windows)]
+        {
+            if std::fs::hard_link(root.path().join("a.txt"), root.path().join("b.txt")).is_err() {
+                return;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return;
+        }
+        let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+        let err = open_regular_file_read(&ws, Path::new("a.txt")).unwrap_err();
+        assert!(
+            matches!(err, FsError::CrossBoundaryHardlink(_)),
+            "multi-link inode must fail closed in restricted mode: {err:?}"
+        );
     }
 }

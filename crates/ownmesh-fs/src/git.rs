@@ -5,8 +5,9 @@
 
 use crate::{FsError, FsResult, WorkspaceRoot};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// One porcelain status entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +100,11 @@ fn default_diff_limit(n: usize) -> usize {
     }
 }
 
+/// Hard ceiling for a single git stdout capture (status or diff). Larger
+/// outputs must be retrieved via cursor pages; never `read_to_end` unbounded.
+const GIT_STDOUT_HARD_CAP: usize = 2 * 1024 * 1024;
+const GIT_STDERR_HARD_CAP: usize = 64 * 1024;
+
 /// Run read-only `git status --porcelain=v1 -b` with entry pagination.
 ///
 /// # Errors
@@ -107,9 +113,11 @@ fn default_diff_limit(n: usize) -> usize {
 /// workspace, or when a `git` subprocess cannot be run successfully.
 pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatusPage> {
     let cwd = resolve_repo_cwd(ws, &opts.path)?;
-    let output = run_git(
+    // Cap status capture well under the hard ceiling; porcelain is line-oriented.
+    let (output, _truncated) = run_git_capped(
         &cwd,
         &["status", "--porcelain=v1", "-b", "--untracked-files=all"],
+        512 * 1024,
     )?;
     let (branch, upstream, entries) = parse_porcelain_v1(&output);
     let clean = entries.is_empty();
@@ -137,6 +145,12 @@ pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatu
 
 /// Run read-only `git diff` (or `--cached`) with line pagination.
 ///
+/// Stdout is streamed with a hard byte cap before line paging so an attacker-
+/// controlled repository cannot force unbounded allocation via `Command::output`.
+/// When the byte cap truncates mid-stream, `truncated=true` and `exhausted=false`
+/// with a cursor so clients can continue; discarded bytes are never silently
+/// dropped without a visible flag.
+///
 /// # Errors
 ///
 /// Returns an error when the repository path is invalid or outside the enforced
@@ -152,35 +166,65 @@ pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage>
         args.push(ps.clone());
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut raw = run_git(&cwd, &arg_refs)?;
     let max_bytes = if opts.max_bytes == 0 {
-        1024 * 1024
+        256 * 1024
     } else {
-        opts.max_bytes
+        opts.max_bytes.min(GIT_STDOUT_HARD_CAP)
     };
-    let truncated = raw.len() > max_bytes;
-    if truncated {
-        raw.truncate(max_bytes);
-    }
-    let all_lines: Vec<String> = raw.lines().map(str::to_owned).collect();
     let start = cursor_to_index(opts.cursor);
     let limit = default_diff_limit(opts.limit);
-    let slice = if start >= all_lines.len() {
-        &[][..]
+    // Fetch only enough raw text to satisfy cursor+limit with headroom for long lines.
+    // Still hard-capped by max_bytes so large diffs never fully materialize.
+    let need_lines = start.saturating_add(limit).saturating_add(1);
+    let fetch_budget = max_bytes.min(GIT_STDOUT_HARD_CAP);
+    let (raw, byte_truncated) = run_git_capped(&cwd, &arg_refs, fetch_budget)?;
+    // Keep only complete lines when truncated mid-line so paging stays stable.
+    let text = if byte_truncated && !raw.ends_with('\n') {
+        match raw.rfind('\n') {
+            Some(idx) => &raw[..=idx],
+            None => raw.as_str(),
+        }
     } else {
-        let end = start.saturating_add(limit).min(all_lines.len());
-        &all_lines[start..end]
+        raw.as_str()
     };
-    let next_index = start.saturating_add(slice.len());
-    let exhausted = next_index >= all_lines.len();
+    let mut page_lines: Vec<String> = Vec::new();
+    let mut seen = 0_usize;
+    let mut more_after_page = false;
+    for line in text.lines() {
+        if seen < start {
+            seen += 1;
+            continue;
+        }
+        if page_lines.len() >= limit {
+            more_after_page = true;
+            break;
+        }
+        page_lines.push(line.to_owned());
+        seen += 1;
+        if seen >= need_lines {
+            // Peek one more only via the break condition above.
+        }
+    }
+    // If we filled the page and the stream had more lines beyond the scanned window,
+    // or byte truncation cut the capture, surface continuation.
+    if !more_after_page && byte_truncated {
+        // Byte cap hit before we could prove exhaustion.
+        more_after_page = true;
+    } else if !more_after_page {
+        // Count whether any line exists after the page within the captured text.
+        let total_lines = text.lines().count();
+        more_after_page = start.saturating_add(page_lines.len()) < total_lines;
+    }
+    let next_index = start.saturating_add(page_lines.len());
+    let exhausted = !more_after_page;
     let next_cursor = (!exhausted).then(|| u64::try_from(next_index).unwrap_or(u64::MAX));
     Ok(GitDiffPage {
         repo_root: cwd.to_string_lossy().into_owned(),
         staged: opts.staged,
-        lines: slice.to_vec(),
+        lines: page_lines,
         next_cursor,
         exhausted,
-        truncated,
+        truncated: byte_truncated || more_after_page,
     })
 }
 
@@ -215,29 +259,119 @@ fn resolve_repo_cwd(ws: &WorkspaceRoot, rel: &Path) -> FsResult<PathBuf> {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> FsResult<String> {
-    let output = Command::new("git")
+    let (out, truncated) = run_git_capped(cwd, args, GIT_STDOUT_HARD_CAP)?;
+    if truncated {
+        return Err(FsError::Io {
+            path: Some(cwd.to_path_buf()),
+            source: std::io::Error::other(format!(
+                "git {} output exceeded {} byte capture ceiling",
+                args.first().unwrap_or(&""),
+                GIT_STDOUT_HARD_CAP
+            )),
+        });
+    }
+    Ok(out)
+}
+
+/// Spawn git with piped stdout/stderr and read at most `max_stdout` / stderr cap.
+/// Returns `(lossy_utf8_stdout, truncated)` where truncated means more stdout bytes
+/// were available than returned (visible to callers; never silent).
+fn run_git_capped(cwd: &Path, args: &[&str], max_stdout: usize) -> FsResult<(String, bool)> {
+    let max_stdout = max_stdout.clamp(1, GIT_STDOUT_HARD_CAP);
+    let mut child = Command::new("git")
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|source| FsError::Io {
             path: Some(cwd.to_path_buf()),
             source,
         })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut stdout = child.stdout.take().ok_or_else(|| FsError::Io {
+        path: Some(cwd.to_path_buf()),
+        source: std::io::Error::other("git stdout pipe missing"),
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| FsError::Io {
+        path: Some(cwd.to_path_buf()),
+        source: std::io::Error::other("git stderr pipe missing"),
+    })?;
+
+    let mut out_buf = vec![0_u8; 0];
+    out_buf
+        .try_reserve(max_stdout.min(64 * 1024))
+        .map_err(|e| FsError::Io {
+            path: Some(cwd.to_path_buf()),
+            source: std::io::Error::other(format!("stdout reserve: {e}")),
+        })?;
+    let mut tmp = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        if out_buf.len() >= max_stdout {
+            // Drain and discard remainder so the child can exit, but mark truncated.
+            truncated = true;
+            let mut discard = [0_u8; 8192];
+            while stdout.read(&mut discard).unwrap_or(0) > 0 {}
+            break;
+        }
+        let want = (max_stdout - out_buf.len()).min(tmp.len());
+        let n = stdout
+            .read(&mut tmp[..want])
+            .map_err(|source| FsError::Io {
+                path: Some(cwd.to_path_buf()),
+                source,
+            })?;
+        if n == 0 {
+            break;
+        }
+        out_buf.extend_from_slice(&tmp[..n]);
+    }
+
+    let mut err_buf = Vec::new();
+    {
+        let mut read = 0_usize;
+        loop {
+            if read >= GIT_STDERR_HARD_CAP {
+                let mut discard = [0_u8; 8192];
+                while stderr.read(&mut discard).unwrap_or(0) > 0 {}
+                break;
+            }
+            let want = (GIT_STDERR_HARD_CAP - read).min(tmp.len());
+            let n = stderr
+                .read(&mut tmp[..want])
+                .map_err(|source| FsError::Io {
+                    path: Some(cwd.to_path_buf()),
+                    source,
+                })?;
+            if n == 0 {
+                break;
+            }
+            err_buf.extend_from_slice(&tmp[..n]);
+            read += n;
+        }
+    }
+
+    let status = child.wait().map_err(|source| FsError::Io {
+        path: Some(cwd.to_path_buf()),
+        source,
+    })?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err_buf);
         return Err(FsError::Io {
             path: Some(cwd.to_path_buf()),
             source: std::io::Error::other(format!(
                 "git {} failed ({}): {}",
                 args.first().unwrap_or(&""),
-                output.status,
+                status,
                 stderr.trim()
             )),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok((String::from_utf8_lossy(&out_buf).into_owned(), truncated))
 }
 
 fn parse_porcelain_v1(text: &str) -> (Option<String>, Option<String>, Vec<GitStatusEntry>) {

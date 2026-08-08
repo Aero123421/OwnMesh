@@ -247,8 +247,40 @@ def main() -> int:
         cache_dir = temp / "cache"
         keystore_dir = state_dir / "keystore"
         workspace_dir = state_dir / "workspace"
-        for directory in [persist, config_dir, state_dir, runtime_dir, cache_dir, keystore_dir, workspace_dir]:
+        workspace_alt = state_dir / "workspace-alt"
+        for directory in [
+            persist,
+            config_dir,
+            state_dir,
+            runtime_dir,
+            cache_dir,
+            keystore_dir,
+            workspace_dir,
+            workspace_alt,
+        ]:
             directory.mkdir(parents=True, exist_ok=True)
+        # Device-local workspace registry (E4): default + alt roots for selection proof.
+        (state_dir / "workspaces.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "workspaces": [
+                        {
+                            "id": "ws_default",
+                            "root": str(workspace_dir.resolve()),
+                            "label": "Default",
+                        },
+                        {
+                            "id": "ws_alt",
+                            "root": str(workspace_alt.resolve()),
+                            "label": "Alt",
+                        },
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
         (config_dir / "config.toml").write_text(
             "\n".join(
@@ -810,6 +842,199 @@ def main() -> int:
             if (workspace_dir / "e2-list-b.txt").exists():
                 raise RuntimeError("delete did not remove e2-list-b.txt on disk")
 
+            # Hash-checked patch (ownmesh_fs_patch) through the same production path.
+            patch_path = "e2-patch.txt"
+            (workspace_dir / patch_path).write_text("before-patch", encoding="utf-8")
+            expected_hash = hashlib.sha256(b"before-patch").hexdigest()
+            patch_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_patch",
+                    {
+                        "device_id": device_id,
+                        "path": patch_path,
+                        "content": f"after-patch-{marker}",
+                        "expected_sha256": expected_hash,
+                        "async": True,
+                        "idempotency_key": f"idem_patch_{marker}",
+                    },
+                    rpc_id=30,
+                )
+            )
+            patch_op = str(patch_sc.get("operation_id") or "")
+            patch_done = wait_operation(issuer, access_token, patch_op, want={"completed"})
+            on_disk_patch = (workspace_dir / patch_path).read_text(encoding="utf-8")
+            if on_disk_patch != f"after-patch-{marker}":
+                raise RuntimeError(f"patch did not update disk: {on_disk_patch!r} op={patch_done}")
+            # Stale expected hash must fail closed (no overwrite).
+            bad_patch_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_patch",
+                    {
+                        "device_id": device_id,
+                        "path": patch_path,
+                        "content": "should-not-apply",
+                        "expected_sha256": expected_hash,
+                        "async": True,
+                        "idempotency_key": f"idem_patch_bad_{marker}",
+                    },
+                    rpc_id=31,
+                )
+            )
+            bad_patch_op = str(bad_patch_sc.get("operation_id") or "")
+            bad_patch_done = wait_operation(
+                issuer, access_token, bad_patch_op, want={"failed", "denied"}, timeout_s=20
+            )
+            if (workspace_dir / patch_path).read_text(encoding="utf-8") != f"after-patch-{marker}":
+                raise RuntimeError(f"stale patch overwrote file: {bad_patch_done}")
+
+            # Raw shell is a separately authorized action from structured command.
+            if os.name == "nt":
+                shell_cmd = f"echo shell-{marker}"
+            else:
+                shell_cmd = f'printf "%s" "shell-{marker}"'
+            shell_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_command_shell",
+                    {
+                        "device_id": device_id,
+                        "command": shell_cmd,
+                        "async": True,
+                        "idempotency_key": f"idem_shell_{marker}",
+                    },
+                    rpc_id=32,
+                )
+            )
+            shell_op = str(shell_sc.get("operation_id") or "")
+            shell_done = wait_operation(issuer, access_token, shell_op, want={"completed"})
+            if f"shell-{marker}" not in json.dumps(shell_done):
+                raise RuntimeError(f"raw shell result missing marker: {shell_done}")
+
+            # E4 workspace selection: write into alt root; default root must not see it.
+            alt_marker = f"alt-{marker}"
+            alt_write = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_write",
+                    {
+                        "device_id": device_id,
+                        "workspace_id": "ws_alt",
+                        "path": "alt-only.txt",
+                        "content": alt_marker,
+                        "async": True,
+                        "idempotency_key": f"idem_ws_alt_{marker}",
+                    },
+                    rpc_id=33,
+                )
+            )
+            alt_op = str(alt_write.get("operation_id") or "")
+            wait_operation(issuer, access_token, alt_op, want={"completed"})
+            if not (workspace_alt / "alt-only.txt").is_file():
+                raise RuntimeError("alt workspace write missing on disk")
+            if (workspace_dir / "alt-only.txt").exists():
+                raise RuntimeError("alt write leaked into default workspace root")
+            cross_read = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_read",
+                    {
+                        "device_id": device_id,
+                        "workspace_id": "ws_default",
+                        "path": "alt-only.txt",
+                        "async": True,
+                        "idempotency_key": f"idem_ws_cross_{marker}",
+                    },
+                    rpc_id=34,
+                )
+            )
+            cross_op = str(cross_read.get("operation_id") or "")
+            cross_done = wait_operation(
+                issuer, access_token, cross_op, want={"failed", "denied", "completed"}, timeout_s=20
+            )
+            cross_dump = json.dumps(cross_done)
+            if alt_marker in cross_dump and str(cross_done.get("status")) == "completed":
+                raise RuntimeError(f"cross-workspace read returned alt content: {cross_done}")
+            if str(cross_done.get("status")) == "completed":
+                # completed empty/not-found is also acceptable fail-closed surface
+                cross_data = cross_done.get("data") if isinstance(cross_done.get("data"), dict) else {}
+                content = str(cross_data.get("content") or "")
+                if content:
+                    raise RuntimeError(f"cross-workspace read leaked content: {cross_done}")
+            # Positive control: alt workspace reads its own file.
+            alt_read = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_read",
+                    {
+                        "device_id": device_id,
+                        "workspace_id": "ws_alt",
+                        "path": "alt-only.txt",
+                        "async": True,
+                        "idempotency_key": f"idem_ws_alt_read_{marker}",
+                    },
+                    rpc_id=35,
+                )
+            )
+            alt_read_op = str(alt_read.get("operation_id") or "")
+            alt_read_done = wait_operation(issuer, access_token, alt_read_op, want={"completed"})
+            if alt_marker not in json.dumps(alt_read_done):
+                raise RuntimeError(f"alt workspace read missed content: {alt_read_done}")
+            # Unknown workspace_id fails closed.
+            bad_ws = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_list",
+                    {
+                        "device_id": device_id,
+                        "workspace_id": "ws_does_not_exist",
+                        "path": ".",
+                        "async": True,
+                        "idempotency_key": f"idem_ws_bad_{marker}",
+                    },
+                    rpc_id=36,
+                )
+            )
+            bad_ws_op = str(bad_ws.get("operation_id") or "")
+            bad_ws_done = wait_operation(
+                issuer, access_token, bad_ws_op, want={"failed", "denied"}, timeout_s=20
+            )
+            if str(bad_ws_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(f"unknown workspace_id must fail closed: {bad_ws_done}")
+            if "unknown workspace" not in json.dumps(bad_ws_done).lower():
+                # Accept any fail-closed error that names the missing workspace.
+                if "ws_does_not_exist" not in json.dumps(bad_ws_done):
+                    raise RuntimeError(f"unknown workspace_id must fail closed: {bad_ws_done}")
+
+            # E5 session open via public MCP (metadata + controller lease; live PTY host partial).
+            ses_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_open",
+                    {
+                        "device_id": device_id,
+                        "title": f"e2-ses-{marker}",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_{marker}",
+                    },
+                    rpc_id=37,
+                )
+            )
+            ses_op = str(ses_sc.get("operation_id") or "")
+            ses_done = wait_operation(issuer, access_token, ses_op, want={"completed"})
+            ses_dump = json.dumps(ses_done)
+            if "ses_" not in ses_dump:
+                raise RuntimeError(f"session open missing session id: {ses_done}")
+
             # Missing idempotency_key on mutating tool must fail closed before route.
             missing_key_status, missing_key_body = http_json(
                 f"{issuer}/mcp",
@@ -840,9 +1065,10 @@ def main() -> int:
 
             print(
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
-                f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+required-key held "
+                f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
+                f"patch+shell+workspace-select+session-open+required-key held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
-                f"list_op={list_op}, chunks={chunk_i})"
+                f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )
             return 0
         finally:

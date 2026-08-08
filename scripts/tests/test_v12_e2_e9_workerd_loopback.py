@@ -74,16 +74,45 @@ def main() -> int:
 
     # Proven real-path rows for this entrypoint. Only list rows with an actual
     # binary x workerd proof script that this gate invokes. Do not paper over.
-    proven_rows = {
-        "E2": "public MCP fs/command via real ownmeshd (partial surface set)",
+    # Partial means production path evidence exists but the full acceptance
+    # definition for that letter is not yet complete.
+    proven_partial = {
+        "E2": (
+            "public MCP fs list/stat/read/write/patch/delete + structured command "
+            "+ raw shell + binary cursor via real ownmeshd"
+        ),
         "E3": "exact-action hash + durable idempotency/cancel claim (partial)",
+        "E4": (
+            "device workspaces.json + workspace_id selection + handle/hardlink "
+            "custody; CLI CRUD still unsupported"
+        ),
+        "E5": (
+            "remote session.open mapped through public MCP (metadata/lease); "
+            "live PTY host ownership still partial"
+        ),
+        "E7": (
+            "MCP git status/diff tools + bounded git capture foundation; "
+            "unified-diff apply + full review flow still open"
+        ),
     }
-    open_acceptance = list(E4_E9_ACCEPTANCE_ROWS)
+    # Rows with no real binary×workerd proof yet (must keep gate red).
+    still_open = (
+        ("E6", "nine official profile adapters + generic tool execution"),
+        ("E8", "networkless elevated broker Full Access mint/custody"),
+        ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
+    )
+    # E4/E5/E7 remain incomplete acceptance even with partial proof.
+    incomplete_acceptance = (
+        ("E4", "workspace CLI CRUD + full custody matrix promotion"),
+        ("E5", "live PTY host + controller lease reconnect/replay proof"),
+        ("E7", "bounded unified-diff patch apply + Git review (no auto-merge)"),
+        *still_open,
+    )
 
     print("Acceptance matrix:")
-    for key, detail in sorted(proven_rows.items()):
+    for key, detail in sorted(proven_partial.items()):
         print(f"  [partial] {key}: {detail}")
-    for key, detail in open_acceptance:
+    for key, detail in still_open:
         print(f"  [OPEN]    {key}: {detail}")
 
     open_rows = _registry_open_rows()
@@ -92,16 +121,16 @@ def main() -> int:
         more = "" if len(open_rows) <= 12 else f" (+{len(open_rows) - 12} more)"
         print(f"Registry unsupported snapshot: {preview}{more}")
 
-    if open_acceptance:
+    if incomplete_acceptance:
         print(
             "E2-E9 workerd gate RED: E4-E9 real binary x local Wrangler/workerd "
-            "proofs are not yet complete. Refusing exit 0 so incomplete work "
-            "cannot look green.",
+            "acceptance is not yet complete (partial rows are not completion). "
+            "Refusing exit 0 so incomplete work cannot look green.",
             file=sys.stderr,
         )
         print(
-            "v1.2 E2-E9 workerd loopback entrypoint: E2/E3 evidenced (partial); "
-            "E4-E9 NOT claimed; gate fail-closed"
+            "v1.2 E2-E9 workerd loopback entrypoint: E2/E3/E4/E5/E7 partial; "
+            "E6/E8/E9 OPEN; gate fail-closed"
         )
         return 2
 

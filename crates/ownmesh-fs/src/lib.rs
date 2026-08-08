@@ -67,6 +67,10 @@ pub enum FsError {
     NotADirectory(PathBuf),
     #[error("symlink or reparse point not permitted in restricted workspace: {0}")]
     SymlinkOrReparse(PathBuf),
+    #[error("cross-boundary hardlink not permitted in restricted workspace: {0}")]
+    CrossBoundaryHardlink(PathBuf),
+    #[error("cross-mount path not permitted in restricted workspace: {0}")]
+    CrossMount(PathBuf),
     #[error("entry limit exceeded")]
     EntryLimit,
     #[error("file too large")]
@@ -344,9 +348,14 @@ pub fn list_dir(
     Ok(page.entries)
 }
 
-/// Cursor-paginated directory listing. Entries are sorted by name; `cursor` is an
-/// exclusive lower-bound on that name. Name/path character budgets drop oversized
-/// entries rather than allocating unbounded JSON.
+/// Cursor-paginated directory listing. Entries are sorted by `(name, path)`;
+/// `cursor` is an exclusive lower-bound on that tuple. Name/path character
+/// budgets drop oversized entries rather than allocating unbounded JSON.
+///
+/// Traversal is cursor-resumable: entries at or before the cursor are skipped
+/// during the scan so later pages still see names beyond any intermediate
+/// collection ceiling. A hard collect ceiling bounds memory; when hit, the
+/// page is marked truncated so clients continue with the returned cursor.
 ///
 /// # Errors
 ///
@@ -377,16 +386,38 @@ pub fn list_dir_page(
     /// directory cursor to a generic truncation stand-in. Sized under the
     /// durable MCP data_json ceiling with headroom for framing.
     const MAX_PAGE_JSON_BYTES: usize = 96_000;
+    /// Hard bound on after-cursor candidates held in memory before paging.
+    /// Must be large enough that multi-page clients can walk past 4_000+ entries
+    /// without silently dropping later names; still fail-closed on huge trees.
+    const MAX_COLLECT_AFTER_CURSOR: usize = 25_000;
     let limit = max_entries.clamp(1, MAX_PAGE_ENTRIES);
-    // Hard scan budget prevents unbounded WalkDir collection before paging.
-    let scan_budget = limit.saturating_mul(8).max(limit).min(4_000);
 
     let mut collected = Vec::new();
+    let mut hit_collect_ceiling = false;
+
+    let mut push_candidate = |info: DirEntryInfo| -> bool {
+        if !entry_within_budgets(&info) {
+            return false;
+        }
+        if let Some((after_name, after_path)) = after.as_ref() {
+            // Exclusive lower bound on the full (name, path) sort tuple.
+            let after_cursor = info.name.as_str() > after_name.as_str()
+                || (info.name.as_str() == after_name.as_str()
+                    && info.path.as_str() > after_path.as_str());
+            if !after_cursor {
+                return false;
+            }
+        }
+        if collected.len() >= MAX_COLLECT_AFTER_CURSOR {
+            hit_collect_ceiling = true;
+            return true; // signal stop
+        }
+        collected.push(info);
+        false
+    };
+
     if recursive {
         for entry in WalkDir::new(&path).min_depth(1) {
-            if collected.len() >= scan_budget {
-                break;
-            }
             let entry = entry.map_err(|e| FsError::Io {
                 path: Some(path.clone()),
                 source: std::io::Error::other(e.to_string()),
@@ -399,8 +430,8 @@ pub fn list_dir_page(
                 is_symlink: entry.file_type().is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
             };
-            if entry_within_budgets(&info) {
-                collected.push(info);
+            if push_candidate(info) {
+                break;
             }
         }
     } else {
@@ -409,9 +440,6 @@ pub fn list_dir_page(
             source,
         })?;
         for entry in rd {
-            if collected.len() >= scan_budget {
-                break;
-            }
             let entry = entry.map_err(|source| FsError::Io {
                 path: Some(path.clone()),
                 source,
@@ -428,19 +456,12 @@ pub fn list_dir_page(
                 is_symlink: ft.is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
             };
-            if entry_within_budgets(&info) {
-                collected.push(info);
+            if push_candidate(info) {
+                break;
             }
         }
     }
     collected.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
-    if let Some((after_name, after_path)) = after.as_ref() {
-        collected.retain(|e| {
-            // Exclusive lower bound on the full (name, path) sort tuple.
-            e.name.as_str() > after_name.as_str()
-                || (e.name.as_str() == after_name.as_str() && e.path.as_str() > after_path.as_str())
-        });
-    }
     let total_matched = collected.len();
 
     // Build the page under both entry-count and UTF-8 JSON byte budgets so a
@@ -487,7 +508,8 @@ pub fn list_dir_page(
     if !hit_byte_cap && total_matched > page_entries.len() {
         hit_entry_cap = true;
     }
-    let truncated = hit_entry_cap || hit_byte_cap || total_matched > page_entries.len();
+    let truncated =
+        hit_entry_cap || hit_byte_cap || hit_collect_ceiling || total_matched > page_entries.len();
     let next_cursor = if truncated {
         page_entries
             .last()
@@ -967,5 +989,48 @@ mod tests {
                 && all_paths.iter().any(|p| p.contains("dir_b")),
             "both dup paths must appear across pages: {all_paths:?}"
         );
+    }
+
+    #[test]
+    fn list_page_walks_past_four_thousand_entries_without_silent_drop() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        // Reproduce the former scan_budget=4000 trap: later pages must still see
+        // entries beyond the first window, every name exactly once.
+        const N: usize = 4_500;
+        for i in 0..N {
+            let name = format!("f{i:05}.txt");
+            write_file(&ws, &name, b"x").unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0_usize;
+        loop {
+            pages += 1;
+            assert!(pages < 200, "pagination failed to terminate");
+            let page = list_dir_page(&ws, "", false, 200, cursor.as_deref()).unwrap();
+            for entry in &page.entries {
+                assert!(
+                    seen.insert(entry.name.clone()),
+                    "duplicate entry across pages: {}",
+                    entry.name
+                );
+            }
+            if !page.truncated {
+                break;
+            }
+            cursor = page.next_cursor;
+            assert!(cursor.is_some(), "truncated page must carry next_cursor");
+        }
+        assert_eq!(
+            seen.len(),
+            N,
+            "expected every entry once; got {} across {pages} pages",
+            seen.len()
+        );
+        for i in 0..N {
+            let name = format!("f{i:05}.txt");
+            assert!(seen.contains(&name), "missing {name}");
+        }
     }
 }

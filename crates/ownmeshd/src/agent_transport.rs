@@ -1408,6 +1408,104 @@ fn map_request_to_method(
                 .or_insert_with(|| Value::String("structured".into()));
             methods::OPS_EXEC
         }
+        // Cloud session surface (E5): map to local session IPC methods. Live PTY
+        // host ownership remains partial — open still creates metadata/lease;
+        // write/resize/replay hit the session manager path when a host is attached.
+        ("session.open" | "session", "session.open" | "ownmesh_session_open" | "open") => {
+            // MCP uses program/args; session manager expects command argv.
+            if !args.contains_key("command") {
+                let mut cmd = Vec::new();
+                if let Some(Value::String(program)) = args.get("program") {
+                    if !program.is_empty() {
+                        cmd.push(Value::String(program.clone()));
+                    }
+                }
+                if let Some(Value::Array(a)) = args.get("args") {
+                    cmd.extend(a.iter().cloned());
+                }
+                if !cmd.is_empty() {
+                    args.insert("command".into(), Value::Array(cmd));
+                }
+            }
+            // Attach path: MCP session_id → runtime id.
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::OPEN
+        }
+        ("session.attach" | "session", "session.attach" | "ownmesh_session_attach" | "attach") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::ATTACH
+        }
+        ("session.list" | "session", "session.list" | "ownmesh_session_list" | "list") => {
+            crate::runtime::session_methods::LIST
+        }
+        ("session.show" | "session", "session.show" | "ownmesh_session_show" | "show") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::SHOW
+        }
+        ("session.claim" | "session", "session.claim" | "ownmesh_session_claim" | "claim") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::CLAIM
+        }
+        (
+            "session.release" | "session",
+            "session.release" | "ownmesh_session_release" | "release",
+        ) => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::RELEASE
+        }
+        (
+            "session.write" | "session",
+            "session.write" | "ownmesh_session_write" | "write" | "input",
+        ) => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::WRITE
+        }
+        ("session.resize" | "session", "session.resize" | "ownmesh_session_resize" | "resize") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::RESIZE
+        }
+        ("session.replay" | "session", "session.replay" | "ownmesh_session_replay" | "replay") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::REPLAY
+        }
+        ("session.close" | "session", "session.close" | "ownmesh_session_close" | "close") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::CLOSE
+        }
+        (
+            "session.terminate" | "session",
+            "session.terminate" | "ownmesh_session_terminate" | "terminate",
+        ) => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::TERMINATE
+        }
+        // Read-only git review surfaces (E7 foundation).
+        ("git.status" | "git", "git.status" | "ownmesh_git_status" | "status") => {
+            crate::runtime::ops_methods::GIT_STATUS
+        }
+        ("git.diff" | "git", "git.diff" | "ownmesh_git_diff" | "diff") => {
+            crate::runtime::ops_methods::GIT_DIFF
+        }
         // Accept short fixture-style capability names used by the E0 contract samples.
         ("fs.read", _) => methods::OPS_FS_READ,
         ("fs.write", _) => methods::OPS_FS_WRITE,
@@ -1426,6 +1524,14 @@ fn map_request_to_method(
             "idempotency_key".into(),
             Value::String(request.idempotency_key.clone()),
         );
+    }
+    // Propagate envelope workspace_id into method args so the runtime selects
+    // the registered root at the side-effect boundary (not audit-only).
+    if let Some(ws) = request.workspace_id.as_ref() {
+        let ws_str = ws.to_string();
+        if !ws_str.trim().is_empty() && !args.contains_key("workspace_id") {
+            args.insert("workspace_id".into(), Value::String(ws_str));
+        }
     }
     Ok((method, Value::Object(args)))
 }

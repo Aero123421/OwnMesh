@@ -516,8 +516,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         title: str,
         program: str,
         args: { type: "array", items: { type: "string" } },
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once session open",
+        },
       },
-      required: ["device_id"],
+      required: ["device_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -538,8 +543,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         title: str,
         program: str,
         args: { type: "array", items: { type: "string" } },
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once session open",
+        },
       },
-      required: ["device_id"],
+      required: ["device_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -559,8 +569,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         session_id: str,
         role: { type: "string", enum: ["observer", "controller"] },
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once attach retries",
+        },
       },
-      required: ["device_id", "session_id", "role"],
+      required: ["device_id", "session_id", "role", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -570,6 +584,164 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.session",
     risk: "session",
+  },
+  {
+    name: "ownmesh_session_write",
+    description: "Write controller input to a live device session (ordered/idempotent)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        data: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once input",
+        },
+      },
+      required: ["device_id", "session_id", "data", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: true,
+      idempotentHint: false,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_resize",
+    description: "Resize a device session PTY (controller only)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        cols: { type: "integer", minimum: 1, maximum: 512 },
+        rows: { type: "integer", minimum: 1, maximum: 512 },
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once resize",
+        },
+      },
+      required: ["device_id", "session_id", "cols", "rows", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_replay",
+    description: "Read bounded session output replay from a sequence cursor",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        from_seq: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 1000 },
+        idempotency_key: {
+          type: "string",
+          description: "Caller idempotency key",
+        },
+      },
+      required: ["device_id", "session_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_close",
+    description: "Close a device session (releases controller; may leave host process)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "session_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+      idempotentHint: false,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_git_status",
+    description: "Bounded git status (porcelain) on a device workspace repository",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        path: str,
+        workspace_id: str,
+        cursor: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 1000 },
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
+  },
+  {
+    name: "ownmesh_git_diff",
+    description: "Bounded git unified diff page on a device workspace repository",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        path: str,
+        pathspec: str,
+        staged: { type: "boolean" },
+        workspace_id: str,
+        cursor: { type: "integer", minimum: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 5000 },
+        max_bytes: { type: "integer", minimum: 1, maximum: 2097152 },
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
   },
   {
     name: "ownmesh_get_operation",
@@ -1262,11 +1434,31 @@ function toolCapability(toolName: string): string {
     case "ownmesh_command_shell":
       return "command.run";
     case "ownmesh_session_open":
-    case "ownmesh_session_attach":
-    case "ownmesh_session_write":
-    case "ownmesh_session_resize":
-    case "ownmesh_session_close":
       return "session.open";
+    case "ownmesh_session_attach":
+      return "session.attach";
+    case "ownmesh_session_list":
+      return "session.list";
+    case "ownmesh_session_show":
+      return "session.show";
+    case "ownmesh_session_write":
+      return "session.write";
+    case "ownmesh_session_resize":
+      return "session.resize";
+    case "ownmesh_session_replay":
+      return "session.replay";
+    case "ownmesh_session_claim":
+      return "session.claim";
+    case "ownmesh_session_release":
+      return "session.release";
+    case "ownmesh_session_close":
+      return "session.close";
+    case "ownmesh_session_terminate":
+      return "session.terminate";
+    case "ownmesh_git_status":
+      return "git.status";
+    case "ownmesh_git_diff":
+      return "git.diff";
     case "ownmesh_cancel_operation":
       return "operation.cancel";
     default:
@@ -1293,6 +1485,32 @@ function toolAction(toolName: string): string {
       return "command.run";
     case "ownmesh_command_shell":
       return "command.shell";
+    case "ownmesh_session_open":
+      return "session.open";
+    case "ownmesh_session_attach":
+      return "session.attach";
+    case "ownmesh_session_list":
+      return "session.list";
+    case "ownmesh_session_show":
+      return "session.show";
+    case "ownmesh_session_write":
+      return "session.write";
+    case "ownmesh_session_resize":
+      return "session.resize";
+    case "ownmesh_session_replay":
+      return "session.replay";
+    case "ownmesh_session_claim":
+      return "session.claim";
+    case "ownmesh_session_release":
+      return "session.release";
+    case "ownmesh_session_close":
+      return "session.close";
+    case "ownmesh_session_terminate":
+      return "session.terminate";
+    case "ownmesh_git_status":
+      return "git.status";
+    case "ownmesh_git_diff":
+      return "git.diff";
     case "ownmesh_cancel_operation":
       return "cancel";
     default:
