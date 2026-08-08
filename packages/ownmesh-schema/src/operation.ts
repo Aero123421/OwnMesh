@@ -26,6 +26,12 @@ export interface OperationError {
   details?: unknown;
 }
 
+/** Server-issued exact-action binding verified by the Agent before side effects. */
+export interface OperationAuthorizationBinding {
+  /** Full bound canonical action object (server-built). */
+  bound_action: Record<string, unknown>;
+}
+
 export interface OperationRequestPayload {
   operation_contract: OperationContract;
   operation_id: string;
@@ -37,6 +43,8 @@ export interface OperationRequestPayload {
    * Client-supplied values are never authority and must be stripped before minting.
    */
   payload_hash?: string;
+  /** Exact-action binding facts. Required for remote MCP side effects. */
+  authorization?: OperationAuthorizationBinding;
   arguments: Record<string, unknown>;
 }
 
@@ -205,6 +213,7 @@ function parseRequest(payload: Record<string, unknown>): OperationRequestPayload
       "workspace_id",
       "idempotency_key",
       "payload_hash",
+      "authorization",
       "arguments",
     ]),
     "operation.request payload",
@@ -225,6 +234,15 @@ function parseRequest(payload: Record<string, unknown>): OperationRequestPayload
       bad("payload_hash must be a 64-char hex SHA-256 digest");
     }
     parsed.payload_hash = payloadHash.toLowerCase();
+  }
+  if (payload.authorization !== undefined) {
+    const auth = asRecord(payload.authorization, "authorization");
+    assertExactKeys(auth, new Set(["bound_action"]), "authorization");
+    const bound = asRecord(auth.bound_action, "authorization.bound_action");
+    if (!parsed.payload_hash) {
+      bad("operation.request authorization requires payload_hash");
+    }
+    parsed.authorization = { bound_action: bound };
   }
   return parsed;
 }

@@ -188,7 +188,14 @@ test("buildDeviceOperation always sets server payload_hash and wire binding fiel
   assert.equal(op.payload_hash.length, 64);
   assert.notEqual(op.payload_hash, "0".repeat(64));
   assert.equal(op.payload.payload_hash, op.payload_hash);
-  // Binding lives on inject metadata + payload_hash, not unknown protocol payload keys.
+  // Authorization binding is on the wire so the Agent can recompute/verify.
+  const auth = op.payload.authorization as { bound_action: Record<string, unknown> };
+  assert.ok(auth && typeof auth.bound_action === "object");
+  assert.equal(auth.bound_action.operation_id, "op_test1");
+  assert.equal(auth.bound_action.expires_at, expiresAt);
+  assert.equal(auth.bound_action.claim_version, 1);
+  assert.equal(auth.bound_action.oauth_client_id, "client_mcp");
+  assert.equal(await hashCanonicalAction(auth.bound_action), op.payload_hash);
   assert.equal(op.expires_at, expiresAt);
   assert.equal(op.claim_version, 1);
   assert.equal(op.oauth_client_id, "client_mcp");
@@ -423,4 +430,54 @@ test("concurrent differing actions with same key: one owner, one mismatch (SqlSt
   const failed = [s1, s2].find((s) => s.status === "failed");
   const err = (failed?.data as { error?: { code?: string } } | undefined)?.error;
   assert.equal(err?.code, "OWNMESH_E_IDEMPOTENCY_MISMATCH");
+});
+
+test("mutating tools reject missing idempotency_key before route", async () => {
+  const store = new MemoryStore();
+  const tok = await seedAuthed(store);
+  const deviceId = "dev_e3_idem_req";
+  await putActiveDevice(store, deviceId);
+  await store.issueDeviceCredential((await store.getDevice(deviceId))!, 3_600_000);
+
+  let routed = 0;
+  const router: OperationRouter = {
+    async routeToDevice() {
+      routed += 1;
+      return { status: "routed_to_device" };
+    },
+  };
+
+  const res = await handleMcp(
+    new Request("https://cp.test/mcp", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${tok.access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "ownmesh_fs_write",
+          arguments: {
+            device_id: deviceId,
+            path: "x.txt",
+            content: "no-key",
+            async: true,
+          },
+        },
+      }),
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    router,
+  );
+  const body = (await res.json()) as {
+    error?: { code?: number; message?: string; data?: { code?: string } };
+  };
+  assert.equal(routed, 0);
+  assert.equal(body.error?.code, -32602);
+  assert.match(String(body.error?.message || ""), /idempotency_key required/i);
+  assert.equal(body.error?.data?.code, "OWNMESH_E_IDEMPOTENCY_KEY_REQUIRED");
 });

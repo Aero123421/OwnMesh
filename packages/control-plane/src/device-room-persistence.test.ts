@@ -329,7 +329,7 @@ test("pending TTL and hard cap are force-pruned", () => {
   }
 
   const removed = router.pruneExpiredPending(now);
-  assert.ok(removed > 0);
+  assert.ok(removed.length > 0);
   assert.equal(router.pending.has("expired_op"), false);
   assert.ok(router.pending.size <= MAX_PENDING_OPERATIONS);
   assert.ok(router.pending.size > 0);

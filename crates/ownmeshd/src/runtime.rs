@@ -879,10 +879,7 @@ impl DaemonRuntime {
         // Policy already used server-side classification in handle_exec.
         // Hard ceilings are enforced here even if a caller bypasses MCP schema.
         let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
-        let max_output_bytes = p
-            .max_output_bytes
-            .unwrap_or(256 * 1024)
-            .clamp(1, 1_000_000);
+        let max_output_bytes = p.max_output_bytes.unwrap_or(256 * 1024).clamp(1, 1_000_000);
         let req = RunRequest {
             kind,
             program: execution_program,
@@ -967,10 +964,12 @@ impl DaemonRuntime {
             ownmesh_fs::read_file_range(&ws, &p.path, offset, want).map_err(fs_err)?;
         let returned = data.len() as u64;
         let next_offset = offset.saturating_add(returned);
-        // Prefer UTF-8 text; otherwise return bounded Base64 without lossy decode.
+        // Prefer UTF-8 text; otherwise return standard Base64 (RFC 4648 with padding)
+        // so clients can decode without inventing a custom alphabet. Never lossy-decode
+        // arbitrary bytes as text.
         let (encoding, content) = match String::from_utf8(data.clone()) {
             Ok(text) => ("utf-8", Value::String(text)),
-            Err(_) => ("base64", Value::String(base64_encode_nopad(&data))),
+            Err(_) => ("base64", Value::String(base64_standard(&data))),
         };
         let mut body = json!({
             "path": p.path,
@@ -2556,7 +2555,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn base64_encode_nopad(bytes: &[u8]) -> String {
+/// RFC 4648 standard Base64 with `=` padding (not base64url).
+fn base64_standard(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;

@@ -12,6 +12,7 @@ No remote Cloudflare resource is accessed.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -635,10 +636,77 @@ def main() -> int:
                     f"expected idempotency mismatch fail-closed, got: {mismatch_sc}"
                 )
 
+            # Binary retrieval: write non-UTF8 bytes via raw workspace then read through MCP.
+            # Runtime must label encoding=base64 (RFC4648 padded) and preserve byte next_offset.
+            binary_name = "e2-binary.bin"
+            binary_bytes = bytes([0x00, 0xFF, 0x10, 0x80, 0xFE]) + marker.encode("utf-8") + bytes([0x01, 0x02])
+            (workspace_dir / binary_name).write_bytes(binary_bytes)
+            bin_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_read",
+                    {
+                        "device_id": device_id,
+                        "path": binary_name,
+                        "offset": 0,
+                        "max_bytes": 4,
+                        "async": True,
+                        "idempotency_key": f"idem_bin_{marker}",
+                    },
+                    rpc_id=9,
+                )
+            )
+            bin_op = str(bin_sc.get("operation_id") or "")
+            bin_done = wait_operation(issuer, access_token, bin_op, want={"completed"})
+            bin_data = bin_done.get("data") if isinstance(bin_done.get("data"), dict) else {}
+            if str(bin_data.get("encoding") or "") != "base64":
+                raise RuntimeError(f"expected base64 encoding for binary read: {bin_done}")
+            chunk = base64.b64decode(str(bin_data.get("content") or ""))
+            if chunk != binary_bytes[:4]:
+                raise RuntimeError(f"binary chunk mismatch: got={chunk!r} want={binary_bytes[:4]!r}")
+            if int(bin_data.get("returned_bytes") or -1) != 4:
+                raise RuntimeError(f"returned_bytes mismatch: {bin_done}")
+            if int(bin_data.get("next_offset") or -1) != 4:
+                raise RuntimeError(f"next_offset must be byte cursor 4: {bin_done}")
+            next_cursor = bin_done.get("next_cursor")
+            if next_cursor not in (None, "off_4") and str(next_cursor) != "off_4":
+                # Prefer explicit off_N; tolerate null when only next_offset is present.
+                if "cur_" in str(next_cursor):
+                    raise RuntimeError(f"binary next_cursor must not be text cur_N: {bin_done}")
+
+            # Missing idempotency_key on mutating tool must fail closed before route.
+            missing_key_status, missing_key_body = http_json(
+                f"{issuer}/mcp",
+                method="POST",
+                headers={"authorization": f"Bearer {access_token}"},
+                body={
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "ownmesh_fs_write",
+                        "arguments": {
+                            "device_id": device_id,
+                            "path": "no-key.txt",
+                            "content": "x",
+                            "async": True,
+                        },
+                    },
+                },
+            )
+            if missing_key_status != 200:
+                raise RuntimeError(f"missing-key HTTP {missing_key_status}: {missing_key_body}")
+            if not isinstance(missing_key_body, dict) or not missing_key_body.get("error"):
+                raise RuntimeError(f"expected JSON-RPC error for missing idempotency_key: {missing_key_body}")
+            err_msg = str((missing_key_body.get("error") or {}).get("message") or "")
+            if "idempotency_key" not in err_msg.lower():
+                raise RuntimeError(f"missing-key error message unexpected: {missing_key_body}")
+
             print(
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
-                f"resume+idempotency+cancel+mismatch held "
-                f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op})"
+                f"resume+idempotency+cancel+mismatch+binary+required-key held "
+                f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op})"
             )
             return 0
         finally:

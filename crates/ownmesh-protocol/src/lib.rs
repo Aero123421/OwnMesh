@@ -18,9 +18,9 @@ mod version;
 
 pub use envelope::{fuzz_parse_envelope, Envelope, PROTOCOL_DEVICE_V1};
 pub use operation::{
-    OperationContract, OperationEnvelope, OperationError, OperationEventPayload, OperationPayload,
-    OperationProgressPayload, OperationProgressStatus, OperationRequestPayload,
-    OperationResultPayload, OperationResultStatus, OPERATION_CONTRACT_V1,
+    OperationAuthorizationBinding, OperationContract, OperationEnvelope, OperationError,
+    OperationEventPayload, OperationPayload, OperationProgressPayload, OperationProgressStatus,
+    OperationRequestPayload, OperationResultPayload, OperationResultStatus, OPERATION_CONTRACT_V1,
 };
 pub use version::{
     assert_current_wire_constant, default_supported_versions, negotiate, NegotiatedProtocol,

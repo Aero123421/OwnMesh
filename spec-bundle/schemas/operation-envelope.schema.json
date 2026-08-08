@@ -180,6 +180,18 @@
           "pattern": "^[0-9a-fA-F]{64}$",
           "description": "Server-computed SHA-256 hex of the canonical authorized action"
         },
+        "authorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bound_action"],
+          "description": "Server-issued exact-action binding verified by the Agent before side effects",
+          "properties": {
+            "bound_action": {
+              "type": "object",
+              "description": "Full bound canonical action object hashed into payload_hash"
+            }
+          }
+        },
         "arguments": {
           "type": "object"
         }

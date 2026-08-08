@@ -350,3 +350,64 @@ test("injectOperation clears pending when no ready agent", () => {
   assert.equal(room.router.pending.has(corr), false);
   assert.equal(room.router.status().pending, 0);
 });
+
+test("ready redelivers durable pending operation.request with fresh seq", async () => {
+  const deviceId = "dev_ready_redeliv_01ab";
+  const room = new DeviceRoomHarness(deviceId, () => true);
+  const agent1 = room.connect("agent");
+
+  room.router.sessions.get(agent1)!.phase = "ready";
+  room.router.sessions.get(agent1)!.remote_routing_enabled = true;
+
+  const corr = randomId("op_");
+  const payload = {
+    operation_contract: "ownmesh.operation/1.0",
+    operation_id: corr,
+    capability: "filesystem.write",
+    idempotency_key: "idem_redeliv",
+    payload_hash: "a".repeat(64),
+    arguments: { action: "fs.write", path: "x.txt", content: "v1" },
+  };
+  const prep = room.router.prepareInjectOperation({
+    type: "fs.write",
+    payload,
+    correlation_id: corr,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+  });
+  assert.equal(prep.ok, true);
+  if (!prep.ok) return;
+  const first = room.router.dispatchPreparedInject(prep.prepared);
+  assert.equal(first.status, "routed_to_device");
+  const firstFrames = room.drain(agent1);
+  assert.equal(firstFrames.length, 1);
+  const firstEnv = JSON.parse(firstFrames[0]!) as DeviceEnvelope;
+  assert.equal(firstEnv.type, "operation.request");
+  assert.equal(firstEnv.correlation_id, corr);
+  const firstSeq = firstEnv.seq;
+
+  // Simulate agent disconnect without result; pending remains durable.
+  room.router.unregisterSession(agent1);
+
+  // New agent reconnects and becomes ready — pending must be redelivered.
+  const agent2 = room.connect("agent");
+  room.router.sessions.get(agent2)!.phase = "proven";
+  await room.send(
+    agent2,
+    envFor(agent2, "ready", deviceId, {
+      remote_routing_enabled: true,
+      capabilities: ["filesystem.write"],
+    }),
+  );
+  const afterReady = room.drain(agent2).map((s) => JSON.parse(s) as DeviceEnvelope);
+  const ack = afterReady.find((e) => e.type === "ready.ack");
+  assert.ok(ack, "expected ready.ack");
+  const redelivered = afterReady.filter((e) => e.type === "operation.request");
+  assert.equal(redelivered.length, 1);
+  assert.equal(redelivered[0]!.correlation_id, corr);
+  assert.ok(
+    Number(redelivered[0]!.seq) > Number(firstSeq),
+    "redelivery must use a fresh advancing seq",
+  );
+  assert.equal(redelivered[0]!.payload.operation_id, corr);
+  assert.ok(room.router.pending.has(corr), "pending stays until terminal result");
+});

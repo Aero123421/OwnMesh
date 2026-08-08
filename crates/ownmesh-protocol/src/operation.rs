@@ -70,6 +70,18 @@ where
     Value::deserialize(deserializer).map(Some)
 }
 
+/// Server-issued exact-action binding carried with operation.request.
+///
+/// The Agent recomputes `sha256(stable_json(bound_action))` and rejects the
+/// request before any side effect when it does not equal `payload_hash`, or when
+/// request/envelope facts disagree with `bound_action`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationAuthorizationBinding {
+    /// Full bound canonical action object (server-built).
+    pub bound_action: Value,
+}
+
 /// Control Plane to Agent request payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +96,9 @@ pub struct OperationRequestPayload {
     /// Client-supplied values are never authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_hash: Option<String>,
+    /// Exact-action binding facts. Required for remote MCP side effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<OperationAuthorizationBinding>,
     pub arguments: Value,
 }
 
@@ -218,6 +233,19 @@ fn validate_request(payload: &OperationRequestPayload) -> Result<(), DomainError
         if !valid {
             return Err(bad_envelope(
                 "operation.request payload_hash must be a 64-char hex SHA-256 digest",
+            ));
+        }
+    }
+    if let Some(authorization) = payload.authorization.as_ref() {
+        if !authorization.bound_action.is_object() {
+            return Err(bad_envelope(
+                "operation.request authorization.bound_action must be an object",
+            ));
+        }
+        // Remote MCP side effects always carry both; partial bindings are rejected.
+        if payload.payload_hash.is_none() {
+            return Err(bad_envelope(
+                "operation.request authorization requires payload_hash",
             ));
         }
     }

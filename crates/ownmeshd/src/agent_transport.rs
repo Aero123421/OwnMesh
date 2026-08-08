@@ -617,7 +617,13 @@ async fn handle_wire_message(
             Ok(None)
         }
         Message::Pong(_) | Message::Frame(_) => Ok(None),
-        Message::Close(_) => Err("control plane closed the WebSocket".into()),
+        Message::Close(frame) => {
+            let detail = frame
+                .as_ref()
+                .map(|f| format!("code={} reason={}", f.code, f.reason))
+                .unwrap_or_else(|| "no close frame".into());
+            Err(format!("control plane closed the WebSocket ({detail})"))
+        }
         Message::Binary(_) => Err("binary WebSocket messages are unsupported".into()),
     }
 }
@@ -790,11 +796,17 @@ async fn handle_live_frame(
             let cancel_registry = Arc::clone(cancel_registry);
             let finish_tx = finish_tx.clone();
             let device_id = config.device_id.clone();
+            let envelope_expires_at = operation
+                .envelope
+                .expires_at
+                .as_ref()
+                .map(|exp| exp.at.to_rfc3339());
             tokio::spawn(async move {
                 let payload = dispatch_remote_operation(
                     &runtime,
                     &device_id,
                     &request,
+                    envelope_expires_at.as_deref(),
                     &cancel_registry,
                     Some(cancel_rx),
                 )
@@ -810,7 +822,32 @@ async fn handle_live_frame(
             });
             Ok(())
         }
-        "error" => Err("control plane returned an Agent protocol error".into()),
+        "error" => {
+            let code = envelope
+                .payload
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let message = envelope
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // Result CAS rejects are operation-scoped; keep the Agent socket alive so
+            // subsequent work (and reconnect recovery) is not denied by one reject.
+            if code == "OWNMESH_E_RESULT_REJECTED" {
+                tracing::warn!(
+                    code,
+                    message,
+                    correlation_id = envelope.correlation_id.as_deref().unwrap_or(""),
+                    "control plane rejected an operation result; continuing Agent session"
+                );
+                return Ok(());
+            }
+            Err(format!(
+                "control plane returned an Agent protocol error ({code}): {message}"
+            ))
+        }
         other => Err(format!("unsupported control-plane message type '{other}'")),
     }
 }
@@ -826,6 +863,231 @@ fn unsupported_surface_payload(operation_id: &ownmesh_domain::OperationId) -> Va
             "retryable": false
         }
     })
+}
+
+/// Stable JSON encoding matching control-plane `stableStringify` (sorted object keys).
+fn stable_stringify(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(v) => {
+            if *v {
+                "true".to_owned()
+            } else {
+                "false".to_owned()
+            }
+        }
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned()),
+        Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&stable_stringify(item));
+            }
+            out.push(']');
+            out
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = String::from("{");
+            let mut first = true;
+            for key in keys {
+                let Some(v) = map.get(key) else {
+                    continue;
+                };
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                out.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned()));
+                out.push(':');
+                out.push_str(&stable_stringify(v));
+            }
+            out.push('}');
+            out
+        }
+    }
+}
+
+fn sha256_hex_str(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn recompute_action_facts(arguments: &Map<String, Value>) -> Result<Map<String, Value>, String> {
+    let mut facts = Map::new();
+    for (key, value) in arguments {
+        if matches!(
+            key.as_str(),
+            "action"
+                | "device_id"
+                | "async"
+                | "tool"
+                | "operation_id"
+                | "_client_hints"
+                | "force_allow"
+                | "bypass_policy"
+                | "skip_approval"
+                | "allow"
+                | "approved"
+                | "intent_summary"
+                | "risk_note"
+                | "principal"
+                | "principal_id"
+                | "tenant_id"
+                | "policy_result"
+                | "payload_hash"
+                | "risk_level"
+                | "decision"
+                | "idempotency_key"
+                | "workspace_id"
+        ) {
+            continue;
+        }
+        if key == "content" {
+            if let Some(text) = value.as_str() {
+                facts.insert("content_sha256".into(), Value::String(sha256_hex_str(text)));
+                facts.insert(
+                    "content_bytes".into(),
+                    Value::Number(serde_json::Number::from(text.as_bytes().len() as u64)),
+                );
+                continue;
+            }
+        }
+        facts.insert(key.clone(), value.clone());
+    }
+    Ok(facts)
+}
+
+/// Verify control-plane exact-action binding immediately before side effects.
+///
+/// Integrity model: the Agent hop is authenticated to the control plane. The
+/// binding object must hash to `payload_hash` and must agree with the request
+/// envelope/arguments so a substituted body cannot execute under a stale hash.
+fn verify_exact_action_binding(
+    device_id: &DeviceId,
+    request: &OperationRequestPayload,
+    envelope_expires_at: Option<&str>,
+) -> Result<(), String> {
+    let Some(authorization) = request.authorization.as_ref() else {
+        // Cancel without binding is allowed only for non-side-effect recovery paths
+        // that never reach DaemonRuntime file/exec handlers with mutable args.
+        let action = action_of(request);
+        if request.capability == "operation.cancel"
+            || action == "cancel"
+            || action == "ownmesh_cancel_operation"
+            || request.capability == "approval.decision"
+            || action == "approval.decision"
+        {
+            return Ok(());
+        }
+        return Err(
+            "remote side-effect operations require authorization.bound_action and payload_hash"
+                .into(),
+        );
+    };
+    let Some(payload_hash) = request.payload_hash.as_deref() else {
+        return Err("authorization binding requires payload_hash".into());
+    };
+    let bound = &authorization.bound_action;
+    let Some(bound_obj) = bound.as_object() else {
+        return Err("authorization.bound_action must be an object".into());
+    };
+
+    let recomputed = sha256_hex_str(&stable_stringify(bound));
+    if !recomputed.eq_ignore_ascii_case(payload_hash) {
+        return Err("payload_hash does not match authorization.bound_action".into());
+    }
+
+    let bound_op = bound_obj
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if bound_op != request.operation_id.as_str() {
+        return Err("bound operation_id mismatch".into());
+    }
+    let bound_device = bound_obj
+        .get("device_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if bound_device != device_id.as_str() {
+        return Err("bound device_id mismatch".into());
+    }
+    let bound_cap = bound_obj
+        .get("capability")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if bound_cap != request.capability {
+        return Err("bound capability mismatch".into());
+    }
+    let action = action_of(request);
+    let bound_action = bound_obj
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !action.is_empty() && bound_action != action {
+        return Err("bound action mismatch".into());
+    }
+    let bound_expires = bound_obj
+        .get("expires_at")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if let Some(env_exp) = envelope_expires_at {
+        // Normalize via Timestamp parse so `.000Z` vs `Z` and equivalent RFC3339
+        // forms from JS/Rust do not false-reject an otherwise valid binding.
+        let bound_ts = ownmesh_domain::Timestamp::parse(bound_expires)
+            .map_err(|_| "bound expires_at is not a valid timestamp".to_owned())?;
+        let env_ts = ownmesh_domain::Timestamp::parse(env_exp)
+            .map_err(|_| "envelope expires_at is not a valid timestamp".to_owned())?;
+        if bound_ts != env_ts {
+            return Err("bound expires_at does not match envelope expires_at".into());
+        }
+    } else if !bound_expires.is_empty() {
+        return Err("envelope missing expires_at required by binding".into());
+    }
+
+    let bound_workspace = bound_obj
+        .get("workspace_id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let request_workspace = request
+        .workspace_id
+        .as_ref()
+        .map(|w| Value::String(w.as_str().to_owned()))
+        .unwrap_or(Value::Null);
+    if bound_workspace != request_workspace {
+        return Err("bound workspace_id mismatch".into());
+    }
+
+    // Recompute action facts from the live arguments and require exact match.
+    let args = args_object(request);
+    let live_facts = recompute_action_facts(&args)?;
+    let bound_facts = bound_obj
+        .get("facts")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if live_facts != bound_facts {
+        return Err("bound action facts do not match request arguments".into());
+    }
+
+    // Principal/tenant/oauth/claim must be present on the bound object (server-set).
+    for required in ["principal_id", "tenant_id", "claim_version", "tool"] {
+        if !bound_obj.contains_key(required) {
+            return Err(format!("bound_action missing required field '{required}'"));
+        }
+    }
+    Ok(())
 }
 
 fn remote_agent_client(device_id: &DeviceId) -> ClientIdentity {
@@ -983,10 +1245,27 @@ async fn dispatch_remote_operation(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     device_id: &DeviceId,
     request: &OperationRequestPayload,
+    envelope_expires_at: Option<&str>,
     cancel_registry: &CancelRegistry,
     cancel_rx: Option<watch::Receiver<bool>>,
 ) -> Value {
     let operation_id = request.operation_id.to_string();
+
+    // E3: verify server-issued exact-action binding before any policy/side effect.
+    // Cancel remains a control path and still verifies when a binding is present.
+    if let Err(message) = verify_exact_action_binding(device_id, request, envelope_expires_at) {
+        return json!({
+            "operation_contract": OPERATION_CONTRACT_V1,
+            "operation_id": operation_id,
+            "status": "failed",
+            "error": {
+                "code": "OWNMESH_E_ACTION_BINDING_MISMATCH",
+                "message": message,
+                "retryable": false
+            }
+        });
+    }
+
     let mapped = match map_request_to_method(request) {
         Ok(mapped) => mapped,
         Err(message) => {
@@ -1533,5 +1812,106 @@ mod tests {
             .send(Message::Text(raw.to_string().into()))
             .await
             .unwrap();
+    }
+
+    fn sample_bound_request(
+        device_id: &str,
+        path: &str,
+        content: Option<&str>,
+    ) -> (OperationRequestPayload, String) {
+        use ownmesh_protocol::OperationAuthorizationBinding;
+        let expires = Timestamp::now()
+            .checked_add(Duration::from_secs(120))
+            .unwrap()
+            .to_rfc3339();
+        let mut facts = Map::new();
+        facts.insert("path".into(), Value::String(path.into()));
+        if let Some(text) = content {
+            facts.insert("content_sha256".into(), Value::String(sha256_hex_str(text)));
+            facts.insert(
+                "content_bytes".into(),
+                Value::Number(serde_json::Number::from(text.as_bytes().len() as u64)),
+            );
+        }
+        let mut bound = Map::new();
+        bound.insert("capability".into(), json!("filesystem.write"));
+        bound.insert("action".into(), json!("fs.write"));
+        bound.insert("tool".into(), json!("ownmesh_fs_write"));
+        bound.insert("device_id".into(), json!(device_id));
+        bound.insert("principal_id".into(), json!("prin_dev"));
+        bound.insert("tenant_id".into(), json!("ten_default"));
+        bound.insert("oauth_client_id".into(), Value::Null);
+        bound.insert("workspace_id".into(), Value::Null);
+        bound.insert("facts".into(), Value::Object(facts));
+        bound.insert("operation_id".into(), json!("op_bind_test"));
+        bound.insert("expires_at".into(), json!(expires));
+        bound.insert("claim_version".into(), json!(1));
+        let bound_value = Value::Object(bound);
+        let hash = sha256_hex_str(&stable_stringify(&bound_value));
+        let mut arguments = Map::new();
+        arguments.insert("action".into(), json!("fs.write"));
+        arguments.insert("path".into(), json!(path));
+        if let Some(text) = content {
+            arguments.insert("content".into(), json!(text));
+        }
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_bind_test").unwrap(),
+            capability: "filesystem.write".into(),
+            workspace_id: None,
+            idempotency_key: "idem_bind_test".into(),
+            payload_hash: Some(hash.clone()),
+            authorization: Some(OperationAuthorizationBinding {
+                bound_action: bound_value,
+            }),
+            arguments: Value::Object(arguments),
+        };
+        (request, expires)
+    }
+
+    #[test]
+    fn exact_action_binding_accepts_matching_request() {
+        let device = DeviceId::parse("dev_bind_ok").unwrap();
+        let (request, expires) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+    }
+
+    #[test]
+    fn exact_action_binding_rejects_argument_tamper() {
+        let device = DeviceId::parse("dev_bind_tamper").unwrap();
+        let (mut request, expires) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
+        request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("path".into(), json!("evil.txt"));
+        let err = verify_exact_action_binding(&device, &request, Some(&expires)).unwrap_err();
+        assert!(err.contains("facts"), "{err}");
+    }
+
+    #[test]
+    fn exact_action_binding_rejects_hash_tamper() {
+        let device = DeviceId::parse("dev_bind_hash").unwrap();
+        let (mut request, expires) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
+        request.payload_hash = Some("0".repeat(64));
+        let err = verify_exact_action_binding(&device, &request, Some(&expires)).unwrap_err();
+        assert!(err.contains("payload_hash"), "{err}");
+    }
+
+    #[test]
+    fn exact_action_binding_rejects_missing_binding_for_side_effect() {
+        let device = DeviceId::parse("dev_bind_missing").unwrap();
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_missing").unwrap(),
+            capability: "filesystem.write".into(),
+            workspace_id: None,
+            idempotency_key: "idem_missing".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({ "action": "fs.write", "path": "x" }),
+        };
+        let err = verify_exact_action_binding(&device, &request, None).unwrap_err();
+        assert!(err.contains("authorization"), "{err}");
     }
 }

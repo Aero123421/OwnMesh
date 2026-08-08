@@ -250,9 +250,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         content: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once write retries",
+        },
       },
-      required: ["device_id", "path", "content"],
+      required: ["device_id", "path", "content", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -272,9 +275,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         content: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once write retries",
+        },
       },
-      required: ["device_id", "path", "content"],
+      required: ["device_id", "path", "content", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -318,9 +324,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         path: str,
         recursive: { type: "boolean", default: false },
         workspace_id: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once delete retries",
+        },
       },
-      required: ["device_id", "path"],
+      required: ["device_id", "path", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -343,9 +352,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         content: str,
         expected_sha256: str,
         workspace_id: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once patch retries",
+        },
       },
-      required: ["device_id", "path", "content"],
+      required: ["device_id", "path", "content", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -367,11 +379,14 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         program: str,
         args: { type: "array", items: { type: "string" } },
         cwd: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once command retries",
+        },
         async: { type: "boolean", description: "Return immediately with operation_id" },
         ...execBoundProps,
       },
-      required: ["device_id", "program"],
+      required: ["device_id", "program", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -392,11 +407,14 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         program: str,
         args: { type: "array", items: { type: "string" } },
         cwd: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once command retries",
+        },
         async: { type: "boolean" },
         ...execBoundProps,
       },
-      required: ["device_id", "program"],
+      required: ["device_id", "program", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -417,11 +435,14 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         command: str,
         cwd: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once shell retries",
+        },
         async: { type: "boolean" },
         ...execBoundProps,
       },
-      required: ["device_id", "command"],
+      required: ["device_id", "command", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -441,11 +462,14 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         command: str,
         cwd: str,
-        idempotency_key: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once shell retries",
+        },
         async: { type: "boolean" },
         ...execBoundProps,
       },
-      required: ["device_id", "command"],
+      required: ["device_id", "command", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -1189,6 +1213,11 @@ export async function bindCanonicalAction(
   return { bound, payload_hash: await hashCanonicalAction(bound) };
 }
 
+/** True when the tool can produce a side effect that must not silently re-run. */
+export function toolRequiresIdempotencyKey(tool: McpToolDef): boolean {
+  return tool.risk === "write" || tool.risk === "exec";
+}
+
 /**
  * Build a device-routed operation that satisfies ownmesh.operation/1.0.
  * correlation_id === operation_id === payload.operation_id (exact-once binding).
@@ -1209,6 +1238,7 @@ export async function buildDeviceOperation(opts: {
   /** Optional precomputed canonical action / hash (avoids double work). */
   canonicalAction?: Record<string, unknown>;
   payloadHash?: string;
+  boundAction?: Record<string, unknown>;
 }): Promise<{
   type: string;
   payload: Record<string, unknown>;
@@ -1216,6 +1246,8 @@ export async function buildDeviceOperation(opts: {
   payload_hash: string;
   /** Action facts only (no operation_id/expiry/claim); used for idempotency match. */
   canonical_action: Record<string, unknown>;
+  /** Full bound object hashed into payload_hash (also on wire authorization). */
+  bound_action: Record<string, unknown>;
   idempotency_key: string;
   workspace_id?: string;
   expires_at: string;
@@ -1263,25 +1295,27 @@ export async function buildDeviceOperation(opts: {
       tenantId: opts.tenantId,
       oauthClientId: opts.oauthClientId,
     }));
-  const payloadHash =
-    opts.payloadHash ??
-    (
-      await bindCanonicalAction(canonicalAction, {
-        operationId: opts.operationId,
-        expiresAt: opts.expiresAt,
-        claimVersion,
-      })
-    ).payload_hash;
+  const bound =
+    opts.boundAction && opts.payloadHash
+      ? { bound: opts.boundAction, payload_hash: opts.payloadHash }
+      : await bindCanonicalAction(canonicalAction, {
+          operationId: opts.operationId,
+          expiresAt: opts.expiresAt,
+          claimVersion,
+        });
+  const payloadHash = bound.payload_hash;
+  const boundAction = bound.bound;
 
-  // Wire payload stays within ownmesh.operation/1.0 request fields (deny_unknown).
-  // Binding facts (expires_at/claim_version/oauth_client_id/operation_id) are hashed
-  // into payload_hash and carried on the inject envelope / D1 row.
+  // Wire payload stays within ownmesh.operation/1.0 request fields.
+  // authorization.bound_action carries the exact hashed object so the Agent can
+  // recompute/verify payload_hash and match request facts before side effects.
   const payload: Record<string, unknown> = {
     operation_contract: OPERATION_CONTRACT_V1,
     operation_id: opts.operationId,
     capability,
     idempotency_key: idempotencyKey,
     payload_hash: payloadHash,
+    authorization: { bound_action: boundAction },
     arguments: argumentsBody,
   };
   let workspaceId: string | undefined;
@@ -1297,9 +1331,10 @@ export async function buildDeviceOperation(opts: {
     correlation_id: opts.operationId,
     payload_hash: payloadHash,
     canonical_action: canonicalAction,
+    bound_action: boundAction,
     idempotency_key: idempotencyKey,
     workspace_id: workspaceId,
-    // Top-level inject metadata (not inside protocol payload object).
+    // Top-level inject metadata (also mirrored inside bound_action).
     expires_at: opts.expiresAt,
     claim_version: claimVersion,
     oauth_client_id: opts.oauthClientId ?? null,
@@ -1822,6 +1857,26 @@ export async function handleMcp(
     const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
     const claimVersion = 1;
 
+    // Side-effect tools require an explicit caller idempotency key so a lost MCP
+    // response can be safely retried without minting a fresh operation identity.
+    if (toolRequiresIdempotencyKey(tool)) {
+      const key =
+        typeof safeArgs.idempotency_key === "string" ? safeArgs.idempotency_key.trim() : "";
+      if (!key) {
+        return mcpError(id, -32602, "idempotency_key required for side-effect tools", {
+          tool: name,
+          code: "OWNMESH_E_IDEMPOTENCY_KEY_REQUIRED",
+        });
+      }
+      if (key.length > 256) {
+        return mcpError(id, -32602, "idempotency_key exceeds 256 characters", {
+          tool: name,
+          code: "OWNMESH_E_IDEMPOTENCY_KEY_INVALID",
+        });
+      }
+      safeArgs.idempotency_key = key;
+    }
+
     // High-risk tools: still route to device, but default path surfaces approval
     // when device is offline or returns ask. Control plane NEVER auto-approves
     // based on model text. Client-supplied allow/force/skip fields are not authority.
@@ -2138,15 +2193,40 @@ export async function handleMcp(
       let data = (detail.result as Record<string, unknown>) || detail;
       let truncated = Boolean((data as { truncated?: boolean }).truncated);
       let next_cursor: string | null = null;
-      // Apply control-plane truncation for large text fields
+      // Preserve device-side byte/range cursors. Never re-slice base64 as text or
+      // invent a character cursor unrelated to the file offset.
+      const encoding =
+        typeof (data as { encoding?: unknown }).encoding === "string"
+          ? String((data as { encoding: string }).encoding).toLowerCase()
+          : "";
+      const deviceNextOffset = (data as { next_offset?: unknown }).next_offset;
+      if (
+        deviceNextOffset !== undefined &&
+        deviceNextOffset !== null &&
+        Number.isFinite(Number(deviceNextOffset))
+      ) {
+        next_cursor = `off_${Math.max(0, Math.floor(Number(deviceNextOffset)))}`;
+      }
       if (typeof (data as { content?: unknown }).content === "string") {
-        const t = truncateText(
-          String((data as { content: string }).content),
-          typeof args.max_bytes === "number" ? args.max_bytes : 64_000,
-        );
-        data = { ...data, content: t.text };
-        truncated = truncated || t.truncated;
-        next_cursor = t.next_cursor;
+        if (encoding === "base64" || encoding === "base64url") {
+          // Binary payloads are already byte-windowed by ownmeshd. Do not apply
+          // UTF-16-oriented text truncation that would corrupt Base64 integrity.
+          if (truncated && next_cursor == null && deviceNextOffset != null) {
+            next_cursor = `off_${Math.max(0, Math.floor(Number(deviceNextOffset)))}`;
+          }
+        } else {
+          // Text only: optional control-plane soft cap for oversized UTF-8 bodies.
+          // When the device already supplied next_offset, prefer that cursor.
+          const t = truncateText(
+            String((data as { content: string }).content),
+            typeof args.max_bytes === "number" ? args.max_bytes : 64_000,
+          );
+          if (t.truncated) {
+            data = { ...data, content: t.text, truncated: true };
+            truncated = true;
+            if (next_cursor == null) next_cursor = t.next_cursor;
+          }
+        }
       }
       if (Array.isArray((data as { entries?: unknown }).entries)) {
         const p = paginateList((data as { entries: unknown[] }).entries, {

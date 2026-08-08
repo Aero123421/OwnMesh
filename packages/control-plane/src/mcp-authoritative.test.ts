@@ -208,7 +208,7 @@ test("store is authoritative: empty tracker still polls after isolate restart", 
   });
 
   const createRes = await handleMcp(
-    rpc("ownmesh_command_run", { device_id: deviceId, program: "echo", args: ["hi"], async: true }, tok.access_token),
+    rpc("ownmesh_command_run", { device_id: deviceId, program: "echo", args: ["hi"], async: true, idempotency_key: "idem_auth_cmd" }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
     router,

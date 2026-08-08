@@ -238,6 +238,12 @@ export type PendingOperation = {
   from_session: string;
   created_at: number;
   payload: Record<string, unknown>;
+  /** Bound envelope expiry used when redelivering after Agent reconnect. */
+  expires_at?: string;
+  /** Last successful dispatch time (ms). */
+  dispatched_at?: number;
+  /** How many times this pending op was sent to an Agent. */
+  dispatch_count?: number;
 };
 
 /** Announced in accepted.session_parameters and enforced on inbound frames. */
@@ -282,6 +288,8 @@ export type HandleMessageResult = {
    * Harness finalizes immediately (no durable store).
    */
   deferred_dispatch?: DeferredDispatch;
+  /** Pending entries dropped for TTL/expiry — DO must mark matching MCP ops failed. */
+  expired_pending?: PendingOperation[];
 };
 
 type SessionIngressGuard = {
@@ -434,13 +442,23 @@ export class DeviceRoomRouter {
     this.pending.clear();
     for (const p of state.pending || []) {
       if (!p || typeof p.correlation_id !== "string") continue;
-      this.pending.set(p.correlation_id, {
+      const restored: PendingOperation = {
         correlation_id: p.correlation_id,
         type: String(p.type || ""),
         from_session: String(p.from_session || ""),
         created_at: Number(p.created_at) || 0,
         payload: p.payload && typeof p.payload === "object" ? { ...p.payload } : {},
-      });
+      };
+      if (typeof (p as PendingOperation).expires_at === "string") {
+        restored.expires_at = String((p as PendingOperation).expires_at);
+      }
+      if (Number.isFinite((p as PendingOperation).dispatched_at)) {
+        restored.dispatched_at = Number((p as PendingOperation).dispatched_at);
+      }
+      if (Number.isFinite((p as PendingOperation).dispatch_count)) {
+        restored.dispatch_count = Number((p as PendingOperation).dispatch_count);
+      }
+      this.pending.set(p.correlation_id, restored);
     }
     this.consumedNonces.clear();
     for (const [nonce, exp] of Object.entries(state.consumedNonces || {})) {
@@ -537,33 +555,81 @@ export class DeviceRoomRouter {
   }
 
   /** Prune TTL-expired + over-limit seen ids and pending ops. Returns counts removed. */
-  pruneAll(now = Date.now()): { seen: number; pending: number } {
+  pruneAll(now = Date.now()): { seen: number; pending: number; expired: PendingOperation[] } {
     let seen = 0;
     for (const guard of this.ingressGuards.values()) {
       seen += pruneSeenMessageIds(guard, now);
     }
-    const pending = this.pruneExpiredPending(now);
-    return { seen, pending };
+    const expired = this.pruneExpiredPending(now);
+    return { seen, pending: expired.length, expired };
   }
 
-  pruneExpiredPending(now = Date.now()): number {
-    let removed = 0;
+  /**
+   * Drop TTL-expired / over-cap pending entries.
+   * Returns removed entries so the Durable Object can mark matching MCP ops
+   * terminal (`failed` / expired) instead of silently losing them.
+   */
+  pruneExpiredPending(now = Date.now()): PendingOperation[] {
+    const removed: PendingOperation[] = [];
     for (const [key, p] of [...this.pending]) {
-      if (!Number.isFinite(p.created_at) || now - p.created_at > PENDING_TTL_MS) {
+      const expMs =
+        typeof p.expires_at === "string" && p.expires_at.trim() !== ""
+          ? Date.parse(p.expires_at)
+          : Number.isFinite(p.created_at)
+            ? p.created_at + PENDING_TTL_MS
+            : NaN;
+      const staleByTtl =
+        !Number.isFinite(p.created_at) || now - p.created_at > PENDING_TTL_MS;
+      const staleByExpiry = Number.isFinite(expMs) && expMs <= now;
+      if (staleByTtl || staleByExpiry) {
         this.pending.delete(key);
-        removed++;
+        removed.push(p);
       }
     }
-    // Hard cap: drop oldest first.
+    // Hard cap: drop oldest first (visible expiry path).
     if (this.pending.size > MAX_PENDING_OPERATIONS) {
       const ordered = [...this.pending.entries()].sort((a, b) => a[1].created_at - b[1].created_at);
       const overflow = this.pending.size - MAX_PENDING_OPERATIONS;
       for (let i = 0; i < overflow; i++) {
-        this.pending.delete(ordered[i]![0]);
-        removed++;
+        const entry = ordered[i]!;
+        this.pending.delete(entry[0]);
+        removed.push(entry[1]);
       }
     }
     return removed;
+  }
+
+  /**
+   * After an Agent becomes ready, redeliver durable pending operation.request
+   * frames with fresh seq/message_id. Completed correlations are handled by the
+   * Agent cache; in-flight side effects remain journal-deduped on the device.
+   */
+  redeliverPendingToAgent(sessionId: string, now = Date.now()): number {
+    const session = this.sessions.get(sessionId);
+    if (!session || !this.isRemoteRoutingAgent(session)) return 0;
+    let n = 0;
+    for (const p of this.pending.values()) {
+      const expMs =
+        typeof p.expires_at === "string" && p.expires_at.trim() !== ""
+          ? Date.parse(p.expires_at)
+          : p.created_at + PENDING_TTL_MS;
+      if (Number.isFinite(expMs) && expMs <= now) continue;
+      const envelope = this.nextEnvelope(
+        "operation.request",
+        p.payload,
+        p.correlation_id,
+        typeof p.expires_at === "string" && p.expires_at.trim() !== ""
+          ? { expiresAt: p.expires_at }
+          : undefined,
+      );
+      if (this.sendToSession(sessionId, JSON.stringify(envelope))) {
+        p.dispatched_at = now;
+        p.dispatch_count = (p.dispatch_count || 0) + 1;
+        n++;
+      }
+    }
+    if (n > 0) this.notifyStateChange();
+    return n;
   }
 
   /**
@@ -896,6 +962,11 @@ export class DeviceRoomRouter {
           msg.correlation_id,
         );
         this.sendToSession(sessionId, JSON.stringify(ack));
+        // Lease recovery: redeliver durable pending work the previous Agent socket
+        // may have missed between persist and result (reconnect/resume path).
+        const expired = this.pruneExpiredPending();
+        const redelivered =
+          att.remote_routing_enabled === true ? this.redeliverPendingToAgent(sessionId) : 0;
         void this.audit.append({
           kind: "device.ready",
           summary: "agent ready",
@@ -903,9 +974,14 @@ export class DeviceRoomRouter {
           meta: {
             capabilities: msg.payload,
             remote_routing_enabled: att.remote_routing_enabled === true,
+            pending_redelivered: redelivered,
+            pending_expired: expired.length,
           },
         });
-        return { ok: true };
+        return {
+          ok: true,
+          expired_pending: expired,
+        };
       }
       case "operation.request": {
         if (att.role !== "client") return { ok: false, error: "invalid_role" };
@@ -997,6 +1073,8 @@ export class DeviceRoomRouter {
           from_session: sessionId,
           created_at: Date.now(),
           payload: normalized,
+          expires_at: agentFrame.expires_at,
+          dispatch_count: 0,
         });
         return {
           ok: true,
@@ -1128,6 +1206,12 @@ export class DeviceRoomRouter {
             deferred.pending_key,
           );
           this.sendToSession(deferred.client_session_id, JSON.stringify(offline));
+        }
+      } else {
+        const pending = this.pending.get(deferred.pending_key);
+        if (pending) {
+          pending.dispatched_at = Date.now();
+          pending.dispatch_count = (pending.dispatch_count || 0) + 1;
         }
       }
       return n;
@@ -1267,6 +1351,9 @@ export class DeviceRoomRouter {
       from_session: from,
       created_at: Date.now(),
       payload: normalized,
+      expires_at: envelope.expires_at,
+      dispatched_at: undefined,
+      dispatch_count: 0,
     });
     return {
       ok: true,
@@ -1321,6 +1408,12 @@ export class DeviceRoomRouter {
       this.pending.delete(prepared.correlation_id);
       this.notifyStateChange();
       return { status: "device_offline", detail: { code: "OWNMESH_E_DEVICE_OFFLINE" } };
+    }
+    const pending = this.pending.get(prepared.correlation_id);
+    if (pending) {
+      pending.dispatched_at = Date.now();
+      pending.dispatch_count = (pending.dispatch_count || 0) + 1;
+      if (prepared.envelope.expires_at) pending.expires_at = prepared.envelope.expires_at;
     }
     return {
       status: "routed_to_device",
@@ -1613,6 +1706,13 @@ export class DeviceRoom {
       await this.storage().put(ROOM_STATE_STORAGE_KEY, snap);
     } catch (err) {
       this.storageBroken = true;
+      const message = err instanceof Error ? err.message : String(err);
+      void this.router.audit.append({
+        kind: "device.storage_fail",
+        summary: message,
+        device_id: this.deviceId,
+        meta: { phase: "persistNow" },
+      });
       this.failClosedAll("storage unavailable", 1013);
       throw err instanceof Error ? err : new Error("storage_persist_failed");
     }
@@ -2208,6 +2308,39 @@ export class DeviceRoom {
       ws.serializeAttachment(updatedAttachment);
     }
 
+    // Pending TTL/expiry must surface a terminal MCP status (never silent drop).
+    if (result.ok && result.expired_pending && result.expired_pending.length > 0 && this.env.DB) {
+      try {
+        const store = createStore(this.env);
+        for (const expired of result.expired_pending) {
+          const opId =
+            expired.payload?.operation_id != null
+              ? String(expired.payload.operation_id)
+              : expired.correlation_id;
+          await applyMcpOperationResult(store, {
+            operationId: opId,
+            correlationId: expired.correlation_id,
+            deviceId: this.deviceId,
+            payload: {
+              operation_contract: OPERATION_CONTRACT_V1,
+              operation_id: opId,
+              status: "failed",
+              error: {
+                code: "OWNMESH_E_OPERATION_EXPIRED",
+                message:
+                  "operation expired or was evicted before a device result arrived; retry with a new idempotency key if the side effect is still required",
+                retryable: true,
+              },
+            },
+          });
+        }
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+    }
+
     // operation.result: bind + CAS-persist BEFORE forward/pending removal.
     if (result.ok && result.mcp_result) {
       const corr = result.mcp_result.correlation_id;
@@ -2250,10 +2383,11 @@ export class DeviceRoom {
         if (corr && result.deferred_forward) {
           this.router.finalizeOperationResult(corr, result.deferred_forward);
         }
-      } catch {
+      } catch (err) {
         // Store write failure: fail closed, no success forward.
         this.storageBroken = true;
-        this.failClosedAll("storage unavailable", 1013);
+        const detail = err instanceof Error ? err.message : String(err);
+        this.failClosedAll(`storage unavailable: ${detail}`.slice(0, 120), 1013);
         return;
       }
     }
@@ -2417,9 +2551,26 @@ export async function applyMcpOperationResult(
     op = await store.getMcpOperation(payloadOpId);
   }
 
-  // No store row: allow room-only routing only when no operation_id was claimed.
+  // No store row: allow room-only routing when no operation_id was claimed, or when
+  // the device completed a control cancel request that was never claimed into D1
+  // (MCP cancel updates the *target* row, not the cancel request identity).
   if (!op) {
-    if (wantOpId) return { ok: false, error: "unknown_operation" };
+    if (wantOpId) {
+      const incoming = opts.payload;
+      const resultObj =
+        incoming.result && typeof incoming.result === "object"
+          ? (incoming.result as Record<string, unknown>)
+          : undefined;
+      const looksLikeCancelControl =
+        resultObj != null &&
+        (Object.prototype.hasOwnProperty.call(resultObj, "cancelled") ||
+          Object.prototype.hasOwnProperty.call(resultObj, "signal_delivered") ||
+          Object.prototype.hasOwnProperty.call(resultObj, "target_operation_id"));
+      if (looksLikeCancelControl && String(incoming.status || "completed") === "completed") {
+        return { ok: true, record: null, room_only: true };
+      }
+      return { ok: false, error: "unknown_operation" };
+    }
     return { ok: true, record: null, room_only: true };
   }
 
