@@ -63,6 +63,13 @@ pub mod methods {
     pub const CREDENTIAL_ROTATE: &str = "credential.rotate";
     /// Revoke a per-client credential (denied for uncredentialed IPC).
     pub const CREDENTIAL_REVOKE: &str = "credential.revoke";
+
+    /// List official + custom CLI profiles with local detection status.
+    pub const PROFILE_LIST: &str = "profile.list";
+    /// Show one profile definition + detection status.
+    pub const PROFILE_SHOW: &str = "profile.show";
+    /// Rescan PATH for official profile binaries (same as list; explicit intent).
+    pub const PROFILE_SCAN: &str = "profile.scan";
 }
 
 /// Correlation identifier for a single request/response pair.

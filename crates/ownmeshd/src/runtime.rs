@@ -28,8 +28,8 @@ use ownmesh_exec::{
     verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
 };
 use ownmesh_fs::{
-    apply_patch, delete_path, git_diff, git_status, list_dir_page, stat_path, write_file,
-    GitDiffOpts, GitStatusOpts, WorkspaceRoot,
+    apply_patch, apply_unified_diff, delete_path, git_diff, git_status, list_dir_page,
+    looks_like_unified_diff, stat_path, write_file, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
 };
 use ownmesh_ipc::{
     app_error, canonicalize_principal_key, is_credentialed_client_principal, is_human_os_principal,
@@ -43,6 +43,7 @@ use ownmesh_policy::{
     temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
     ExecutableIdentityBinding, OperationFacts, PolicyDocument, TemporaryGrant,
 };
+use ownmesh_profiles::{ProfileRegistry, ProfileStatus};
 use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{SessionKind, SessionManager, StreamKind as SessionStreamKind};
 use ownmesh_session_host::{default_shell_command, LiveHost};
@@ -218,6 +219,10 @@ pub struct FsWriteParams {
     /// When set, refuse the write unless the current file hash matches (fs.patch).
     #[serde(default)]
     pub expected_sha256: Option<String>,
+    /// Patch format: `replace` (default whole-file) or `unified` (bounded unified diff).
+    /// When omitted, content that looks like a unified diff is applied as unified.
+    #[serde(default)]
+    pub patch_format: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
     #[serde(default)]
@@ -1207,6 +1212,35 @@ impl DaemonRuntime {
 
     fn execute_fs_write(&self, p: &FsWriteParams) -> IpcResult<Value> {
         let ws = self.workspace_for(p.workspace_id.as_deref())?;
+        let format = p
+            .patch_format
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("");
+        // Explicit replace always wins. Unified is selected by format or by a
+        // hash-checked patch whose body is a unified diff (E7).
+        let use_unified = match format {
+            "replace" | "whole" | "full" => false,
+            "unified" | "unified_diff" | "diff" => true,
+            _ if p.expected_sha256.is_some() && looks_like_unified_diff(&p.content) => true,
+            _ => false,
+        };
+
+        if use_unified {
+            let new_hash =
+                apply_unified_diff(&ws, &p.path, &p.content, p.expected_sha256.as_deref())
+                    .map_err(fs_err)?;
+            return Ok(json!({
+                "path": p.path,
+                "bytes_written": p.content.len(),
+                "sha256": new_hash,
+                "patched": true,
+                "patch_format": "unified",
+                "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+            }));
+        }
+
         if let Some(expected) = p.expected_sha256.as_deref() {
             let new_hash =
                 apply_patch(&ws, &p.path, p.content.as_bytes(), Some(expected)).map_err(fs_err)?;
@@ -1215,6 +1249,7 @@ impl DaemonRuntime {
                 "bytes_written": p.content.len(),
                 "sha256": new_hash,
                 "patched": true,
+                "patch_format": "replace",
                 "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
             }));
         }
@@ -2061,6 +2096,8 @@ full_user_access/full_access for arbitrary commands",
             ops_methods::WORKSPACE_ADD => self.handle_workspace_add(params, client),
             ops_methods::WORKSPACE_UPDATE => self.handle_workspace_update(params, client),
             ops_methods::WORKSPACE_REMOVE => self.handle_workspace_remove(params, client),
+            methods::PROFILE_LIST | methods::PROFILE_SCAN => self.handle_profile_list(params),
+            methods::PROFILE_SHOW => self.handle_profile_show(params),
             methods::APPROVAL_LIST => self.handle_approval_list(),
             methods::APPROVAL_SHOW => self.handle_approval_show(params),
             methods::APPROVAL_APPROVE => self.handle_approval_approve(params, client).await,
@@ -2155,11 +2192,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 raw.to_owned()
             }
         };
-        let kind = match p.kind.as_deref() {
+        let mut kind = match p.kind.as_deref() {
             Some("process") => SessionKind::Process,
             Some("profile_agent") | Some("profile") => SessionKind::ProfileAgent,
             _ => SessionKind::Pty,
         };
+        if p.profile_id.is_some() && kind == SessionKind::Pty {
+            // Explicit profile_id without kind defaults to profile agent session.
+            kind = SessionKind::ProfileAgent;
+        }
         let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
         // Resolve/pin cwd under the selected workspace (custody when enforce is on;
@@ -2172,7 +2213,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             Some(ws_root.root().to_string_lossy().into_owned())
         };
-        // Accept either explicit argv (`command`) or MCP program/args shape.
+        // Official profile launch plan (E6): detection + preferred interface, with
+        // PTY fallback. Never copies tool credentials to the cloud. Generic CLIs
+        // still use program/args/command without profile registration.
+        let mut profile_meta: Option<Value> = None;
         let command = if let Some(cmd) = p.command.clone().filter(|c| !c.is_empty()) {
             Some(cmd)
         } else if let Some(program) = p
@@ -2186,6 +2230,28 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 argv.extend(args);
             }
             Some(argv)
+        } else if let Some(profile_id) = p
+            .profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let reg = ProfileRegistry::with_official();
+            let plan = reg
+                .launch_plan(profile_id, None, /* force_pty */ true)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: format!("profile launch plan failed: {e}"),
+                })?;
+            profile_meta = Some(json!({
+                "profile_id": plan.profile_id,
+                "interface": plan.interface.as_str(),
+                "use_pty": plan.use_pty,
+                "program": plan.program,
+            }));
+            let mut argv = vec![plan.program];
+            argv.extend(plan.args);
+            Some(argv)
         } else {
             None
         };
@@ -2197,7 +2263,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 title,
                 principal,
                 Self::now(),
-                p.profile_id,
+                p.profile_id.clone(),
                 None,
                 command.clone(),
                 cwd.clone(),
@@ -2205,10 +2271,11 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 Some(workspace_id.clone()),
             )
             .map_err(session_err)?;
-        // Own a live PTY for interactive sessions (E5). Process/profile kinds stay
-        // metadata-only until their adapters land; failure to spawn is fail-closed
-        // so ChatGPT never sees a fake echo-only "session".
-        if kind == SessionKind::Pty {
+        // Own a live PTY for interactive sessions (E5) and profile PTY fallback (E6).
+        // Process-only kinds stay metadata until structured adapters stream events.
+        // Failure to spawn is fail-closed so ChatGPT never sees a fake echo-only session.
+        let spawn_live = matches!(kind, SessionKind::Pty | SessionKind::ProfileAgent);
+        if spawn_live {
             let pty_cmd = match command.as_ref() {
                 Some(argv) if !argv.is_empty() => PtyCommand {
                     program: argv[0].clone(),
@@ -2252,6 +2319,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     if let Some(obj) = value.as_object_mut() {
                         obj.insert("live_pty".into(), json!(true));
                         obj.insert("pty_backend".into(), json!(backend));
+                        if let Some(meta) = profile_meta {
+                            obj.insert("profile".into(), meta);
+                        }
                     }
                     return Ok(value);
                 }
@@ -2271,8 +2341,69 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         })?;
         if let Some(obj) = value.as_object_mut() {
             obj.insert("live_pty".into(), json!(false));
+            if let Some(meta) = profile_meta {
+                obj.insert("profile".into(), meta);
+            }
         }
         Ok(value)
+    }
+
+    fn handle_profile_list(&self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            cursor: Option<String>,
+            #[serde(default)]
+            limit: Option<usize>,
+        }
+        let p: P = parse_params(params)?;
+        let reg = ProfileRegistry::with_official();
+        let mut statuses: Vec<ProfileStatus> = reg.detect_all();
+        statuses.sort_by(|a, b| a.id.cmp(&b.id));
+        let limit = p.limit.unwrap_or(32).clamp(1, 64);
+        let start = p
+            .cursor
+            .as_deref()
+            .and_then(|c| statuses.iter().position(|s| s.id == c).map(|i| i + 1))
+            .unwrap_or(0);
+        let end = (start + limit).min(statuses.len());
+        let page = &statuses[start..end];
+        let truncated = end < statuses.len();
+        let next_cursor = if truncated {
+            page.last().map(|s| s.id.clone())
+        } else {
+            None
+        };
+        Ok(json!({
+            "profiles": page,
+            "count": page.len(),
+            "total": statuses.len(),
+            "truncated": truncated,
+            "next_cursor": next_cursor,
+            "official_count": 9,
+            "note": "local PATH detection only; credentials never leave the device",
+        }))
+    }
+
+    fn handle_profile_show(&self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse_params(params)?;
+        let reg = ProfileRegistry::with_official();
+        let profile = reg.get(&p.id).map_err(|e| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: e.to_string(),
+        })?;
+        let status = reg.detect(&p.id).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })?;
+        Ok(json!({
+            "profile": profile,
+            "status": status,
+        }))
     }
 
     fn handle_session_list(
@@ -2706,13 +2837,33 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     .unwrap_or(ownmesh_session::MAX_REPLAY_PAGE_BYTES),
             )
             .map_err(session_err)?;
+        // Live-ring remainder is a durable continuation fact — never report EOF.
+        let live_pending = self
+            .live_hosts
+            .get(&p.id)
+            .map(LiveHost::pending_output_bytes)
+            .unwrap_or(0);
+        let mut truncated = page.truncated;
+        let mut next_seq = page.next_seq;
+        if live_pending > 0 {
+            truncated = true;
+            if next_seq.is_none() {
+                // Point past the last returned chunk so the next page continues.
+                next_seq = page
+                    .chunks
+                    .last()
+                    .map(|c| c.seq.saturating_add(1))
+                    .or(Some(1));
+            }
+        }
         Ok(json!({
             "chunks": page.chunks,
             "session_id": p.id,
-            "truncated": page.truncated,
-            "next_seq": page.next_seq,
+            "truncated": truncated,
+            "next_seq": next_seq,
             "returned_bytes": page.returned_bytes,
             "live_drained_bytes": drained,
+            "live_pending_bytes": live_pending,
             "live_pty": self.live_hosts.contains_key(&p.id),
         }))
     }
@@ -2926,6 +3077,18 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 message: "session.resize requires resize_seq for remote principals".into(),
             });
         }
+        // Fail closed before reserving/finalizing when no live host exists.
+        // Persisted/stale sessions after daemon recovery must not consume sequences
+        // or report resized:true without a real PTY side effect (matches write).
+        if !self.live_hosts.contains_key(&p.id) {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "session {} has no live PTY host (restarted daemon or non-PTY kind)",
+                    p.id
+                ),
+            });
+        }
 
         // Reserve seq+digest before PTY resize mutation (same exact-once rules as write).
         let resize_digest = format!("{}:{}", p.cols, p.rows);
@@ -2959,12 +3122,17 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         }
 
         if should_deliver {
-            if let Some(host) = self.live_hosts.get(&p.id) {
-                host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
-                    code: app_error::INTERNAL,
-                    message: format!("live PTY resize failed: {e}"),
-                })?;
-            }
+            let host = self.live_hosts.get(&p.id).ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "session {} has no live PTY host (restarted daemon or non-PTY kind)",
+                    p.id
+                ),
+            })?;
+            host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("live PTY resize failed: {e}"),
+            })?;
             let principal = client.client_name.as_str();
             let snapshot = self.sessions.clone();
             if let Some(seq) = applied_seq {
@@ -2983,7 +3151,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             "cols": p.cols,
             "rows": p.rows,
             "workspace_id": bound_ws,
-            "live_pty": self.live_hosts.contains_key(&p.id),
+            "live_pty": true,
             "resize_seq": applied_seq,
         }))
     }
@@ -3275,18 +3443,44 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
     }
 
     /// Move pending live-host bytes into the session replay ring (bounded chunks).
+    ///
+    /// Loops until the live ring is empty or the per-call spool budget is hit.
+    /// When live-ring bytes remain after the budget, a visible system note is
+    /// appended so callers never see a false EOF (`truncated:false,next_seq:null`).
     fn drain_live_output_into_session(&mut self, session_id: &str) -> IpcResult<usize> {
-        let Some(host) = self.live_hosts.get(session_id) else {
+        if !self.live_hosts.contains_key(session_id) {
             return Ok(0);
-        };
-        let (text, ring_truncated, exited, exit_code) = host
-            .drain_output(ownmesh_session::MAX_CHUNK_BYTES)
-            .map_err(|e| IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: format!("live PTY drain failed: {e}"),
-            })?;
+        }
+        // Cap how much we fold into the durable spool per call so a huge ring
+        // cannot monopolize the request path. Remaining live bytes stay visible.
+        let per_call_budget = ownmesh_session::MAX_REPLAY_PAGE_BYTES;
         let mut drained = 0usize;
-        if !text.is_empty() {
+        let mut saw_ring_truncated = false;
+        let mut exited = false;
+        let mut exit_code: Option<u32> = None;
+        let mut remaining_after = 0usize;
+
+        while drained < per_call_budget {
+            let take = (per_call_budget - drained).min(ownmesh_session::MAX_CHUNK_BYTES);
+            // Drain without holding `live_hosts` across session mutations.
+            let (text, ring_truncated, child_exited, child_code, remaining) = {
+                let Some(host) = self.live_hosts.get(session_id) else {
+                    break;
+                };
+                host.drain_output(take).map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("live PTY drain failed: {e}"),
+                })?
+            };
+            saw_ring_truncated |= ring_truncated;
+            exited |= child_exited;
+            if child_code.is_some() {
+                exit_code = child_code;
+            }
+            remaining_after = remaining;
+            if text.is_empty() {
+                break;
+            }
             let snapshot = self.sessions.clone();
             // Split oversized text into MAX_CHUNK_BYTES pieces.
             let mut offset = 0usize;
@@ -3314,21 +3508,35 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 drained = drained.saturating_add(piece.len());
                 offset = end;
             }
-            if ring_truncated {
+            self.commit_sessions(snapshot)?;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        // Re-check pending after the loop (reader may have appended concurrently).
+        if let Some(host) = self.live_hosts.get(session_id) {
+            remaining_after = remaining_after.max(host.pending_output_bytes());
+        }
+
+        if saw_ring_truncated || remaining_after > 0 {
+            let snapshot = self.sessions.clone();
+            if saw_ring_truncated {
                 let _ = self.sessions.push_output(
                     session_id,
                     "[live-pty ring truncated under backpressure]",
                     SessionStreamKind::System,
                 );
             }
-            self.commit_sessions(snapshot)?;
-        } else if ring_truncated {
-            let snapshot = self.sessions.clone();
-            let _ = self.sessions.push_output(
-                session_id,
-                "[live-pty ring truncated under backpressure]",
-                SessionStreamKind::System,
-            );
+            if remaining_after > 0 {
+                let _ = self.sessions.push_output(
+                    session_id,
+                    format!(
+                        "[live-pty more output pending bytes={remaining_after}; continue replay]"
+                    ),
+                    SessionStreamKind::System,
+                );
+            }
             self.commit_sessions(snapshot)?;
         }
         if exited {
@@ -3455,6 +3663,13 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
     #[must_use]
     pub fn session_count_for_test(&self) -> usize {
         self.sessions.list().len()
+    }
+
+    /// Test helper: drop the live PTY while keeping session metadata (daemon restart).
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn stop_live_host_for_test(&mut self, session_id: &str) {
+        self.stop_live_host(session_id);
     }
 
     /// Test helper: force a controller lease expiry timestamp (does not auto-extend).

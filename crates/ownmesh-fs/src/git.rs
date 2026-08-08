@@ -389,11 +389,15 @@ fn load_or_build_diff_spool(cwd: &Path, args: &[&str], max_bytes: usize) -> FsRe
 
     // Only trust an existing spool when it is a regular file we can open exclusively
     // enough to hash, and the embedded content hash matches the line payload.
+    // Stat/ceiling BEFORE allocation so a huge attacker-controlled spool cannot
+    // force unbounded `read()` into daemon memory.
+    let spool_byte_ceiling = GIT_STDOUT_HARD_CAP.saturating_add(256 * 1024);
     if let Ok(meta) = std::fs::symlink_metadata(&path) {
-        if meta.file_type().is_symlink() || !meta.is_file() {
+        let oversize = usize::try_from(meta.len()).map_or(true, |n| n > spool_byte_ceiling);
+        if meta.file_type().is_symlink() || !meta.is_file() || oversize {
             let _ = std::fs::remove_file(&path);
         } else if let Ok(bytes) = std::fs::read(&path) {
-            if bytes.len() <= GIT_STDOUT_HARD_CAP.saturating_add(256 * 1024) {
+            if bytes.len() <= spool_byte_ceiling {
                 if let Ok(spool) = serde_json::from_slice::<DiffSpool>(&bytes) {
                     let mut hasher = Sha256::new();
                     for (i, line) in spool.lines.iter().enumerate() {

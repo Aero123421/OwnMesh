@@ -248,6 +248,49 @@ fn is_script_or_interpreter_in_dir(program: &str, cwd: Option<&Path>) -> bool {
     path_has_shebang(path)
 }
 
+/// Hard ceiling for structured executable pin/revalidation hashing.
+/// Prevents a remote full-access structured command from forcing unbounded
+/// `read()` of a huge regular file before policy execution.
+pub const MAX_EXECUTABLE_PIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Hard ceiling for the on-disk idempotency journal file.
+pub const MAX_JOURNAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Stream SHA-256 of a regular file up to `max_bytes` without unbounded allocation.
+fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResult<String> {
+    if expected_len > max_bytes {
+        return Err(ExecError::Journal(format!(
+            "executable exceeds {max_bytes} byte pin budget: {} ({expected_len} bytes)",
+            path.display()
+        )));
+    }
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max_bytes {
+            return Err(ExecError::Journal(format!(
+                "executable exceeded {max_bytes} byte pin budget while hashing: {}",
+                path.display()
+            )));
+        }
+        hasher.update(&buf[..n]);
+    }
+    if total != expected_len {
+        return Err(ExecError::Journal(format!(
+            "executable length changed while hashing ({expected_len} -> {total})"
+        )));
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Capture device/inode/content digest for a structured executable path.
 ///
 /// # Errors
@@ -261,10 +304,7 @@ pub fn pin_executable(path: &Path, policy_kind: CommandKind) -> ExecResult<Execu
             path.display()
         )));
     }
-    let bytes = std::fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let content_sha256 = hex::encode(hasher.finalize());
+    let content_sha256 = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES)?;
     let (device, inode) = file_identity(&meta);
     Ok(ExecutablePin {
         path: path.to_string_lossy().into_owned(),
@@ -309,15 +349,12 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
                 .into(),
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| {
+    let digest = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
         ExecError::Journal(format!(
             "executable content revalidation failed for {}: {e}",
             path.display()
         ))
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let digest = hex::encode(hasher.finalize());
     if digest != pin.content_sha256 {
         return Err(ExecError::Journal(
             "executable content digest drifted before execution; request must be re-authorized"
@@ -658,7 +695,29 @@ impl IdempotencyJournal {
     pub fn open(path: impl Into<PathBuf>) -> ExecResult<Self> {
         let path = path.into();
         let entries = if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
+            let meta = std::fs::metadata(&path)?;
+            if meta.len() > MAX_JOURNAL_FILE_BYTES {
+                return Err(ExecError::Journal(format!(
+                    "idempotency journal exceeds {MAX_JOURNAL_FILE_BYTES} byte budget ({})",
+                    meta.len()
+                )));
+            }
+            // Cap allocation to the pre-checked size (never unbounded read_to_string).
+            use std::io::Read;
+            let file = std::fs::File::open(&path)?;
+            let mut raw = String::new();
+            let limit = usize::try_from(meta.len().saturating_add(1))
+                .unwrap_or(usize::MAX)
+                .min(
+                    usize::try_from(MAX_JOURNAL_FILE_BYTES.saturating_add(1)).unwrap_or(usize::MAX),
+                );
+            let mut take = file.take(u64::try_from(limit).unwrap_or(u64::MAX));
+            take.read_to_string(&mut raw)?;
+            if raw.len() as u64 > MAX_JOURNAL_FILE_BYTES {
+                return Err(ExecError::Journal(format!(
+                    "idempotency journal exceeds {MAX_JOURNAL_FILE_BYTES} byte budget"
+                )));
+            }
             serde_json::from_str(&raw).map_err(|e| ExecError::Journal(e.to_string()))?
         } else {
             HashMap::new()
@@ -1178,6 +1237,39 @@ mod tests {
         assert_eq!(res.exit_code, Some(0));
         assert!(res.stdout.contains("hello-ownmesh"));
         assert!(!res.timed_out);
+    }
+
+    #[test]
+    fn pin_executable_rejects_oversized_before_allocation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            // Sparse when the FS supports it — still reports large len() for the ceiling.
+            f.set_len(MAX_EXECUTABLE_PIN_BYTES + 1).unwrap();
+        }
+        let err = pin_executable(&path, CommandKind::Structured).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pin budget") || msg.contains("byte"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn journal_open_rejects_oversized_file_before_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(MAX_JOURNAL_FILE_BYTES + 1).unwrap();
+        }
+        let err = IdempotencyJournal::open(&path).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("journal exceeds") || msg.contains("byte budget"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]

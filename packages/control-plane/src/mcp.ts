@@ -154,7 +154,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_list_profiles",
-    description: "List official/custom CLI profiles known to OwnMesh (catalog metadata)",
+    description:
+      "List official CLI profiles. Without device_id returns catalog metadata; with device_id runs live PATH detection on that PC (credentials never leave the device).",
     inputSchema: {
       type: "object",
       properties: { ...deviceProp, ...cursorProps },
@@ -369,7 +370,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_fs_patch",
     description:
-      "Replace a whole file when expected_sha256 matches (hash-checked write). Bounded unified-diff apply remains a later E7 surface.",
+      "Hash-checked file patch on a device. Default is whole-file replace when expected_sha256 matches. Set patch_format=unified (or supply a unified diff body with expected_sha256) for bounded single-file unified-diff apply. Multi-file/binary diffs are rejected.",
     inputSchema: {
       type: "object",
       properties: {
@@ -377,6 +378,11 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         path: str,
         content: str,
         expected_sha256: str,
+        patch_format: {
+          type: "string",
+          description: "replace (whole-file) or unified (bounded unified-diff apply)",
+          enum: ["replace", "unified", "unified_diff", "diff"],
+        },
         workspace_id: str,
         idempotency_key: {
           type: "string",
@@ -1733,9 +1739,14 @@ function toolCapability(toolName: string): string {
     case "ownmesh_fs_list":
     case "ownmesh_fs_stat":
     case "ownmesh_fs_read":
-    case "ownmesh_profile_list":
-    case "ownmesh_profile_show":
       return "filesystem.read";
+    case "ownmesh_list_profiles":
+    case "ownmesh_profile_list":
+      return "profile.list";
+    case "ownmesh_profile_show":
+      return "profile.show";
+    case "ownmesh_profile_scan":
+      return "profile.scan";
     case "ownmesh_fs_write":
     case "ownmesh_fs_delete":
     case "ownmesh_fs_patch":
@@ -1845,6 +1856,13 @@ function toolAction(toolName: string): string {
       return "workspace.update";
     case "ownmesh_workspace_remove":
       return "workspace.remove";
+    case "ownmesh_list_profiles":
+    case "ownmesh_profile_list":
+      return "profile.list";
+    case "ownmesh_profile_show":
+      return "profile.show";
+    case "ownmesh_profile_scan":
+      return "profile.scan";
     case "ownmesh_cancel_operation":
       return "cancel";
     default:
@@ -2474,8 +2492,9 @@ export async function handleMcp(
       return mcpResult(id, toolContent(env));
     }
 
-    if (name === "ownmesh_list_profiles") {
-      // Catalog metadata from control plane; live detect still happens on device.
+    if (name === "ownmesh_list_profiles" && !deviceId) {
+      // Catalog-only fallback when no device is selected. With device_id, route
+      // to ownmeshd for real PATH detection (E6).
       const { page, next_cursor, truncated } = paginateList(
         [...OFFICIAL_PROFILE_CATALOG],
         {
@@ -2486,9 +2505,11 @@ export async function handleMcp(
       const env = makeEnvelope({
         operation_id: operationId,
         status: "completed",
-        device_id: deviceId || undefined,
-        summary: "official profile catalog",
-        data: { profiles: page, note: "Detection runs on device; catalog is control-plane metadata." },
+        summary: "official profile catalog (no device_id; detection not run)",
+        data: {
+          profiles: page,
+          note: "Pass device_id for live PATH detection on the selected PC.",
+        },
         truncated,
         next_cursor,
         warnings: injectWarnings,

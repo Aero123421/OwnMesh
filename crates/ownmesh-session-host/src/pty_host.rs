@@ -52,7 +52,7 @@ impl PtySession {
         write_stdin_line(writer.as_mut(), line).map_err(|err| err.to_string())
     }
 
-    /// Stop and reap the child. `Drop` repeats this as a backstop on every error path.
+    /// Stop and reap the child process tree. `Drop` repeats this as a backstop.
     pub fn terminate_and_wait(&self) -> Result<(), String> {
         let SessionKindInner::Pty { child, .. } = &self.kind else {
             return Ok(());
@@ -60,7 +60,7 @@ impl PtySession {
         let mut child = child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        terminate_child(child.as_mut())
+        terminate_child_tree(child.as_mut(), self.handle.pid)
     }
 }
 
@@ -70,7 +70,7 @@ impl Drop for PtySession {
             let child = child
                 .get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = terminate_child(child.as_mut());
+            let _ = terminate_child_tree(child.as_mut(), self.handle.pid);
         }
     }
 }
@@ -127,7 +127,11 @@ impl ByteRing {
         }
     }
 
-    fn drain(&mut self, max_bytes: usize) -> (Vec<u8>, bool) {
+    /// Drain up to `max_bytes`. Returns `(bytes, ring_truncated, remaining_after)`.
+    ///
+    /// `remaining_after > 0` is a durable continuation fact: the caller must not
+    /// treat this drain as EOF while unread live-ring bytes remain.
+    fn drain(&mut self, max_bytes: usize) -> (Vec<u8>, bool, usize) {
         let take = max_bytes.min(self.bytes);
         let mut out = Vec::with_capacity(take);
         for _ in 0..take {
@@ -143,7 +147,11 @@ impl ByteRing {
         if self.bytes == 0 {
             self.truncated = false;
         }
-        (out, truncated)
+        (out, truncated, self.bytes)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -182,11 +190,13 @@ impl LiveHost {
 
     /// Drain up to `max_bytes` of pending UTF-8 lossy output.
     ///
-    /// Returns `(text, ring_truncated, child_exited, exit_code)`.
+    /// Returns `(text, ring_truncated, child_exited, exit_code, remaining_bytes)`.
+    /// `remaining_bytes > 0` means more live-ring data is pending and must be
+    /// surfaced as a continuation (never a silent EOF).
     pub fn drain_output(
         &self,
         max_bytes: usize,
-    ) -> Result<(String, bool, bool, Option<u32>), String> {
+    ) -> Result<(String, bool, bool, Option<u32>, usize), String> {
         // Opportunistically observe child exit without blocking.
         if let Ok(mut child) = self.child.lock() {
             if let Ok(Some(status)) = child.try_wait() {
@@ -198,9 +208,14 @@ impl LiveHost {
             }
         }
         let mut ring = self.output.lock().map_err(|e| e.to_string())?;
-        let (bytes, truncated) = ring.drain(max_bytes.max(1));
+        let (bytes, truncated, remaining) = ring.drain(max_bytes.max(1));
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        Ok((text, truncated, ring.exited, ring.exit_code))
+        Ok((text, truncated, ring.exited, ring.exit_code, remaining))
+    }
+
+    /// Bytes still buffered in the live ring (not yet drained into the spool).
+    pub fn pending_output_bytes(&self) -> usize {
+        self.output.lock().map(|ring| ring.remaining()).unwrap_or(0)
     }
 
     /// True when the child has exited (best-effort).
@@ -217,7 +232,10 @@ impl LiveHost {
         }
     }
 
-    /// Kill and reap the child; stop the reader thread.
+    /// Kill and reap the child process tree; stop the reader thread.
+    ///
+    /// Uses OS process-tree containment (Windows `taskkill /T`, Unix session/pgid
+    /// kill) so background descendants of interactive shells do not survive.
     pub fn terminate(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::SeqCst);
         // Drop writer so the child sees EOF on stdin before kill.
@@ -229,7 +247,7 @@ impl LiveHost {
                 .child
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            terminate_child(child.as_mut())
+            terminate_child_tree(child.as_mut(), self.handle.pid)
         };
         // Never join the reader on the request/Drop path: ConPTY read() can stay
         // blocked after kill on some Windows hosts and would hang the daemon.
@@ -279,11 +297,62 @@ fn write_stdin_line(writer: &mut dyn Write, line: &str) -> std::io::Result<()> {
     writer.flush()
 }
 
-fn terminate_child(child: &mut (dyn portable_pty::Child + Send + Sync)) -> Result<(), String> {
+/// Kill a process tree by OS facilities that do not require `unsafe`.
+///
+/// - Windows: `taskkill /T /F` walks the parent/child tree (Job Object would need
+///   `unsafe` which this workspace forbids).
+/// - Unix: portable-pty `setsid()` makes the shell a session leader; kill the
+///   session (`pkill -s`) plus process-group and direct PID so background jobs
+///   (`sleep &`) cannot outlive the session.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // Session kill first (covers background jobs that changed PGID).
+        let _ = std::process::Command::new("pkill")
+            .args(["-KILL", "-s", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // Negative PID = process group (session leader is usually its own PGID).
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn terminate_child_tree(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    known_pid: Option<u32>,
+) -> Result<(), String> {
     if matches!(child.try_wait(), Ok(Some(_))) {
         return Ok(());
     }
 
+    let pid = known_pid.or_else(|| child.process_id());
+    if let Some(pid) = pid {
+        kill_process_tree(pid);
+    }
+
+    // Direct kill remains as a backstop when tree kill is unavailable/racy.
     if let Err(kill_err) = child.kill() {
         return match child.try_wait() {
             Ok(Some(_)) => Ok(()),
@@ -809,7 +878,8 @@ mod tests {
         let mut host = LiveHost::spawn(&cmd, PtySize::default()).expect("spawn live host");
         let mut acc = String::new();
         for _ in 0..80 {
-            let (chunk, _trunc, exited, _) = host.drain_output(64 * 1024).expect("drain");
+            let (chunk, _trunc, exited, _, _remaining) =
+                host.drain_output(64 * 1024).expect("drain");
             acc.push_str(&chunk);
             if acc.contains("LIVE_HOST_MARKER_OK") || exited {
                 break;
@@ -820,6 +890,72 @@ mod tests {
         assert!(
             acc.contains("LIVE_HOST_MARKER_OK"),
             "live host must capture real process output, got: {acc:?}"
+        );
+    }
+
+    #[test]
+    fn byte_ring_drain_reports_remaining_continuation() {
+        let mut ring = ByteRing::new();
+        // 128 KiB of pending live output; drain only 64 KiB at a time.
+        ring.push(&vec![b'A'; 128 * 1024]);
+        let (first, trunc1, rem1) = ring.drain(64 * 1024);
+        assert_eq!(first.len(), 64 * 1024);
+        assert!(!trunc1);
+        assert_eq!(rem1, 64 * 1024, "must surface remaining live-ring bytes");
+        assert_eq!(ring.remaining(), 64 * 1024);
+        let (second, trunc2, rem2) = ring.drain(64 * 1024);
+        assert_eq!(second.len(), 64 * 1024);
+        assert!(!trunc2);
+        assert_eq!(rem2, 0);
+        assert_eq!(ring.remaining(), 0);
+    }
+
+    #[test]
+    fn terminate_kills_background_descendant_process_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("bg-child-alive");
+
+        #[cfg(windows)]
+        let cmd = {
+            // Child of the session shell sleeps then writes a marker. Terminate
+            // must kill the whole tree (taskkill /T) so the marker never appears.
+            let marker_win = marker.to_string_lossy().replace('/', "\\");
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec![
+                    "/Q".into(),
+                    "/C".into(),
+                    format!(
+                        "start /b cmd /c \"ping -n 9 127.0.0.1 >nul & echo survived>{marker_win}\" & ping -n 30 127.0.0.1 >nul"
+                    ),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        #[cfg(unix)]
+        let cmd = {
+            let marker_s = marker.to_string_lossy().replace('\\', "/");
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!("(sleep 8; printf survived > '{marker_s}') & wait"),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        };
+
+        let mut host = LiveHost::spawn(&cmd, PtySize::default()).expect("spawn tree host");
+        // Give the background child time to start.
+        std::thread::sleep(Duration::from_millis(600));
+        host.terminate().expect("terminate process tree");
+        // Wait past the child's sleep window; marker must not appear.
+        std::thread::sleep(Duration::from_millis(9_000));
+        assert!(
+            !marker.exists(),
+            "background descendant survived session terminate (process-tree kill failed)"
         );
     }
 

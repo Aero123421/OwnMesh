@@ -1057,3 +1057,153 @@ async fn session_write_pending_after_final_persist_failure_is_at_most_once() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn profile_list_detects_official_ids_without_credential_exfil() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let listed = rt
+        .dispatch(methods::PROFILE_LIST, None, &client("local"))
+        .await
+        .expect("profile.list");
+    assert_eq!(listed["official_count"], 9);
+    assert_eq!(listed["total"], 9);
+    let profiles = listed["profiles"].as_array().expect("profiles array");
+    assert_eq!(profiles.len(), 9);
+    let ids: Vec<&str> = profiles.iter().filter_map(|p| p["id"].as_str()).collect();
+    assert!(ids.contains(&"codex"));
+    assert!(ids.contains(&"claude-code"));
+    assert!(ids.contains(&"pi"));
+    // Status is local PATH detection only — never embeds secrets.
+    let blob = listed.to_string().to_ascii_lowercase();
+    assert!(!blob.contains("api_key"));
+    assert!(!blob.contains("authorization"));
+}
+
+#[tokio::test]
+async fn fs_patch_applies_bounded_unified_diff() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    rt.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+
+    rt.dispatch(
+        methods::OPS_FS_WRITE,
+        Some(json!({
+            "path": "patch-me.txt",
+            "content": "one\ntwo\nthree\n",
+            "idempotency_key": "seed-patch-file",
+        })),
+        &client("local"),
+    )
+    .await
+    .expect("seed file");
+
+    let diff = concat!(
+        "--- a/patch-me.txt\n",
+        "+++ b/patch-me.txt\n",
+        "@@ -1,3 +1,3 @@\n",
+        " one\n",
+        "-two\n",
+        "+TWO\n",
+        " three\n",
+    );
+    let patched = rt
+        .dispatch(
+            methods::OPS_FS_WRITE,
+            Some(json!({
+                "path": "patch-me.txt",
+                "content": diff,
+                "patch_format": "unified",
+                "idempotency_key": "unified-patch-1",
+            })),
+            &client("local"),
+        )
+        .await
+        .expect("unified patch");
+    assert_ne!(
+        patched.get("approval_required"),
+        Some(&json!(true)),
+        "unexpected approval gate: {patched}"
+    );
+    let body = patched.get("result").unwrap_or(&patched);
+    assert_eq!(body["patched"], true, "response={patched}");
+    assert_eq!(body["patch_format"], "unified");
+
+    let read = rt
+        .dispatch(
+            methods::OPS_FS_READ,
+            Some(json!({ "path": "patch-me.txt", "max_bytes": 1024 })),
+            &client("local"),
+        )
+        .await
+        .expect("read patched");
+    let read_body = read.get("result").unwrap_or(&read);
+    assert_eq!(read_body["content"], "one\nTWO\nthree\n");
+}
+
+#[tokio::test]
+async fn session_resize_without_live_host_fails_before_consuming_sequence() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let id = open_session(&mut rt, "owner", "resize-stale").await;
+
+    // Simulate daemon recovery: metadata survives, live PTY does not.
+    rt.stop_live_host_for_test(&id);
+
+    let err = rt
+        .dispatch(
+            session_methods::RESIZE,
+            Some(json!({
+                "id": id,
+                "cols": 120,
+                "rows": 40,
+                "resize_seq": 1,
+            })),
+            &client("owner"),
+        )
+        .await
+        .expect_err("phantom resize must fail");
+    match err {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::CONFLICT, "{message}");
+            assert!(
+                message.to_ascii_lowercase().contains("no live pty"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Sequence must remain unconsumed so a later reattach can still use seq=1.
+    // Re-open is not possible on same id; verify a second resize still fails the
+    // same way (not "replayed" success).
+    let err2 = rt
+        .dispatch(
+            session_methods::RESIZE,
+            Some(json!({
+                "id": id,
+                "cols": 120,
+                "rows": 40,
+                "resize_seq": 1,
+            })),
+            &client("owner"),
+        )
+        .await
+        .expect_err("still no live host");
+    match err2 {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::CONFLICT, "{message}");
+            assert!(
+                message.to_ascii_lowercase().contains("no live pty"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}

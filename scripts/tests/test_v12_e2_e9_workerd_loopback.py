@@ -100,25 +100,32 @@ def main() -> int:
             "remote session.open owns live PTY/ConPTY in ownmeshd (full_user/full_access); "
             "public MCP replay surfaces real process output; attach(observer demote)/write-deny "
             "+ workspace bind; input_seq/resize_seq reserve-before-write with payload digest; "
-            "RetryPending at-most-once (no PTY re-delivery); "
+            "RetryPending at-most-once (no PTY re-delivery); process-tree terminate; "
+            "resize fail-closed without live host; live-ring remaining/continuation; "
             "two-principal give handoff; controller lease reconnect matrix still partial"
+        ),
+        "E6": (
+            "device profile.list/show/scan PATH detection for nine official ids; "
+            "MCP ownmesh_list_profiles with device_id routes to ownmeshd; "
+            "session.open profile_id launch plan + live PTY fallback; "
+            "structured adapter events/native resume matrix still open"
         ),
         "E7": (
             "MCP git status/diff + private integrity-bound diff spool + fsmonitor off; "
-            "unified-diff apply + full review flow still open"
+            "bounded single-file unified-diff apply on fs.patch; full multi-file review flow still open"
         ),
     }
     # Rows with no real binary×workerd proof yet (must keep gate red).
     still_open = (
-        ("E6", "nine official profile adapters + generic tool execution"),
         ("E8", "networkless elevated broker Full Access mint/custody"),
         ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
     )
-    # E4/E5/E7 remain incomplete acceptance even with partial proof.
+    # E4/E5/E6/E7 remain incomplete acceptance even with partial proof.
     incomplete_acceptance = (
         ("E4", "full custody matrix promotion beyond handle-held list + device-local CRUD"),
         ("E5", "controller lease reconnect/handoff + multi-observer replay matrix"),
-        ("E7", "bounded unified-diff patch apply + Git review (no auto-merge)"),
+        ("E6", "nine structured adapters + native resume/events beyond PATH detect + PTY fallback"),
+        ("E7", "full Git review workflow (tests/diff pages) beyond single-file unified apply"),
         *still_open,
     )
 
@@ -142,8 +149,8 @@ def main() -> int:
             file=sys.stderr,
         )
         print(
-            "v1.2 E2-E9 workerd loopback entrypoint: E2/E3/E4/E5/E7 partial; "
-            "E6/E8/E9 OPEN; gate fail-closed"
+            "v1.2 E2-E9 workerd loopback entrypoint: E2/E3/E4/E5/E6/E7 partial; "
+            "E8/E9 OPEN; gate fail-closed"
         )
         return 2
 

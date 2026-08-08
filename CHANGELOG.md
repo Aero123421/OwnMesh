@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.2.0-beta.12 — E5 process-tree/replay integrity + E6 detect + E7 unified diff
+
+- **E5 process tree:** live PTY terminate kills the OS process tree (Windows
+  `taskkill /T`, Unix session/`pkill -s` + process-group) so background
+  descendants of interactive shells cannot survive `session.terminate`.
+- **E5 resize:** `session.resize` fails closed before sequence reserve when no
+  live PTY host exists (daemon recovery / non-PTY kind) — no phantom success.
+- **E5 replay:** live-ring drain reports remaining bytes; multi-page drain loops
+  under budget; `session.replay` surfaces `live_pending_bytes` and forces
+  `truncated`/`next_seq` when unread live output remains.
+- **Bounds:** executable pin/revalidation, idempotency journal open, git diff
+  spool load, and agent transport state all ceiling **before** allocation.
+- **E7:** bounded single-file unified-diff apply (`patch_format=unified` or
+  hash-checked unified body) on `fs.patch` / `ops.fs.write`.
+- **E6:** device `profile.list`/`show`/`scan` IPC + MCP `ownmesh_list_profiles`
+  with `device_id` runs real PATH detection; `session.open` with `profile_id`
+  builds an official launch plan and owns a live PTY fallback. CLI profile
+  surfaces remain explicit unsupported.
+- Gate remains intentionally red until E4–E9 production rows are fully evidenced.
+
 ## v1.2.0-beta.11 — handle-held dir list, PTY at-most-once, workspace CRUD
 
 - **E4 custody:** restricted `list_dir` holds the validated directory handle and

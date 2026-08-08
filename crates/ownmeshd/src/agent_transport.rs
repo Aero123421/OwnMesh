@@ -225,6 +225,20 @@ impl AgentTransportState {
     }
 
     fn load(path: &Path, issuer: &str, device_id: &DeviceId) -> Result<Self, String> {
+        // Ceiling BEFORE allocation: never `read()` an attacker-grown state file
+        // into memory and only then discover it exceeds the budget.
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::fresh(issuer, device_id));
+            }
+            Err(error) => return Err(format!("stat transport state: {error}")),
+        };
+        if meta.len() as usize > MAX_TRANSPORT_STATE_FILE_BYTES {
+            return Err(format!(
+                "transport state exceeds {MAX_TRANSPORT_STATE_FILE_BYTES} byte budget"
+            ));
+        }
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1628,7 +1642,7 @@ fn map_request_to_method(
             methods::OPS_FS_WRITE
         }
         ("filesystem.write", "fs.patch" | "ownmesh_fs_patch") => {
-            // Hash-checked whole-file replacement (bounded unified-diff is E7).
+            // Hash-checked whole-file replace or bounded unified-diff apply (E7).
             methods::OPS_FS_WRITE
         }
         ("filesystem.write", "fs.delete" | "ownmesh_fs_delete" | "ownmesh_delete_file")
@@ -1791,6 +1805,17 @@ fn map_request_to_method(
             "workspace.remove" | "workspace",
             "workspace.remove" | "ownmesh_workspace_remove" | "remove",
         ) => crate::runtime::ops_methods::WORKSPACE_REMOVE,
+        // E6 official profile detection (local PATH only; no credential exfil).
+        (
+            "profile.list" | "profile",
+            "profile.list" | "ownmesh_list_profiles" | "ownmesh_profile_list" | "list",
+        ) => methods::PROFILE_LIST,
+        ("profile.scan" | "profile", "profile.scan" | "ownmesh_profile_scan" | "scan") => {
+            methods::PROFILE_SCAN
+        }
+        ("profile.show" | "profile", "profile.show" | "ownmesh_profile_show" | "show") => {
+            methods::PROFILE_SHOW
+        }
         // Accept short fixture-style capability names used by the E0 contract samples.
         ("fs.read", _) => methods::OPS_FS_READ,
         ("fs.write", _) => methods::OPS_FS_WRITE,

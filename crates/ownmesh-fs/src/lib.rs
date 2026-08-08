@@ -75,6 +75,8 @@ pub enum FsError {
     EntryLimit,
     #[error("file too large")]
     TooLarge,
+    #[error("unified diff apply failed: {0}")]
+    Patch(String),
 }
 
 /// Result alias.
@@ -1107,6 +1109,347 @@ pub fn apply_patch(
     Ok(hash_bytes(new_content))
 }
 
+/// Maximum unified-diff text accepted for a single apply (pre-parse ceiling).
+pub const MAX_UNIFIED_DIFF_BYTES: usize = 512 * 1024;
+/// Maximum target file size that may be patched via unified diff.
+pub const MAX_UNIFIED_DIFF_TARGET_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum lines in a unified-diff target after apply.
+pub const MAX_UNIFIED_DIFF_TARGET_LINES: usize = 200_000;
+
+/// True when `content` looks like a unified diff (not a whole-file body).
+#[must_use]
+pub fn looks_like_unified_diff(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("diff --git ") || trimmed.starts_with("--- ") {
+        return trimmed.lines().any(|l| l.starts_with("@@"));
+    }
+    false
+}
+
+/// Apply a bounded single-file unified diff to `rel`.
+///
+/// Supports standard `---`/`+++`/`@@` hunks against one text file. Multi-file
+/// patches, binary diffs, and rename/copy headers are rejected fail-closed.
+/// When `expected_sha256` is set it must match the pre-image file.
+///
+/// # Errors
+///
+/// Returns [`FsError::Patch`] / hash / IO errors on mismatch or overflow.
+pub fn apply_unified_diff(
+    ws: &WorkspaceRoot,
+    rel: impl AsRef<Path>,
+    diff_text: &str,
+    expected_sha256: Option<&str>,
+) -> FsResult<String> {
+    if diff_text.len() > MAX_UNIFIED_DIFF_BYTES {
+        return Err(FsError::Patch(format!(
+            "unified diff exceeds {MAX_UNIFIED_DIFF_BYTES} byte budget"
+        )));
+    }
+    if diff_text.as_bytes().contains(&0) {
+        return Err(FsError::Patch(
+            "binary/NUL unified diffs are not supported".into(),
+        ));
+    }
+
+    let hunks = parse_unified_diff_hunks(diff_text)?;
+    if hunks.is_empty() {
+        return Err(FsError::Patch("unified diff contains no hunks".into()));
+    }
+
+    // Load current file (empty pre-image allowed for create-style patches).
+    let current = match read_file_text_bounded(ws, rel.as_ref(), MAX_UNIFIED_DIFF_TARGET_BYTES) {
+        Ok(text) => text,
+        Err(FsError::NotFound(_)) => String::new(),
+        Err(e) => return Err(e),
+    };
+    if let Some(expected) = expected_sha256 {
+        let actual = hash_bytes(current.as_bytes());
+        if actual != expected {
+            let path = ws
+                .resolve(rel.as_ref())
+                .unwrap_or_else(|_| rel.as_ref().to_path_buf());
+            return Err(FsError::HashMismatch {
+                path,
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+
+    let old_lines: Vec<&str> = split_lines_preserve(&current);
+    let new_lines = apply_hunks_to_lines(&old_lines, &hunks)?;
+    if new_lines.len() > MAX_UNIFIED_DIFF_TARGET_LINES {
+        return Err(FsError::Patch(format!(
+            "patched file would exceed {MAX_UNIFIED_DIFF_TARGET_LINES} lines"
+        )));
+    }
+    let mut out = String::new();
+    for (i, line) in new_lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    // Preserve a trailing newline when the post-image is non-empty and the
+    // final hunk did not explicitly omit it via `\ No newline` (simplified:
+    // always end text files with newline when non-empty — matches git apply
+    // common case for ChatGPT-authored patches).
+    if !out.is_empty() && !out.ends_with('\n') && current.ends_with('\n') {
+        out.push('\n');
+    }
+    if out.len() > MAX_UNIFIED_DIFF_TARGET_BYTES {
+        return Err(FsError::Patch(format!(
+            "patched file would exceed {MAX_UNIFIED_DIFF_TARGET_BYTES} byte budget"
+        )));
+    }
+    write_file(ws, rel, out.as_bytes())?;
+    Ok(hash_bytes(out.as_bytes()))
+}
+
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    /// 1-based old start line (0 means empty file).
+    old_start: usize,
+    old_count: usize,
+    lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone)]
+enum DiffLine {
+    Context(String),
+    Delete(String),
+    Add(String),
+}
+
+fn parse_unified_diff_hunks(diff_text: &str) -> FsResult<Vec<DiffHunk>> {
+    let mut hunks = Vec::new();
+    let mut lines = diff_text.lines().peekable();
+    let mut saw_file_header = false;
+    let mut file_headers = 0usize;
+
+    while let Some(line) = lines.next() {
+        if line.starts_with("diff --git ") {
+            file_headers = file_headers.saturating_add(1);
+            if file_headers > 1 {
+                return Err(FsError::Patch(
+                    "multi-file unified diffs are not supported; patch one path at a time".into(),
+                ));
+            }
+            saw_file_header = true;
+            continue;
+        }
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            saw_file_header = true;
+            continue;
+        }
+        if line.starts_with("@@") {
+            let (old_start, old_count) = parse_hunk_header(line)?;
+            let mut hunk_lines = Vec::new();
+            while let Some(&next) = lines.peek() {
+                if next.starts_with("@@")
+                    || next.starts_with("diff --git ")
+                    || next.starts_with("--- ")
+                {
+                    break;
+                }
+                let body = lines.next().unwrap_or(next);
+                if body.starts_with('\\') {
+                    // "\ No newline at end of file" — ignore (handled softly).
+                    continue;
+                }
+                if body.is_empty() {
+                    // Some producers emit a blank line as context " ".
+                    hunk_lines.push(DiffLine::Context(String::new()));
+                    continue;
+                }
+                let (tag, rest) = body.split_at(1);
+                match tag {
+                    " " => hunk_lines.push(DiffLine::Context(rest.to_owned())),
+                    "-" => hunk_lines.push(DiffLine::Delete(rest.to_owned())),
+                    "+" => hunk_lines.push(DiffLine::Add(rest.to_owned())),
+                    _ => {
+                        return Err(FsError::Patch(format!(
+                            "invalid hunk line (expected ' ','-','+'): {body:?}"
+                        )));
+                    }
+                }
+                if hunk_lines.len() > MAX_UNIFIED_DIFF_TARGET_LINES {
+                    return Err(FsError::Patch("hunk line budget exceeded".into()));
+                }
+            }
+            hunks.push(DiffHunk {
+                old_start,
+                old_count,
+                lines: hunk_lines,
+            });
+            continue;
+        }
+        // Ignore index/mode headers and noise between files.
+        let _ = saw_file_header;
+    }
+    Ok(hunks)
+}
+
+fn parse_hunk_header(line: &str) -> FsResult<(usize, usize)> {
+    // @@ -l,s +l,s @@ optional
+    let rest = line
+        .strip_prefix("@@")
+        .and_then(|s| s.split("@@").next())
+        .ok_or_else(|| FsError::Patch(format!("malformed hunk header: {line}")))?
+        .trim();
+    let old = rest
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| FsError::Patch(format!("malformed hunk header: {line}")))?;
+    let old = old
+        .strip_prefix('-')
+        .ok_or_else(|| FsError::Patch(format!("malformed hunk old range: {line}")))?;
+    let mut parts = old.split(',');
+    let start: usize = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| FsError::Patch(format!("malformed hunk old start: {line}")))?;
+    let count: usize = match parts.next() {
+        Some(s) => s
+            .parse()
+            .map_err(|_| FsError::Patch(format!("malformed hunk old count: {line}")))?,
+        None => 1,
+    };
+    Ok((start, count))
+}
+
+fn split_lines_preserve(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    // Keep line bodies without the newline separator.
+    let mut out: Vec<&str> = text.split('\n').collect();
+    // If text ends with newline, split leaves a trailing empty element representing
+    // the empty line after the final newline — drop it so line counts match git.
+    if text.ends_with('\n') && out.last().is_some_and(|s| s.is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+fn apply_hunks_to_lines(old_lines: &[&str], hunks: &[DiffHunk]) -> FsResult<Vec<String>> {
+    let mut result: Vec<String> = old_lines.iter().map(|s| (*s).to_owned()).collect();
+    // Apply from bottom to top so earlier line numbers stay stable.
+    let mut ordered: Vec<&DiffHunk> = hunks.iter().collect();
+    ordered.sort_by(|a, b| b.old_start.cmp(&a.old_start));
+
+    for hunk in ordered {
+        let start_idx = if hunk.old_start == 0 {
+            0usize
+        } else {
+            hunk.old_start.saturating_sub(1)
+        };
+        if start_idx > result.len() {
+            return Err(FsError::Patch(format!(
+                "hunk old_start {} past end of file ({} lines)",
+                hunk.old_start,
+                result.len()
+            )));
+        }
+
+        // Verify context/delete lines match the current file slice.
+        let mut cursor = start_idx;
+        let mut delete_count = 0usize;
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Context(s) | DiffLine::Delete(s) => {
+                    if cursor >= result.len() || result[cursor] != *s {
+                        return Err(FsError::Patch(format!(
+                            "hunk context mismatch at line {}: expected {s:?}, got {:?}",
+                            cursor + 1,
+                            result.get(cursor)
+                        )));
+                    }
+                    if matches!(line, DiffLine::Delete(_)) {
+                        delete_count = delete_count.saturating_add(1);
+                    }
+                    cursor = cursor.saturating_add(1);
+                }
+                DiffLine::Add(_) => {}
+            }
+        }
+        let old_span = cursor.saturating_sub(start_idx);
+        if hunk.old_count > 0 && old_span != hunk.old_count {
+            return Err(FsError::Patch(format!(
+                "hunk old_count mismatch: header {}, matched {old_span}",
+                hunk.old_count
+            )));
+        }
+        let _ = delete_count;
+
+        // Build replacement slice for [start_idx, cursor).
+        let mut replacement = Vec::new();
+        let mut verify_cursor = start_idx;
+        for line in &hunk.lines {
+            match line {
+                DiffLine::Context(s) => {
+                    replacement.push(s.clone());
+                    verify_cursor = verify_cursor.saturating_add(1);
+                }
+                DiffLine::Delete(_) => {
+                    verify_cursor = verify_cursor.saturating_add(1);
+                }
+                DiffLine::Add(s) => {
+                    replacement.push(s.clone());
+                }
+            }
+        }
+        let _ = verify_cursor;
+        result.splice(start_idx..cursor, replacement);
+    }
+    Ok(result)
+}
+
+fn read_file_text_bounded(ws: &WorkspaceRoot, rel: &Path, max_bytes: usize) -> FsResult<String> {
+    // Hold the open file (custody path) so we hash/read the same inode we authorized.
+    let (mut f, path) = if ws.enforce {
+        custody::open_regular_file_read(ws, rel)?
+    } else {
+        let path = ws.resolve(rel)?;
+        if !path.exists() {
+            return Err(FsError::NotFound(path));
+        }
+        let f = fs::File::open(&path).map_err(|source| FsError::Io {
+            path: Some(path.clone()),
+            source,
+        })?;
+        (f, path)
+    };
+    let meta = f.metadata().map_err(|source| FsError::Io {
+        path: Some(path.clone()),
+        source,
+    })?;
+    if !meta.is_file() {
+        return Err(FsError::NotAFile(path));
+    }
+    if usize::try_from(meta.len()).map_or(true, |n| n > max_bytes) {
+        return Err(FsError::TooLarge);
+    }
+    let mut buf = Vec::new();
+    let mut limited = Read::take(&mut f, max_bytes as u64 + 1);
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|source| FsError::Io {
+            path: Some(path.clone()),
+            source,
+        })?;
+    if buf.len() > max_bytes {
+        return Err(FsError::TooLarge);
+    }
+    if buf.contains(&0) {
+        return Err(FsError::Patch(
+            "target file is binary; unified diff apply requires text".into(),
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| FsError::Patch(format!("target is not UTF-8: {e}")))
+}
+
 fn hash_file(path: &Path) -> FsResult<String> {
     let mut f = fs::File::open(path).map_err(|source| FsError::Io {
         path: Some(path.to_path_buf()),
@@ -1532,5 +1875,55 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn unified_diff_apply_replaces_bounded_hunk() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), false).unwrap();
+        write_file(&ws, "note.txt", b"alpha\nbeta\ngamma\n").unwrap();
+        let diff = concat!(
+            "--- a/note.txt\n",
+            "+++ b/note.txt\n",
+            "@@ -1,3 +1,3 @@\n",
+            " alpha\n",
+            "-beta\n",
+            "+BETA\n",
+            " gamma\n",
+        );
+        assert!(looks_like_unified_diff(diff));
+        let hash = apply_unified_diff(&ws, "note.txt", diff, None).unwrap();
+        let bytes = read_file(&ws, "note.txt", 1024).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, "alpha\nBETA\ngamma\n");
+        assert_eq!(hash, hash_bytes(text.as_bytes()));
+    }
+
+    #[test]
+    fn unified_diff_apply_rejects_context_mismatch() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), false).unwrap();
+        write_file(&ws, "note.txt", b"alpha\nbeta\n").unwrap();
+        let diff = concat!(
+            "--- a/note.txt\n",
+            "+++ b/note.txt\n",
+            "@@ -1,2 +1,2 @@\n",
+            " alpha\n",
+            "-BETA\n",
+            "+gamma\n",
+        );
+        let err = apply_unified_diff(&ws, "note.txt", diff, None).unwrap_err();
+        assert!(matches!(err, FsError::Patch(_)), "{err:?}");
+    }
+
+    #[test]
+    fn unified_diff_apply_rejects_oversized_diff_text() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), false).unwrap();
+        write_file(&ws, "note.txt", b"x\n").unwrap();
+        let mut huge = String::from("--- a/note.txt\n+++ b/note.txt\n@@ -1 +1 @@\n-x\n+");
+        huge.push_str(&"y".repeat(MAX_UNIFIED_DIFF_BYTES));
+        let err = apply_unified_diff(&ws, "note.txt", &huge, None).unwrap_err();
+        assert!(matches!(err, FsError::Patch(_)), "{err:?}");
     }
 }
