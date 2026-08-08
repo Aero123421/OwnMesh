@@ -455,6 +455,8 @@ fn ensure_no_cross_boundary_alias(file: &File, path: &Path, ws: &WorkspaceRoot) 
 struct ByHandleInfo {
     volume_serial: u32,
     number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
 }
 
 #[cfg(windows)]
@@ -478,6 +480,8 @@ fn by_handle_file_info(file: &File) -> std::io::Result<ByHandleInfo> {
     Ok(ByHandleInfo {
         volume_serial: info.dwVolumeSerialNumber,
         number_of_links: info.nNumberOfLinks,
+        file_index_high: info.nFileIndexHigh,
+        file_index_low: info.nFileIndexLow,
     })
 }
 
@@ -1017,8 +1021,10 @@ pub(crate) fn delete_enforced(ws: &WorkspaceRoot, rel: &Path, recursive: bool) -
     })
 }
 
-/// List directory after opening + revalidating the directory handle.
-pub(crate) fn resolve_dir_enforced(ws: &WorkspaceRoot, rel: &Path) -> FsResult<PathBuf> {
+/// Open + revalidate a directory handle under the workspace. The returned
+/// `File` MUST be held across any subsequent enumeration so a rename/symlink
+/// replacement of the directory name cannot retarget the listing.
+pub(crate) fn open_dir_enforced(ws: &WorkspaceRoot, rel: &Path) -> FsResult<(File, PathBuf)> {
     let path = if rel.as_os_str().is_empty() {
         dunce_canonicalize(ws.root()).unwrap_or_else(|_| ws.root().to_path_buf())
     } else if rel.is_absolute() {
@@ -1044,7 +1050,402 @@ pub(crate) fn resolve_dir_enforced(ws: &WorkspaceRoot, rel: &Path) -> FsResult<P
     if !meta.is_dir() {
         return Err(FsError::NotADirectory(path));
     }
-    ensure_handle_under_workspace(&dir, ws)
+    let final_path = ensure_handle_under_workspace(&dir, ws)?;
+    Ok((dir, final_path))
+}
+
+/// List directory after opening + revalidating the directory handle.
+///
+/// Prefer [`open_dir_enforced`] + [`read_dir_held`] when the handle must remain
+/// open across the side-effect boundary. This path-only helper is for callers
+/// that only need a revalidated cwd path (e.g. git spawn).
+pub(crate) fn resolve_dir_enforced(ws: &WorkspaceRoot, rel: &Path) -> FsResult<PathBuf> {
+    let (_dir, path) = open_dir_enforced(ws, rel)?;
+    Ok(path)
+}
+
+/// Stable open-file identity used to detect path replacement races.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index_high: u32,
+    #[cfg(windows)]
+    file_index_low: u32,
+}
+
+fn open_identity(file: &File, path: &Path) -> FsResult<OpenIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata().map_err(|source| FsError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+        Ok(OpenIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let info = by_handle_file_info(file).map_err(|source| FsError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+        Ok(OpenIdentity {
+            volume_serial: info.volume_serial,
+            file_index_high: info.file_index_high,
+            file_index_low: info.file_index_low,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, path);
+        Err(FsError::InvalidPath(
+            "open identity unsupported on this platform".into(),
+        ))
+    }
+}
+
+/// One directory child observed through a held directory handle.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldDirChild {
+    pub name: std::ffi::OsString,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: Option<u64>,
+}
+
+/// Enumerate a directory through a retained handle. Never releases the caller's
+/// handle. On platforms without true handle-rooted readdir, enumerates via a
+/// handle-stable path (Linux `/proc/self/fd`) or path + post-identity check.
+pub(crate) fn read_dir_held(dir: &File, path: &Path) -> FsResult<Vec<HeldDirChild>> {
+    let before = open_identity(dir, path)?;
+    let children = read_dir_held_platform(dir, path)?;
+    // Handle must still name the same directory inode after enumeration.
+    let after = open_identity(dir, path)?;
+    if before != after {
+        return Err(FsError::SymlinkOrReparse(path.to_path_buf()));
+    }
+    // Path-name revalidation: if the directory name was replaced with a
+    // symlink/junction while we held the old handle, refuse to return entries
+    // that may have been collected from the replacement via any path-based hop.
+    match open_dir_nofollow(path) {
+        Ok(probe) => {
+            if ensure_not_reparse_handle(&probe, path).is_err() {
+                return Err(FsError::SymlinkOrReparse(path.to_path_buf()));
+            }
+            let probe_id = open_identity(&probe, path)?;
+            if probe_id != before {
+                return Err(FsError::SymlinkOrReparse(path.to_path_buf()));
+            }
+        }
+        Err(_) => {
+            // Name no longer opens as a real directory — fail closed.
+            return Err(FsError::SymlinkOrReparse(path.to_path_buf()));
+        }
+    }
+    Ok(children)
+}
+
+fn read_dir_held_platform(dir: &File, path: &Path) -> FsResult<Vec<HeldDirChild>> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        read_dir_held_windows(dir)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/self/fd/N is a magic path that always refers to the open file
+        // description, so readdir is handle-rooted while `dir` stays open.
+        use std::os::unix::io::AsRawFd;
+        let magic = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        read_dir_path_children(&magic, path)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // fdopendir consumes a dup'd fd; original `dir` remains held by caller.
+        read_dir_held_unix_fdopendir(dir, path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = dir;
+        read_dir_path_children(path, path)
+    }
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn read_dir_path_children(enum_path: &Path, display_path: &Path) -> FsResult<Vec<HeldDirChild>> {
+    let rd = fs::read_dir(enum_path).map_err(|source| FsError::Io {
+        path: Some(display_path.to_path_buf()),
+        source,
+    })?;
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|source| FsError::Io {
+            path: Some(display_path.to_path_buf()),
+            source,
+        })?;
+        let ft = entry.file_type().map_err(|source| FsError::Io {
+            path: Some(entry.path()),
+            source,
+        })?;
+        let meta = entry.metadata().ok();
+        out.push(HeldDirChild {
+            name: entry.file_name(),
+            is_dir: ft.is_dir(),
+            is_symlink: ft.is_symlink(),
+            size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn read_dir_held_unix_fdopendir(dir: &File, path: &Path) -> FsResult<Vec<HeldDirChild>> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::io::AsRawFd;
+
+    // Dup so fdopendir/closedir own a distinct descriptor.
+    let raw = dir.as_raw_fd();
+    let dup = unsafe { libc::dup(raw) };
+    if dup < 0 {
+        return Err(FsError::Io {
+            path: Some(path.to_path_buf()),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            let _ = libc::close(dup);
+        }
+        return Err(FsError::Io {
+            path: Some(path.to_path_buf()),
+            source: err,
+        });
+    }
+    let mut out = Vec::new();
+    loop {
+        // readdir is not thread-safe; ownmeshd serializes FS ops per request.
+        let ent = unsafe { libc::readdir(stream) };
+        if ent.is_null() {
+            break;
+        }
+        let d_name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let bytes = d_name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name = std::ffi::OsString::from_vec(bytes.to_vec());
+        let child_path = path.join(&name);
+        let (is_dir, is_symlink, size) = {
+            let dtype = unsafe { (*ent).d_type };
+            if dtype == libc::DT_DIR {
+                (true, false, None)
+            } else if dtype == libc::DT_LNK {
+                (false, true, None)
+            } else if dtype == libc::DT_REG {
+                let sz = fs::symlink_metadata(&child_path).ok().map(|m| m.len());
+                (false, false, sz)
+            } else if dtype == libc::DT_UNKNOWN || dtype == 0 {
+                match fs::symlink_metadata(&child_path) {
+                    Ok(m) => {
+                        let ft = m.file_type();
+                        (
+                            ft.is_dir(),
+                            ft.is_symlink(),
+                            if ft.is_file() { Some(m.len()) } else { None },
+                        )
+                    }
+                    Err(_) => (false, false, None),
+                }
+            } else {
+                (false, false, None)
+            }
+        };
+        let _ = child_path;
+        out.push(HeldDirChild {
+            name,
+            is_dir,
+            is_symlink,
+            size,
+        });
+    }
+    unsafe {
+        let _ = libc::closedir(stream);
+    }
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn read_dir_held_windows(dir: &File) -> FsResult<Vec<HeldDirChild>> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_NO_MORE_FILES, FALSE, HANDLE, WIN32_ERROR,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, GetFileInformationByHandleEx,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ID_BOTH_DIR_INFO,
+    };
+
+    #[allow(clippy::cast_possible_truncation)]
+    let handle = dir.as_raw_handle() as HANDLE;
+    let mut out = Vec::new();
+    // 64 KiB buffer is enough for many entries per syscall without unbounded alloc.
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut restart = true;
+    loop {
+        let class = if restart {
+            FileIdBothDirectoryRestartInfo
+        } else {
+            FileIdBothDirectoryInfo
+        };
+        let buf_len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        let ok = unsafe {
+            GetFileInformationByHandleEx(handle, class, buf.as_mut_ptr().cast(), buf_len)
+        };
+        if ok == FALSE {
+            let err: WIN32_ERROR = unsafe { GetLastError() };
+            if err == ERROR_NO_MORE_FILES {
+                break;
+            }
+            return Err(FsError::Io {
+                path: None,
+                source: std::io::Error::from_raw_os_error(err.cast_signed()),
+            });
+        }
+        restart = false;
+        let mut offset = 0usize;
+        loop {
+            if offset + std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() > buf.len() {
+                break;
+            }
+            // Copy header via unaligned read — buffer is byte-aligned only.
+            let mut header = FILE_ID_BOTH_DIR_INFO {
+                NextEntryOffset: 0,
+                FileIndex: 0,
+                CreationTime: 0,
+                LastAccessTime: 0,
+                LastWriteTime: 0,
+                ChangeTime: 0,
+                EndOfFile: 0,
+                AllocationSize: 0,
+                FileAttributes: 0,
+                FileNameLength: 0,
+                EaSize: 0,
+                ShortNameLength: 0,
+                ShortName: [0; 12],
+                FileId: 0,
+                FileName: [0; 1],
+            };
+            // SAFETY: offset checked against buffer length above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buf.as_ptr().add(offset),
+                    std::ptr::from_mut(&mut header).cast::<u8>(),
+                    std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>(),
+                );
+            }
+            let name_bytes = usize::try_from(header.FileNameLength).unwrap_or(0);
+            let name_start = offset + std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+            let name_u16_len = name_bytes / 2;
+            if name_start.saturating_add(name_bytes) > buf.len() {
+                break;
+            }
+            // Decode UTF-16LE name without requiring u16 alignment of the byte buffer.
+            let mut name_u16 = vec![0u16; name_u16_len];
+            for (i, slot) in name_u16.iter_mut().enumerate() {
+                let b0 = buf[name_start + i * 2];
+                let b1 = buf[name_start + i * 2 + 1];
+                *slot = u16::from_le_bytes([b0, b1]);
+            }
+            let name = std::ffi::OsString::from_wide(&name_u16);
+            if name != "." && name != ".." {
+                let attrs = header.FileAttributes;
+                let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+                let is_dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+                let size = if !is_dir && !is_reparse && header.EndOfFile >= 0 {
+                    Some(header.EndOfFile.cast_unsigned())
+                } else {
+                    None
+                };
+                out.push(HeldDirChild {
+                    name,
+                    // Treat reparse points as symlinks, not traversable dirs.
+                    is_dir: is_dir && !is_reparse,
+                    is_symlink: is_reparse,
+                    size,
+                });
+            }
+            if header.NextEntryOffset == 0 {
+                break;
+            }
+            offset = offset.saturating_add(usize::try_from(header.NextEntryOffset).unwrap_or(0));
+            if offset >= buf.len() {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Recursive handle-held walk for restricted listings. Does not follow
+/// symlink/reparse children as directories.
+pub(crate) fn walk_dir_held<F>(
+    ws: &WorkspaceRoot,
+    dir: &File,
+    path: &Path,
+    recursive: bool,
+    mut on_entry: F,
+) -> FsResult<()>
+where
+    F: FnMut(crate::DirEntryInfo) -> FsResult<()>,
+{
+    fn walk_level<F>(
+        ws: &WorkspaceRoot,
+        dir: &File,
+        path: &Path,
+        recursive: bool,
+        on_entry: &mut F,
+    ) -> FsResult<()>
+    where
+        F: FnMut(crate::DirEntryInfo) -> FsResult<()>,
+    {
+        let children = read_dir_held(dir, path)?;
+        for child in children {
+            let child_path = path.join(&child.name);
+            let info = crate::DirEntryInfo {
+                name: child.name.to_string_lossy().into_owned(),
+                path: child_path.to_string_lossy().into_owned(),
+                is_dir: child.is_dir,
+                is_symlink: child.is_symlink,
+                size: child.size,
+            };
+            on_entry(info)?;
+            if recursive && child.is_dir && !child.is_symlink {
+                // Open child with nofollow and revalidate under workspace before descent.
+                let child_dir = open_dir_nofollow(&child_path).map_err(|source| FsError::Io {
+                    path: Some(child_path.clone()),
+                    source,
+                })?;
+                ensure_not_reparse_handle(&child_dir, &child_path)?;
+                let child_final = ensure_handle_under_workspace(&child_dir, ws)?;
+                walk_level(ws, &child_dir, &child_final, true, on_entry)?;
+            }
+        }
+        Ok(())
+    }
+    walk_level(ws, dir, path, recursive, &mut on_entry)
 }
 
 #[cfg(test)]
@@ -1260,6 +1661,69 @@ mod tests {
                     "junction parent must fail closed: {err:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn list_dir_rename_to_outside_symlink_fails_closed() {
+        use crate::list_dir_page;
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"top-secret").unwrap();
+        let sub = root.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("inside.txt"), b"safe").unwrap();
+        fs::write(outside.path().join("leaked.txt"), b"leak").unwrap();
+
+        let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+        let page = list_dir_page(&ws, "sub", false, 50, None).unwrap();
+        assert!(page.entries.iter().any(|e| e.name == "inside.txt"));
+
+        // Simulate TOCTOU: rename checked dir out and replace name with symlink/junction.
+        let moved = root.path().join("sub-moved");
+        fs::rename(&sub, &moved).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root.path().join("sub")).unwrap();
+            let err = list_dir_page(&ws, "sub", false, 50, None).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FsError::SymlinkOrReparse(_)
+                        | FsError::EscapesWorkspace(_)
+                        | FsError::NotADirectory(_)
+                ),
+                "rename-to-symlink must fail closed: {err:?}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let link = root.path().join("sub");
+            let ok = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &outside.path().to_string_lossy(),
+                ])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                eprintln!("skip windows junction list race test (mklink failed)");
+                return;
+            }
+            let err = list_dir_page(&ws, "sub", false, 50, None).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FsError::SymlinkOrReparse(_)
+                        | FsError::EscapesWorkspace(_)
+                        | FsError::NotADirectory(_)
+                ),
+                "rename-to-junction must fail closed: {err:?}"
+            );
         }
     }
 }

@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.2.0-beta.11 — handle-held dir list, PTY at-most-once, workspace CRUD
+
+- **E4 custody:** restricted `list_dir` holds the validated directory handle and
+  enumerates through handle-rooted APIs (Windows `GetFileInformationByHandleEx`,
+  Linux `/proc/self/fd`, other Unix `fdopendir`). Rename-to-outside-symlink/junction
+  races fail closed and never return outside entries.
+- **E5 exact-once:** `session.write` / `session.resize` treat `RetryPending` as
+  **at-most-once** — never re-deliver PTY input/resize; surface an explicit
+  uncertain/conflict outcome for reconciliation.
+- **E4 workspace CRUD:** device-local `ops.workspace.{list,show,add,update,remove}`
+  IPC, CLI `ownmesh workspace …`, and public MCP tools
+  `ownmesh_workspace_*` route through Agent → ownmeshd. `ws_default` cannot be
+  removed or relocated.
+- Gate remains intentionally red until E6–E9 production rows are complete.
+
+
 ## v1.2.0-beta.10 — session policy authority + PTY exact-once + dir spool bind
 
 - E3: MCP per-tool argument allowlist strips hidden session `command`/`cwd` and client authority keys before hash/route

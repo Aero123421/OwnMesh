@@ -368,8 +368,11 @@ pub fn list_dir_page(
     max_entries: usize,
     cursor: Option<&str>,
 ) -> FsResult<DirListPage> {
-    let path = if ws.enforce {
-        custody::resolve_dir_enforced(ws, rel.as_ref())?
+    // Restricted mode holds the directory handle across enumeration so a
+    // rename-to-symlink replacement of the checked path cannot retarget listing.
+    let (held_dir, path) = if ws.enforce {
+        let (dir, path) = custody::open_dir_enforced(ws, rel.as_ref())?;
+        (Some(dir), path)
     } else {
         let path = ws.resolve(rel)?;
         if !path.exists() {
@@ -378,7 +381,7 @@ pub fn list_dir_page(
         if !path.is_dir() {
             return Err(FsError::NotADirectory(path));
         }
-        path
+        (None, path)
     };
     // Server-side ceiling independent of caller-supplied max_entries.
     const MAX_PAGE_ENTRIES: usize = 500;
@@ -449,7 +452,10 @@ pub fn list_dir_page(
         Ok(())
     };
 
-    if recursive {
+    if let Some(dir) = held_dir.as_ref() {
+        // Handle-held walk: never drop the validated descriptor before side effect.
+        custody::walk_dir_held(ws, dir, &path, recursive, &mut push_entry)?;
+    } else if recursive {
         for entry in WalkDir::new(&path).min_depth(1) {
             let entry = entry.map_err(|e| FsError::Io {
                 path: Some(path.clone()),
@@ -490,6 +496,8 @@ pub fn list_dir_page(
             push_entry(info)?;
         }
     }
+    // Explicitly keep the handle alive through the walk above.
+    drop(held_dir);
 
     let mut snapshot = if spilled { spool_entries } else { snapshot };
 

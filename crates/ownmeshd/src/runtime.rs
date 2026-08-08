@@ -79,6 +79,11 @@ pub mod ops_methods {
     pub const GIT_STATUS: &str = "ops.git.status";
     pub const GIT_DIFF: &str = "ops.git.diff";
     pub const LOGS_LIST_PROVIDERS: &str = "ops.logs.list_providers";
+    pub const WORKSPACE_LIST: &str = "ops.workspace.list";
+    pub const WORKSPACE_SHOW: &str = "ops.workspace.show";
+    pub const WORKSPACE_ADD: &str = "ops.workspace.add";
+    pub const WORKSPACE_UPDATE: &str = "ops.workspace.update";
+    pub const WORKSPACE_REMOVE: &str = "ops.workspace.remove";
 }
 
 const LOCAL_PRINCIPAL: &str = "prin_local";
@@ -353,6 +358,8 @@ pub struct DaemonRuntime {
     op_journal_persist_fault: AtomicUsize,
     #[cfg(test)]
     approvals_persist_fault: AtomicUsize,
+    #[cfg(test)]
+    sessions_persist_fault: AtomicUsize,
 }
 
 impl DaemonRuntime {
@@ -432,6 +439,8 @@ impl DaemonRuntime {
             op_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
             approvals_persist_fault: AtomicUsize::new(0),
+            #[cfg(test)]
+            sessions_persist_fault: AtomicUsize::new(0),
         })
     }
 
@@ -458,6 +467,8 @@ impl DaemonRuntime {
     }
 
     fn persist_sessions(&self) -> IpcResult<()> {
+        #[cfg(test)]
+        self.maybe_inject_persist_fault(&self.sessions_persist_fault, "session")?;
         self.sessions
             .save_to_path(&self.sessions_path)
             .map_err(|e| IpcError::Remote {
@@ -700,7 +711,6 @@ impl DaemonRuntime {
 
     /// Register or update a workspace root (device-local). Roots must be absolute
     /// existing directories. Does not cross-tenant; ownership is the device itself.
-    #[allow(dead_code)]
     pub fn upsert_workspace(&mut self, entry: WorkspaceEntry) -> IpcResult<WorkspaceEntry> {
         let id = entry.id.trim();
         if id.is_empty()
@@ -747,7 +757,6 @@ impl DaemonRuntime {
         Ok(stored)
     }
 
-    #[allow(dead_code)]
     fn persist_workspaces(&self) -> IpcResult<()> {
         let file = WorkspaceRegistryFile {
             schema_version: 1,
@@ -2047,6 +2056,11 @@ full_user_access/full_access for arbitrary commands",
             ops_methods::LOGS_LIST_PROVIDERS => self.handle_logs_list_providers(params),
             ops_methods::GIT_STATUS => self.handle_git_status(params, client).await,
             ops_methods::GIT_DIFF => self.handle_git_diff(params, client).await,
+            ops_methods::WORKSPACE_LIST => self.handle_workspace_list(client),
+            ops_methods::WORKSPACE_SHOW => self.handle_workspace_show(params),
+            ops_methods::WORKSPACE_ADD => self.handle_workspace_add(params, client),
+            ops_methods::WORKSPACE_UPDATE => self.handle_workspace_update(params, client),
+            ops_methods::WORKSPACE_REMOVE => self.handle_workspace_remove(params, client),
             methods::APPROVAL_LIST => self.handle_approval_list(),
             methods::APPROVAL_SHOW => self.handle_approval_show(params),
             methods::APPROVAL_APPROVE => self.handle_approval_approve(params, client).await,
@@ -2787,29 +2801,48 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         // Stale/gap/conflict never reach the process; exact-once retries replay.
         let input_digest = sha256_hex(p.data.as_bytes());
         let snapshot = self.sessions.clone();
-        let (applied_seq, replayed, should_deliver) = if let Some(seq) = p.input_seq {
+        let (applied_seq, replayed, should_deliver, uncertain) = if let Some(seq) = p.input_seq {
             let outcome = self
                 .sessions
                 .reserve_input_seq(&p.id, seq, &input_digest)
                 .map_err(session_err)?;
             match outcome {
-                ownmesh_session::SeqReserveOutcome::Replayed { seq } => (Some(seq), true, false),
-                ownmesh_session::SeqReserveOutcome::Deliver { seq }
-                | ownmesh_session::SeqReserveOutcome::RetryPending { seq } => {
-                    (Some(seq), false, true)
+                // Durable applied receipt: never re-deliver.
+                ownmesh_session::SeqReserveOutcome::Replayed { seq } => {
+                    (Some(seq), true, false, false)
+                }
+                // First reservation: deliver once after durable pending receipt.
+                ownmesh_session::SeqReserveOutcome::Deliver { seq } => {
+                    (Some(seq), false, true, false)
+                }
+                // Prior attempt left Pending — delivery is uncertain. At-most-once:
+                // never re-write the PTY; surface explicit uncertain reconciliation.
+                ownmesh_session::SeqReserveOutcome::RetryPending { seq } => {
+                    (Some(seq), false, false, true)
                 }
             }
         } else {
-            (None, false, true)
+            (None, false, true, false)
         };
         // Persist reservation before mutation so a crash leaves a durable receipt
         // and retries cannot rewind sequences.
         self.commit_sessions(snapshot)?;
 
+        if uncertain {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "session.write input_seq {} delivery uncertain (prior attempt pending);                      not re-delivered (at-most-once). Reconcile session state before retrying                      with a new sequence.",
+                    applied_seq.unwrap_or_default()
+                ),
+            });
+        }
+
         if !should_deliver {
             return Ok(json!({
                 "accepted": true,
                 "replayed": true,
+                "uncertain": false,
                 "bytes": p.data.len(),
                 "live_pty": true,
                 "live_drained_bytes": 0,
@@ -2897,20 +2930,33 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         // Reserve seq+digest before PTY resize mutation (same exact-once rules as write).
         let resize_digest = format!("{}:{}", p.cols, p.rows);
         let snapshot = self.sessions.clone();
-        let (applied_seq, should_deliver) = if let Some(seq) = p.resize_seq {
+        let (applied_seq, should_deliver, uncertain) = if let Some(seq) = p.resize_seq {
             let outcome = self
                 .sessions
                 .reserve_resize_seq(&p.id, seq, &resize_digest)
                 .map_err(session_err)?;
             match outcome {
-                ownmesh_session::SeqReserveOutcome::Replayed { seq } => (Some(seq), false),
-                ownmesh_session::SeqReserveOutcome::Deliver { seq }
-                | ownmesh_session::SeqReserveOutcome::RetryPending { seq } => (Some(seq), true),
+                ownmesh_session::SeqReserveOutcome::Replayed { seq } => (Some(seq), false, false),
+                ownmesh_session::SeqReserveOutcome::Deliver { seq } => (Some(seq), true, false),
+                // At-most-once: never re-resize on uncertain pending receipt.
+                ownmesh_session::SeqReserveOutcome::RetryPending { seq } => {
+                    (Some(seq), false, true)
+                }
             }
         } else {
-            (None, true)
+            (None, true, false)
         };
         self.commit_sessions(snapshot)?;
+
+        if uncertain {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "session.resize resize_seq {} delivery uncertain (prior attempt pending);                      not re-delivered (at-most-once). Reconcile session state before retrying                      with a new sequence.",
+                    applied_seq.unwrap_or_default()
+                ),
+            });
+        }
 
         if should_deliver {
             if let Some(host) = self.live_hosts.get(&p.id) {
@@ -2939,6 +2985,221 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             "workspace_id": bound_ws,
             "live_pty": self.live_hosts.contains_key(&p.id),
             "resize_seq": applied_seq,
+        }))
+    }
+
+    fn handle_workspace_list(&self, _client: &ClientIdentity) -> IpcResult<Value> {
+        let mut workspaces: Vec<Value> = self
+            .workspaces
+            .iter()
+            .map(|w| {
+                json!({
+                    "id": w.id,
+                    "root": w.root.to_string_lossy(),
+                    "label": w.label,
+                })
+            })
+            .collect();
+        workspaces.sort_by(|a, b| {
+            a["id"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["id"].as_str().unwrap_or(""))
+        });
+        Ok(json!({
+            "workspaces": workspaces,
+            "count": workspaces.len(),
+            "enforce_workspace": self.enforce_workspace,
+        }))
+    }
+
+    fn handle_workspace_show(&self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse_params(params)?;
+        let id = p.id.trim();
+        let entry = self
+            .workspaces
+            .iter()
+            .find(|w| w.id == id || (id == "default" && w.id == "ws_default"))
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("unknown workspace_id: {id}"),
+            })?;
+        Ok(json!({
+            "id": entry.id,
+            "root": entry.root.to_string_lossy(),
+            "label": entry.label,
+            "exists": entry.root.exists(),
+        }))
+    }
+
+    fn handle_workspace_add(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            path: String,
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            label: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let root = PathBuf::from(p.path.trim());
+        if !root.is_absolute() {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "workspace path must be absolute".into(),
+            });
+        }
+        let id = if let Some(raw) = p.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            raw.to_owned()
+        } else {
+            // Deterministic short id from canonical path bytes (ws_ + 12 hex).
+            let key = root.to_string_lossy().to_ascii_lowercase();
+            let digest = sha256_hex(key.as_bytes());
+            format!("ws_{}", &digest[..12])
+        };
+        let entry = WorkspaceEntry {
+            id,
+            root,
+            label: p.label,
+        };
+        let stored = self.upsert_workspace(entry)?;
+        self.append_audit(
+            "workspace.add",
+            Some("workspace.add"),
+            Some(stored.id.as_str()),
+            Some("ok"),
+            format!(
+                "root={} principal={}",
+                stored.root.display(),
+                client.client_name
+            ),
+        );
+        Ok(json!({
+            "id": stored.id,
+            "root": stored.root.to_string_lossy(),
+            "label": stored.label,
+            "created": true,
+        }))
+    }
+
+    fn handle_workspace_update(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            label: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let id = p.id.trim().to_owned();
+        if (id == "ws_default" || id == "default")
+            && p.path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "ws_default root cannot be relocated".into(),
+            });
+        }
+        let idx = self
+            .workspaces
+            .iter()
+            .position(|w| w.id == id || (id == "default" && w.id == "ws_default"))
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("unknown workspace_id: {id}"),
+            })?;
+        if let Some(path) = p.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let root = PathBuf::from(path);
+            if !root.is_absolute() {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "workspace path must be absolute".into(),
+                });
+            }
+            std::fs::create_dir_all(&root).map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: e.to_string(),
+            })?;
+            self.workspaces[idx].root = root;
+        }
+        if let Some(label) = p.label {
+            let label = label.trim().to_owned();
+            self.workspaces[idx].label = if label.is_empty() { None } else { Some(label) };
+        }
+        self.persist_workspaces()?;
+        let stored = self.workspaces[idx].clone();
+        self.append_audit(
+            "workspace.update",
+            Some("workspace.update"),
+            Some(stored.id.as_str()),
+            Some("ok"),
+            format!(
+                "root={} principal={}",
+                stored.root.display(),
+                client.client_name
+            ),
+        );
+        Ok(json!({
+            "id": stored.id,
+            "root": stored.root.to_string_lossy(),
+            "label": stored.label,
+            "updated": true,
+        }))
+    }
+
+    fn handle_workspace_remove(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse_params(params)?;
+        let id = p.id.trim();
+        if id == "ws_default" || id == "default" {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "ws_default cannot be removed".into(),
+            });
+        }
+        let before = self.workspaces.len();
+        self.workspaces.retain(|w| w.id != id);
+        if self.workspaces.len() == before {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("unknown workspace_id: {id}"),
+            });
+        }
+        self.persist_workspaces()?;
+        self.append_audit(
+            "workspace.remove",
+            Some("workspace.remove"),
+            Some(id),
+            Some("ok"),
+            format!("removed principal={}", client.client_name),
+        );
+        Ok(json!({
+            "id": id,
+            "removed": true,
         }))
     }
 
@@ -3178,6 +3439,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
     pub fn fail_approvals_persist_on_nth_call_for_test(&self, nth: usize) {
         assert!(nth > 0);
         self.approvals_persist_fault.store(nth, Ordering::SeqCst);
+    }
+
+    /// Fault the nth future session persist without touching the durable file.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn fail_sessions_persist_on_nth_call_for_test(&self, nth: usize) {
+        // nth=0 clears the fault injector.
+        self.sessions_persist_fault.store(nth, Ordering::SeqCst);
     }
 
     /// Test helper: number of in-memory sessions.

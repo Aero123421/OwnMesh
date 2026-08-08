@@ -1610,6 +1610,86 @@ def main() -> int:
                 )
 
             # E3/E4/E5: session scope must NOT bypass command policy in Recommended.
+            # E4: public MCP workspace CRUD against device-local registry.
+            extra_ws = workspace_dir.parent / "ws-extra-e4"
+            extra_ws.mkdir(parents=True, exist_ok=True)
+            ws_add_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_workspace_add",
+                    {
+                        "device_id": device_id,
+                        "path": str(extra_ws.resolve()),
+                        "id": "ws_extra_e4",
+                        "label": "e4-extra",
+                        "async": True,
+                        "idempotency_key": f"idem_ws_add_{marker}",
+                    },
+                    rpc_id=91,
+                )
+            )
+            ws_add_op = str(ws_add_sc.get("operation_id") or "")
+            ws_add_done = wait_operation(issuer, access_token, ws_add_op, want={"completed"}, timeout_s=60.0)
+            if "ws_extra_e4" not in json.dumps(ws_add_done):
+                raise RuntimeError(f"workspace.add missing id: {ws_add_done}")
+            ws_list_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_workspace_list",
+                    {
+                        "device_id": device_id,
+                        "async": True,
+                        "idempotency_key": f"idem_ws_list_{marker}",
+                    },
+                    rpc_id=92,
+                )
+            )
+            ws_list_op = str(ws_list_sc.get("operation_id") or "")
+            ws_list_done = wait_operation(issuer, access_token, ws_list_op, want={"completed"}, timeout_s=60.0)
+            if "ws_extra_e4" not in json.dumps(ws_list_done).lower():
+                raise RuntimeError(f"workspace.list missing ws_extra_e4: {ws_list_done}")
+            # Prove selection: write into the newly registered root.
+            ws_write_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_write",
+                    {
+                        "device_id": device_id,
+                        "workspace_id": "ws_extra_e4",
+                        "path": "e4-ws.txt",
+                        "content": "from-extra-ws",
+                        "async": True,
+                        "idempotency_key": f"idem_ws_write_{marker}",
+                    },
+                    rpc_id=93,
+                )
+            )
+            ws_write_op = str(ws_write_sc.get("operation_id") or "")
+            ws_write_done = wait_operation(issuer, access_token, ws_write_op, want={"completed"}, timeout_s=60.0)
+            if not (extra_ws / "e4-ws.txt").exists():
+                raise RuntimeError(f"workspace-scoped write missing on disk; op={ws_write_done}")
+            ws_rm_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_workspace_remove",
+                    {
+                        "device_id": device_id,
+                        "id": "ws_extra_e4",
+                        "async": True,
+                        "idempotency_key": f"idem_ws_rm_{marker}",
+                    },
+                    rpc_id=94,
+                )
+            )
+            ws_rm_op = str(ws_rm_sc.get("operation_id") or "")
+            ws_rm_done = wait_operation(issuer, access_token, ws_rm_op, want={"completed"}, timeout_s=60.0)
+            if str(ws_rm_done.get("status")) != "completed":
+                raise RuntimeError(f"workspace.remove failed: {ws_rm_done}")
+
             # Restart ownmeshd under recommended; session.open with external marker
             # command must fail closed and must not create the marker file.
             (config_dir / "policy.toml").write_text(
@@ -1727,7 +1807,7 @@ def main() -> int:
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
                 f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
                 f"patch+shell+workspace-select+live-pty+session-open+observer-deny-write+"
-                f"workspace-list/show+input_seq+two-principal-handoff+required-key+session-policy-deny held "
+                f"workspace-list/show+workspace-CRUD+input_seq+two-principal-handoff+required-key+session-policy-deny held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )

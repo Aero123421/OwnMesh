@@ -125,6 +125,16 @@ function legacyAction(op: string): string {
     case "ownmesh_cancel_operation":
     case "cancel":
       return "cancel";
+    case "ownmesh_workspace_list":
+      return "workspace.list";
+    case "ownmesh_workspace_show":
+      return "workspace.show";
+    case "ownmesh_workspace_add":
+      return "workspace.add";
+    case "ownmesh_workspace_update":
+      return "workspace.update";
+    case "ownmesh_workspace_remove":
+      return "workspace.remove";
     case "approval.decision":
       return "approval.decision";
     default:
@@ -144,6 +154,11 @@ function legacyCapability(op: string, payload: Record<string, unknown>): string 
     return "filesystem.write";
   }
   if (action.startsWith("command.")) return "command.run";
+  if (action.startsWith("workspace.")) {
+    return action === "workspace.list" || action === "workspace.show"
+      ? "workspace.list"
+      : action;
+  }
   if (action === "cancel") return "operation.cancel";
   if (action.startsWith("session")) return "session.open";
   if (op.startsWith("ownmesh_fs_write") || op.startsWith("ownmesh_fs_delete")) {
@@ -175,6 +190,23 @@ function requiredScopeForCapability(capability: string, actionOrOp: string): str
   }
   if (capability.startsWith("session") || actionOrOp.startsWith("ownmesh_session") || actionOrOp.startsWith("session")) {
     return "ownmesh.session";
+  }
+  if (
+    capability.startsWith("workspace.") ||
+    actionOrOp.startsWith("ownmesh_workspace_") ||
+    actionOrOp.startsWith("workspace.")
+  ) {
+    if (
+      capability === "workspace.list" ||
+      capability === "workspace.show" ||
+      actionOrOp === "ownmesh_workspace_list" ||
+      actionOrOp === "ownmesh_workspace_show" ||
+      actionOrOp === "workspace.list" ||
+      actionOrOp === "workspace.show"
+    ) {
+      return "ownmesh.read";
+    }
+    return "ownmesh.write";
   }
   if (
     capability === "filesystem.read" ||

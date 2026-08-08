@@ -89,16 +89,18 @@ def main() -> int:
         ),
         "E4": (
             "device workspaces.json + workspace_id selection + handle/hardlink "
-            "custody; component-wise parent create with held-handle rename; "
+            "custody; handle-held dir list (rename-to-symlink fail-closed); "
+            "component-wise parent create with held-handle rename; "
             "session.open/list/show workspace bind+filter; directory full "
             "snapshot-then-sort cursors + v2 spool root/recursive bind + pre-append "
             "byte budget; restricted command.run/session.open fail-closed; "
-            "CLI CRUD still unsupported"
+            "CLI+MCP workspace CRUD (device-local registry)"
         ),
         "E5": (
             "remote session.open owns live PTY/ConPTY in ownmeshd (full_user/full_access); "
             "public MCP replay surfaces real process output; attach(observer demote)/write-deny "
             "+ workspace bind; input_seq/resize_seq reserve-before-write with payload digest; "
+            "RetryPending at-most-once (no PTY re-delivery); "
             "two-principal give handoff; controller lease reconnect matrix still partial"
         ),
         "E7": (
@@ -114,7 +116,7 @@ def main() -> int:
     )
     # E4/E5/E7 remain incomplete acceptance even with partial proof.
     incomplete_acceptance = (
-        ("E4", "workspace CLI CRUD + full custody matrix promotion"),
+        ("E4", "full custody matrix promotion beyond handle-held list + device-local CRUD"),
         ("E5", "controller lease reconnect/handoff + multi-observer replay matrix"),
         ("E7", "bounded unified-diff patch apply + Git review (no auto-merge)"),
         *still_open,

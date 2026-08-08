@@ -241,8 +241,8 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_surface_count_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                '"explicit_unsupported_count": 32',
-                '"explicit_unsupported_count": 31',
+                '"explicit_unsupported_count": 27',
+                '"explicit_unsupported_count": 26',
                 1,
             )
 

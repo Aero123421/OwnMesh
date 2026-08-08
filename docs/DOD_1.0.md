@@ -10,7 +10,7 @@
 
 ## Conclusion
 
-OwnMesh 1.x is **not complete against the specification DoD**. The parsed CLI contains **32 explicit unsupported CLI surfaces** from the authoritative Rust registry plus 7 additional hard-error unsupported surfaces (**39 total**), recorded in `release/SUPPORTED_SURFACES.json`; these surfaces are excluded from the completeness claim and return explicit errors. Remote routing hard-fails rather than falling back locally, `approval watch` does not degrade to a one-shot list, and broker install/uninstall cannot claim native service state.
+OwnMesh 1.x is **not complete against the specification DoD**. The parsed CLI contains **27 explicit unsupported CLI surfaces** from the authoritative Rust registry plus 7 additional hard-error unsupported surfaces (**34 total**), recorded in `release/SUPPORTED_SURFACES.json`; these surfaces are excluded from the completeness claim and return explicit errors. Remote routing hard-fails rather than falling back locally, `approval watch` does not degrade to a one-shot list, and broker install/uninstall cannot claim native service state.
 
 The v1.0.2 remediation made build/security/release evidence fail-closed. v1.1.0 adds onboarding (setup/doctor/user-level service) and signed distribution/update without claiming full specification completeness. “Library exists”, “parser accepts a command”, and “workflow exists” are not counted as end-to-end completion.
 

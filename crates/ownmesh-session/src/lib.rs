@@ -84,7 +84,9 @@ pub enum SessionError {
 pub enum SeqReserveOutcome {
     /// First time this sequence is seen; caller must deliver then finalize.
     Deliver { seq: u64 },
-    /// Prior attempt reserved but may not have finalized; caller may re-deliver once.
+    /// Prior attempt reserved but may not have finalized. Callers MUST NOT
+    /// re-deliver the side effect (at-most-once). Surface an uncertain outcome
+    /// or reconcile via durable host state instead of rewriting the PTY.
     RetryPending { seq: u64 },
     /// Durable applied receipt matches; caller must not re-deliver.
     Replayed { seq: u64 },

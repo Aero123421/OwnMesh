@@ -79,7 +79,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
    | `ownmesh.read` / `ownmesh.device` | `ownmesh_list_devices`, `ownmesh_fs_list` / `ownmesh_list_files`, `ownmesh_fs_read` / `ownmesh_read_file`, `ownmesh_get_operation`, `ownmesh_list_profiles` |
    | `ownmesh.write` | `ownmesh_fs_write` / `ownmesh_write_file` |
    | `ownmesh.exec` | `ownmesh_command_run` / `ownmesh_run_command`, `ownmesh_command_shell` / `ownmesh_run_shell`, `ownmesh_cancel_operation` |
-   | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` under `full_user_access`/`full_access` only (denied in `workspace_only`/`recommended` until OS confinement); controller `input_seq`/`resize_seq` exact-once; E5 partial: reconnect matrix still open; always pass `workspace_id` |
+   | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` under `full_user_access`/`full_access` only (denied in `workspace_only`/`recommended` until OS confinement); controller `input_seq`/`resize_seq` exact-once (RetryPending is at-most-once / uncertain, never re-delivers); E5 partial: reconnect matrix still open; always pass `workspace_id` |
    | `offline_access` | refresh tokens for long-lived ChatGPT connector |
 
 6. Complete OAuth in the browser when ChatGPT prompts.
@@ -91,6 +91,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
 | Goal | Example prompt |
 |---|---|
 | Discovery | “List my OwnMesh devices” |
+| Workspace CRUD (E4) | `ownmesh_workspace_list|show|add|update|remove` — device-local registry via MCP; `ws_default` protected |
 | Read | “On device `dev_…`, list files under the workspace root” |
 | Write | “Write `hello.txt` with content `hi` on that device” |
 | Structured command | “Run `git status` via OwnMesh structured command (not shell)” |

@@ -228,8 +228,14 @@ pub enum DeviceCmd {
 pub enum WorkspaceCmd {
     /// Add a workspace root.
     Add {
-        /// Filesystem path.
+        /// Filesystem path (absolute).
         path: String,
+        /// Optional workspace id (ws_...); derived from path when omitted.
+        #[arg(long)]
+        id: Option<String>,
+        /// Optional human label.
+        #[arg(long)]
+        label: Option<String>,
     },
     /// List workspaces.
     List,
@@ -242,6 +248,12 @@ pub enum WorkspaceCmd {
     Update {
         /// Workspace id.
         id: String,
+        /// Optional new absolute root path.
+        #[arg(long)]
+        path: Option<String>,
+        /// Optional human label (empty clears).
+        #[arg(long)]
+        label: Option<String>,
     },
     /// Remove a workspace.
     Remove {

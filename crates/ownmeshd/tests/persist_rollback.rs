@@ -904,3 +904,156 @@ async fn successful_lockdown_and_revoke_still_persist() {
     assert!(rt.is_lockdown());
     assert!(paths.state_dir.join("lockdown.flag").is_file());
 }
+
+#[tokio::test]
+async fn workspace_crud_roundtrip_persists_registry() {
+    use runtime::ops_methods;
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let listed = rt
+        .dispatch(ops_methods::WORKSPACE_LIST, None, &client("owner"))
+        .await
+        .expect("list");
+    assert!(listed["count"].as_u64().unwrap() >= 1);
+
+    let extra = dir.path().join("extra-ws");
+    fs::create_dir_all(&extra).unwrap();
+    let added = rt
+        .dispatch(
+            ops_methods::WORKSPACE_ADD,
+            Some(json!({
+                "path": extra.to_string_lossy(),
+                "id": "ws_extra1",
+                "label": "extra",
+            })),
+            &client("owner"),
+        )
+        .await
+        .expect("add");
+    assert_eq!(added["id"], "ws_extra1");
+
+    let shown = rt
+        .dispatch(
+            ops_methods::WORKSPACE_SHOW,
+            Some(json!({ "id": "ws_extra1" })),
+            &client("owner"),
+        )
+        .await
+        .expect("show");
+    assert_eq!(shown["label"], "extra");
+
+    let updated = rt
+        .dispatch(
+            ops_methods::WORKSPACE_UPDATE,
+            Some(json!({ "id": "ws_extra1", "label": "extra-2" })),
+            &client("owner"),
+        )
+        .await
+        .expect("update");
+    assert_eq!(updated["label"], "extra-2");
+
+    // Survive restart.
+    drop(rt);
+    let mut rt = DaemonRuntime::open(&paths).expect("reopen");
+    let listed = rt
+        .dispatch(ops_methods::WORKSPACE_LIST, None, &client("owner"))
+        .await
+        .expect("list2");
+    let ids: Vec<&str> = listed["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"ws_extra1"), "{ids:?}");
+
+    let removed = rt
+        .dispatch(
+            ops_methods::WORKSPACE_REMOVE,
+            Some(json!({ "id": "ws_extra1" })),
+            &client("owner"),
+        )
+        .await
+        .expect("remove");
+    assert_eq!(removed["removed"], true);
+
+    let err = rt
+        .dispatch(
+            ops_methods::WORKSPACE_REMOVE,
+            Some(json!({ "id": "ws_default" })),
+            &client("owner"),
+        )
+        .await
+        .expect_err("default protected");
+    match err {
+        IpcError::Remote { message, .. } => assert!(message.contains("ws_default"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn session_write_pending_after_final_persist_failure_is_at_most_once() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    rt.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+    let id = open_session(&mut rt, "owner", "pty-once").await;
+
+    // Fail the finalize persist (2nd session persist in write path after open's persists).
+    // open_session already persisted; write does: reserve commit (#1) then finalize commit (#2).
+    rt.fail_sessions_persist_on_nth_call_for_test(2);
+    let err = rt
+        .dispatch(
+            session_methods::WRITE,
+            Some(json!({
+                "id": id,
+                "data": "once-only
+            ",
+                "input_seq": 1,
+            })),
+            &client("owner"),
+        )
+        .await
+        .expect_err("finalize persist must fail");
+    match &err {
+        IpcError::Remote { message, .. } => {
+            assert!(
+                message.to_ascii_lowercase().contains("session")
+                    || message.to_ascii_lowercase().contains("persist"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Clear fault. Retry same seq must NOT re-deliver (uncertain / at-most-once).
+    rt.fail_sessions_persist_on_nth_call_for_test(0);
+    // Resetting to 0 disables fault (fetch_update only fires when remaining > 0).
+    let err2 = rt
+        .dispatch(
+            session_methods::WRITE,
+            Some(json!({
+                "id": id,
+                "data": "once-only
+            ",
+                "input_seq": 1,
+            })),
+            &client("owner"),
+        )
+        .await
+        .expect_err("retry pending must be uncertain");
+    match err2 {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::CONFLICT, "{message}");
+            let lower = message.to_ascii_lowercase();
+            assert!(
+                lower.contains("uncertain") || lower.contains("at-most-once"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}

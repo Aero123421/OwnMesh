@@ -14,6 +14,7 @@ mod session_cmd;
 mod setup;
 mod status;
 mod update_cmd;
+mod workspace_cmd;
 
 use crate::cli::{
     Cli, Commands, ConfigCmd, DeviceCmd, InstanceCmd, McpCmd, PrivilegedCmd, ProcessCmd,
@@ -40,11 +41,6 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "instance list",
     "instance use",
     "instance remove",
-    "workspace add",
-    "workspace list",
-    "workspace show",
-    "workspace update",
-    "workspace remove",
     "process start",
     "process status",
     "process logs",
@@ -186,13 +182,7 @@ fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {
 }
 
 fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode> {
-    match cmd {
-        WorkspaceCmd::Add { path } => stub(cli, "workspace add", path),
-        WorkspaceCmd::List => stub(cli, "workspace list", "chapter 6"),
-        WorkspaceCmd::Show { id } => stub(cli, "workspace show", id),
-        WorkspaceCmd::Update { id } => stub(cli, "workspace update", id),
-        WorkspaceCmd::Remove { id } => stub(cli, "workspace remove", id),
-    }
+    workspace_cmd::dispatch_workspace(cli, cmd)
 }
 
 fn dispatch_process(cli: &Cli, cmd: &ProcessCmd) -> Result<(), ExitCode> {

@@ -10,7 +10,7 @@ OwnMesh is **not** an AI orchestrator, and the 1.x line is **not feature-complet
 
 **v1.1.0** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
-The CLI currently has **32 explicit unsupported CLI surfaces** from the Rust dispatch registry plus 7 additional hard-error unsupported surfaces (**39 total**). They return machine-visible errors and are excluded from completeness claims. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, remote execution/session routing fails instead of falling back locally, and `approval watch` fails instead of silently behaving like a one-shot list.
+The CLI currently has **27 explicit unsupported CLI surfaces** from the Rust dispatch registry plus 7 additional hard-error unsupported surfaces (**34 total**). They return machine-visible errors and are excluded from completeness claims. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, remote execution/session routing fails instead of falling back locally, and `approval watch` fails instead of silently behaving like a one-shot list.
 
 ### Supported CLI areas
 

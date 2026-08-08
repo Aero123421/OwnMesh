@@ -1773,6 +1773,24 @@ fn map_request_to_method(
         ("git.diff" | "git", "git.diff" | "ownmesh_git_diff" | "diff") => {
             crate::runtime::ops_methods::GIT_DIFF
         }
+        // Device-local workspace registry CRUD (E4 configuration).
+        ("workspace.list" | "workspace", "workspace.list" | "ownmesh_workspace_list" | "list") => {
+            crate::runtime::ops_methods::WORKSPACE_LIST
+        }
+        ("workspace.show" | "workspace", "workspace.show" | "ownmesh_workspace_show" | "show") => {
+            crate::runtime::ops_methods::WORKSPACE_SHOW
+        }
+        ("workspace.add" | "workspace", "workspace.add" | "ownmesh_workspace_add" | "add") => {
+            crate::runtime::ops_methods::WORKSPACE_ADD
+        }
+        (
+            "workspace.update" | "workspace",
+            "workspace.update" | "ownmesh_workspace_update" | "update",
+        ) => crate::runtime::ops_methods::WORKSPACE_UPDATE,
+        (
+            "workspace.remove" | "workspace",
+            "workspace.remove" | "ownmesh_workspace_remove" | "remove",
+        ) => crate::runtime::ops_methods::WORKSPACE_REMOVE,
         // Accept short fixture-style capability names used by the E0 contract samples.
         ("fs.read", _) => methods::OPS_FS_READ,
         ("fs.write", _) => methods::OPS_FS_WRITE,

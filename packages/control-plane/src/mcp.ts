@@ -926,6 +926,134 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "read",
   },
   {
+    name: "ownmesh_workspace_list",
+    description: "List device-local workspace roots registered on a PC (CRUD configuration)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "discovery",
+  },
+  {
+    name: "ownmesh_workspace_show",
+    description: "Show one device-local workspace root by id",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "id", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "discovery",
+  },
+  {
+    name: "ownmesh_workspace_add",
+    description: "Register an absolute workspace root on a device (device-local registry)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        path: str,
+        id: str,
+        label: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once add",
+        },
+      },
+      required: ["device_id", "path", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.write",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_workspace_update",
+    description: "Update a device-local workspace label and/or root path",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        id: str,
+        path: str,
+        label: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "id", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.write",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_workspace_remove",
+    description: "Remove a non-default device-local workspace registration (does not delete files)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "id", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: true,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.write",
+    risk: "write",
+  },
+  {
     name: "ownmesh_get_operation",
     description: "Poll status of a long-running or approval-gated operation",
     inputSchema: {
@@ -1643,6 +1771,16 @@ function toolCapability(toolName: string): string {
       return "git.status";
     case "ownmesh_git_diff":
       return "git.diff";
+    case "ownmesh_workspace_list":
+      return "workspace.list";
+    case "ownmesh_workspace_show":
+      return "workspace.show";
+    case "ownmesh_workspace_add":
+      return "workspace.add";
+    case "ownmesh_workspace_update":
+      return "workspace.update";
+    case "ownmesh_workspace_remove":
+      return "workspace.remove";
     case "ownmesh_cancel_operation":
       return "operation.cancel";
     default:
@@ -1697,6 +1835,16 @@ function toolAction(toolName: string): string {
       return "git.status";
     case "ownmesh_git_diff":
       return "git.diff";
+    case "ownmesh_workspace_list":
+      return "workspace.list";
+    case "ownmesh_workspace_show":
+      return "workspace.show";
+    case "ownmesh_workspace_add":
+      return "workspace.add";
+    case "ownmesh_workspace_update":
+      return "workspace.update";
+    case "ownmesh_workspace_remove":
+      return "workspace.remove";
     case "ownmesh_cancel_operation":
       return "cancel";
     default:
