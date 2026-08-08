@@ -2344,12 +2344,15 @@ full_user_access/full_access for arbitrary commands",
             id: String,
             #[serde(default)]
             principal: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
         let now = self.prepare_session_access()?;
         // Only an existing reader may claim a released/expired controller lease.
         self.require_reader(&p.id, &client.client_name, now)?;
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
         let lease = self
@@ -2357,7 +2360,7 @@ full_user_access/full_access for arbitrary commands",
             .claim_controller(&p.id, principal, now)
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
-        Ok(json!({ "lease": lease, "session_id": p.id }))
+        Ok(json!({ "lease": lease, "session_id": p.id, "workspace_id": bound_ws }))
     }
 
     fn handle_session_release(
@@ -2370,17 +2373,20 @@ full_user_access/full_access for arbitrary commands",
             id: String,
             #[serde(default)]
             principal: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
         let now = self.prepare_session_access()?;
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
         self.sessions
             .release_controller(&p.id, &principal, now)
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
-        Ok(json!({ "released": true, "session_id": p.id }))
+        Ok(json!({ "released": true, "session_id": p.id, "workspace_id": bound_ws }))
     }
 
     fn handle_session_give(
@@ -2394,6 +2400,8 @@ full_user_access/full_access for arbitrary commands",
             to: String,
             #[serde(default)]
             from: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         // give requires from == authenticated identity (spoofed from is rejected).
@@ -2409,6 +2417,7 @@ full_user_access/full_access for arbitrary commands",
             }
         }
         let now = self.prepare_session_access()?;
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let from = client.client_name.clone();
         let snapshot = self.sessions.clone();
         let lease = self
@@ -2422,7 +2431,7 @@ full_user_access/full_access for arbitrary commands",
             .map_err(session_err)?
             .into_iter()
             .collect();
-        Ok(json!({ "lease": lease, "readers": readers }))
+        Ok(json!({ "lease": lease, "readers": readers, "workspace_id": bound_ws }))
     }
 
     fn handle_session_close(
@@ -2430,17 +2439,24 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
-        let id = require_id(params, "id")?;
-        self.require_controller(&id, &client.client_name, now)?;
-        let _ = self.drain_live_output_into_session(&id);
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        self.require_controller(&p.id, &client.client_name, now)?;
+        let _ = self.drain_live_output_into_session(&p.id);
         // Snapshot before host teardown so a failed sessions persist rolls back
         // the complete manager (including host_pid) transactionally.
         let snapshot = self.sessions.clone();
-        self.sessions.close(&id).map_err(session_err)?;
+        self.sessions.close(&p.id).map_err(session_err)?;
         self.commit_sessions(snapshot)?;
-        self.stop_live_host(&id);
-        Ok(json!({ "closed": true, "session_id": id }))
+        self.stop_live_host(&p.id);
+        Ok(json!({ "closed": true, "session_id": p.id, "workspace_id": bound_ws }))
     }
 
     fn handle_session_terminate(
@@ -2454,6 +2470,8 @@ full_user_access/full_access for arbitrary commands",
             id: Option<String>,
             #[serde(default)]
             all: bool,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
@@ -2491,13 +2509,14 @@ full_user_access/full_access for arbitrary commands",
             code: app_error::INVALID_PARAMS,
             message: "id or all required".into(),
         })?;
+        let bound_ws = self.require_session_workspace(&id, p.workspace_id.as_deref())?;
         self.require_controller(&id, &client.client_name, now)?;
         let _ = self.drain_live_output_into_session(&id);
         let snapshot = self.sessions.clone();
         self.sessions.terminate(&id).map_err(session_err)?;
         self.commit_sessions(snapshot)?;
         self.stop_live_host(&id);
-        Ok(json!({ "terminated": 1, "session_id": id }))
+        Ok(json!({ "terminated": 1, "session_id": id, "workspace_id": bound_ws }))
     }
 
     fn handle_session_replay(

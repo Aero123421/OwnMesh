@@ -1,13 +1,14 @@
 # Changelog
 
-## v1.2.0-beta.8 — E5 live PTY host + E4 write custody + git spool integrity
+## v1.2.0-beta.8 — E5 live PTY + E3 crash outbox + large dir spool + session lifecycle
 
-- `ownmeshd` owns long-lived ConPTY/openpty hosts on `session.open` (kind=pty); write/resize/replay hit real process I/O with bounded drain into the durable ring
-- `ownmesh-session-host` exposes `LiveHost` as a library; reader join never blocks Drop/terminate on stalled ConPTY reads
-- MCP session attach/write/resize/replay require `workspace_id` for exact-action hash binding
-- Restricted write parents are created component-wise with held directory handle across temp+rename (Linux `renameat`)
-- Git diff spools use per-user private state dir + content-hash integrity; `core.fsmonitor` forced off for read-only captures
-- E2 workerd proof asserts live PTY process output via public MCP replay
+- E3: Agent transport durable pending dispatch outbox; crash/reconnect resumes or emits terminal `OWNMESH_E_DISPATCH_LOST` (no stranded seen-without-completion); capacity rejects without live eviction
+- E2/E4: directory listings >25k spill to private durable spool with integrity hash + `v2:` cursors so Full Access can retrieve every entry in chunks
+- E5: live PTY host in ownmeshd; public MCP session list/show/claim/release/give/terminate; `workspace_id` required on close/claim/release/give/terminate
+- E5: pipe fallback uses concurrent capped readers + timeout kill (no unbounded `Command::output`)
+- E7: git diff spool TTL/count/byte quota cleanup on private state dir
+- Restricted write parents component-wise with held directory handle across temp+rename (Linux `renameat`)
+- Release notes document 32 explicit unsupported CLI surfaces / 39 total via `release/SUPPORTED_SURFACES.json`
 - Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
 
 ## v1.2.0-beta.7 — E4 workspace selection + custody hardlinks + E2 surface proof

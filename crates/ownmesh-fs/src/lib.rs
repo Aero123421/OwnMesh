@@ -352,14 +352,15 @@ pub fn list_dir(
 /// `cursor` is an exclusive lower-bound on that tuple. Name/path character
 /// budgets drop oversized entries rather than allocating unbounded JSON.
 ///
-/// Traversal is cursor-resumable: entries at or before the cursor are skipped
-/// during the scan so later pages still see names beyond any intermediate
-/// collection ceiling. A hard collect ceiling bounds memory; when hit, the
-/// page is marked truncated so clients continue with the returned cursor.
+/// Small directories stay in-memory. Directories that exceed the memory snapshot
+/// bound spill into a private durable spool with quota/TTL so Full Access can
+/// still retrieve every entry via chunks without unbounded RSS. Never issues a
+/// continuation cursor from an incomplete unsorted window.
 ///
 /// # Errors
 ///
-/// Returns an error when the path cannot be resolved or read, or is not a directory.
+/// Returns an error when the path cannot be resolved or read, is not a directory,
+/// or when the hard spool entry/byte quota is exceeded.
 pub fn list_dir_page(
     ws: &WorkspaceRoot,
     rel: impl AsRef<Path>,
@@ -379,34 +380,55 @@ pub fn list_dir_page(
         }
         path
     };
-    let after = decode_list_cursor(cursor);
     // Server-side ceiling independent of caller-supplied max_entries.
     const MAX_PAGE_ENTRIES: usize = 500;
     /// UTF-8 JSON page budget so Agent/DeviceRoom envelopes never lose the
-    /// directory cursor to a generic truncation stand-in. Sized under the
-    /// durable MCP data_json ceiling with headroom for framing.
+    /// directory cursor to a generic truncation stand-in.
     const MAX_PAGE_JSON_BYTES: usize = 96_000;
-    /// Hard bound on a full directory snapshot held in memory before sort+page.
-    /// Filesystem iteration order is not lexical: we MUST materialize the full
-    /// snapshot, sort it, then page. Returning a cursor from a partial unsorted
-    /// window permanently skips entries that appear later in iteration order but
-    /// sort before the cursor (e.g. 25k `z*` before any `a*`).
-    /// Fail closed with EntryLimit when the tree exceeds this bound — never
-    /// issue a continuation cursor from an incomplete snapshot.
-    const MAX_DIR_SNAPSHOT: usize = 25_000;
+    /// In-memory snapshot bound. Above this, entries spill to a durable spool.
+    const MAX_DIR_MEMORY_SNAPSHOT: usize = 25_000;
+    /// Hard spool entry quota (disk-backed, still bounded).
+    const MAX_DIR_SPOOL_ENTRIES: usize = 250_000;
     let limit = max_entries.clamp(1, MAX_PAGE_ENTRIES);
 
-    // Phase 1: full bounded snapshot (ignore caller cursor until after sort).
+    // Resume from a durable spool cursor without re-walking the tree.
+    if let Some((spool_id, after)) = decode_v2_list_cursor(cursor) {
+        let snapshot = load_dir_spool(&spool_id)?;
+        return Ok(page_sorted_snapshot(
+            snapshot,
+            after.as_ref(),
+            limit,
+            MAX_PAGE_JSON_BYTES,
+            Some(spool_id.as_str()),
+        ));
+    }
+
+    let after = decode_list_cursor(cursor);
+
+    // Phase 1: walk. Stay in RAM until memory bound, then spill to durable spool.
     let mut snapshot: Vec<DirEntryInfo> = Vec::new();
-    let mut push_snapshot = |info: DirEntryInfo| -> FsResult<()> {
+    let mut spool_entries: Vec<DirEntryInfo> = Vec::new();
+    let mut spilled = false;
+
+    let mut push_entry = |info: DirEntryInfo| -> FsResult<()> {
         if !entry_within_budgets(&info) {
             return Ok(());
         }
-        if snapshot.len() >= MAX_DIR_SNAPSHOT {
-            // One more in-budget entry proves the snapshot is incomplete.
+        if !spilled {
+            if snapshot.len() >= MAX_DIR_MEMORY_SNAPSHOT {
+                // Spill existing snapshot + continue on disk-backed vector with
+                // a much higher hard cap so large valid trees remain retrievable.
+                spool_entries = std::mem::take(&mut snapshot);
+                spilled = true;
+            } else {
+                snapshot.push(info);
+                return Ok(());
+            }
+        }
+        if spool_entries.len() >= MAX_DIR_SPOOL_ENTRIES {
             return Err(FsError::EntryLimit);
         }
-        snapshot.push(info);
+        spool_entries.push(info);
         Ok(())
     };
 
@@ -424,7 +446,7 @@ pub fn list_dir_page(
                 is_symlink: entry.file_type().is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
             };
-            push_snapshot(info)?;
+            push_entry(info)?;
         }
     } else {
         let rd = fs::read_dir(&path).map_err(|source| FsError::Io {
@@ -448,57 +470,76 @@ pub fn list_dir_page(
                 is_symlink: ft.is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
             };
-            push_snapshot(info)?;
+            push_entry(info)?;
         }
     }
 
-    // Phase 2: stable total order, then exclusive cursor lower-bound.
+    let mut snapshot = if spilled { spool_entries } else { snapshot };
+
+    // Phase 2: stable total order (required; filesystem order is not lexical).
     snapshot.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
-    let matched: Vec<DirEntryInfo> = match after.as_ref() {
-        None => snapshot,
+
+    let spool_id = if spilled {
+        Some(persist_dir_spool(&path, recursive, &snapshot)?)
+    } else {
+        None
+    };
+
+    Ok(page_sorted_snapshot(
+        snapshot,
+        after.as_ref(),
+        limit,
+        MAX_PAGE_JSON_BYTES,
+        spool_id.as_deref(),
+    ))
+}
+
+fn page_sorted_snapshot(
+    snapshot: Vec<DirEntryInfo>,
+    after: Option<&(String, String)>,
+    limit: usize,
+    max_page_json_bytes: usize,
+    spool_id: Option<&str>,
+) -> DirListPage {
+    // Exclusive cursor lower-bound without a second full clone when possible.
+    let start_idx = match after {
+        None => 0,
         Some((after_name, after_path)) => snapshot
-            .into_iter()
-            .filter(|info| {
+            .iter()
+            .position(|info| {
                 info.name.as_str() > after_name.as_str()
                     || (info.name.as_str() == after_name.as_str()
                         && info.path.as_str() > after_path.as_str())
             })
-            .collect(),
+            .unwrap_or(snapshot.len()),
     };
-    let total_matched = matched.len();
+    let total_matched = snapshot.len().saturating_sub(start_idx);
 
-    // Phase 3: page under entry-count and UTF-8 JSON byte budgets.
     let mut page_entries: Vec<DirEntryInfo> = Vec::new();
     let mut page_bytes: usize = 2; // []
     let mut hit_entry_cap = false;
     let mut hit_byte_cap = false;
-    for entry in matched {
+    for entry in snapshot.into_iter().skip(start_idx) {
         if page_entries.len() >= limit {
             hit_entry_cap = true;
             break;
         }
         let entry_json_len = match serde_json::to_vec(&entry) {
             Ok(v) => v.len(),
-            Err(_) => {
-                // Fail closed on serialization surprises: count a conservative ceiling.
-                entry
-                    .name
-                    .len()
-                    .saturating_add(entry.path.len())
-                    .saturating_add(64)
-            }
+            Err(_) => entry
+                .name
+                .len()
+                .saturating_add(entry.path.len())
+                .saturating_add(64),
         };
         let comma = usize::from(!page_entries.is_empty());
         let next_bytes = page_bytes
             .saturating_add(comma)
             .saturating_add(entry_json_len);
-        if !page_entries.is_empty() && next_bytes > MAX_PAGE_JSON_BYTES {
+        if !page_entries.is_empty() && next_bytes > max_page_json_bytes {
             hit_byte_cap = true;
-            // Stop before this entry; cursor is the last accepted (name, path).
             break;
         }
-        // Always accept the first entry even if it alone is large so progress is
-        // possible; callers still see truncated + cursor.
         page_bytes = if page_entries.is_empty() {
             entry_json_len.saturating_add(2)
         } else {
@@ -511,18 +552,255 @@ pub fn list_dir_page(
     }
     let truncated = hit_entry_cap || hit_byte_cap || total_matched > page_entries.len();
     let next_cursor = if truncated {
-        page_entries
-            .last()
-            .map(|e| encode_list_cursor(&e.name, &e.path))
+        page_entries.last().map(|e| match spool_id {
+            Some(id) => encode_v2_list_cursor(id, &e.name, &e.path),
+            None => encode_list_cursor(&e.name, &e.path),
+        })
     } else {
         None
     };
-    Ok(DirListPage {
+    DirListPage {
         entries: page_entries,
         next_cursor,
         truncated,
         total_matched,
-    })
+    }
+}
+
+/// Durable directory list spool (sorted snapshot) for large trees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DirListSpool {
+    version: u32,
+    root_key: String,
+    recursive: bool,
+    created_unix: u64,
+    entry_count: usize,
+    content_sha256: String,
+    entries: Vec<DirEntryInfo>,
+}
+
+const DIR_SPOOL_VERSION: u32 = 1;
+const DIR_SPOOL_TTL_SECS: u64 = 15 * 60;
+const MAX_DIR_SPOOLS: usize = 32;
+const MAX_DIR_SPOOL_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+fn dir_spool_dir() -> PathBuf {
+    let base = std::env::var_os("OWNMESH_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            #[cfg(windows)]
+            {
+                std::env::var_os("LOCALAPPDATA")
+                    .map(|h| PathBuf::from(h).join("OwnMesh").join("state"))
+            }
+            #[cfg(not(windows))]
+            {
+                std::env::var_os("XDG_STATE_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|h| PathBuf::from(h).join(".local/state/OwnMesh"))
+                    })
+                    .map(|h| h.join("state"))
+            }
+        })
+        .unwrap_or_else(|| {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "ownmesh-{}",
+                std::env::var("USERNAME")
+                    .or_else(|_| std::env::var("USER"))
+                    .unwrap_or_else(|_| format!("uid-{}", std::process::id()))
+            ));
+            p.push("state");
+            p
+        });
+    base.join("dir-list-spool")
+}
+
+fn ensure_dir_spool_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = fs::metadata(dir)?;
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(dir, perms)?;
+    }
+    Ok(())
+}
+
+fn cleanup_dir_spools(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut files: Vec<(PathBuf, u64, u64)> = Vec::new();
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        if now.saturating_sub(modified) > DIR_SPOOL_TTL_SECS {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        files.push((path, modified, meta.len()));
+    }
+    // Keep newest MAX_DIR_SPOOLS; drop oldest beyond quota.
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    for (path, _, _) in files.into_iter().skip(MAX_DIR_SPOOLS) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn persist_dir_spool(root: &Path, recursive: bool, entries: &[DirEntryInfo]) -> FsResult<String> {
+    let dir = dir_spool_dir();
+    let _ = ensure_dir_spool_dir(&dir);
+    cleanup_dir_spools(&dir);
+
+    let mut hasher = Sha256::new();
+    hasher.update(root.to_string_lossy().as_bytes());
+    hasher.update([u8::from(recursive)]);
+    for e in entries {
+        hasher.update(e.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(e.path.as_bytes());
+        hasher.update([0]);
+    }
+    let content_sha256 = hex::encode(hasher.finalize());
+    let created_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut id_hasher = Sha256::new();
+    id_hasher.update(content_sha256.as_bytes());
+    id_hasher.update(created_unix.to_le_bytes());
+    id_hasher.update(std::process::id().to_le_bytes());
+    let spool_id = hex::encode(id_hasher.finalize());
+    let spool_id = spool_id[..32].to_owned();
+
+    let spool = DirListSpool {
+        version: DIR_SPOOL_VERSION,
+        root_key: root.to_string_lossy().into_owned(),
+        recursive,
+        created_unix,
+        entry_count: entries.len(),
+        content_sha256: content_sha256.clone(),
+        entries: entries.to_vec(),
+    };
+    let encoded = serde_json::to_vec(&spool).map_err(|e| FsError::Io {
+        path: Some(dir.clone()),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    if encoded.len() > MAX_DIR_SPOOL_FILE_BYTES {
+        return Err(FsError::EntryLimit);
+    }
+    let path = dir.join(format!("{spool_id}.json"));
+    let tmp = dir.join(format!("{spool_id}.json.tmp"));
+    fs::write(&tmp, &encoded).map_err(|source| FsError::Io {
+        path: Some(tmp.clone()),
+        source,
+    })?;
+    fs::rename(&tmp, &path).map_err(|source| FsError::Io {
+        path: Some(path),
+        source,
+    })?;
+    Ok(spool_id)
+}
+
+fn load_dir_spool(spool_id: &str) -> FsResult<Vec<DirEntryInfo>> {
+    if spool_id.len() != 32 || !spool_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(FsError::InvalidPath(
+            "invalid directory list spool id".to_owned(),
+        ));
+    }
+    let path = dir_spool_dir().join(format!("{spool_id}.json"));
+    let meta = fs::symlink_metadata(&path).map_err(|source| FsError::Io {
+        path: Some(path.clone()),
+        source,
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        let _ = fs::remove_file(&path);
+        return Err(FsError::NotFound(path));
+    }
+    if usize::try_from(meta.len()).map_or(true, |n| n > MAX_DIR_SPOOL_FILE_BYTES) {
+        let _ = fs::remove_file(&path);
+        return Err(FsError::EntryLimit);
+    }
+    let bytes = fs::read(&path).map_err(|source| FsError::Io {
+        path: Some(path.clone()),
+        source,
+    })?;
+    let spool: DirListSpool = serde_json::from_slice(&bytes).map_err(|e| FsError::Io {
+        path: Some(path.clone()),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    if spool.version != DIR_SPOOL_VERSION {
+        let _ = fs::remove_file(&path);
+        return Err(FsError::InvalidPath("unsupported dir spool version".into()));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(spool.created_unix) > DIR_SPOOL_TTL_SECS {
+        let _ = fs::remove_file(&path);
+        return Err(FsError::NotFound(path));
+    }
+    // Integrity: recompute content hash over entry name/path tuples.
+    let mut hasher = Sha256::new();
+    hasher.update(spool.root_key.as_bytes());
+    hasher.update([u8::from(spool.recursive)]);
+    for e in &spool.entries {
+        hasher.update(e.name.as_bytes());
+        hasher.update([0]);
+        hasher.update(e.path.as_bytes());
+        hasher.update([0]);
+    }
+    let recomputed = hex::encode(hasher.finalize());
+    if recomputed != spool.content_sha256 || spool.entry_count != spool.entries.len() {
+        let _ = fs::remove_file(&path);
+        return Err(FsError::InvalidPath("dir spool integrity failure".into()));
+    }
+    Ok(spool.entries)
+}
+
+fn encode_v2_list_cursor(spool_id: &str, name: &str, path: &str) -> String {
+    format!(
+        "v2:{spool_id}.{}.{}",
+        base64url_nopad(name.as_bytes()),
+        base64url_nopad(path.as_bytes())
+    )
+}
+
+fn decode_v2_list_cursor(cursor: Option<&str>) -> Option<(String, Option<(String, String)>)> {
+    let raw = cursor?.trim();
+    let rest = raw.strip_prefix("v2:")?;
+    let (spool_id, after_part) = rest.split_once('.')?;
+    if spool_id.len() != 32 || !spool_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (name_b64, path_b64) = after_part.split_once('.')?;
+    let name = String::from_utf8(base64url_decode_nopad(name_b64)?).ok()?;
+    let path = String::from_utf8(base64url_decode_nopad(path_b64)?).ok()?;
+    Some((spool_id.to_owned(), Some((name, path))))
 }
 
 /// Stat a path; optionally compute SHA-256 for files.
@@ -1032,6 +1310,59 @@ mod tests {
             let name = format!("f{i:05}.txt");
             assert!(seen.contains(&name), "missing {name}");
         }
+    }
+
+    /// Large directories that exceed the in-memory snapshot bound must still be
+    /// fully retrievable via durable spool cursors (Full Access chunking).
+    #[test]
+    fn list_page_retrieves_all_entries_beyond_memory_snapshot_via_spool() {
+        let dir = tempdir().unwrap();
+        // Isolate spool IO under the test temp dir.
+        std::env::set_var("OWNMESH_STATE_DIR", dir.path().join("state"));
+        let ws = WorkspaceRoot::new(dir.path().join("tree"), true).unwrap();
+        std::fs::create_dir_all(ws.root()).unwrap();
+        // Just over the 25_000 in-memory bound.
+        const N: usize = 25_050;
+        for i in 0..N {
+            let name = format!("g{i:05}.txt");
+            write_file(&ws, &name, b"x").unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0_usize;
+        let mut saw_v2 = false;
+        loop {
+            pages += 1;
+            assert!(pages < 400, "pagination failed to terminate");
+            let page = list_dir_page(&ws, "", false, 200, cursor.as_deref()).unwrap();
+            for entry in &page.entries {
+                assert!(
+                    seen.insert(entry.name.clone()),
+                    "duplicate entry across pages: {}",
+                    entry.name
+                );
+            }
+            if let Some(c) = page.next_cursor.as_deref() {
+                if c.starts_with("v2:") {
+                    saw_v2 = true;
+                }
+            }
+            if !page.truncated {
+                break;
+            }
+            cursor = page.next_cursor;
+            assert!(cursor.is_some(), "truncated page must carry next_cursor");
+        }
+        assert!(
+            saw_v2,
+            "expected durable v2 spool cursor for >25k directory"
+        );
+        assert_eq!(
+            seen.len(),
+            N,
+            "expected every entry once via spool pages; got {} across {pages} pages",
+            seen.len()
+        );
     }
 
     /// Adversarial unordered-enumeration property: names that sort early must not

@@ -674,17 +674,168 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       properties: {
         ...deviceProp,
         session_id: str,
+        workspace_id: str,
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key",
         },
       },
-      required: ["device_id", "session_id", "idempotency_key"],
+      required: ["device_id", "session_id", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
       openWorldHint: false,
+      idempotentHint: false,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_list",
+    description: "List sessions visible to the caller on a device",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_show",
+    description: "Show one device session (metadata + lease/readers)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "session_id", "workspace_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_claim",
+    description: "Claim the controller lease on a device session (existing reader only)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once claim",
+        },
+      },
+      required: ["device_id", "session_id", "workspace_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: false,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_release",
+    description: "Release the controller lease on a device session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "session_id", "workspace_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_give",
+    description: "Hand off the controller lease to another authenticated principal",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        to: str,
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key for exact-once handoff",
+        },
+      },
+      required: ["device_id", "session_id", "to", "workspace_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+      idempotentHint: false,
+    },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_terminate",
+    description: "Terminate a device session and its live process tree",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        workspace_id: str,
+        idempotency_key: {
+          type: "string",
+          description: "Required caller idempotency key",
+        },
+      },
+      required: ["device_id", "session_id", "workspace_id", "idempotency_key"],
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: true,
       idempotentHint: false,
     },
     scope: "ownmesh.session",
@@ -1455,6 +1606,8 @@ function toolCapability(toolName: string): string {
       return "session.claim";
     case "ownmesh_session_release":
       return "session.release";
+    case "ownmesh_session_give":
+      return "session.give";
     case "ownmesh_session_close":
       return "session.close";
     case "ownmesh_session_terminate":
@@ -1507,6 +1660,8 @@ function toolAction(toolName: string): string {
       return "session.claim";
     case "ownmesh_session_release":
       return "session.release";
+    case "ownmesh_session_give":
+      return "session.give";
     case "ownmesh_session_close":
       return "session.close";
     case "ownmesh_session_terminate":

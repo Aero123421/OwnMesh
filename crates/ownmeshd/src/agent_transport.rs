@@ -19,7 +19,7 @@ use ownmesh_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,6 +54,10 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const MAX_COMPLETION_QUEUE: usize = 8;
 /// Cap concurrent remote dispatches (running + waiting to send a result).
 const MAX_IN_FLIGHT_REMOTE_OPS: usize = 32;
+/// Durable accepted-but-not-completed operation.request envelopes (crash outbox).
+const MAX_PENDING_DISPATCHES: usize = 64;
+/// Bound raw envelope retention so the transport state file stays inside budget.
+const MAX_PENDING_RAW_BYTES: usize = MAX_PAYLOAD_BYTES.saturating_add(64 * 1024);
 
 type AgentSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -178,6 +182,18 @@ struct CompletedReply {
     payload: Value,
 }
 
+/// Immutable accepted operation.request kept until a durable completion exists.
+/// Survives crash between "seen" acknowledgment and side-effect finish so
+/// control-plane replay can resume dispatch or resend a terminal result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingDispatch {
+    message_id: String,
+    correlation_id: String,
+    operation_id: String,
+    raw: String,
+    accepted_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentTransportState {
     version: u32,
@@ -189,6 +205,9 @@ struct AgentTransportState {
     seen_message_ids: VecDeque<String>,
     #[serde(default)]
     completed_replies: VecDeque<CompletedReply>,
+    /// Crash outbox: raw envelopes accepted but not yet completed.
+    #[serde(default)]
+    pending_dispatches: VecDeque<PendingDispatch>,
 }
 
 impl AgentTransportState {
@@ -201,6 +220,7 @@ impl AgentTransportState {
             last_server_seq: 0,
             seen_message_ids: VecDeque::new(),
             completed_replies: VecDeque::new(),
+            pending_dispatches: VecDeque::new(),
         }
     }
 
@@ -236,6 +256,7 @@ impl AgentTransportState {
         trim_front(&mut state.seen_message_ids, MAX_REPLAY_ENTRIES);
         trim_front(&mut state.completed_replies, MAX_COMPLETED_REPLIES);
         state.enforce_completed_reply_budgets();
+        state.enforce_pending_dispatch_budgets();
         Ok(state)
     }
 
@@ -277,12 +298,75 @@ impl AgentTransportState {
     }
 
     fn remember_completed(&mut self, reply: CompletedReply) {
+        // Terminal result supersedes any crash-outbox entry for this correlation.
+        self.clear_pending_by_correlation(&reply.correlation_id);
         let compact = compact_completed_reply(reply);
         self.completed_replies
             .retain(|candidate| candidate.correlation_id != compact.correlation_id);
         self.completed_replies.push_back(compact);
         trim_front(&mut self.completed_replies, MAX_COMPLETED_REPLIES);
         self.enforce_completed_reply_budgets();
+    }
+
+    fn pending_by_correlation(&self, correlation_id: &str) -> Option<&PendingDispatch> {
+        self.pending_dispatches
+            .iter()
+            .find(|pending| pending.correlation_id == correlation_id)
+    }
+
+    fn remember_pending(&mut self, pending: PendingDispatch) -> Result<(), String> {
+        if pending.raw.len() > MAX_PENDING_RAW_BYTES {
+            return Err(format!(
+                "pending operation envelope exceeds {MAX_PENDING_RAW_BYTES} byte budget"
+            ));
+        }
+        if pending.correlation_id.is_empty() || pending.message_id.is_empty() {
+            return Err("pending dispatch requires message_id and correlation_id".into());
+        }
+        // Replace any prior accept for the same correlation (should be rare).
+        self.pending_dispatches
+            .retain(|candidate| candidate.correlation_id != pending.correlation_id);
+        // Capacity reject WITHOUT live-entry eviction (matches nonce map policy).
+        if self.pending_dispatches.len() >= MAX_PENDING_DISPATCHES {
+            return Err(format!(
+                "pending dispatch outbox full (max {MAX_PENDING_DISPATCHES}); no live eviction"
+            ));
+        }
+        let total_raw = self
+            .pending_dispatches
+            .iter()
+            .map(|p| p.raw.len())
+            .sum::<usize>()
+            .saturating_add(pending.raw.len());
+        if total_raw > MAX_COMPLETED_REPLIES_BYTES / 2 {
+            return Err("pending dispatch outbox byte budget exhausted; no live eviction".into());
+        }
+        self.pending_dispatches.push_back(pending);
+        Ok(())
+    }
+
+    fn clear_pending_by_correlation(&mut self, correlation_id: &str) {
+        self.pending_dispatches
+            .retain(|pending| pending.correlation_id != correlation_id);
+    }
+
+    fn enforce_pending_dispatch_budgets(&mut self) {
+        // Load-time hard bound only (corrupt/oversize files). Runtime admits never
+        // grow past the cap without an explicit capacity error.
+        while self.pending_dispatches.len() > MAX_PENDING_DISPATCHES {
+            let _ = self.pending_dispatches.pop_front();
+        }
+        let mut total_raw = self
+            .pending_dispatches
+            .iter()
+            .map(|p| p.raw.len())
+            .sum::<usize>();
+        while total_raw > MAX_COMPLETED_REPLIES_BYTES / 2 {
+            let Some(oldest) = self.pending_dispatches.pop_front() else {
+                break;
+            };
+            total_raw = total_raw.saturating_sub(oldest.raw.len());
+        }
     }
 
     /// Compact oversize entries, then drop oldest until aggregate bytes fit.
@@ -640,6 +724,55 @@ async fn live_loop(
     // Bounded queue + semaphore: slow WSS consumers must not grow RSS without limit.
     let (finish_tx, mut finish_rx) = mpsc::channel::<FinishedRemoteOp>(MAX_COMPLETION_QUEUE);
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REMOTE_OPS));
+    let active_dispatches = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+    // Crash resume: redispatch any accepted-but-incomplete operation.request entries
+    // from the durable outbox. Runtime idempotency keys prevent duplicate side effects.
+    let pending_resume: Vec<PendingDispatch> = state.pending_dispatches.iter().cloned().collect();
+    for pending in pending_resume {
+        if state.completed(&pending.correlation_id).is_some() {
+            state.clear_pending_by_correlation(&pending.correlation_id);
+            continue;
+        }
+        let Ok(envelope) = Envelope::parse_str(&pending.raw) else {
+            // Corrupt outbox entry: fail closed with a terminal receipt.
+            let payload = json!({
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": pending.operation_id,
+                "status": "failed",
+                "error": {
+                    "code": "OWNMESH_E_DISPATCH_LOST",
+                    "message": "pending dispatch envelope is corrupt and cannot be resumed",
+                    "retryable": false
+                }
+            });
+            let completed = CompletedReply {
+                correlation_id: pending.correlation_id.clone(),
+                operation_id: pending.operation_id.clone(),
+                payload,
+            };
+            state.remember_completed(completed.clone());
+            state.save(&config.state_path)?;
+            send_cached_result(socket, config, state, &completed).await?;
+            continue;
+        };
+        handle_live_frame(
+            socket,
+            config,
+            runtime,
+            state,
+            InboundFrame::New {
+                raw: pending.raw.clone(),
+                envelope,
+            },
+            &cancel_registry,
+            &finish_tx,
+            &in_flight,
+            &active_dispatches,
+        )
+        .await?;
+    }
+    state.save(&config.state_path)?;
 
     loop {
         tokio::select! {
@@ -664,6 +797,7 @@ async fn live_loop(
             }
             Some(finished) = finish_rx.recv() => {
                 // Durable completion before network send (same as sync path).
+                // remember_completed also clears the crash-outbox entry.
                 state.remember_completed(finished.completed.clone());
                 state.save(&config.state_path)?;
                 send_cached_result(socket, config, state, &finished.completed).await?;
@@ -683,6 +817,7 @@ async fn live_loop(
                         &cancel_registry,
                         &finish_tx,
                         &in_flight,
+                        &active_dispatches,
                     ).await?;
                 }
             }
@@ -785,6 +920,30 @@ fn parse_and_record_inbound(
     }
     state.last_server_seq = envelope.seq;
     state.remember_message(message_id.to_owned());
+    // Crash outbox: persist the immutable operation.request envelope BEFORE the
+    // seen-ack is durable so a daemon crash cannot strand D1 in pending forever.
+    if envelope.message_type == "operation.request" {
+        let correlation_id = envelope
+            .correlation_id
+            .clone()
+            .unwrap_or_else(|| message_id.to_owned());
+        let operation_id = envelope
+            .payload
+            .get("operation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        // Skip outbox when a terminal result already exists (replay after complete).
+        if state.completed(&correlation_id).is_none() {
+            state.remember_pending(PendingDispatch {
+                message_id: message_id.to_owned(),
+                correlation_id,
+                operation_id,
+                raw: raw.to_owned(),
+                accepted_at: Timestamp::now().to_rfc3339(),
+            })?;
+        }
+    }
     state.save(&config.state_path)?;
     Ok(InboundFrame::New {
         raw: raw.to_owned(),
@@ -801,6 +960,7 @@ async fn handle_live_frame(
     cancel_registry: &Arc<CancelRegistry>,
     finish_tx: &mpsc::Sender<FinishedRemoteOp>,
     in_flight: &Arc<Semaphore>,
+    active_dispatches: &Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), String> {
     let (raw, envelope) = match frame {
         InboundFrame::New { raw, envelope } => (Some(raw), envelope),
@@ -827,8 +987,40 @@ async fn handle_live_frame(
             if let Some(completed) = state.completed(correlation).cloned() {
                 return send_cached_result(socket, config, state, &completed).await;
             }
-            let Some(raw) = raw else {
-                return Ok(());
+            // Duplicate / crash-resume: recover the immutable envelope from the outbox.
+            let raw = match raw {
+                Some(raw) => raw,
+                None => match state.pending_by_correlation(correlation) {
+                    Some(pending) => pending.raw.clone(),
+                    None => {
+                        // Seen without pending or completion: fail closed so D1 cannot
+                        // remain pending forever after an outbox eviction/corruption.
+                        let operation_id = envelope
+                            .payload
+                            .get("operation_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or(correlation)
+                            .to_owned();
+                        let payload = json!({
+                            "operation_contract": OPERATION_CONTRACT_V1,
+                            "operation_id": operation_id,
+                            "status": "failed",
+                            "error": {
+                                "code": "OWNMESH_E_DISPATCH_LOST",
+                                "message": "operation was accepted but the durable dispatch outbox entry is gone; retry with a new operation id",
+                                "retryable": false
+                            }
+                        });
+                        let completed = CompletedReply {
+                            correlation_id: correlation.to_owned(),
+                            operation_id,
+                            payload,
+                        };
+                        state.remember_completed(completed.clone());
+                        state.save(&config.state_path)?;
+                        return send_cached_result(socket, config, state, &completed).await;
+                    }
+                },
             };
             let operation =
                 OperationEnvelope::parse_str(&raw).map_err(|error| error.to_string())?;
@@ -942,6 +1134,15 @@ async fn handle_live_frame(
                 }
             };
 
+            // In-process exact-once: do not start a second side effect while one runs
+            // (Duplicate redelivery or crash-outbox resume during the same session).
+            {
+                let mut active = active_dispatches.lock().await;
+                if !active.insert(correlation.to_owned()) {
+                    return Ok(());
+                }
+            }
+
             // Register cancel before spawn so a concurrent cancel cannot miss the
             // window between accept and dispatch start.
             let operation_id = request.operation_id.to_string();
@@ -949,6 +1150,7 @@ async fn handle_live_frame(
             let correlation_owned = correlation.to_owned();
             let cancel_registry = Arc::clone(cancel_registry);
             let finish_tx = finish_tx.clone();
+            let active_dispatches = Arc::clone(active_dispatches);
             let device_id = config.device_id.clone();
             let envelope_expires_at = operation
                 .envelope
@@ -968,13 +1170,15 @@ async fn handle_live_frame(
                 .await;
                 cancel_registry.forget(&operation_id).await;
                 let completed = CompletedReply {
-                    correlation_id: correlation_owned,
+                    correlation_id: correlation_owned.clone(),
                     operation_id,
                     payload,
                 };
                 // Backpressure: wait for the live loop to drain rather than drop
                 // or grow an unbounded queue while the WebSocket consumer is slow.
                 let _ = finish_tx.send(FinishedRemoteOp { completed }).await;
+                let mut active = active_dispatches.lock().await;
+                active.remove(&correlation_owned);
             });
             Ok(())
         }
@@ -1483,6 +1687,12 @@ fn map_request_to_method(
             }
             crate::runtime::session_methods::RELEASE
         }
+        ("session.give" | "session", "session.give" | "ownmesh_session_give" | "give") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::GIVE
+        }
         (
             "session.write" | "session",
             "session.write" | "ownmesh_session_write" | "write" | "input",
@@ -1955,6 +2165,113 @@ mod tests {
         let mut rewind: Value = serde_json::from_str(&raw).unwrap();
         rewind["message_id"] = Value::String("msg_rewind".into());
         assert!(parse_and_record_inbound(&rewind.to_string(), &config, &mut state).is_err());
+    }
+
+    #[test]
+    fn operation_request_persists_pending_outbox_across_crash_reload() {
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_outbox").unwrap();
+        let config = AgentTransportConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            ws_url: agent_connect_url("http://127.0.0.1:1", device.as_str()).unwrap(),
+            origin: "http://127.0.0.1:1".into(),
+            device_id: device.clone(),
+            credential: SecretString::new("redacted-test-credential"),
+            key: DeviceKeyPair::generate(),
+            state_path: dir.path().join("transport.json"),
+        };
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        let sent_at = Timestamp::now();
+        let expires_at = sent_at.checked_add(Duration::from_secs(60)).unwrap();
+        let raw_value = json!({
+            "protocol": PROTOCOL_DEVICE_V1,
+            "message_id": "msg_outbox_1",
+            "type": "operation.request",
+            "device_id": device.as_str(),
+            "correlation_id": "op_outbox_1",
+            "seq": 1,
+            "sent_at": sent_at,
+            "expires_at": expires_at,
+            "payload": {
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": "op_outbox_1",
+                "capability": "fs.read",
+                "idempotency_key": "idem_outbox_1",
+                "arguments": { "path": "a.txt" }
+            }
+        });
+        let raw = raw_value.to_string();
+        assert!(matches!(
+            parse_and_record_inbound(&raw, &config, &mut state).unwrap(),
+            InboundFrame::New { .. }
+        ));
+        assert_eq!(state.pending_dispatches.len(), 1);
+        assert_eq!(state.pending_dispatches[0].correlation_id, "op_outbox_1");
+        assert_eq!(state.pending_dispatches[0].raw, raw);
+
+        // Simulate crash: reload only what was durably saved.
+        let reloaded =
+            AgentTransportState::load(&config.state_path, &config.issuer, &device).unwrap();
+        assert_eq!(reloaded.pending_dispatches.len(), 1);
+        assert!(reloaded.has_seen_message("msg_outbox_1"));
+        assert!(reloaded.completed("op_outbox_1").is_none());
+
+        // Duplicate after crash still surfaces as Duplicate, with outbox raw intact.
+        let mut reloaded = reloaded;
+        assert!(matches!(
+            parse_and_record_inbound(&raw, &config, &mut reloaded).unwrap(),
+            InboundFrame::Duplicate(_)
+        ));
+        let pending = reloaded
+            .pending_by_correlation("op_outbox_1")
+            .expect("outbox must retain raw for resume");
+        assert_eq!(pending.raw, raw);
+
+        // Terminal completion clears the outbox (exact-once finish).
+        reloaded.remember_completed(CompletedReply {
+            correlation_id: "op_outbox_1".into(),
+            operation_id: "op_outbox_1".into(),
+            payload: json!({
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": "op_outbox_1",
+                "status": "completed",
+                "result": { "ok": true }
+            }),
+        });
+        assert!(reloaded.pending_by_correlation("op_outbox_1").is_none());
+        assert!(reloaded.completed("op_outbox_1").is_some());
+    }
+
+    #[test]
+    fn pending_outbox_capacity_rejects_without_live_eviction() {
+        let device = DeviceId::parse("dev_cap").unwrap();
+        let mut state = AgentTransportState::fresh("http://127.0.0.1:1", &device);
+        for i in 0..MAX_PENDING_DISPATCHES {
+            state
+                .remember_pending(PendingDispatch {
+                    message_id: format!("msg_cap_{i}"),
+                    correlation_id: format!("op_cap_{i}"),
+                    operation_id: format!("op_cap_{i}"),
+                    raw: format!(r#"{{"i":{i}}}"#),
+                    accepted_at: Timestamp::now().to_rfc3339(),
+                })
+                .unwrap();
+        }
+        let err = state
+            .remember_pending(PendingDispatch {
+                message_id: "msg_overflow".into(),
+                correlation_id: "op_overflow".into(),
+                operation_id: "op_overflow".into(),
+                raw: r#"{"i":999}"#.into(),
+                accepted_at: Timestamp::now().to_rfc3339(),
+            })
+            .expect_err("must reject when full");
+        assert!(
+            err.contains("no live eviction"),
+            "capacity error must refuse eviction: {err}"
+        );
+        assert_eq!(state.pending_dispatches.len(), MAX_PENDING_DISPATCHES);
+        assert!(state.pending_by_correlation("op_cap_0").is_some());
     }
 
     #[tokio::test]

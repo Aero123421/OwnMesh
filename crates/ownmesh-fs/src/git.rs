@@ -319,10 +319,72 @@ fn ensure_private_spool_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+const DIFF_SPOOL_TTL_SECS: u64 = 15 * 60;
+const MAX_DIFF_SPOOLS: usize = 64;
+const MAX_DIFF_SPOOL_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+fn cleanup_diff_spools(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut files: Vec<(std::path::PathBuf, u64, u64)> = Vec::new();
+    for ent in rd.flatten() {
+        let path = ent.path();
+        let is_spool = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext == "json" || ext.starts_with("json."));
+        if !is_spool {
+            continue;
+        }
+        // Drop leftover temp files aggressively.
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.starts_with("json."))
+        {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        if now.saturating_sub(modified) > DIFF_SPOOL_TTL_SECS {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        files.push((path, modified, meta.len()));
+    }
+    // Newest first; drop oldest beyond count and total byte quotas.
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut kept_bytes = 0u64;
+    for (idx, (path, _, len)) in files.into_iter().enumerate() {
+        if idx >= MAX_DIFF_SPOOLS || kept_bytes.saturating_add(len) > MAX_DIFF_SPOOL_TOTAL_BYTES {
+            let _ = std::fs::remove_file(path);
+        } else {
+            kept_bytes = kept_bytes.saturating_add(len);
+        }
+    }
+}
+
 fn load_or_build_diff_spool(cwd: &Path, args: &[&str], max_bytes: usize) -> FsResult<DiffSpool> {
     let path = diff_spool_path(cwd, args, max_bytes);
     if let Some(parent) = path.parent() {
         let _ = ensure_private_spool_dir(parent);
+        cleanup_diff_spools(parent);
     }
 
     // Only trust an existing spool when it is a regular file we can open exclusively

@@ -15,6 +15,11 @@ use std::time::Duration;
 
 /// Aggregate byte budget for one live host's unread output ring.
 pub const LIVE_OUTPUT_RING_BYTES: usize = 1024 * 1024;
+/// Hard cap for the one-shot pipe fallback (CLI session-host only).
+/// Never `Command::output()` an attacker-controlled stream into memory.
+pub const PIPE_FALLBACK_MAX_BYTES: usize = 256 * 1024;
+/// Wall-clock bound for pipe-fallback collection before process-tree kill.
+pub const PIPE_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Live PTY session used by the standalone CLI (or pipe fallback).
 pub struct PtySession {
@@ -468,6 +473,7 @@ fn spawn_pipe_fallback(
     pty_err: &str,
 ) -> Result<PtySession, String> {
     use std::process::{Command, Stdio};
+    use std::time::Instant;
     let mut c = Command::new(&cmd.program);
     c.args(&cmd.args)
         .stdin(Stdio::null())
@@ -479,12 +485,65 @@ fn spawn_pipe_fallback(
     for (k, v) in &cmd.env {
         c.env(k, v);
     }
-    let output = c
-        .output()
-        .map_err(|e| format!("pty failed ({pty_err}); pipe fallback failed: {e}"))?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.stderr.is_empty() {
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut child = c
+        .spawn()
+        .map_err(|e| format!("pty failed ({pty_err}); pipe fallback spawn failed: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("pty failed ({pty_err}); pipe fallback missing stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("pty failed ({pty_err}); pipe fallback missing stderr"))?;
+
+    // Concurrent capped readers — never Command::output() an unbounded stream.
+    let out_join =
+        std::thread::spawn(move || read_pipe_capped(stdout, PIPE_FALLBACK_MAX_BYTES / 2));
+    let err_join =
+        std::thread::spawn(move || read_pipe_capped(stderr, PIPE_FALLBACK_MAX_BYTES / 2));
+
+    let deadline = Instant::now() + PIPE_FALLBACK_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "pty failed ({pty_err}); pipe fallback wait failed: {e}"
+                ));
+            }
+        }
+    }
+
+    let (out_text, out_trunc) = out_join.join().unwrap_or_else(|_| (String::new(), true));
+    let (err_text, err_trunc) = err_join.join().unwrap_or_else(|_| (String::new(), true));
+
+    let mut text = out_text;
+    if !err_text.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&err_text);
+    }
+    if out_trunc || err_trunc {
+        text.push_str("\n[ownmesh: pipe fallback output truncated]\n");
+    }
+    // Final hard cap after merge (UTF-8 safe).
+    if text.len() > PIPE_FALLBACK_MAX_BYTES {
+        let mut end = PIPE_FALLBACK_MAX_BYTES.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("\n[ownmesh: pipe fallback output truncated]\n");
     }
     let handle = SessionHostHandle {
         session_id: format!("pipe_{}", std::process::id()),
@@ -499,6 +558,54 @@ fn spawn_pipe_fallback(
             output: Mutex::new(Some(text)),
         },
     })
+}
+
+/// Read a pipe with a hard byte cap. Does not grow without bound on infinite output.
+fn read_pipe_capped(mut reader: impl Read, max_bytes: usize) -> (String, bool) {
+    let max_bytes = max_bytes.max(1);
+    let mut buf = vec![0u8; 4096];
+    let mut acc = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = max_bytes.saturating_sub(acc.len());
+                if room == 0 {
+                    truncated = true;
+                    // Drain remaining to avoid blocking the writer forever, but
+                    // do not retain bytes. Bound drain iterations.
+                    let mut drained = 0usize;
+                    while drained < PIPE_FALLBACK_MAX_BYTES {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(m) => drained = drained.saturating_add(m),
+                            Err(_) => break,
+                        }
+                    }
+                    break;
+                }
+                let take = n.min(room);
+                acc.extend_from_slice(&buf[..take]);
+                if take < n {
+                    truncated = true;
+                    // Best-effort short drain of the remainder of this read cycle.
+                    let mut drained = 0usize;
+                    while drained < 64 * 1024 {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(m) => drained = drained.saturating_add(m),
+                            Err(_) => break,
+                        }
+                    }
+                    break;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    (String::from_utf8_lossy(&acc).into_owned(), truncated)
 }
 
 /// Read PTY output until child exits or `max_ms` elapses (0 = 5s default for safety).
@@ -627,6 +734,60 @@ mod tests {
         let err = write_stdin_line(&mut FailingWriter { fail_flush: true }, "input")
             .expect_err("flush failure must surface");
         assert!(err.to_string().contains("flush failed"));
+    }
+
+    #[test]
+    fn pipe_fallback_bounds_infinite_output_and_terminates() {
+        // Force the pipe fallback path by calling it directly with a producer that
+        // would OOM under Command::output().
+        #[cfg(windows)]
+        let cmd = PtyCommand {
+            program: "cmd.exe".into(),
+            args: vec![
+                "/Q".into(),
+                "/C".into(),
+                // tight loop writing to stdout; kill/timeout must contain it
+                "for /L %i in (1,0,2) do @echo INFINITE_PIPE_FALLBACK_LINE_%i".into(),
+            ],
+            cwd: None,
+            env: vec![],
+        };
+        #[cfg(not(windows))]
+        let cmd = PtyCommand {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "while true; do printf 'INFINITE_PIPE_FALLBACK_LINE\n'; done".into(),
+            ],
+            cwd: None,
+            env: vec![],
+        };
+        let started = std::time::Instant::now();
+        let session = spawn_pipe_fallback(&cmd, PtySize::default(), "forced-test-fallback")
+            .expect("bounded pipe fallback must succeed");
+        assert_eq!(session.handle.backend, PtyBackend::PipeFallback);
+        let text = match &session.kind {
+            SessionKindInner::Pipe { output } => output
+                .lock()
+                .ok()
+                .and_then(|mut g| g.take())
+                .unwrap_or_default(),
+            SessionKindInner::Pty { .. } => panic!("expected pipe session"),
+        };
+        assert!(
+            text.len() <= PIPE_FALLBACK_MAX_BYTES + 128,
+            "pipe fallback must cap output, got {} bytes",
+            text.len()
+        );
+        assert!(
+            text.contains("truncated") || text.len() <= PIPE_FALLBACK_MAX_BYTES,
+            "overflow must be visible; got len={}",
+            text.len()
+        );
+        assert!(
+            started.elapsed() < PIPE_FALLBACK_TIMEOUT + Duration::from_secs(5),
+            "fallback must terminate near timeout bound"
+        );
     }
 
     #[test]
