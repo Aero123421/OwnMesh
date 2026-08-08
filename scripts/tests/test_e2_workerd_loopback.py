@@ -1015,6 +1015,7 @@ def main() -> int:
                     raise RuntimeError(f"unknown workspace_id must fail closed: {bad_ws_done}")
 
             # E5 session open via public MCP (metadata + controller lease; live PTY host partial).
+            # E4: workspace_id is bound onto the session record at open.
             ses_sc = structured(
                 mcp_call(
                     issuer,
@@ -1023,6 +1024,7 @@ def main() -> int:
                     {
                         "device_id": device_id,
                         "title": f"e2-ses-{marker}",
+                        "workspace_id": "ws_default",
                         "async": True,
                         "idempotency_key": f"idem_ses_{marker}",
                     },
@@ -1034,6 +1036,10 @@ def main() -> int:
             ses_dump = json.dumps(ses_done)
             if "ses_" not in ses_dump:
                 raise RuntimeError(f"session open missing session id: {ses_done}")
+            if "ws_default" not in ses_dump:
+                raise RuntimeError(
+                    f"session open must persist workspace_id binding: {ses_done}"
+                )
             # Extract session id from completed result payload.
             ses_id = None
             for node in (ses_done, ses_done.get("data") if isinstance(ses_done.get("data"), dict) else {}):

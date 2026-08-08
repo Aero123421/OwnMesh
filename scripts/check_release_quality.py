@@ -370,6 +370,17 @@ def main() -> int:
                     m.group(1) == ver,
                     f"{label} version {m.group(1)} must match workspace {ver}",
                 )
+        # MCP initialize/health surface SERVICE_VERSION — must match the train.
+        util_ts = read("packages/control-plane/src/util.ts")
+        svc_ver = re.search(
+            r'export const SERVICE_VERSION\s*=\s*"([^"]+)"', util_ts
+        )
+        require(svc_ver is not None, "SERVICE_VERSION missing in util.ts")
+        if svc_ver:
+            require(
+                svc_ver.group(1) == ver,
+                f"SERVICE_VERSION {svc_ver.group(1)} must match workspace {ver}",
+            )
         train = re.search(r'"release_train"\s*:\s*"([^"]+)"', surfaces_txt)
         require(train is not None, "release/SUPPORTED_SURFACES.json release_train missing")
         if train:

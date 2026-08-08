@@ -16,20 +16,26 @@ Public MCP → local Wrangler/workerd → DeviceRoom → Agent WSS → ownmeshd:
 - Binary range + 512 KiB multi-chunk read
 - Resume / idempotency / cancel / required-key fail-closed
 - **workspace_id** selection (`ws_default` / `ws_alt`) with cross-root denial
-- **session.open** + **session.attach(observer)** write-deny (metadata/lease; live PTY host still partial)
+- **session.open** (with `workspace_id` binding) + **session.attach(observer)** write-deny (metadata/lease; live PTY host still partial)
 
 ## Custody / bounds
 
 - Hardlink and cross-mount fail-closed in restricted mode
-- Directory pagination past 4_000+ entries without silent omission
+- Directory list **full snapshot-then-sort** before any cursor (fail closed past
+  25_000 entries); adversarial unordered enumeration cannot skip early names
+- Git status surfaces `truncated=true` and never claims `exhausted`/`clean` on a
+  byte-capped porcelain capture; git diff pages a durable line spool so large
+  cursors make forward progress (no empty-page continuation loops)
 - Git capture concurrently drains stdout/stderr with hard caps + kill-on-timeout
 - Restricted presets (`workspace_only` / `recommended`) **deny `command.run`** until
   OS process confinement exists (interpreter/absolute-path escape fail-closed)
 - Session attach `role=observer` demotes controller and cannot write/resize
+- `session.open` persists `workspace_id`; attach/write/resize reject mismatched ids
 - Session replay/push enforce chunk, aggregate-byte, session-count, and file budgets
 - OAuth AS metadata omits `registration_endpoint` unless
   `ALLOW_DYNAMIC_CLIENT_REGISTRATION=true` (docs match production default)
-- Package versions aligned to `1.2.0-beta.7` (schema included); release checker enforces
+- Package versions + MCP `SERVICE_VERSION` aligned to `1.2.0-beta.7`; release
+  checker enforces util.ts consistency with the workspace train
 
 ## Explicitly not claimed
 

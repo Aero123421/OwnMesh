@@ -335,7 +335,8 @@ fn register_spawned_session(
                     ),
                     cmd.cwd.clone(),
                     Some(size),
-                )
+                    None,
+                )?
                 .id
         };
         manager.set_host_pid(&persist_id, pid)?;
@@ -488,13 +489,15 @@ mod tests {
         assert!(ok, "output={out:?} backend={:?}", handle.handle.backend);
 
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "t",
-            "host",
-            now_unix(),
-            None,
-        );
+        let ses = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "t",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         let data = if out.is_empty() {
             "pty-host-ok\n".into()
         } else {
@@ -591,13 +594,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         let mut mgr = SessionManager::new();
-        let target = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "target",
-            "host",
-            now_unix(),
-            None,
-        );
+        let target = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "target",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         mgr.attach_observer(&target.id, "reader", now_unix())
             .unwrap();
         mgr.set_host_pid(&target.id, Some(42)).unwrap();
@@ -623,21 +628,25 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         let mut mgr = SessionManager::new();
-        let target = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "target",
-            "host",
-            now_unix(),
-            None,
-        );
+        let target = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "target",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         mgr.set_host_pid(&target.id, Some(42)).unwrap();
-        let unrelated = mgr.open(
-            ownmesh_session::SessionKind::Process,
-            "unrelated",
-            "other",
-            now_unix(),
-            None,
-        );
+        let unrelated = mgr
+            .open(
+                ownmesh_session::SessionKind::Process,
+                "unrelated",
+                "other",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         mgr.push_output(
             &unrelated.id,
             "existing output",
@@ -659,13 +668,15 @@ mod tests {
     #[test]
     fn mutation_failure_also_restores_complete_manager() {
         let mut mgr = SessionManager::new();
-        let target = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "target",
-            "host",
-            now_unix(),
-            None,
-        );
+        let target = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "target",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         let before = serde_json::to_value(&mgr).unwrap();
 
         let err = mutate_and_persist(&mut mgr, None, |manager| {

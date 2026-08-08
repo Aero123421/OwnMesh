@@ -2083,9 +2083,28 @@ full_user_access/full_access for arbitrary commands",
             command: Option<Vec<String>>,
             #[serde(default)]
             cwd: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        // Bind workspace identity at open: validates id/ownership against the
+        // device workspace registry. Restricted modes also pin the cwd root;
+        // full_access modes keep workspace as audit/context metadata only.
+        let workspace_id = {
+            let _ws = self.workspace_for(p.workspace_id.as_deref())?;
+            let raw = p
+                .workspace_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("ws_default");
+            if raw == "default" {
+                "ws_default".to_owned()
+            } else {
+                raw.to_owned()
+            }
+        };
         let kind = match p.kind.as_deref() {
             Some("process") => SessionKind::Process,
             Some("profile_agent") | Some("profile") => SessionKind::ProfileAgent,
@@ -2106,6 +2125,7 @@ full_user_access/full_access for arbitrary commands",
                 p.command,
                 p.cwd,
                 None,
+                Some(workspace_id),
             )
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
@@ -2163,6 +2183,8 @@ full_user_access/full_access for arbitrary commands",
             /// Legacy boolean; ignored when `role` is present.
             #[serde(default)]
             read_only: Option<bool>,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
@@ -2194,6 +2216,7 @@ full_user_access/full_access for arbitrary commands",
         // Session IDs are identifiers, not bearer capabilities. Attaching cannot
         // grant a new principal access; delegation must happen through session.give.
         self.require_reader(&p.id, &client.client_name, now)?;
+        self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
         if read_only {
@@ -2464,6 +2487,8 @@ full_user_access/full_access for arbitrary commands",
             data: String,
             #[serde(default)]
             principal: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
@@ -2481,6 +2506,7 @@ full_user_access/full_access for arbitrary commands",
         self.sessions
             .authorize_stdin(&p.id, &principal, now)
             .map_err(session_err)?;
+        self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         // Record a bounded input receipt for observers (never echo multi-MB payloads).
         let snapshot = self.sessions.clone();
         let echo = if p.data.len() <= 256 {
@@ -2510,10 +2536,13 @@ full_user_access/full_access for arbitrary commands",
             id: String,
             cols: u16,
             rows: u16,
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
         self.require_controller(&p.id, &client.client_name, now)?;
+        self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.as_str();
         let snapshot = self.sessions.clone();
         self.sessions
@@ -2554,6 +2583,38 @@ full_user_access/full_access for arbitrary commands",
             }),
             Err(e) => Err(session_err(e)),
         }
+    }
+
+    /// When a caller supplies `workspace_id`, it must match the session binding.
+    /// Omitting the field is allowed (session-owned binding remains authoritative).
+    fn require_session_workspace(
+        &self,
+        session_id: &str,
+        workspace_id: Option<&str>,
+    ) -> IpcResult<()> {
+        let Some(raw) = workspace_id.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(());
+        };
+        let want = if raw == "default" { "ws_default" } else { raw };
+        let info = self.sessions.get(session_id).map_err(session_err)?;
+        let bound = info
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ws_default");
+        let bound = if bound == "default" {
+            "ws_default"
+        } else {
+            bound
+        };
+        if bound != want {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!("session {session_id} is bound to workspace {bound}, not {want}"),
+            });
+        }
+        Ok(())
     }
 
     /// Test helper: set policy in-memory without touching disk preset file optionally.

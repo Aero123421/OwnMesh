@@ -178,6 +178,10 @@ pub struct SessionInfo {
     /// Working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Tenant/device workspace this session is bound to (`ws_...`).
+    /// Always recorded for audit; enforced as a path boundary only in restricted modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 impl SessionInfo {
@@ -286,11 +290,11 @@ impl SessionManager {
         profile_id: Option<String>,
     ) -> SessionResult<SessionInfo> {
         self.open_with(
-            kind, title, creator, now_unix, profile_id, None, None, None, None,
+            kind, title, creator, now_unix, profile_id, None, None, None, None, None,
         )
     }
 
-    /// Open with optional command/cwd/native id.
+    /// Open with optional command/cwd/native id/workspace binding.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with(
         &mut self,
@@ -303,6 +307,7 @@ impl SessionManager {
         command: Option<Vec<String>>,
         cwd: Option<String>,
         size: Option<PtySize>,
+        workspace_id: Option<String>,
     ) -> SessionResult<SessionInfo> {
         if self.sessions.len() >= self.max_sessions {
             return Err(SessionError::SessionLimit);
@@ -331,6 +336,7 @@ impl SessionManager {
             host_pid: None,
             command,
             cwd,
+            workspace_id,
         };
         self.sessions.insert(
             id,

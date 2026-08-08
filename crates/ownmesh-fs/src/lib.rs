@@ -386,34 +386,28 @@ pub fn list_dir_page(
     /// directory cursor to a generic truncation stand-in. Sized under the
     /// durable MCP data_json ceiling with headroom for framing.
     const MAX_PAGE_JSON_BYTES: usize = 96_000;
-    /// Hard bound on after-cursor candidates held in memory before paging.
-    /// Must be large enough that multi-page clients can walk past 4_000+ entries
-    /// without silently dropping later names; still fail-closed on huge trees.
-    const MAX_COLLECT_AFTER_CURSOR: usize = 25_000;
+    /// Hard bound on a full directory snapshot held in memory before sort+page.
+    /// Filesystem iteration order is not lexical: we MUST materialize the full
+    /// snapshot, sort it, then page. Returning a cursor from a partial unsorted
+    /// window permanently skips entries that appear later in iteration order but
+    /// sort before the cursor (e.g. 25k `z*` before any `a*`).
+    /// Fail closed with EntryLimit when the tree exceeds this bound — never
+    /// issue a continuation cursor from an incomplete snapshot.
+    const MAX_DIR_SNAPSHOT: usize = 25_000;
     let limit = max_entries.clamp(1, MAX_PAGE_ENTRIES);
 
-    let mut collected = Vec::new();
-    let mut hit_collect_ceiling = false;
-
-    let mut push_candidate = |info: DirEntryInfo| -> bool {
+    // Phase 1: full bounded snapshot (ignore caller cursor until after sort).
+    let mut snapshot: Vec<DirEntryInfo> = Vec::new();
+    let mut push_snapshot = |info: DirEntryInfo| -> FsResult<()> {
         if !entry_within_budgets(&info) {
-            return false;
+            return Ok(());
         }
-        if let Some((after_name, after_path)) = after.as_ref() {
-            // Exclusive lower bound on the full (name, path) sort tuple.
-            let after_cursor = info.name.as_str() > after_name.as_str()
-                || (info.name.as_str() == after_name.as_str()
-                    && info.path.as_str() > after_path.as_str());
-            if !after_cursor {
-                return false;
-            }
+        if snapshot.len() >= MAX_DIR_SNAPSHOT {
+            // One more in-budget entry proves the snapshot is incomplete.
+            return Err(FsError::EntryLimit);
         }
-        if collected.len() >= MAX_COLLECT_AFTER_CURSOR {
-            hit_collect_ceiling = true;
-            return true; // signal stop
-        }
-        collected.push(info);
-        false
+        snapshot.push(info);
+        Ok(())
     };
 
     if recursive {
@@ -430,9 +424,7 @@ pub fn list_dir_page(
                 is_symlink: entry.file_type().is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
             };
-            if push_candidate(info) {
-                break;
-            }
+            push_snapshot(info)?;
         }
     } else {
         let rd = fs::read_dir(&path).map_err(|source| FsError::Io {
@@ -456,21 +448,31 @@ pub fn list_dir_page(
                 is_symlink: ft.is_symlink(),
                 size: meta.and_then(|m| if m.is_file() { Some(m.len()) } else { None }),
             };
-            if push_candidate(info) {
-                break;
-            }
+            push_snapshot(info)?;
         }
     }
-    collected.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
-    let total_matched = collected.len();
 
-    // Build the page under both entry-count and UTF-8 JSON byte budgets so a
-    // long workspace path + many legal names cannot exceed the Agent envelope.
+    // Phase 2: stable total order, then exclusive cursor lower-bound.
+    snapshot.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    let matched: Vec<DirEntryInfo> = match after.as_ref() {
+        None => snapshot,
+        Some((after_name, after_path)) => snapshot
+            .into_iter()
+            .filter(|info| {
+                info.name.as_str() > after_name.as_str()
+                    || (info.name.as_str() == after_name.as_str()
+                        && info.path.as_str() > after_path.as_str())
+            })
+            .collect(),
+    };
+    let total_matched = matched.len();
+
+    // Phase 3: page under entry-count and UTF-8 JSON byte budgets.
     let mut page_entries: Vec<DirEntryInfo> = Vec::new();
     let mut page_bytes: usize = 2; // []
     let mut hit_entry_cap = false;
     let mut hit_byte_cap = false;
-    for entry in collected {
+    for entry in matched {
         if page_entries.len() >= limit {
             hit_entry_cap = true;
             break;
@@ -504,12 +506,10 @@ pub fn list_dir_page(
         };
         page_entries.push(entry);
     }
-    // If we stopped early due to entry cap, remaining scanned names still count.
     if !hit_byte_cap && total_matched > page_entries.len() {
         hit_entry_cap = true;
     }
-    let truncated =
-        hit_entry_cap || hit_byte_cap || hit_collect_ceiling || total_matched > page_entries.len();
+    let truncated = hit_entry_cap || hit_byte_cap || total_matched > page_entries.len();
     let next_cursor = if truncated {
         page_entries
             .last()
@@ -1032,5 +1032,69 @@ mod tests {
             let name = format!("f{i:05}.txt");
             assert!(seen.contains(&name), "missing {name}");
         }
+    }
+
+    /// Adversarial unordered-enumeration property: names that sort early must not
+    /// be permanently skipped when the filesystem yields late-sorting names first.
+    /// Full snapshot-then-sort is the integrity guarantee under test.
+    #[test]
+    fn list_page_unordered_enumeration_does_not_skip_early_names() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        // Create late-sorting names first, then early-sorting names. Regardless of
+        // OS dirent order, paging must surface every name exactly once.
+        for i in 0..300 {
+            write_file(&ws, format!("z{i:04}.txt"), b"z").unwrap();
+        }
+        for i in 0..300 {
+            write_file(&ws, format!("a{i:04}.txt"), b"a").unwrap();
+        }
+        for i in 0..300 {
+            write_file(&ws, format!("m{i:04}.txt"), b"m").unwrap();
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0_usize;
+        loop {
+            pages += 1;
+            assert!(pages < 50, "pagination failed to terminate");
+            let page = list_dir_page(&ws, "", false, 100, cursor.as_deref()).unwrap();
+            for entry in &page.entries {
+                assert!(
+                    seen.insert(entry.name.clone()),
+                    "duplicate across pages: {}",
+                    entry.name
+                );
+            }
+            if !page.truncated {
+                break;
+            }
+            cursor = page.next_cursor;
+            assert!(cursor.is_some(), "truncated page must carry next_cursor");
+        }
+        assert_eq!(seen.len(), 900, "got {} across {pages} pages", seen.len());
+        // Early-sorting names must all be present (the former partial-window bug
+        // dropped these when z* filled the collect budget first).
+        for i in 0..300 {
+            assert!(
+                seen.contains(&format!("a{i:04}.txt")),
+                "missing early name a{i:04}"
+            );
+            assert!(
+                seen.contains(&format!("m{i:04}.txt")),
+                "missing mid name m{i:04}"
+            );
+            assert!(
+                seen.contains(&format!("z{i:04}.txt")),
+                "missing late name z{i:04}"
+            );
+        }
+        // First page must start with an early-sorted name under total order.
+        let first = list_dir_page(&ws, "", false, 10, None).unwrap();
+        assert!(
+            first.entries[0].name.starts_with('a'),
+            "sorted snapshot must page from a*, got {:?}",
+            first.entries[0].name
+        );
     }
 }
