@@ -359,6 +359,9 @@ pub struct DaemonRuntime {
     /// Optional cancel signal for the currently executing remote command.
     /// Lives only for the duration of `dispatch_cancellable`.
     active_cancel: Option<watch::Receiver<bool>>,
+    /// Remote MCP/control-plane operation id for the active dispatch (when any).
+    /// Ask/allow receipts must echo this id so DeviceRoom correlation binding holds.
+    active_remote_operation_id: Option<String>,
     #[cfg(test)]
     op_journal_persist_fault: AtomicUsize,
     #[cfg(test)]
@@ -440,6 +443,7 @@ impl DaemonRuntime {
             broker_endpoint,
             broker_secret,
             active_cancel: None,
+            active_remote_operation_id: None,
             #[cfg(test)]
             op_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
@@ -916,7 +920,16 @@ impl DaemonRuntime {
         }
 
         let verdict = self.evaluate(&facts, &requester_principal);
-        let operation_id = Self::new_id("op_");
+        // Prefer the control-plane operation id when present so Ask/Allow results
+        // keep DeviceRoom correlation/operation_id binding. Local IPC keeps a
+        // freshly minted id.
+        let operation_id = self
+            .active_remote_operation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| Self::new_id("op_"));
         self.append_audit(
             "policy.evaluate",
             Some(&facts.capability),
@@ -2051,17 +2064,195 @@ full_user_access/full_access for arbitrary commands",
     }
 
     /// Dispatch with an optional cancel receiver for interrupting in-flight exec.
+    ///
+    /// When `remote_operation_id` is set (Agent/MCP path), Ask/Allow receipts echo
+    /// that id so DeviceRoom correlation/operation_id binding holds.
     pub async fn dispatch_cancellable(
         &mut self,
         method: &str,
         params: Option<Value>,
         client: &ClientIdentity,
         cancel: Option<watch::Receiver<bool>>,
+        remote_operation_id: Option<String>,
     ) -> IpcResult<Value> {
         self.active_cancel = cancel;
+        self.active_remote_operation_id = remote_operation_id
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
         let outcome = self.dispatch(method, params, client).await;
         self.active_cancel = None;
+        self.active_remote_operation_id = None;
         outcome
+    }
+
+    /// Apply a control-plane recovery approval decision to a deferred device
+    /// approval. Look up by device `approval_id` when provided, otherwise by
+    /// `target_operation_id` (the remote MCP operation id retained at Ask).
+    ///
+    /// Reachable only from the authenticated Agent channel. Does not accept
+    /// client-supplied allow/force flags, and does not claim a ChatGPT
+    /// cryptographic attestation — the control plane already authenticated the
+    /// human approver via OAuth + one-time CSRF claim.
+    pub async fn apply_control_plane_approval_decision(
+        &mut self,
+        params: Option<Value>,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            approval_id: Option<String>,
+            #[serde(default)]
+            target_operation_id: Option<String>,
+            decision: String,
+            #[serde(default)]
+            tool: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        let _ = p.tool;
+        let decision = p.decision.trim().to_ascii_lowercase();
+        if decision != "approve" && decision != "deny" {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "decision must be approve or deny".into(),
+            });
+        }
+        let approval_id = p
+            .approval_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let target_operation_id = p
+            .target_operation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        // Resolve deferred approval. Prefer exact device approval id; fall back
+        // to the remote operation id retained when policy returned Ask.
+        let resolved_id = if let Some(id) = approval_id.as_ref() {
+            if self.approvals.contains_key(id) {
+                id.clone()
+            } else if let Some(target) = target_operation_id.as_ref() {
+                self.approvals
+                    .iter()
+                    .find(|(_, rec)| rec.operation_id == *target && rec.state == "pending")
+                    .map(|(k, _)| k.clone())
+                    .ok_or_else(|| IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: format!(
+                            "approval not found for id={id} target_operation_id={target}"
+                        ),
+                    })?
+            } else {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: format!("approval not found: {id}"),
+                });
+            }
+        } else if let Some(target) = target_operation_id.as_ref() {
+            let matches: Vec<String> = self
+                .approvals
+                .iter()
+                .filter(|(_, rec)| rec.operation_id == *target && rec.state == "pending")
+                .map(|(k, _)| k.clone())
+                .collect();
+            match matches.as_slice() {
+                [only] => only.clone(),
+                [] => {
+                    return Err(IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: format!("no pending approval for operation {target}"),
+                    });
+                }
+                _ => {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "multiple pending approvals for operation {target}; supply approval_id"
+                        ),
+                    });
+                }
+            }
+        } else {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "approval_id or target_operation_id required".into(),
+            });
+        };
+
+        let rec = self
+            .approvals
+            .get(&resolved_id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("approval not found: {resolved_id}"),
+            })?;
+        if let Some(target) = target_operation_id.as_ref() {
+            if &rec.operation_id != target {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: format!(
+                        "target_operation_id {target} does not match approval {}",
+                        rec.operation_id
+                    ),
+                });
+            }
+        }
+        if rec.state != "pending" {
+            // Exact-once: already decided/executing — surface durable state, never re-run.
+            return Ok(json!({
+                "approval_decision_applied": true,
+                "replayed": true,
+                "approval_id": resolved_id,
+                "target_operation_id": rec.operation_id,
+                "decision": decision,
+                "state": rec.state,
+                "result": rec.result.clone(),
+            }));
+        }
+
+        // Synthetic human principal for the recovery path. Distinct from any
+        // `client:remote:…` requester so independent-approver checks pass. The
+        // control plane already authenticated the human via OAuth + CSRF claim.
+        let recovery =
+            ClientIdentity::new("user:control-plane-recovery", env!("CARGO_PKG_VERSION"));
+
+        if decision == "deny" {
+            let body = self.handle_approval_deny(Some(json!({ "id": resolved_id })), &recovery)?;
+            return Ok(json!({
+                "approval_decision_applied": true,
+                "replayed": false,
+                "approval_id": resolved_id,
+                "target_operation_id": body.get("operation_id").cloned().unwrap_or(Value::Null),
+                "decision": "deny",
+                "state": "denied",
+                "result": body,
+            }));
+        }
+
+        let body = self
+            .handle_approval_approve(
+                Some(json!({ "id": resolved_id, "temporary_grant": false })),
+                &recovery,
+            )
+            .await?;
+        let target = body
+            .get("operation_id")
+            .cloned()
+            .unwrap_or_else(|| json!(target_operation_id.clone().unwrap_or_default()));
+        let exec_result = body.get("result").cloned().unwrap_or(Value::Null);
+        Ok(json!({
+            "approval_decision_applied": true,
+            "replayed": false,
+            "approval_id": resolved_id,
+            "target_operation_id": target,
+            "decision": "approve",
+            "state": "approved",
+            "result": exec_result,
+            "execution": body,
+        }))
     }
 
     /// Dispatch one authenticated RPC method bound to `client` identity.

@@ -84,7 +84,9 @@ def main() -> int:
         "E3": (
             "exact-action hash + durable idempotency/cancel claim; MCP per-tool arg "
             "allowlist; runtime principal from bound_action; principal-namespaced journal; "
-            "session.open denied under recommended/workspace_only; tenant_members handoff "
+            "session.open denied under recommended/workspace_only; recommended Ask retains "
+            "remote operation_id; browser /approve recovery executes deferred side effect "
+            "exactly once via device approval resolution; tenant_members handoff "
             "(partial - team admin UI still out of scope)"
         ),
         "E4": (

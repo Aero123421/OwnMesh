@@ -1990,17 +1990,55 @@ async fn dispatch_remote_operation(
     }
 
     if mapped.0 == "__approval_decision__" {
-        return json!({
-            "operation_contract": OPERATION_CONTRACT_V1,
-            "operation_id": operation_id,
-            "status": "completed",
-            "result": {
-                "approval_decision_received": true,
-                "decision": mapped.1.get("decision").cloned().unwrap_or(Value::Null),
-                "approval_id": mapped.1.get("approval_id").cloned().unwrap_or(Value::Null),
-                "note": "device acknowledged control-plane approval decision; local policy/grants remain authoritative"
+        // Optional recovery/admin path: resolve the deferred device approval and
+        // execute/deny exactly once. ChatGPT confirmation is not an OwnMesh
+        // attestation; this path runs only after control-plane OAuth+CSRF claim.
+        let outcome = {
+            let mut guard = runtime.lock().await;
+            guard
+                .apply_control_plane_approval_decision(Some(mapped.1.clone()))
+                .await
+        };
+        return match outcome {
+            Ok(body) => {
+                // decisionOpId stays on the envelope so DeviceRoom pending matches;
+                // target_operation_id + execution live in result for store apply.
+                let _ = body.get("decision");
+                json!({
+                    "operation_contract": OPERATION_CONTRACT_V1,
+                    "operation_id": operation_id,
+                    "status": "completed",
+                    "result": bound_result_object(body)
+                })
             }
-        });
+            Err(error) => {
+                let (code, message) = match &error {
+                    ownmesh_ipc::IpcError::Remote { code, message } => {
+                        let mapped = match *code {
+                            ownmesh_ipc::app_error::POLICY_DENIED => "OWNMESH_E_POLICY_DENIED",
+                            ownmesh_ipc::app_error::UNAUTHORIZED
+                            | ownmesh_ipc::app_error::TOKEN_REVOKED
+                            | ownmesh_ipc::app_error::LOCKDOWN => "OWNMESH_E_AUTHORIZATION",
+                            ownmesh_ipc::app_error::INVALID_PARAMS => "OWNMESH_E_INVALID_ARGUMENT",
+                            ownmesh_ipc::app_error::CONFLICT => "OWNMESH_E_CONFLICT",
+                            _ => "OWNMESH_E_INTERNAL",
+                        };
+                        (mapped.to_owned(), message.clone())
+                    }
+                    other => ("OWNMESH_E_INTERNAL".to_owned(), other.to_string()),
+                };
+                json!({
+                    "operation_contract": OPERATION_CONTRACT_V1,
+                    "operation_id": operation_id,
+                    "status": "failed",
+                    "error": {
+                        "code": code,
+                        "message": message,
+                        "retryable": false
+                    }
+                })
+            }
+        };
     }
 
     let client = match remote_agent_client_from_bound(request) {
@@ -2021,7 +2059,13 @@ async fn dispatch_remote_operation(
     let outcome = {
         let mut guard = runtime.lock().await;
         guard
-            .dispatch_cancellable(mapped.0, Some(mapped.1), &client, cancel_rx)
+            .dispatch_cancellable(
+                mapped.0,
+                Some(mapped.1),
+                &client,
+                cancel_rx,
+                Some(operation_id.clone()),
+            )
             .await
     };
 
@@ -2029,9 +2073,11 @@ async fn dispatch_remote_operation(
         Ok(body) => {
             // Runtime may surface policy ask without executing.
             if body.get("approval_required") == Some(&Value::Bool(true)) {
+                // Always echo the remote MCP operation id (never a local mint) so
+                // DeviceRoom operation_id binding accepts the approval_required result.
                 return json!({
                     "operation_contract": OPERATION_CONTRACT_V1,
-                    "operation_id": body.get("operation_id").cloned().unwrap_or_else(|| Value::String(operation_id.clone())),
+                    "operation_id": operation_id,
                     "status": "failed",
                     "error": {
                         "code": "OWNMESH_E_APPROVAL_REQUIRED",
@@ -2040,8 +2086,9 @@ async fn dispatch_remote_operation(
                         "details": {
                             "approval_required": true,
                             "approval_id": body.get("approval_id").cloned(),
+                            "operation_id": operation_id,
                             "reason": body.get("reason").cloned(),
-                            "note": "ChatGPT confirmation is not an OwnMesh cryptographic attestation; local policy still requires an approved device grant when configured to ask"
+                            "note": "ChatGPT confirmation is not an OwnMesh cryptographic attestation; local policy still requires an approved device grant when configured to ask. Browser/CLI recovery approval remains available."
                         }
                     }
                 });

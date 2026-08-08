@@ -3920,10 +3920,21 @@ export async function handleApprove(
         }
         // Fresh operation identity for the decision notification so it cannot collide
         // with the original operation's correlation tombstone after approval_required.
+        // Prefer the device-issued approval_id (from OWNMESH_E_APPROVAL_REQUIRED) so
+        // ownmeshd can resolve the deferred request; fall back to outbox id only when
+        // the device id was never recorded (lookup then uses target_operation_id).
         const decisionOpId = randomId("op_");
+        const deviceApprovalId =
+          (op.approval_id && String(op.approval_id).trim()) ||
+          (op.data && typeof op.data === "object" && (op.data as { approval_id?: unknown }).approval_id != null
+            ? String((op.data as { approval_id: unknown }).approval_id)
+            : "") ||
+          claimed.id;
         route = await opts.routeToDevice(deviceId, {
           type: "approval.decision",
           payload: {
+            // Strict ownmesh.operation/1.0 request shape only — deny_unknown_fields
+            // rejects top-level decision/approval_id mirrors on the Agent parser.
             operation_contract: OPERATION_CONTRACT_V1,
             operation_id: decisionOpId,
             capability: "approval.decision",
@@ -3932,14 +3943,9 @@ export async function handleApprove(
               action: "approval.decision",
               target_operation_id: op.operation_id,
               decision,
-              approval_id: claimed.id,
+              approval_id: deviceApprovalId,
               tool: op.tool,
             },
-            // Flat mirrors retained for older readers / production-path assertions.
-            decision,
-            approval_id: claimed.id,
-            tool: op.tool,
-            target_operation_id: op.operation_id,
           },
           correlation_id: decisionOpId,
         });

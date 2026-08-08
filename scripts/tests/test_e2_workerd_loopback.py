@@ -1763,6 +1763,111 @@ def main() -> int:
                 if str(bypass_done.get("status")) not in {"failed", "denied"}:
                     raise RuntimeError(f"unexpected session bypass result: {bypass_done}")
 
+            # E3: Recommended write must surface approval_required with the *same*
+            # MCP operation_id (no DeviceRoom operation_id_mismatch drop). Browser
+            # recovery /approve then executes the deferred write exactly once.
+            ask_name = f"ask-approve-{marker}.txt"
+            ask_path = workspace_dir / ask_name
+            if ask_path.exists():
+                ask_path.unlink()
+            ask_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_write",
+                    {
+                        "device_id": device_id,
+                        "path": ask_name,
+                        "content": f"approved-{marker}",
+                        "async": True,
+                        "idempotency_key": f"idem_ask_write_{marker}",
+                    },
+                    rpc_id=91,
+                )
+            )
+            ask_op = str(ask_sc.get("operation_id") or "")
+            if not ask_op.startswith("op_"):
+                raise RuntimeError(f"ask write missing operation_id: {ask_sc}")
+            ask_done = wait_operation(
+                issuer,
+                access_token,
+                ask_op,
+                want={"approval_required", "failed", "denied", "completed"},
+                timeout_s=45.0,
+            )
+            ask_status = str(ask_done.get("status") or "")
+            if ask_status != "approval_required":
+                raise RuntimeError(
+                    f"recommended write must reach approval_required (got {ask_status}): {ask_done}"
+                )
+            if ask_path.exists():
+                raise RuntimeError("ask write must not land before approval")
+            device_apr = ask_done.get("approval_id") or (ask_done.get("data") or {}).get("approval_id")
+            if not device_apr:
+                # approval_id may only be nested under data.error.details
+                dump_ask = json.dumps(ask_done)
+                if "apr_" not in dump_ask:
+                    raise RuntimeError(f"approval_required missing approval_id: {ask_done}")
+
+            # Browser recovery path (dev bypass principal; no bearer self-approve).
+            import re as _re
+            req = urllib.request.Request(
+                f"{issuer}/approve?operation_id={ask_op}",
+                method="GET",
+                headers={
+                    "x-ownmesh-dev-principal": "prin_dev",
+                    "accept": "text/html",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    html = resp.read().decode("utf-8", errors="replace")
+                    get_status = resp.status
+            except urllib.error.HTTPError as error:
+                html = error.read().decode("utf-8", errors="replace")
+                get_status = error.code
+            if get_status != 200:
+                raise RuntimeError(f"GET /approve failed {get_status}: {html[:800]}")
+            tx_m = _re.search(r'name="transaction_id"\s+value="([^"]+)"', html)
+            csrf_m = _re.search(r'name="csrf_token"\s+value="([^"]+)"', html)
+            if not tx_m or not csrf_m:
+                raise RuntimeError(f"GET /approve missing csrf fields: {html[:500]}")
+            post_status, post_body = http_json(
+                f"{issuer}/approve?operation_id={ask_op}",
+                method="POST",
+                headers={
+                    "x-ownmesh-dev-principal": "prin_dev",
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                    "origin": issuer,
+                },
+                body={
+                    "decision": "approve",
+                    "transaction_id": tx_m.group(1),
+                    "csrf_token": csrf_m.group(1),
+                    "operation_id": ask_op,
+                },
+            )
+            if post_status != 200:
+                raise RuntimeError(f"POST /approve failed {post_status}: {post_body}")
+            if not isinstance(post_body, dict) or post_body.get("ok") is not True:
+                raise RuntimeError(f"POST /approve not ok: {post_body}")
+            approved_done = wait_operation(
+                issuer,
+                access_token,
+                ask_op,
+                want={"completed", "failed", "denied"},
+                timeout_s=60.0,
+            )
+            if str(approved_done.get("status")) != "completed":
+                raise RuntimeError(
+                    f"approved ask write did not complete: {approved_done} post={post_body}"
+                )
+            if not ask_path.is_file():
+                raise RuntimeError(f"approved write missing on disk: {ask_path}")
+            if ask_path.read_text(encoding="utf-8") != f"approved-{marker}":
+                raise RuntimeError(f"approved write content mismatch: {ask_path.read_text(encoding='utf-8')!r}")
+
             # Restore full_user_access for any later local inspection (cleanup path).
             (config_dir / "policy.toml").write_text(
                 "\n".join(
@@ -1807,7 +1912,7 @@ def main() -> int:
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
                 f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
                 f"patch+shell+workspace-select+live-pty+session-open+observer-deny-write+"
-                f"workspace-list/show+workspace-CRUD+input_seq+two-principal-handoff+required-key+session-policy-deny held "
+                f"workspace-list/show+workspace-CRUD+input_seq+two-principal-handoff+required-key+session-policy-deny+ask-approve held "
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )

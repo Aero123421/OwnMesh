@@ -4,6 +4,16 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 
 ## Highlights
 
+### E3 — policy Ask identity + recovery approval execution
+- Remote Agent dispatches bind the MCP `operation_id` into `DaemonRuntime` so policy
+  `Ask` receipts echo the control-plane identity (DeviceRoom no longer rejects
+  `operation_id_mismatch` on `OWNMESH_E_APPROVAL_REQUIRED`).
+- Control-plane `/approve` recovery decisions are applied on-device: deferred
+  request executes or denies exactly once; results fold onto the original MCP
+  operation via `target_operation_id`.
+- ChatGPT confirmation is still not claimed as a cryptographic OwnMesh attestation.
+  Browser/CLI recovery remains the optional path when device policy is configured to ask.
+
 ### E5 — live PTY integrity
 - Process-tree terminate for cloud sessions (`taskkill /T` on Windows; Unix session + process-group kill) so background shell descendants do not survive `session.terminate`.
 - `session.resize` fails closed before sequence reservation when no live PTY host exists (daemon recovery).
@@ -27,3 +37,10 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 - `scripts/tests/test_v12_e2_e9_workerd_loopback.py` stays **RED (exit 2)** until E4–E9 acceptance rows are fully evidenced on the real binary × workerd path.
 - E8 elevated broker mint and E9 resumable transfer remain open.
 - Completeness claim remains false; E10 live-account proof is out of scope for this run.
+
+## Surface registry
+
+[`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json) records
+**27 explicit unsupported CLI surfaces** and **34 total** unsupported surfaces.
+Profile CLI wiring, transfer, and elevated broker install remain unsupported.
+Completeness claim remains false.

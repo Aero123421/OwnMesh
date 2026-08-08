@@ -2164,4 +2164,130 @@ mod tests {
         server.request_shutdown();
         let _ = handle.await;
     }
+
+    /// Remote MCP Ask must retain the control-plane operation id, and a bound
+    /// control-plane recovery decision must execute the deferred side effect
+    /// exactly once under that same operation identity.
+    #[tokio::test]
+    async fn remote_ask_retains_operation_id_and_control_plane_approve_executes() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::Recommended));
+
+        let remote_op = "op_mcp_ask_bind_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let marker = paths.state_dir.join("workspace").join("remote-ask.txt");
+        assert!(!marker.exists());
+
+        let ask = rt
+            .dispatch_cancellable(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "remote-ask.txt",
+                    "content": "from-control-plane-approve",
+                    "idempotency_key": "remote-ask-key-1",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+            )
+            .await
+            .expect("ask");
+        assert_eq!(ask["approval_required"], true);
+        assert_eq!(
+            ask["operation_id"].as_str().unwrap(),
+            remote_op,
+            "Ask must echo the remote MCP operation id"
+        );
+        let approval_id = ask["approval_id"].as_str().unwrap().to_owned();
+        assert!(!marker.exists(), "must not write before approve");
+
+        // Wrong target binding must fail closed.
+        let bad = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": "op_other",
+                "decision": "approve",
+            })))
+            .await
+            .expect_err("mismatched target");
+        match bad {
+            IpcError::Remote { code, .. } => assert_eq!(code, app_error::INVALID_PARAMS),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let approved = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "decision": "approve",
+            })))
+            .await
+            .expect("control-plane approve");
+        assert_eq!(approved["approval_decision_applied"], true);
+        assert_eq!(approved["decision"], "approve");
+        assert_eq!(approved["target_operation_id"], remote_op);
+        assert_eq!(approved["replayed"], false);
+        assert!(marker.exists(), "approve must execute deferred write");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "from-control-plane-approve"
+        );
+
+        // Exact-once: second decision must not re-run the side effect.
+        let before = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let again = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "decision": "approve",
+            })))
+            .await
+            .expect("replay");
+        assert_eq!(again["replayed"], true);
+        let after = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        assert_eq!(before, after, "replay must not rewrite the file");
+    }
+
+    #[tokio::test]
+    async fn remote_ask_control_plane_deny_is_terminal() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let remote_op = "op_mcp_ask_deny_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let ask = rt
+            .dispatch_cancellable(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "deny-me.txt",
+                    "content": "nope",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+            )
+            .await
+            .expect("ask");
+        assert_eq!(ask["operation_id"].as_str().unwrap(), remote_op);
+        let denied = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "target_operation_id": remote_op,
+                "decision": "deny",
+            })))
+            .await
+            .expect("deny");
+        assert_eq!(denied["decision"], "deny");
+        assert_eq!(denied["state"], "denied");
+        assert!(!paths
+            .state_dir
+            .join("workspace")
+            .join("deny-me.txt")
+            .exists());
+    }
 }

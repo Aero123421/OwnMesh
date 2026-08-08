@@ -31,4 +31,3 @@ The E2–E9 workerd gate stays **red** until every row is evidenced.
 **27 explicit unsupported CLI surfaces** and **34 total** unsupported surfaces
 after promoting device-local workspace CRUD. Profile/transfer/broker install
 remain unsupported. Completeness claim remains false.
-

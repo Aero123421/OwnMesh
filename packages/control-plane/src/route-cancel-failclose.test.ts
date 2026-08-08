@@ -523,3 +523,101 @@ test("applyMcpOperationResult: cancel_requested accepts delayed completed/failed
     assert.equal((await store.getMcpOperation(opId))?.status, terminal);
   }
 });
+
+test("applyMcpOperationResult: approval_decision_applied folds onto target operation", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const deviceId = "dev_apr_fold_01abcdef01";
+  const targetOpId = randomId("op_");
+  const decisionOpId = randomId("op_");
+  await store.putMcpOperation({
+    operation_id: targetOpId,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "pending",
+    summary: "human approved; routing decision to device",
+    data: { approval_decision: "approve" },
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    approval_id: "apr_device_1",
+    warnings: [],
+    correlation_id: targetOpId,
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const applied = await applyMcpOperationResult(store, {
+    // decision notification id has no store row
+    operationId: decisionOpId,
+    correlationId: decisionOpId,
+    deviceId,
+    payload: {
+      status: "completed",
+      operation_id: decisionOpId,
+      result: {
+        approval_decision_applied: true,
+        decision: "approve",
+        target_operation_id: targetOpId,
+        approval_id: "apr_device_1",
+        result: { written: true, path: "ask.txt" },
+      },
+    },
+  });
+  assert.equal(applied.ok, true);
+  assert.ok(applied.ok && applied.record);
+  assert.equal(applied.record!.operation_id, targetOpId);
+  assert.equal(applied.record!.status, "completed");
+  assert.equal(applied.record!.approval_required, false);
+  assert.equal((applied.record!.data as { execution?: { written?: boolean } }).execution?.written, true);
+  assert.equal((await store.getMcpOperation(targetOpId))?.status, "completed");
+});
+
+test("applyMcpOperationResult: approval_decision deny folds onto target", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const deviceId = "dev_apr_fold_02abcdef02";
+  const targetOpId = randomId("op_");
+  const decisionOpId = randomId("op_");
+  await store.putMcpOperation({
+    operation_id: targetOpId,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "approval_required",
+    summary: "waiting",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: true,
+    approval_id: "apr_device_2",
+    warnings: [],
+    correlation_id: targetOpId,
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const applied = await applyMcpOperationResult(store, {
+    operationId: decisionOpId,
+    correlationId: decisionOpId,
+    deviceId,
+    payload: {
+      status: "completed",
+      operation_id: decisionOpId,
+      result: {
+        approval_decision_applied: true,
+        decision: "deny",
+        target_operation_id: targetOpId,
+        approval_id: "apr_device_2",
+        state: "denied",
+      },
+    },
+  });
+  assert.equal(applied.ok, true);
+  assert.equal((await store.getMcpOperation(targetOpId))?.status, "denied");
+});

@@ -2599,8 +2599,9 @@ export async function applyMcpOperationResult(
   }
 
   // No store row: allow room-only routing when no operation_id was claimed, or when
-  // the device completed a control cancel request that was never claimed into D1
-  // (MCP cancel updates the *target* row, not the cancel request identity).
+  // the device completed a control cancel / approval.decision request that was never
+  // claimed into D1. Approval decisions apply their execution result onto the
+  // *target* MCP operation (the original ask), not the decision notification id.
   if (!op) {
     if (wantOpId) {
       const incoming = opts.payload;
@@ -2613,8 +2614,81 @@ export async function applyMcpOperationResult(
         (Object.prototype.hasOwnProperty.call(resultObj, "cancelled") ||
           Object.prototype.hasOwnProperty.call(resultObj, "signal_delivered") ||
           Object.prototype.hasOwnProperty.call(resultObj, "target_operation_id"));
-      if (looksLikeCancelControl && String(incoming.status || "completed") === "completed") {
-        return { ok: true, record: null, room_only: true };
+      const incomingStatus = String(incoming.status || "completed");
+      if (
+        looksLikeCancelControl &&
+        (incomingStatus === "completed" || incomingStatus === "failed" || incomingStatus === "denied")
+      ) {
+        // Approval decision: fold execution onto the original MCP operation.
+        if (
+          resultObj &&
+          resultObj.approval_decision_applied === true &&
+          resultObj.target_operation_id != null &&
+          String(resultObj.target_operation_id).trim() !== ""
+        ) {
+          const targetId = String(resultObj.target_operation_id);
+          const target = await store.getMcpOperation(targetId);
+          if (!target) {
+            return { ok: false, error: "unknown_operation" };
+          }
+          if (opts.deviceId && target.device_id && opts.deviceId !== target.device_id) {
+            return { ok: false, error: "device_mismatch" };
+          }
+          const decision = String(resultObj.decision || "").toLowerCase();
+          let targetStatus = "completed";
+          if (decision === "deny") targetStatus = "denied";
+          else if (String(incoming.status || "") === "failed") targetStatus = "failed";
+          else if (resultObj.state === "denied") targetStatus = "denied";
+          const execData =
+            resultObj.result && typeof resultObj.result === "object"
+              ? (resultObj.result as Record<string, unknown>)
+              : { ...(resultObj as Record<string, unknown>) };
+          const updatedTarget = await store.updateMcpOperation(
+            target.operation_id,
+            {
+              status: targetStatus,
+              summary:
+                targetStatus === "denied"
+                  ? "human denied via control-plane recovery approval"
+                  : targetStatus === "failed"
+                    ? String(
+                        (incoming.error as { message?: unknown } | undefined)?.message ||
+                          "approved execution failed",
+                      )
+                    : "human approved; device executed deferred operation",
+              data: {
+                ...(target.data || {}),
+                approval_decision: decision || targetStatus,
+                approval_decision_applied: true,
+                approval_id:
+                  resultObj.approval_id != null
+                    ? String(resultObj.approval_id)
+                    : target.approval_id,
+                execution: execData,
+              },
+              approval_required: false,
+              approval_id:
+                resultObj.approval_id != null
+                  ? String(resultObj.approval_id)
+                  : target.approval_id,
+            },
+            ["pending", "running", "approval_required", "cancel_requested"],
+          );
+          if (!updatedTarget) {
+            // Target may already be terminal (deny finalize raced) — accept as room-only.
+            const cur = await store.getMcpOperation(targetId);
+            if (cur && ["completed", "failed", "denied", "cancelled"].includes(cur.status)) {
+              return { ok: true, record: cur };
+            }
+            return { ok: false, error: "cas_conflict" };
+          }
+          return { ok: true, record: updatedTarget };
+        }
+        // Cancel control or non-applied decision ack: room-only when completed.
+        if (incomingStatus === "completed") {
+          return { ok: true, record: null, room_only: true };
+        }
+        return { ok: false, error: "unknown_operation" };
       }
       return { ok: false, error: "unknown_operation" };
     }
