@@ -477,6 +477,43 @@ impl SessionManager {
         }
     }
 
+    pub fn renew_controller_lease(
+        &mut self,
+        id: &str,
+        principal: &str,
+        lease_id: &str,
+        epoch: u64,
+        now: i64,
+        ttl: i64,
+    ) -> SessionResult<ControllerLease> {
+        if !(1..=3600).contains(&ttl) {
+            return Err(SessionError::Invalid("lease ttl out of bounds".into()));
+        }
+        self.authorize_controller_lease(id, principal, lease_id, epoch, now)?;
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        let lease = s
+            .info
+            .controller
+            .as_mut()
+            .ok_or(SessionError::NotController)?;
+        lease.expires_unix = now
+            .checked_add(ttl)
+            .ok_or_else(|| SessionError::Invalid("lease expiry overflow".into()))?;
+        Ok(lease.clone())
+    }
+
+    pub fn detach_controller_lease(
+        &mut self,
+        id: &str,
+        principal: &str,
+        lease_id: &str,
+        epoch: u64,
+        now: i64,
+    ) -> SessionResult<()> {
+        self.authorize_controller_lease(id, principal, lease_id, epoch, now)?;
+        self.release_controller(id, principal, now)
+    }
+
     /// Attach as observer (no stdin). `now_unix` is part of the uniform ACL surface.
     pub fn attach_observer(
         &mut self,
