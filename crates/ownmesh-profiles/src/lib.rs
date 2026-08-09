@@ -104,6 +104,24 @@ pub enum AdapterDialect {
     QoderAcp,
 }
 
+impl AdapterDialect {
+    /// Stable manifest binding string; never derive this from debug output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "codex_app_server",
+            Self::ClaudeStreamJson => "claude_stream_json",
+            Self::KimiAcp => "kimi_acp",
+            Self::OpenCodeServer => "opencode_server",
+            Self::PiRpc => "pi_rpc",
+            Self::AgyStreamJson => "agy_stream_json",
+            Self::QwenAcp => "qwen_acp",
+            Self::HermesAcp => "hermes_acp",
+            Self::QoderAcp => "qoder_acp",
+        }
+    }
+}
+
 /// Native-session continuation surface exposed by an adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]

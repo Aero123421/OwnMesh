@@ -23,6 +23,8 @@
 
 #[path = "session_transition_journal.rs"]
 mod session_transition_journal;
+#[path = "structured_adapter.rs"]
+mod structured_adapter;
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
@@ -47,21 +49,23 @@ use ownmesh_policy::{
     ExecutableIdentityBinding, OperationFacts, PolicyDocument, TemporaryGrant,
 };
 use ownmesh_profiles::{
-    official_adapter_spec, parse_adapter_event_page, NativeResume, ProfileRegistry, ProfileStatus,
+    official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
+    ProfileStatus,
 };
 use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{
     SessionKind, SessionManager, SidecarHostBinding, StreamKind as SessionStreamKind,
 };
 use ownmesh_session_host::{
-    default_shell_command, LiveHost, SupervisorBinding, SupervisorClient, SupervisorCommand,
-    SupervisorEnv, SupervisorSpawnRequest,
+    default_shell_command, HostIoMode, LiveHost, SupervisorBinding, SupervisorClient,
+    SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use session_transition_journal::{
     SessionTransitionJournal, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
 };
+use structured_adapter::StructuredAdapterDriver;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -688,6 +692,79 @@ impl DaemonRuntime {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
+    }
+
+    /// Run the documented, bounded structured child bootstrap through the
+    /// persistent supervisor.  The child owns no network listener; stdout is
+    /// drained solely through the owner-only sidecar spool.
+    async fn bootstrap_structured_adapter(
+        supervisor: &SupervisorClient,
+        binding: &SupervisorBinding,
+        dialect: AdapterDialect,
+        prompt: Option<&str>,
+        native_session_id: Option<&str>,
+    ) -> IpcResult<Option<String>> {
+        let mut driver = StructuredAdapterDriver::new(dialect, prompt, native_session_id)
+            .map_err(|message| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message,
+            })?;
+        for request in driver.start().map_err(|message| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message,
+        })? {
+            supervisor.write(binding, request).await.map_err(|err| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!("structured adapter bootstrap write failed: {err}"),
+            })?;
+        }
+        if driver.is_complete() {
+            return Ok(driver.native_session_id().map(str::to_owned));
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut cursor = 0_u64;
+        let mut partial = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let page = supervisor
+                .drain_stream(binding, cursor, 64 * 1024, "stdout")
+                .await
+                .map_err(|err| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("structured adapter bootstrap drain failed: {err}"),
+                })?;
+            cursor = page.next_offset.unwrap_or(page.total_bytes);
+            if page.bytes.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+            partial.extend_from_slice(&page.bytes);
+            if partial.len() > structured_adapter::MAX_STRUCTURED_FRAME_BYTES {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: "structured adapter emitted an overlong bootstrap record".into(),
+                });
+            }
+            while let Some(end) = partial.iter().position(|byte| *byte == b'\n') {
+                let record: Vec<_> = partial.drain(..=end).collect();
+                for request in driver.on_record(&record).map_err(|message| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message,
+                })? {
+                    supervisor.write(binding, request).await.map_err(|err| IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!("structured adapter follow-up write failed: {err}"),
+                    })?;
+                }
+                if driver.is_complete() {
+                    return Ok(driver.native_session_id().map(str::to_owned));
+                }
+            }
+        }
+        Err(IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: "structured adapter bootstrap timed out".into(),
+        })
     }
 
     fn new_id(prefix: &str) -> String {
@@ -3014,6 +3091,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         // PTY fallback. Never copies tool credentials to the cloud. Generic CLIs
         // still use program/args/command without profile registration.
         let mut profile_meta: Option<Value> = None;
+        let mut structured_adapter: Option<(String, AdapterDialect)> = None;
         let command = if let Some(cmd) = p.command.clone().filter(|c| !c.is_empty()) {
             Some(cmd)
         } else if let Some(program) = p
@@ -3082,6 +3160,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                         "profile {profile_id} cannot provide structured mode; use adapter_mode=pty explicitly"
                     ),
                 });
+            }
+            if !plan.use_pty {
+                if matches!(spec.dialect, AdapterDialect::OpenCodeServer) {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: "OpenCode's local HTTP adapter is unavailable without a documented authenticated client; select adapter_mode=pty".into(),
+                    });
+                }
+                structured_adapter = Some((spec.profile_id.clone(), spec.dialect));
             }
             profile_meta = Some(json!({
                 "profile_id": plan.profile_id,
@@ -3177,9 +3264,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     },
                     cols: size.cols,
                     rows: size.rows,
-                    io_mode: ownmesh_session_host::HostIoMode::Pty,
-                    profile_id: None,
-                    adapter_dialect: None,
+                    io_mode: if structured_adapter.is_some() {
+                        HostIoMode::StructuredPipes
+                    } else {
+                        HostIoMode::Pty
+                    },
+                    profile_id: structured_adapter.as_ref().map(|(id, _)| id.clone()),
+                    adapter_dialect: structured_adapter
+                        .as_ref()
+                        .map(|(_, dialect)| dialect.as_str().to_owned()),
                 };
                 let binding = {
                     let supervisor = self.ensure_remote_supervisor().await?;
@@ -3191,6 +3284,35 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                             message: format!("persistent session sidecar spawn failed: {err}"),
                         })?
                 };
+                if let Some((_, dialect)) = structured_adapter {
+                    let native_id = match Self::bootstrap_structured_adapter(
+                        self.ensure_remote_supervisor().await?,
+                        &binding,
+                        dialect,
+                        p.prompt.as_deref(),
+                        p.native_session_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(native_id) => native_id,
+                        Err(error) => {
+                            if let Ok(proxy) = self.ensure_remote_supervisor().await {
+                                let _ = proxy.terminate(&binding, format!("open-rollback:{}:structured", info.id)).await;
+                            }
+                            self.sessions = snapshot;
+                            return Err(error);
+                        }
+                    };
+                    if let Some(native_id) = native_id {
+                        if let Err(error) = self.sessions.set_native_session_id(&info.id, native_id) {
+                            if let Ok(proxy) = self.ensure_remote_supervisor().await {
+                                let _ = proxy.terminate(&binding, format!("open-rollback:{}:native-id", info.id)).await;
+                            }
+                            self.sessions = snapshot;
+                            return Err(session_err(error));
+                        }
+                    }
+                }
                 let status = {
                     let supervisor = self.ensure_remote_supervisor().await?;
                     supervisor
