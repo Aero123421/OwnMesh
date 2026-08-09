@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { canonicalTransferEphemeralProof, verifyTransferTicket, type TransferTicketClaims } from "./transfer-room.ts";
-import { mintTransferTicketPair, type AgentEphemeralReply, type TransferServerBinding } from "./transfer-orchestrator.ts";
+import { mintTransferTicketPair, parseTransferPreflightResult, type AgentEphemeralReply, type TransferServerBinding } from "./transfer-orchestrator.ts";
 
 const hex = (bytes: Uint8Array) => [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 
@@ -36,4 +36,13 @@ test("ticket coordinator accepts only exact Agent proofs and returns metadata wi
   assert.equal(JSON.stringify(pair.metadata).includes("ephemeral"), false);
   await assert.rejects(mintTransferTicketPair("secret", binding, { ...source, plan_sha256: "b".repeat(64) }, destination, "session_1", "jti_2", "jti_3"));
   await assert.rejects(mintTransferTicketPair("secret", binding, source, { ...destination, ephemeral_public_key: "33".repeat(32) }, "session_1", "jti_4", "jti_5"));
+});
+
+test("preflight result parser rejects bytes, unknown fields, and correlation substitution", () => {
+  const expected = { role: "source" as const, transfer_id: "xfer_1", tenant_id: "ten_1", plan_sha256: "a".repeat(64), epoch: 1, fence: 2, expires_at: Date.now() + 10_000, device_id: "dev_s", workspace_id: "ws_s", session_nonce: "nonce_1" };
+  const value = { ...expected, ephemeral_public_key: "11".repeat(32), ephemeral_signature: "22".repeat(64) };
+  assert.deepEqual(parseTransferPreflightResult(value, expected), value);
+  assert.equal(parseTransferPreflightResult({ ...value, ciphertext_base64: "forbidden" }, expected), null);
+  assert.equal(parseTransferPreflightResult({ ...value, fence: 3 }, expected), null);
+  assert.equal(parseTransferPreflightResult({ ...value, role: "destination" }, expected), null);
 });

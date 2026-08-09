@@ -48,6 +48,32 @@ export type AgentEphemeralReply = {
   ephemeral_signature: string;
 };
 
+/** Parse the bounded `operation.result.result.transfer_preflight` payload.
+ * This is intentionally metadata-only and is the only shape a future
+ * DeviceRoom correlation path may hand to the coordinator. */
+export function parseTransferPreflightResult(
+  value: unknown,
+  expected: Pick<TransferServerBinding, "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "expires_at"> & { role: TransferRole; device_id: string; workspace_id: string; session_nonce: string },
+): AgentEphemeralReply | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  const allowed = ["role", "transfer_id", "tenant_id", "device_id", "workspace_id", "plan_sha256", "epoch", "fence", "session_nonce", "expires_at", "ephemeral_public_key", "ephemeral_signature"];
+  if (Object.keys(obj).some((name) => !allowed.includes(name))) return null;
+  const text = (name: string) => typeof obj[name] === "string" ? obj[name] : null;
+  const integer = (name: string) => typeof obj[name] === "number" && Number.isSafeInteger(obj[name]) ? obj[name] as number : null;
+  const reply: AgentEphemeralReply = {
+    role: text("role") as TransferRole, transfer_id: text("transfer_id") || "", tenant_id: text("tenant_id") || "",
+    device_id: text("device_id") || "", workspace_id: text("workspace_id") || "", plan_sha256: text("plan_sha256") || "",
+    epoch: integer("epoch") ?? 0, fence: integer("fence") ?? 0, session_nonce: text("session_nonce") || "",
+    expires_at: integer("expires_at") ?? 0, ephemeral_public_key: text("ephemeral_public_key") || "", ephemeral_signature: text("ephemeral_signature") || "",
+  };
+  return reply.role === expected.role && reply.transfer_id === expected.transfer_id && reply.tenant_id === expected.tenant_id
+    && reply.device_id === expected.device_id && reply.workspace_id === expected.workspace_id
+    && reply.plan_sha256 === expected.plan_sha256 && reply.epoch === expected.epoch && reply.fence === expected.fence
+    && reply.session_nonce === expected.session_nonce && reply.expires_at === expected.expires_at
+    && key(reply.ephemeral_public_key, 32) && key(reply.ephemeral_signature, 64) ? reply : null;
+}
+
 export type TransferTicketPair = Readonly<{
   source_ticket: string;
   destination_ticket: string;

@@ -29,6 +29,7 @@ import {
   verifyInternalContext,
 } from "./util.ts";
 import { createStore, type ControlPlaneStore, type McpOperationRecord } from "./store.ts";
+import { parseTransferPreflightResult, type TransferServerBinding } from "./transfer-orchestrator.ts";
 
 export const PROTOCOL = "ownmesh.device/1.0";
 /** Independent operation payload contract (must match Rust/TS schema packages). */
@@ -2568,6 +2569,84 @@ export type ApplyMcpOperationResultOutcome =
   | { ok: false; error: string };
 
 /**
+ * The two Agent preflight operations are internal coordinator messages, never
+ * public MCP tools.  The expectation is written by the control plane when it
+ * creates each exact-bound operation.  Keeping it under this private key also
+ * makes a generic operation.result incapable of turning into a transfer proof.
+ */
+type TransferPreflightExpectation = Pick<
+  TransferServerBinding,
+  "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "expires_at"
+> & {
+  role: "source" | "destination";
+  device_id: string;
+  workspace_id: string;
+  session_nonce: string;
+  coordinator_request_id: string;
+  workspace_version: number;
+};
+
+function transferPreflightExpectation(op: McpOperationRecord): TransferPreflightExpectation | null {
+  const value = op.data.__transfer_preflight_expectation;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const allowed = [
+    "role", "transfer_id", "tenant_id", "plan_sha256", "epoch", "fence", "expires_at",
+    "device_id", "workspace_id", "session_nonce", "coordinator_request_id", "workspace_version",
+  ];
+  if (Object.keys(raw).some((key) => !allowed.includes(key))) return null;
+  const text = (key: string) => typeof raw[key] === "string" && raw[key].length > 0 ? raw[key] as string : null;
+  const integer = (key: string) => typeof raw[key] === "number" && Number.isSafeInteger(raw[key]) ? raw[key] as number : null;
+  const role = text("role");
+  const expected: TransferPreflightExpectation = {
+    role: role === "source" || role === "destination" ? role : "source",
+    transfer_id: text("transfer_id") || "", tenant_id: text("tenant_id") || "",
+    plan_sha256: text("plan_sha256") || "", epoch: integer("epoch") ?? 0,
+    fence: integer("fence") ?? 0, expires_at: integer("expires_at") ?? 0,
+    device_id: text("device_id") || "", workspace_id: text("workspace_id") || "",
+    session_nonce: text("session_nonce") || "", coordinator_request_id: text("coordinator_request_id") || "",
+    workspace_version: integer("workspace_version") ?? 0,
+  };
+  if (!role || expected.device_id !== op.device_id || expected.tenant_id !== op.tenant_id
+    || expected.workspace_id !== op.workspace_id || expected.workspace_version < 1
+    || expected.epoch < 1 || expected.fence < 1 || expected.expires_at <= Date.now()
+    || !/^[a-f0-9]{64}$/.test(expected.plan_sha256)) return null;
+  return expected;
+}
+
+function sanitizeTransferPreflightResult(
+  op: McpOperationRecord,
+  payload: Record<string, unknown>,
+): { data: Record<string, unknown> } | { error: string } {
+  const expected = transferPreflightExpectation(op);
+  if (!expected) return { error: "transfer_preflight_expectation_invalid" };
+  const result = payload.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    return { error: "transfer_preflight_result_invalid" };
+  }
+  const raw = result as Record<string, unknown>;
+  const allowed = ["transfer_preflight", "operation_id", "coordinator_request_id", "principal_id", "workspace_version"];
+  if (Object.keys(raw).some((key) => !allowed.includes(key))) return { error: "transfer_preflight_result_unknown_field" };
+  if (raw.operation_id !== op.operation_id || raw.coordinator_request_id !== expected.coordinator_request_id
+    || raw.principal_id !== op.principal_id || raw.workspace_version !== expected.workspace_version) {
+    return { error: "transfer_preflight_correlation_mismatch" };
+  }
+  const reply = parseTransferPreflightResult(raw.transfer_preflight, expected);
+  if (!reply) return { error: "transfer_preflight_proof_mismatch" };
+  // Store only the bounded proof metadata.  This deliberately excludes the
+  // raw operation payload and gives the ticket coordinator no byte channel.
+  return {
+    data: {
+      transfer_preflight: reply,
+      operation_id: op.operation_id,
+      coordinator_request_id: expected.coordinator_request_id,
+      principal_id: op.principal_id,
+      workspace_version: expected.workspace_version,
+    },
+  };
+}
+
+/**
  * Map a device-originated operation.result onto authoritative mcp_operations state.
  * Single runtime helper (DeviceRoom DO); mcp.ts must not duplicate this.
  *
@@ -2762,10 +2841,23 @@ export async function applyMcpOperationResult(
     status = op.status === "pending" ? "running" : op.status;
   }
 
-  const data =
+  let data =
     payload.result && typeof payload.result === "object"
       ? (payload.result as Record<string, unknown>)
       : { ...payload };
+  if (op.tool === "__transfer_preflight_source" || op.tool === "__transfer_preflight_destination") {
+    // A failed preflight carries only the normal bounded error envelope; a
+    // completed preflight must pass the exact metadata/proof correlation gate.
+    // In particular, never copy a generic Agent result (which could contain
+    // chunk bytes) into the durable operation row.
+    if (status === "completed") {
+      const sanitized = sanitizeTransferPreflightResult(op, payload);
+      if ("error" in sanitized) return { ok: false, error: sanitized.error };
+      data = sanitized.data;
+    } else {
+      data = {};
+    }
+  }
   if (status === "approval_required" && errDetails) {
     Object.assign(data, {
       approval_required: true,

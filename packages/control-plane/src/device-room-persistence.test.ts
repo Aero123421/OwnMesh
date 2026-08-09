@@ -1081,6 +1081,108 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   );
 });
 
+test("transfer preflight results are exact-correlated metadata only", async () => {
+  const { store } = openSqliteAdapter();
+  await store.ensureBootstrap();
+  const deviceId = "dev_preflight_source_01";
+  await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_");
+  const correlationId = randomId("cor_");
+  const expiresAt = Date.now() + 30_000;
+  const expected = {
+    role: "source",
+    transfer_id: "xfer_preflight_1",
+    tenant_id: DEFAULT_TENANT,
+    plan_sha256: "a".repeat(64),
+    epoch: 1,
+    fence: 1,
+    expires_at: expiresAt,
+    device_id: deviceId,
+    workspace_id: "ws_source",
+    session_nonce: "nonce_preflight_1",
+    coordinator_request_id: "coord_preflight_1",
+    workspace_version: 7,
+  };
+  await store.putMcpOperation({
+    operation_id: opId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "__transfer_preflight_source",
+    status: "pending",
+    summary: "transfer source preflight",
+    data: { __transfer_preflight_expectation: expected },
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: correlationId,
+    workspace_id: "ws_source",
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const proof = {
+    role: "source",
+    transfer_id: expected.transfer_id,
+    tenant_id: expected.tenant_id,
+    device_id: deviceId,
+    workspace_id: expected.workspace_id,
+    plan_sha256: expected.plan_sha256,
+    epoch: 1,
+    fence: 1,
+    session_nonce: expected.session_nonce,
+    expires_at: expiresAt,
+    ephemeral_public_key: "11".repeat(32),
+    ephemeral_signature: "22".repeat(64),
+  };
+  const rejected = await applyMcpOperationResult(store, {
+    operationId: opId,
+    correlationId,
+    deviceId,
+    payload: {
+      operation_id: opId,
+      status: "completed",
+      result: {
+        transfer_preflight: { ...proof, ciphertext_base64: "must-not-persist" },
+        operation_id: opId,
+        coordinator_request_id: expected.coordinator_request_id,
+        principal_id: "prin_dev",
+        workspace_version: expected.workspace_version,
+      },
+    },
+  });
+  assert.deepEqual(rejected, { ok: false, error: "transfer_preflight_proof_mismatch" });
+  assert.equal((await store.getMcpOperation(opId))?.status, "pending");
+
+  const accepted = await applyMcpOperationResult(store, {
+    operationId: opId,
+    correlationId,
+    deviceId,
+    payload: {
+      operation_id: opId,
+      status: "completed",
+      result: {
+        transfer_preflight: proof,
+        operation_id: opId,
+        coordinator_request_id: expected.coordinator_request_id,
+        principal_id: "prin_dev",
+        workspace_version: expected.workspace_version,
+      },
+    },
+  });
+  assert.equal(accepted.ok, true);
+  const saved = await store.getMcpOperation(opId);
+  assert.equal(saved?.status, "completed");
+  assert.deepEqual(saved?.data, {
+    transfer_preflight: proof,
+    operation_id: opId,
+    coordinator_request_id: expected.coordinator_request_id,
+    principal_id: "prin_dev",
+    workspace_version: expected.workspace_version,
+  });
+});
+
 test("operation.result store write failure fails closed without forward", async () => {
   const deviceId = "dev_result_store_fail";
   const { adapter, store } = openSqliteAdapter();

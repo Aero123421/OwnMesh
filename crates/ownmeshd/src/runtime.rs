@@ -1877,11 +1877,13 @@ full_user_access/full_access for arbitrary commands",
             destination_relative_path: p.destination_path,
         };
         binding.validate().map_err(Self::transfer_error)?;
-        // Resolve both registered roots before creating any durable state.  This
-        // rejects unknown workspaces and absolute/traversal source/destination
-        // paths before they can become part of an immutable plan.
+        // Source planning owns only source custody.  The destination Agent
+        // performs its own workspace/no-replace preflight and later obtains the
+        // destination lease.  Resolving a remote destination root here would
+        // incorrectly require two devices to share a daemon filesystem.
+        // TransferBinding::validate above still rejects absolute/traversal paths
+        // before either value becomes immutable plan metadata.
         let source = self.workspace_for(Some(&source_workspace_id))?;
-        let _destination = self.workspace_for(Some(&p.destination_workspace_id))?;
         let source_path = source
             .resolve(Path::new(&binding.source_relative_path))
             .map_err(fs_err)?;
@@ -7495,6 +7497,39 @@ mod transfer_runtime_tests {
         runtime.active_remote_payload_hash = Some("a".repeat(64));
         runtime.active_remote_device_id = Some("dev_transfer_test".into());
         runtime.active_remote_expires_at_unix = Some(DaemonRuntime::now() + 300);
+    }
+
+    #[tokio::test]
+    async fn transfer_source_plan_does_not_require_a_local_destination_root() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        std::fs::write(
+            paths.state_dir.join("workspace").join("source.bin"),
+            b"source bytes",
+        )
+        .unwrap();
+        bind_remote_transfer(&mut runtime);
+
+        let plan = runtime
+            .handle_transfer_plan(
+                Some(json!({
+                    "source_path": "source.bin",
+                    "destination_path": "received.bin",
+                    // This workspace intentionally exists only on the remote
+                    // destination daemon; source planning must not resolve it.
+                    "destination_workspace_id": "ws_remote_destination",
+                    "workspace_id": "ws_default"
+                })),
+                &remote_client(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan["size_bytes"], json!(12));
+        assert_eq!(
+            plan["destination_workspace_id"],
+            json!("ws_remote_destination")
+        );
     }
 
     #[tokio::test]
