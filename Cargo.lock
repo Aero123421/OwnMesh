@@ -1890,6 +1890,7 @@ dependencies = [
  "hex",
  "hmac",
  "ownmesh-domain",
+ "ownmesh-ipc",
  "rand 0.8.7",
  "serde",
  "serde_json",

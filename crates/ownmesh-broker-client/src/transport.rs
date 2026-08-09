@@ -70,6 +70,8 @@ pub enum BrokerV2ClientError {
     RequestIdMismatch,
     #[error("v2 transport failed before execute submission: {0}")]
     Connect(String),
+    #[error("v2 Windows broker server identity rejected: {0}")]
+    TrustedServer(String),
     #[error("v2 execution outcome uncertain; do not retry: {0}")]
     ExecutionUncertain(String),
 }
@@ -131,6 +133,168 @@ impl BrokerEndpoint {
             Self::NamedPipe(_) | Self::UnixSocket(_) => Ok(()),
         }
     }
+}
+
+/// Fixed production identity that a Windows v2 broker client must verify before
+/// it writes an authority-bearing frame.  This cannot be inferred from a pipe
+/// name: the exact pipe handle PID, SCM running-service PID, installed image
+/// path, process birth, and held image identity must all agree.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsBrokerTrust {
+    service_name: String,
+    broker_image: PathBuf,
+}
+
+#[cfg(windows)]
+impl WindowsBrokerTrust {
+    /// Construct a trust record from the service name and the already-custodied
+    /// installed broker image.  The path is canonicalized immediately; a
+    /// missing/reparse/replaced record is denied before pipe connection.
+    pub fn new(service_name: impl Into<String>, broker_image: &Path) -> BrokerV2ClientResult<Self> {
+        let service_name = service_name.into();
+        if service_name.is_empty()
+            || service_name.len() > 256
+            || !service_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(BrokerV2ClientError::TrustedServer(
+                "invalid SCM service name".into(),
+            ));
+        }
+        let broker_image = std::fs::canonicalize(broker_image).map_err(|error| {
+            BrokerV2ClientError::TrustedServer(format!(
+                "canonicalize recorded broker image: {error}"
+            ))
+        })?;
+        if !broker_image.is_file() {
+            return Err(BrokerV2ClientError::TrustedServer(
+                "recorded broker image is not a regular file".into(),
+            ));
+        }
+        Ok(Self {
+            service_name,
+            broker_image,
+        })
+    }
+
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+    #[must_use]
+    pub fn broker_image(&self) -> &Path {
+        &self.broker_image
+    }
+}
+
+/// A connected, SCM-and-handle-attested Windows broker pipe.  The retained
+/// process facts must be revalidated after the response before a caller treats
+/// it as an authoritative execution receipt.
+#[cfg(windows)]
+pub struct VerifiedWindowsBrokerConnection {
+    connection: ownmesh_ipc::ClientConnection,
+    process: ownmesh_ipc::WindowsProcessFacts,
+}
+
+#[cfg(windows)]
+impl VerifiedWindowsBrokerConnection {
+    #[must_use]
+    pub fn connection_mut(&mut self) -> &mut ownmesh_ipc::ClientConnection {
+        &mut self.connection
+    }
+
+    /// Revalidate PID birth and held image identity after a request/response.
+    pub fn revalidate_server(&self) -> BrokerV2ClientResult<()> {
+        self.process
+            .revalidate_process_birth()
+            .map_err(|error| BrokerV2ClientError::TrustedServer(error.to_string()))?;
+        self.process
+            .revalidate_image()
+            .map_err(|error| BrokerV2ClientError::TrustedServer(error.to_string()))
+    }
+}
+
+/// Open only the fixed secure broker pipe and verify the server process before
+/// any bytes are sent.  Generic NamedPipe endpoints deliberately cannot use
+/// this path, preventing same-name/user-pipe substitution.
+#[cfg(windows)]
+pub async fn connect_verified_windows_broker(
+    endpoint: &BrokerEndpoint,
+    trust: &WindowsBrokerTrust,
+) -> BrokerV2ClientResult<VerifiedWindowsBrokerConnection> {
+    let BrokerEndpoint::NamedPipe(pipe_name) = endpoint else {
+        return Err(BrokerV2ClientError::TrustedServer(
+            "Windows v2 broker requires a named pipe".into(),
+        ));
+    };
+    if pipe_name != ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME {
+        return Err(BrokerV2ClientError::TrustedServer(
+            "Windows broker pipe name is not the fixed secure endpoint".into(),
+        ));
+    }
+    let connection = ownmesh_ipc::connect(&ownmesh_ipc::Endpoint::NamedPipe(pipe_name.clone()))
+        .await
+        .map_err(|error| BrokerV2ClientError::Connect(error.to_string()))?;
+    let pid = connection
+        .windows_pipe_server_pid()
+        .map_err(|error| BrokerV2ClientError::TrustedServer(error.to_string()))?;
+    let service = ownmesh_ipc::windows_running_service_facts(trust.service_name(), pid)
+        .map_err(|error| BrokerV2ClientError::TrustedServer(error.to_string()))?;
+    let configured_image = extract_windows_service_image(service.binary_command_line())?;
+    let configured_image = std::fs::canonicalize(configured_image).map_err(|error| {
+        BrokerV2ClientError::TrustedServer(format!("canonicalize SCM broker image: {error}"))
+    })?;
+    if configured_image != trust.broker_image {
+        return Err(BrokerV2ClientError::TrustedServer(
+            "SCM broker image differs from installed trust record".into(),
+        ));
+    }
+    let process = ownmesh_ipc::windows_process_facts(pid)
+        .map_err(|error| BrokerV2ClientError::TrustedServer(error.to_string()))?;
+    if !process
+        .image_path()
+        .eq_ignore_ascii_case(trust.broker_image.to_string_lossy().as_ref())
+    {
+        return Err(BrokerV2ClientError::TrustedServer(
+            "pipe server running image differs from SCM/install record".into(),
+        ));
+    }
+    process
+        .revalidate_process_birth()
+        .map_err(|error| BrokerV2ClientError::TrustedServer(error.to_string()))?;
+    process
+        .revalidate_image()
+        .map_err(|error| BrokerV2ClientError::TrustedServer(error.to_string()))?;
+    Ok(VerifiedWindowsBrokerConnection {
+        connection,
+        process,
+    })
+}
+
+#[cfg(windows)]
+fn extract_windows_service_image(command_line: &str) -> BrokerV2ClientResult<&Path> {
+    let command_line = command_line.trim();
+    let image = if let Some(rest) = command_line.strip_prefix('"') {
+        rest.split_once('"')
+            .map(|(image, _)| image)
+            .ok_or_else(|| {
+                BrokerV2ClientError::TrustedServer(
+                    "SCM broker command line has an unterminated image quote".into(),
+                )
+            })?
+    } else {
+        command_line.split_whitespace().next().ok_or_else(|| {
+            BrokerV2ClientError::TrustedServer("SCM broker command line is empty".into())
+        })?
+    };
+    if image.is_empty() {
+        return Err(BrokerV2ClientError::TrustedServer(
+            "SCM broker image is empty".into(),
+        ));
+    }
+    Ok(Path::new(image))
 }
 
 /// True when `addr` is a loopback IP (IPv4 or IPv6).
@@ -643,5 +807,35 @@ mod tests {
             }
             other => panic!("unexpected default: {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_service_image_parser_rejects_ambiguous_or_unterminated_command_lines() {
+        assert_eq!(
+            extract_windows_service_image(
+                r#""C:\Program Files\OwnMesh\ownmesh-broker.exe" run --config C:\x"#
+            )
+            .unwrap(),
+            Path::new(r"C:\Program Files\OwnMesh\ownmesh-broker.exe")
+        );
+        assert!(extract_windows_service_image(r#""C:\Program Files\broken.exe"#).is_err());
+        assert!(extract_windows_service_image(" ").is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn verified_windows_client_refuses_nonfixed_pipe_before_connecting() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let trust = WindowsBrokerTrust::new("OwnMeshBroker", file.path()).unwrap();
+        let Err(err) = connect_verified_windows_broker(
+            &BrokerEndpoint::NamedPipe(r"\\.\pipe\attacker".into()),
+            &trust,
+        )
+        .await
+        else {
+            panic!("non-fixed pipe must be denied before connecting");
+        };
+        assert!(matches!(err, BrokerV2ClientError::TrustedServer(_)));
     }
 }

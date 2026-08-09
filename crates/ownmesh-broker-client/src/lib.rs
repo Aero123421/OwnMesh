@@ -30,6 +30,10 @@ pub use transport::{
     is_loopback_socket_addr, resolve_broker_endpoint, BrokerEndpoint, BrokerV2ClientError,
     BrokerV2ClientResult, PeerCred, TransportKind, V2TimeoutPhase,
 };
+#[cfg(windows)]
+pub use transport::{
+    connect_verified_windows_broker, VerifiedWindowsBrokerConnection, WindowsBrokerTrust,
+};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
