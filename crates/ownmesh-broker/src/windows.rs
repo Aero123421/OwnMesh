@@ -344,21 +344,27 @@ where
         tokio::select! {
             result = &mut execution => result.map_err(|error| format!("Windows Job execution task failed: {error}")),
             read = connection.read(&mut probe) => {
-                let read = read.map_err(|error| format!("observe Windows broker peer disconnect: {error}"))?;
+                // Treat EOF, a pipe reset/error, and an unexpected second byte
+                // identically.  In particular, never propagate a read error
+                // before fencing the active Job: ERROR_BROKEN_PIPE is an
+                // attacker-controlled disconnect signal, not a safe early
+                // return.
+                let _disconnect = read.err();
                 // A v2 connection is single-frame.  EOF is the normal loss of
                 // custody signal; a second byte is an equally invalid protocol
                 // transition and is fenced in exactly the same way.
                 let cancelled = self.runner.cancel(&request.request_id, &request.nonce);
-                if !cancelled {
-                    return Err("Windows broker peer changed connection but no matching active Job was cancellable".into());
-                }
                 let response = execution
                     .await
                     .map_err(|error| format!("Windows Job cancellation task failed: {error}"))?;
                 // Return the runner receipt so the durable replay ledger is
                 // finalized even though the caller can no longer receive it.
                 // A subsequent same-nonce frame remains fenced by that ledger.
-                let _ = read;
+                // `cancel == false` is an allowed select race: the Job may
+                // have completed just before this branch won.  Awaiting its
+                // terminal response above still lets the caller finalize the
+                // same durable replay reservation exactly once.
+                let _ = cancelled;
                 Ok(response)
             }
         }
