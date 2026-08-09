@@ -34,6 +34,8 @@ impl SupervisorRpcMethods {
     pub const DRAIN: &'static str = "session_supervisor.drain";
     pub const TERMINATE: &'static str = "session_supervisor.terminate";
     pub const REATTACH: &'static str = "session_supervisor.reattach";
+    /// CAS recovery for a binding that has expired but whose PTY TTL has not.
+    pub const RECLAIM: &'static str = "session_supervisor.reclaim";
     pub const ROTATE: &'static str = "session_supervisor.rotate";
 }
 
@@ -116,7 +118,8 @@ async fn dispatch(
                 params.workspace_id,
                 params.owner_principal,
                 params.controller_epoch,
-                params.expires_unix,
+                params.binding_expires_unix,
+                params.host_expires_unix,
             )
             .map_err(invalid)?;
             let binding = state
@@ -178,7 +181,21 @@ async fn dispatch(
                     &params.binding,
                     params.owner_principal,
                     params.controller_epoch,
-                    params.expires_unix,
+                    params.binding_expires_unix,
+                )
+                .await
+                .map_err(invalid)?;
+            Ok(json!(binding))
+        }
+        SupervisorRpcMethods::RECLAIM => {
+            let params: RotateParams = parse(params)?;
+            require_component(&params.owner_principal, "owner_principal")?;
+            let binding = state
+                .reclaim_expired_binding(
+                    &params.binding,
+                    params.owner_principal,
+                    params.controller_epoch,
+                    params.binding_expires_unix,
                 )
                 .await
                 .map_err(invalid)?;
@@ -251,7 +268,8 @@ struct SpawnParams {
     workspace_id: String,
     owner_principal: String,
     controller_epoch: u64,
-    expires_unix: i64,
+    binding_expires_unix: i64,
+    host_expires_unix: i64,
     command: CommandParams,
     cols: u16,
     rows: u16,
@@ -310,7 +328,7 @@ struct RotateParams {
     binding: SupervisorBinding,
     owner_principal: String,
     controller_epoch: u64,
-    expires_unix: i64,
+    binding_expires_unix: i64,
 }
 
 #[cfg(test)]
@@ -412,6 +430,10 @@ mod tests {
     }
 
     fn spawn_params() -> Value {
-        json!({"session_id":"ses_ipc", "device_id":"dev", "workspace_id":"ws", "owner_principal":"owner", "controller_epoch":1, "expires_unix":2_000_000_000_i64, "command":{"program":if cfg!(windows) {"cmd.exe"} else {"/bin/sh"}, "args":[], "cwd":null, "env":[]}, "cols":80, "rows":24})
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        json!({"session_id":"ses_ipc", "device_id":"dev", "workspace_id":"ws", "owner_principal":"owner", "controller_epoch":1, "binding_expires_unix":now + 60, "host_expires_unix":now + 600, "command":{"program":if cfg!(windows) {"cmd.exe"} else {"/bin/sh"}, "args":[], "cwd":null, "env":[]}, "cols":80, "rows":24})
     }
 }

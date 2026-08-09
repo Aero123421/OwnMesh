@@ -69,6 +69,8 @@ impl SupervisorState {
         command: PtyCommand,
         size: PtySize,
     ) -> Result<SupervisorBinding, String> {
+        // Refuse bad TTLs before allocating a PTY/process tree.
+        manifest.validate_runtime_lifetimes(unix_now())?;
         let mut hosts = self.hosts.lock().await;
         if hosts.len() >= MAX_HOSTS {
             return Err("supervisor host quota reached".into());
@@ -159,21 +161,60 @@ impl SupervisorState {
         previous: &SupervisorBinding,
         next_owner_principal: impl Into<String>,
         next_epoch: u64,
-        next_expires_unix: i64,
+        next_binding_expires_unix: i64,
     ) -> Result<SupervisorBinding, String> {
         let mut hosts = self.hosts.lock().await;
         let hosted = hosts
             .get_mut(&previous.session_id)
             .ok_or("supervisor host unavailable")?;
         exact(previous, &hosted.manifest)?;
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
         let next = HostManifest::new(
             hosted.manifest.session_id.clone(),
             hosted.manifest.device_id.clone(),
             hosted.manifest.workspace_id.clone(),
             next_owner_principal,
             next_epoch,
-            next_expires_unix,
+            next_binding_expires_unix,
+            hosted.manifest.host_expires_unix,
         )?;
+        next.validate_runtime_lifetimes(unix_now())?;
+        hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
+    /// CAS-reclaim an expired daemon binding while retaining the live PTY.
+    /// The exact stale nonce/epoch is accepted only as evidence for recovery;
+    /// all mutation methods reject it until this operation issues a successor.
+    pub async fn reclaim_expired_binding(
+        &self,
+        previous: &SupervisorBinding,
+        next_owner_principal: impl Into<String>,
+        next_epoch: u64,
+        next_binding_expires_unix: i64,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        if !previous.matches(&hosted.manifest) {
+            return Err("supervisor binding mismatch".into());
+        }
+        if hosted.manifest.binding_expires_unix > unix_now() {
+            return Err("supervisor binding has not expired".into());
+        }
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
+        let next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            next_owner_principal,
+            next_epoch,
+            next_binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.validate_runtime_lifetimes(unix_now())?;
         hosted.spool.rotate_manifest(next.clone())?;
         hosted.manifest = next.clone();
         Ok(binding_of(&next))
@@ -188,7 +229,7 @@ impl SupervisorState {
             let mut hosts = self.hosts.lock().await;
             let ids: Vec<_> = hosts
                 .iter()
-                .filter(|(_, hosted)| hosted.manifest.expires_unix <= now)
+                .filter(|(_, hosted)| hosted.manifest.host_expires_unix <= now)
                 .map(|(id, _)| id.clone())
                 .take(MAX_HOSTS)
                 .collect();
@@ -230,7 +271,7 @@ fn binding_of(manifest: &HostManifest) -> SupervisorBinding {
 }
 fn exact(binding: &SupervisorBinding, manifest: &HostManifest) -> Result<(), String> {
     let now = unix_now();
-    if manifest.expires_unix <= now {
+    if manifest.binding_expires_unix <= now {
         return Err("supervisor binding expired".into());
     }
     if binding.matches(manifest) {
@@ -238,6 +279,16 @@ fn exact(binding: &SupervisorBinding, manifest: &HostManifest) -> Result<(), Str
     } else {
         Err("supervisor binding mismatch".into())
     }
+}
+
+fn rotate_epoch(current: u64, next: u64) -> Result<(), String> {
+    let expected = current
+        .checked_add(1)
+        .ok_or("supervisor controller epoch overflow")?;
+    if next != expected {
+        return Err("supervisor controller epoch must advance exactly once".into());
+    }
+    Ok(())
 }
 
 fn unix_now() -> i64 {
@@ -268,7 +319,8 @@ mod tests {
             "ws",
             "client:remote:t:p",
             1,
-            2_000_000_000,
+            unix_now() + 60,
+            unix_now() + 600,
         )
         .unwrap();
         let active_binding = state
@@ -296,31 +348,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotation_invalidates_old_binding_and_expiry_sweeps_host() {
+    async fn binding_expiry_preserves_host_for_cas_reclaim() {
         let root = tempdir().unwrap();
         let state = SupervisorState::new(root.path());
         let original = state
             .spawn(
-                HostManifest::new("ses_rotate", "dev", "ws", "owner_a", 1, 2_000_000_000).unwrap(),
+                HostManifest::new(
+                    "ses_rotate",
+                    "dev",
+                    "ws",
+                    "owner_a",
+                    1,
+                    unix_now() + 2,
+                    unix_now() + 600,
+                )
+                .unwrap(),
                 shell_command(),
                 PtySize::default(),
             )
             .await
             .unwrap();
         let successor = state
-            .rotate_binding(&original, "owner_b", 2, 2_000_000_000)
+            .rotate_binding(&original, "owner_b", 2, unix_now() + 2)
             .await
             .unwrap();
         assert_ne!(successor.host_nonce, original.host_nonce);
         assert!(state.reattach(&original).await.is_err());
         state.reattach(&successor).await.unwrap();
-        let expired = state
-            .rotate_binding(&successor, "owner_b", 3, 1)
+        assert!(state
+            .rotate_binding(&successor, "owner_b", 4, unix_now() + 60)
+            .await
+            .is_err());
+        let pid_before_expiry = state.reattach(&successor).await.unwrap().pid;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(state.write(&successor, b"nope").await.is_err());
+        assert_eq!(state.sweep_expired().await, 0);
+        let reclaimed = state
+            .reclaim_expired_binding(&successor, "owner_c", 3, unix_now() + 60)
             .await
             .unwrap();
-        assert!(state.write(&expired, b"nope").await.is_err());
-        assert_eq!(state.sweep_expired().await, 1);
-        assert!(state.reattach(&expired).await.is_err());
+        assert_eq!(
+            state.reattach(&reclaimed).await.unwrap().pid,
+            pid_before_expiry
+        );
+        state.terminate(&reclaimed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn past_and_oversized_lifetime_are_refused_before_spawn() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let now = unix_now();
+        let past =
+            HostManifest::new("ses_past", "dev", "ws", "owner", 1, now - 1, now + 60).unwrap();
+        assert!(state
+            .spawn(past, shell_command(), PtySize::default())
+            .await
+            .is_err());
+        let huge =
+            HostManifest::new("ses_huge", "dev", "ws", "owner", 1, now + 60, now + 86_401).unwrap();
+        assert!(state
+            .spawn(huge, shell_command(), PtySize::default())
+            .await
+            .is_err());
     }
 
     fn shell_command() -> PtyCommand {
