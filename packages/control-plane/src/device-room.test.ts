@@ -351,7 +351,7 @@ test("injectOperation clears pending when no ready agent", () => {
   assert.equal(room.router.status().pending, 0);
 });
 
-test("ready redelivers durable pending operation.request with fresh seq", async () => {
+test("router redelivers durable pending operation.request with fresh seq after DO-authorized ready", async () => {
   const deviceId = "dev_ready_redeliv_01ab";
   const room = new DeviceRoomHarness(deviceId, () => true);
   const agent1 = room.connect("agent");
@@ -388,7 +388,9 @@ test("ready redelivers durable pending operation.request with fresh seq", async 
   // Simulate agent disconnect without result; pending remains durable.
   room.router.unregisterSession(agent1);
 
-  // New agent reconnects and becomes ready — pending must be redelivered.
+  // New agent reconnects and becomes ready. Production DeviceRoom first
+  // revalidates the durable principal credential generation, then calls this
+  // pure-router delivery primitive; the harness performs that final primitive.
   const agent2 = room.connect("agent");
   room.router.sessions.get(agent2)!.phase = "proven";
   await room.send(
@@ -401,7 +403,10 @@ test("ready redelivers durable pending operation.request with fresh seq", async 
   const afterReady = room.drain(agent2).map((s) => JSON.parse(s) as DeviceEnvelope);
   const ack = afterReady.find((e) => e.type === "ready.ack");
   assert.ok(ack, "expected ready.ack");
-  const redelivered = afterReady.filter((e) => e.type === "operation.request");
+  assert.equal(afterReady.filter((e) => e.type === "operation.request").length, 0);
+  assert.equal(room.router.redeliverPendingToAgent(agent2), 1);
+  const redelivered = room.drain(agent2).map((s) => JSON.parse(s) as DeviceEnvelope)
+    .filter((e) => e.type === "operation.request");
   assert.equal(redelivered.length, 1);
   assert.equal(redelivered[0]!.correlation_id, corr);
   assert.ok(

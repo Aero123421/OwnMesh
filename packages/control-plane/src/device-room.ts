@@ -332,7 +332,33 @@ export type HandleMessageResult = {
   deferred_dispatch?: DeferredDispatch;
   /** Pending entries dropped for TTL/expiry — DO must mark matching MCP ops failed. */
   expired_pending?: PendingOperation[];
+  /** Ready Agent whose durable pending work must be revalidated by the DO. */
+  agent_ready_session_id?: string;
 };
+
+type PrincipalCredentialBinding = {
+  principal_id: string;
+  tenant_id: string;
+  generation: number;
+};
+
+/** Extract only a complete, server-bound credential epoch from an operation. */
+function principalCredentialBinding(payload: Record<string, unknown>): PrincipalCredentialBinding | null {
+  const authorization = payload.authorization;
+  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
+  const bound = (authorization as Record<string, unknown>).bound_action;
+  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
+  const action = bound as Record<string, unknown>;
+  const principalId = action.principal_id;
+  const tenantId = action.tenant_id;
+  const generation = action.principal_credential_generation;
+  if (
+    typeof principalId !== "string" || principalId.trim() === "" ||
+    typeof tenantId !== "string" || tenantId.trim() === "" ||
+    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
+  ) return null;
+  return { principal_id: principalId, tenant_id: tenantId, generation };
+}
 
 type SessionIngressGuard = {
   lastSeq: number;
@@ -1015,11 +1041,9 @@ export class DeviceRoomRouter {
           msg.correlation_id,
         );
         this.sendToSession(sessionId, JSON.stringify(ack));
-        // Lease recovery: redeliver durable pending work the previous Agent socket
-        // may have missed between persist and result (reconnect/resume path).
+        // The DO revalidates every durable pending credential generation before
+        // redelivery. The pure router intentionally never sends old authority.
         const expired = this.pruneExpiredPending();
-        const redelivered =
-          att.remote_routing_enabled === true ? this.redeliverPendingToAgent(sessionId) : 0;
         void this.audit.append({
           kind: "device.ready",
           summary: "agent ready",
@@ -1027,13 +1051,14 @@ export class DeviceRoomRouter {
           meta: {
             capabilities: msg.payload,
             remote_routing_enabled: att.remote_routing_enabled === true,
-            pending_redelivered: redelivered,
+            pending_redelivered: 0,
             pending_expired: expired.length,
           },
         });
         return {
           ok: true,
           expired_pending: expired,
+          ...(att.remote_routing_enabled === true ? { agent_ready_session_id: sessionId } : {}),
         };
       }
       case "operation.request": {
@@ -1866,6 +1891,78 @@ export class DeviceRoom {
     }
   }
 
+  /**
+   * Verify that the immutable bound action still names the current, durable
+   * OAuth credential epoch.  A signed internal context authenticates the
+   * router caller, but it must never revive an operation authorized under a
+   * rotated or revoked principal credential.
+   */
+  private async credentialGenerationCurrent(
+    payload: Record<string, unknown>,
+    expected?: { principal_id: string; tenant_id: string },
+  ): Promise<"ok" | "binding_mismatch" | "credential_generation_mismatch" | "storage_unavailable"> {
+    if (!this.env.DB) return "storage_unavailable";
+    const binding = principalCredentialBinding(payload);
+    if (!binding) return "binding_mismatch";
+    if (
+      expected &&
+      (binding.principal_id !== expected.principal_id || binding.tenant_id !== expected.tenant_id)
+    ) return "binding_mismatch";
+    try {
+      const current = await createStore(this.env).getPrincipal(binding.principal_id);
+      if (!current || current.tenant_id !== binding.tenant_id) return "credential_generation_mismatch";
+      return current.credential_generation === binding.generation
+        ? "ok"
+        : "credential_generation_mismatch";
+    } catch {
+      return "storage_unavailable";
+    }
+  }
+
+  /**
+   * Recheck every persisted request immediately before reconnect delivery.
+   * Invalidated authority becomes a terminal durable result and is removed
+   * before any Agent socket is sent a frame.
+   */
+  private async redeliverCurrentPending(sessionId: string): Promise<void> {
+    if (!this.env.DB) throw new Error("storage_unavailable");
+    const store = createStore(this.env);
+    let removed = false;
+    for (const pending of [...this.router.pending.values()]) {
+      if (pending.live_only) continue;
+      const check = await this.credentialGenerationCurrent(pending.payload);
+      if (check === "ok") continue;
+      if (check === "storage_unavailable") throw new Error("storage_unavailable");
+      this.router.pending.delete(pending.correlation_id);
+      removed = true;
+      const operationId =
+        typeof pending.payload.operation_id === "string"
+          ? pending.payload.operation_id
+          : pending.correlation_id;
+      await store.updateMcpOperation(
+        operationId,
+        {
+          status: "failed",
+          summary: "operation authorization invalidated before device delivery",
+          data: {
+            error: {
+              code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+              message: "principal credential rotated or was revoked before device delivery",
+              retryable: false,
+            },
+          },
+          approval_required: false,
+        },
+        ["pending", "running", "approval_required", "cancel_requested"],
+      );
+    }
+    // Persist removals before delivery; otherwise hibernation could resurrect
+    // an invalid pending operation after a successful generation check.
+    if (removed) await this.persistNow();
+    const redelivered = this.router.redeliverPendingToAgent(sessionId);
+    if (redelivered > 0) await this.persistNow();
+  }
+
   async fetch(request: Request): Promise<Response> {
     await this.ready;
     const url = new URL(request.url);
@@ -1979,6 +2076,18 @@ export class DeviceRoom {
         opCtx.claims.correlation_id !== body.correlation_id
       ) {
         return json({ error: "binding_mismatch" }, { status: 403 });
+      }
+      const generationCheck = await this.credentialGenerationCurrent(body.payload || {}, {
+        principal_id: opCtx.claims.principal_id,
+        tenant_id: opCtx.claims.tenant_id,
+      });
+      if (generationCheck !== "ok") {
+        if (generationCheck === "storage_unavailable") {
+          this.storageBroken = true;
+          this.failClosedAll("storage unavailable", 1013);
+          return json({ error: "storage_unavailable" }, { status: 503 });
+        }
+        return json({ error: generationCheck }, { status: 403 });
       }
 
       // ---- Explicit durable ordering (output-gate compatible) ----
@@ -2119,6 +2228,18 @@ export class DeviceRoom {
         || payload.operation_id !== correlationId || !correlationId
         || (opCtx.claims.correlation_id && opCtx.claims.correlation_id !== correlationId)) {
         return json({ error: "binding_mismatch" }, { status: 403 });
+      }
+      const generationCheck = await this.credentialGenerationCurrent(payload, {
+        principal_id: opCtx.claims.principal_id,
+        tenant_id: opCtx.claims.tenant_id,
+      });
+      if (generationCheck !== "ok") {
+        if (generationCheck === "storage_unavailable") {
+          this.storageBroken = true;
+          this.failClosedAll("storage unavailable", 1013);
+          return json({ error: "storage_unavailable" }, { status: 503 });
+        }
+        return json({ error: generationCheck }, { status: 403 });
       }
       if (this.router.hasInternalNonce(opCtx.claims.nonce) || this.router.pending.has(correlationId)) {
         return json({ status: "dispatch_uncertain", detail: { error: "live_operation_already_observed" } }, { status: 409 });
@@ -2470,6 +2591,16 @@ export class DeviceRoom {
       const guard = this.router.ingressGuards.get(sessionId);
       if (guard) updatedAttachment.lastSeq = guard.lastSeq;
       ws.serializeAttachment(updatedAttachment);
+    }
+
+    if (result.ok && result.agent_ready_session_id) {
+      try {
+        await this.redeliverCurrentPending(result.agent_ready_session_id);
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
     }
 
     // Pending TTL/expiry must surface a terminal MCP status (never silent drop).

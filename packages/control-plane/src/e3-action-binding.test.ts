@@ -133,6 +133,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     deviceId: "dev_x",
     principalId: "prin_a",
     tenantId: "ten_a",
+    principalCredentialGeneration: 1,
     oauthClientId: "client_mcp",
   });
   const b = await buildCanonicalAction({
@@ -141,6 +142,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     deviceId: "dev_x",
     principalId: "prin_a",
     tenantId: "ten_a",
+    principalCredentialGeneration: 1,
     oauthClientId: "client_mcp",
   });
   assert.equal(await hashCanonicalAction(a), await hashCanonicalAction(b));
@@ -154,6 +156,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     deviceId: "dev_x",
     principalId: "prin_a",
     tenantId: "ten_a",
+    principalCredentialGeneration: 1,
     oauthClientId: "client_mcp",
   });
   assert.notEqual(await hashCanonicalAction(a), await hashCanonicalAction(c));
@@ -166,6 +169,7 @@ test("bindCanonicalAction includes operation_id, expires_at, claim_version", asy
     deviceId: "dev_x",
     principalId: "prin_a",
     tenantId: "ten_a",
+    principalCredentialGeneration: 1,
     oauthClientId: "client_a",
   });
   const expiresAt = "2030-01-01T00:00:00.000Z";
@@ -179,6 +183,65 @@ test("bindCanonicalAction includes operation_id, expires_at, claim_version", asy
   assert.equal(bound.bound.claim_version, 1);
   assert.equal(bound.payload_hash.length, 64);
   assert.notEqual(bound.payload_hash, await hashCanonicalAction(base));
+});
+
+test("principal credential generation is durable, rotates on credential changes, and binds public device operations", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    const token = await seedAuthed(store);
+    const principal = await store.getPrincipal("prin_dev");
+    assert.equal(principal?.credential_generation, 1);
+
+    const rotated = await store.rotateRefresh(token.refresh_token);
+    assert.equal(rotated.ok, true);
+    if (!rotated.ok) continue;
+    assert.equal((await store.getPrincipal("prin_dev"))?.credential_generation, 2);
+
+    await store.revokeToken(rotated.token.access_token);
+    const current = await store.getPrincipal("prin_dev");
+    assert.equal(current?.credential_generation, 3);
+    const readiness = await store.schemaReadiness();
+    assert.equal(readiness.checks.principals_credential_generation, true);
+
+    const before = await buildCanonicalAction({
+      toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 2,
+    });
+    const after = await buildCanonicalAction({
+      toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3,
+    });
+    assert.notEqual(await hashCanonicalAction(before), await hashCanonicalAction(after));
+
+    const fresh = await store.issueTokens(
+      "client_mcp", "prin_dev", "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device",
+    );
+    const deviceId = `dev_credential_${store.kind}`;
+    await putActiveDevice(store, deviceId);
+    await store.issueDeviceCredential((await store.getDevice(deviceId))!, 3_600_000);
+    let routed: Record<string, unknown> | undefined;
+    const response = await handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: { authorization: `Bearer ${fresh.access_token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: `credential-${store.kind}`, method: "tools/call",
+          params: { name: "ownmesh_fs_list", arguments: { device_id: deviceId, path: "/" } },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      {
+        async routeToDevice(_deviceId, operation) {
+          routed = operation.payload;
+          return { status: "routed_to_device" };
+        },
+      },
+    );
+    assert.equal(response.status, 200);
+    const bound = ((routed?.authorization as { bound_action?: Record<string, unknown> })?.bound_action);
+    assert.equal(bound?.principal_credential_generation, 3);
+    assert.equal(routed?.payload_hash, await hashCanonicalAction(bound!));
+  }
 });
 
 test("buildDeviceOperation always sets server payload_hash and wire binding fields", async () => {
@@ -197,6 +260,7 @@ test("buildDeviceOperation always sets server payload_hash and wire binding fiel
     deviceId: "dev_1",
     principalId: "prin_1",
     tenantId: "ten_1",
+    principalCredentialGeneration: 1,
     expiresAt,
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -285,6 +349,7 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
     deviceId,
     principalId: "prin_dev",
     tenantId: "ten_default",
+    principalCredentialGeneration: 1,
     oauthClientId: "client_mcp",
   });
   const firstHash = await hashCanonicalAction(firstAction);
@@ -549,6 +614,7 @@ test("command env is normalized into canonical action facts", async () => {
     deviceId: "dev_env",
     principalId: "prin_env",
     tenantId: "ten_env",
+    principalCredentialGeneration: 1,
   });
   assert.deepEqual((canonical.facts as { env?: Record<string, string> }).env, {
     A: "1",
@@ -567,6 +633,7 @@ test("command env is normalized into canonical action facts", async () => {
     deviceId: "dev_env",
     principalId: "prin_env",
     tenantId: "ten_env",
+    principalCredentialGeneration: 1,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
   const facts = (op.bound_action.facts as { env?: Record<string, string> }).env;
@@ -710,6 +777,7 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
     deviceId,
     principalId: "prin_dev",
     tenantId: "ten_default",
+    principalCredentialGeneration: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -1136,6 +1204,7 @@ test("dispatch outbox survives large write claim (~300 KiB) and redelivers after
     deviceId,
     principalId: "prin_dev",
     tenantId: "ten_default",
+    principalCredentialGeneration: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",

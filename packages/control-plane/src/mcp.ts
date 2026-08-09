@@ -1737,6 +1737,33 @@ export function readDispatchOutbox(data: Record<string, unknown> | null | undefi
   };
 }
 
+/**
+ * Outbox payloads are immutable but can wait across a credential rotation.
+ * Re-read the server-owned principal epoch immediately before a Worker-side
+ * delivery attempt; DeviceRoom repeats this check immediately before socket
+ * delivery. Missing or malformed authority is never considered current.
+ */
+async function boundCredentialGenerationCurrent(
+  store: ControlPlaneStore,
+  operation: { payload: Record<string, unknown> },
+): Promise<boolean> {
+  const authorization = operation.payload.authorization;
+  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return false;
+  const bound = (authorization as Record<string, unknown>).bound_action;
+  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return false;
+  const action = bound as Record<string, unknown>;
+  const principalId = action.principal_id;
+  const tenantId = action.tenant_id;
+  const generation = action.principal_credential_generation;
+  if (
+    typeof principalId !== "string" || principalId.trim() === "" ||
+    typeof tenantId !== "string" || tenantId.trim() === "" ||
+    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
+  ) return false;
+  const principal = await store.getPrincipal(principalId);
+  return principal?.tenant_id === tenantId && principal.credential_generation === generation;
+}
+
 /** True when a non-terminal claim still needs (re)dispatch of the bound body. */
 export function needsDispatchRedelivery(op: {
   status: string;
@@ -2249,11 +2276,16 @@ export async function buildCanonicalAction(opts: {
   deviceId: string;
   principalId: string;
   tenantId: string;
+  /** Positive credential epoch read from the durable server-side principal record. */
+  principalCredentialGeneration: number;
   /** Authenticated OAuth client id (never client-supplied). */
   oauthClientId?: string;
   /** Server-authorized E4 custody binding; never accepted from MCP arguments. */
   workspaceBinding?: { workspace_id: string; version: number };
 }): Promise<Record<string, unknown>> {
+  if (!Number.isSafeInteger(opts.principalCredentialGeneration) || opts.principalCredentialGeneration < 1) {
+    throw new Error("principal credential generation is required");
+  }
   const action = toolAction(opts.toolName);
   const capability = toolCapability(opts.toolName);
   const workspaceId =
@@ -2294,6 +2326,7 @@ export async function buildCanonicalAction(opts: {
     tool: opts.toolName,
     device_id: opts.deviceId,
     principal_id: opts.principalId,
+    principal_credential_generation: opts.principalCredentialGeneration,
     tenant_id: opts.tenantId,
     oauth_client_id: opts.oauthClientId ?? null,
     workspace_id: workspaceId ?? null,
@@ -2341,6 +2374,8 @@ export async function buildDeviceOperation(opts: {
   deviceId: string;
   principalId: string;
   tenantId: string;
+  /** Positive credential epoch read from the durable server-side principal record. */
+  principalCredentialGeneration: number;
   expiresAt: string;
   claimVersion?: number;
   oauthClientId?: string;
@@ -2405,6 +2440,7 @@ export async function buildDeviceOperation(opts: {
       deviceId: opts.deviceId,
       principalId: opts.principalId,
       tenantId: opts.tenantId,
+      principalCredentialGeneration: opts.principalCredentialGeneration,
       oauthClientId: opts.oauthClientId,
       workspaceBinding: opts.workspaceBinding,
     }));
@@ -2695,7 +2731,7 @@ export async function finalTransferPlanHash(meta: TransferPlanMeta, grantPayload
 async function buildTransferStartOperation(opts: {
   transfer: TransferPlanMeta; role: "source" | "destination"; operationId: string;
   principal: string; tenant: string; clientId: string; ticket: string; planSha256: string;
-  grantPayloadHash: string;
+  grantPayloadHash: string; principalCredentialGeneration: number;
 }): Promise<Awaited<ReturnType<typeof buildDeviceOperation>>> {
   const meta = opts.transfer;
   const source = opts.role === "source";
@@ -2716,6 +2752,7 @@ async function buildTransferStartOperation(opts: {
     ...finalTransferAction(meta, meta.source_sha256!, meta.source_size_bytes!),
     device_id: source ? meta.source_device_id : meta.destination_device_id,
     workspace_id: workspaceId, workspace_version: workspaceVersion, role: opts.role,
+    principal_credential_generation: opts.principalCredentialGeneration,
     // The bearer is carried only on the Agent request; intentionally exclude it
     // from any public/audited action representation.
     facts: Object.fromEntries(Object.entries(args).filter(([key]) => key !== "ticket")),
@@ -2848,7 +2885,7 @@ function transferNeedsFreshGeneration(meta: TransferPlanMeta, source: McpOperati
 }
 
 async function buildTransferPreflightOperation(opts: {
-  transfer: TransferPlanMeta; role: "source" | "destination"; operationId: string; principal: string; tenant: string; clientId: string;
+  transfer: TransferPlanMeta; role: "source" | "destination"; operationId: string; principal: string; tenant: string; clientId: string; principalCredentialGeneration: number;
 }): Promise<Awaited<ReturnType<typeof buildDeviceOperation>>> {
   const m = opts.transfer;
   const source = opts.role === "source";
@@ -2881,6 +2918,7 @@ async function buildTransferPreflightOperation(opts: {
   const canonical = {
     capability: action, action, tool: source ? "__transfer_preflight_source" : "__transfer_preflight_destination",
     device_id: deviceId, principal_id: opts.principal, tenant_id: opts.tenant, oauth_client_id: opts.clientId,
+    principal_credential_generation: opts.principalCredentialGeneration,
     workspace_id: workspaceId, workspace_version: workspaceVersion,
     facts: Object.fromEntries(Object.entries(args).filter(([key]) => key !== "workspace_id")),
   };
@@ -3007,6 +3045,16 @@ export async function handleMcp(
     if (!token) return mcpError(id, -32001, "unauthorized");
     const rec = await store.getAccess(token);
     if (!rec) return mcpError(id, -32001, "invalid_token");
+    const principal = await store.getPrincipal(rec.principal);
+    const principalCredentialGeneration = Number(principal?.credential_generation);
+    if (
+      !principal ||
+      principal.tenant_id !== rec.tenant_id ||
+      !Number.isSafeInteger(principalCredentialGeneration) ||
+      principalCredentialGeneration < 1
+    ) {
+      return mcpError(id, -32001, "invalid_token");
+    }
 
     const params = body.params || {};
     const name = String(params.name || "");
@@ -3164,7 +3212,7 @@ export async function handleMcp(
       ]);
       if (!source.ok || !destination.ok || !sourceWs.ok || !destinationWs.ok) return mcpError(id, -32004, "transfer_not_available");
       const meta: TransferPlanMeta = { transfer_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, source_path: sourcePath, destination_path: destinationPath, source_workspace_version: sourceWs.workspace.version, destination_workspace_version: destinationWs.workspace.version, epoch: 1, fence: 1, ttl_seconds: ttlSeconds, expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(), state: "planned" };
-      const canonical = { capability: "transfer.plan", action: "transfer.plan", tool: name, principal_id: rec.principal, tenant_id: rec.tenant_id, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, facts: { source_path: sourcePath, destination_path: destinationPath, ttl_seconds: ttlSeconds } };
+      const canonical = { capability: "transfer.plan", action: "transfer.plan", tool: name, principal_id: rec.principal, tenant_id: rec.tenant_id, principal_credential_generation: principalCredentialGeneration, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, facts: { source_path: sourcePath, destination_path: destinationPath, ttl_seconds: ttlSeconds } };
       const claimed = await store.claimMcpOperationByIdempotency({
         operation_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, tool: name, status: "pending", summary: "transfer plan created", data: { [TRANSFER_META_KEY]: meta }, truncated: false, next_cursor: null, approval_required: false, warnings: injectWarnings, correlation_id: correlation, payload_hash: await hashCanonicalAction(canonical), idempotency_key: idem, workspace_id: sourceWorkspaceId, expires_at: meta.expires_at, claim_version: 1, action: canonical, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso(),
       });
@@ -3206,6 +3254,7 @@ export async function handleMcp(
         const deviceOp = await buildDeviceOperation({
           toolName: "__transfer_artifact_get", operationId: artifactId, deviceId: meta.destination_device_id,
           principalId: rec.principal, tenantId: rec.tenant_id, expiresAt: meta.expires_at, claimVersion: 1,
+          principalCredentialGeneration,
           oauthClientId: rec.client_id, workspaceBinding: { workspace_id: meta.destination_workspace_id, version: meta.destination_workspace_version },
           args: { plan_id: meta.destination_plan_id, workspace_id: meta.destination_workspace_id, offset, max_bytes: maxBytes, idempotency_key: artifactId },
         });
@@ -3237,7 +3286,7 @@ export async function handleMcp(
         if (!cancellationMeta) return mcpError(id, -32004, "transfer_not_available");
         const cancelOps = await Promise.all(activeTargets.map(async ([target, deviceId, workspaceId, workspaceVersion, role]) => {
           const operationId = randomId("op_");
-          const deviceOp = await buildDeviceOperation({ toolName: "ownmesh_cancel_operation", operationId, deviceId, principalId: rec.principal, tenantId: rec.tenant_id, expiresAt: cancellationMeta.expires_at, claimVersion: 1, oauthClientId: rec.client_id, workspaceBinding: { workspace_id: workspaceId, version: workspaceVersion }, args: { target_operation_id: target, idempotency_key: `transfer-cancel:${cancellationMeta.transfer_id}:${role}:${target}` } });
+          const deviceOp = await buildDeviceOperation({ toolName: "ownmesh_cancel_operation", operationId, deviceId, principalId: rec.principal, tenantId: rec.tenant_id, expiresAt: cancellationMeta.expires_at, claimVersion: 1, principalCredentialGeneration, oauthClientId: rec.client_id, workspaceBinding: { workspace_id: workspaceId, version: workspaceVersion }, args: { target_operation_id: target, idempotency_key: `transfer-cancel:${cancellationMeta.transfer_id}:${role}:${target}` } });
           await store.putMcpOperation({ operation_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: deviceId, tool: "__transfer_cancel_control", status: "pending", summary: `transfer ${role} cancellation requested`, data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: cancellationMeta.transfer_id, target_operation_id: target }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: `transfer-cancel:${cancellationMeta.transfer_id}:${role}:${target}`, workspace_id: workspaceId, expires_at: cancellationMeta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
           return { operationId, deviceId, deviceOp, role };
         }));
@@ -3280,7 +3329,7 @@ export async function handleMcp(
       if (meta.state === "planned") {
         if (!router) return mcpError(id, -32009, "device room unavailable");
         const preflightId = randomId("op_");
-        const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: preflightId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id });
+        const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: preflightId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
         const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: "", epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${preflightId}`, coordinator_request_id: preflightId, workspace_version: meta.source_workspace_version };
         await store.putMcpOperation({ operation_id: preflightId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.source_device_id, tool: "__transfer_preflight_source", status: "pending", summary: "transfer source preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: preflightId, payload_hash: deviceOp.payload_hash, idempotency_key: preflightId, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
@@ -3319,7 +3368,7 @@ export async function handleMcp(
         const finalPlanSha256 = await finalTransferPlanHash(preliminary, grantPayloadHash, sourceDigest, sourceSize);
         const bound: TransferPlanMeta = { ...preliminary, plan_sha256: finalPlanSha256 };
         const finalSourceId = randomId("op_");
-        const deviceOp = await buildTransferPreflightOperation({ transfer: bound, role: "source", operationId: finalSourceId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id });
+        const deviceOp = await buildTransferPreflightOperation({ transfer: bound, role: "source", operationId: finalSourceId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
         const expectation = { role: "source", transfer_id: bound.transfer_id, tenant_id: bound.tenant_id, plan_sha256: finalPlanSha256, epoch: bound.epoch, fence: bound.fence, expires_at: Date.parse(bound.expires_at), device_id: bound.source_device_id, workspace_id: bound.source_workspace_id, session_nonce: `nonce_${finalSourceId}`, coordinator_request_id: finalSourceId, workspace_version: bound.source_workspace_version };
         await store.putMcpOperation({ operation_id: finalSourceId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: bound.source_device_id, tool: "__transfer_preflight_source_final", status: "pending", summary: "transfer source final preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: finalSourceId, payload_hash: deviceOp.payload_hash, idempotency_key: finalSourceId, workspace_id: bound.source_workspace_id, expires_at: bound.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(bound.source_device_id, deviceOp);
@@ -3343,7 +3392,7 @@ export async function handleMcp(
           return mcpResult(id, toolContent({ ...plan, data: { transfer: publicTransferMeta(meta), next: "await authenticated final source preflight" } }));
         }
         const destinationId = randomId("op_");
-        const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "destination", operationId: destinationId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id });
+        const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "destination", operationId: destinationId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
         const expectation = { role: "destination", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.destination_device_id, workspace_id: meta.destination_workspace_id, session_nonce: `nonce_${destinationId}`, coordinator_request_id: destinationId, workspace_version: meta.destination_workspace_version };
         await store.putMcpOperation({ operation_id: destinationId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_preflight_destination", status: "pending", summary: "transfer destination preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: destinationId, payload_hash: deviceOp.payload_hash, idempotency_key: destinationId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
@@ -3387,8 +3436,8 @@ export async function handleMcp(
         } catch { return mcpError(id, -32009, "transfer execution proof invalid"); }
         const sourceStartId = randomId("op_"); const destinationStartId = randomId("op_");
         const [sourceStart, destinationStart] = await Promise.all([
-          buildTransferStartOperation({ transfer: meta, role: "source", operationId: sourceStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.source_ticket, planSha256: meta.plan_sha256, grantPayloadHash }),
-          buildTransferStartOperation({ transfer: meta, role: "destination", operationId: destinationStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.destination_ticket, planSha256: meta.plan_sha256, grantPayloadHash }),
+          buildTransferStartOperation({ transfer: meta, role: "source", operationId: sourceStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.source_ticket, planSha256: meta.plan_sha256, grantPayloadHash, principalCredentialGeneration }),
+          buildTransferStartOperation({ transfer: meta, role: "destination", operationId: destinationStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.destination_ticket, planSha256: meta.plan_sha256, grantPayloadHash, principalCredentialGeneration }),
         ]);
         // D1 retains only a redacted non-redeliverable recipe. The raw bearer
         // is delivered exactly once over a ready Agent socket; neither an MCP
@@ -3641,6 +3690,7 @@ export async function handleMcp(
         deviceId: cancelDeviceId,
         principalId: rec.principal,
         tenantId: rec.tenant_id,
+        principalCredentialGeneration,
         expiresAt: cancelExpiresAt,
         claimVersion: 1,
         oauthClientId: rec.client_id,
@@ -4040,6 +4090,7 @@ export async function handleMcp(
       deviceId,
       principalId: rec.principal,
       tenantId: rec.tenant_id,
+      principalCredentialGeneration,
       expiresAt,
       claimVersion,
       oauthClientId: rec.client_id,
@@ -4202,6 +4253,29 @@ export async function handleMcp(
       if (router && needsDispatchRedelivery(replayed)) {
         const box = readDispatchOutbox(replayed.data || {});
         if (box) {
+          if (!(await boundCredentialGenerationCurrent(store, box.body))) {
+            const rejected = await patchOp(
+              store,
+              tracker,
+              replayed.operation_id,
+              {
+                status: "failed",
+                summary: "operation authorization invalidated before device redelivery",
+                data: {
+                  ...(replayed.data || {}),
+                  error: {
+                    code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+                    message: "principal credential rotated or was revoked before device redelivery",
+                    retryable: false,
+                  },
+                },
+                approval_required: false,
+              },
+              ["pending", "running", "cancel_requested"],
+            );
+            if (rejected) replayed = rejected;
+            return mcpResult(id, toolContent(publicTrackedView(replayed)));
+          }
           const redelivered = await router.routeToDevice(deviceId, box.body);
           // dispatch_uncertain: leave outbox pending for another identical retry;
           // DeviceRoom correlation dedup prevents a second side-effect send.
@@ -4298,6 +4372,37 @@ export async function handleMcp(
       return mcpResult(id, toolContent(finalOp));
     }
 
+    if (!(await boundCredentialGenerationCurrent(store, deviceOp))) {
+      const env = makeEnvelope({
+        operation_id: operationId,
+        status: "failed",
+        device_id: deviceId,
+        summary: "operation authorization invalidated before device delivery",
+        data: {
+          error: {
+            code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+            message: "principal credential rotated or was revoked before device delivery",
+            retryable: false,
+            operation_id: operationId,
+          },
+        },
+        correlation_id: correlation,
+        warnings: injectWarnings,
+      });
+      const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+        status: env.status,
+        summary: env.summary,
+        data: env.data,
+        truncated: env.truncated,
+        next_cursor: env.next_cursor,
+        session_id: env.session_id,
+        device_id: env.device_id,
+        correlation_id: env.correlation_id,
+        warnings: env.warnings,
+        approval_required: false,
+      });
+      return mcpResult(id, toolContent(finalOp));
+    }
     const routed = await router.routeToDevice(deviceId, deviceOp);
     // Mark durable outbox dispatched only after the DeviceRoom inject attempt returns
     // a status that means the body was accepted into the routing surface (or terminal).
@@ -4854,6 +4959,11 @@ export async function handleApprove(
     }
     const denied = await authorizeMcpApprover(store, principal, op, authSource);
     if (denied) return denied;
+    const approver = await store.getPrincipal(principal.id);
+    const approverCredentialGeneration = Number(approver?.credential_generation);
+    if (!Number.isSafeInteger(approverCredentialGeneration) || approverCredentialGeneration < 1) {
+      return json({ error: "forbidden", error_description: "approver credential generation unavailable" }, { status: 403 });
+    }
     if (operationId && operationId !== op.operation_id) {
       return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
     }
@@ -5069,6 +5179,7 @@ export async function handleApprove(
           device_id: deviceId,
           principal_id: principal.id,
           tenant_id: principal.tenant_id,
+          principal_credential_generation: approverCredentialGeneration,
           oauth_client_id: null,
           workspace_id: op.workspace_id ?? null,
           facts: decisionFacts,

@@ -155,6 +155,8 @@ export type PrincipalRecord = {
   tenant_id: string;
   kind: string;
   display_name: string;
+  /** Server-owned, positive, monotonic OAuth credential epoch. */
+  credential_generation: number;
   created_at: string;
 };
 
@@ -490,6 +492,8 @@ export interface ControlPlaneStore {
     tenantId?: string,
   ): Promise<PrincipalRecord>;
   getPrincipal(id: string): Promise<PrincipalRecord | null>;
+  /** Advance the server-owned OAuth credential epoch. Never caller supplied. */
+  advancePrincipalCredentialGeneration(id: string): Promise<number | null>;
 
   putAuthCode(code: AuthCodeRecord): Promise<void>;
   takeAuthCode(code: string): Promise<AuthCodeRecord | null>;
@@ -741,6 +745,8 @@ export type SchemaReadiness = {
     mcp_operations: boolean;
     mcp_approval_transactions: boolean;
     mcp_approval_outbox: boolean;
+    /** 0012 server-owned principal OAuth credential generation */
+    principals_credential_generation: boolean;
   };
 };
 
@@ -932,6 +938,10 @@ const SCHEMA_READINESS_OBJECTS: Record<
     ],
     indexes: ["idx_mcp_outbox_op", "idx_mcp_outbox_status"],
   },
+  principals_credential_generation: {
+    table: "principals",
+    columns: ["id", "credential_generation"],
+  },
 };
 
 const DEFAULT_TENANT = "ten_default";
@@ -974,6 +984,7 @@ export class MemoryStore implements ControlPlaneStore {
         tenant_id: DEFAULT_TENANT,
         kind: "human",
         display_name: "Dev User",
+        credential_generation: 1,
         created_at: nowIso(),
       });
     }
@@ -1016,6 +1027,7 @@ export class MemoryStore implements ControlPlaneStore {
       tenant_id: tenantId,
       kind,
       display_name: displayName,
+      credential_generation: 1,
       created_at: nowIso(),
     };
     this.principals.set(id, p);
@@ -1023,6 +1035,15 @@ export class MemoryStore implements ControlPlaneStore {
   }
   async getPrincipal(id: string): Promise<PrincipalRecord | null> {
     return this.principals.get(id) || null;
+  }
+  async advancePrincipalCredentialGeneration(id: string): Promise<number | null> {
+    const principal = this.principals.get(id);
+    if (!principal) return null;
+    const next = principal.credential_generation + 1;
+    if (!Number.isSafeInteger(next) || next < 1) throw new Error("principal credential generation overflow");
+    principal.credential_generation = next;
+    this.principals.set(id, principal);
+    return next;
   }
 
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
@@ -1102,6 +1123,7 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
+      await this.advancePrincipalCredentialGeneration(prior.principal);
       return {
         ok: false,
         error: "reuse",
@@ -1122,6 +1144,7 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
+      await this.advancePrincipalCredentialGeneration(old.principal);
       return {
         ok: false,
         error: "reuse",
@@ -1133,6 +1156,7 @@ export class MemoryStore implements ControlPlaneStore {
     this.tokensByAccess.set(access, old);
     this.accessByRefresh.delete(refreshToken);
     this.usedRefresh.set(refreshToken, old.refresh_family);
+    await this.advancePrincipalCredentialGeneration(old.principal);
     const next = await this.issueTokens(
       old.client_id,
       old.principal,
@@ -1147,19 +1171,21 @@ export class MemoryStore implements ControlPlaneStore {
       const access = this.accessByRefresh.get(token);
       if (access) {
         const rec = this.tokensByAccess.get(access);
-        if (rec) {
+        if (rec && !rec.revoked) {
           rec.revoked = true;
           this.tokensByAccess.set(access, rec);
+          await this.advancePrincipalCredentialGeneration(rec.principal);
         }
         this.accessByRefresh.delete(token);
       }
       return;
     }
     const rec = this.tokensByAccess.get(token);
-    if (rec) {
+    if (rec && !rec.revoked) {
       rec.revoked = true;
       this.tokensByAccess.set(token, rec);
       this.accessByRefresh.delete(rec.refresh_token);
+      await this.advancePrincipalCredentialGeneration(rec.principal);
     }
   }
 
@@ -2011,7 +2037,7 @@ export class SqlStore implements ControlPlaneStore {
   ): Promise<PrincipalRecord> {
     const existing = await this.db
       .prepare(
-        `SELECT id, tenant_id, kind, display_name, created_at FROM principals WHERE id = ?`,
+        `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
       )
       .bind(id)
       .first<PrincipalRecord>();
@@ -2031,14 +2057,29 @@ export class SqlStore implements ControlPlaneStore {
       tenant_id: tenantId,
       kind,
       display_name: displayName,
+      credential_generation: 1,
       created_at: created,
     };
   }
 
   async getPrincipal(id: string): Promise<PrincipalRecord | null> {
     return this.db.prepare(
-      `SELECT id, tenant_id, kind, display_name, created_at FROM principals WHERE id = ?`,
+      `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
     ).bind(id).first<PrincipalRecord>();
+  }
+
+  async advancePrincipalCredentialGeneration(id: string): Promise<number | null> {
+    const updated = await this.db
+      .prepare(
+        `UPDATE principals
+         SET credential_generation = credential_generation + 1
+         WHERE id = ? AND credential_generation >= 1
+         RETURNING credential_generation`,
+      )
+      .bind(id)
+      .first<{ credential_generation: number }>();
+    const generation = Number(updated?.credential_generation);
+    return Number.isSafeInteger(generation) && generation >= 1 ? generation : null;
   }
 
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
@@ -2221,15 +2262,18 @@ export class SqlStore implements ControlPlaneStore {
     // Real reuse: ledger hit and/or refresh_used=1 within the expires_at window.
     if (used || row.refresh_used) {
       const fam = used?.refresh_family || row.refresh_family;
-      await this.db.prepare(
-        `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-      ).bind(fam, now).run();
-      await this.db
-        .prepare(
+      await this.db.batch([
+        this.db.prepare(
+          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+        ).bind(fam, now),
+        this.db.prepare(
           `UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`,
-        )
-        .bind(fam)
-        .run();
+        ).bind(fam),
+        this.db.prepare(
+          `UPDATE principals SET credential_generation = credential_generation + 1
+           WHERE id = ? AND credential_generation >= 1`,
+        ).bind(row.principal_id),
+      ]);
       if (!used) {
         await this.db.prepare(
           `INSERT OR IGNORE INTO used_refresh_tokens (refresh_token_hash, refresh_family, used_at) VALUES (?, ?, ?)`,
@@ -2300,32 +2344,50 @@ export class SqlStore implements ControlPlaneStore {
                AND cur.revoked = 0
            )`,
       ).bind(accessHash, newRefreshHash, expiresAtIso, ts, refreshHash),
+      this.db.prepare(
+        `UPDATE principals SET credential_generation = credential_generation + 1
+         WHERE id = ? AND credential_generation >= 1
+           AND EXISTS (SELECT 1 FROM oauth_tokens WHERE access_token_hash = ? AND revoked = 0)`,
+      ).bind(row.principal_id, accessHash),
     ]);
 
     // Winner is determined from this statement's own meta.changes (not SQL changes()).
     const casWon = Number(batchResults[0]?.meta?.changes ?? 0) > 0;
     const successorInserted = Number(batchResults[2]?.meta?.changes ?? 0) > 0;
-    if (!casWon || !successorInserted) {
+    const generationAdvanced = Number(batchResults[3]?.meta?.changes ?? 0) > 0;
+    if (!casWon || !successorInserted || !generationAdvanced) {
       const raced = await this.db.prepare(
         `SELECT refresh_family FROM oauth_tokens WHERE refresh_token_hash = ? AND refresh_used = 1`,
       ).bind(refreshHash).first<{ refresh_family: string }>();
       if (raced) {
-        await this.db.prepare(
-          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-        ).bind(raced.refresh_family, nowIso()).run();
-        await this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
-          .bind(raced.refresh_family).run();
+        await this.db.batch([
+          this.db.prepare(
+            `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+          ).bind(raced.refresh_family, nowIso()),
+          this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
+            .bind(raced.refresh_family),
+          this.db.prepare(
+            `UPDATE principals SET credential_generation = credential_generation + 1
+             WHERE id = ? AND credential_generation >= 1`,
+          ).bind(row.principal_id),
+        ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
       }
       const ledger = await this.db.prepare(
         `SELECT refresh_family FROM used_refresh_tokens WHERE refresh_token_hash = ?`,
       ).bind(refreshHash).first<{ refresh_family: string }>();
       if (ledger) {
-        await this.db.prepare(
-          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-        ).bind(ledger.refresh_family, nowIso()).run();
-        await this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
-          .bind(ledger.refresh_family).run();
+        await this.db.batch([
+          this.db.prepare(
+            `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+          ).bind(ledger.refresh_family, nowIso()),
+          this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
+            .bind(ledger.refresh_family),
+          this.db.prepare(
+            `UPDATE principals SET credential_generation = credential_generation + 1
+             WHERE id = ? AND credential_generation >= 1`,
+          ).bind(row.principal_id),
+        ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
       }
       return { ok: false, error: "invalid_grant" };
@@ -2339,11 +2401,17 @@ export class SqlStore implements ControlPlaneStore {
       `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
     ).bind(fam).first("revoked");
     if (!successor || successor.revoked || familyRevoked) {
-      await this.db.prepare(
-        `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-      ).bind(fam, nowIso()).run();
-      await this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
-        .bind(fam).run();
+      await this.db.batch([
+        this.db.prepare(
+          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+        ).bind(fam, nowIso()),
+        this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
+          .bind(fam),
+        this.db.prepare(
+          `UPDATE principals SET credential_generation = credential_generation + 1
+           WHERE id = ? AND credential_generation >= 1`,
+        ).bind(row.principal_id),
+      ]);
       return { ok: false, error: "reuse", description: "refresh token reuse detected" };
     }
 
@@ -2367,21 +2435,22 @@ export class SqlStore implements ControlPlaneStore {
 
   async revokeToken(token: string): Promise<void> {
     const hash = await sha256Hex(token);
-    if (token.startsWith("rtk_")) {
-      await this.db
-        .prepare(
-          `UPDATE oauth_tokens SET revoked = 1 WHERE refresh_token_hash = ?`,
-        )
-        .bind(hash)
-        .run();
-      return;
-    }
-    await this.db
-      .prepare(
-        `UPDATE oauth_tokens SET revoked = 1 WHERE access_token_hash = ?`,
-      )
-      .bind(hash)
-      .run();
+    const column = token.startsWith("rtk_") ? "refresh_token_hash" : "access_token_hash";
+    const row = await this.db.prepare(
+      `SELECT principal_id, revoked FROM oauth_tokens WHERE ${column} = ?`,
+    ).bind(hash).first<{ principal_id: string; revoked: number }>();
+    if (!row || row.revoked) return;
+    if (!this.db.batch) throw new Error("SqlStore.revokeToken requires db.batch");
+    await this.db.batch([
+      this.db.prepare(
+        `UPDATE principals SET credential_generation = credential_generation + 1
+         WHERE id = ? AND credential_generation >= 1
+           AND EXISTS (SELECT 1 FROM oauth_tokens WHERE ${column} = ? AND revoked = 0)`,
+      ).bind(row.principal_id, hash),
+      this.db.prepare(
+        `UPDATE oauth_tokens SET revoked = 1 WHERE ${column} = ? AND revoked = 0`,
+      ).bind(hash),
+    ]);
   }
 
   async lookupRevocableToken(token: string): Promise<RevocableTokenMeta | null> {

@@ -667,7 +667,21 @@ test("revoked / expired device credential is rejected on important ops", async (
     `UPDATE device_credentials SET expires_at = ? WHERE credential_hash = ?`,
   ).run(new Date(Date.now() - 60_000).toISOString(), hash2);
 
-  const expPayload = { type: "ownmesh_fs_list", correlation_id: "op_exp" };
+  const expPayload = {
+    type: "ownmesh_fs_list",
+    correlation_id: "op_exp",
+    payload: {
+      operation_id: "op_exp",
+      capability: "fs.list",
+      authorization: {
+        bound_action: {
+          principal_id: "prin_dev",
+          tenant_id: DEFAULT_TENANT,
+          principal_credential_generation: 1,
+        },
+      },
+    },
+  };
   const { headers: expHeaders, bodyText: expBody } = await operationHeaders(deviceB, expPayload, {
     correlation_id: "op_exp",
   });
@@ -793,7 +807,22 @@ test("persist failure fails closed: no success response after storage put error"
   room.router.sendToSession = () => true;
 
   failPut = true;
-  const payload = { type: "ownmesh_fs_list", correlation_id: "op_pf", payload: { path: "/" } };
+  const payload = {
+    type: "ownmesh_fs_list",
+    correlation_id: "op_pf",
+    payload: {
+      operation_id: "op_pf",
+      capability: "fs.list",
+      authorization: {
+        bound_action: {
+          principal_id: "prin_dev",
+          tenant_id: DEFAULT_TENANT,
+          principal_credential_generation: 1,
+        },
+      },
+      arguments: { path: "/" },
+    },
+  };
   const { headers, bodyText } = await operationHeaders(deviceId, payload, { correlation_id: "op_pf" });
   const res = await room.fetch(
     new Request("https://device-room/operation?device_id=" + deviceId, {
@@ -910,6 +939,79 @@ test("pending payload byte budget rejects inject beyond TTL/count caps", () => {
   assert.equal(r2.status, "rejected");
   assert.equal((r2.detail as { code: string }).code, "OWNMESH_E_PENDING_PAYLOAD_LIMIT");
   assert.ok(router.totalPendingPayloadBytes() <= MAX_PENDING_PAYLOAD_BYTES);
+});
+
+test("credential rotation terminally removes a pending operation before Agent redelivery", async () => {
+  const { adapter, store } = openSqliteAdapter();
+  const deviceId = "dev_generation_redelivery_01";
+  await seedActiveDevice(store, deviceId);
+  const operationId = "op_generation_redelivery_01";
+  const generation = (await store.getPrincipal("prin_dev"))!.credential_generation;
+  const boundAction = {
+    capability: "fs.list",
+    action: "fs.list",
+    tool: "ownmesh_fs_list",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    principal_credential_generation: generation,
+    facts: { path: "/" },
+  };
+  await store.putMcpOperation({
+    operation_id: operationId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_list",
+    status: "pending",
+    summary: "awaiting redelivery",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: operationId,
+    action: boundAction,
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const room = new DeviceRoom(mockDOState(), {
+    DB: adapter as unknown as D1Database,
+    SESSION_SECRET,
+  });
+  await room.ready;
+  room.deviceId = deviceId;
+  room.router.deviceId = deviceId;
+  const agentId = "ags_generation_redelivery";
+  room.router.registerSession({
+    role: "agent", device_id: deviceId, session_id: agentId,
+    connected_at: Date.now(), phase: "ready", remote_routing_enabled: true,
+  });
+  let sends = 0;
+  room.router.sendToSession = () => {
+    sends += 1;
+    return true;
+  };
+  room.router.pending.set(operationId, {
+    correlation_id: operationId,
+    type: "ownmesh_fs_list",
+    from_session: "http_client",
+    created_at: Date.now(),
+    payload: {
+      operation_id: operationId,
+      capability: "fs.list",
+      authorization: { bound_action: boundAction },
+    },
+  });
+
+  await store.advancePrincipalCredentialGeneration("prin_dev");
+  await (room as unknown as { redeliverCurrentPending(sessionId: string): Promise<void> })
+    .redeliverCurrentPending(agentId);
+
+  assert.equal(sends, 0);
+  assert.equal(room.router.pending.has(operationId), false);
+  assert.equal((await store.getMcpOperation(operationId))?.status, "failed");
 });
 
 test("operation.result CAS binds op+correlation+device before forward; mismatch rejected", async () => {
@@ -1157,6 +1259,13 @@ test("live-operation sends raw ticket once but persists only a redacted tombston
     expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     payload: {
       operation_id: correlationId, capability: "transfer.start",
+      authorization: {
+        bound_action: {
+          principal_id: "prin_dev",
+          tenant_id: DEFAULT_TENANT,
+          principal_credential_generation: 1,
+        },
+      },
       arguments: {
         ticket, jti: `jti-${ticket}`, ephemeral_public_key: `ephemeral-${ticket}`,
         relay_ciphertext: `cipher-${ticket}`,
