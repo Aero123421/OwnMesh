@@ -2486,7 +2486,7 @@ full_user_access/full_access for arbitrary commands",
             session_methods::SHOW => self.handle_session_show(params, client),
             session_methods::ATTACH => self.handle_session_attach(params, client),
             session_methods::CLAIM => self.handle_session_claim(params, client).await,
-            session_methods::RENEW => self.handle_session_renew(params, client),
+            session_methods::RENEW => self.handle_session_renew(params, client).await,
             session_methods::DETACH => self.handle_session_detach(params, client).await,
             session_methods::RELEASE => self.handle_session_release(params, client),
             session_methods::GIVE => self.handle_session_give(params, client).await,
@@ -3468,7 +3468,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
     /// Renew the exact controller seat without changing its epoch. Remote callers
     /// must echo the opaque lease id and generation, so a stale controller cannot
     /// extend a handed-off or reclaimed seat.
-    fn handle_session_renew(
+    async fn handle_session_renew(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -3489,8 +3489,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let snapshot = self.sessions.clone();
-        let lease = self
-            .sessions
+        let mut preview = self.sessions.clone();
+        let lease = preview
             .renew_controller_lease(
                 &p.id,
                 &client.client_name,
@@ -3500,7 +3500,93 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 p.ttl_secs,
             )
             .map_err(session_err)?;
-        self.commit_sessions(snapshot)?;
+        if let Some(old_binding) = self
+            .sessions
+            .get(&p.id)
+            .map_err(session_err)?
+            .sidecar_host
+            .clone()
+        {
+            let transition_id = format!(
+                "renew:{}:{}:{}:{}",
+                p.id, p.lease_id, p.controller_epoch, lease.expires_unix
+            );
+            // Finish any earlier durable transition before publishing this
+            // renewal intent; this keeps the old nonce an exact CAS witness.
+            self.ensure_remote_supervisor().await?;
+            let record = TransitionRecord {
+                transition_id: transition_id.clone(),
+                kind: TransitionKind::Renew,
+                phase: TransitionPhase::Intent,
+                session_id: p.id.clone(),
+                device_id: old_binding.device_id.clone(),
+                workspace_id: bound_ws.clone(),
+                authenticated_principal: client.client_name.clone(),
+                old_binding: old_binding.clone(),
+                target: TransitionTarget {
+                    principal: client.client_name.clone(),
+                    controller_epoch: lease.epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    controller_attached: true,
+                },
+                new_binding: None,
+                created_unix: now,
+                expires_unix: old_binding.host_expires_unix,
+            };
+            self.transition_journal
+                .begin(record)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("begin sidecar renew journal: {e}"),
+                })?;
+            let old = supervisor_binding_from(&p.id, &old_binding);
+            let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "sidecar unavailable after bootstrap".into(),
+            })?;
+            let returned = proxy
+                .renew(&old, lease.expires_unix, transition_id.clone())
+                .await
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("sidecar renew failed: {e}"),
+                })?;
+            if returned.controller_epoch != lease.epoch {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: "sidecar renew returned a different controller epoch".into(),
+                });
+            }
+            let new_binding = SidecarHostBinding {
+                device_id: old_binding.device_id.clone(),
+                workspace_id: old_binding.workspace_id.clone(),
+                owner_principal: client.client_name.clone(),
+                host_nonce: returned.host_nonce,
+                controller_epoch: returned.controller_epoch,
+                binding_expires_unix: lease.expires_unix,
+                host_expires_unix: old_binding.host_expires_unix,
+            };
+            self.transition_journal
+                .mark_applied(&transition_id, new_binding.clone())
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("mark sidecar renew journal: {e}"),
+                })?;
+            preview
+                .set_sidecar_host_binding(&p.id, Some(new_binding))
+                .map_err(session_err)?;
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+            self.transition_journal
+                .clear(&transition_id)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("clear sidecar renew journal: {e}"),
+                })?;
+        } else {
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+        }
         Ok(json!({ "lease": lease, "session_id": p.id, "workspace_id": bound_ws }))
     }
 
