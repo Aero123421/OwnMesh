@@ -82,6 +82,25 @@ const STORAGE_METADATA = "ownmesh:transfer:metadata:v1";
 const STORAGE_TICKETS = "ownmesh:transfer:tickets:v1";
 const MAX_TICKET_REPLAYS = 128;
 
+/** Persist only a domain-separated replay fingerprint.  A JTI is not a
+ * bearer by itself, but retaining its raw value is unnecessary durable link
+ * material.  Binding the digest to the transfer also prevents equal JTIs in
+ * different Rooms from sharing an at-rest identifier. */
+async function ticketReplayKey(transferId: string, jti: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const fields = ["ownmesh-transfer-ticket-replay-v1", transferId, jti].map((value) => encoder.encode(value));
+  const size = fields.reduce((total, value) => total + 4 + value.byteLength, 0);
+  const canonical = new Uint8Array(size);
+  const view = new DataView(canonical.buffer);
+  let offset = 0;
+  for (const value of fields) {
+    view.setUint32(offset, value.byteLength, false); offset += 4;
+    canonical.set(value, offset); offset += value.byteLength;
+  }
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", canonical));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function base64Url(bytes: Uint8Array): string {
   let text = ""; for (const byte of bytes) text += String.fromCharCode(byte);
   return btoa(text).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
@@ -431,7 +450,15 @@ export class TransferRoom {
   private async restore(): Promise<void> {
     this.metadata = (await this.storage().get<TransferMetadata>(STORAGE_METADATA)) || null;
     const entries = (await this.storage().get<Array<[string, number]>>(STORAGE_TICKETS)) || [];
-    for (const [jti, exp] of entries) if (id(jti) && Number.isFinite(exp) && exp > Date.now()) this.consumed.set(jti, exp);
+    const now = Date.now();
+    if (!Array.isArray(entries) || entries.length > MAX_TICKET_REPLAYS) throw new Error("invalid transfer replay ledger");
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry.length !== 2 || !hash(entry[0])
+        || !Number.isSafeInteger(entry[1]) || entry[1] < 1 || entry[1] > now + TICKET_MAX_MS) {
+        throw new Error("invalid transfer replay ledger");
+      }
+      if (entry[1] > now) this.consumed.set(entry[0], entry[1]);
+    }
     if (this.metadata) {
       this.router = new TransferRoomRouter(this.metadata, async (metadata) => this.persistMetadata(metadata));
       // Hibernation resets the peer map, not the live Cloudflare WebSockets.
@@ -466,9 +493,10 @@ export class TransferRoom {
     this.metadata = metadata;
   }
   private async consume(claims: TransferTicketClaims): Promise<boolean> {
-    for (const [jti, exp] of this.consumed) if (exp <= Date.now()) this.consumed.delete(jti);
-    if (this.consumed.has(claims.jti) || this.consumed.size >= MAX_TICKET_REPLAYS) return false;
-    this.consumed.set(claims.jti, claims.ticket_exp);
+    for (const [replayKey, exp] of this.consumed) if (exp <= Date.now()) this.consumed.delete(replayKey);
+    const replayKey = await ticketReplayKey(claims.transfer_id, claims.jti);
+    if (this.consumed.has(replayKey) || this.consumed.size >= MAX_TICKET_REPLAYS) return false;
+    this.consumed.set(replayKey, claims.ticket_exp);
     await this.storage().put(STORAGE_TICKETS, [...this.consumed]);
     return true;
   }

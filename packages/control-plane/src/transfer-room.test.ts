@@ -1,12 +1,58 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canonicalTransferEphemeralProof, issueTransferTicket, TransferRoomRouter, TRANSFER_PROTOCOL, validateTransferAttachment, verifyTransferEphemeralProof, verifyTransferTicket, type TransferAttachment, type TransferMetadata, type TransferTicketClaims } from "./transfer-room.ts";
+import { canonicalTransferEphemeralProof, issueTransferTicket, TransferRoom, TransferRoomRouter, TRANSFER_PROTOCOL, validateTransferAttachment, verifyTransferEphemeralProof, verifyTransferTicket, type TransferAttachment, type TransferMetadata, type TransferTicketClaims } from "./transfer-room.ts";
 
 const digest = "a".repeat(64);
 function meta(): TransferMetadata { return { version: 1, transfer_id: "xfer_test", tenant_id: "ten_a", source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, transfer_expires_at: Date.now() + 10 * 60_000, max_bytes: 128 * 1024, epoch: 1, fence: 7, state: "prepared", contiguous_ack_sequence: null, contiguous_ack_offset: 0 }; }
 function frame(type: string, fields: Record<string, unknown> = {}) { return JSON.stringify({ protocol: TRANSFER_PROTOCOL, type, transfer_id: "xfer_test", epoch: 1, fence: 7, plan_sha256: digest, ...fields }); }
 function encrypted(length: number): string { return btoa("x".repeat(length + 16)); }
 function ticket(role: "source" | "destination"): TransferTicketClaims { return { v: 1, jti: `jti_${role}`, session_nonce: `nonce_${role}`, transfer_id: "xfer_test", tenant_id: "ten_a", principal_id: "prin_a", device_id: role === "source" ? "dev_source" : "dev_destination", role, source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, epoch: 1, fence: 7, max_bytes: 128 * 1024, ticket_exp: Date.now() + 20_000, transfer_expires_at: Date.now() + 10 * 60_000, source_device_public_key: "01".repeat(32), destination_device_public_key: "02".repeat(32), source_ephemeral_public_key: "03".repeat(32), destination_ephemeral_public_key: "04".repeat(32), source_ephemeral_signature: "05".repeat(64), destination_ephemeral_signature: "06".repeat(64) }; }
+
+type TransferMockSocket = {
+  attachment: unknown; closed: boolean; sent: string[];
+  send(data: string): void; close(): void;
+  serializeAttachment(value: unknown): void; deserializeAttachment(): unknown;
+};
+function transferMockSocket(): TransferMockSocket {
+  const socket: TransferMockSocket = {
+    attachment: null, closed: false, sent: [],
+    send(data) { socket.sent.push(data); }, close() { socket.closed = true; },
+    serializeAttachment(value) { socket.attachment = value; },
+    deserializeAttachment() { return socket.attachment; },
+  };
+  return socket;
+}
+function installTransferWebSocketPair(): void {
+  const target = globalThis as typeof globalThis & { WebSocketPair?: new () => { 0: TransferMockSocket; 1: TransferMockSocket } };
+  if (!target.WebSocketPair) target.WebSocketPair = class WebSocketPair {
+    0 = transferMockSocket(); 1 = transferMockSocket();
+  };
+}
+function transferState(storage: Map<string, unknown>, sockets: TransferMockSocket[] = []): DurableObjectState {
+  return {
+    id: { toString: () => "xfer_test", equals: () => false, name: "xfer_test" } as DurableObjectId,
+    storage: {
+      get: async (key: string) => structuredClone(storage.get(key)),
+      put: async (key: string, value: unknown) => { storage.set(key, structuredClone(value)); },
+      delete: async (key: string) => storage.delete(key),
+      setAlarm: async () => undefined,
+    },
+    getWebSockets: () => sockets as unknown as WebSocket[],
+    acceptWebSocket: (socket: WebSocket) => { sockets.push(socket as unknown as TransferMockSocket); },
+  } as unknown as DurableObjectState;
+}
+async function transferUpgrade(room: TransferRoom, encoded: string): Promise<number> {
+  try {
+    return (await room.fetch(new Request("https://room.invalid/", {
+      headers: { Upgrade: "websocket", "x-ownmesh-transfer-ticket": encoded },
+    }))).status;
+  } catch (error) {
+    // Node's Response rejects status 101 after the DO has accepted the socket.
+    const message = error instanceof Error ? error.message : String(error);
+    if (/status.*101|range of 200 to 599/i.test(message)) return 101;
+    throw error;
+  }
+}
 
 test("transfer tickets are short lived and bind role, device, tenant, plan and session nonce", async () => {
   const secret = "test-secret"; const source = ticket("source");
@@ -16,6 +62,37 @@ test("transfer tickets are short lived and bind role, device, tenant, plan and s
   await assert.rejects(issueTransferTicket(secret, { ...source, role: "source", device_id: "dev_destination" }));
   await assert.rejects(issueTransferTicket(secret, { ...source, ticket_exp: Date.now() - 1 }));
   await assert.rejects(issueTransferTicket(secret, { ...source, transfer_expires_at: source.ticket_exp - 1 }));
+});
+
+test("TransferRoom persists only a transfer-bound JTI hash and rejects replay after hibernation", async () => {
+  installTransferWebSocketPair();
+  const secret = "replay-ledger-secret";
+  const rawJti = "jti_distinctive_raw_value_must_not_survive";
+  const claims = { ...ticket("source"), jti: rawJti };
+  const encoded = await issueTransferTicket(secret, claims);
+  const storage = new Map<string, unknown>();
+  assert.equal(await transferUpgrade(new TransferRoom(transferState(storage), { SESSION_SECRET: secret }), encoded), 101);
+
+  const ledger = storage.get("ownmesh:transfer:tickets:v1");
+  assert.ok(Array.isArray(ledger));
+  assert.equal(ledger.length, 1);
+  assert.match(String(ledger[0]?.[0]), /^[a-f0-9]{64}$/);
+  assert.notEqual(ledger[0]?.[0], rawJti, "raw JTI must never be the durable replay key");
+  assert.equal(JSON.stringify([...storage.entries()]).includes(rawJti), false);
+  assert.equal(JSON.stringify([...storage.entries()]).includes(encoded), false);
+
+  // A fresh object has no in-memory ledger, so this proves restore from the
+  // actual storage key retains replay denial across hibernation/eviction.
+  const restored = new TransferRoom(transferState(storage), { SESSION_SECRET: secret });
+  assert.equal(await transferUpgrade(restored, encoded), 409);
+
+  // Restore is strict: legacy/raw identifiers cannot be silently accepted as
+  // replay state and malformed/future entries do not bypass the cap/TTL rules.
+  const invalid = new Map<string, unknown>([["ownmesh:transfer:tickets:v1", [[rawJti, Date.now() + 10_000]]]]);
+  await assert.rejects(
+    transferUpgrade(new TransferRoom(transferState(invalid), { SESSION_SECRET: secret }), encoded),
+    /invalid transfer replay ledger/,
+  );
 });
 
 test("ephemeral proof binds the exact key, role, and immutable transfer facts", async () => {
