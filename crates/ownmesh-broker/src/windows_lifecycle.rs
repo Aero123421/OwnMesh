@@ -13,6 +13,7 @@ use ownmesh_ipc::{windows_process_facts, windows_running_service_facts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -59,6 +60,7 @@ const SECRET_NAME: &str = "broker.request.secret";
 const SIGNING_NAME: &str = "broker.cap.signing";
 const STAGING_NAME: &str = "staged";
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
+const MAX_BROKER_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -461,8 +463,37 @@ fn hash_file(path: &Path) -> Result<String, String> {
             path.display()
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    if metadata.len() > MAX_BROKER_IMAGE_BYTES {
+        return Err(format!(
+            "{} exceeds broker image byte ceiling",
+            path.display()
+        ));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let opened = file.metadata().map_err(|e| e.to_string())?;
+    if opened.len() != metadata.len() || opened.len() > MAX_BROKER_IMAGE_BYTES {
+        return Err("broker image changed or exceeded bound while opening (fail-closed)".into());
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            break;
+        }
+        read = read
+            .checked_add(u64::try_from(count).unwrap_or(u64::MAX))
+            .ok_or("broker image length overflow")?;
+        if read > MAX_BROKER_IMAGE_BYTES {
+            return Err("broker image exceeds byte ceiling while hashing".into());
+        }
+        digest.update(&buffer[..count]);
+    }
+    if read != opened.len() {
+        return Err("broker image length changed while hashing (fail-closed)".into());
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn query_service_pid(name: &str) -> Result<u32, String> {
@@ -1163,5 +1194,14 @@ mod tests {
         let source = include_str!("windows_lifecycle.rs");
         assert!(!source.contains("var_os(\"ProgramData\")"));
         assert!(!source.contains("var_os(\"ProgramFiles\")"));
+    }
+
+    #[test]
+    fn oversized_broker_image_is_rejected_without_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.exe");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_BROKER_IMAGE_BYTES + 1).unwrap();
+        assert!(hash_file(&path).unwrap_err().contains("ceiling"));
     }
 }
