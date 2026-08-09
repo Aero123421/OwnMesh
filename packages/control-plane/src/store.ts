@@ -696,6 +696,8 @@ export interface ControlPlaneStore {
   /** Create or update cloud workspace custody.  Only admin paths call this. */
   putWorkspace(workspace: WorkspaceRecord): Promise<void>;
   getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null>;
+  putWorkspaceMember(workspaceId: string, principalId: string): Promise<void>;
+  isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean>;
   /**
    * Fail-closed workspace ACL/version gate.  Device owners and tenant
    * owners/admins administer workspaces; ordinary members require ownership
@@ -961,6 +963,7 @@ export class MemoryStore implements ControlPlaneStore {
   /** key = `${tenant_id}\0${principal_id}` */
   tenantMembers = new Map<string, { tenant_id: string; principal_id: string; role: "owner" | "admin" | "member"; created_at: string }>();
   workspaces = new Map<string, WorkspaceRecord>();
+  workspaceMembers = new Set<string>();
   audits: AuditEvent[] = [];
   migrations = new Set<string>();
 
@@ -1791,6 +1794,14 @@ export class MemoryStore implements ControlPlaneStore {
     return row ? { ...row } : null;
   }
 
+  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
+    this.workspaceMembers.add(`${workspaceId}\0${principalId}`);
+  }
+
+  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
+    return this.workspaceMembers.has(`${workspaceId}\0${principalId}`);
+  }
+
   async assertWorkspaceOperableForMcp(
     workspaceId: string,
     deviceId: string,
@@ -1812,7 +1823,8 @@ export class MemoryStore implements ControlPlaneStore {
       workspace.owner_principal_id === principalId ||
       device?.principal_id === principalId ||
       role === "owner" ||
-      role === "admin";
+      role === "admin" ||
+      (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
     return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
   }
 
@@ -3794,6 +3806,25 @@ export class SqlStore implements ControlPlaneStore {
     }
   }
 
+  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
+    await this.db
+      .prepare(`INSERT OR IGNORE INTO workspace_members (workspace_id, principal_id, created_at) VALUES (?, ?, ?)`)
+      .bind(workspaceId, principalId, nowIso())
+      .run();
+  }
+
+  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
+    try {
+      const row = await this.db
+        .prepare(`SELECT 1 AS ok FROM workspace_members WHERE workspace_id = ? AND principal_id = ? LIMIT 1`)
+        .bind(workspaceId, principalId)
+        .first<{ ok: number }>();
+      return !!row;
+    } catch {
+      return false;
+    }
+  }
+
   async assertWorkspaceOperableForMcp(
     workspaceId: string, deviceId: string, principalId: string, tenantId: string,
   ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
@@ -3803,7 +3834,7 @@ export class SqlStore implements ControlPlaneStore {
     }
     const device = await this.getDevice(deviceId);
     const role = await this.getTenantMemberRole(tenantId, principalId);
-    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin";
+    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin" || (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
     return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
   }
 

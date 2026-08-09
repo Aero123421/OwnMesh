@@ -189,6 +189,24 @@ def mcp_call(issuer: str, token: str, name: str, arguments: dict[str, object], r
     return result
 
 
+def mcp_expect_rejected(issuer: str, token: str, name: str, arguments: dict[str, object], rpc_id: int) -> dict[str, object]:
+    """Assert a pre-route MCP authorization rejection (no synthetic operation)."""
+    status, body = http_json(
+        f"{issuer}/mcp",
+        method="POST",
+        headers={"authorization": f"Bearer {token}"},
+        body={
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+    )
+    if status != 200 or not isinstance(body, dict) or not isinstance(body.get("error"), dict):
+        raise RuntimeError(f"expected pre-route rejection from {name}: HTTP={status} body={body}")
+    return body
+
+
 def structured(result: dict[str, object]) -> dict[str, object]:
     sc = result.get("structuredContent")
     if not isinstance(sc, dict):
@@ -486,6 +504,54 @@ def main() -> int:
             devices = (listed.get("data") or {}).get("devices") if isinstance(listed.get("data"), dict) else None
             if not isinstance(devices, list) or not any(d.get("id") == device_id for d in devices if isinstance(d, dict)):
                 raise RuntimeError(f"device {device_id} missing from list_devices: {listed}")
+
+            # E4 cloud custody bootstrap for the two device-local roots used by
+            # this real-path proof. MCP owns tenant/device/principal/version;
+            # ownmeshd canonicalizes and upserts the corresponding local root.
+            for rpc_id, workspace_id, workspace_path in (
+                (96, "ws_default", workspace_dir),
+                (97, "ws_alt", workspace_alt),
+            ):
+                ws_sc = structured(
+                    mcp_call(
+                        issuer,
+                        access_token,
+                        "ownmesh_workspace_add",
+                        {
+                            "device_id": device_id,
+                            "id": workspace_id,
+                            "path": str(workspace_path.resolve()),
+                            "async": True,
+                            "idempotency_key": f"idem_workspace_bootstrap_{workspace_id}_{marker}",
+                        },
+                        rpc_id=rpc_id,
+                    )
+                )
+                ws_done = wait_operation(
+                    issuer, access_token, str(ws_sc.get("operation_id") or ""), want={"completed"}
+                )
+                if workspace_id not in json.dumps(ws_done):
+                    raise RuntimeError(f"workspace custody bootstrap failed: {ws_done}")
+            # Explicit E4 collaboration grant: tenant membership alone is not a
+            # workspace grant. The second principal used for E5 handoff gets
+            # only the default-root membership, never implicit device-wide ACL.
+            subprocess.run(
+                wrangler(
+                    corepack,
+                    "d1",
+                    "execute",
+                    "DB",
+                    "--local",
+                    "--persist-to",
+                    str(persist),
+                    "--command",
+                    "INSERT OR IGNORE INTO workspace_members (workspace_id,principal_id,created_at) VALUES ('ws_default','prin_other','2026-08-08T00:00:00.000Z');",
+                ),
+                cwd=CONTROL_PLANE,
+                env=base_env,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
 
             # Direct write via public MCP → DeviceRoom → real binary runtime.
             write_sc = structured(
@@ -1014,31 +1080,21 @@ def main() -> int:
             if alt_marker not in json.dumps(alt_read_done):
                 raise RuntimeError(f"alt workspace read missed content: {alt_read_done}")
             # Unknown workspace_id fails closed.
-            bad_ws = structured(
-                mcp_call(
-                    issuer,
-                    access_token,
-                    "ownmesh_fs_list",
-                    {
-                        "device_id": device_id,
-                        "workspace_id": "ws_does_not_exist",
-                        "path": ".",
-                        "async": True,
-                        "idempotency_key": f"idem_ws_bad_{marker}",
-                    },
-                    rpc_id=36,
-                )
+            bad_ws = mcp_expect_rejected(
+                issuer,
+                access_token,
+                "ownmesh_fs_list",
+                {
+                    "device_id": device_id,
+                    "workspace_id": "ws_does_not_exist",
+                    "path": ".",
+                    "async": True,
+                    "idempotency_key": f"idem_ws_bad_{marker}",
+                },
+                rpc_id=36,
             )
-            bad_ws_op = str(bad_ws.get("operation_id") or "")
-            bad_ws_done = wait_operation(
-                issuer, access_token, bad_ws_op, want={"failed", "denied"}, timeout_s=20
-            )
-            if str(bad_ws_done.get("status")) not in {"failed", "denied"}:
-                raise RuntimeError(f"unknown workspace_id must fail closed: {bad_ws_done}")
-            if "unknown workspace" not in json.dumps(bad_ws_done).lower():
-                # Accept any fail-closed error that names the missing workspace.
-                if "ws_does_not_exist" not in json.dumps(bad_ws_done):
-                    raise RuntimeError(f"unknown workspace_id must fail closed: {bad_ws_done}")
+            if "workspace_not_available" not in json.dumps(bad_ws).lower():
+                raise RuntimeError(f"unknown workspace_id must reject before routing: {bad_ws}")
 
             # E5 session open via public MCP with a real live PTY host in ownmeshd.
             # E4: workspace_id is bound onto the session record at open.
@@ -1210,30 +1266,24 @@ def main() -> int:
                 raise RuntimeError(f"observer session.write must fail closed: {bad_write_done}")
 
             # Mismatched workspace_id on session write must fail closed.
-            bad_ws_write = structured(
-                mcp_call(
-                    issuer,
-                    access_token,
-                    "ownmesh_session_write",
-                    {
-                        "device_id": device_id,
-                        "session_id": lease_ses_id,
-                        "workspace_id": "ws_does_not_match",
-                        "data": "x",
-                        "input_seq": 1,
-                        "async": True,
-                        "idempotency_key": f"idem_ses_ws_mismatch_{marker}",
-                    },
-                    rpc_id=56,
-                )
+            bad_ws_write = mcp_expect_rejected(
+                issuer,
+                access_token,
+                "ownmesh_session_write",
+                {
+                    "device_id": device_id,
+                    "session_id": lease_ses_id,
+                    "workspace_id": "ws_does_not_match",
+                    "data": "x",
+                    "input_seq": 1,
+                    "async": True,
+                    "idempotency_key": f"idem_ses_ws_mismatch_{marker}",
+                },
+                rpc_id=56,
             )
-            bad_ws_write_op = str(bad_ws_write.get("operation_id") or "")
-            bad_ws_write_done = wait_operation(
-                issuer, access_token, bad_ws_write_op, want={"failed", "denied"}, timeout_s=20
-            )
-            if str(bad_ws_write_done.get("status")) not in {"failed", "denied"}:
+            if "workspace_not_available" not in json.dumps(bad_ws_write).lower():
                 raise RuntimeError(
-                    f"session.write workspace mismatch must fail closed: {bad_ws_write_done}"
+                    f"session.write workspace mismatch must reject before routing: {bad_ws_write}"
                 )
 
             # E4: session list/show must bind workspace — alt session is invisible under default.
@@ -1868,6 +1918,63 @@ def main() -> int:
             if ask_path.read_text(encoding="utf-8") != f"approved-{marker}":
                 raise RuntimeError(f"approved write content mismatch: {ask_path.read_text(encoding='utf-8')!r}")
 
+            # E3 ChatGPT-primary delegated policy: restart with the explicit
+            # device-owner configuration and prove the same public MCP →
+            # Worker/DO → Agent WSS → ownmeshd path executes a recommended Ask
+            # without an OwnMesh approval page. The previous exact-bound write
+            # proved non-delegated Ask/recovery; this one proves delegation is
+            # opt-in and only applies after Agent binding verification.
+            (config_dir / "policy.toml").write_text(
+                "\n".join(
+                    [
+                        "schema_version = 1",
+                        'preset = "recommended"',
+                        "delegate_remote_mcp = true",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            stop_process(daemon_process)
+            daemon_process = None
+            log_path_delegated = temp / "ownmeshd-delegated.log"
+            with log_path_delegated.open("wb") as log_delegated:
+                daemon_process = subprocess.Popen(
+                    [str(binary), "run"],
+                    cwd=ROOT,
+                    env=base_env,
+                    stdout=log_delegated,
+                    stderr=subprocess.STDOUT,
+                )
+                wait_for_ready(daemon_process, log_path_delegated)
+            delegated_name = f"delegated-{marker}.txt"
+            delegated_path = workspace_dir / delegated_name
+            delegated_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_fs_write",
+                    {
+                        "device_id": device_id,
+                        "path": delegated_name,
+                        "content": f"delegated-{marker}",
+                        "async": True,
+                        "idempotency_key": f"idem_delegated_write_{marker}",
+                    },
+                    rpc_id=95,
+                )
+            )
+            delegated_op = str(delegated_sc.get("operation_id") or "")
+            delegated_done = wait_operation(
+                issuer, access_token, delegated_op, want={"completed", "approval_required"}, timeout_s=45.0
+            )
+            if str(delegated_done.get("status")) != "completed":
+                raise RuntimeError(
+                    f"delegated recommended write must complete without OwnMesh approval: {delegated_done}"
+                )
+            if delegated_path.read_text(encoding="utf-8") != f"delegated-{marker}":
+                raise RuntimeError("delegated recommended write missing or corrupt on disk")
+
             # Restore full_user_access for any later local inspection (cleanup path).
             (config_dir / "policy.toml").write_text(
                 "\n".join(
@@ -1912,7 +2019,11 @@ def main() -> int:
                 "E2/E3 workerd loopback passed: public MCP wrote/read/ran via real ownmeshd; "
                 f"env+resume+idempotency+bound-cancel+mismatch+binary+512k-pages+list/stat/delete+"
                 f"patch+shell+workspace-select+live-pty+session-open+observer-deny-write+"
-                f"workspace-list/show+workspace-CRUD+input_seq+two-principal-handoff+required-key+session-policy-deny+ask-approve held "
+                f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
+                f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
+                f"workspace-list/show+workspace-CRUD+input_seq+two-principal-handoff+required-key+session-policy-deny+ask-approve+delegated-MCP held "
+                f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
+                f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, delegated_op={delegated_op}, chunks={chunk_i})"
                 f"(write_op={write_op}, read_op={read_op}, cmd_op={cmd_op}, long_op={long_op}, bin_op={bin_op}, "
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )

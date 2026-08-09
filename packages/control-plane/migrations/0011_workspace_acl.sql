@@ -20,3 +20,15 @@ CREATE INDEX IF NOT EXISTS idx_workspaces_tenant_device
   ON workspaces(tenant_id, device_id, active);
 CREATE INDEX IF NOT EXISTS idx_workspaces_owner
   ON workspaces(tenant_id, owner_principal_id, active);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+  workspace_id TEXT NOT NULL,
+  principal_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, principal_id),
+  FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id),
+  FOREIGN KEY (principal_id) REFERENCES principals(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_members_principal
+  ON workspace_members(principal_id, workspace_id);
