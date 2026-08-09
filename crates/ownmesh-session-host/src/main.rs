@@ -25,7 +25,7 @@ use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use ownmesh_session::{
     load_manager, save_manager, PtyCommand, PtySize, SessionError, SessionManager, SessionResult,
 };
-use ownmesh_session_host::{read_until, spawn_pty, PtySession};
+use ownmesh_session_host::{read_until, spawn_pty, PtySession, SupervisorIpcServer};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode as StdExitCode;
@@ -50,6 +50,18 @@ struct Cli {
 enum Commands {
     /// Probe local daemon connectivity and print status.
     Status,
+    /// Run the persistent local-only PTY supervisor sidecar.
+    ///
+    /// This creates no network listener: it binds only OwnMesh IPC's per-user
+    /// Unix socket or Windows named pipe endpoint.
+    Supervise {
+        /// Custody-attested owner-only sidecar state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Runtime directory used to derive the local endpoint.
+        #[arg(long)]
+        runtime_dir: PathBuf,
+    },
     /// Serve a session with a real PTY/ConPTY (or pipe fallback).
     Serve {
         /// Session id to host.
@@ -97,6 +109,10 @@ fn main() -> StdExitCode {
 fn run(cli: Cli) -> Result<(), ExitCode> {
     match cli.command.unwrap_or(Commands::Status) {
         Commands::Status => run_status(),
+        Commands::Supervise {
+            state_dir,
+            runtime_dir,
+        } => run_supervise(state_dir, runtime_dir),
         Commands::Serve {
             session_id,
             program,
@@ -118,6 +134,23 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
             stdin_line,
         ),
     }
+}
+
+fn run_supervise(state_dir: PathBuf, runtime_dir: PathBuf) -> Result<(), ExitCode> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| ExitCode::Internal)?;
+    rt.block_on(async move {
+        let (server, _) = SupervisorIpcServer::new(state_dir, runtime_dir).map_err(|err| {
+            eprintln!("session supervisor setup: {err}");
+            ExitCode::UsageConfig
+        })?;
+        server.serve().await.map_err(|err| {
+            eprintln!("session supervisor stopped: {err}");
+            ExitCode::Internal
+        })
+    })
 }
 
 fn run_status() -> Result<(), ExitCode> {

@@ -87,6 +87,22 @@ impl SupervisorIpcServer {
     pub fn credential_state_dir(&self) -> &Path {
         &self.credential_state_dir
     }
+
+    /// Serve the local endpoint and periodically apply only hard host-TTL
+    /// cleanup. Controller binding expiry is deliberately not a process kill.
+    pub async fn serve(self) -> IpcResult<()> {
+        let state = Arc::clone(&self.state);
+        let sweep = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                let _ = state.sweep_expired().await;
+            }
+        });
+        let result = self.server.serve().await;
+        sweep.abort();
+        result
+    }
 }
 
 fn supervisor_handler(state: Arc<SupervisorState>) -> MethodHandler {
