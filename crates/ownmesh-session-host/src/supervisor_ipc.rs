@@ -7,11 +7,12 @@
 
 use crate::{HostManifest, SupervisorBinding, SupervisorState};
 use ownmesh_ipc::{
-    app_error, current_os_user_id, AuthGate, BootstrapStatus, Endpoint, IpcBus, IpcError,
-    IpcResult, IpcServer, MethodHandler, ServerConfig,
+    app_error, current_os_user_id, AuthGate, BootstrapStatus, ClientIdentity, ClientOptions,
+    CredentialSecretResult, Endpoint, IpcBus, IpcClient, IpcError, IpcResult, IpcServer,
+    MethodHandler, ServerConfig,
 };
 use ownmesh_session::{PtyCommand, PtySize};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +24,125 @@ const MAX_COMMAND_ARGS: usize = 64;
 const MAX_COMMAND_ENV: usize = 64;
 const MAX_COMPONENT_BYTES: usize = 4096;
 const MAX_DRAIN_BYTES: usize = 1024 * 1024;
+
+/// Bounded PTY spawn facts supplied only by the credentialed daemon proxy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorSpawnRequest {
+    pub session_id: String,
+    pub device_id: String,
+    pub workspace_id: String,
+    pub owner_principal: String,
+    pub controller_epoch: u64,
+    pub binding_expires_unix: i64,
+    pub host_expires_unix: i64,
+    pub command: SupervisorCommand,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Serializable bounded command description for local IPC only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub env: Vec<SupervisorEnv>,
+}
+
+/// One bounded environment overlay entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorEnv {
+    pub key: String,
+    pub value: String,
+}
+
+/// Dedicated credentialed client used by exactly one `ownmeshd` instance.
+pub struct SupervisorClient {
+    client: IpcClient,
+}
+
+impl SupervisorClient {
+    /// Provision a fresh credential, revoking the previous daemon instance.
+    pub async fn bootstrap(
+        endpoint: Endpoint,
+        runtime_dir: impl Into<PathBuf>,
+        management_credential: impl Into<String>,
+    ) -> IpcResult<Self> {
+        let runtime_dir = runtime_dir.into();
+        let management = IpcClient::new(
+            endpoint.clone(),
+            runtime_dir.clone(),
+            ClientIdentity::new("ownmeshd-supervisor-bootstrap", env!("CARGO_PKG_VERSION")),
+            ClientOptions {
+                max_reconnect_attempts: 4,
+                ..ClientOptions::default()
+            },
+        )
+        .with_client_credential(management_credential);
+        let issued: CredentialSecretResult = serde_json::from_value(
+            management
+                .call(
+                    ownmesh_ipc::methods::CREDENTIAL_PROVISION,
+                    Some(json!({"client_id": SUPERVISOR_DAEMON_CLIENT_ID})),
+                )
+                .await?,
+        )?;
+        Ok(Self {
+            client: IpcClient::new(
+                endpoint,
+                runtime_dir,
+                ClientIdentity::new("ownmeshd-session-proxy", env!("CARGO_PKG_VERSION")),
+                ClientOptions {
+                    max_reconnect_attempts: 4,
+                    ..ClientOptions::default()
+                },
+            )
+            .with_client_credential(issued.credential),
+        })
+    }
+
+    pub async fn spawn(&self, request: SupervisorSpawnRequest) -> IpcResult<SupervisorBinding> {
+        Ok(serde_json::from_value(
+            self.client
+                .call(SupervisorRpcMethods::SPAWN, Some(json!(request)))
+                .await?,
+        )?)
+    }
+    pub async fn status(&self, binding: &SupervisorBinding) -> IpcResult<crate::SupervisorStatus> {
+        Ok(serde_json::from_value(
+            self.client
+                .call(SupervisorRpcMethods::STATUS, Some(json!(binding)))
+                .await?,
+        )?)
+    }
+    pub async fn write(&self, binding: &SupervisorBinding, bytes: Vec<u8>) -> IpcResult<()> {
+        self.client
+            .call(
+                SupervisorRpcMethods::WRITE,
+                Some(json!({"binding":binding,"bytes":bytes})),
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn resize(&self, binding: &SupervisorBinding, cols: u16, rows: u16) -> IpcResult<()> {
+        self.client
+            .call(
+                SupervisorRpcMethods::RESIZE,
+                Some(json!({"binding":binding,"cols":cols,"rows":rows})),
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn terminate(&self, binding: &SupervisorBinding) -> IpcResult<()> {
+        self.client
+            .call(SupervisorRpcMethods::TERMINATE, Some(json!(binding)))
+            .await?;
+        Ok(())
+    }
+}
 
 /// Local RPC method names. They are deliberately absent from public MCP.
 pub struct SupervisorRpcMethods;
@@ -126,7 +246,7 @@ async fn dispatch(
 ) -> IpcResult<Value> {
     match method {
         SupervisorRpcMethods::SPAWN => {
-            let params: SpawnParams = parse(params)?;
+            let params: SupervisorSpawnRequest = parse(params)?;
             validate_spawn(&params)?;
             let manifest = HostManifest::new(
                 params.session_id,
@@ -242,7 +362,7 @@ fn require_component(value: &str, field: &str) -> IpcResult<()> {
     }
     Ok(())
 }
-fn validate_spawn(params: &SpawnParams) -> IpcResult<()> {
+fn validate_spawn(params: &SupervisorSpawnRequest) -> IpcResult<()> {
     for (field, value) in [
         ("session_id", &params.session_id),
         ("device_id", &params.device_id),
@@ -276,29 +396,7 @@ fn validate_spawn(params: &SpawnParams) -> IpcResult<()> {
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpawnParams {
-    session_id: String,
-    device_id: String,
-    workspace_id: String,
-    owner_principal: String,
-    controller_epoch: u64,
-    binding_expires_unix: i64,
-    host_expires_unix: i64,
-    command: CommandParams,
-    cols: u16,
-    rows: u16,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CommandParams {
-    program: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-    env: Vec<EnvPair>,
-}
-impl CommandParams {
+impl SupervisorCommand {
     fn into_command(self) -> PtyCommand {
         PtyCommand {
             program: self.program,
@@ -311,12 +409,6 @@ impl CommandParams {
                 .collect(),
         }
     }
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnvPair {
-    key: String,
-    value: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

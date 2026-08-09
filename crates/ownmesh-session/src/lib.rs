@@ -216,6 +216,11 @@ pub struct SessionInfo {
     /// Host process id when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_pid: Option<u32>,
+    /// Durable exact binding for a persistent local session-host sidecar.
+    /// This contains no credential secret; the nonce is a CAS witness and is
+    /// rotated whenever controller ownership changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_host: Option<SidecarHostBinding>,
     /// Command argv snapshot for restart recovery metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
@@ -244,6 +249,19 @@ pub struct SessionInfo {
     /// Durable receipt state for `last_resize_seq`.
     #[serde(default)]
     pub last_resize_state: SeqReceiptState,
+}
+
+/// Persisted, non-secret facts needed to reattach a daemon to its local PTY
+/// sidecar after daemon/Agent restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SidecarHostBinding {
+    pub device_id: String,
+    pub workspace_id: String,
+    pub owner_principal: String,
+    pub host_nonce: String,
+    pub controller_epoch: u64,
+    pub binding_expires_unix: i64,
+    pub host_expires_unix: i64,
 }
 
 impl SessionInfo {
@@ -398,6 +416,7 @@ impl SessionManager {
             native_session_id,
             view_mode: PtyViewMode::Raw,
             host_pid: None,
+            sidecar_host: None,
             command,
             cwd,
             workspace_id,
@@ -982,6 +1001,18 @@ impl SessionManager {
     pub fn set_host_pid(&mut self, id: &str, pid: Option<u32>) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.host_pid = pid;
+        Ok(())
+    }
+
+    /// Replace the durable exact sidecar attachment facts after a successful
+    /// sidecar spawn/rotate/reclaim transaction.
+    pub fn set_sidecar_host_binding(
+        &mut self,
+        id: &str,
+        binding: Option<SidecarHostBinding>,
+    ) -> SessionResult<()> {
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        s.info.sidecar_host = binding;
         Ok(())
     }
 

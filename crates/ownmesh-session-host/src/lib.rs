@@ -26,6 +26,9 @@ pub use pty_host::{
     default_shell_command, read_until, spawn_pty, LiveHost, PtySession, LIVE_OUTPUT_RING_BYTES,
     PIPE_FALLBACK_MAX_BYTES, READ_UNTIL_MAX_BYTES,
 };
-pub use supervisor_ipc::{SupervisorIpcServer, SupervisorRpcMethods, SUPERVISOR_DAEMON_CLIENT_ID};
+pub use supervisor_ipc::{
+    SupervisorClient, SupervisorCommand, SupervisorEnv, SupervisorIpcServer, SupervisorRpcMethods,
+    SupervisorSpawnRequest, SUPERVISOR_DAEMON_CLIENT_ID,
+};
 pub use supervisor_spool::{HostManifest, OwnerSpool, SpoolPage, SUPERVISOR_SPOOL_MAX_BYTES};
 pub use supervisor_state::{SupervisorBinding, SupervisorState, SupervisorStatus};
