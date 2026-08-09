@@ -200,6 +200,32 @@ impl SupervisorClient {
                 .await?,
         )?)
     }
+    pub async fn detach(
+        &self,
+        binding: &SupervisorBinding,
+        controller_epoch: u64,
+        transition_id: String,
+    ) -> IpcResult<SupervisorBinding> {
+        Ok(serde_json::from_value(self.client.call(SupervisorRpcMethods::DETACH, Some(json!({"binding":binding,"controller_epoch":controller_epoch,"transition_id":transition_id}))).await?)?)
+    }
+    pub async fn claim(
+        &self,
+        binding: &SupervisorBinding,
+        owner_principal: String,
+        controller_epoch: u64,
+        binding_expires_unix: i64,
+        transition_id: String,
+    ) -> IpcResult<SupervisorBinding> {
+        Ok(serde_json::from_value(self.client.call(SupervisorRpcMethods::CLAIM, Some(json!({"binding":binding,"owner_principal":owner_principal,"controller_epoch":controller_epoch,"binding_expires_unix":binding_expires_unix,"transition_id":transition_id}))).await?)?)
+    }
+    pub async fn renew(
+        &self,
+        binding: &SupervisorBinding,
+        binding_expires_unix: i64,
+        transition_id: String,
+    ) -> IpcResult<SupervisorBinding> {
+        Ok(serde_json::from_value(self.client.call(SupervisorRpcMethods::RENEW, Some(json!({"binding":binding,"binding_expires_unix":binding_expires_unix,"transition_id":transition_id}))).await?)?)
+    }
     pub async fn terminate(&self, binding: &SupervisorBinding) -> IpcResult<()> {
         self.client
             .call(SupervisorRpcMethods::TERMINATE, Some(json!(binding)))
@@ -221,6 +247,9 @@ impl SupervisorRpcMethods {
     /// CAS recovery for a binding that has expired but whose PTY TTL has not.
     pub const RECLAIM: &'static str = "session_supervisor.reclaim";
     pub const ROTATE: &'static str = "session_supervisor.rotate";
+    pub const DETACH: &'static str = "session_supervisor.detach";
+    pub const CLAIM: &'static str = "session_supervisor.claim";
+    pub const RENEW: &'static str = "session_supervisor.renew";
 }
 
 /// Owns the local IPC server and state registry location.
@@ -401,12 +430,68 @@ async fn dispatch(
         SupervisorRpcMethods::RECLAIM => {
             let params: RotateParams = parse(params)?;
             require_component(&params.owner_principal, "owner_principal")?;
+            require_transition_id(&params.transition_id)?;
+            let digest = transition_digest(&params)?;
             let binding = state
-                .reclaim_expired_binding(
+                .reclaim_idempotent(
                     &params.binding,
                     params.owner_principal,
                     params.controller_epoch,
                     params.binding_expires_unix,
+                    &params.transition_id,
+                    &digest,
+                )
+                .await
+                .map_err(invalid)?;
+            Ok(json!(binding))
+        }
+        SupervisorRpcMethods::DETACH => {
+            let params: DetachParams = parse(params)?;
+            require_transition_id(&params.transition_id)?;
+            let digest = digest_value(
+                json!({"binding":params.binding,"controller_epoch":params.controller_epoch}),
+            )?;
+            let binding = state
+                .detach_idempotent(
+                    &params.binding,
+                    params.controller_epoch,
+                    &params.transition_id,
+                    &digest,
+                )
+                .await
+                .map_err(invalid)?;
+            Ok(json!(binding))
+        }
+        SupervisorRpcMethods::CLAIM => {
+            let params: RotateParams = parse(params)?;
+            require_component(&params.owner_principal, "owner_principal")?;
+            require_transition_id(&params.transition_id)?;
+            let digest = transition_digest(&params)?;
+            let binding = state
+                .claim_idempotent(
+                    &params.binding,
+                    params.owner_principal,
+                    params.controller_epoch,
+                    params.binding_expires_unix,
+                    &params.transition_id,
+                    &digest,
+                )
+                .await
+                .map_err(invalid)?;
+            Ok(json!(binding))
+        }
+        SupervisorRpcMethods::RENEW => {
+            let params: RenewParams = parse(params)?;
+            require_transition_id(&params.transition_id)?;
+            let digest = digest_value(
+                json!({"binding":params.binding,"binding_expires_unix":params.binding_expires_unix}),
+            )?;
+            let binding = state
+                .renew_idempotent(
+                    &params.binding,
+                    params.binding_expires_unix,
+                    &params.transition_id,
+                    &digest,
                 )
                 .await
                 .map_err(invalid)?;
@@ -481,13 +566,16 @@ fn require_transition_id(value: &str) -> IpcResult<()> {
 fn transition_digest(params: &RotateParams) -> IpcResult<String> {
     // Digest is derived by the authenticated sidecar from the exact parsed
     // request; callers never get to supply an idempotency payload digest.
-    let bytes = serde_json::to_vec(&json!({
+    digest_value(json!({
         "binding": params.binding,
         "owner_principal": params.owner_principal,
         "controller_epoch": params.controller_epoch,
         "binding_expires_unix": params.binding_expires_unix,
     }))
-    .map_err(|err| invalid(format!("encode supervisor transition: {err}")))?;
+}
+fn digest_value(value: Value) -> IpcResult<String> {
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|err| invalid(format!("encode supervisor transition: {err}")))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -531,6 +619,20 @@ struct RotateParams {
     binding: SupervisorBinding,
     owner_principal: String,
     controller_epoch: u64,
+    binding_expires_unix: i64,
+    transition_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DetachParams {
+    binding: SupervisorBinding,
+    controller_epoch: u64,
+    transition_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenewParams {
+    binding: SupervisorBinding,
     binding_expires_unix: i64,
     transition_id: String,
 }
