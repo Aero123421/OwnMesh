@@ -2,6 +2,7 @@
 
 use crate::{HostManifest, LiveHost, OwnerSpool, SpoolPage};
 use ownmesh_session::{PtyCommand, PtySize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::Mutex;
@@ -10,7 +11,8 @@ const MAX_STDIN_BYTES: usize = 64 * 1024;
 const MAX_HOSTS: usize = 64;
 
 /// Exact host attachment facts supplied by the authenticated daemon client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupervisorBinding {
     pub session_id: String,
     pub device_id: String,
@@ -31,7 +33,8 @@ impl SupervisorBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupervisorStatus {
     pub pid: Option<u32>,
     pub pending_output_bytes: usize,

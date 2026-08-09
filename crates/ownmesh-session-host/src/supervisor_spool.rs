@@ -77,7 +77,8 @@ impl HostManifest {
 }
 
 /// A bounded spool page. Offsets are absolute, never compacted physical bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpoolPage {
     pub bytes: Vec<u8>,
     pub next_offset: Option<u64>,

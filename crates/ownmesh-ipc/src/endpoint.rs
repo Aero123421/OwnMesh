@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub enum IpcBus {
     /// User-level `ownmeshd` bus used by CLI/TUI/session-host.
     Daemon,
+    /// Persistent unprivileged PTY session supervisor; local IPC only.
+    SessionSupervisor,
     /// Privileged broker bus (separate endpoint; not opened by default here).
     Privileged,
 }
@@ -18,6 +20,7 @@ impl IpcBus {
     pub const fn suffix(self) -> &'static str {
         match self {
             Self::Daemon => "daemon",
+            Self::SessionSupervisor => "session-supervisor",
             Self::Privileged => "privileged",
         }
     }
