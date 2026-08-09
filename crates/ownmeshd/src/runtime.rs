@@ -2619,7 +2619,7 @@ full_user_access/full_access for arbitrary commands",
     /// replacement PTY. A missing active host is an explicit conflict; an
     /// expired controller binding is deliberately left for exact reclaim so
     /// expiry never kills a still-valid host TTL.
-    async fn reattach_persistent_sidecars(&self) -> IpcResult<()> {
+    async fn reattach_persistent_sidecars(&mut self) -> IpcResult<()> {
         const MAX_REATTACH: usize = 64;
         let now = Self::now();
         let bindings: Vec<_> = self
@@ -2634,26 +2634,39 @@ full_user_access/full_access for arbitrary commands",
                 message: "persistent sidecar reattach quota exceeded".into(),
             });
         }
-        let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
-            code: app_error::CONFLICT,
-            message: "sidecar unavailable during reattach".into(),
-        })?;
-        for (session_id, binding) in bindings {
-            if binding.binding_expires_unix <= now {
-                continue;
+        let mut recovered_pids = Vec::new();
+        {
+            let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "sidecar unavailable during reattach".into(),
+            })?;
+            for (session_id, binding) in bindings {
+                if binding.binding_expires_unix <= now {
+                    continue;
+                }
+                let exact = supervisor_binding_from(&session_id, &binding);
+                let status = proxy
+                    .status(&exact)
+                    .await
+                    .map_err(|error| IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "persistent session {session_id} cannot reattach without respawn: {error}"
+                        ),
+                    })?;
+                recovered_pids.push((session_id, status.pid));
             }
-            let exact = supervisor_binding_from(&session_id, &binding);
-            proxy
-                .status(&exact)
-                .await
-                .map_err(|error| IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!(
-                        "persistent session {session_id} cannot reattach without respawn: {error}"
-                    ),
-                })?;
         }
-        Ok(())
+        if recovered_pids.is_empty() {
+            return Ok(());
+        }
+        let snapshot = self.sessions.clone();
+        for (session_id, pid) in recovered_pids {
+            self.sessions
+                .set_host_pid(&session_id, pid)
+                .map_err(session_err)?;
+        }
+        self.commit_sessions(snapshot)
     }
 
     async fn recover_sidecar_transitions(&mut self) -> IpcResult<()> {

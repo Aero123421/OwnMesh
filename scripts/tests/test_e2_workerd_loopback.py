@@ -144,6 +144,69 @@ def stop_process(process: subprocess.Popen[bytes] | None) -> None:
         process.wait(timeout=8)
 
 
+def stop_daemon_only(process: subprocess.Popen[bytes] | None) -> None:
+    """Stop ownmeshd without recursively killing its detached session sidecar."""
+    if process is None or process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=8)
+
+
+def stop_session_sidecars(state_dir: Path) -> None:
+    """Best-effort explicit cleanup of only this test's uniquely-rooted sidecar."""
+    needle = str(state_dir / "session-supervisor")
+    pids: list[int] = []
+    if os.name == "nt":
+        query = (
+            "$p=Get-CimInstance Win32_Process | Where-Object { "
+            "$_.Name -eq 'ownmesh-session-host.exe' -and $_.CommandLine -like '*"
+            + needle.replace("'", "''")
+            + "*' }; $p | ForEach-Object { $_.ProcessId }"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", query],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        pids = [int(line) for line in result.stdout.splitlines() if line.strip().isdigit()]
+    else:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) == 2 and "ownmesh-session-host" in parts[1] and needle in parts[1]:
+                pids.append(int(parts[0]))
+    for pid in pids:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        else:
+            subprocess.run(["kill", "-TERM", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def start_daemon(binary: Path, env: dict[str, str], log_path: Path) -> subprocess.Popen[bytes]:
+    with log_path.open("wb") as log:
+        return subprocess.Popen([str(binary), "run"], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+
+
 def http_json(url: str, *, method: str = "GET", headers: dict[str, str] | None = None, body: object | None = None) -> tuple[int, object]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
@@ -212,6 +275,32 @@ def structured(result: dict[str, object]) -> dict[str, object]:
     if not isinstance(sc, dict):
         raise RuntimeError(f"missing structuredContent: {result}")
     return sc
+
+
+def find_value(value: object, key: str) -> object | None:
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        for child in value.values():
+            found = find_value(child, key)
+            if found is not None:
+                return found
+    if isinstance(value, list):
+        for child in value:
+            found = find_value(child, key)
+            if found is not None:
+                return found
+    return None
+
+
+def sidecar_bytes(value: object) -> bytes:
+    encoded = find_value(value, "sidecar_bytes_base64")
+    if not isinstance(encoded, str):
+        return b""
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise RuntimeError(f"invalid sidecar replay base64: {error}") from error
 
 
 def wait_operation(issuer: str, token: str, operation_id: str, *, want: set[str], timeout_s: float = 30.0) -> dict[str, object]:
@@ -358,6 +447,11 @@ def main() -> int:
                 cwd=ROOT,
                 env=base_env,
             )
+            run_checked(
+                [cargo, "build", "-p", "ownmesh-session-host", "--bin", "ownmesh-session-host"],
+                cwd=ROOT,
+                env=base_env,
+            )
             public_key = run_checked(
                 [cargo, "run", "-q", "-p", "ownmeshd", "--example", "e1_loopback_provision", "--", "provision"],
                 cwd=ROOT,
@@ -479,15 +573,8 @@ def main() -> int:
 
             binary = ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
             log_path = temp / "ownmeshd-0.log"
-            with log_path.open("wb") as log:
-                daemon_process = subprocess.Popen(
-                    [str(binary), "run"],
-                    cwd=ROOT,
-                    env=base_env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                )
-                state0 = wait_for_ready(daemon_process, log_path)
+            daemon_process = start_daemon(binary, base_env, log_path)
+            state0 = wait_for_ready(daemon_process, log_path)
 
             # Discovery through public MCP (control-plane local).
             listed = structured(
@@ -1162,7 +1249,7 @@ def main() -> int:
             # E5: replay must surface real process output from the live PTY host.
             import time as _time
             live_marker = f"E5_LIVE_PTY_{marker}"
-            saw_live = live_marker in ses_dump
+            saw_live = live_marker in ses_dump or live_marker.encode() in sidecar_bytes(ses_done)
             if not saw_live:
                 for attempt in range(12):
                     rep_sc = structured(
@@ -1183,7 +1270,7 @@ def main() -> int:
                     )
                     rep_op = str(rep_sc.get("operation_id") or "")
                     rep_done = wait_operation(issuer, access_token, rep_op, want={"completed"})
-                    if live_marker in json.dumps(rep_done):
+                    if live_marker in json.dumps(rep_done) or live_marker.encode() in sidecar_bytes(rep_done):
                         saw_live = True
                         break
                     _time.sleep(0.25)
@@ -1237,7 +1324,7 @@ def main() -> int:
                 issuer, access_token_other, str(other_rep_sc.get("operation_id") or ""), want={"completed"}
             )
             other_rep_dump = json.dumps(other_rep_done)
-            if live_marker not in other_rep_dump:
+            if live_marker not in other_rep_dump and live_marker.encode() not in sidecar_bytes(other_rep_done):
                 raise RuntimeError(f"observer replay must expose live process output: {other_rep_done}")
 
             # Second session for observer lease checks (interactive shell).
@@ -1476,6 +1563,8 @@ def main() -> int:
             if str(gap_done.get("status")) not in {"failed", "denied"}:
                 raise RuntimeError(f"input_seq gap must fail closed: {gap_done}")
 
+            restart_marker = f"E5_RESTART_CONTINUITY_{marker}"
+            restart_command = f"echo {restart_marker}\n"
             w1_sc = structured(
                 mcp_call(
                     issuer,
@@ -1485,7 +1574,7 @@ def main() -> int:
                         "device_id": device_id,
                         "session_id": seq_ses_id,
                         "workspace_id": "ws_default",
-                        "data": "first\n",
+                        "data": restart_command,
                         "input_seq": 1,
                         "lease_id": seq_lease_id,
                         "controller_epoch": seq_controller_epoch,
@@ -1500,6 +1589,106 @@ def main() -> int:
             )
             if "accepted" not in json.dumps(w1_done).lower() and str(w1_done.get("status")) != "completed":
                 raise RuntimeError(f"input_seq=1 write must complete: {w1_done}")
+
+            # E5 persistent-supervisor acceptance: kill only ownmeshd/Agent,
+            # leaving the detached sidecar and its PTY alive. A fresh Agent
+            # connection must reattach the same host without spawning another.
+            show_before_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_show",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_restart_show_before_{marker}",
+                    },
+                    rpc_id=620,
+                )
+            )
+            show_before = wait_operation(
+                issuer, access_token, str(show_before_sc.get("operation_id") or ""), want={"completed"}
+            )
+            before_pid = find_value(show_before, "host_pid")
+            if not isinstance(before_pid, int) or before_pid <= 0:
+                raise RuntimeError(f"persistent session must expose host_pid before daemon restart: {show_before}")
+
+            stop_daemon_only(daemon_process)
+            log_path = temp / "ownmeshd-restart.log"
+            daemon_process = start_daemon(binary, base_env, log_path)
+            wait_for_ready(daemon_process, log_path)
+
+            show_after_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_show",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_restart_show_after_{marker}",
+                    },
+                    rpc_id=621,
+                )
+            )
+            show_after = wait_operation(
+                issuer, access_token, str(show_after_sc.get("operation_id") or ""), want={"completed"}, timeout_s=45.0
+            )
+            restart_replay_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_replay",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "from_seq": 1,
+                        "sidecar_cursor": 0,
+                        "max_bytes": 1024,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_restart_replay_{marker}",
+                    },
+                    rpc_id=622,
+                )
+            )
+            restart_replay = wait_operation(
+                issuer, access_token, str(restart_replay_sc.get("operation_id") or ""), want={"completed"}, timeout_s=45.0
+            )
+            if restart_marker.encode() not in sidecar_bytes(restart_replay):
+                raise RuntimeError(
+                    f"sidecar cursor replay must retain pre-restart PTY output: {restart_replay}"
+                )
+            # The replay above lazy-bootstraps the supervisor and reattaches its
+            # exact host binding. Verify the reattached status is now durable
+            # and reports the same process, not a replacement PTY.
+            show_reattached_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_show",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_restart_show_reattached_{marker}",
+                    },
+                    rpc_id=623,
+                )
+            )
+            show_reattached = wait_operation(
+                issuer, access_token, str(show_reattached_sc.get("operation_id") or ""), want={"completed"}
+            )
+            after_pid = find_value(show_reattached, "host_pid")
+            if after_pid != before_pid:
+                raise RuntimeError(
+                    f"sidecar reattach must retain the exact PTY PID across daemon restart: before={before_pid} after={after_pid}"
+                )
 
             # Stale replay of seq=1 must fail (outer idempotency key differs).
             stale_sc = structured(
@@ -2315,6 +2504,7 @@ def main() -> int:
             return 0
         finally:
             stop_process(daemon_process)
+            stop_session_sidecars(state_dir)
             stop_process(wrangler_process)
             cleanup_env = base_env.copy()
             cleanup_env.pop("OWNMESH_E1_TEST_CREDENTIAL", None)

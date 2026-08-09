@@ -76,6 +76,18 @@ def main() -> int:
     # binary x workerd proof script that this gate invokes. Do not paper over.
     # Partial means production path evidence exists but the full acceptance
     # definition for that letter is not yet complete.
+    proven_complete = {
+        "E4": (
+            "workspace CRUD/enforcement + handle-rooted custody on the real "
+            "public MCP/workerd/Agent/ownmeshd route"
+        ),
+        "E5": (
+            "persistent sidecar PTY with exact controller leases, raw bounded "
+            "cursor replay for multiple workspace-granted observers, daemon/Agent "
+            "restart reattach retaining the same PTY PID and output, handoff/detach/"
+            "expiry reclaim, and stale token/nonce mutation denial"
+        ),
+    }
     proven_partial = {
         "E2": (
             "public MCP fs list/stat/read/write/patch/delete + structured command "
@@ -88,23 +100,6 @@ def main() -> int:
             "remote operation_id; browser /approve recovery executes deferred side effect "
             "exactly once via device approval resolution; tenant_members handoff "
             "(partial - team admin UI still out of scope)"
-        ),
-        "E4": (
-            "device workspaces.json + workspace_id selection + handle/hardlink "
-            "custody; handle-held dir list (rename-to-symlink fail-closed); "
-            "component-wise parent create with held-handle rename; "
-            "session.open/list/show workspace bind+filter; directory full "
-            "snapshot-then-sort cursors + v2 spool root/recursive bind + pre-append "
-            "byte budget; restricted command.run/session.open fail-closed; "
-            "CLI+MCP workspace CRUD (device-local registry)"
-        ),
-        "E5": (
-            "remote session.open owns live PTY/ConPTY in ownmeshd (full_user/full_access); "
-            "public MCP replay surfaces real process output; attach(observer demote)/write-deny "
-            "+ workspace bind; input_seq/resize_seq reserve-before-write with payload digest; "
-            "RetryPending at-most-once (no PTY re-delivery); process-tree terminate; "
-            "resize fail-closed without live host; live-ring remaining/continuation; "
-            "two-principal give handoff; controller lease reconnect matrix still partial"
         ),
         "E6": (
             "device profile.list/show/scan PATH detection for nine official ids; "
@@ -122,16 +117,16 @@ def main() -> int:
         ("E8", "networkless elevated broker Full Access mint/custody"),
         ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
     )
-    # E4/E5/E6/E7 remain incomplete acceptance even with partial proof.
+    # E4/E5 have real workerd acceptance; E6-E9 remain incomplete.
     incomplete_acceptance = (
-        ("E4", "full custody matrix promotion beyond handle-held list + device-local CRUD"),
-        ("E5", "controller lease reconnect/handoff + multi-observer replay matrix"),
         ("E6", "nine structured adapters + native resume/events beyond PATH detect + PTY fallback"),
         ("E7", "full Git review workflow (tests/diff pages) beyond single-file unified apply"),
         *still_open,
     )
 
     print("Acceptance matrix:")
+    for key, detail in sorted(proven_complete.items()):
+        print(f"  [PROVEN]  {key}: {detail}")
     for key, detail in sorted(proven_partial.items()):
         print(f"  [partial] {key}: {detail}")
     for key, detail in still_open:
@@ -145,13 +140,13 @@ def main() -> int:
 
     if incomplete_acceptance:
         print(
-            "E2-E9 workerd gate RED: E4-E9 real binary x local Wrangler/workerd "
+            "E2-E9 workerd gate RED: E6-E9 real binary x local Wrangler/workerd "
             "acceptance is not yet complete (partial rows are not completion). "
             "Refusing exit 0 so incomplete work cannot look green.",
             file=sys.stderr,
         )
         print(
-            "v1.2 E2-E9 workerd loopback entrypoint: E2/E3/E4/E5/E6/E7 partial; "
+            "v1.2 E2-E9 workerd loopback entrypoint: E2-E5 proven; E6/E7 partial; "
             "E8/E9 OPEN; gate fail-closed"
         )
         return 2

@@ -530,7 +530,21 @@ impl SessionManager {
         now: i64,
     ) -> SessionResult<()> {
         self.authorize_controller_lease(id, principal, lease_id, epoch, now)?;
-        self.release_controller(id, principal, now)
+        // Detach invalidates the exact controller generation just as the
+        // persistent sidecar rotates its nonce. Keep the durable manager epoch
+        // in lockstep so a later claim/detach cannot reuse sidecar epoch facts.
+        let next_epoch = self
+            .sessions
+            .get(id)
+            .ok_or(SessionError::NotFound)?
+            .info
+            .controller_epoch
+            .checked_add(1)
+            .ok_or_else(|| SessionError::Invalid("controller epoch exhausted".into()))?;
+        self.release_controller(id, principal, now)?;
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        s.info.controller_epoch = next_epoch;
+        Ok(())
     }
 
     /// Attach as observer (no stdin). `now_unix` is part of the uniform ACL surface.
