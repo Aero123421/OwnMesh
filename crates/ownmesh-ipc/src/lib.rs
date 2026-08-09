@@ -61,6 +61,8 @@ pub use rpc::{
     JSONRPC_VERSION,
 };
 pub use server::{reject_unknown_handler, IpcServer, MethodHandler, RevokedClients, ServerConfig};
+#[cfg(windows)]
+pub use transport::WindowsPipePeerFacts;
 pub use transport::{connect, ClientConnection, LocalListener, ServerConnection};
 
 /// Stable crate name used by diagnostics and tests.
