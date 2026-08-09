@@ -8,19 +8,26 @@ not invent a command line or protocol request for it.
 ## Common safety boundary
 
 Every adapter uses an argv vector (never a shell), a bounded byte parser, and
-an explicit transport.  Structured adapters are not silently changed into a
-network listener: their only transport is the child process's stdio, except
-OpenCode's documented local HTTP server mode.  Authentication probes may use
+an explicit transport. Structured adapters are not silently changed into a
+network listener: their transport is the child process's stdio. Authentication probes may use
 only the documented read-only status/version command; credential files,
 environment values, and command output are never copied to audit or cloud
 records.
 
+The structured ACP adapters use the stable v1 schema at
+https://agentclientprotocol.com/protocol/v1/schema: `initialize` sends
+`protocolVersion: 1`, explicit non-escalating client capabilities and bounded
+client info; the peer must return `protocolVersion: 1` and an
+`agentCapabilities` object. `session/new` and `session/load` include the
+absolute workspace `cwd` and `mcpServers: []`; native load is enabled only by
+`agentCapabilities.loadSession: true`.
+
 | Profile | Official primary source | Verified contract | Resume contract OwnMesh may use |
 |---|---|---|---|
-| Codex | https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md | `codex app-server` uses JSON-RPC 2.0 over default stdio JSONL; `initialize`, `thread/start`, `thread/resume`, and event notifications are documented. | `thread/resume` after initialize |
+| Codex | https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md | `codex app-server` uses JSON-RPC semantics over default stdio JSONL **without** the `jsonrpc` wire member; after a successful `initialize`, emit `initialized`, then `thread/start` or `thread/resume`, then `turn/start`. | `thread/resume` after initialize |
 | Claude Code | https://docs.anthropic.com/en/docs/claude-code/cli-usage | `claude -p`, `--output-format stream-json`, and `--resume <id>` are documented. | `--resume <native-id>` |
 | Kimi Code | https://github.com/MoonshotAI/kimi-code/blob/main/docs/en/reference/kimi-command.md | `kimi acp` is stdio JSON-RPC ACP; `--prompt ... --output-format stream-json` and `--session` are documented. | `--session <native-id>`; ACP load remains capability-negotiated rather than assumed |
-| OpenCode | https://dev.opencode.ai/docs/cli/ and https://dev.opencode.ai/docs/server/ | `opencode run`, `opencode serve`, and session management are documented. `serve` is an HTTP server. | no CLI resume argv asserted; use documented server/session API only if negotiated, otherwise degraded/PTy |
+| OpenCode | https://opencode.ai/docs/cli/ | `opencode acp` is the structured stdin/stdout nd-JSON surface. The sidecar never starts `serve` or an inbound listener. | ACP `session/load` only when `agentCapabilities.loadSession` is advertised; otherwise explicit degraded/PTy |
 | Pi | https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/README.md | `pi --mode rpc` is strict LF-delimited JSONL, not generic Unicode line splitting. | degraded/PTy: no resume argv or RPC method is asserted from the cited README |
 | Antigravity (`agy`) | https://github.com/google-gemini/gemini-cli/discussions/27274 | current first-party transition notice confirms `agy` and headless output choices, including `stream-json`; the exact session-resume wire surface is not asserted. | degraded/PTy unless the discovered CLI advertises a safe resume surface |
 | Qwen Code | https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/settings.md and https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/commands.md | `--acp`, `--output-format stream-json`, and `qwen sessions list --json` are documented. | ACP load/resume only after capability advertisement; otherwise explicit degraded |

@@ -6,6 +6,7 @@
 
 use ownmesh_profiles::AdapterDialect;
 use serde_json::{json, Value};
+use std::path::Path;
 
 pub const MAX_STRUCTURED_FRAME_BYTES: usize = 64 * 1024;
 
@@ -29,6 +30,7 @@ enum DriverPhase {
 pub struct StructuredAdapterDriver {
     prompt: String,
     native_session_id: Option<String>,
+    cwd: String,
     phase: DriverPhase,
     thread_or_session_id: Option<String>,
 }
@@ -38,6 +40,7 @@ impl StructuredAdapterDriver {
         dialect: AdapterDialect,
         prompt: Option<&str>,
         native_session_id: Option<&str>,
+        cwd: &str,
     ) -> Result<Self, String> {
         let prompt = prompt.unwrap_or_default();
         if prompt.len() > MAX_STRUCTURED_FRAME_BYTES / 2 || prompt.contains('\0') {
@@ -48,23 +51,25 @@ impl StructuredAdapterDriver {
         }) {
             return Err("invalid structured adapter native session id".into());
         }
+        if !Path::new(cwd).is_absolute() {
+            return Err("ACP structured adapter requires an absolute cwd".into());
+        }
         let phase = match dialect {
             AdapterDialect::CodexAppServer => DriverPhase::CodexAwaitInitialize,
             AdapterDialect::PiRpc => DriverPhase::PiPrompted,
             AdapterDialect::KimiAcp
+            | AdapterDialect::OpenCodeServer
             | AdapterDialect::QwenAcp
             | AdapterDialect::HermesAcp
             | AdapterDialect::QoderAcp => DriverPhase::AcpAwaitInitialize,
             // These profiles receive their documented prompt as one argv item;
             // their stdout still travels through the structured pipe/spool.
             AdapterDialect::ClaudeStreamJson | AdapterDialect::AgyStreamJson => DriverPhase::ArgvOnly,
-            // OpenCode's documented API is local HTTP.  The sidecar does not
-            // create listeners, so it remains explicitly unavailable here.
-            AdapterDialect::OpenCodeServer => return Err("OpenCode local HTTP driver is not enabled".into()),
         };
         Ok(Self {
             prompt: prompt.into(),
             native_session_id: native_session_id.map(str::to_owned),
+            cwd: cwd.into(),
             phase,
             thread_or_session_id: None,
         })
@@ -78,16 +83,24 @@ impl StructuredAdapterDriver {
             DriverPhase::PiPrompted => Ok(vec![frame(json!({
                 "id": "ownmesh-prompt-1", "type": "prompt", "message": self.prompt,
             }))?]),
+            // App-server uses JSON-RPC semantics but explicitly omits the
+            // `jsonrpc` member on its stdio JSONL wire format.
             DriverPhase::CodexAwaitInitialize => Ok(vec![
                 frame(json!({
-                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "id": 1, "method": "initialize",
                     "params": {"clientInfo": {"name": "ownmesh", "version": "1.2"}},
                 }))?,
-                frame(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}))?,
             ]),
             DriverPhase::AcpAwaitInitialize => Ok(vec![frame(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {"clientInfo": {"name": "ownmesh", "version": "1.2"}},
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": false, "writeTextFile": false},
+                        "terminal": false,
+                    },
+                    "clientInfo": {"name": "ownmesh", "version": "1.2"},
+                },
             }))?]),
             _ => Err("structured adapter bootstrap already started".into()),
         }
@@ -102,19 +115,29 @@ impl StructuredAdapterDriver {
         }
         let value: Value = serde_json::from_slice(&record[..record.len() - 1])
             .map_err(|_| "malformed structured adapter JSON record")?;
+        if value.get("error").is_some() {
+            return Err("structured adapter returned a JSON-RPC error".into());
+        }
         if let Some(method) = value.get("method").and_then(Value::as_str) {
-            if method.contains("permission") || method.contains("approval") {
+            if method.contains("permission") || method.contains("approval")
+                || method.starts_with("fs/") || method.starts_with("terminal/")
+                || method.contains("tool")
+            {
                 return Err("structured adapter requested unapproved permission".into());
             }
         }
         match self.phase {
             DriverPhase::CodexAwaitInitialize if response_id(&value) == Some(1) => {
+                require_result_object(&value, "Codex initialize")?;
                 self.phase = DriverPhase::CodexAwaitThread;
                 let request = match &self.native_session_id {
-                    Some(id) => json!({"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{"threadId":id}}),
-                    None => json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}),
+                    Some(id) => json!({"id":2,"method":"thread/resume","params":{"threadId":id}}),
+                    None => json!({"id":2,"method":"thread/start","params":{}}),
                 };
-                Ok(vec![frame(request)?])
+                Ok(vec![
+                    frame(json!({"method":"initialized","params":{}}))?,
+                    frame(request)?,
+                ])
             }
             DriverPhase::CodexAwaitThread if response_id(&value) == Some(2) => {
                 let id = extract_id(&value, &["thread", "id"])
@@ -123,19 +146,32 @@ impl StructuredAdapterDriver {
                 self.thread_or_session_id = Some(id.clone());
                 self.phase = DriverPhase::CodexAwaitTurn;
                 Ok(vec![frame(json!({
-                    "jsonrpc":"2.0", "id":3, "method":"turn/start",
+                    "id":3, "method":"turn/start",
                     "params":{"threadId":id, "input":[{"type":"text","text":self.prompt}]},
                 }))?])
             }
             DriverPhase::CodexAwaitTurn | DriverPhase::AcpAwaitPrompt
                 if response_id(&value) == Some(3) =>
             {
+                if matches!(self.phase, DriverPhase::CodexAwaitTurn) {
+                    require_result_object(&value, "Codex turn/start")?;
+                } else if value.get("result").and_then(|r| r.get("stopReason")).and_then(Value::as_str).is_none() {
+                    return Err("ACP session/prompt response omitted stopReason".into());
+                }
                 self.phase = DriverPhase::Complete;
                 Ok(vec![])
             }
             DriverPhase::AcpAwaitInitialize if response_id(&value) == Some(1) => {
+                let result = require_result_object(&value, "ACP initialize")?;
+                if result.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+                    return Err("ACP peer did not negotiate protocolVersion 1".into());
+                }
+                let capabilities = result
+                    .get("agentCapabilities")
+                    .and_then(Value::as_object)
+                    .ok_or("ACP initialize response omitted agentCapabilities")?;
                 let method = if self.native_session_id.is_some() {
-                    if !acp_supports_load(&value) {
+                    if capabilities.get("loadSession").and_then(Value::as_bool) != Some(true) {
                         return Err("ACP peer did not negotiate session/load".into());
                     }
                     "session/load"
@@ -144,15 +180,19 @@ impl StructuredAdapterDriver {
                 };
                 self.phase = DriverPhase::AcpAwaitSession;
                 let params = match &self.native_session_id {
-                    Some(id) => json!({"sessionId":id}),
-                    None => json!({}),
+                    Some(id) => json!({"sessionId":id, "cwd": self.cwd, "mcpServers": []}),
+                    None => json!({"cwd": self.cwd, "mcpServers": []}),
                 };
                 Ok(vec![frame(json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}))?])
             }
             DriverPhase::AcpAwaitSession if response_id(&value) == Some(2) => {
-                let id = extract_string(&value, "sessionId")
-                    .or_else(|| extract_id(&value, &["session", "id"]))
-                    .ok_or("ACP session response omitted session id")?;
+                let id = if self.native_session_id.is_some() {
+                    require_result_object(&value, "ACP session/load")?;
+                    self.native_session_id.clone().ok_or("ACP native session id disappeared")?
+                } else {
+                    extract_string(&value, "sessionId")
+                        .ok_or("ACP session/new response omitted sessionId")?
+                };
                 self.thread_or_session_id = Some(id.clone());
                 self.phase = DriverPhase::AcpAwaitPrompt;
                 Ok(vec![frame(json!({
@@ -202,15 +242,11 @@ fn extract_id(value: &Value, path: &[&str]) -> Option<String> {
     current.as_str().map(str::to_owned)
 }
 
-fn acp_supports_load(value: &Value) -> bool {
+fn require_result_object<'a>(value: &'a Value, what: &str) -> Result<&'a serde_json::Map<String, Value>, String> {
     value
         .get("result")
-        .and_then(|result| result.get("capabilities"))
         .and_then(Value::as_object)
-        .is_some_and(|caps| {
-            caps.get("session/load").and_then(Value::as_bool) == Some(true)
-                || caps.get("loadSession").and_then(Value::as_bool) == Some(true)
-        })
+        .ok_or_else(|| format!("{what} response omitted object result"))
 }
 
 #[cfg(test)]
@@ -219,27 +255,57 @@ mod tests {
 
     #[test]
     fn pi_uses_documented_strict_lf_prompt_frame() {
-        let driver = StructuredAdapterDriver::new(AdapterDialect::PiRpc, Some("hello"), None).unwrap();
+        let driver = StructuredAdapterDriver::new(AdapterDialect::PiRpc, Some("hello"), None, &cwd()).unwrap();
         assert_eq!(driver.start().unwrap(), vec![b"{\"id\":\"ownmesh-prompt-1\",\"message\":\"hello\",\"type\":\"prompt\"}\n"]);
         assert!(driver.is_complete());
     }
 
     #[test]
     fn codex_waits_for_thread_id_before_turn() {
-        let mut driver = StructuredAdapterDriver::new(AdapterDialect::CodexAppServer, Some("ship it"), None).unwrap();
-        assert_eq!(driver.start().unwrap().len(), 2);
-        let thread = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n").unwrap();
-        assert!(String::from_utf8_lossy(&thread[0]).contains("thread/start"));
-        let turn = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n").unwrap();
+        let mut driver = StructuredAdapterDriver::new(AdapterDialect::CodexAppServer, Some("ship it"), None, &cwd()).unwrap();
+        let initial = driver.start().unwrap();
+        assert_eq!(initial.len(), 1);
+        assert!(!String::from_utf8_lossy(&initial[0]).contains("jsonrpc"));
+        let thread = driver.on_record(b"{\"id\":1,\"result\":{}}\n").unwrap();
+        assert!(String::from_utf8_lossy(&thread[0]).contains("initialized"));
+        assert!(String::from_utf8_lossy(&thread[1]).contains("thread/start"));
+        let turn = driver.on_record(b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n").unwrap();
         assert!(String::from_utf8_lossy(&turn[0]).contains("turn/start"));
         assert_eq!(driver.native_session_id(), Some("thr_1"));
     }
 
     #[test]
     fn acp_resume_is_capability_gated_and_permissions_fail_closed() {
-        let mut driver = StructuredAdapterDriver::new(AdapterDialect::KimiAcp, Some("hello"), Some("native_1")).unwrap();
+        let mut driver = StructuredAdapterDriver::new(AdapterDialect::KimiAcp, Some("hello"), Some("native_1"), &cwd()).unwrap();
         driver.start().unwrap();
-        assert!(driver.on_record(b"{\"id\":1,\"result\":{\"capabilities\":{}}}\n").is_err());
+        assert!(driver.on_record(b"{\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{}}}\n").is_err());
         assert!(driver.on_record(b"{\"method\":\"session/request_permission\",\"params\":{}}\n").is_err());
     }
+
+    #[test]
+    fn acp_v1_requests_required_session_facts_and_validates_result_shape() {
+        let mut driver = StructuredAdapterDriver::new(AdapterDialect::OpenCodeServer, Some("hello"), None, &cwd()).unwrap();
+        let mut initial = driver.start().unwrap();
+        let init = String::from_utf8(initial.remove(0)).unwrap();
+        assert!(init.contains("\"jsonrpc\":\"2.0\""));
+        assert!(init.contains("\"protocolVersion\":1"));
+        assert!(init.contains("\"clientCapabilities\""));
+        assert!(driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n").unwrap().is_empty());
+        let mut new = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false}}}\n").unwrap();
+        let new = String::from_utf8(new.remove(0)).unwrap();
+        assert!(new.contains("\"session/new\""));
+        assert!(new.contains("\"cwd\""));
+        assert!(new.contains("\"mcpServers\":[]"));
+        assert!(driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n").is_err());
+    }
+
+    #[test]
+    fn correlated_errors_fail_closed_without_state_advance() {
+        let mut driver = StructuredAdapterDriver::new(AdapterDialect::CodexAppServer, Some("hello"), None, &cwd()).unwrap();
+        driver.start().unwrap();
+        assert!(driver.on_record(b"{\"id\":1,\"error\":{\"code\":-1,\"message\":\"no\"}}\n").is_err());
+        assert!(!driver.is_complete());
+    }
+
+    fn cwd() -> String { std::env::current_dir().unwrap().to_string_lossy().into_owned() }
 }

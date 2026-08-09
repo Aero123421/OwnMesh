@@ -175,7 +175,7 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
         AgyStreamJson, ClaudeStreamJson, CodexAppServer, HermesAcp, KimiAcp, OpenCodeServer,
         PiRpc, QoderAcp, QwenAcp,
     };
-    use AdapterTransport::{LocalHttp, StdioJsonl, StdioJsonRpc};
+    use AdapterTransport::{StdioJsonl, StdioJsonRpc};
 
     vec![
         AdapterSpec {
@@ -221,15 +221,15 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
         },
         AdapterSpec {
             profile_id: "opencode".into(),
-            transport: LocalHttp,
+            transport: StdioJsonRpc,
             dialect: OpenCodeServer,
-            start_args: vec!["serve".into()],
+            start_args: vec!["acp".into()],
             resume: NativeResume::Negotiated {
-                method: "session/get".into(),
+                method: "session/load".into(),
             },
             auth_probe: None,
             structured_events: true,
-            safe_capabilities: vec!["local_server".into(), "session_api".into()],
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
         },
         AdapterSpec {
             profile_id: "pi".into(),
@@ -552,7 +552,7 @@ pub fn official_profiles() -> Vec<Profile> {
             display_name: "OpenCode".into(),
             binaries: vec!["opencode".into()],
             interface_order: vec![
-                InterfacePreference::Http,
+                InterfacePreference::Acp,
                 InterfacePreference::Jsonl,
                 InterfacePreference::Pty,
             ],
@@ -561,10 +561,10 @@ pub fn official_profiles() -> Vec<Profile> {
             auth_status_args: vec![],
             supports_native_resume: false,
             supports_structured: true,
-            supports_acp: false,
+            supports_acp: true,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
-            structured_start_args: vec!["serve".into()],
+            structured_start_args: vec!["acp".into()],
             resume_args: vec![],
             official: true,
         },

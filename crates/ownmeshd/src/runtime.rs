@@ -703,8 +703,9 @@ impl DaemonRuntime {
         dialect: AdapterDialect,
         prompt: Option<&str>,
         native_session_id: Option<&str>,
+        cwd: &str,
     ) -> IpcResult<Option<String>> {
-        let mut driver = StructuredAdapterDriver::new(dialect, prompt, native_session_id)
+        let mut driver = StructuredAdapterDriver::new(dialect, prompt, native_session_id, cwd)
             .map_err(|message| IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
                 message,
@@ -3162,12 +3163,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 });
             }
             if !plan.use_pty {
-                if matches!(spec.dialect, AdapterDialect::OpenCodeServer) {
-                    return Err(IpcError::Remote {
-                        code: app_error::CONFLICT,
-                        message: "OpenCode's local HTTP adapter is unavailable without a documented authenticated client; select adapter_mode=pty".into(),
-                    });
-                }
                 structured_adapter = Some((spec.profile_id.clone(), spec.dialect));
             }
             profile_meta = Some(json!({
@@ -3291,6 +3286,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                         dialect,
                         p.prompt.as_deref(),
                         p.native_session_id.as_deref(),
+                        cwd.as_deref().ok_or_else(|| IpcError::Remote {
+                            code: app_error::INVALID_PARAMS,
+                            message: "structured profile requires an absolute workspace cwd".into(),
+                        })?,
                     )
                     .await
                     {
