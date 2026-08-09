@@ -55,6 +55,15 @@ pub struct WindowsPipePeerFacts {
     user_sid: String,
     integrity_rid: u32,
     session_id: u32,
+    process: WindowsProcessFacts,
+}
+
+/// Immutable process identity held through the authorization decision.
+/// Constructed only from a Windows process handle and a second image file
+/// handle; user-provided PID/path strings cannot create this value.
+#[cfg(windows)]
+pub struct WindowsProcessFacts {
+    pid: u32,
     creation_filetime: u64,
     image_path: String,
     image_volume_serial: u64,
@@ -83,11 +92,7 @@ impl std::fmt::Debug for WindowsPipePeerFacts {
             .field("user_sid", &self.user_sid)
             .field("integrity_rid", &self.integrity_rid)
             .field("session_id", &self.session_id)
-            .field("creation_filetime", &self.creation_filetime)
-            .field("image_path", &self.image_path)
-            .field("image_volume_serial", &self.image_volume_serial)
-            .field("image_file_id", &self.image_file_id)
-            .field("image_sha256", &self.image_sha256)
+            .field("process", &self.process)
             .finish_non_exhaustive()
     }
 }
@@ -112,6 +117,60 @@ impl WindowsPipePeerFacts {
     }
     #[must_use]
     pub const fn creation_filetime(&self) -> u64 {
+        self.process.creation_filetime()
+    }
+    #[must_use]
+    pub fn image_path(&self) -> &str {
+        self.process.image_path()
+    }
+    #[must_use]
+    pub const fn image_volume_serial(&self) -> u64 {
+        self.process.image_volume_serial()
+    }
+    #[must_use]
+    pub const fn image_file_id(&self) -> [u8; 16] {
+        self.process.image_file_id()
+    }
+    #[must_use]
+    pub const fn image_sha256(&self) -> [u8; 32] {
+        self.process.image_sha256()
+    }
+
+    /// Re-read the process creation time through the retained process handle.
+    /// A mismatch means PID reuse or a closed/replaced process and is denied.
+    pub fn revalidate_process_birth(&self) -> IpcResult<()> {
+        self.process.revalidate_process_birth()
+    }
+
+    /// Re-read the held image handle's file identity and digest.  This catches
+    /// replacement attempts between pipe accept and the privileged action.
+    pub fn revalidate_image(&self) -> IpcResult<()> {
+        self.process.revalidate_image()
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for WindowsProcessFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsProcessFacts")
+            .field("pid", &self.pid)
+            .field("creation_filetime", &self.creation_filetime)
+            .field("image_path", &self.image_path)
+            .field("image_volume_serial", &self.image_volume_serial)
+            .field("image_file_id", &self.image_file_id)
+            .field("image_sha256", &self.image_sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl WindowsProcessFacts {
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+    #[must_use]
+    pub const fn creation_filetime(&self) -> u64 {
         self.creation_filetime
     }
     #[must_use]
@@ -130,36 +189,30 @@ impl WindowsPipePeerFacts {
     pub const fn image_sha256(&self) -> [u8; 32] {
         self.image_sha256
     }
-
-    /// Re-read the process creation time through the retained process handle.
-    /// A mismatch means PID reuse or a closed/replaced process and is denied.
     pub fn revalidate_process_birth(&self) -> IpcResult<()> {
         let observed = unsafe { process_creation_filetime(self.process_handle.as_raw_handle()) }
             .map_err(|error| {
                 IpcError::Unauthorized(format!(
-                    "cannot revalidate named-pipe client process birth (fail-closed): {error}"
+                    "cannot revalidate process birth (fail-closed): {error}"
                 ))
             })?;
         if observed != self.creation_filetime {
             return Err(IpcError::Unauthorized(
-                "named-pipe client PID was reused or process birth changed (fail-closed)".into(),
+                "process PID was reused or process birth changed (fail-closed)".into(),
             ));
         }
         Ok(())
     }
-
-    /// Re-read the held image handle's file identity and digest.  This catches
-    /// replacement attempts between pipe accept and the privileged action.
     pub fn revalidate_image(&self) -> IpcResult<()> {
         let (volume, file_id) = unsafe { windows_file_id(self.image_handle.as_raw_handle()) }
             .map_err(|error| {
                 IpcError::Unauthorized(format!(
-                    "cannot revalidate named-pipe client image identity (fail-closed): {error}"
+                    "cannot revalidate process image identity (fail-closed): {error}"
                 ))
             })?;
         let digest = sha256_file(&self.image_handle).map_err(|error| {
             IpcError::Unauthorized(format!(
-                "cannot revalidate named-pipe client image digest (fail-closed): {error}"
+                "cannot revalidate process image digest (fail-closed): {error}"
             ))
         })?;
         if volume != self.image_volume_serial
@@ -167,7 +220,7 @@ impl WindowsPipePeerFacts {
             || digest != self.image_sha256
         {
             return Err(IpcError::Unauthorized(
-                "named-pipe client image changed after accept (fail-closed)".into(),
+                "process image changed after attestation (fail-closed)".into(),
             ));
         }
         Ok(())
@@ -775,6 +828,21 @@ fn windows_pipe_peer_facts(server: &NamedPipeServer) -> IpcResult<WindowsPipePee
                 "named pipe client token context retrieval failed (fail-closed): {error}"
             ))
         })?;
+    let process = windows_process_facts(pid)?;
+    Ok(WindowsPipePeerFacts {
+        pid,
+        user_sid,
+        integrity_rid,
+        session_id,
+        process,
+    })
+}
+
+/// Attest a process using a retained process handle and a retained canonical
+/// image handle.  Clients use this after `GetNamedPipeServerProcessId` before
+/// sending a broker request, and again after receiving its response.
+#[cfg(windows)]
+pub fn windows_process_facts(pid: u32) -> IpcResult<WindowsProcessFacts> {
     let (
         process_handle,
         image_handle,
@@ -785,14 +853,11 @@ fn windows_pipe_peer_facts(server: &NamedPipeServer) -> IpcResult<WindowsPipePee
         creation_filetime,
     ) = unsafe { open_process_and_image(pid) }.map_err(|error| {
         IpcError::Unauthorized(format!(
-            "named pipe client image attestation failed (fail-closed): {error}"
+            "Windows process attestation failed (fail-closed): {error}"
         ))
     })?;
-    Ok(WindowsPipePeerFacts {
+    Ok(WindowsProcessFacts {
         pid,
-        user_sid,
-        integrity_rid,
-        session_id,
         creation_filetime,
         image_path,
         image_volume_serial,
@@ -801,6 +866,186 @@ fn windows_pipe_peer_facts(server: &NamedPipeServer) -> IpcResult<WindowsPipePee
         process_handle,
         image_handle,
     })
+}
+
+/// SCM-attested identity for a running Windows service.  The service manager,
+/// rather than pipe metadata or a caller-supplied service name, supplies the
+/// PID and configured binary command line.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsServiceFacts {
+    service_name: String,
+    pid: u32,
+    binary_command_line: String,
+}
+
+#[cfg(windows)]
+impl WindowsServiceFacts {
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+    #[must_use]
+    pub fn binary_command_line(&self) -> &str {
+        &self.binary_command_line
+    }
+}
+
+/// Query the local Service Control Manager and require a currently-running
+/// service PID to equal the PID reported by the exact Named Pipe handle.
+/// Callers must additionally attest that PID with [`windows_process_facts`]
+/// and compare its canonical image identity with the installed service image.
+#[cfg(windows)]
+pub fn windows_running_service_facts(
+    service_name: &str,
+    expected_pid: u32,
+) -> IpcResult<WindowsServiceFacts> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW,
+        QueryServiceStatusEx, QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
+        SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
+    };
+
+    if expected_pid == 0
+        || service_name.is_empty()
+        || service_name.len() > 256
+        || !service_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(IpcError::Protocol(
+            "Windows service identity input is invalid (fail-closed)".into(),
+        ));
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(service_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(IpcError::Unauthorized(format!(
+            "open local Service Control Manager failed (fail-closed): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let result = (|| {
+        let service = unsafe {
+            OpenServiceW(
+                manager,
+                wide.as_ptr(),
+                SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+            )
+        };
+        if service.is_null() {
+            return Err(IpcError::Unauthorized(format!(
+                "open expected broker service failed (fail-closed): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let service_result = (|| {
+            let mut status = unsafe { std::mem::zeroed::<SERVICE_STATUS_PROCESS>() };
+            let mut status_needed = 0_u32;
+            if unsafe {
+                QueryServiceStatusEx(
+                    service,
+                    SC_STATUS_PROCESS_INFO,
+                    std::ptr::from_mut(&mut status).cast(),
+                    u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>())
+                        .unwrap_or(u32::MAX),
+                    &mut status_needed,
+                )
+            } == 0
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "query broker service status failed (fail-closed): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if status.dwCurrentState != SERVICE_RUNNING || status.dwProcessId != expected_pid {
+                return Err(IpcError::Unauthorized(format!(
+                    "broker service is not running at the pipe-attested PID {expected_pid} (fail-closed)"
+                )));
+            }
+            let mut needed = 0_u32;
+            let _ = unsafe { QueryServiceConfigW(service, ptr::null_mut(), 0, &mut needed) };
+            if needed
+                < u32::try_from(std::mem::size_of::<QUERY_SERVICE_CONFIGW>()).unwrap_or(u32::MAX)
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "query broker service image size failed (fail-closed): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let bytes = usize::try_from(needed).map_err(|_| {
+                IpcError::Unauthorized("broker service image buffer length overflow".into())
+            })?;
+            let words = bytes.div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0_usize; words];
+            let mut returned = needed;
+            if unsafe {
+                QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &mut returned)
+            } == 0
+                || returned > needed
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "query broker service image failed (fail-closed): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+            let command_ptr = config.lpBinaryPathName;
+            let start = buffer.as_ptr() as usize;
+            let end = start.checked_add(bytes).ok_or_else(|| {
+                IpcError::Unauthorized("broker service image buffer overflow".into())
+            })?;
+            let command_start = command_ptr as usize;
+            if command_ptr.is_null()
+                || command_start < start
+                || command_start >= end
+                || !command_start.is_multiple_of(std::mem::align_of::<u16>())
+            {
+                return Err(IpcError::Unauthorized(
+                    "broker service image command line is outside SCM buffer (fail-closed)".into(),
+                ));
+            }
+            let units = (end - command_start) / std::mem::size_of::<u16>();
+            let command = unsafe { std::slice::from_raw_parts(command_ptr, units) };
+            let nul = command.iter().position(|unit| *unit == 0).ok_or_else(|| {
+                IpcError::Unauthorized(
+                    "broker service image command line is unterminated (fail-closed)".into(),
+                )
+            })?;
+            let binary_command_line = String::from_utf16(&command[..nul]).map_err(|_| {
+                IpcError::Unauthorized(
+                    "broker service image command line is invalid UTF-16 (fail-closed)".into(),
+                )
+            })?;
+            if binary_command_line.trim().is_empty() {
+                return Err(IpcError::Unauthorized(
+                    "broker service image command line is empty (fail-closed)".into(),
+                ));
+            }
+            Ok(WindowsServiceFacts {
+                service_name: service_name.to_owned(),
+                pid: status.dwProcessId,
+                binary_command_line,
+            })
+        })();
+        unsafe {
+            let _ = CloseServiceHandle(service);
+        }
+        service_result
+    })();
+    unsafe {
+        let _ = CloseServiceHandle(manager);
+    }
+    result
 }
 
 /// Capture the fields from an impersonated client token required to distinguish
