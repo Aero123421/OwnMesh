@@ -5,10 +5,12 @@
 //! request, or unbounded diff/test output. Runtime wiring consumes this
 //! manifest before running a review and pages the underlying bounded spools.
 
+use ownmesh_exec::ExecutablePin;
 use ownmesh_ipc::{
     atomic_write_owner_only, prepare_owner_only_state_dir, read_owner_only_file_bounded,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +40,7 @@ pub struct TestRequest {
     pub program: String,
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    pub pin: ExecutablePin,
 }
 
 /// Optional primary agent/direct command; shell strings are intentionally absent.
@@ -47,6 +50,7 @@ pub struct ReviewCommand {
     pub program: String,
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    pub pin: ExecutablePin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +71,9 @@ pub struct ReviewManifest {
     pub tests: Vec<TestRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_operation_id: Option<String>,
+    /// Exact control-plane payload binding; never supplied by the review DTO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_payload_hash: Option<String>,
     /// Absolute cursors and digests bind any paged result spool to this receipt.
     #[serde(default)]
     pub status_cursor: u64,
@@ -97,6 +104,8 @@ pub struct ReviewManifestStore {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultKind {
+    GitStatus,
+    GitDiff,
     CommandStdout,
     CommandStderr,
     TestStdout,
@@ -227,7 +236,6 @@ impl ReviewResultStore {
             offset = chunk_end;
         }
         let end = cursor + (cap - remaining) as u64;
-        use sha2::{Digest, Sha256};
         let canonical = serde_json::to_vec(&disk.chunks).map_err(|e| e.to_string())?;
         let sha256 = format!("{:x}", Sha256::digest(canonical));
         Ok(ReviewResultPage {
@@ -338,6 +346,37 @@ impl ReviewManifestStore {
         Ok(out)
     }
 
+    /// Atomically record a terminal phase and the digest of its already-durable
+    /// result spool. The spool is written first; a crash can leave `Running`,
+    /// but can never claim a terminal digest for unwritten bytes.
+    pub fn finish(
+        &mut self,
+        id: &str,
+        phase: ReviewPhase,
+        result_sha256: String,
+    ) -> Result<ReviewManifest, String> {
+        if !matches!(
+            phase,
+            ReviewPhase::Completed | ReviewPhase::Failed | ReviewPhase::Cancelled
+        ) || result_sha256.len() != 64
+            || !result_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid terminal review result".into());
+        }
+        let entry = self.entries.get(id).ok_or("review manifest not found")?;
+        if entry.phase != ReviewPhase::Running {
+            return Err("review is not running".into());
+        }
+        let mut candidate = self.entries.clone();
+        let out = candidate.get_mut(id).ok_or("review manifest not found")?;
+        out.phase = phase;
+        out.result_sha256 = Some(result_sha256);
+        let out = out.clone();
+        self.persist_entries(&candidate)?;
+        self.entries = candidate;
+        Ok(out)
+    }
+
     pub fn get(&self, id: &str) -> Option<&ReviewManifest> {
         self.entries.get(id)
     }
@@ -378,11 +417,23 @@ fn validate(m: &ReviewManifest) -> Result<(), String> {
     }) {
         return Err("invalid review result digest".into());
     }
+    if m.remote_payload_hash.as_deref().is_some_and(|digest| {
+        digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err("invalid review payload digest".into());
+    }
     if m.tests.len() > MAX_TESTS {
         return Err("review test count exceeds cap".into());
     }
     if let Some(command) = &m.command {
         validate_command(&command.program, &command.args, command.timeout_ms)?;
+        validate_pin(&command.pin)?;
+        if command.program != command.pin.path {
+            return Err("review command program/pin mismatch".into());
+        }
     }
     for test in &m.tests {
         if test.program.is_empty()
@@ -399,6 +450,10 @@ fn validate(m: &ReviewManifest) -> Result<(), String> {
             .any(|arg| arg.len() > MAX_ARG_BYTES || arg.chars().any(char::is_control))
         {
             return Err("invalid review test argument".into());
+        }
+        validate_pin(&test.pin)?;
+        if test.program != test.pin.path {
+            return Err("review test program/pin mismatch".into());
         }
     }
     Ok(())
@@ -418,10 +473,37 @@ fn validate_command(program: &str, args: &[String], timeout_ms: u64) -> Result<(
     }
     Ok(())
 }
+fn validate_pin(pin: &ExecutablePin) -> Result<(), String> {
+    if !Path::new(&pin.path).is_absolute()
+        || pin.len == 0
+        || pin.content_sha256.len() != 64
+        || !pin
+            .content_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || pin.policy_kind != "structured"
+    {
+        return Err("invalid review executable pin".into());
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn pin() -> ExecutablePin {
+        ExecutablePin {
+            path: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            content_sha256: "a".repeat(64),
+            len: 1,
+            device: None,
+            inode: None,
+            policy_kind: "structured".into(),
+        }
+    }
     fn manifest() -> ReviewManifest {
         ReviewManifest {
             review_id: "rev_1".into(),
@@ -436,11 +518,13 @@ mod tests {
             phase: ReviewPhase::Planned,
             command: None,
             tests: vec![TestRequest {
-                program: "cargo".into(),
+                program: pin().path.clone(),
                 args: vec!["test".into()],
                 timeout_ms: 60_000,
+                pin: pin(),
             }],
             remote_operation_id: None,
+            remote_payload_hash: None,
             status_cursor: 0,
             diff_cursor: 0,
             result_sha256: None,
@@ -483,6 +567,15 @@ mod tests {
         m.tests[0].args = vec!["ok\nno".into()];
         assert!(validate(&m).is_err());
         m.tests[0].args = vec!["x".repeat(MAX_ARG_BYTES + 1)];
+        assert!(validate(&m).is_err());
+    }
+    #[test]
+    fn pin_substitution_and_uppercase_digest_reject() {
+        let mut m = manifest();
+        m.tests[0].program = "C:/substituted.exe".into();
+        assert!(validate(&m).is_err());
+        let mut m = manifest();
+        m.tests[0].pin.content_sha256 = "A".repeat(64);
         assert!(validate(&m).is_err());
     }
     #[test]

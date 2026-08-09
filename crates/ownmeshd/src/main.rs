@@ -28,7 +28,6 @@
 
 mod agent_transport;
 mod daemon;
-mod review_manifest;
 mod runtime;
 
 use clap::{Parser, Subcommand};

@@ -21,13 +21,12 @@
     clippy::unused_self
 )]
 
+#[path = "review_manifest.rs"]
+mod review_manifest;
 #[path = "session_transition_journal.rs"]
 mod session_transition_journal;
 #[path = "structured_adapter.rs"]
 mod structured_adapter;
-use crate::review_manifest::{
-    ReviewManifest, ReviewManifestStore, ReviewPhase, ReviewResultStore, TestRequest,
-};
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
@@ -63,6 +62,10 @@ use ownmesh_session::{
 use ownmesh_session_host::{
     default_shell_command, HostIoMode, LiveHost, SupervisorBinding, SupervisorClient,
     SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest,
+};
+use review_manifest::{
+    ResultKind, ReviewCommand, ReviewManifest, ReviewManifestStore, ReviewPhase, ReviewResultChunk,
+    ReviewResultStore, TestRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -121,6 +124,70 @@ const OP_JOURNAL_IN_PROGRESS: &str = "in_progress";
 
 fn review_page_limit() -> usize {
     48 * 1024
+}
+
+/// Keep the JSON-encoded spool well below its owner-only file cap. Results are
+/// bytes serialized as JSON arrays, so the raw byte ceiling cannot be the disk
+/// ceiling. A visible terminal chunk records any omitted tail.
+const REVIEW_CAPTURE_BYTES: usize = 160 * 1024;
+const REVIEW_CONTENT_BYTES: usize = 140 * 1024;
+
+fn append_review_result(
+    chunks: &mut Vec<ReviewResultChunk>,
+    kind: ResultKind,
+    test_index: Option<u8>,
+    bytes: Vec<u8>,
+) {
+    if chunks.len() >= 60 {
+        return;
+    }
+    let used: usize = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
+    // Reserve terminal/system space so aggregate truncation can never be silent.
+    let room = REVIEW_CONTENT_BYTES.saturating_sub(used);
+    if room == 0 {
+        return;
+    }
+    let take = bytes.len().min(room);
+    for part in bytes[..take].chunks(64 * 1024) {
+        chunks.push(ReviewResultChunk {
+            kind: kind.clone(),
+            test_index,
+            bytes: part.to_vec(),
+        });
+    }
+    if take < bytes.len() {
+        append_review_system(
+            chunks,
+            format!(
+                "review output truncated: omitted {} bytes",
+                bytes.len() - take
+            ),
+        );
+    }
+}
+
+fn append_review_system(chunks: &mut Vec<ReviewResultChunk>, text: String) {
+    if chunks.len() >= 64 {
+        return;
+    }
+    let used: usize = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
+    let room = REVIEW_CAPTURE_BYTES.saturating_sub(used);
+    if room == 0 {
+        return;
+    }
+    let bytes = text.into_bytes();
+    chunks.push(ReviewResultChunk {
+        kind: ResultKind::System,
+        test_index: None,
+        bytes: bytes[..bytes.len().min(room).min(64 * 1024)].to_vec(),
+    });
+}
+
+fn format_run_summary(label: &str, result: &RunResult) -> String {
+    format!(
+        "{label}: exit={:?} timeout={} truncated={} duration_ms={}",
+        result.exit_code, result.timed_out, result.truncated, result.duration_ms
+    )
 }
 
 /// Pending or decided approval tied to a deferred operation.
@@ -1792,6 +1859,24 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
+        /// Network DTO deliberately excludes executable pins: the daemon resolves and
+        /// pins every program itself before it creates a receipt or starts a process.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CommandRequest {
+            program: String,
+            #[serde(default)]
+            args: Vec<String>,
+            timeout_ms: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TestRequestDto {
+            program: String,
+            #[serde(default)]
+            args: Vec<String>,
+            timeout_ms: u64,
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct P {
@@ -1799,8 +1884,8 @@ full_user_access/full_access for arbitrary commands",
             #[serde(default)]
             path: String,
             #[serde(default)]
-            command: Option<crate::review_manifest::ReviewCommand>,
-            tests: Vec<TestRequest>,
+            command: Option<CommandRequest>,
+            tests: Vec<TestRequestDto>,
         }
         let p: P = parse_params(params)?;
         let device_id = self
@@ -1811,7 +1896,114 @@ full_user_access/full_access for arbitrary commands",
                 message: "review.start requires verified Agent device identity".into(),
             })?
             .to_owned();
+        if self.enforce_workspace {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: "review command execution is denied under a restricted workspace preset until OS process confinement is available".into(),
+            });
+        }
         let ws = self.workspace_for(Some(&p.workspace_id))?;
+        let repo_cwd = ws.resolve(Path::new(&p.path)).map_err(fs_err)?;
+        let command = p
+            .command
+            .map(|request| {
+                self.pin_review_command(
+                    request.program,
+                    request.args,
+                    request.timeout_ms,
+                    &repo_cwd,
+                )
+            })
+            .transpose()?;
+        let tests: Vec<TestRequest> = p
+            .tests
+            .into_iter()
+            .map(|request| {
+                self.pin_review_command(
+                    request.program,
+                    request.args,
+                    request.timeout_ms,
+                    &repo_cwd,
+                )
+                .map(|command| TestRequest {
+                    program: command.program,
+                    args: command.args,
+                    timeout_ms: command.timeout_ms,
+                    pin: command.pin,
+                })
+            })
+            .collect::<IpcResult<_>>()?;
+
+        // Review runs are a batch of independently policy-sensitive programs.
+        // Never infer authorization from the first program: the most restrictive
+        // local verdict wins before repository inspection or process execution.
+        let principal = canonicalize_principal_key(client.principal_key());
+        let mut aggregate = Decision::Allow;
+        let mut reasons = Vec::new();
+        let mut review_programs: Vec<(&String, &ExecutablePin)> = Vec::new();
+        if let Some(command) = command.as_ref() {
+            review_programs.push((&command.program, &command.pin));
+        }
+        review_programs.extend(tests.iter().map(|test| (&test.program, &test.pin)));
+        for (program, pin) in review_programs {
+            let facts = OperationFacts {
+                capability: "command.run".into(),
+                kind: "structured".into(),
+                program: Some(program.clone()),
+                path: Some(repo_cwd.to_string_lossy().into_owned()),
+                workspace_relative: true,
+                executable_identity: Some(executable_identity_from_pin(pin)),
+                tags: vec!["review".into()],
+                ..Default::default()
+            };
+            let mut verdict = self.evaluate(&facts, &principal);
+            let delegated_remote = self.delegate_remote_mcp
+                && self.active_remote_operation_id.is_some()
+                && self.active_remote_payload_hash.is_some()
+                && self
+                    .active_remote_expires_at_unix
+                    .is_some_and(|expiry| expiry >= Self::now());
+            if delegated_remote && verdict.decision == Decision::Ask {
+                verdict.decision = Decision::Allow;
+                verdict
+                    .reason
+                    .push_str("; remote MCP delegation configured");
+            }
+            aggregate = aggregate.tighten(verdict.decision);
+            reasons.push(verdict.reason);
+        }
+        if aggregate == Decision::Deny {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!("policy denied review batch: {}", reasons.join("; ")),
+            });
+        }
+        if aggregate == Decision::Ask {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!("review batch requires a policy approval path which is not available for review.start: {}", reasons.join("; ")),
+            });
+        }
+        let journal_key = self
+            .active_remote_operation_id
+            .as_ref()
+            .map(|operation_id| principal_journal_key(&principal, operation_id));
+        if let Some(previous) = self.lookup_idempotent(journal_key.as_ref())? {
+            if previous.get("remote_payload_hash").and_then(Value::as_str)
+                != self.active_remote_payload_hash.as_deref()
+            {
+                return Err(IpcError::Remote {
+                    code: app_error::UNAUTHORIZED,
+                    message: "review operation id replay payload binding mismatch".into(),
+                });
+            }
+            return Ok(previous);
+        }
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         let status = git_status(
             &ws,
             &GitStatusOpts {
@@ -1822,6 +2014,10 @@ full_user_access/full_access for arbitrary commands",
         )
         .map_err(fs_err)?;
         let head_oid = git_head_oid(&ws, Path::new(&p.path)).map_err(fs_err)?;
+        let initial_status = serde_json::to_vec(&status).map_err(|error| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: error.to_string(),
+        })?;
         let now = Self::now();
         let manifest = ReviewManifest {
             review_id: Self::new_id("rev_"),
@@ -1831,9 +2027,10 @@ full_user_access/full_access for arbitrary commands",
             head_oid,
             principal: client.client_name.clone(),
             phase: ReviewPhase::Planned,
-            command: p.command,
-            tests: p.tests,
+            command,
+            tests,
             remote_operation_id: self.active_remote_operation_id.clone(),
+            remote_payload_hash: self.active_remote_payload_hash.clone(),
             status_cursor: 0,
             diff_cursor: 0,
             result_sha256: None,
@@ -1847,16 +2044,305 @@ full_user_access/full_access for arbitrary commands",
                 code: app_error::CONFLICT,
                 message,
             })?;
-        self.review_results
-            .write(&saved.review_id, saved.expires_unix, Vec::new())
+        self.review_manifests
+            .set_phase(&saved.review_id, ReviewPhase::Running)
             .map_err(|message| IpcError::Remote {
                 code: app_error::INTERNAL,
                 message,
             })?;
-        serde_json::to_value(saved).map_err(|e| IpcError::Remote {
+        let mut chunks = Vec::new();
+        append_review_system(
+            &mut chunks,
+            format!(
+                "baseline git status: {}",
+                String::from_utf8_lossy(&initial_status)
+            ),
+        );
+        let mut failed = false;
+        let mut cancelled = false;
+        if let Some(command) = saved.command.as_ref() {
+            if git_head_oid(&ws, Path::new(&saved.repo_root)).map_err(fs_err)? == saved.head_oid {
+                let result = self
+                    .run_review_command(command, Path::new(&saved.repo_root))
+                    .await;
+                cancelled |= result.1;
+                failed |= !result.0;
+                let summary = format_run_summary("command", &result.2);
+                append_review_result(
+                    &mut chunks,
+                    ResultKind::CommandStdout,
+                    None,
+                    result.2.stdout.into_bytes(),
+                );
+                append_review_result(
+                    &mut chunks,
+                    ResultKind::CommandStderr,
+                    None,
+                    result.2.stderr.into_bytes(),
+                );
+                append_review_system(&mut chunks, summary);
+            } else {
+                append_review_system(
+                    &mut chunks,
+                    "review repository HEAD changed before command spawn".into(),
+                );
+                failed = true;
+            }
+        }
+        if !cancelled
+            && !failed
+            && git_head_oid(&ws, Path::new(&saved.repo_root)).map_err(fs_err)? != saved.head_oid
+        {
+            append_review_system(
+                &mut chunks,
+                "review repository HEAD changed after command; tests not started".into(),
+            );
+            failed = true;
+        }
+        if !cancelled && !failed {
+            for (index, test) in saved.tests.iter().enumerate() {
+                let result = self
+                    .run_review_test(test, Path::new(&saved.repo_root))
+                    .await;
+                cancelled |= result.1;
+                failed |= !result.0;
+                let summary = format_run_summary(&format!("test[{index}]"), &result.2);
+                append_review_result(
+                    &mut chunks,
+                    ResultKind::TestStdout,
+                    Some(index as u8),
+                    result.2.stdout.into_bytes(),
+                );
+                append_review_result(
+                    &mut chunks,
+                    ResultKind::TestStderr,
+                    Some(index as u8),
+                    result.2.stderr.into_bytes(),
+                );
+                append_review_system(&mut chunks, summary);
+                if cancelled {
+                    break;
+                }
+            }
+        }
+        if cancelled {
+            append_review_system(
+                &mut chunks,
+                "review cancelled; process tree termination requested".into(),
+            );
+        }
+        if !cancelled
+            && git_head_oid(&ws, Path::new(&saved.repo_root)).map_err(fs_err)? != saved.head_oid
+        {
+            append_review_system(
+                &mut chunks,
+                "review repository HEAD changed after tests; final result is stale".into(),
+            );
+            failed = true;
+        }
+        match git_status(
+            &ws,
+            &GitStatusOpts {
+                path: PathBuf::from(&saved.repo_root),
+                cursor: None,
+                limit: 500,
+            },
+        ) {
+            Ok(status) => append_review_result(
+                &mut chunks,
+                ResultKind::GitStatus,
+                None,
+                serde_json::to_vec(&status)
+                    .unwrap_or_else(|_| b"git status serialization failed".to_vec()),
+            ),
+            Err(error) => {
+                append_review_system(&mut chunks, format!("git status snapshot failed: {error}"));
+            }
+        }
+        match git_diff(
+            &ws,
+            &GitDiffOpts {
+                path: PathBuf::from(&saved.repo_root),
+                cursor: None,
+                limit: 500,
+                max_bytes: 64 * 1024,
+                ..Default::default()
+            },
+        ) {
+            Ok(diff) => append_review_result(
+                &mut chunks,
+                ResultKind::GitDiff,
+                None,
+                serde_json::to_vec(&diff)
+                    .unwrap_or_else(|_| b"git diff serialization failed".to_vec()),
+            ),
+            Err(error) => {
+                append_review_system(&mut chunks, format!("git diff snapshot failed: {error}"));
+            }
+        }
+        if chunks.len() >= 58 {
+            append_review_system(
+                &mut chunks,
+                "review aggregate spool truncated at bounded chunk budget".into(),
+            );
+        }
+        let phase = if cancelled {
+            ReviewPhase::Cancelled
+        } else if failed {
+            ReviewPhase::Failed
+        } else {
+            ReviewPhase::Completed
+        };
+        self.review_results
+            .write(&saved.review_id, saved.expires_unix, chunks)
+            .map_err(|message| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message,
+            })?;
+        let digest = self
+            .review_results
+            .page(&saved.review_id, 0, 1, Self::now())
+            .map_err(|message| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message,
+            })?
+            .sha256;
+        let completed = self
+            .review_manifests
+            .finish(&saved.review_id, phase, digest)
+            .map_err(|message| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message,
+            })?;
+        let mut body = serde_json::to_value(completed).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
+        })?;
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "remote_payload_hash".into(),
+                json!(self.active_remote_payload_hash),
+            );
+        }
+        self.store_idempotent(journal_key.as_ref(), &body)?;
+        Ok(body)
+    }
+
+    fn pin_review_command(
+        &self,
+        program: String,
+        args: Vec<String>,
+        timeout_ms: u64,
+        cwd: &Path,
+    ) -> IpcResult<ReviewCommand> {
+        if program.trim().is_empty() || timeout_ms == 0 || timeout_ms > 300_000 {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "invalid review argv command".into(),
+            });
+        }
+        let resolved =
+            resolve_executable_path(&program, Some(cwd)).ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "review program could not be resolved to a regular executable".into(),
+            })?;
+        let resolved_program = resolved.to_string_lossy().into_owned();
+        if classify_from_request_in_dir(None, &resolved_program, &args, Some(cwd))
+            != CommandKind::Structured
+        {
+            return Err(IpcError::Remote { code: app_error::POLICY_DENIED, message: "review commands must be pinned structured argv executables, not shells or interpreters".into() });
+        }
+        let pin = pin_executable(&resolved, CommandKind::Structured).map_err(|error| {
+            IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: format!("unable to pin review executable: {error}"),
+            }
+        })?;
+        Ok(ReviewCommand {
+            program: resolved_program,
+            args,
+            timeout_ms,
+            pin,
         })
+    }
+
+    async fn run_review_command(
+        &self,
+        command: &ReviewCommand,
+        cwd: &Path,
+    ) -> (bool, bool, RunResult) {
+        let revalidated = verify_executable_pin(Path::new(&command.pin.path), &command.pin).is_ok()
+            && classify_from_request_in_dir(None, &command.pin.path, &command.args, None)
+                == CommandKind::Structured;
+        if !revalidated {
+            return (
+                false,
+                false,
+                RunResult {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: "executable pin revalidation failed; review command was not spawned"
+                        .into(),
+                    timed_out: false,
+                    duration_ms: 0,
+                    truncated: false,
+                    replayed: false,
+                },
+            );
+        }
+        let request = RunRequest {
+            kind: CommandKind::Structured,
+            program: command.pin.path.clone(),
+            args: command.args.clone(),
+            cwd: Some(cwd.to_path_buf()),
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(command.timeout_ms),
+            max_output_bytes: 96 * 1024,
+            idempotency_key: None,
+        };
+        match run_command_cancellable(&request, None, self.active_cancel.clone()).await {
+            Ok(result) => {
+                let cancelled = self
+                    .active_cancel
+                    .as_ref()
+                    .is_some_and(|receiver| *receiver.borrow());
+                (
+                    result.exit_code == Some(0) && !result.timed_out && !cancelled,
+                    cancelled,
+                    result,
+                )
+            }
+            Err(error) => {
+                let cancelled = matches!(error, ownmesh_exec::ExecError::Cancelled);
+                (
+                    false,
+                    cancelled,
+                    RunResult {
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: error.to_string(),
+                        timed_out: false,
+                        duration_ms: 0,
+                        truncated: false,
+                        replayed: false,
+                    },
+                )
+            }
+        }
+    }
+
+    async fn run_review_test(&self, test: &TestRequest, cwd: &Path) -> (bool, bool, RunResult) {
+        self.run_review_command(
+            &ReviewCommand {
+                program: test.program.clone(),
+                args: test.args.clone(),
+                timeout_ms: test.timeout_ms,
+                pin: test.pin.clone(),
+            },
+            cwd,
+        )
+        .await
     }
 
     fn handle_review_show(

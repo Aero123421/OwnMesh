@@ -1044,7 +1044,29 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_review_start",
     description: "Create a bounded, device-local Git review receipt for one exact workspace repository and argv-only tests.",
-    inputSchema: { type: "object", properties: { ...deviceProp, workspace_id: str, path: str, tests: { type: "array", maxItems: 16 }, idempotency_key: str }, required: ["device_id", "workspace_id", "tests", "idempotency_key"], additionalProperties: false },
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        workspace_id: str,
+        path: str,
+        command: {
+          type: "object",
+          properties: { program: str, args: { type: "array", items: str, maxItems: 64 }, timeout_ms: { type: "integer", minimum: 1, maximum: 300000 } },
+          required: ["program", "timeout_ms"], additionalProperties: false,
+        },
+        tests: {
+          type: "array", maxItems: 16,
+          items: {
+            type: "object",
+            properties: { program: str, args: { type: "array", items: str, maxItems: 64 }, timeout_ms: { type: "integer", minimum: 1, maximum: 300000 } },
+            required: ["program", "timeout_ms"], additionalProperties: false,
+          },
+        },
+        idempotency_key: str,
+      },
+      required: ["device_id", "workspace_id", "tests", "idempotency_key"], additionalProperties: false,
+    },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, scope: "ownmesh.write", risk: "write",
   },
   {
