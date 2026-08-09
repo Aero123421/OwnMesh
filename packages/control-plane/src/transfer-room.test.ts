@@ -26,11 +26,37 @@ test("ephemeral proof binds the exact key, role, and immutable transfer facts", 
   const claims = ticket("source");
   claims.source_device_public_key = hex(publicKey);
   claims.destination_device_public_key = hex(publicKey);
-  claims.source_ephemeral_signature = hex(new Uint8Array(await crypto.subtle.sign("Ed25519", key.privateKey, new TextEncoder().encode(canonicalTransferEphemeralProof(claims, "source")))));
-  claims.destination_ephemeral_signature = hex(new Uint8Array(await crypto.subtle.sign("Ed25519", key.privateKey, new TextEncoder().encode(canonicalTransferEphemeralProof(claims, "destination")))));
+  claims.source_ephemeral_signature = hex(new Uint8Array(await crypto.subtle.sign("Ed25519", key.privateKey, canonicalTransferEphemeralProof(claims, "source"))));
+  claims.destination_ephemeral_signature = hex(new Uint8Array(await crypto.subtle.sign("Ed25519", key.privateKey, canonicalTransferEphemeralProof(claims, "destination"))));
   assert.equal(await verifyTransferEphemeralProof(claims, "source", claims.source_device_public_key), true);
   assert.equal(await verifyTransferEphemeralProof({ ...claims, source_ephemeral_public_key: "ff".repeat(32) }, "source", claims.source_device_public_key), false);
   assert.equal(await verifyTransferEphemeralProof({ ...claims, epoch: 2 }, "source", claims.source_device_public_key), false);
+});
+
+test("ephemeral proof golden vector is length-delimited for punctuation-bearing IDs", () => {
+  const claims = ticket("source");
+  Object.assign(claims, {
+    transfer_id: "x|=fer", tenant_id: "t=|", source_device_id: "dev|=",
+    source_workspace_id: "ws=|", plan_sha256: "00".repeat(32),
+    source_ephemeral_public_key: "11".repeat(32), epoch: 0x0102_0304,
+    fence: 0x0102_0304_0506, session_nonce: "n|=", exp: 1_700_000_000_000,
+  });
+  const u32 = (n: number) => Uint8Array.of(0, 0, 0, n);
+  const u64 = (n: bigint) => {
+    const bytes = new Uint8Array(8); new DataView(bytes.buffer).setBigUint64(0, n, false); return bytes;
+  };
+  const text = (value: string) => [u32(value.length), new TextEncoder().encode(value)];
+  const expectedParts = [
+    ...text("ownmesh-transfer-ephemeral-v1"), ...text("x|=fer"), ...text("t=|"), Uint8Array.of(1),
+    ...text("dev|="), ...text("ws=|"), new Uint8Array(32), Uint8Array.of(1, 2, 3, 4),
+    u64(0x0102_0304_0506n), ...text("n|="), new Uint8Array(32).fill(0x11),
+    Uint8Array.of(0, 0, 1, 0x8b, 0xcf, 0xe5, 0x68, 0),
+  ];
+  const expected = new Uint8Array(expectedParts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0; for (const part of expectedParts) { expected.set(part, offset); offset += part.length; }
+  assert.deepEqual(canonicalTransferEphemeralProof(claims, "source"), expected);
+  const different = { ...claims, transfer_id: "x", tenant_id: "=fer|t=|" };
+  assert.notDeepEqual(canonicalTransferEphemeralProof(claims, "source"), canonicalTransferEphemeralProof(different, "source"));
 });
 
 test("TransferRoom forwards one opaque chunk and persists only contiguous ACK metadata", async () => {

@@ -86,30 +86,55 @@ function fromBase64Url(value: string): Uint8Array | null {
 }
 async function ticketKey(secret: string): Promise<CryptoKey> { return crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]); }
 
+/** Fixed-key JSON before the ticket HMAC. JSON is used only as a transport
+ * container; verification rejects any non-canonical ordering/extra keys. */
+function canonicalTransferTicketJson(c: TransferTicketClaims): string {
+  return JSON.stringify({
+    v: c.v, jti: c.jti, session_nonce: c.session_nonce, transfer_id: c.transfer_id,
+    tenant_id: c.tenant_id, principal_id: c.principal_id, device_id: c.device_id,
+    role: c.role, source_device_id: c.source_device_id, destination_device_id: c.destination_device_id,
+    source_workspace_id: c.source_workspace_id, destination_workspace_id: c.destination_workspace_id,
+    plan_sha256: c.plan_sha256, epoch: c.epoch, fence: c.fence, max_bytes: c.max_bytes, exp: c.exp,
+    source_device_public_key: c.source_device_public_key, destination_device_public_key: c.destination_device_public_key,
+    source_ephemeral_public_key: c.source_ephemeral_public_key, destination_ephemeral_public_key: c.destination_ephemeral_public_key,
+    source_ephemeral_signature: c.source_ephemeral_signature, destination_ephemeral_signature: c.destination_ephemeral_signature,
+  });
+}
+
 function hex(value: unknown, bytes: number): value is string {
   return typeof value === "string" && new RegExp(`^[a-f0-9]{${bytes * 2}}$`).test(value);
 }
 
-/** The device-signed, deliberately non-JSON representation of one ephemeral
- * key binding. It must match the Rust Agent implementation byte-for-byte. */
-export function canonicalTransferEphemeralProof(claims: TransferTicketClaims, role: TransferRole): string {
+/** The device-signed binary representation of one ephemeral key binding.
+ *
+ * This is intentionally not delimiter- or JSON-based: transfer identifiers
+ * are opaque and may contain punctuation. Every string has a u32 BE byte
+ * length, hashes/keys are decoded fixed-width lowercase hex, and integer
+ * fields have fixed widths. It must match Rust byte-for-byte. */
+export function canonicalTransferEphemeralProof(claims: TransferTicketClaims, role: TransferRole): Uint8Array {
   const device = role === "source" ? claims.source_device_id : claims.destination_device_id;
   const workspace = role === "source" ? claims.source_workspace_id : claims.destination_workspace_id;
   const ephemeral = role === "source" ? claims.source_ephemeral_public_key : claims.destination_ephemeral_public_key;
-  return [
-    "ownmesh-transfer-ephemeral-v1",
-    `transfer=${claims.transfer_id}`,
-    `tenant=${claims.tenant_id}`,
-    `role=${role}`,
-    `device=${device}`,
-    `workspace=${workspace}`,
-    `plan=${claims.plan_sha256}`,
-    `epoch=${claims.epoch}`,
-    `fence=${claims.fence}`,
-    `session_nonce=${claims.session_nonce}`,
-    `ephemeral_pub=${ephemeral}`,
-    `expires=${claims.exp}`,
-  ].join("|");
+  if (!hash(claims.plan_sha256) || !hex(ephemeral, 32)) throw new Error("invalid_ephemeral_proof_claims");
+  const parts: Uint8Array[] = [];
+  const u32 = (value: number) => {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) throw new Error("invalid_ephemeral_proof_integer");
+    const bytes = new Uint8Array(4); new DataView(bytes.buffer).setUint32(0, value, false); return bytes;
+  };
+  const u64 = (value: number) => {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error("invalid_ephemeral_proof_integer");
+    const bytes = new Uint8Array(8); new DataView(bytes.buffer).setBigUint64(0, BigInt(value), false); return bytes;
+  };
+  const text = (value: string) => { const bytes = new TextEncoder().encode(value); parts.push(u32(bytes.byteLength), bytes); };
+  const rawHex = (value: string) => Uint8Array.from(value.match(/../g)!, (pair) => Number.parseInt(pair, 16));
+  text("ownmesh-transfer-ephemeral-v1");
+  text(claims.transfer_id); text(claims.tenant_id); parts.push(Uint8Array.of(role === "source" ? 1 : 2));
+  text(device); text(workspace); parts.push(rawHex(claims.plan_sha256), u32(claims.epoch), u64(claims.fence));
+  text(claims.session_nonce); parts.push(rawHex(ephemeral), u64(claims.exp));
+  const length = parts.reduce((total, part) => total + part.byteLength, 0);
+  const out = new Uint8Array(length); let offset = 0;
+  for (const part of parts) { out.set(part, offset); offset += part.byteLength; }
+  return out;
 }
 
 /** Verify a device identity signature over its one-time X25519 public key. */
@@ -128,14 +153,14 @@ export async function verifyTransferEphemeralProof(
     return crypto.subtle.verify(
       "Ed25519", key,
       Uint8Array.from(signature.match(/../g)!, (pair) => Number.parseInt(pair, 16)),
-      new TextEncoder().encode(canonicalTransferEphemeralProof(claims, role)),
+      canonicalTransferEphemeralProof(claims, role),
     );
   } catch { return false; }
 }
 
 export async function issueTransferTicket(secret: string, claims: TransferTicketClaims): Promise<string> {
   if (!secret || claims.v !== 1 || !id(claims.jti) || !id(claims.session_nonce) || !id(claims.transfer_id) || !id(claims.tenant_id) || !id(claims.principal_id) || !id(claims.device_id) || !id(claims.source_device_id) || !id(claims.destination_device_id) || !id(claims.source_workspace_id) || !id(claims.destination_workspace_id) || !hash(claims.plan_sha256) || !hex(claims.source_device_public_key, 32) || !hex(claims.destination_device_public_key, 32) || !hex(claims.source_ephemeral_public_key, 32) || !hex(claims.destination_ephemeral_public_key, 32) || !hex(claims.source_ephemeral_signature, 64) || !hex(claims.destination_ephemeral_signature, 64) || (claims.role !== "source" && claims.role !== "destination") || claims.device_id !== (claims.role === "source" ? claims.source_device_id : claims.destination_device_id) || claims.exp <= Date.now() || claims.exp > Date.now() + TICKET_MAX_MS || !Number.isSafeInteger(claims.epoch) || claims.epoch < 1 || !Number.isSafeInteger(claims.fence) || claims.fence < 1 || !Number.isSafeInteger(claims.max_bytes) || claims.max_bytes < 1) throw new Error("invalid_transfer_ticket_claims");
-  const body = base64Url(new TextEncoder().encode(JSON.stringify(claims)));
+  const body = base64Url(new TextEncoder().encode(canonicalTransferTicketJson(claims)));
   const signature = new Uint8Array(await crypto.subtle.sign("HMAC", await ticketKey(secret), new TextEncoder().encode(body)));
   return `${body}.${base64Url(signature)}`;
 }
@@ -146,7 +171,9 @@ export async function verifyTransferTicket(secret: string | undefined, raw: stri
   const signature = fromBase64Url(sig); if (!signature) return null;
   if (!(await crypto.subtle.verify("HMAC", await ticketKey(secret), signature, new TextEncoder().encode(body)))) return null;
   const bytes = fromBase64Url(body); if (!bytes) return null;
-  let claims: TransferTicketClaims; try { claims = JSON.parse(new TextDecoder().decode(bytes)) as TransferTicketClaims; } catch { return null; }
+  const decoded = new TextDecoder().decode(bytes);
+  let claims: TransferTicketClaims; try { claims = JSON.parse(decoded) as TransferTicketClaims; } catch { return null; }
+  if (decoded !== canonicalTransferTicketJson(claims)) return null;
   try { await issueTransferTicket(secret, claims); } catch { return null; }
   return claims;
 }

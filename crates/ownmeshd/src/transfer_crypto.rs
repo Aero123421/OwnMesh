@@ -83,13 +83,13 @@ impl AgentTransferTicket {
     pub fn verify_ephemeral_proofs(&self) -> Result<(), String> {
         verify_from_public_key_hex(
             &self.source_device_public_key,
-            self.ephemeral_proof("source")?.as_bytes(),
+            &self.ephemeral_proof("source")?,
             &self.source_ephemeral_signature,
         )
         .map_err(|_| "invalid source ephemeral proof".to_owned())?;
         verify_from_public_key_hex(
             &self.destination_device_public_key,
-            self.ephemeral_proof("destination")?.as_bytes(),
+            &self.ephemeral_proof("destination")?,
             &self.destination_ephemeral_signature,
         )
         .map_err(|_| "invalid destination ephemeral proof".to_owned())
@@ -124,7 +124,7 @@ impl AgentTransferTicket {
         Ok(out)
     }
 
-    fn ephemeral_proof(&self, role: &str) -> Result<String, String> {
+    fn ephemeral_proof(&self, role: &str) -> Result<Vec<u8>, String> {
         let (device, workspace, ephemeral) = match role {
             "source" => (
                 &self.source_device_id,
@@ -138,8 +138,33 @@ impl AgentTransferTicket {
             ),
             _ => return Err("invalid transfer role".into()),
         };
-        Ok(format!("{EPHEMERAL_PROOF_DOMAIN}|transfer={}|tenant={}|role={role}|device={device}|workspace={workspace}|plan={}|epoch={}|fence={}|session_nonce={}|ephemeral_pub={ephemeral}|expires={}", self.transfer_id, self.tenant_id, self.plan_sha256, self.epoch, self.fence, self.session_nonce, self.exp))
+        let plan = decode_hex(&self.plan_sha256)?;
+        let ephemeral = decode_hex(ephemeral)?;
+        if plan.len() != 32 || ephemeral.len() != 32 {
+            return Err("invalid transfer proof key material".into());
+        }
+        let mut out = Vec::new();
+        push_proof_string(&mut out, EPHEMERAL_PROOF_DOMAIN)?;
+        push_proof_string(&mut out, &self.transfer_id)?;
+        push_proof_string(&mut out, &self.tenant_id)?;
+        out.push(if role == "source" { 1 } else { 2 });
+        push_proof_string(&mut out, device)?;
+        push_proof_string(&mut out, workspace)?;
+        out.extend_from_slice(&plan);
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.fence.to_be_bytes());
+        push_proof_string(&mut out, &self.session_nonce)?;
+        out.extend_from_slice(&ephemeral);
+        out.extend_from_slice(&self.exp.to_be_bytes());
+        Ok(out)
     }
+}
+
+fn push_proof_string(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    let length = u32::try_from(value.len()).map_err(|_| "transfer proof field too long")?;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -347,7 +372,10 @@ fn sha_hex(bytes: &[u8]) -> String {
 }
 
 fn valid_hex(value: &str, bytes: usize) -> bool {
-    value.len() == bytes.saturating_mul(2) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == bytes.saturating_mul(2)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_id(value: &str) -> bool {
@@ -355,7 +383,11 @@ fn valid_id(value: &str) -> bool {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
-    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !value.len().is_multiple_of(2)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err("invalid hexadecimal value".into());
     }
     (0..value.len())
@@ -442,10 +474,10 @@ mod tests {
             destination_ephemeral_signature: String::new(),
         };
         ticket.source_ephemeral_signature = hex(source
-            .sign(ticket.ephemeral_proof("source").unwrap().as_bytes())
+            .sign(&ticket.ephemeral_proof("source").unwrap())
             .expose());
         ticket.destination_ephemeral_signature = hex(destination
-            .sign(ticket.ephemeral_proof("destination").unwrap().as_bytes())
+            .sign(&ticket.ephemeral_proof("destination").unwrap())
             .expose());
         ticket
     }
@@ -465,5 +497,25 @@ mod tests {
         let mut replay = signed_ticket();
         replay.epoch = 2;
         assert!(replay.validate_for("dev_s", "source", 1).is_err());
+    }
+
+    #[test]
+    fn ephemeral_proof_golden_vector_is_unambiguous_for_delimiter_ids() {
+        let mut ticket = signed_ticket();
+        ticket.transfer_id = "x|=fer".into();
+        ticket.tenant_id = "t=|".into();
+        ticket.source_device_id = "dev|=".into();
+        ticket.source_workspace_id = "ws=|".into();
+        ticket.plan_sha256 = "00".repeat(32);
+        ticket.source_ephemeral_public_key = "11".repeat(32);
+        ticket.epoch = 0x0102_0304;
+        ticket.fence = 0x0102_0304_0506;
+        ticket.session_nonce = "n|=".into();
+        ticket.exp = 1_700_000_000_000;
+        let proof = ticket.ephemeral_proof("source").unwrap();
+        let mut different = ticket;
+        different.transfer_id = "x".into();
+        different.tenant_id = "=fer|t=|".into();
+        assert_ne!(proof, different.ephemeral_proof("source").unwrap());
     }
 }
