@@ -8,7 +8,9 @@ use crate::{
     load_windows_daemon_trust_record, InstallRecord, InstallStatus, WindowsDurableReplayLedger,
     WindowsJobRunner, WindowsProductionBrokerServer,
 };
-use ownmesh_broker_client::{BrokerSecret, CapabilitySigningKey};
+use ownmesh_broker_client::{
+    BrokerEndpoint, BrokerSecret, CapabilitySigningKey, WindowsBrokerTrust,
+};
 use ownmesh_ipc::{windows_process_facts, windows_running_service_facts};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -92,6 +94,39 @@ struct WindowsBrokerConfig {
     trust_sha256: String,
     secret_sha256: String,
     signing_sha256: String,
+}
+
+/// Safe, narrow projection of the Windows custody boundary for ownmeshd.
+/// It intentionally exposes only the request-MAC secret, fixed endpoint, and
+/// broker server trust; the capability signing key never leaves this crate.
+#[derive(Clone)]
+pub struct WindowsDaemonBrokerClient {
+    endpoint: BrokerEndpoint,
+    request_secret: BrokerSecret,
+    server_trust: WindowsBrokerTrust,
+    trusted_daemon_executable: PathBuf,
+}
+
+impl WindowsDaemonBrokerClient {
+    #[must_use]
+    pub fn endpoint(&self) -> &BrokerEndpoint {
+        &self.endpoint
+    }
+
+    #[must_use]
+    pub fn request_secret(&self) -> &BrokerSecret {
+        &self.request_secret
+    }
+
+    #[must_use]
+    pub fn server_trust(&self) -> &WindowsBrokerTrust {
+        &self.server_trust
+    }
+
+    #[must_use]
+    pub fn trusted_daemon_executable(&self) -> &Path {
+        &self.trusted_daemon_executable
+    }
 }
 
 fn wide(value: &OsStr) -> Vec<u16> {
@@ -934,7 +969,13 @@ fn daemon_trust_record() -> Result<crate::WindowsDaemonTrustRecord, String> {
     let facts = windows_process_facts(pid).map_err(|e| e.to_string())?;
     let (daemon_pipe_sid, daemon_token_sid, daemon_session_id, daemon_integrity_rid) =
         process_token_identity(pid)?;
-    if !daemon_identity_matches_secret_policy(&daemon_config, &daemon_pipe_sid, &daemon_token_sid) {
+    if !daemon_identity_matches_secret_policy(
+        &daemon_config,
+        &daemon_pipe_sid,
+        &daemon_token_sid,
+        daemon_integrity_rid,
+    ) || !daemon_command_matches_exact_image(scm.binary_command_line(), facts.image_path())
+    {
         return Err(
             "OwnMeshDaemon is not the exact LocalSystem SCM/token identity required to read broker secrets"
                 .into(),
@@ -1067,11 +1108,29 @@ fn daemon_identity_matches_secret_policy(
     actual: &ServiceConfigSnapshot,
     pipe_sid: &str,
     token_sid: &str,
+    integrity_rid: u32,
 ) -> bool {
     actual.service_type == SERVICE_WIN32_OWN_PROCESS
+        && actual.load_order_group_empty
+        && actual.tag_id == 0
+        && actual.dependencies_empty
         && actual.account.eq_ignore_ascii_case("LocalSystem")
         && pipe_sid == "S-1-5-18"
         && token_sid == "sid:010100000000000512000000"
+        && integrity_rid == 0x4000
+}
+
+fn daemon_command_matches_exact_image(command: &str, image: &str) -> bool {
+    let command = command.trim();
+    let Some(rest) = command.strip_prefix('"') else {
+        return false;
+    };
+    let Some((configured_image, tail)) = rest.split_once('"') else {
+        return false;
+    };
+    !configured_image.is_empty()
+        && tail.trim().is_empty()
+        && configured_image.eq_ignore_ascii_case(image)
 }
 
 fn query_service_config(
@@ -2012,6 +2071,75 @@ fn load_service_config() -> Result<WindowsBrokerConfig, String> {
     Ok(cfg)
 }
 
+/// Reattest the complete fixed Windows custody boundary immediately before an
+/// ownmeshd elevated request. This safe facade stays in the existing native
+/// Windows module so the daemon crate remains `#![forbid(unsafe_code)]`.
+pub fn load_windows_daemon_broker_client(
+    current_exe: &Path,
+) -> Result<WindowsDaemonBrokerClient, String> {
+    let config_path = config_path()?;
+    let root = data_root()?;
+    verify_system_admin_custody(&root)?;
+    let raw_config = std::fs::read(&config_path)
+        .map_err(|error| format!("read Windows broker custody config: {error}"))?;
+    let cfg = load_service_config()?;
+    if raw_config != serde_json::to_vec_pretty(&cfg).map_err(|error| error.to_string())?
+        || hash_file(&cfg.broker_binary)? != cfg.broker_sha256
+        || hash_file(&cfg.trust_record)? != cfg.trust_sha256
+        || hash_file(&cfg.request_secret)? != cfg.secret_sha256
+        || hash_file(&cfg.signing_key)? != cfg.signing_sha256
+    {
+        return Err("Windows broker custody hashes differ from config".into());
+    }
+    for path in [
+        &cfg.broker_binary,
+        &cfg.trust_record,
+        &cfg.request_secret,
+        &cfg.signing_key,
+        &cfg.replay_ledger,
+    ] {
+        verify_system_admin_custody(path)?;
+    }
+    verify_system_admin_custody(&cfg.staging_dir)?;
+    let recorded = load_windows_daemon_trust_record(&cfg.trust_record)?;
+    let live = daemon_trust_record()?;
+    if recorded.record() != &live {
+        return Err(
+            "Windows daemon trust identity differs from live LocalSystem SCM process".into(),
+        );
+    }
+    let running = std::fs::canonicalize(current_exe)
+        .map_err(|error| format!("canonicalize running ownmeshd image: {error}"))?;
+    let trusted = std::fs::canonicalize(&live.image_path)
+        .map_err(|error| format!("canonicalize trusted ownmeshd image: {error}"))?;
+    if running != trusted {
+        return Err("running ownmeshd image differs from Windows trust record".into());
+    }
+    // This reuses the exact SCM DACL/config/PID/image/pipe validation used by
+    // status. `support` deliberately remains unsupported pending a real admin
+    // receipt, but `installed` is an internal custody fact for this client.
+    if !broker_status_windows(Path::new("")).map(|status| status.installed)? {
+        return Err("Windows broker SCM/pipe custody is not live".into());
+    }
+    let secret = BrokerSecret::from_bytes(
+        std::fs::read(&cfg.request_secret)
+            .map_err(|error| format!("read Windows broker request secret: {error}"))?,
+    );
+    if secret.as_bytes().len() != BROKER_SECRET_BYTES {
+        return Err("Windows broker request secret has unexpected length".into());
+    }
+    let server_trust = WindowsBrokerTrust::new(BROKER_SERVICE, &cfg.broker_binary)
+        .map_err(|error| format!("load fixed Windows broker server trust: {error}"))?;
+    Ok(WindowsDaemonBrokerClient {
+        endpoint: BrokerEndpoint::NamedPipe(
+            ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME.into(),
+        ),
+        request_secret: secret,
+        server_trust,
+        trusted_daemon_executable: trusted,
+    })
+}
+
 async fn run_windows_broker_service(
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -2250,17 +2378,34 @@ mod tests {
         assert!(daemon_identity_matches_secret_policy(
             &exact,
             "S-1-5-18",
-            "sid:010100000000000512000000"
+            "sid:010100000000000512000000",
+            0x4000,
         ));
         assert!(!daemon_identity_matches_secret_policy(
             &exact,
             "S-1-5-21-foreign",
-            "sid:010100000000000512000000"
+            "sid:010100000000000512000000",
+            0x4000,
         ));
         assert!(!daemon_identity_matches_secret_policy(
             &exact,
             "S-1-5-18",
-            "sid:010100000000000521000000"
+            "sid:010100000000000521000000",
+            0x4000,
+        ));
+        assert!(!daemon_identity_matches_secret_policy(
+            &exact,
+            "S-1-5-18",
+            "sid:010100000000000512000000",
+            0x3000,
+        ));
+        assert!(daemon_command_matches_exact_image(
+            r#""C:\Program Files\OwnMesh\ownmeshd.exe""#,
+            r"C:\Program Files\OwnMesh\ownmeshd.exe",
+        ));
+        assert!(!daemon_command_matches_exact_image(
+            r#""C:\Program Files\OwnMesh\ownmeshd.exe" --config attacker"#,
+            r"C:\Program Files\OwnMesh\ownmeshd.exe",
         ));
     }
 

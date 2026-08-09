@@ -75,8 +75,8 @@ pub use windows::{
 pub use windows_ledger::WindowsDurableReplayLedger;
 #[cfg(windows)]
 pub use windows_lifecycle::{
-    broker_status_windows, install_windows_broker, run_windows_service_dispatcher,
-    uninstall_windows_broker,
+    broker_status_windows, install_windows_broker, load_windows_daemon_broker_client,
+    run_windows_service_dispatcher, uninstall_windows_broker, WindowsDaemonBrokerClient,
 };
 #[cfg(windows)]
 pub use windows_runner::WindowsJobRunner;

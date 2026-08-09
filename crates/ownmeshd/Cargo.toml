@@ -63,6 +63,9 @@ uuid = { version = "1.12.1", features = ["v4", "serde"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process"] }
 
+[target.'cfg(windows)'.dependencies]
+ownmesh-broker = { path = "../ownmesh-broker" }
+
 [dev-dependencies]
 tempfile = "3.15.0"
 tokio = { version = "1.43.0", features = [

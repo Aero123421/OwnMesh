@@ -29,12 +29,20 @@ mod review_manifest;
 mod session_transition_journal;
 #[path = "structured_adapter.rs"]
 mod structured_adapter;
+#[cfg(target_os = "linux")]
 use broker_runtime::load_linux_broker_client;
+#[cfg(windows)]
+use broker_runtime::load_windows_broker_client;
+#[cfg(windows)]
 use ownmesh_broker_client::{
-    compute_execute_intent_mac_v2, connect_and_execute_v2, connect_and_execute_v2_cancellable,
-    BrokerV2ClientError, ExecutablePinV2, ExecuteIntentV2, OperationFactsV2, BROKER_PROTOCOL_V2,
-    DEFAULT_CAPABILITY_TTL_SECS,
+    build_cancel_intent_v2, connect_and_cancel_v2_windows, connect_and_execute_v2_windows,
 };
+use ownmesh_broker_client::{
+    compute_execute_intent_mac_v2, BrokerV2ClientError, ExecutablePinV2, ExecuteIntentV2,
+    OperationFactsV2, BROKER_PROTOCOL_V2, DEFAULT_CAPABILITY_TTL_SECS,
+};
+#[cfg(target_os = "linux")]
+use ownmesh_broker_client::{connect_and_execute_v2, connect_and_execute_v2_cancellable};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
     classify_from_request_in_dir, pin_executable, resolve_executable_path, run_command_cancellable,
@@ -1434,6 +1442,26 @@ impl DaemonRuntime {
     }
 
     async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.try_linux_broker_elevated(p).await;
+        }
+        #[cfg(windows)]
+        {
+            return self.try_windows_broker_elevated(p).await;
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = p;
+            Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "unsupported: elevated execution has no native broker implementation on this platform".into(),
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn try_linux_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
         let running_image = std::env::current_exe().map_err(|_| IpcError::Remote {
             code: app_error::INTERNAL,
             message: "elevated execution cannot resolve the running daemon image (fail-closed)"
@@ -1486,6 +1514,90 @@ impl DaemonRuntime {
             });
         }
         Self::broker_response_value(response)
+    }
+
+    #[cfg(windows)]
+    async fn try_windows_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
+        let running_image = std::env::current_exe().map_err(|_| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message:
+                "elevated execution cannot resolve the running Windows daemon image (fail-closed)"
+                    .into(),
+        })?;
+        // This loader accepts only the fixed ProgramData/ProgramFiles custody
+        // set, requires this process to be the LocalSystem OwnMeshDaemon SCM
+        // service, and reconstructs no endpoint from caller input.
+        let broker = load_windows_broker_client(&running_image).map_err(|_| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: "unsupported: elevated execution requires the fixed LocalSystem Windows broker custody installation; broker unavailable or custody validation failed (fail-closed; no local exec)".into(),
+        })?;
+        let execute = self.build_broker_execute_intent(p, &broker.secret)?;
+        let response = self
+            .execute_windows_broker_with_cancel(&broker, &execute)
+            .await
+            .map_err(Self::broker_client_error)?;
+        if response.request_id != execute.request_id {
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "broker response request-id mismatch; outcome remains uncertain".into(),
+            });
+        }
+        // The pipe client revalidates its broker server handle after the
+        // response. Rebuild the complete daemon+broker custody boundary as a
+        // second, independent post-response fence before journaling success.
+        let reattested = load_windows_broker_client(&running_image).map_err(|_| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: "Windows broker or daemon custody changed after execution; outcome is uncertain and must not be retried".into(),
+        })?;
+        if reattested.endpoint != broker.endpoint
+            || reattested.trust != broker.trust
+            || reattested.trusted_executable != broker.trusted_executable
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "Windows broker trust identity changed after execution; outcome is uncertain and must not be retried".into(),
+            });
+        }
+        Self::broker_response_value(response)
+    }
+
+    #[cfg(windows)]
+    async fn execute_windows_broker_with_cancel(
+        &self,
+        broker: &broker_runtime::WindowsBrokerClient,
+        execute: &ExecuteIntentV2,
+    ) -> Result<ownmesh_broker_client::BrokerResponseV2, BrokerV2ClientError> {
+        let Some(mut cancel) = self.active_cancel.clone() else {
+            return connect_and_execute_v2_windows(&broker.endpoint, &broker.trust, execute).await;
+        };
+        let mut execute_result = Box::pin(connect_and_execute_v2_windows(
+            &broker.endpoint,
+            &broker.trust,
+            execute,
+        ));
+        let mut cancel_sent = false;
+        loop {
+            tokio::select! {
+                response = &mut execute_result => return response,
+                changed = cancel.changed(), if !cancel_sent => {
+                    if changed.is_err() || !*cancel.borrow_and_update() {
+                        continue;
+                    }
+                    cancel_sent = true;
+                    // Cancellation gets its own verified pipe connection and a
+                    // freshly MACed, target-fenced intent. Its result cannot
+                    // replace the execute receipt; only the original response
+                    // decides the durable outer operation outcome.
+                    let cancel_intent = build_cancel_intent_v2(&broker.secret, execute, Self::now());
+                    let _ = connect_and_cancel_v2_windows(
+                        &broker.endpoint,
+                        &broker.trust,
+                        &cancel_intent,
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     fn broker_response_value(
