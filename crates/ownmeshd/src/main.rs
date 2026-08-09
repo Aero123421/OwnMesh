@@ -29,6 +29,7 @@
 mod agent_transport;
 mod daemon;
 mod runtime;
+mod session_transition_journal;
 
 use clap::{Parser, Subcommand};
 use ownmesh_domain::ExitCode;
