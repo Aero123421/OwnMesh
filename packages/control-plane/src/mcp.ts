@@ -689,6 +689,10 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         session_id: str,
         from_seq: { type: "integer", minimum: 0 },
+        // Absolute raw-byte cursor for the persistent PTY sidecar spool. This
+        // is intentionally independent from UTF-8 session sequence replay so
+        // each observer can resume bounded binary-safe output independently.
+        sidecar_cursor: { type: "integer", minimum: 0 },
         limit: { type: "integer", minimum: 1, maximum: 1000 },
         workspace_id: str,
         idempotency_key: {
