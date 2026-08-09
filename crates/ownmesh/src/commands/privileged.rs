@@ -1,4 +1,4 @@
-//! `ownmesh privileged` — Linux native broker lifecycle front-end.
+//! `ownmesh privileged` — native broker lifecycle front-end.
 //!
 //! The actual authority stays in the root-owned `ownmesh-broker` program; this
 //! command only locates that program and relays its verified lifecycle result.
@@ -6,9 +6,9 @@
 use crate::cli::{Cli, PrivilegedCmd};
 use ownmesh_domain::ExitCode;
 use serde_json::{json, Value};
-#[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
+use std::path::PathBuf;
+#[cfg(any(target_os = "linux", windows))]
 use std::process::Command;
 
 pub fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
@@ -19,6 +19,7 @@ pub fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCod
     }
 }
 
+#[allow(dead_code)]
 fn lifecycle_failure_json(command: &str, message: &str) -> Value {
     json!({
         "schema_version": 1,
@@ -30,18 +31,18 @@ fn lifecycle_failure_json(command: &str, message: &str) -> Value {
 }
 
 fn run_install(cli: &Cli) -> Result<(), ExitCode> {
-    run_linux_backend(cli, "privileged broker install", &["install"])
+    run_native_backend(cli, "privileged broker install", &["install"])
 }
 
 fn run_status(cli: &Cli) -> Result<(), ExitCode> {
-    run_linux_backend(cli, "privileged broker status", &["status"])
+    run_native_backend(cli, "privileged broker status", &["status"])
 }
 
 fn run_uninstall(cli: &Cli) -> Result<(), ExitCode> {
-    run_linux_backend(cli, "privileged broker uninstall", &["uninstall"])
+    run_native_backend(cli, "privileged broker uninstall", &["uninstall"])
 }
 
-fn run_linux_backend(cli: &Cli, command: &str, _args: &[&str]) -> Result<(), ExitCode> {
+fn run_native_backend(cli: &Cli, command: &str, _args: &[&str]) -> Result<(), ExitCode> {
     #[cfg(target_os = "linux")]
     {
         if !effective_uid_is_root() {
@@ -69,7 +70,26 @@ fn run_linux_backend(cli: &Cli, command: &str, _args: &[&str]) -> Result<(), Exi
             Err(ExitCode::UsageConfig)
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        let _ = (cli, command);
+        let broker = broker_binary().map_err(|e| {
+            eprintln!("{e}");
+            ExitCode::UsageConfig
+        })?;
+        let output = Command::new(broker).args(_args).output().map_err(|e| {
+            eprintln!("run native broker backend: {e}");
+            ExitCode::UsageConfig
+        })?;
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(ExitCode::UsageConfig)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let message =
             "unsupported: native privileged broker lifecycle is currently supported on Linux only";
@@ -91,20 +111,38 @@ fn effective_uid_is_root() -> bool {
         .is_some_and(|uid| uid == "0")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn broker_binary() -> Result<PathBuf, String> {
-    let installed = PathBuf::from("/usr/lib/ownmesh/ownmesh-broker");
-    if installed.is_file() {
-        return Ok(installed);
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            let installed = PathBuf::from(program_files)
+                .join("OwnMesh")
+                .join("ownmesh-broker.exe");
+            if installed.is_file() {
+                return Ok(installed);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let installed = PathBuf::from("/usr/lib/ownmesh/ownmesh-broker");
+        if installed.is_file() {
+            return Ok(installed);
+        }
     }
     let ownmesh =
         std::env::current_exe().map_err(|e| format!("resolve ownmesh executable: {e}"))?;
-    let sibling = ownmesh.with_file_name("ownmesh-broker");
+    let sibling = ownmesh.with_file_name(if cfg!(windows) {
+        "ownmesh-broker.exe"
+    } else {
+        "ownmesh-broker"
+    });
     if sibling.is_file() {
         Ok(sibling)
     } else {
         Err(
-            "ownmesh-broker was not found beside ownmesh or at /usr/lib/ownmesh/ownmesh-broker"
+            "ownmesh-broker was not found beside ownmesh or at the fixed native installation path"
                 .into(),
         )
     }

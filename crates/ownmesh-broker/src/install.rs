@@ -158,7 +158,16 @@ pub fn install_broker(
             },
         );
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        if endpoint_override.is_some() {
+            return Err(
+                "Windows broker endpoint is fixed; refusing caller-controlled endpoint".into(),
+            );
+        }
+        return crate::windows_lifecycle::install_windows_broker(base);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (base, endpoint_override);
         Err(
@@ -179,7 +188,16 @@ pub fn install_broker_with_config(
             std::env::current_exe().map_err(|e| format!("resolve broker executable: {e}"))?;
         return install_linux(base, &broker, &config);
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        if config.endpoint.is_some() {
+            return Err(
+                "Windows broker endpoint is fixed; refusing caller-controlled endpoint".into(),
+            );
+        }
+        return crate::windows_lifecycle::install_windows_broker(base);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = (base, config);
         Err(
@@ -389,7 +407,11 @@ pub fn uninstall_broker(base: &Path) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        return crate::windows_lifecycle::uninstall_windows_broker(base);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = base;
         Err(
@@ -454,7 +476,11 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
             },
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        return crate::windows_lifecycle::broker_status_windows(base);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         let _ = base;
         Ok(absent_status(
@@ -463,6 +489,7 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
     }
 }
 
+#[cfg(not(windows))]
 fn absent_status(note: &str) -> InstallStatus {
     InstallStatus {
         installed: false,

@@ -14,10 +14,14 @@
 )]
 
 use clap::{Parser, Subcommand};
+#[cfg(windows)]
+use ownmesh_broker::run_windows_service_dispatcher;
 use ownmesh_broker::{
-    broker_status, install_broker_with_config, load_linux_run_config, run_broker, uninstall_broker,
-    BrokerInstallConfig, UnixSocketSecurity,
+    broker_status, install_broker_with_config, uninstall_broker, BrokerInstallConfig,
+    UnixSocketSecurity,
 };
+#[cfg(not(windows))]
+use ownmesh_broker::{load_linux_run_config, run_broker};
 use ownmesh_broker_client::BrokerEndpoint;
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;
 use std::path::{Path, PathBuf};
@@ -161,6 +165,19 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Install { state_dir, endpoint, trusted_executable, daemon_uid, daemon_gid, socket_owner_uid, socket_group_gid, socket_mode, allowed_uids } => {
             let endpoint = endpoint.map(|raw| raw.strip_prefix("unix:").map(PathBuf::from).map(BrokerEndpoint::UnixSocket).ok_or_else(|| "install endpoint must use unix:/run/ownmesh/broker.sock".to_string())).transpose()?;
+            #[cfg(windows)]
+            {
+                let _ = (trusted_executable, daemon_uid, daemon_gid, socket_owner_uid, socket_group_gid, socket_mode, allowed_uids);
+                if endpoint.is_some() { return Err("Windows broker endpoint is fixed and may not be overridden".into()); }
+                let rec = install_broker_with_config(state_dir.as_deref().unwrap_or_else(|| Path::new(".")), BrokerInstallConfig {
+                    endpoint: None, trusted_executable: PathBuf::new(), daemon_uid: 0, daemon_gid: 0,
+                    socket_security: UnixSocketSecurity { owner_uid: 0, group_gid: 0, mode: 0 }, allowed_uids: vec![],
+                })?;
+                println!("installed=true support={} endpoint={}", rec.support, rec.endpoint);
+                return Ok(());
+            }
+            #[cfg(not(windows))]
+            {
             let broker = std::env::current_exe().map_err(|e| format!("resolve broker executable: {e}"))?;
             let trusted = trusted_executable.unwrap_or_else(|| broker.with_file_name("ownmeshd"));
             let (daemon_uid, daemon_group_gid) = resolve_daemon_identity(daemon_uid, daemon_gid)?;
@@ -170,9 +187,23 @@ async fn run(cli: Cli) -> Result<(), String> {
                 allowed_uids: if allowed_uids.is_empty() { vec![daemon_uid] } else { allowed_uids },
             })?;
             println!("installed=true support={} endpoint={}", rec.support, rec.endpoint); Ok(())
+            }
         }
         Commands::Uninstall { state_dir } => { uninstall_broker(state_dir.as_deref().unwrap_or_else(|| Path::new(".")))?; println!("installed=false"); Ok(()) }
-        Commands::Run { config } => run_broker(load_linux_run_config(&config)?).await,
+        Commands::Run { config } => {
+            #[cfg(windows)]
+            {
+                // SCM owns the fixed configuration path.  Retain the required
+                // argument to avoid silently accepting a legacy interactive
+                // invocation, then reject any mutable path before dispatch.
+                let _ = config;
+                run_windows_service_dispatcher()
+            }
+            #[cfg(not(windows))]
+            {
+                run_broker(load_linux_run_config(&config)?).await
+            }
+        }
         Commands::Exec {
             secret_file: _,
             signing_key_file: _,
@@ -188,6 +219,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+#[cfg(not(windows))]
 fn resolve_daemon_identity(uid: Option<u32>, gid: Option<u32>) -> Result<(u32, u32), String> {
     let (uid, gid) = match (uid, gid) {
         (Some(uid), Some(gid)) => (uid, gid),

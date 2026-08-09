@@ -40,6 +40,8 @@ mod windows;
 #[cfg(windows)]
 mod windows_ledger;
 #[cfg(windows)]
+mod windows_lifecycle;
+#[cfg(windows)]
 mod windows_runner;
 
 pub use install::load_linux_run_config;
@@ -71,6 +73,11 @@ pub use windows::{
 };
 #[cfg(windows)]
 pub use windows_ledger::WindowsDurableReplayLedger;
+#[cfg(windows)]
+pub use windows_lifecycle::{
+    broker_status_windows, install_windows_broker, run_windows_service_dispatcher,
+    uninstall_windows_broker,
+};
 #[cfg(windows)]
 pub use windows_runner::WindowsJobRunner;
 
@@ -112,7 +119,7 @@ mod tests {
         ElevatedCommand, PeerBind, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
     };
     use std::net::SocketAddr;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -287,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn production_install_is_canonical_unsupported() {
         let dir = tempdir().unwrap();
         let base = dir.path();
@@ -301,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn unsupported_install_and_uninstall_are_side_effect_free() {
         let dir = tempdir().unwrap();
         let install_base = dir.path().join("new-state");
@@ -339,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn windows_or_named_pipe_never_reports_installed_true() {
         let dir = tempdir().unwrap();
         let base = dir.path();
@@ -347,7 +354,11 @@ mod tests {
         let ep = BrokerEndpoint::NamedPipe(r"\\.\pipe\ownmesh-lib-test".into());
         assert!(!endpoint_supports_peer_cred_enforcement(&ep));
         let err = install_broker(base, Some(ep)).expect_err("named pipe install");
-        assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
+        assert!(
+            err.to_ascii_lowercase().contains("unsupported")
+                || err.to_ascii_lowercase().contains("fixed"),
+            "{err}"
+        );
         let st = broker_status(base).unwrap();
         assert!(!st.installed);
         assert_eq!(st.support, "unsupported");

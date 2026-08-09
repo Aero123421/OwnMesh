@@ -10,8 +10,13 @@ authors.workspace = true
 description = "ownmesh-broker"
 readme = "README.md"
 
-[lints]
-workspace = true
+[lints.rust]
+# Native Windows SCM and token APIs are isolated to windows_lifecycle.rs.
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 
 [[bin]]
 name = "ownmesh-broker"
@@ -42,6 +47,17 @@ tokio = { version = "1", features = [
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Services",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

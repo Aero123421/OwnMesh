@@ -34,28 +34,31 @@ fn named_pipe_and_windows_install_never_returns_installed_true() {
 
     #[cfg(windows)]
     {
-        let err = install_broker(base, None).expect_err("Windows install must be unsupported");
-        assert!(
-            err.to_ascii_lowercase().contains("unsupported"),
-            "expected unsupported error, got: {err}"
-        );
         let st = broker_status(base).unwrap();
         assert!(!st.installed, "installed must be false: {st:?}");
         assert_eq!(st.support, "unsupported");
         assert!(
             st.notes.iter().any(|n| {
                 let l = n.to_ascii_lowercase();
-                l.contains("unsupported") || l.contains("fail-closed") || l.contains("named")
+                l.contains("unsupported")
+                    || l.contains("fail-closed")
+                    || l.contains("named")
+                    || l.contains("custody")
             }),
             "notes must explain unsupported: {st:?}"
         );
     }
 
-    // Named Pipe is never peer-enforceable on any OS under forbid(unsafe_code).
+    // Generic Named Pipe endpoints remain forbidden: Windows only permits the
+    // fixed SCM-owned broker pipe selected by the lifecycle module.
     let pipe = BrokerEndpoint::NamedPipe(r"\\.\pipe\ownmesh-fix4-test".into());
     assert!(!endpoint_supports_peer_cred_enforcement(&pipe));
     let err = install_broker(base, Some(pipe)).expect_err("named pipe install");
-    assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
+    assert!(
+        err.to_ascii_lowercase().contains("unsupported")
+            || err.to_ascii_lowercase().contains("fixed"),
+        "{err}"
+    );
     let st = broker_status(base).unwrap();
     assert!(!st.installed);
     assert_eq!(st.support, "unsupported");
@@ -127,15 +130,22 @@ fn loopback_tcp_install_is_unsupported() {
     let ep = BrokerEndpoint::LoopbackTcp("127.0.0.1:0".parse().unwrap());
     assert!(!endpoint_supports_peer_cred_enforcement(&ep));
     let err = install_broker(dir.path(), Some(ep)).expect_err("tcp install");
-    assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
+    assert!(
+        err.to_ascii_lowercase().contains("unsupported")
+            || err.to_ascii_lowercase().contains("fixed"),
+        "{err}"
+    );
     let st = broker_status(dir.path()).unwrap();
     assert!(!st.installed);
 }
 
 #[test]
 fn install_without_legacy_arguments_is_explicitly_unsupported_and_side_effect_free() {
-    let dir = tempdir().unwrap();
-    let err = install_broker(dir.path(), None).expect_err("production install is unsupported");
-    assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
-    assert!(!dir.path().join("broker").exists());
+    #[cfg(not(windows))]
+    {
+        let dir = tempdir().unwrap();
+        let err = install_broker(dir.path(), None).expect_err("production install is unsupported");
+        assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
+        assert!(!dir.path().join("broker").exists());
+    }
 }
