@@ -31,7 +31,14 @@ const MAX_WINDOWS_BROKER_CONCURRENCY: usize = 16;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsDaemonTrustRecord {
-    pub daemon_sid: String,
+    /// Canonical Windows SID text (`S-1-...`) used only to construct and
+    /// inspect the fixed named-pipe DACL.
+    pub daemon_pipe_sid: String,
+    /// Canonical TokenUser SID bytes rendered by `ownmesh-ipc` as
+    /// `sid:<lowercase-hex>`. This is used only for peer comparison after
+    /// pipe impersonation. Keeping it separate prevents an SDDL string from
+    /// being compared to an unrelated textual representation.
+    pub daemon_token_sid: String,
     pub daemon_service_name: String,
     pub daemon_session_id: u32,
     pub daemon_integrity_rid: u32,
@@ -128,14 +135,14 @@ where
 {
     /// Bind only the fixed pipe with its protected daemon/SYSTEM/Admin DACL.
     pub async fn bind(
-        daemon_sid: &str,
+        daemon_pipe_sid: &str,
         authorizer: A,
         ledger: L,
         runner: R,
         secret: BrokerSecret,
         signing_key: CapabilitySigningKey,
     ) -> Result<Self, String> {
-        let listener = ownmesh_ipc::LocalListener::bind_secure_broker_pipe(daemon_sid)
+        let listener = ownmesh_ipc::LocalListener::bind_secure_broker_pipe(daemon_pipe_sid)
             .await
             .map_err(|error| error.to_string())?;
         let verify_key = signing_key.verify_key();
@@ -455,7 +462,11 @@ impl WindowsTrustedDaemon {
     /// elevated lifecycle code; this constructor only accepts its bounded bytes
     /// after the caller has completed that custody proof.
     pub fn from_record(record: WindowsDaemonTrustRecord) -> Result<Self, String> {
-        validate_sid(&record.daemon_sid)?;
+        let pipe_sid = parse_canonical_windows_sid(&record.daemon_pipe_sid)?;
+        let token_sid = parse_canonical_token_sid(&record.daemon_token_sid)?;
+        if pipe_sid != token_sid {
+            return Err("Windows daemon pipe SID and TokenUser SID differ (fail-closed)".into());
+        }
         validate_service_name(&record.daemon_service_name)?;
         if record.daemon_integrity_rid == 0 {
             return Err("Windows daemon integrity RID must be explicit (fail-closed)".into());
@@ -499,7 +510,7 @@ impl WindowsTrustedDaemon {
     /// the configured command image, held process image, file identity, and
     /// digest must each equal the elevated installation record.
     pub fn authorize_peer(&self, peer: &WindowsPipePeerFacts) -> Result<(), String> {
-        if peer.user_sid() != self.record.daemon_sid {
+        if peer.user_sid() != self.record.daemon_token_sid {
             return Err("named-pipe peer SID differs from trusted daemon SID (fail-closed)".into());
         }
         if peer.session_id() != self.record.daemon_session_id
@@ -588,16 +599,110 @@ pub fn load_windows_daemon_trust_record(path: &Path) -> Result<WindowsTrustedDae
     WindowsTrustedDaemon::from_record(record)
 }
 
-fn validate_sid(sid: &str) -> Result<(), String> {
-    if !sid.starts_with("S-")
-        || sid.len() > 184
-        || !sid
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'S')
-    {
-        return Err("trusted daemon SID is invalid (fail-closed)".into());
+/// Decode the sole SDDL form accepted in a custody record.  Rendering must be
+/// canonical, so equivalent spellings such as leading zeroes cannot become a
+/// record-substitution channel.
+fn parse_canonical_windows_sid(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() < 7 || value.len() > 184 || !value.starts_with("S-1-") {
+        return Err("trusted daemon pipe SID is invalid (fail-closed)".into());
     }
-    Ok(())
+    let mut parts = value.split('-');
+    let (Some("S"), Some("1"), Some(authority)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("trusted daemon pipe SID is malformed (fail-closed)".into());
+    };
+    let authority = parse_canonical_decimal(authority, "SID authority")?;
+    if authority > 0x0000_ffff_ffff_ffff {
+        return Err("trusted daemon SID authority exceeds 48 bits (fail-closed)".into());
+    }
+    let subauthorities = parts
+        .map(|part| parse_canonical_decimal(part, "SID subauthority"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if subauthorities.len() > 15 {
+        return Err("trusted daemon SID has too many subauthorities (fail-closed)".into());
+    }
+    let mut bytes = Vec::with_capacity(8 + subauthorities.len() * 4);
+    bytes.push(1);
+    bytes.push(u8::try_from(subauthorities.len()).map_err(|_| "SID subauthority count overflow")?);
+    let authority = authority.to_be_bytes();
+    bytes.extend_from_slice(&authority[2..]);
+    for subauthority in subauthorities {
+        let subauthority = u32::try_from(subauthority)
+            .map_err(|_| "trusted daemon SID subauthority exceeds 32 bits (fail-closed)")?;
+        bytes.extend_from_slice(&subauthority.to_le_bytes());
+    }
+    let canonical = render_windows_sid(&bytes)?;
+    if canonical != value {
+        return Err("trusted daemon pipe SID is not canonical (fail-closed)".into());
+    }
+    Ok(bytes)
+}
+
+fn parse_canonical_token_sid(value: &str) -> Result<Vec<u8>, String> {
+    let hex = value
+        .strip_prefix("sid:")
+        .ok_or("trusted daemon TokenUser SID lacks sid: prefix (fail-closed)")?;
+    if hex.len() < 16
+        || hex.len() > 136
+        || hex.len() % 2 != 0
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(
+            "trusted daemon TokenUser SID is not canonical lowercase hex (fail-closed)".into(),
+        );
+    }
+    let bytes = hex::decode(hex).map_err(|_| "trusted daemon TokenUser SID is invalid hex")?;
+    let canonical = render_windows_sid(&bytes)?;
+    if token_sid_from_bytes(&bytes) != value || parse_canonical_windows_sid(&canonical)? != bytes {
+        return Err("trusted daemon TokenUser SID is malformed (fail-closed)".into());
+    }
+    Ok(bytes)
+}
+
+fn parse_canonical_decimal(value: &str, label: &str) -> Result<u64, String> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "trusted daemon {label} is not canonical decimal (fail-closed)"
+        ));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("trusted daemon {label} overflows (fail-closed)"))
+}
+
+fn render_windows_sid(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() < 8 || bytes[0] != 1 {
+        return Err("trusted daemon SID binary revision is invalid (fail-closed)".into());
+    }
+    let count = usize::from(bytes[1]);
+    let expected = 8_usize
+        .checked_add(
+            count
+                .checked_mul(4)
+                .ok_or("trusted daemon SID length overflow")?,
+        )
+        .ok_or("trusted daemon SID length overflow")?;
+    if count > 15 || bytes.len() != expected {
+        return Err("trusted daemon SID binary length is invalid (fail-closed)".into());
+    }
+    let mut authority_bytes = [0_u8; 8];
+    authority_bytes[2..].copy_from_slice(&bytes[2..8]);
+    let authority = u64::from_be_bytes(authority_bytes);
+    let mut rendered = format!("S-1-{authority}");
+    for chunk in bytes[8..].chunks_exact(4) {
+        let subauthority = u32::from_le_bytes(chunk.try_into().map_err(|_| "SID chunk length")?);
+        rendered.push('-');
+        rendered.push_str(&subauthority.to_string());
+    }
+    Ok(rendered)
+}
+
+fn token_sid_from_bytes(bytes: &[u8]) -> String {
+    format!("sid:{}", hex::encode(bytes))
 }
 
 fn validate_service_name(name: &str) -> Result<(), String> {
@@ -657,32 +762,66 @@ mod tests {
         let dir = tempdir().unwrap();
         let image = dir.path().join("ownmeshd.exe");
         std::fs::write(&image, b"not-an-executable-but-regular").unwrap();
-        let record = WindowsDaemonTrustRecord {
-            daemon_sid: "S-1-5-21-1".into(),
+        let record = test_record(image);
+        assert!(WindowsTrustedDaemon::from_record(record).is_ok());
+        let bad_sid = WindowsDaemonTrustRecord {
+            daemon_pipe_sid: "S-1-5-18)(A;;GA;;;WD".into(),
+            ..test_record(dir.path().join("ownmeshd.exe"))
+        };
+        assert!(WindowsTrustedDaemon::from_record(bad_sid).is_err());
+    }
+
+    #[test]
+    fn trust_record_rejects_sid_representation_substitution() {
+        let dir = tempdir().unwrap();
+        let image = dir.path().join("ownmeshd.exe");
+        std::fs::write(&image, b"regular").unwrap();
+        let mut mismatched = test_record(image.clone());
+        mismatched.daemon_token_sid = token_sid("S-1-5-18");
+        assert!(WindowsTrustedDaemon::from_record(mismatched).is_err());
+
+        let mut noncanonical_pipe = test_record(image.clone());
+        noncanonical_pipe.daemon_pipe_sid = "S-1-05-21-1".into();
+        assert!(WindowsTrustedDaemon::from_record(noncanonical_pipe).is_err());
+
+        let mut noncanonical_token = test_record(image);
+        noncanonical_token.daemon_token_sid = noncanonical_token.daemon_token_sid.to_uppercase();
+        assert!(WindowsTrustedDaemon::from_record(noncanonical_token).is_err());
+    }
+
+    #[test]
+    fn old_ambiguous_or_unknown_record_schema_is_rejected() {
+        let dir = tempdir().unwrap();
+        let image = dir.path().join("ownmeshd.exe");
+        std::fs::write(&image, b"regular").unwrap();
+        let record = test_record(image);
+        let path = dir.path().join("trust.json");
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("daemon_token_sid");
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("daemon_sid".into(), serde_json::json!("S-1-5-21-1"));
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(load_windows_daemon_trust_record(&path).is_err());
+    }
+
+    fn test_record(image_path: PathBuf) -> WindowsDaemonTrustRecord {
+        WindowsDaemonTrustRecord {
+            daemon_pipe_sid: "S-1-5-21-1".into(),
+            daemon_token_sid: token_sid("S-1-5-21-1"),
             daemon_service_name: "OwnMeshDaemon".into(),
             daemon_session_id: 1,
             daemon_integrity_rid: 0x2000,
-            image_path: image,
+            image_path,
             image_volume_serial: 1,
             image_file_id: "00".repeat(16),
             image_sha256: "00".repeat(32),
             service_config_generation: 1,
-        };
-        assert!(WindowsTrustedDaemon::from_record(record).is_ok());
-        let bad_sid = WindowsDaemonTrustRecord {
-            daemon_sid: "S-1-5-18)(A;;GA;;;WD".into(),
-            ..WindowsDaemonTrustRecord {
-                daemon_sid: "S-1-5-21-1".into(),
-                daemon_service_name: "OwnMeshDaemon".into(),
-                daemon_session_id: 1,
-                daemon_integrity_rid: 0x2000,
-                image_path: dir.path().join("ownmeshd.exe"),
-                image_volume_serial: 1,
-                image_file_id: "00".repeat(16),
-                image_sha256: "00".repeat(32),
-                service_config_generation: 1,
-            }
-        };
-        assert!(WindowsTrustedDaemon::from_record(bad_sid).is_err());
+        }
+    }
+
+    fn token_sid(pipe_sid: &str) -> String {
+        token_sid_from_bytes(&parse_canonical_windows_sid(pipe_sid).unwrap())
     }
 }
