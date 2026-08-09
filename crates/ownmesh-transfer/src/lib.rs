@@ -25,7 +25,7 @@ use ownmesh_ipc::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -285,12 +285,10 @@ impl TransferPlan {
                 "expired grant or zero quota".into(),
             ));
         }
-        validate_source_custody(source)?;
-        let before = fs::metadata(source).map_err(io_error)?;
-        let mut file = File::open(source).map_err(io_error)?;
+        let mut file = open_source_nofollow(source)?;
+        validate_source_handle(&file)?;
         let (size_bytes, sha256) = hash_reader(&mut file, limits.max_bytes)?;
-        let after = fs::metadata(source).map_err(io_error)?;
-        if !before.is_file() || before.len() != size_bytes || after.len() != size_bytes {
+        if file.metadata().map_err(io_error)?.len() != size_bytes {
             return Err(TransferError::SourceChanged);
         }
         Self::from_verified(binding, grant, size_bytes, sha256)
@@ -387,9 +385,79 @@ impl TransferPlan {
     }
 }
 
-fn validate_source_custody(source: &Path) -> TransferResult<()> {
-    let meta = fs::symlink_metadata(source).map_err(io_error)?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
+fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn nofollow_flag() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        0o400_000
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    {
+        0x100
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    {
+        0
+    }
+}
+
+/// Open the final source component without following a symlink/reparse point.
+/// Callers must retain this handle; a pathname is never reopened for transfer I/O.
+fn open_source_nofollow(source: &Path) -> TransferResult<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(nofollow_flag())
+            .open(source)
+            .map_err(io_error)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(source)
+            .map_err(io_error)
+    }
+}
+
+fn validate_source_handle(file: &File) -> TransferResult<()> {
+    let meta = file.metadata().map_err(io_error)?;
+    if !meta.is_file() || is_reparse_or_symlink(&meta) {
         return Err(TransferError::CustodyUnavailable);
     }
     #[cfg(unix)]
@@ -501,7 +569,6 @@ impl TransferChunk {
 /// Reads an already-planned source in fixed, bounded chunks.
 pub struct TransferSender {
     plan: TransferPlan,
-    source: PathBuf,
     file: File,
     sequence: u64,
     offset: u64,
@@ -512,44 +579,39 @@ pub struct TransferSender {
 
 impl TransferSender {
     pub fn open(plan: TransferPlan, source: &Path) -> TransferResult<Self> {
-        plan.validate_at(now_unix())?;
-        validate_source_custody(source)?;
-        let metadata = fs::metadata(source).map_err(io_error)?;
-        if metadata.len() != plan.size_bytes {
-            return Err(TransferError::SourceChanged);
-        }
-        let file = File::open(source).map_err(io_error)?;
-        Ok(Self {
-            remaining: plan.size_bytes,
-            plan,
-            source: source.to_path_buf(),
-            file,
-            sequence: 0,
-            offset: 0,
-            hasher: Sha256::new(),
-            done: false,
-        })
+        Self::open_at(plan, source, 0, 0)
     }
 
-    /// Reopen a source at a receiver-provided contiguous cursor after daemon
-    /// restart.  The already-sent prefix is re-hashed without buffering so the
-    /// final source-change check still covers the complete immutable content.
+    /// Open a no-follow source handle at a receiver-provided cursor. Production
+    /// callers should use [`JournalStore::open_source_sender_at`], which first
+    /// creates an owner-only immutable snapshot; this direct helper remains for
+    /// core-only callers and still never reopens the pathname after admission.
     pub fn open_at(
         plan: TransferPlan,
         source: &Path,
         sequence: u64,
         offset: u64,
     ) -> TransferResult<Self> {
+        let file = open_source_nofollow(source)?;
+        Self::from_verified_file(plan, file, sequence, offset)
+    }
+
+    fn from_verified_file(
+        plan: TransferPlan,
+        mut file: File,
+        sequence: u64,
+        offset: u64,
+    ) -> TransferResult<Self> {
         plan.validate_at(now_unix())?;
-        validate_source_custody(source)?;
+        validate_source_handle(&file)?;
         if offset > plan.size_bytes {
             return Err(TransferError::Overflow);
         }
-        let metadata = fs::metadata(source).map_err(io_error)?;
-        if metadata.len() != plan.size_bytes {
+        let (size, digest) = hash_reader(&mut file, plan.size_bytes)?;
+        if size != plan.size_bytes || digest != plan.sha256 {
             return Err(TransferError::SourceChanged);
         }
-        let mut file = File::open(source).map_err(io_error)?;
+        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
         let mut hasher = Sha256::new();
         let mut remaining_prefix = offset;
         let mut buffer = vec![0_u8; MAX_CHUNK_BYTES];
@@ -568,7 +630,6 @@ impl TransferSender {
                 .checked_sub(offset)
                 .ok_or(TransferError::Overflow)?,
             plan,
-            source: source.to_path_buf(),
             file,
             sequence,
             offset,
@@ -615,10 +676,7 @@ impl TransferSender {
             .ok_or(TransferError::Overflow)?;
         self.remaining = next_remaining;
         if self.remaining == 0 {
-            let metadata = fs::metadata(&self.source).map_err(io_error)?;
-            if metadata.len() != self.plan.size_bytes
-                || hex::encode(self.hasher.clone().finalize()) != self.plan.sha256
-            {
+            if hex::encode(self.hasher.clone().finalize()) != self.plan.sha256 {
                 return Err(TransferError::SourceChanged);
             }
         }
@@ -1106,6 +1164,86 @@ impl JournalStore {
         Ok(journal)
     }
 
+    /// Create or reopen the owner-only immutable source snapshot used by the
+    /// live data plane. The caller-provided path is opened once with no-follow
+    /// semantics, copied in bounded chunks, and checked against the immutable
+    /// plan before any network chunk can be emitted. Later reads use only the
+    /// retained owner-only file handle, never that pathname again.
+    pub fn open_source_sender_at(
+        &self,
+        plan: TransferPlan,
+        source: &Path,
+        sequence: u64,
+        offset: u64,
+    ) -> TransferResult<TransferSender> {
+        plan.validate_at(now_unix())?;
+        let snapshot = self.path(plan.id(), ".source")?;
+        if snapshot.exists() {
+            match open_owner_only_file_read(&snapshot)
+                .map_err(|_| TransferError::CustodyUnavailable)
+                .and_then(|file| {
+                    TransferSender::from_verified_file(plan.clone(), file, sequence, offset)
+                }) {
+                Ok(sender) => return Ok(sender),
+                Err(_) => {
+                    // A crash while staging can leave only a partial snapshot.
+                    // It is owner-only and plan-addressed, so remove precisely it
+                    // before making one fresh bounded attempt.
+                    remove_owner_only_file(&snapshot)
+                        .map_err(|_| TransferError::CustodyUnavailable)?;
+                }
+            }
+        }
+
+        let mut input = open_source_nofollow(source)?;
+        validate_source_handle(&input)?;
+        create_owner_only_file_new(&snapshot, &[])
+            .map_err(|_| TransferError::CustodyUnavailable)?;
+        let copy_result = (|| -> TransferResult<()> {
+            let mut output = open_owner_only_file_append(&snapshot)
+                .map_err(|_| TransferError::CustodyUnavailable)?;
+            let mut hasher = Sha256::new();
+            let mut total = 0_u64;
+            let mut buffer = vec![0_u8; MAX_CHUNK_BYTES];
+            loop {
+                let read = input.read(&mut buffer).map_err(io_error)?;
+                if read == 0 {
+                    break;
+                }
+                total = total
+                    .checked_add(u64::try_from(read).map_err(|_| TransferError::Overflow)?)
+                    .ok_or(TransferError::Overflow)?;
+                if total > plan.size_bytes {
+                    return Err(TransferError::SourceChanged);
+                }
+                output.write_all(&buffer[..read]).map_err(io_error)?;
+                hasher.update(&buffer[..read]);
+            }
+            output.sync_all().map_err(io_error)?;
+            if total != plan.size_bytes || hex::encode(hasher.finalize()) != plan.sha256 {
+                return Err(TransferError::SourceChanged);
+            }
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            let _ = remove_owner_only_file(&snapshot);
+            return Err(error);
+        }
+        let file =
+            open_owner_only_file_read(&snapshot).map_err(|_| TransferError::CustodyUnavailable)?;
+        TransferSender::from_verified_file(plan, file, sequence, offset)
+    }
+
+    /// Remove the exact owner-only source snapshot after terminal completion or
+    /// cancellation. It cannot select a caller-controlled path.
+    pub fn remove_source_snapshot(&self, plan: &TransferPlan) -> TransferResult<()> {
+        let path = self.path(plan.id(), ".source")?;
+        if path.exists() {
+            remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+        }
+        Ok(())
+    }
+
     /// Persist immutable plan metadata separately from progress so a restarted
     /// daemon can reopen only the exact authorized transfer id.
     pub fn save_plan(&self, plan: &TransferPlan) -> TransferResult<()> {
@@ -1329,6 +1467,13 @@ impl JournalStore {
                     return Err(TransferError::CustodyUnavailable);
                 }
                 remove_owner_only_file(&part).map_err(|_| TransferError::CustodyUnavailable)?;
+            }
+            let source = self.path(&journal.plan_id, ".source")?;
+            if let Ok(metadata) = fs::symlink_metadata(&source) {
+                if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+                    return Err(TransferError::CustodyUnavailable);
+                }
+                remove_owner_only_file(&source).map_err(|_| TransferError::CustodyUnavailable)?;
             }
             remove_owner_only_file(&journal_path).map_err(|_| TransferError::CustodyUnavailable)?;
             let plan = self.path(&journal.plan_id, ".plan.json")?;

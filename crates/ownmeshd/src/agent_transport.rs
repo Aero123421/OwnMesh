@@ -111,6 +111,147 @@ fn parse_transfer_ticket_wire(raw: &str) -> Result<AgentTransferTicket, String> 
     serde_json::from_slice(&bytes).map_err(|_| "invalid transfer ticket body".into())
 }
 
+/// The bearer itself is intentionally excluded from the auditable action hash,
+/// but every authority fact inside it must equal the already verified
+/// `transfer.start` action. This prevents a stolen valid ticket from attaching a
+/// different Room/proof generation to an otherwise exact-bound request.
+fn validate_ticket_for_start(
+    ticket: &AgentTransferTicket,
+    request: &OperationRequestPayload,
+    args: &Value,
+    device_id: &DeviceId,
+) -> Result<(), String> {
+    let object = args.as_object().ok_or("invalid transfer start arguments")?;
+    let text = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("transfer start argument '{name}' is missing"))
+    };
+    let number = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("transfer start argument '{name}' is missing"))
+    };
+    let bound = request
+        .authorization
+        .as_ref()
+        .and_then(|authorization| authorization.bound_action.as_object())
+        .ok_or("verified transfer start binding is missing")?;
+    let principal = bound
+        .get("principal_id")
+        .and_then(Value::as_str)
+        .ok_or("verified transfer start principal is missing")?;
+    let tenant = bound
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .ok_or("verified transfer start tenant is missing")?;
+    let role = text("role")?;
+    let expected_local = if role == "source" {
+        text("source_device_id")?
+    } else if role == "destination" {
+        text("destination_device_id")?
+    } else {
+        return Err("invalid transfer start role".into());
+    };
+    let grant_expiry = number("grant_expires_at_unix")?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock before unix epoch")?
+        .as_millis() as u64;
+    ticket.validate_for(device_id.as_str(), role, now_ms)?;
+    if ticket.transfer_id != text("transfer_id")?
+        || ticket.tenant_id != tenant
+        || ticket.principal_id != principal
+        || ticket.device_id != device_id.as_str()
+        || ticket.role != role
+        || ticket.source_device_id != text("source_device_id")?
+        || ticket.destination_device_id != text("destination_device_id")?
+        || ticket.source_workspace_id != text("source_workspace_id")?
+        || ticket.destination_workspace_id != text("destination_workspace_id")?
+        || ticket.plan_sha256 != text("plan_sha256")?
+        || ticket.epoch != u32::try_from(number("epoch")?).map_err(|_| "transfer epoch overflow")?
+        || ticket.fence != number("fence")?
+        || ticket.max_bytes != number("size_bytes")?
+        || ticket.transfer_expires_at / 1_000 != grant_expiry
+        || expected_local != device_id.as_str()
+    {
+        return Err("transfer ticket does not match exact start binding".into());
+    }
+    Ok(())
+}
+
+fn transfer_start_result(
+    admitted: &Value,
+    ticket: &AgentTransferTicket,
+    completed: bool,
+    destination_publish: Option<&Value>,
+    expected_artifact_sha256: Option<&str>,
+) -> Result<Value, String> {
+    let object = admitted
+        .as_object()
+        .ok_or("transfer start admission is invalid")?;
+    let allowed = [
+        "transfer_id",
+        "plan_id",
+        "role",
+        "plan_sha256",
+        "epoch",
+        "fence",
+        "admitted",
+    ];
+    if object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || object.get("transfer_id").and_then(Value::as_str) != Some(ticket.transfer_id.as_str())
+        || object.get("role").and_then(Value::as_str) != Some(ticket.role.as_str())
+        || object.get("plan_sha256").and_then(Value::as_str) != Some(ticket.plan_sha256.as_str())
+        || object.get("epoch").and_then(Value::as_u64) != Some(u64::from(ticket.epoch))
+        || object.get("fence").and_then(Value::as_u64) != Some(ticket.fence)
+        || object.get("admitted") != Some(&Value::Bool(true))
+        || object
+            .get("plan_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err("transfer start admission binding mismatch".into());
+    }
+    let mut result = json!({
+        "transfer_id": ticket.transfer_id,
+        "plan_id": object.get("plan_id").cloned().unwrap_or(Value::Null),
+        "role": ticket.role,
+        "plan_sha256": ticket.plan_sha256,
+        "epoch": ticket.epoch,
+        "fence": ticket.fence,
+        "admitted": true,
+        "completed": completed,
+    });
+    if ticket.role == "destination" {
+        let published = destination_publish
+            .and_then(Value::as_object)
+            .ok_or("destination publication receipt missing")?;
+        let sha256 = published
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or("destination publication digest missing")?;
+        let expected_artifact_sha256 = expected_artifact_sha256
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or("destination canonical artifact digest missing")?;
+        if published.get("published") != Some(&Value::Bool(true))
+            || published.get("plan_id").and_then(Value::as_str)
+                != object.get("plan_id").and_then(Value::as_str)
+            || published.get("size_bytes").and_then(Value::as_u64) != Some(ticket.max_bytes)
+            || sha256 != expected_artifact_sha256
+        {
+            return Err("destination publication receipt is invalid".into());
+        }
+        result["published"] = Value::Bool(true);
+        result["artifact_sha256"] = Value::String(sha256.to_owned());
+    }
+    Ok(result)
+}
+
 fn base64url_decode(value: &str) -> Result<Vec<u8>, String> {
     if value.is_empty() || value.len() % 4 == 1 {
         return Err("invalid base64url".into());
@@ -500,11 +641,9 @@ async fn run_destination_transfer_pump(
             if expected_offset != ticket.max_bytes {
                 return Err("transfer finish before durable destination completion".into());
             }
-            transfer_runtime_call(runtime, authority, methods::TRANSFER_FINALIZE, json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"workspace_id":ticket.destination_workspace_id}), None).await?;
+            let finalized = transfer_runtime_call(runtime, authority, methods::TRANSFER_FINALIZE, json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"workspace_id":ticket.destination_workspace_id}), None).await?;
             socket.send(Message::Text(json!({"protocol":"ownmesh.transfer/1.0","type":"finish_ack","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256}).to_string().into())).await.map_err(|_| "transfer finish acknowledgement send failed")?;
-            return Ok(
-                json!({"transfer_id":ticket.transfer_id,"state":"completed","plan_sha256":ticket.plan_sha256}),
-            );
+            return Ok(finalized);
         }
         if object.get("type").and_then(Value::as_str) != Some("chunk")
             || !transfer_frame_binding(object, ticket)
@@ -2220,15 +2359,23 @@ fn map_request_to_method(
 ) -> Result<(&'static str, Value), String> {
     let action = action_of(request);
     let mut args = args_object(request);
-    // Only the private preflight operations receive server-derived peer facts.
-    // They are still covered by the exact operation authorization binding before
-    // this mapper runs; public MCP requests never route these capabilities.
+    // Only private exact-bound transfer operations receive server-derived peer
+    // facts. `transfer.start` needs the complete signed plan so its local
+    // runtime can reconstruct exactly what the Room ticket authorizes; it is
+    // admitted here only after `verify_exact_action_binding` has authenticated
+    // the whole action. Public transfer calls remain unable to inject them.
     let internal_preflight = matches!(
         request.capability.as_str(),
         "transfer.preflight_source" | "transfer.preflight_destination"
     );
+    let internal_start = request.capability == "transfer.start"
+        && request
+            .authorization
+            .as_ref()
+            .is_some_and(|authorization| authorization.bound_action.is_object());
     if (request.capability.starts_with("transfer.") || action.starts_with("transfer."))
         && !internal_preflight
+        && !internal_start
     {
         for forbidden in [
             "tenant_id",
@@ -2822,27 +2969,25 @@ async fn dispatch_remote_operation(
     // Reject a malformed/foreign ticket before policy or runtime admission.
     // The private ephemeral is intentionally consumed only by the actual pump
     // after this admission succeeds, so a malformed retry cannot burn it.
-    if request.capability == "transfer.start" {
-        let ticket_wire = mapped
+    let transfer_start_ticket = if request.capability == "transfer.start" {
+        let ticket = mapped
             .1
             .get("ticket")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing transfer ticket".to_owned())
             .and_then(parse_transfer_ticket_wire);
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "clock before unix epoch")
-            .map(|duration| duration.as_millis() as u64);
-        match (ticket_wire, now_ms) {
-            (Ok(ticket), Ok(now_ms))
-                if ticket
-                    .validate_for(device_id.as_str(), &ticket.role, now_ms)
-                    .is_ok() => {}
-            _ => {
+        match ticket.and_then(|ticket| {
+            validate_ticket_for_start(&ticket, request, &mapped.1, device_id)?;
+            Ok(ticket)
+        }) {
+            Ok(ticket) => Some(ticket),
+            Err(_) => {
                 return json!({ "operation_contract": OPERATION_CONTRACT_V1, "operation_id": operation_id, "status": "failed", "error": { "code": "OWNMESH_E_TRANSFER_TICKET", "message": "invalid transfer ticket", "retryable": false } })
             }
         }
-    }
+    } else {
+        None
+    };
 
     if mapped.0 == "__cancel__" {
         // Cancel is handled on the live loop; this branch is defensive only.
@@ -2976,13 +3121,20 @@ async fn dispatch_remote_operation(
 
     match outcome {
         Ok(body) => {
-            if let Some(args) = transfer_start_args {
+            if let (Some(args), Some(ticket)) = (transfer_start_args, transfer_start_ticket) {
                 let session = async {
                     let ticket_wire = args
                         .get("ticket")
                         .and_then(Value::as_str)
                         .ok_or("missing transfer ticket")?;
-                    let ticket = parse_transfer_ticket_wire(ticket_wire)?;
+                    // Re-check the same exact action immediately before the
+                    // one-time preflight cache is consumed and before opening
+                    // the Room socket.  This keeps a substituted bearer from
+                    // spending a legitimate ephemeral proof.
+                    validate_ticket_for_start(&ticket, request, &args, device_id)?;
+                    let expected_artifact_sha256 = args
+                        .get("content_sha256")
+                        .and_then(Value::as_str);
                     let cipher =
                         consume_preflight_cipher(preflight_ephemerals, device_id.as_str(), &ticket)
                             .await?;
@@ -3034,14 +3186,16 @@ async fn dispatch_remote_operation(
                     // transition and remove the local receiver part file.  The
                     // cancel frame is best-effort only: local cleanup is still
                     // attempted if the peer has already disconnected.
-                    let peer_cancelled = pumped
+                    let failure = pumped
                         .as_ref()
                         .err()
-                        .is_some_and(|error| {
-                            classify_transfer_failure(error) == TransferSessionFailure::Cancelled
-                        });
-                    if *cancel.borrow() || peer_cancelled {
-                        if *cancel.borrow() {
+                        .map(|error| classify_transfer_failure(error));
+                    if *cancel.borrow()
+                        || matches!(failure, Some(TransferSessionFailure::Cancelled | TransferSessionFailure::Terminal))
+                    {
+                        if *cancel.borrow()
+                            || matches!(failure, Some(TransferSessionFailure::Terminal))
+                        {
                             let _ = socket
                                 .send(Message::Text(
                                     json!({"protocol":"ownmesh.transfer/1.0","type":"cancel","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256})
@@ -3059,7 +3213,14 @@ async fn dispatch_remote_operation(
                         )
                         .await;
                     }
-                    pumped
+                    let pump_receipt = pumped?;
+                    transfer_start_result(
+                        &body,
+                        &ticket,
+                        true,
+                        (ticket.role == "destination").then_some(&pump_receipt),
+                        expected_artifact_sha256,
+                    )
                 }
                 .await;
                 return match session {
@@ -4308,6 +4469,83 @@ mod tests {
             error.contains("tenant_id") || error.contains("destination_device_id"),
             "{error}"
         );
+
+        // The private start envelope is already exact-action-bound before this
+        // mapper is reached.  It must preserve the server-derived plan facts
+        // for the local runtime, unlike every public transfer surface above.
+        let mut start = normal;
+        start.capability = "transfer.start".into();
+        start.arguments = json!({
+            "action": "transfer.start",
+            "transfer_id": "xfer_start_1",
+            "ticket": "opaque-ticket",
+            "role": "source",
+            "tenant_id": "ten_1",
+            "source_device_id": "dev_source",
+            "destination_device_id": "dev_destination",
+            "grant_id": "xfer_start_1",
+            "grant_expires_at_unix": 4_102_444_800_u64,
+        });
+        start.authorization = Some(ownmesh_protocol::OperationAuthorizationBinding {
+            bound_action: json!({"exact": "server-bound action"}),
+        });
+        let (method, args) = map_request_to_method(&start).unwrap();
+        assert_eq!(method, "transfer.start");
+        assert_eq!(args["source_device_id"], json!("dev_source"));
+        assert_eq!(args["grant_id"], json!("xfer_start_1"));
+
+        start.authorization = None;
+        let error = map_request_to_method(&start).unwrap_err();
+        assert!(
+            error.contains("tenant_id") || error.contains("source_device_id"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn transfer_start_receipt_rejects_cross_ticket_substitution_and_emits_exact_destination_contract(
+    ) {
+        let mut ticket: AgentTransferTicket = serde_json::from_value(json!({
+            "v": 1,
+            "jti": "jti_1", "session_nonce": "session_1",
+            "transfer_id": "xfer_expected", "tenant_id": "ten_1", "principal_id": "prin_1",
+            "device_id": "dev_destination", "role": "destination",
+            "source_device_id": "dev_source", "destination_device_id": "dev_destination",
+            "source_workspace_id": "ws_source", "destination_workspace_id": "ws_destination",
+            "plan_sha256": "a".repeat(64), "epoch": 1, "fence": 9, "max_bytes": 7,
+            "ticket_exp": u64::MAX, "transfer_expires_at": u64::MAX,
+            "source_device_public_key": "00".repeat(32), "destination_device_public_key": "00".repeat(32),
+            "source_ephemeral_public_key": "00".repeat(32), "destination_ephemeral_public_key": "00".repeat(32),
+            "source_ephemeral_signature": "00".repeat(64), "destination_ephemeral_signature": "00".repeat(64)
+        }))
+        .unwrap();
+        let admission = json!({"transfer_id":"xfer_expected","plan_id":"plan_1","role":"destination","plan_sha256":"a".repeat(64),"epoch":1,"fence":9,"admitted":true});
+        let publication =
+            json!({"plan_id":"plan_1","published":true,"size_bytes":7,"sha256":"b".repeat(64)});
+        let result = transfer_start_result(
+            &admission,
+            &ticket,
+            true,
+            Some(&publication),
+            Some(&"b".repeat(64)),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({"transfer_id":"xfer_expected","plan_id":"plan_1","role":"destination","plan_sha256":"a".repeat(64),"epoch":1,"fence":9,"admitted":true,"completed":true,"published":true,"artifact_sha256":"b".repeat(64)})
+        );
+
+        // A valid-looking ticket for a different transfer cannot attach to
+        // this same-content admission and cannot produce a durable receipt.
+        ticket.transfer_id = "xfer_substituted".into();
+        assert!(transfer_start_result(
+            &admission,
+            &ticket,
+            true,
+            Some(&publication),
+            Some(&"b".repeat(64)),
+        )
+        .is_err());
     }
 
     #[tokio::test]

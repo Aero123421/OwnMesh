@@ -2404,7 +2404,9 @@ full_user_access/full_access for arbitrary commands",
         let source = workspace
             .resolve(Path::new(&plan.binding().source_relative_path))
             .map_err(fs_err)?;
-        let sender = TransferSender::open_at(plan.clone(), &source, p.sequence, p.offset)
+        let sender = self
+            .transfer_store
+            .open_source_sender_at(plan.clone(), &source, p.sequence, p.offset)
             .map_err(Self::transfer_error)?;
         self.transfer_senders.insert(plan.id().to_owned(), sender);
         self.transfer_last_chunks.remove(plan.id());
@@ -2434,14 +2436,21 @@ full_user_access/full_access for arbitrary commands",
                 );
             }
         }
-        let sender = self
+        let next = self
             .transfer_senders
             .get_mut(plan.id())
             .ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "source is not open; reopen at the durable receiver cursor".into(),
-            })?;
-        let Some(chunk) = sender.next_chunk().map_err(Self::transfer_error)? else {
+            })?
+            .next_chunk()
+            .map_err(Self::transfer_error)?;
+        let Some(chunk) = next else {
+            self.transfer_senders.remove(plan.id());
+            self.transfer_last_chunks.remove(plan.id());
+            self.transfer_store
+                .remove_source_snapshot(&plan)
+                .map_err(Self::transfer_error)?;
             return Ok(json!({ "plan_id": plan.id(), "sequence": p.sequence, "eof": true }));
         };
         if chunk.sequence != p.sequence {
@@ -2767,6 +2776,7 @@ full_user_access/full_access for arbitrary commands",
             {
                 self.transfer_senders.remove(plan.id());
                 self.transfer_last_chunks.remove(plan.id());
+                let _ = self.transfer_store.remove_source_snapshot(&plan);
                 return Ok(json!({ "plan_id": plan.id(), "cancelled": true, "source_only": true }));
             }
             Err(error) => return Err(Self::transfer_error(error)),
@@ -2806,6 +2816,7 @@ full_user_access/full_access for arbitrary commands",
             .map_err(Self::transfer_error)?;
         self.transfer_senders.remove(plan.id());
         self.transfer_last_chunks.remove(plan.id());
+        let _ = self.transfer_store.remove_source_snapshot(&plan);
         Ok(json!({ "plan_id": plan.id(), "cancelled": true, "state": updated.state() }))
     }
 

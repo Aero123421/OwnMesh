@@ -256,11 +256,53 @@ fn source_mutation_is_detected_before_streaming() {
     let plan =
         TransferPlan::for_source(&source, binding(), grant(), PlanLimits::default(), 1).unwrap();
     std::fs::write(&source, b"other").unwrap();
-    let mut sender = TransferSender::open(plan, &source).unwrap();
-    assert_eq!(
-        sender.next_chunk().unwrap_err(),
-        TransferError::SourceChanged
-    );
+    assert!(matches!(
+        TransferSender::open(plan, &source),
+        Err(TransferError::SourceChanged)
+    ));
+}
+
+#[test]
+fn source_snapshot_retains_the_verified_file_across_path_replacement() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.bin");
+    let original = b"verified source".to_vec();
+    std::fs::write(&source, &original).unwrap();
+    let plan =
+        TransferPlan::for_source(&source, binding(), grant(), PlanLimits::default(), 1).unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let mut sender = store
+        .open_source_sender_at(plan.clone(), &source, 0, 0)
+        .unwrap();
+
+    // Simulate a rename/replacement race after admission. Every emitted byte
+    // must still come from the owner-only verified snapshot, not this path.
+    std::fs::rename(&source, dir.path().join("source.old")).unwrap();
+    std::fs::write(&source, b"attacker changed").unwrap();
+    let mut sent = Vec::new();
+    while let Some(chunk) = sender.next_chunk().unwrap() {
+        sent.extend_from_slice(&chunk.bytes);
+    }
+    assert_eq!(sent, original);
+    drop(sender);
+    store.remove_source_snapshot(&plan).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn source_symlink_is_rejected_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target.bin");
+    let link = dir.path().join("source.bin");
+    std::fs::write(&target, b"private target").unwrap();
+    symlink(&target, &link).unwrap();
+    let plan = make_plan(b"private target");
+    assert!(matches!(
+        TransferSender::open(plan, &link),
+        Err(TransferError::Io(_)) | Err(TransferError::CustodyUnavailable)
+    ));
 }
 
 #[test]
