@@ -102,7 +102,7 @@ impl SupervisorState {
         // Do not reserve durable identity until a PTY exists. If custody/spool
         // creation fails, dropping this newly spawned host cleans its tree.
         let spool = OwnerSpool::create(&self.root, manifest.clone())?;
-        let stderr_spool = matches!(io_mode, HostIoMode::StructuredPipes).then(|| OwnerSpool::create(&self.root.join("stderr"), manifest.clone())).transpose()?;
+        let stderr_spool = matches!(io_mode, HostIoMode::StructuredPipes).then(|| OwnerSpool::create_stderr(&self.root, &manifest.session_id)).transpose()?;
         let binding = binding_of(&manifest);
         hosts.insert(
             manifest.session_id.clone(),

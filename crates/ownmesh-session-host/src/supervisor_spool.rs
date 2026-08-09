@@ -22,6 +22,7 @@ pub const SUPERVISOR_BINDING_MAX_TTL_SECS: i64 = 60 * 60;
 pub const SUPERVISOR_HOST_MAX_TTL_SECS: i64 = 24 * 60 * 60;
 const MANIFEST_FILE: &str = "host-manifest.json";
 const SPOOL_FILE: &str = "owner-output.spool";
+const STDERR_SPOOL_FILE: &str = "stderr-output.spool";
 const CLAIM_FILE: &str = "host.claim";
 const TERMINATION_FILE: &str = "host-terminated.json";
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
@@ -214,6 +215,7 @@ pub struct SpoolPage {
 pub struct OwnerSpool {
     dir: PathBuf,
     manifest: HostManifest,
+    payload_file: &'static str,
 }
 
 impl OwnerSpool {
@@ -244,7 +246,7 @@ impl OwnerSpool {
         // State (base offset + bytes) is one atomically replaced owner-only file.
         create_owner_only_file_new(&dir.join(SPOOL_FILE), &encode_spool(0, &[]))
             .map_err(|e| format!("create supervisor spool: {e}"))?;
-        Ok(Self { dir, manifest })
+        Ok(Self { dir, manifest, payload_file: SPOOL_FILE })
     }
 
     pub fn open(root: &Path, session_id: &str) -> Result<Self, String> {
@@ -262,7 +264,18 @@ impl OwnerSpool {
         if manifest.session_id != session_id {
             return Err("supervisor manifest/session path mismatch".into());
         }
-        let spool = Self { dir, manifest };
+        let spool = Self { dir, manifest, payload_file: SPOOL_FILE };
+        let _ = spool.read_state()?;
+        Ok(spool)
+    }
+
+    /// Open a second stream in the same custody-attested session directory.
+    /// It shares the single authoritative manifest and transition receipt.
+    pub fn create_stderr(root: &Path, session_id: &str) -> Result<Self, String> {
+        let mut spool = Self::open(root, session_id)?;
+        let path = spool.dir.join(STDERR_SPOOL_FILE);
+        if !path.exists() { create_owner_only_file_new(&path, &encode_spool(0, &[])).map_err(|e| format!("create stderr spool: {e}"))?; }
+        spool.payload_file = STDERR_SPOOL_FILE;
         let _ = spool.read_state()?;
         Ok(spool)
     }
@@ -413,7 +426,7 @@ impl OwnerSpool {
         let mut next = Vec::with_capacity(retained.len().saturating_sub(drop_count) + bytes.len());
         next.extend_from_slice(&retained[drop_count..]);
         next.extend_from_slice(bytes);
-        atomic_write_owner_only(&self.dir.join(SPOOL_FILE), &encode_spool(next_base, &next))
+        atomic_write_owner_only(&self.dir.join(self.payload_file), &encode_spool(next_base, &next))
             .map_err(|e| format!("write supervisor spool: {e}"))
     }
 
@@ -450,7 +463,7 @@ impl OwnerSpool {
 
     fn read_state(&self) -> Result<(u64, Vec<u8>), String> {
         let bytes = read_owner_only_file_bounded(
-            &self.dir.join(SPOOL_FILE),
+            &self.dir.join(self.payload_file),
             SUPERVISOR_SPOOL_MAX_BYTES + SPOOL_HEADER_BYTES,
         )
         .map_err(|e| format!("read supervisor spool: {e}"))?;
