@@ -1874,10 +1874,18 @@ full_user_access/full_access for arbitrary commands",
             })?;
         if review.principal != client.client_name
             || self.active_remote_device_id.as_deref() != Some(review.device_id.as_str())
+            || review.expires_unix < Self::now()
         {
             return Err(IpcError::Remote {
                 code: app_error::POLICY_DENIED,
                 message: "review binding mismatch".into(),
+            });
+        }
+        let ws = self.workspace_for(Some(&review.workspace_id))?;
+        if git_head_oid(&ws, Path::new(&review.repo_root)).map_err(fs_err)? != review.head_oid {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "review repository HEAD changed; start a new review".into(),
             });
         }
         let result = self
@@ -1922,7 +1930,7 @@ full_user_access/full_access for arbitrary commands",
             });
         }
         let ws = self.workspace_for(Some(&review.workspace_id))?;
-        let head = git_head_oid(&ws, Path::new("")).map_err(fs_err)?;
+        let head = git_head_oid(&ws, Path::new(&review.repo_root)).map_err(fs_err)?;
         if head != review.head_oid {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
