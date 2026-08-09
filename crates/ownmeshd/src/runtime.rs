@@ -105,6 +105,7 @@ pub mod ops_methods {
     pub const GIT_DIFF: &str = "ops.git.diff";
     pub const REVIEW_START: &str = "ops.review.start";
     pub const REVIEW_SHOW: &str = "ops.review.show";
+    pub const REVIEW_PAGE: &str = "ops.review.page";
     pub const LOGS_LIST_PROVIDERS: &str = "ops.logs.list_providers";
     pub const WORKSPACE_LIST: &str = "ops.workspace.list";
     pub const WORKSPACE_SHOW: &str = "ops.workspace.show";
@@ -117,6 +118,10 @@ const LOCAL_PRINCIPAL: &str = "prin_local";
 const DEFAULT_GRANT_SECS: i64 = 3600;
 const OP_JOURNAL_STATE_FIELD: &str = "__ownmesh_operation_state";
 const OP_JOURNAL_IN_PROGRESS: &str = "in_progress";
+
+fn review_page_limit() -> usize {
+    48 * 1024
+}
 
 /// Pending or decided approval tied to a deferred operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1885,6 +1890,63 @@ full_user_access/full_access for arbitrary commands",
         Ok(json!({ "review": review, "result": result }))
     }
 
+    fn handle_review_page(
+        &self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct P {
+            review_id: String,
+            #[serde(default)]
+            cursor: u64,
+            #[serde(default = "review_page_limit")]
+            max_bytes: usize,
+        }
+        let p: P = parse_params(params)?;
+        let review = self
+            .review_manifests
+            .get(&p.review_id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "review not found".into(),
+            })?;
+        if review.principal != client.client_name
+            || self.active_remote_device_id.as_deref() != Some(review.device_id.as_str())
+            || review.expires_unix < Self::now()
+        {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: "review binding expired or mismatched".into(),
+            });
+        }
+        let ws = self.workspace_for(Some(&review.workspace_id))?;
+        let head = git_head_oid(&ws, Path::new("")).map_err(fs_err)?;
+        if head != review.head_oid {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "review repository HEAD changed; start a new review".into(),
+            });
+        }
+        let page = self
+            .review_results
+            .page(
+                &p.review_id,
+                p.cursor,
+                p.max_bytes.min(48 * 1024),
+                Self::now(),
+            )
+            .map_err(|message| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message,
+            })?;
+        serde_json::to_value(page).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })
+    }
+
     fn handle_approval_list(&self) -> IpcResult<Value> {
         let mut list: Vec<&ApprovalRecord> = self.approvals.values().collect();
         list.sort_by(|a, b| b.created_at_unix.cmp(&a.created_at_unix));
@@ -2680,6 +2742,7 @@ full_user_access/full_access for arbitrary commands",
             ops_methods::GIT_DIFF => self.handle_git_diff(params, client).await,
             ops_methods::REVIEW_START => self.handle_review_start(params, client).await,
             ops_methods::REVIEW_SHOW => self.handle_review_show(params, client),
+            ops_methods::REVIEW_PAGE => self.handle_review_page(params, client),
             ops_methods::WORKSPACE_LIST => self.handle_workspace_list(client),
             ops_methods::WORKSPACE_SHOW => self.handle_workspace_show(params),
             ops_methods::WORKSPACE_ADD => self.handle_workspace_add(params, client),

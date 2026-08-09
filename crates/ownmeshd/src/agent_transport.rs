@@ -1800,6 +1800,9 @@ fn map_request_to_method(
         ("review.show" | "review", "review.show" | "ownmesh_review_show" | "show") => {
             crate::runtime::ops_methods::REVIEW_SHOW
         }
+        ("review.page" | "review", "review.page" | "ownmesh_review_page" | "page") => {
+            crate::runtime::ops_methods::REVIEW_PAGE
+        }
         // Device-local workspace registry CRUD (E4 configuration).
         ("workspace.list" | "workspace", "workspace.list" | "ownmesh_workspace_list" | "list") => {
             crate::runtime::ops_methods::WORKSPACE_LIST

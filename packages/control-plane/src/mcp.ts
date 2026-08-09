@@ -1054,6 +1054,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, scope: "ownmesh.read", risk: "read",
   },
   {
+    name: "ownmesh_review_page",
+    description: "Read one bounded typed output page from an exact device-local review receipt.",
+    inputSchema: { type: "object", properties: { ...deviceProp, review_id: str, cursor: { type: "integer", minimum: 0 }, max_bytes: { type: "integer", minimum: 1, maximum: 49152 }, idempotency_key: str }, required: ["device_id", "review_id", "idempotency_key"], additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, scope: "ownmesh.read", risk: "read",
+  },
+  {
     name: "ownmesh_workspace_list",
     description: "List device-local workspace roots registered on a PC (CRUD configuration)",
     inputSchema: {
@@ -1912,6 +1918,8 @@ function toolCapability(toolName: string): string {
       return "review.start";
     case "ownmesh_review_show":
       return "review.show";
+    case "ownmesh_review_page":
+      return "review.page";
     case "ownmesh_workspace_list":
       return "workspace.list";
     case "ownmesh_workspace_show":
@@ -1984,6 +1992,8 @@ function toolAction(toolName: string): string {
       return "review.start";
     case "ownmesh_review_show":
       return "review.show";
+    case "ownmesh_review_page":
+      return "review.page";
     case "ownmesh_workspace_list":
       return "workspace.list";
     case "ownmesh_workspace_show":
