@@ -188,15 +188,14 @@ impl LiveHost {
             .map_err(|e| format!("resize: {e}"))
     }
 
-    /// Drain up to `max_bytes` of pending UTF-8 lossy output.
+    /// Drain up to `max_bytes` of raw PTY output bytes.
     ///
-    /// Returns `(text, ring_truncated, child_exited, exit_code, remaining_bytes)`.
-    /// `remaining_bytes > 0` means more live-ring data is pending and must be
-    /// surfaced as a continuation (never a silent EOF).
-    pub fn drain_output(
-        &self,
-        max_bytes: usize,
-    ) -> Result<(String, bool, bool, Option<u32>, usize), String> {
+    /// Returns `(bytes, ring_truncated, child_exited, exit_code, remaining_bytes)`.
+    /// Callers that need display text must perform their own explicitly lossy
+    /// conversion; durable supervisor spools retain these bytes unchanged.
+    pub fn drain_output_bytes(&self, max_bytes: usize) -> Result<RawDrainOutput, String> {
+        // `remaining_bytes > 0` means more live-ring data is pending and must
+        // be surfaced as a continuation (never a silent EOF).
         // Opportunistically observe child exit without blocking.
         if let Ok(mut child) = self.child.lock() {
             if let Ok(Some(status)) = child.try_wait() {
@@ -209,8 +208,26 @@ impl LiveHost {
         }
         let mut ring = self.output.lock().map_err(|e| e.to_string())?;
         let (bytes, truncated, remaining) = ring.drain(max_bytes.max(1));
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        Ok((text, truncated, ring.exited, ring.exit_code, remaining))
+        Ok((bytes, truncated, ring.exited, ring.exit_code, remaining))
+    }
+
+    /// Drain up to `max_bytes` of pending output as explicitly lossy UTF-8.
+    ///
+    /// This compatibility view is for terminal presentation only. Persistent
+    /// supervisor output uses [`Self::drain_output_bytes`] instead.
+    pub fn drain_output(
+        &self,
+        max_bytes: usize,
+    ) -> Result<(String, bool, bool, Option<u32>, usize), String> {
+        let (bytes, truncated, exited, exit_code, remaining) =
+            self.drain_output_bytes(max_bytes)?;
+        Ok((
+            String::from_utf8_lossy(&bytes).into_owned(),
+            truncated,
+            exited,
+            exit_code,
+            remaining,
+        ))
     }
 
     /// Bytes still buffered in the live ring (not yet drained into the spool).
@@ -679,6 +696,10 @@ fn read_pipe_capped(mut reader: impl Read, max_bytes: usize) -> (String, bool) {
 
 /// Aggregate byte budget for one-shot `read_until` collection (CLI helper).
 pub const READ_UNTIL_MAX_BYTES: usize = 256 * 1024;
+
+/// Raw PTY drain result: bytes, ring truncation, child exit, exit status, and
+/// remaining live-ring bytes.
+pub type RawDrainOutput = (Vec<u8>, bool, bool, Option<u32>, usize);
 /// Bounded channel depth for reader→collector chunks (4 KiB each).
 const READ_UNTIL_CHANNEL_CHUNKS: usize = 64;
 

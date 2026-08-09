@@ -149,6 +149,29 @@ impl OwnerSpool {
         &self.manifest
     }
 
+    /// Replace the durable controller binding without altering retained PTY
+    /// bytes. The caller must have already proven exact possession of the old
+    /// binding; this method validates the successor before atomically replacing
+    /// the manifest so a crash exposes either the old or the complete new one.
+    pub fn rotate_manifest(&mut self, next: HostManifest) -> Result<(), String> {
+        next.validate()?;
+        if next.session_id != self.manifest.session_id
+            || next.device_id != self.manifest.device_id
+            || next.workspace_id != self.manifest.workspace_id
+        {
+            return Err("supervisor binding identity cannot change".into());
+        }
+        if next.controller_epoch <= self.manifest.controller_epoch {
+            return Err("supervisor binding epoch must advance".into());
+        }
+        let bytes = serde_json::to_vec(&next)
+            .map_err(|e| format!("encode rotated supervisor manifest: {e}"))?;
+        atomic_write_owner_only(&self.dir.join(MANIFEST_FILE), &bytes)
+            .map_err(|e| format!("rotate supervisor manifest: {e}"))?;
+        self.manifest = next;
+        Ok(())
+    }
+
     /// Atomically append bounded output. Dropping head bytes increments the
     /// durable absolute base offset, so cursors never rewind into different data.
     pub fn append(&self, bytes: &[u8]) -> Result<(), String> {
