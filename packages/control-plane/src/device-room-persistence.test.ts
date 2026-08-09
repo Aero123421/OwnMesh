@@ -19,6 +19,7 @@ import {
   MAX_PENDING_PAYLOAD_BYTES,
   MAX_SEEN_MESSAGE_IDS,
   MAX_SERIALIZED_STATE_BYTES,
+  LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS,
   PENDING_TTL_MS,
   PROTOCOL,
   ROOM_STATE_STORAGE_KEY,
@@ -52,6 +53,27 @@ async function operationHeaders(
     correlation_id: extra?.correlation_id,
     method: "POST",
     path: "/operation",
+    body_sha256,
+  });
+  return { headers, bodyText };
+}
+
+/** Mint the stricter one-shot internal context used for ticket-bearing starts. */
+async function liveOperationHeaders(
+  deviceId: string,
+  body: unknown,
+  correlationId: string,
+): Promise<{ headers: Headers; bodyText: string }> {
+  const bodyText = JSON.stringify(body);
+  const body_sha256 = await sha256Hex(bodyText);
+  const headers = await internalDoHeaders(SESSION_SECRET, {
+    op: "live_operation",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    correlation_id: correlationId,
+    method: "POST",
+    path: "/live-operation",
     body_sha256,
   });
   return { headers, bodyText };
@@ -1081,6 +1103,172 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   );
 });
 
+test("live transfer tombstone survives hibernation without bearer replay or storage", async () => {
+  const deviceId = "dev_live_ticket_01";
+  const rawBearer = "ticket.live-secret.jti-123";
+  const rawCiphertext = "ciphertext-live-transfer-bytes";
+  const delivered: string[] = [];
+  const router = new DeviceRoomRouter(deviceId, {
+    sendToSession: (sid, raw) => { if (sid === "ags_live") delivered.push(raw); return true; },
+    sendToRole: () => 0,
+  });
+  router.registerSession({ role: "agent", device_id: deviceId, session_id: "ags_live", connected_at: Date.now(), phase: "ready", remote_routing_enabled: true });
+  router.pending.set("op_live", {
+    correlation_id: "op_live", type: "transfer.start", from_session: "", created_at: Date.now(),
+    payload: { operation_id: "op_live", capability: "transfer.start" }, expires_at: new Date(Date.now() + 60_000).toISOString(), live_only: true,
+  });
+  const snapshot = router.exportState();
+  const stored = JSON.stringify(snapshot);
+  for (const forbidden of [rawBearer, rawCiphertext, "ephemeral", "bearer.secret", "raw-transfer-bytes"]) {
+    assert.equal(stored.includes(forbidden), false, `durable state leaked ${forbidden}`);
+  }
+  const resumed = new DeviceRoomRouter(deviceId, { sendToSession: () => true, sendToRole: () => 0 });
+  resumed.importState(snapshot);
+  resumed.registerSession({ role: "agent", device_id: deviceId, session_id: "ags_live", connected_at: Date.now(), phase: "ready", remote_routing_enabled: true });
+  assert.equal(resumed.redeliverPendingToAgent("ags_live"), 0, "live ticket must never be hibernation-replayed");
+  const result = await resumed.handleMessage("ags_live", JSON.stringify(envFor("ags_live", "operation.result", deviceId, { operation_id: "op_live", status: "completed", result: {} }, "op_live")));
+  assert.equal(result.ok, true, "delayed authenticated result still correlates");
+  assert.ok(delivered.length === 0);
+});
+
+test("live-operation sends raw ticket once but persists only a redacted tombstone", async () => {
+  const deviceId = "dev_live_do_boundary_01";
+  const { adapter, store } = openSqliteAdapter();
+  const { token } = await seedActiveDevice(store, deviceId);
+  const authHash = await sha256Hex(token);
+  const storage = new Map<string, unknown>();
+  const att: SessionAttachment = {
+    role: "agent", device_id: deviceId, session_id: "ags_live_boundary", connected_at: Date.now(),
+    phase: "ready", remote_routing_enabled: true, auth_hash: authHash, lastSeq: 0,
+  };
+  const socket = mockSocket(att);
+  const room = new DeviceRoom(mockDOState({ sockets: [socket], storage }), {
+    DB: adapter as unknown as D1Database, SESSION_SECRET,
+  });
+  await room.ready;
+  room.deviceId = deviceId;
+  room.router.deviceId = deviceId;
+  room.wsSessions.set(socket as unknown as WebSocket, att.session_id);
+  room.router.registerSession(att);
+
+  const makeLiveBody = (correlationId: string, ticket: string) => ({
+    type: "operation.request",
+    correlation_id: correlationId,
+    expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    payload: {
+      operation_id: correlationId, capability: "transfer.start",
+      arguments: {
+        ticket, jti: `jti-${ticket}`, ephemeral_public_key: `ephemeral-${ticket}`,
+        relay_ciphertext: `cipher-${ticket}`,
+      },
+    },
+  });
+  const callLive = async (correlationId: string, ticket: string) => {
+    const { headers, bodyText } = await liveOperationHeaders(deviceId, makeLiveBody(correlationId, ticket), correlationId);
+    return room.fetch(new Request(`https://device-room/live-operation?device_id=${deviceId}`, {
+      method: "POST", headers, body: bodyText,
+    }));
+  };
+
+  const noAgent = new DeviceRoom(mockDOState({ storage: new Map() }), {
+    DB: adapter as unknown as D1Database, SESSION_SECRET,
+  });
+  await noAgent.ready;
+  noAgent.deviceId = deviceId;
+  noAgent.router.deviceId = deviceId;
+  const offline = await (async () => {
+    const correlationId = "op_live_offline";
+    const { headers, bodyText } = await liveOperationHeaders(deviceId, makeLiveBody(correlationId, "ticket-offline"), correlationId);
+    return noAgent.fetch(new Request(`https://device-room/live-operation?device_id=${deviceId}`, { method: "POST", headers, body: bodyText }));
+  })();
+  assert.equal(offline.status, 503);
+  assert.equal(((await offline.json()) as { status: string }).status, "device_offline");
+
+  const marker = "ticket-live-boundary-secret";
+  const delivered = await callLive("op_live_delivered", marker);
+  assert.equal(delivered.status, 200);
+  assert.equal(((await delivered.json()) as { status: string }).status, "routed_to_device");
+  assert.equal(socket.sent.length, 1, "the ready exact Agent receives the one live request");
+  assert.ok(socket.sent[0]!.includes(marker));
+
+  const persisted = JSON.stringify(storage.get(ROOM_STATE_STORAGE_KEY));
+  for (const forbidden of [marker, `jti-${marker}`, `ephemeral-${marker}`, `cipher-${marker}`]) {
+    assert.equal(persisted.includes(forbidden), false, `DO persisted raw live field: ${forbidden}`);
+  }
+  const hibernated = new DeviceRoom(mockDOState({ storage }), {
+    DB: adapter as unknown as D1Database, SESSION_SECRET,
+  });
+  await hibernated.ready;
+  hibernated.deviceId = deviceId;
+  hibernated.router.deviceId = deviceId;
+  hibernated.router.registerSession({ ...att, session_id: "ags_live_after_hibernate" });
+  assert.equal(hibernated.router.redeliverPendingToAgent("ags_live_after_hibernate"), 0, "hibernation never replays a live bearer");
+
+  // A closed socket is a definite non-delivery, so its tombstone is removed
+  // before the offline response and cannot consume room capacity.
+  socket.close(1006, "closed before live send");
+  const sendFalseMarker = "ticket-send-false-secret";
+  const sendFalse = await callLive("op_live_send_false", sendFalseMarker);
+  assert.equal(sendFalse.status, 503);
+  assert.equal(((await sendFalse.json()) as { status: string }).status, "device_offline");
+  const afterFalse = JSON.stringify(storage.get(ROOM_STATE_STORAGE_KEY));
+  assert.equal(afterFalse.includes(sendFalseMarker), false);
+  assert.equal(room.router.pending.has("op_live_send_false"), false);
+
+  // A persist failure precedes socket dispatch. The live request is therefore
+  // non-successful and its bearer never crosses either durable or socket state.
+  const failingStorage = new Map<string, unknown>();
+  const failingSocket = mockSocket({ ...att, session_id: "ags_live_persist_fail" });
+  const failingState = mockDOState({ sockets: [failingSocket], storage: failingStorage });
+  (failingState.storage as unknown as { put: (key: string, value: unknown) => Promise<void> }).put = async () => {
+    throw new Error("live_tombstone_persist_failed");
+  };
+  const persistFailRoom = new DeviceRoom(failingState, { DB: adapter as unknown as D1Database, SESSION_SECRET });
+  await persistFailRoom.ready;
+  persistFailRoom.deviceId = deviceId;
+  persistFailRoom.router.deviceId = deviceId;
+  persistFailRoom.wsSessions.set(failingSocket as unknown as WebSocket, "ags_live_persist_fail");
+  persistFailRoom.router.registerSession({ ...att, session_id: "ags_live_persist_fail" });
+  const persistFailMarker = "ticket-persist-failure-secret";
+  const persistFailCorrelation = "op_live_persist_fail";
+  const persistFailHeaders = await liveOperationHeaders(
+    deviceId, makeLiveBody(persistFailCorrelation, persistFailMarker), persistFailCorrelation,
+  );
+  const persistFail = await persistFailRoom.fetch(new Request(`https://device-room/live-operation?device_id=${deviceId}`, {
+    method: "POST", headers: persistFailHeaders.headers, body: persistFailHeaders.bodyText,
+  }));
+  assert.equal(persistFail.status, 503);
+  assert.equal(((await persistFail.json()) as { error: string }).error, "storage_unavailable");
+  assert.equal(failingSocket.sent.length, 0, "no live bearer send may precede durable tombstone persistence");
+  assert.equal(JSON.stringify(failingStorage).includes(persistFailMarker), false);
+});
+
+test("live transfer tombstones retain only until operation expiry and remain bounded", () => {
+  const deviceId = "dev_live_tombstone_bounds_01";
+  const router = new DeviceRoomRouter(deviceId, { sendToSession: () => true, sendToRole: () => 0 });
+  const now = Date.now();
+  router.pending.set("long_running", {
+    correlation_id: "long_running", type: "transfer.start", from_session: "", payload: { operation_id: "long_running", capability: "transfer.start" },
+    created_at: now - PENDING_TTL_MS - 1, expires_at: new Date(now + LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS).toISOString(), live_only: true,
+  });
+  router.pending.set("expired", {
+    correlation_id: "expired", type: "transfer.start", from_session: "", payload: { operation_id: "expired", capability: "transfer.start" },
+    created_at: now, expires_at: new Date(now - 1).toISOString(), live_only: true,
+  });
+  router.pruneExpiredPending(now);
+  assert.equal(router.pending.has("long_running"), true, "long transfer result remains correlatable past normal dispatch TTL");
+  assert.equal(router.pending.has("expired"), false, "operation deadline clears live correlation tombstone");
+
+  for (let i = 0; i < MAX_PENDING_OPERATIONS + 8; i++) {
+    router.pending.set(`live_${i}`, {
+      correlation_id: `live_${i}`, type: "transfer.start", from_session: "", payload: { operation_id: `live_${i}`, capability: "transfer.start" },
+      created_at: now + i, expires_at: new Date(now + LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS).toISOString(), live_only: true,
+    });
+  }
+  router.pruneExpiredPending(now);
+  assert.ok(router.pending.size <= MAX_PENDING_OPERATIONS, "live-only correlation state is hard bounded");
+});
+
 test("transfer preflight results are exact-correlated metadata only", async () => {
   const { store } = openSqliteAdapter();
   await store.ensureBootstrap();
@@ -1096,7 +1284,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
     plan_sha256: "a".repeat(64),
     epoch: 1,
     fence: 1,
-    transfer_expires_at: expiresAt,
+    expires_at: expiresAt,
     device_id: deviceId,
     workspace_id: "ws_source",
     session_nonce: "nonce_preflight_1",
@@ -1132,7 +1320,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
     epoch: 1,
     fence: 1,
     session_nonce: expected.session_nonce,
-    transfer_expires_at: expiresAt,
+    expires_at: expiresAt,
     ephemeral_public_key: "11".repeat(32),
     ephemeral_signature: "22".repeat(64),
   };

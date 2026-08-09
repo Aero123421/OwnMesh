@@ -244,7 +244,7 @@ export function generateUserCode(): string {
 // ---------------------------------------------------------------------------
 
 /** Internal ops that the edge Worker may invoke on a DeviceRoom. */
-export type InternalContextOp = "ws" | "operation";
+export type InternalContextOp = "ws" | "operation" | "live_operation";
 
 /**
  * Claims bound into `x-ownmesh-internal-context`.

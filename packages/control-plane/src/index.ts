@@ -146,6 +146,7 @@ async function routeToDeviceRoom(
     oauth_client_id?: string | null;
   },
   bind?: { principal_id?: string; tenant_id?: string },
+  liveOnly = false,
 ): Promise<{ status: string; detail?: unknown }> {
   if (!env.DEVICE_ROOM) {
     // Fail closed: never pretends routing succeeded without a DO binding.
@@ -192,9 +193,9 @@ async function routeToDeviceRoom(
   const body = JSON.stringify(operation);
   const bodySha256 = await sha256Hex(body);
   const method = "POST";
-  const path = "/operation";
+  const path = liveOnly ? "/live-operation" : "/operation";
   const headers = await internalDoHeaders(env.SESSION_SECRET, {
-    op: "operation",
+    op: liveOnly ? "live_operation" : "operation",
     device_id: deviceId,
     principal_id: principalId,
     tenant_id: tenantId,
@@ -213,7 +214,7 @@ async function routeToDeviceRoom(
   try {
     const outcome = await Promise.race<Response | typeof timedOut>([
       stub.fetch(
-        new Request(`https://device-room/operation?device_id=${encodeURIComponent(deviceId)}`, {
+        new Request(`https://device-room${path}?device_id=${encodeURIComponent(deviceId)}`, {
           method,
           headers,
           body,
@@ -232,7 +233,9 @@ async function routeToDeviceRoom(
         detail: {
           error: "device_room_fetch_timeout",
           timeout_ms: timeoutMs,
-          note: "request may already be durable in DeviceRoom; keep pending and await result or redeliver identical body",
+          note: liveOnly
+            ? "live ticket delivery is uncertain; never replay its bearer, advance to a fresh proof generation"
+            : "request may already be durable in DeviceRoom; keep pending and await result or redeliver identical body",
         },
       };
     }
@@ -245,7 +248,9 @@ async function routeToDeviceRoom(
       detail: {
         error: "device_room_fetch_failed",
         message: err instanceof Error ? err.message : String(err),
-        note: "post-send failure is not proof of rejection; keep pending for redelivery/dedup",
+          note: liveOnly
+            ? "live ticket delivery is uncertain; never replay its bearer, advance to a fresh proof generation"
+            : "post-send failure is not proof of rejection; keep pending for redelivery/dedup",
       },
     };
   } finally {
@@ -490,6 +495,10 @@ export default {
             routeToDeviceRoom(env, deviceId, operation, mcpAccess
               ? { principal_id: mcpAccess.principal, tenant_id: mcpAccess.tenant_id }
               : undefined),
+          routeLiveToDevice: (deviceId, operation) =>
+            routeToDeviceRoom(env, deviceId, operation, mcpAccess
+              ? { principal_id: mcpAccess.principal, tenant_id: mcpAccess.tenant_id }
+              : undefined, true),
         },
         { issuer, transferTicketSecret: env.SESSION_SECRET },
       );

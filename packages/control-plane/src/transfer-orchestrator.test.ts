@@ -17,8 +17,8 @@ test("ticket coordinator accepts only exact Agent proofs and returns metadata wi
     source_device_public_key: hex(new Uint8Array(await crypto.subtle.exportKey("raw", sourceKey.publicKey) as ArrayBuffer)),
     destination_device_public_key: hex(new Uint8Array(await crypto.subtle.exportKey("raw", destinationKey.publicKey) as ArrayBuffer)),
   };
-  const source: AgentEphemeralReply = { role: "source", transfer_id: binding.transfer_id, tenant_id: binding.tenant_id, device_id: binding.source_device_id, workspace_id: binding.source_workspace_id, plan_sha256: binding.plan_sha256, epoch: 1, fence: 1, session_nonce: "session_1", transfer_expires_at: transferExpiresAt, ephemeral_public_key: "11".repeat(32), ephemeral_signature: "" };
-  const destination: AgentEphemeralReply = { role: "destination", transfer_id: binding.transfer_id, tenant_id: binding.tenant_id, device_id: binding.destination_device_id, workspace_id: binding.destination_workspace_id, plan_sha256: binding.plan_sha256, epoch: 1, fence: 1, session_nonce: "session_1", transfer_expires_at: transferExpiresAt, ephemeral_public_key: "22".repeat(32), ephemeral_signature: "" };
+  const source: AgentEphemeralReply = { role: "source", transfer_id: binding.transfer_id, tenant_id: binding.tenant_id, device_id: binding.source_device_id, workspace_id: binding.source_workspace_id, plan_sha256: binding.plan_sha256, epoch: 1, fence: 1, session_nonce: "session_1", expires_at: transferExpiresAt, ephemeral_public_key: "11".repeat(32), ephemeral_signature: "" };
+  const destination: AgentEphemeralReply = { role: "destination", transfer_id: binding.transfer_id, tenant_id: binding.tenant_id, device_id: binding.destination_device_id, workspace_id: binding.destination_workspace_id, plan_sha256: binding.plan_sha256, epoch: 1, fence: 1, session_nonce: "session_1", expires_at: transferExpiresAt, ephemeral_public_key: "22".repeat(32), ephemeral_signature: "" };
   const claims = (role: "source" | "destination"): TransferTicketClaims => ({
     v: 1, jti: "jti_test", session_nonce: "session_1", transfer_id: binding.transfer_id, tenant_id: binding.tenant_id, principal_id: binding.principal_id,
     device_id: role === "source" ? binding.source_device_id : binding.destination_device_id, role,
@@ -39,7 +39,7 @@ test("ticket coordinator accepts only exact Agent proofs and returns metadata wi
 });
 
 test("preflight result parser rejects bytes, unknown fields, and correlation substitution", () => {
-  const expected = { role: "source" as const, transfer_id: "xfer_1", tenant_id: "ten_1", plan_sha256: "a".repeat(64), epoch: 1, fence: 2, transfer_expires_at: Date.now() + 10_000, device_id: "dev_s", workspace_id: "ws_s", session_nonce: "nonce_1" };
+  const expected = { role: "source" as const, transfer_id: "xfer_1", tenant_id: "ten_1", plan_sha256: "a".repeat(64), epoch: 1, fence: 2, expires_at: Date.now() + 10_000, device_id: "dev_s", workspace_id: "ws_s", session_nonce: "nonce_1" };
   const value = { ...expected, ephemeral_public_key: "11".repeat(32), ephemeral_signature: "22".repeat(64) };
   assert.deepEqual(parseTransferPreflightResult(value, expected), value);
   assert.equal(parseTransferPreflightResult({ ...value, ciphertext_base64: "forbidden" }, expected), null);

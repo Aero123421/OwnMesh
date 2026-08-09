@@ -1903,6 +1903,9 @@ export type OperationRouter = {
       oauth_client_id?: string | null;
     },
   ): Promise<{ status: string; detail?: unknown }>;
+  /** Socket-only delivery for one-use transfer ticket material. The receiver
+   * must not retain/replay the raw request after hibernation or disconnect. */
+  routeLiveToDevice?: OperationRouter["routeToDevice"];
 };
 
 export type McpHandleOptions = {
@@ -2536,6 +2539,9 @@ export type TransferPlanMeta = {
    * uncertain, so recovery fences and creates a fresh proof generation. */
   source_start_routed?: boolean;
   destination_start_routed?: boolean;
+  /** Non-bearer deadline for live ticket delivery. Once elapsed, the next send
+   * must fence into a new proof/ticket generation rather than replaying it. */
+  live_ticket_deadline_ms?: number;
   source_cancel_operation_id?: string;
   destination_cancel_operation_id?: string;
   cancellation_idempotency_key?: string;
@@ -2596,6 +2602,7 @@ function transferMeta(data: Record<string, unknown> | null | undefined): Transfe
   for (const key of ["source_start_routed", "destination_start_routed"]) {
     if (value[key] !== undefined && typeof value[key] !== "boolean") return null;
   }
+  if (value.live_ticket_deadline_ms !== undefined && (!Number.isSafeInteger(value.live_ticket_deadline_ms) || Number(value.live_ticket_deadline_ms) <= 0)) return null;
   if (value.pair_generation !== undefined && (!Number.isSafeInteger(value.pair_generation) || Number(value.pair_generation) < 1)) return null;
   if (value.source_size_bytes !== undefined && (!Number.isSafeInteger(value.source_size_bytes) || Number(value.source_size_bytes) < 0)) return null;
   if (value.source_sha256 !== undefined && (typeof value.source_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.source_sha256))) return null;
@@ -2835,7 +2842,8 @@ async function reconcileTransferCancellation(
  * it must treat the old pair as uncertain and advance the Room fence instead
  * of ever attempting to replay an unknowably consumed ticket. */
 function transferNeedsFreshGeneration(meta: TransferPlanMeta, source: McpOperationRecord | null, destination: McpOperationRecord | null): boolean {
-  return !meta.source_start_routed || !meta.destination_start_routed
+  return (typeof meta.live_ticket_deadline_ms === "number" && Date.now() >= meta.live_ticket_deadline_ms)
+    || !meta.source_start_routed || !meta.destination_start_routed
     || retryableTransferStartFailure(source) || retryableTransferStartFailure(destination);
 }
 
@@ -2854,7 +2862,7 @@ async function buildTransferPreflightOperation(opts: {
     source_device_id: m.source_device_id, destination_device_id: m.destination_device_id,
     source_workspace_id: m.source_workspace_id, destination_workspace_id: m.destination_workspace_id,
     workspace_id: workspaceId, epoch: m.epoch, fence: m.fence,
-    session_nonce: `nonce_${opts.operationId}`, transfer_expires_at: Date.parse(m.expires_at),
+    session_nonce: `nonce_${opts.operationId}`, expires_at: Date.parse(m.expires_at),
     coordinator_request_id: opts.operationId, workspace_version: workspaceVersion,
   };
   if (!source) args.plan_sha256 = m.plan_sha256;
@@ -3258,7 +3266,7 @@ export async function handleMcp(
             ...meta, state: "planned", epoch: meta.epoch + 1, fence: meta.fence + 1,
             plan_sha256: undefined, source_preflight_operation_id: undefined, destination_preflight_operation_id: undefined,
             source_start_operation_id: undefined, destination_start_operation_id: undefined,
-            source_start_routed: undefined, destination_start_routed: undefined,
+            source_start_routed: undefined, destination_start_routed: undefined, live_ticket_deadline_ms: undefined,
             source_cancel_operation_id: undefined, destination_cancel_operation_id: undefined,
             destination_plan_id: undefined,
           };
@@ -3273,7 +3281,7 @@ export async function handleMcp(
         if (!router) return mcpError(id, -32009, "device room unavailable");
         const preflightId = randomId("op_");
         const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: preflightId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id });
-        const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: "", epoch: meta.epoch, fence: meta.fence, transfer_expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${preflightId}`, coordinator_request_id: preflightId, workspace_version: meta.source_workspace_version };
+        const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: "", epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${preflightId}`, coordinator_request_id: preflightId, workspace_version: meta.source_workspace_version };
         await store.putMcpOperation({ operation_id: preflightId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.source_device_id, tool: "__transfer_preflight_source", status: "pending", summary: "transfer source preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: preflightId, payload_hash: deviceOp.payload_hash, idempotency_key: preflightId, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
         if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source preflight dispatch failed");
@@ -3292,6 +3300,11 @@ export async function handleMcp(
         const sourcePlanId = sourcePlanObject?.plan_id;
         const sourceSize = sourcePlanObject?.size_bytes;
         const sourceDigest = sourcePlanObject?.sha256;
+        if (source && ["failed", "denied", "device_offline", "cancelled"].includes(source.status)) {
+          const terminal = { ...meta, state: source.status === "cancelled" ? "cancelled" as const : "failed" as const };
+          const updated = await patchOp(store, tracker, plan.operation_id, { status: terminal.state, summary: "source preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
+          return mcpResult(id, toolContent({ ...(updated || plan), data: { transfer: publicTransferMeta(terminal) } }));
+        }
         if (!source || source.status !== "completed" || typeof sourceHash !== "string" || !/^[a-f0-9]{64}$/.test(sourceHash)
           || typeof sourcePlanId !== "string" || !transferText(sourcePlanId) || typeof sourceSize !== "number" || !Number.isSafeInteger(sourceSize) || sourceSize < 0
           || typeof sourceDigest !== "string" || !/^[a-f0-9]{64}$/.test(sourceDigest)) {
@@ -3307,7 +3320,7 @@ export async function handleMcp(
         const bound: TransferPlanMeta = { ...preliminary, plan_sha256: finalPlanSha256 };
         const finalSourceId = randomId("op_");
         const deviceOp = await buildTransferPreflightOperation({ transfer: bound, role: "source", operationId: finalSourceId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id });
-        const expectation = { role: "source", transfer_id: bound.transfer_id, tenant_id: bound.tenant_id, plan_sha256: finalPlanSha256, epoch: bound.epoch, fence: bound.fence, transfer_expires_at: Date.parse(bound.expires_at), device_id: bound.source_device_id, workspace_id: bound.source_workspace_id, session_nonce: `nonce_${finalSourceId}`, coordinator_request_id: finalSourceId, workspace_version: bound.source_workspace_version };
+        const expectation = { role: "source", transfer_id: bound.transfer_id, tenant_id: bound.tenant_id, plan_sha256: finalPlanSha256, epoch: bound.epoch, fence: bound.fence, expires_at: Date.parse(bound.expires_at), device_id: bound.source_device_id, workspace_id: bound.source_workspace_id, session_nonce: `nonce_${finalSourceId}`, coordinator_request_id: finalSourceId, workspace_version: bound.source_workspace_version };
         await store.putMcpOperation({ operation_id: finalSourceId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: bound.source_device_id, tool: "__transfer_preflight_source_final", status: "pending", summary: "transfer source final preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: finalSourceId, payload_hash: deviceOp.payload_hash, idempotency_key: finalSourceId, workspace_id: bound.source_workspace_id, expires_at: bound.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(bound.source_device_id, deviceOp);
         if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source final preflight dispatch failed");
@@ -3321,12 +3334,17 @@ export async function handleMcp(
         const source = sourceId ? await store.getMcpOperation(sourceId) : null;
         const proof = source?.data?.transfer_preflight;
         const finalHash = proof && typeof proof === "object" && !Array.isArray(proof) ? (proof as Record<string, unknown>).plan_sha256 : null;
+        if (source && ["failed", "denied", "device_offline", "cancelled"].includes(source.status)) {
+          const terminal = { ...meta, state: source.status === "cancelled" ? "cancelled" as const : "failed" as const };
+          const updated = await patchOp(store, tracker, plan.operation_id, { status: terminal.state, summary: "final source preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
+          return mcpResult(id, toolContent({ ...(updated || plan), data: { transfer: publicTransferMeta(terminal) } }));
+        }
         if (!source || source.status !== "completed" || finalHash !== meta.plan_sha256 || !router) {
           return mcpResult(id, toolContent({ ...plan, data: { transfer: publicTransferMeta(meta), next: "await authenticated final source preflight" } }));
         }
         const destinationId = randomId("op_");
         const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "destination", operationId: destinationId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id });
-        const expectation = { role: "destination", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, transfer_expires_at: Date.parse(meta.expires_at), device_id: meta.destination_device_id, workspace_id: meta.destination_workspace_id, session_nonce: `nonce_${destinationId}`, coordinator_request_id: destinationId, workspace_version: meta.destination_workspace_version };
+        const expectation = { role: "destination", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.destination_device_id, workspace_id: meta.destination_workspace_id, session_nonce: `nonce_${destinationId}`, coordinator_request_id: destinationId, workspace_version: meta.destination_workspace_version };
         await store.putMcpOperation({ operation_id: destinationId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_preflight_destination", status: "pending", summary: "transfer destination preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: destinationId, payload_hash: deviceOp.payload_hash, idempotency_key: destinationId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
         if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "destination preflight dispatch failed");
@@ -3338,12 +3356,17 @@ export async function handleMcp(
       if (meta.state === "destination_preflight") {
         const destinationId = meta.destination_preflight_operation_id || "";
         const destination = destinationId ? await store.getMcpOperation(destinationId) : null;
+        if (destination && ["failed", "denied", "device_offline", "cancelled"].includes(destination.status)) {
+          const terminal = { ...meta, state: destination.status === "cancelled" ? "cancelled" as const : "failed" as const };
+          const updated = await patchOp(store, tracker, plan.operation_id, { status: terminal.state, summary: "destination preflight did not complete", data: { [TRANSFER_META_KEY]: terminal } }, ["pending", "running", "cancel_requested"]);
+          return mcpResult(id, toolContent({ ...(updated || plan), data: { transfer: publicTransferMeta(terminal) } }));
+        }
         if (!destination || destination.status !== "completed") return mcpResult(id, toolContent({ ...plan, data: { transfer: publicTransferMeta(meta), next: "await authenticated destination preflight" } }));
         const sourceId = meta.source_preflight_operation_id || "";
         const source = sourceId ? await store.getMcpOperation(sourceId) : null;
         const sourceReply = source?.data?.transfer_preflight;
         const destinationReply = destination.data?.transfer_preflight;
-        if (!source || source.status !== "completed" || !sourceReply || !destinationReply || !opts.transferTicketSecret || !router
+        if (!source || source.status !== "completed" || !sourceReply || !destinationReply || !opts.transferTicketSecret || !router?.routeLiveToDevice
           || !meta.plan_sha256 || !meta.source_sha256 || meta.source_size_bytes === undefined) {
           return mcpError(id, -32009, "transfer execution bridge unavailable");
         }
@@ -3367,9 +3390,9 @@ export async function handleMcp(
           buildTransferStartOperation({ transfer: meta, role: "source", operationId: sourceStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.source_ticket, planSha256: meta.plan_sha256, grantPayloadHash }),
           buildTransferStartOperation({ transfer: meta, role: "destination", operationId: destinationStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.destination_ticket, planSha256: meta.plan_sha256, grantPayloadHash }),
         ]);
-        // Tickets exist only in the short-lived exact Agent requests/outboxes;
-        // no MCP result, plan record, audit entry, or Durable Object metadata
-        // contains a bearer, key, plaintext, or ciphertext.
+        // D1 retains only a redacted non-redeliverable recipe. The raw bearer
+        // is delivered exactly once over a ready Agent socket; neither an MCP
+        // record nor DeviceRoom pending/hibernation state may contain it.
         for (const [operation, deviceId, workspaceId, tool] of [[sourceStart, meta.source_device_id, meta.source_workspace_id, "__transfer_start_source"], [destinationStart, meta.destination_device_id, meta.destination_workspace_id, "__transfer_start_destination"]] as const) {
           await store.putMcpOperation({ operation_id: operation.correlation_id, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: deviceId, tool, status: "pending", summary: "ticket-bound transfer start", data: { [DISPATCH_OUTBOX_KEY]: buildTicketlessTransferStartOutbox(operation) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operation.correlation_id, payload_hash: operation.payload_hash, idempotency_key: operation.correlation_id, workspace_id: workspaceId, expires_at: meta.expires_at, claim_version: 1, action: operation.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         }
@@ -3377,7 +3400,7 @@ export async function handleMcp(
         // live bearer is routed. A crash/partial route can then only reconcile
         // or fence into a fresh generation; it can never mint the old proof
         // pair again under the same epoch.
-        const next: TransferPlanMeta = { ...meta, state: "sending", source_start_operation_id: sourceStartId, destination_start_operation_id: destinationStartId, source_start_routed: false, destination_start_routed: false, pair_generation: (meta.pair_generation || 0) + 1 };
+        const next: TransferPlanMeta = { ...meta, state: "sending", source_start_operation_id: sourceStartId, destination_start_operation_id: destinationStartId, source_start_routed: false, destination_start_routed: false, live_ticket_deadline_ms: Date.now() + TRANSFER_TICKET_TTL_MS, pair_generation: (meta.pair_generation || 0) + 1 };
         const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "ticket-bound transfer dispatch prepared", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
         if (!updated) return mcpError(id, -32009, "transfer plan race");
         // Persist each live route acknowledgement independently.  A process
@@ -3385,16 +3408,16 @@ export async function handleMcp(
         // send() turns into a +1 epoch/fence recovery; it never reuses either
         // ticket/proof pair or asks a Room to accept an old fence.
         let sourceRouted: { status: string };
-        try { sourceRouted = await router.routeToDevice(meta.source_device_id, sourceStart); } catch { sourceRouted = { status: "dispatch_uncertain" }; }
+        try { sourceRouted = await router.routeLiveToDevice(meta.source_device_id, sourceStart); } catch { sourceRouted = { status: "dispatch_uncertain" }; }
         if (sourceRouted.status === "dispatch_uncertain") return mcpResult(id, toolContent({ ...updated, data: { transfer: publicTransferMeta(next), next: "route uncertain; repeat send to fence into a fresh proof generation" } }));
-        if (!["routed_to_device", "pending"].includes(sourceRouted.status)) return mcpError(id, -32009, "source transfer start dispatch failed");
+        if (sourceRouted.status !== "routed_to_device") return mcpError(id, -32009, "source transfer start dispatch failed");
         const sourceAckMeta: TransferPlanMeta = { ...next, source_start_routed: true };
         const sourceAck = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "source transfer start routed", data: { [TRANSFER_META_KEY]: sourceAckMeta } }, ["running"]);
         if (!sourceAck) return mcpError(id, -32009, "transfer start route receipt race");
         let destinationRouted: { status: string };
-        try { destinationRouted = await router.routeToDevice(meta.destination_device_id, destinationStart); } catch { destinationRouted = { status: "dispatch_uncertain" }; }
+        try { destinationRouted = await router.routeLiveToDevice(meta.destination_device_id, destinationStart); } catch { destinationRouted = { status: "dispatch_uncertain" }; }
         if (destinationRouted.status === "dispatch_uncertain") return mcpResult(id, toolContent({ ...sourceAck, data: { transfer: publicTransferMeta(sourceAckMeta), next: "route uncertain; repeat send to fence into a fresh proof generation" } }));
-        if (!["routed_to_device", "pending"].includes(destinationRouted.status)) return mcpError(id, -32009, "destination transfer start dispatch failed");
+        if (destinationRouted.status !== "routed_to_device") return mcpError(id, -32009, "destination transfer start dispatch failed");
         const completeAckMeta: TransferPlanMeta = { ...sourceAckMeta, destination_start_routed: true };
         const completeAck = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "ticket-bound transfer started", data: { [TRANSFER_META_KEY]: completeAckMeta } }, ["running"]);
         if (!completeAck) return mcpError(id, -32009, "transfer start route receipt race");
@@ -5313,6 +5336,12 @@ export function createHarnessRouter(opts: {
         }
       }
       return routed;
+    },
+    async routeLiveToDevice(deviceId, operation) {
+      // The harness has no durable DeviceRoom state; preserve the single
+      // synchronous delivery model for unit tests without manufacturing an
+      // outbox replay recipe.
+      return opts.inject(deviceId, operation);
     },
   };
 }

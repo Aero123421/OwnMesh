@@ -75,6 +75,9 @@ export const SEEN_MESSAGE_ID_TTL_MS = 10 * 60 * 1000;
 export const MAX_PENDING_OPERATIONS = 1024;
 /** Drop pending ops older than this TTL. */
 export const PENDING_TTL_MS = 15 * 60 * 1000;
+/** A live transfer-result tombstone is correlation-only, but must still have a
+ * finite upper bound independent of its 60-second bearer ticket. */
+export const LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS = 24 * 60 * 60 * 1000;
 /** Hard cap on serialized hibernation state (UTF-8 JSON bytes). */
 export const MAX_SERIALIZED_STATE_BYTES = 1_048_576;
 /** Hard cap on ingress-guard session entries (beyond per-session seen-id cap). */
@@ -277,6 +280,12 @@ export type PendingOperation = {
   dispatched_at?: number;
   /** How many times this pending op was sent to an Agent. */
   dispatch_count?: number;
+  /**
+   * A transfer ticket delivery keeps only this correlation record durable.  Its
+   * original operation body is socket-only and must never be replayed after a
+   * hibernation/reconnect.
+   */
+  live_only?: boolean;
 };
 
 /** Announced in accepted.session_parameters and enforced on inbound frames. */
@@ -491,6 +500,9 @@ export class DeviceRoomRouter {
       if (Number.isFinite((p as PendingOperation).dispatch_count)) {
         restored.dispatch_count = Number((p as PendingOperation).dispatch_count);
       }
+      if ((p as PendingOperation).live_only === true) {
+        restored.live_only = true;
+      }
       this.pending.set(p.correlation_id, restored);
     }
     this.consumedNonces.clear();
@@ -611,8 +623,12 @@ export class DeviceRoomRouter {
           : Number.isFinite(p.created_at)
             ? p.created_at + PENDING_TTL_MS
             : NaN;
-      const staleByTtl =
-        !Number.isFinite(p.created_at) || now - p.created_at > PENDING_TTL_MS;
+      // A live-only tombstone has no bearer to replay and exists solely to
+      // correlate a genuine long-running transfer result. Its bounded transfer
+      // expiry, rather than the ordinary 15-minute dispatch TTL, controls it.
+      const staleByTtl = !p.live_only && (
+        !Number.isFinite(p.created_at) || now - p.created_at > PENDING_TTL_MS
+      );
       const staleByExpiry = Number.isFinite(expMs) && expMs <= now;
       if (staleByTtl || staleByExpiry) {
         this.pending.delete(key);
@@ -642,6 +658,10 @@ export class DeviceRoomRouter {
     if (!session || !this.isRemoteRoutingAgent(session)) return 0;
     let n = 0;
     for (const p of this.pending.values()) {
+      // Live transfer starts deliberately retain no request body.  A new
+      // ticket/proof generation is required after a disconnect, never a DO
+      // replay of a bearer that may already have been consumed.
+      if (p.live_only) continue;
       const expMs =
         typeof p.expires_at === "string" && p.expires_at.trim() !== ""
           ? Date.parse(p.expires_at)
@@ -2064,6 +2084,102 @@ export class DeviceRoom {
       });
     }
 
+    if (url.pathname.endsWith("/live-operation") && request.method === "POST") {
+      const broken = this.refuseIfStorageBroken();
+      if (broken) return broken;
+      const rawBody = await readTextLimited(request, MAX_PAYLOAD_BYTES);
+      if (rawBody === null) return json({ error: "payload_too_large", max_bytes: MAX_PAYLOAD_BYTES }, { status: 413 });
+      const bodySha256 = await sha256Hex(rawBody);
+      const opCtx = await verifyInternalContext(this.env.SESSION_SECRET, request.headers.get(internalContextHeaderName()), {
+        op: "live_operation", device_id: this.deviceId, method: "POST", path: "/live-operation", body_sha256: bodySha256, replayGuard: null,
+      });
+      if (!opCtx.ok) return json({ error: opCtx.error }, { status: opCtx.status });
+      const security = await this.revalidateCredentials();
+      if (!security.ok) return json({ error: security.error }, { status: security.status });
+      try {
+        const store = createStore(this.env);
+        const device = await store.getDevice(this.deviceId);
+        if (!device || device.tenant_id !== opCtx.claims.tenant_id
+          || !(await store.canOperateDevice(this.deviceId, opCtx.claims.principal_id, opCtx.claims.tenant_id))) {
+          return json({ error: "binding_mismatch" }, { status: 403 });
+        }
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return json({ error: "storage_unavailable" }, { status: 503 });
+      }
+      let body: { type?: unknown; payload?: unknown; correlation_id?: unknown; expires_at?: unknown };
+      try { body = JSON.parse(rawBody) as typeof body; } catch { return json({ error: "bad_json" }, { status: 400 }); }
+      const payload = body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+        ? body.payload as Record<string, unknown> : null;
+      const correlationId = typeof body.correlation_id === "string" ? body.correlation_id : "";
+      // This is deliberately not a generic bypass of durable delivery: only a
+      // ticket-bearing transfer.start may cross this socket-only boundary.
+      if (body.type !== "operation.request" || !payload || payload.capability !== "transfer.start"
+        || payload.operation_id !== correlationId || !correlationId
+        || (opCtx.claims.correlation_id && opCtx.claims.correlation_id !== correlationId)) {
+        return json({ error: "binding_mismatch" }, { status: 403 });
+      }
+      if (this.router.hasInternalNonce(opCtx.claims.nonce) || this.router.pending.has(correlationId)) {
+        return json({ status: "dispatch_uncertain", detail: { error: "live_operation_already_observed" } }, { status: 409 });
+      }
+      const recipients = [...this.router.sessions.entries()].filter(([, session]) => this.router.isRemoteRoutingAgent(session));
+      if (recipients.length !== 1) {
+        return json({ status: "device_offline", detail: { error: recipients.length === 0 ? "no_ready_agent" : "multiple_ready_agents" } }, { status: 503 });
+      }
+      const expiresAt = typeof body.expires_at === "string" && body.expires_at.trim() !== "" ? body.expires_at : undefined;
+      const now = Date.now();
+      const expiresMs = expiresAt ? Date.parse(expiresAt) : NaN;
+      if (!Number.isFinite(expiresMs) || expiresMs <= now || expiresMs > now + LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS) {
+        return json({ error: "binding_mismatch" }, { status: 403 });
+      }
+      // Do not let repeated fresh generations accumulate correlation tombstones.
+      // Persist any prune before admitting a new live operation, otherwise a
+      // hibernation between requests could resurrect them and evade the cap.
+      const pruned = this.router.pruneExpiredPending(now);
+      if (pruned.length > 0) {
+        try { await this.persistNow(); } catch {
+          return json({ error: "storage_unavailable" }, { status: 503 });
+        }
+      }
+      if (this.router.pending.size >= MAX_PENDING_OPERATIONS) {
+        return json({ status: "rejected", detail: { code: "OWNMESH_E_PENDING_LIMIT" } }, { status: 429 });
+      }
+      const [sessionId] = recipients[0]!;
+      const envelope = this.router.nextEnvelope("operation.request", payload, correlationId, expiresAt ? { expiresAt } : undefined);
+      // Persist a correlation-only tombstone before sending. It permits the
+      // eventual Agent result to CAS into D1, but contains no bearer, JTI,
+      // ephemeral proof, ciphertext, or raw transfer request and is skipped on
+      // every reconnect/hibernation replay.
+      this.router.pending.set(correlationId, {
+        correlation_id: correlationId, type: "transfer.start", from_session: "", created_at: Date.now(),
+        payload: { operation_id: correlationId, capability: "transfer.start" },
+        // The result can legitimately arrive after the 60s connection ticket
+        // expires; expiry is the already bound transfer operation deadline.
+        expires_at: expiresAt, live_only: true,
+      });
+      if (!this.router.consumeInternalNonce(opCtx.claims.nonce, opCtx.claims.exp)) {
+        this.router.pending.delete(correlationId);
+        return json({ error: "replay" }, { status: 401 });
+      }
+      try { await this.persistNow(); } catch {
+        this.router.pending.delete(correlationId);
+        this.router.releaseInternalNonce(opCtx.claims.nonce);
+        return json({ error: "storage_unavailable" }, { status: 503 });
+      }
+      if (!this.router.sendToSession(sessionId, JSON.stringify(envelope))) {
+        // A false return is a definite local non-delivery, so remove the
+        // tombstone before returning offline. Never retry the raw body; the
+        // coordinator will fence and mint a fresh generation.
+        this.router.pending.delete(correlationId);
+        try { await this.persistNow(); } catch {
+          return json({ error: "storage_unavailable" }, { status: 503 });
+        }
+        return json({ status: "device_offline", detail: { error: "live_agent_send_failed" } }, { status: 503 });
+      }
+      return json({ status: "routed_to_device", detail: { correlation_id: correlationId, live_only: true } });
+    }
+
     if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
       const broken = this.refuseIfStorageBroken();
       if (broken) return broken;
@@ -2576,7 +2692,7 @@ export type ApplyMcpOperationResultOutcome =
  */
 type TransferPreflightExpectation = Pick<
   TransferServerBinding,
-  "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "transfer_expires_at"
+  "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence"
 > & {
   role: "source" | "destination";
   device_id: string;
@@ -2584,6 +2700,8 @@ type TransferPreflightExpectation = Pick<
   session_nonce: string;
   coordinator_request_id: string;
   workspace_version: number;
+  /** Rust preflight proof wire field; milliseconds. */
+  expires_at: number;
 };
 
 function transferPreflightExpectation(op: McpOperationRecord): TransferPreflightExpectation | null {
@@ -2591,7 +2709,7 @@ function transferPreflightExpectation(op: McpOperationRecord): TransferPreflight
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const allowed = [
-    "role", "transfer_id", "tenant_id", "plan_sha256", "epoch", "fence", "transfer_expires_at",
+    "role", "transfer_id", "tenant_id", "plan_sha256", "epoch", "fence", "expires_at",
     "device_id", "workspace_id", "session_nonce", "coordinator_request_id", "workspace_version",
   ];
   if (Object.keys(raw).some((key) => !allowed.includes(key))) return null;
@@ -2602,14 +2720,14 @@ function transferPreflightExpectation(op: McpOperationRecord): TransferPreflight
     role: role === "source" || role === "destination" ? role : "source",
     transfer_id: text("transfer_id") || "", tenant_id: text("tenant_id") || "",
     plan_sha256: text("plan_sha256") || "", epoch: integer("epoch") ?? 0,
-    fence: integer("fence") ?? 0, transfer_expires_at: integer("transfer_expires_at") ?? 0,
+    fence: integer("fence") ?? 0, expires_at: integer("expires_at") ?? 0,
     device_id: text("device_id") || "", workspace_id: text("workspace_id") || "",
     session_nonce: text("session_nonce") || "", coordinator_request_id: text("coordinator_request_id") || "",
     workspace_version: integer("workspace_version") ?? 0,
   };
   if (!role || expected.device_id !== op.device_id || expected.tenant_id !== op.tenant_id
     || expected.workspace_id !== op.workspace_id || expected.workspace_version < 1
-    || expected.epoch < 1 || expected.fence < 1 || expected.transfer_expires_at <= Date.now()
+    || expected.epoch < 1 || expected.fence < 1 || expected.expires_at <= Date.now()
     // The source Agent is the authority that hashes the pinned source file.
     // Its preflight starts with no server-known plan hash; every other path
     // requires the already CAS-bound hash.
@@ -2647,6 +2765,7 @@ function sanitizeTransferPreflightResult(
       || typeof p.size_bytes !== "number" || !Number.isSafeInteger(p.size_bytes) || p.size_bytes < 0) {
       return { error: "transfer_preflight_source_plan_invalid" };
     }
+
     sourcePlan = { plan_id: p.plan_id, sha256: p.sha256, size_bytes: p.size_bytes };
   } else if (raw.source_plan !== undefined) {
     return { error: "transfer_preflight_destination_source_plan_forbidden" };
@@ -2954,7 +3073,7 @@ export async function applyMcpOperationResult(
     payload.result && typeof payload.result === "object"
       ? (payload.result as Record<string, unknown>)
       : { ...payload };
-  if (op.tool === "__transfer_preflight_source" || op.tool === "__transfer_preflight_destination") {
+  if (op.tool === "__transfer_preflight_source" || op.tool === "__transfer_preflight_source_final" || op.tool === "__transfer_preflight_destination") {
     // A failed preflight carries only the normal bounded error envelope; a
     // completed preflight must pass the exact metadata/proof correlation gate.
     // In particular, never copy a generic Agent result (which could contain

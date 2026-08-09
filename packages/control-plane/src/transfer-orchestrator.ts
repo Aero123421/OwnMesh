@@ -46,7 +46,8 @@ export type AgentEphemeralReply = {
   epoch: number;
   fence: number;
   session_nonce: string;
-  transfer_expires_at: number;
+  /** Millisecond expiry of the preflight proof; matches the Rust wire field. */
+  expires_at: number;
   ephemeral_public_key: string;
   ephemeral_signature: string;
 };
@@ -56,11 +57,11 @@ export type AgentEphemeralReply = {
  * DeviceRoom correlation path may hand to the coordinator. */
 export function parseTransferPreflightResult(
   value: unknown,
-  expected: Pick<TransferServerBinding, "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "transfer_expires_at"> & { role: TransferRole; device_id: string; workspace_id: string; session_nonce: string },
+  expected: Pick<TransferServerBinding, "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence"> & { role: TransferRole; device_id: string; workspace_id: string; session_nonce: string; expires_at: number },
 ): AgentEphemeralReply | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const obj = value as Record<string, unknown>;
-  const allowed = ["role", "transfer_id", "tenant_id", "device_id", "workspace_id", "plan_sha256", "epoch", "fence", "session_nonce", "transfer_expires_at", "ephemeral_public_key", "ephemeral_signature"];
+  const allowed = ["role", "transfer_id", "tenant_id", "device_id", "workspace_id", "plan_sha256", "epoch", "fence", "session_nonce", "expires_at", "ephemeral_public_key", "ephemeral_signature"];
   if (Object.keys(obj).some((name) => !allowed.includes(name))) return null;
   const text = (name: string) => typeof obj[name] === "string" ? obj[name] : null;
   const integer = (name: string) => typeof obj[name] === "number" && Number.isSafeInteger(obj[name]) ? obj[name] as number : null;
@@ -68,7 +69,7 @@ export function parseTransferPreflightResult(
     role: text("role") as TransferRole, transfer_id: text("transfer_id") || "", tenant_id: text("tenant_id") || "",
     device_id: text("device_id") || "", workspace_id: text("workspace_id") || "", plan_sha256: text("plan_sha256") || "",
     epoch: integer("epoch") ?? 0, fence: integer("fence") ?? 0, session_nonce: text("session_nonce") || "",
-    transfer_expires_at: integer("transfer_expires_at") ?? 0, ephemeral_public_key: text("ephemeral_public_key") || "", ephemeral_signature: text("ephemeral_signature") || "",
+    expires_at: integer("expires_at") ?? 0, ephemeral_public_key: text("ephemeral_public_key") || "", ephemeral_signature: text("ephemeral_signature") || "",
   };
   return reply.role === expected.role && reply.transfer_id === expected.transfer_id && reply.tenant_id === expected.tenant_id
     && reply.device_id === expected.device_id && reply.workspace_id === expected.workspace_id
@@ -78,7 +79,7 @@ export function parseTransferPreflightResult(
     // lower-case SHA-256 before it can dispatch destination preflight/start.
     && (expected.plan_sha256 === "" && expected.role === "source" ? hash(reply.plan_sha256) : reply.plan_sha256 === expected.plan_sha256)
     && reply.epoch === expected.epoch && reply.fence === expected.fence
-    && reply.session_nonce === expected.session_nonce && reply.transfer_expires_at === expected.transfer_expires_at
+    && reply.session_nonce === expected.session_nonce && reply.expires_at === expected.expires_at
     && key(reply.ephemeral_public_key, 32) && key(reply.ephemeral_signature, 64) ? reply : null;
 }
 
@@ -140,7 +141,7 @@ export async function mintTransferTicketPair(
     && reply.device_id === (role === "source" ? binding.source_device_id : binding.destination_device_id)
     && reply.workspace_id === (role === "source" ? binding.source_workspace_id : binding.destination_workspace_id)
     && reply.plan_sha256 === binding.plan_sha256 && reply.epoch === binding.epoch
-    && reply.fence === binding.fence && reply.session_nonce === nonce && reply.transfer_expires_at === binding.transfer_expires_at
+    && reply.fence === binding.fence && reply.session_nonce === nonce && reply.expires_at === binding.transfer_expires_at
     && key(reply.ephemeral_public_key, 32) && key(reply.ephemeral_signature, 64);
   if (!matchReply(source, "source") || !matchReply(destination, "destination")) {
     throw new Error("agent_ephemeral_reply_binding_mismatch");
