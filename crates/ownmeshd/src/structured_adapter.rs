@@ -215,6 +215,15 @@ impl StructuredAdapterDriver {
         matches!(self.phase, DriverPhase::ArgvOnly | DriverPhase::PiPrompted | DriverPhase::Complete)
     }
 
+    /// Session open is ready once the bounded prompt request has been accepted
+    /// for delivery. A `turn/start`/`session/prompt` response represents model
+    /// completion and may take arbitrarily longer than the handshake.
+    #[must_use]
+    pub fn is_open_ready(&self) -> bool {
+        self.is_complete()
+            || matches!(self.phase, DriverPhase::CodexAwaitTurn | DriverPhase::AcpAwaitPrompt)
+    }
+
 }
 
 fn frame(value: Value) -> Result<Vec<u8>, String> {
@@ -305,6 +314,18 @@ mod tests {
         driver.start().unwrap();
         assert!(driver.on_record(b"{\"id\":1,\"error\":{\"code\":-1,\"message\":\"no\"}}\n").is_err());
         assert!(!driver.is_complete());
+    }
+
+    #[test]
+    fn long_running_prompt_is_open_ready_before_completion() {
+        let mut driver = StructuredAdapterDriver::new(AdapterDialect::KimiAcp, Some("long task"), None, &cwd()).unwrap();
+        driver.start().unwrap();
+        let mut session = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false}}}\n").unwrap();
+        let _ = session.remove(0);
+        let prompt = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"native_long\"}}\n").unwrap();
+        assert_eq!(prompt.len(), 1);
+        assert!(driver.is_open_ready());
+        assert!(!driver.is_complete(), "prompt completion is deliberately not an open prerequisite");
     }
 
     fn cwd() -> String { std::env::current_dir().unwrap().to_string_lossy().into_owned() }

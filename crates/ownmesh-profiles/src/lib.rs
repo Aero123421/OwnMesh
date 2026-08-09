@@ -1479,12 +1479,15 @@ pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPag
 /// Best-effort event normalization from JSONL adapter lines.
 pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let raw_type = v
-        .get("type")
-        .or_else(|| v.get("event"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let raw_type = if v.get("error").is_some() {
+        "error".to_owned()
+    } else {
+        v.get("type")
+            .or_else(|| v.get("event"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
     let kind = match raw_type.as_str() {
         "message" | "assistant" | "text" | "content" => "message",
         "tool_call" | "tool" | "function_call" => "tool_call",
@@ -1498,6 +1501,7 @@ pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
         .get("text")
         .or_else(|| v.get("content"))
         .or_else(|| v.pointer("/message/content"))
+        .or_else(|| v.pointer("/error/message"))
         .and_then(|x| {
             if x.is_string() {
                 x.as_str().map(str::to_string)
@@ -1774,6 +1778,14 @@ acp = false
             .as_deref()
             .unwrap()
             .contains("exceeds"));
+    }
+
+    #[test]
+    fn post_open_json_rpc_errors_are_visible_structured_events() {
+        let event = normalize_event_json(r#"{"id":3,"error":{"code":-32001,"message":"turn failed"}}"#)
+            .expect("JSON-RPC error must not disappear from replay");
+        assert_eq!(event.kind, "error");
+        assert_eq!(event.text.as_deref(), Some("turn failed"));
     }
 
     #[test]

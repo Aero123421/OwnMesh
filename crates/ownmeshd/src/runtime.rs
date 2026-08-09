@@ -719,7 +719,7 @@ impl DaemonRuntime {
                 message: format!("structured adapter bootstrap write failed: {err}"),
             })?;
         }
-        if driver.is_complete() {
+        if driver.is_open_ready() {
             return Ok(driver.native_session_id().map(str::to_owned));
         }
 
@@ -757,7 +757,7 @@ impl DaemonRuntime {
                         message: format!("structured adapter follow-up write failed: {err}"),
                     })?;
                 }
-                if driver.is_complete() {
+                if driver.is_open_ready() {
                     return Ok(driver.native_session_id().map(str::to_owned));
                 }
             }
