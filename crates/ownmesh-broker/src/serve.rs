@@ -22,8 +22,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex as AsyncMutex;
+#[cfg(target_os = "linux")]
+use tokio::sync::Semaphore;
 
 /// Default relative name for the capability signing key (broker-only).
 pub const CAPABILITY_SIGNING_FILE: &str = "broker.cap.signing";
@@ -823,7 +827,7 @@ struct ProductionState {
     verify_key: CapabilityVerifyKey,
     broker_instance_id: String,
     broker_key_id: String,
-    ledger: ReplayLedger,
+    ledger: StdMutex<ReplayLedger>,
 }
 
 #[cfg(target_os = "linux")]
@@ -853,21 +857,44 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .map_err(|error| format!("bind broker socket {}: {error}", socket_path.display()))?;
     apply_linux_socket_custody(&socket_path, cfg.socket_security)?;
-    let mut state = ProductionState {
+    let state = Arc::new(ProductionState {
         secret,
         signing_key,
         verify_key,
         broker_instance_id,
         broker_key_id,
-        ledger,
-    };
+        ledger: StdMutex::new(ledger),
+    });
+    // A full broker returns a bounded error rather than allowing an attacker to
+    // create unbounded pending local IPC tasks.
+    let concurrency = Arc::new(Semaphore::new(16));
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
-        let response = handle_linux_production_connection(&mut stream, &policy, &mut state).await;
-        if let Err(error) = write_resp(&mut stream, &response).await {
-            // One untrusted peer's broken connection never changes broker state.
-            let _ = error;
-        }
+        let permit = match Arc::clone(&concurrency).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _ = write_resp(
+                    &mut stream,
+                    &BrokerResponse {
+                        request_id: "unknown".into(),
+                        ok: false,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some("broker busy; bounded concurrency limit reached".into()),
+                    },
+                )
+                .await;
+                continue;
+            }
+        };
+        let policy = policy.clone();
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let response = handle_linux_production_connection(&mut stream, &policy, state).await;
+            let _ = write_resp(&mut stream, &response).await;
+        });
     }
 }
 
@@ -875,7 +902,7 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
 async fn handle_linux_production_connection(
     stream: &mut tokio::net::UnixStream,
     policy: &crate::peer::TrustedPeerPolicy,
-    state: &mut ProductionState,
+    state: Arc<ProductionState>,
 ) -> BrokerResponse {
     let request_id = "unknown".to_string();
     let result: Result<BrokerResponse, String> = async {
@@ -924,11 +951,18 @@ async fn handle_linux_production_connection(
         .map_err(|error| error.to_string())?;
         state
             .ledger
+            .lock()
+            .map_err(|_| "replay ledger lock poisoned".to_string())?
             .reserve_verified_request(&internal, now)
             .map_err(|error| replay_error(&error))?;
         let mut response = run_v2_elevated(&internal).await;
         let digest = operation_facts_digest(&internal.facts);
-        if let Err(error) = state.ledger.mark_completed(&internal.nonce, &digest) {
+        if let Err(error) = state
+            .ledger
+            .lock()
+            .map_err(|_| "replay ledger lock poisoned".to_string())?
+            .mark_completed(&internal.nonce, &digest)
+        {
             response.ok = false;
             response.error = Some(format!("durable ledger finalize failed: {error}"));
         }
