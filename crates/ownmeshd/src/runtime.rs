@@ -2085,7 +2085,7 @@ full_user_access/full_access for arbitrary commands",
             || !p
                 .plan_sha256
                 .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || p.plan_sha256.len() != 64
             || binding.destination_principal_id != authority.principal_id
             || binding.destination_device_id != authority.device_id
@@ -7847,6 +7847,28 @@ mod transfer_runtime_tests {
         std::fs::write(destination_root.join("received.bin"), b"untouched").unwrap();
         assert!(destination_runtime
             .handle_transfer_preflight_destination(Some(destination_request), &remote_client())
+            .await
+            .is_err());
+        let invalid_hash = json!({
+            "transfer_id": "xfer_bad_hash",
+            "source_path": "source.bin",
+            "destination_path": "another.bin",
+            "source_principal_id": "principal_a",
+            "destination_principal_id": "principal_a",
+            "source_device_id": "dev_transfer_test",
+            "destination_device_id": "dev_destination",
+            "source_workspace_id": "ws_default",
+            "workspace_id": "ws_destination",
+            "plan_sha256": "g".repeat(64),
+            "epoch": 1,
+            "fence": 1,
+            "session_nonce": "nonce_split",
+            "expires_at": (DaemonRuntime::now() as u64 + 120) * 1000,
+            "coordinator_request_id": "coord_split",
+            "workspace_version": 1,
+        });
+        assert!(destination_runtime
+            .handle_transfer_preflight_destination(Some(invalid_hash), &remote_client())
             .await
             .is_err());
     }
