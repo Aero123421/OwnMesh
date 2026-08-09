@@ -46,9 +46,9 @@ impl StructuredAdapterDriver {
         if prompt.len() > MAX_STRUCTURED_FRAME_BYTES / 2 || prompt.contains('\0') {
             return Err("structured adapter prompt exceeds bounded frame policy".into());
         }
-        if native_session_id.is_some_and(|id| {
-            id.is_empty() || id.len() > 512 || id.chars().any(char::is_control)
-        }) {
+        if native_session_id
+            .is_some_and(|id| id.is_empty() || id.len() > 512 || id.chars().any(char::is_control))
+        {
             return Err("invalid structured adapter native session id".into());
         }
         if !Path::new(cwd).is_absolute() {
@@ -64,7 +64,9 @@ impl StructuredAdapterDriver {
             | AdapterDialect::QoderAcp => DriverPhase::AcpAwaitInitialize,
             // These profiles receive their documented prompt as one argv item;
             // their stdout still travels through the structured pipe/spool.
-            AdapterDialect::ClaudeStreamJson | AdapterDialect::AgyStreamJson => DriverPhase::ArgvOnly,
+            AdapterDialect::ClaudeStreamJson | AdapterDialect::AgyStreamJson => {
+                DriverPhase::ArgvOnly
+            }
         };
         Ok(Self {
             prompt: prompt.into(),
@@ -85,12 +87,10 @@ impl StructuredAdapterDriver {
             }))?]),
             // App-server uses JSON-RPC semantics but explicitly omits the
             // `jsonrpc` member on its stdio JSONL wire format.
-            DriverPhase::CodexAwaitInitialize => Ok(vec![
-                frame(json!({
-                    "id": 1, "method": "initialize",
-                    "params": {"clientInfo": {"name": "ownmesh", "version": "1.2"}},
-                }))?,
-            ]),
+            DriverPhase::CodexAwaitInitialize => Ok(vec![frame(json!({
+                "id": 1, "method": "initialize",
+                "params": {"clientInfo": {"name": "ownmesh", "version": "1.2"}},
+            }))?]),
             DriverPhase::AcpAwaitInitialize => Ok(vec![frame(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {
@@ -119,8 +119,10 @@ impl StructuredAdapterDriver {
             return Err("structured adapter returned a JSON-RPC error".into());
         }
         if let Some(method) = value.get("method").and_then(Value::as_str) {
-            if method.contains("permission") || method.contains("approval")
-                || method.starts_with("fs/") || method.starts_with("terminal/")
+            if method.contains("permission")
+                || method.contains("approval")
+                || method.starts_with("fs/")
+                || method.starts_with("terminal/")
                 || method.contains("tool")
             {
                 return Err("structured adapter requested unapproved permission".into());
@@ -155,7 +157,12 @@ impl StructuredAdapterDriver {
             {
                 if matches!(self.phase, DriverPhase::CodexAwaitTurn) {
                     require_result_object(&value, "Codex turn/start")?;
-                } else if value.get("result").and_then(|r| r.get("stopReason")).and_then(Value::as_str).is_none() {
+                } else if value
+                    .get("result")
+                    .and_then(|r| r.get("stopReason"))
+                    .and_then(Value::as_str)
+                    .is_none()
+                {
                     return Err("ACP session/prompt response omitted stopReason".into());
                 }
                 self.phase = DriverPhase::Complete;
@@ -183,12 +190,16 @@ impl StructuredAdapterDriver {
                     Some(id) => json!({"sessionId":id, "cwd": self.cwd, "mcpServers": []}),
                     None => json!({"cwd": self.cwd, "mcpServers": []}),
                 };
-                Ok(vec![frame(json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}))?])
+                Ok(vec![frame(
+                    json!({"jsonrpc":"2.0","id":2,"method":method,"params":params}),
+                )?])
             }
             DriverPhase::AcpAwaitSession if response_id(&value) == Some(2) => {
                 let id = if self.native_session_id.is_some() {
                     require_result_object(&value, "ACP session/load")?;
-                    self.native_session_id.clone().ok_or("ACP native session id disappeared")?
+                    self.native_session_id
+                        .clone()
+                        .ok_or("ACP native session id disappeared")?
                 } else {
                     extract_string(&value, "sessionId")
                         .ok_or("ACP session/new response omitted sessionId")?
@@ -207,12 +218,17 @@ impl StructuredAdapterDriver {
 
     #[must_use]
     pub fn native_session_id(&self) -> Option<&str> {
-        self.thread_or_session_id.as_deref().or(self.native_session_id.as_deref())
+        self.thread_or_session_id
+            .as_deref()
+            .or(self.native_session_id.as_deref())
     }
 
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        matches!(self.phase, DriverPhase::ArgvOnly | DriverPhase::PiPrompted | DriverPhase::Complete)
+        matches!(
+            self.phase,
+            DriverPhase::ArgvOnly | DriverPhase::PiPrompted | DriverPhase::Complete
+        )
     }
 
     /// Session open is ready once the bounded prompt request has been accepted
@@ -221,13 +237,16 @@ impl StructuredAdapterDriver {
     #[must_use]
     pub fn is_open_ready(&self) -> bool {
         self.is_complete()
-            || matches!(self.phase, DriverPhase::CodexAwaitTurn | DriverPhase::AcpAwaitPrompt)
+            || matches!(
+                self.phase,
+                DriverPhase::CodexAwaitTurn | DriverPhase::AcpAwaitPrompt
+            )
     }
-
 }
 
 fn frame(value: Value) -> Result<Vec<u8>, String> {
-    let mut bytes = serde_json::to_vec(&value).map_err(|e| format!("encode structured request: {e}"))?;
+    let mut bytes =
+        serde_json::to_vec(&value).map_err(|e| format!("encode structured request: {e}"))?;
     bytes.push(b'\n');
     if bytes.len() > MAX_STRUCTURED_FRAME_BYTES {
         return Err("structured adapter request exceeds 64KiB".into());
@@ -251,7 +270,10 @@ fn extract_id(value: &Value, path: &[&str]) -> Option<String> {
     current.as_str().map(str::to_owned)
 }
 
-fn require_result_object<'a>(value: &'a Value, what: &str) -> Result<&'a serde_json::Map<String, Value>, String> {
+fn require_result_object<'a>(
+    value: &'a Value,
+    what: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
     value
         .get("result")
         .and_then(Value::as_object)
@@ -264,69 +286,125 @@ mod tests {
 
     #[test]
     fn pi_uses_documented_strict_lf_prompt_frame() {
-        let driver = StructuredAdapterDriver::new(AdapterDialect::PiRpc, Some("hello"), None, &cwd()).unwrap();
-        assert_eq!(driver.start().unwrap(), vec![b"{\"id\":\"ownmesh-prompt-1\",\"message\":\"hello\",\"type\":\"prompt\"}\n"]);
+        let driver =
+            StructuredAdapterDriver::new(AdapterDialect::PiRpc, Some("hello"), None, &cwd())
+                .unwrap();
+        assert_eq!(
+            driver.start().unwrap(),
+            vec![b"{\"id\":\"ownmesh-prompt-1\",\"message\":\"hello\",\"type\":\"prompt\"}\n"]
+        );
         assert!(driver.is_complete());
     }
 
     #[test]
     fn codex_waits_for_thread_id_before_turn() {
-        let mut driver = StructuredAdapterDriver::new(AdapterDialect::CodexAppServer, Some("ship it"), None, &cwd()).unwrap();
+        let mut driver = StructuredAdapterDriver::new(
+            AdapterDialect::CodexAppServer,
+            Some("ship it"),
+            None,
+            &cwd(),
+        )
+        .unwrap();
         let initial = driver.start().unwrap();
         assert_eq!(initial.len(), 1);
         assert!(!String::from_utf8_lossy(&initial[0]).contains("jsonrpc"));
         let thread = driver.on_record(b"{\"id\":1,\"result\":{}}\n").unwrap();
         assert!(String::from_utf8_lossy(&thread[0]).contains("initialized"));
         assert!(String::from_utf8_lossy(&thread[1]).contains("thread/start"));
-        let turn = driver.on_record(b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n").unwrap();
+        let turn = driver
+            .on_record(b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thr_1\"}}}\n")
+            .unwrap();
         assert!(String::from_utf8_lossy(&turn[0]).contains("turn/start"));
         assert_eq!(driver.native_session_id(), Some("thr_1"));
     }
 
     #[test]
     fn acp_resume_is_capability_gated_and_permissions_fail_closed() {
-        let mut driver = StructuredAdapterDriver::new(AdapterDialect::KimiAcp, Some("hello"), Some("native_1"), &cwd()).unwrap();
+        let mut driver = StructuredAdapterDriver::new(
+            AdapterDialect::KimiAcp,
+            Some("hello"),
+            Some("native_1"),
+            &cwd(),
+        )
+        .unwrap();
         driver.start().unwrap();
-        assert!(driver.on_record(b"{\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{}}}\n").is_err());
-        assert!(driver.on_record(b"{\"method\":\"session/request_permission\",\"params\":{}}\n").is_err());
+        assert!(driver
+            .on_record(b"{\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{}}}\n")
+            .is_err());
+        assert!(driver
+            .on_record(b"{\"method\":\"session/request_permission\",\"params\":{}}\n")
+            .is_err());
     }
 
     #[test]
     fn acp_v1_requests_required_session_facts_and_validates_result_shape() {
-        let mut driver = StructuredAdapterDriver::new(AdapterDialect::OpenCodeServer, Some("hello"), None, &cwd()).unwrap();
+        let mut driver = StructuredAdapterDriver::new(
+            AdapterDialect::OpenCodeServer,
+            Some("hello"),
+            None,
+            &cwd(),
+        )
+        .unwrap();
         let mut initial = driver.start().unwrap();
         let init = String::from_utf8(initial.remove(0)).unwrap();
         assert!(init.contains("\"jsonrpc\":\"2.0\""));
         assert!(init.contains("\"protocolVersion\":1"));
         assert!(init.contains("\"clientCapabilities\""));
-        assert!(driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n").unwrap().is_empty());
+        assert!(driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n")
+            .unwrap()
+            .is_empty());
         let mut new = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false}}}\n").unwrap();
         let new = String::from_utf8(new.remove(0)).unwrap();
         assert!(new.contains("\"session/new\""));
         assert!(new.contains("\"cwd\""));
         assert!(new.contains("\"mcpServers\":[]"));
-        assert!(driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n").is_err());
+        assert!(driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n")
+            .is_err());
     }
 
     #[test]
     fn correlated_errors_fail_closed_without_state_advance() {
-        let mut driver = StructuredAdapterDriver::new(AdapterDialect::CodexAppServer, Some("hello"), None, &cwd()).unwrap();
+        let mut driver = StructuredAdapterDriver::new(
+            AdapterDialect::CodexAppServer,
+            Some("hello"),
+            None,
+            &cwd(),
+        )
+        .unwrap();
         driver.start().unwrap();
-        assert!(driver.on_record(b"{\"id\":1,\"error\":{\"code\":-1,\"message\":\"no\"}}\n").is_err());
+        assert!(driver
+            .on_record(b"{\"id\":1,\"error\":{\"code\":-1,\"message\":\"no\"}}\n")
+            .is_err());
         assert!(!driver.is_complete());
     }
 
     #[test]
     fn long_running_prompt_is_open_ready_before_completion() {
-        let mut driver = StructuredAdapterDriver::new(AdapterDialect::KimiAcp, Some("long task"), None, &cwd()).unwrap();
+        let mut driver =
+            StructuredAdapterDriver::new(AdapterDialect::KimiAcp, Some("long task"), None, &cwd())
+                .unwrap();
         driver.start().unwrap();
         let mut session = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":false}}}\n").unwrap();
         let _ = session.remove(0);
-        let prompt = driver.on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"native_long\"}}\n").unwrap();
+        let prompt = driver
+            .on_record(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"native_long\"}}\n",
+            )
+            .unwrap();
         assert_eq!(prompt.len(), 1);
         assert!(driver.is_open_ready());
-        assert!(!driver.is_complete(), "prompt completion is deliberately not an open prerequisite");
+        assert!(
+            !driver.is_complete(),
+            "prompt completion is deliberately not an open prerequisite"
+        );
     }
 
-    fn cwd() -> String { std::env::current_dir().unwrap().to_string_lossy().into_owned() }
+    fn cwd() -> String {
+        std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
 }

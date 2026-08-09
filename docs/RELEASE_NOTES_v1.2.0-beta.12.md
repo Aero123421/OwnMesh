@@ -35,14 +35,14 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 - `ownmesh_fs_patch` accepts `patch_format=unified` (or a hash-checked unified body) for single-file apply.
 - Multi-file/binary diffs fail closed. Whole-file replace remains available via `patch_format=replace`.
 
-### E6 — profile detection + PTY launch
-- Device IPC `profile.list` / `profile.show` / `profile.scan` run real PATH detection for the nine official profile IDs.
-- MCP `ownmesh_list_profiles` with `device_id` routes to the device; without `device_id` returns catalog metadata only.
-- `session.open` with `profile_id` builds an official launch plan and owns a live PTY fallback. Credentials never leave the device.
-- CLI `profile *` surfaces remain explicit unsupported until CLI wiring is proved.
+### E6 — nine structured profile adapters
+- Device IPC `profile.list` / `profile.show` run real PATH detection for the nine official profile IDs, and public MCP routes both through the Agent to the device.
+- Each official profile runs in the persistent sidecar with strict bounded stdio framing: headerless Codex app-server, ACP v1 (including negotiated load), Pi RPC, and stream-json argv dialects.
+- The public workerd acceptance path proves all nine unique outputs, delayed turn completion without blocking `session.open`, native argv/negotiated resume where source-backed, explicit degraded rejection otherwise, safe no-credential-probe status, and exact terminate cleanup.
+- CLI `profile *` surfaces remain explicit unsupported; this acceptance covers the remote MCP profile contract.
 
 ## Gate posture
-- `scripts/tests/test_v12_e2_e9_workerd_loopback.py` stays **RED (exit 2)** until E4–E9 acceptance rows are fully evidenced on the real binary × workerd path.
+- `scripts/tests/test_v12_e2_e9_workerd_loopback.py` stays **RED (exit 2)** until E7–E9 acceptance rows are fully evidenced on the real binary × workerd path.
 - E8 elevated broker mint and E9 resumable transfer remain open.
 - Completeness claim remains false; E10 live-account proof is out of scope for this run.
 

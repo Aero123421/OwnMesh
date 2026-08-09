@@ -65,7 +65,6 @@ use serde_json::{json, Value};
 use session_transition_journal::{
     SessionTransitionJournal, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
 };
-use structured_adapter::StructuredAdapterDriver;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,6 +72,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use structured_adapter::StructuredAdapterDriver;
 use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 
@@ -714,10 +714,13 @@ impl DaemonRuntime {
             code: app_error::INVALID_PARAMS,
             message,
         })? {
-            supervisor.write(binding, request).await.map_err(|err| IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: format!("structured adapter bootstrap write failed: {err}"),
-            })?;
+            supervisor
+                .write(binding, request)
+                .await
+                .map_err(|err| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("structured adapter bootstrap write failed: {err}"),
+                })?;
         }
         if driver.is_open_ready() {
             return Ok(driver.native_session_id().map(str::to_owned));
@@ -748,14 +751,20 @@ impl DaemonRuntime {
             }
             while let Some(end) = partial.iter().position(|byte| *byte == b'\n') {
                 let record: Vec<_> = partial.drain(..=end).collect();
-                for request in driver.on_record(&record).map_err(|message| IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message,
-                })? {
-                    supervisor.write(binding, request).await.map_err(|err| IpcError::Remote {
+                for request in driver
+                    .on_record(&record)
+                    .map_err(|message| IpcError::Remote {
                         code: app_error::CONFLICT,
-                        message: format!("structured adapter follow-up write failed: {err}"),
-                    })?;
+                        message,
+                    })?
+                {
+                    supervisor
+                        .write(binding, request)
+                        .await
+                        .map_err(|err| IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!("structured adapter follow-up write failed: {err}"),
+                        })?;
                 }
                 if driver.is_open_ready() {
                     return Ok(driver.native_session_id().map(str::to_owned));
@@ -3056,9 +3065,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 });
             }
         };
-        if p.native_session_id.as_deref().is_some_and(|id| {
-            id.is_empty() || id.len() > 512 || id.chars().any(char::is_control)
-        }) {
+        if p.native_session_id
+            .as_deref()
+            .is_some_and(|id| id.is_empty() || id.len() > 512 || id.chars().any(char::is_control))
+        {
             return Err(IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
                 message: "native_session_id must be a non-control string <= 512 bytes".into(),
@@ -3067,13 +3077,16 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         if p.adapter_mode.is_some() && p.profile_id.is_none() {
             return Err(IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
-                message: "adapter_mode requires profile_id; generic program/args are unchanged".into(),
+                message: "adapter_mode requires profile_id; generic program/args are unchanged"
+                    .into(),
             });
         }
         if p.native_session_id.is_some() && p.profile_id.is_none() {
             return Err(IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
-                message: "native_session_id requires profile_id; generic program/args are unchanged".into(),
+                message:
+                    "native_session_id requires profile_id; generic program/args are unchanged"
+                        .into(),
             });
         }
         let principal = client.client_name.clone();
@@ -3093,6 +3106,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         // still use program/args/command without profile registration.
         let mut profile_meta: Option<Value> = None;
         let mut structured_adapter: Option<(String, AdapterDialect)> = None;
+        // Argv resumes consume the native id in their exact launch plan; a
+        // negotiated JSON-RPC resume keeps it for the structured driver.
+        let mut driver_native_session_id = p.native_session_id.clone();
         let command = if let Some(cmd) = p.command.clone().filter(|c| !c.is_empty()) {
             Some(cmd)
         } else if let Some(program) = p
@@ -3117,26 +3133,29 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 code: app_error::INVALID_PARAMS,
                 message: format!("no source-backed adapter contract for profile {profile_id}"),
             })?;
+            // Process-argv resumes (Claude/Kimi/Hermes) consume the native id
+            // before ACP bootstrap; passing it again would incorrectly issue a
+            // second `session/load`. Negotiated resumes (Codex/ACP) start the
+            // normal structured child and let the exact driver perform the
+            // source-backed resume after capability negotiation.
             let native_resume = p.native_session_id.as_deref().map(|native_id| match &spec.resume {
-                NativeResume::Argv { .. } => reg.resume_plan(profile_id, native_id).map_err(|e| {
-                    IpcError::Remote {
-                        code: app_error::INVALID_PARAMS,
-                        message: format!("profile native resume plan failed: {e}"),
-                    }
-                }),
-                NativeResume::Negotiated { method } => Err(IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!(
-                        "profile {profile_id} native resume requires negotiated {method}; RPC resume is not available in this session host"
-                    ),
-                }),
+                NativeResume::Argv { .. } => {
+                    driver_native_session_id = None;
+                    reg.resume_plan_with_prompt(profile_id, native_id, p.prompt.as_deref()).map(Some).map_err(|e| {
+                        IpcError::Remote {
+                            code: app_error::INVALID_PARAMS,
+                            message: format!("profile native resume plan failed: {e}"),
+                        }
+                    })
+                }
+                NativeResume::Negotiated { .. } => Ok(None),
                 NativeResume::Degraded => Err(IpcError::Remote {
                     code: app_error::CONFLICT,
                     message: format!(
                         "profile {profile_id} has no source-backed native resume; use a new profile session or explicit PTY"
                     ),
                 }),
-            }).transpose()?;
+            }).transpose()?.flatten();
             let plan = match native_resume {
                 Some(plan) => plan,
                 None => reg
@@ -3285,7 +3304,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                         &binding,
                         dialect,
                         p.prompt.as_deref(),
-                        p.native_session_id.as_deref(),
+                        driver_native_session_id.as_deref(),
                         cwd.as_deref().ok_or_else(|| IpcError::Remote {
                             code: app_error::INVALID_PARAMS,
                             message: "structured profile requires an absolute workspace cwd".into(),
@@ -3296,16 +3315,27 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                         Ok(native_id) => native_id,
                         Err(error) => {
                             if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                                let _ = proxy.terminate(&binding, format!("open-rollback:{}:structured", info.id)).await;
+                                let _ = proxy
+                                    .terminate(
+                                        &binding,
+                                        format!("open-rollback:{}:structured", info.id),
+                                    )
+                                    .await;
                             }
                             self.sessions = snapshot;
                             return Err(error);
                         }
                     };
                     if let Some(native_id) = native_id {
-                        if let Err(error) = self.sessions.set_native_session_id(&info.id, native_id) {
+                        if let Err(error) = self.sessions.set_native_session_id(&info.id, native_id)
+                        {
                             if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                                let _ = proxy.terminate(&binding, format!("open-rollback:{}:native-id", info.id)).await;
+                                let _ = proxy
+                                    .terminate(
+                                        &binding,
+                                        format!("open-rollback:{}:native-id", info.id),
+                                    )
+                                    .await;
                             }
                             self.sessions = snapshot;
                             return Err(session_err(error));
@@ -4403,6 +4433,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         struct P {
             #[serde(default)]
             id: Option<String>,
+            /// Public MCP's canonical field; accept it as an exact alias for
+            /// the local IPC `id` without allowing the two to disagree.
+            #[serde(default)]
+            session_id: Option<String>,
             #[serde(default)]
             all: bool,
             #[serde(default)]
@@ -4451,7 +4485,13 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             }
             return Ok(json!({ "terminated": n, "all": true }));
         }
-        let id = p.id.ok_or_else(|| IpcError::Remote {
+        if p.id.is_some() && p.session_id.is_some() && p.id != p.session_id {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "id and session_id disagree".into(),
+            });
+        }
+        let id = p.id.or(p.session_id).ok_or_else(|| IpcError::Remote {
             code: app_error::INVALID_PARAMS,
             message: "id or all required".into(),
         })?;
@@ -4548,9 +4588,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("mark sidecar terminate journal: {e}"),
                 })?;
-            preview
-                .set_sidecar_host_binding(&id, None)
-                .map_err(session_err)?;
+            // `SessionManager::terminate` removes the entry, which is the
+            // durable binding clear. Do not mutate the already-removed
+            // preview entry here: doing so turns an otherwise successful
+            // exact sidecar tombstone into a spurious `session not found`.
             self.sessions = preview;
             self.commit_sessions(snapshot)?;
             self.transition_journal
@@ -4684,10 +4725,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 })
             });
         let profile_event_cursor = profile_events.as_ref().map(|page| page.next_cursor);
-        let profile_event_truncated = profile_events
-            .as_ref()
-            .is_some_and(|page| page.has_more)
-            || sidecar_truncated;
+        let profile_event_truncated =
+            profile_events.as_ref().is_some_and(|page| page.has_more) || sidecar_truncated;
         Ok(json!({
             "chunks": page.chunks,
             "session_id": p.id,

@@ -171,6 +171,25 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "read",
   },
   {
+    name: "ownmesh_profile_show",
+    description:
+      "Show one official CLI profile's device-local detection and safe authentication status. Credentials are never read or returned.",
+    inputSchema: {
+      type: "object",
+      properties: { ...deviceProp, id: str },
+      required: ["device_id", "id"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
+  },
+  {
     name: "ownmesh_fs_list",
     description: "List files in a workspace path on a device (alias: ownmesh_list_files)",
     inputSchema: {

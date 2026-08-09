@@ -87,6 +87,13 @@ def main() -> int:
             "restart reattach retaining the same PTY PID and output, handoff/detach/"
             "expiry reclaim, and stale token/nonce mutation denial"
         ),
+        "E6": (
+            "nine official profile adapters plus a generic CLI through public "
+            "MCP/workerd/Agent/ownmeshd: strict Codex and ACP handshakes, "
+            "bounded raw cursor replay, delayed turn completion, safe auth "
+            "status, native argv/negotiated resume, explicit unsupported "
+            "resume rejection, and exact sidecar cleanup"
+        ),
     }
     proven_partial = {
         "E2": (
@@ -101,12 +108,6 @@ def main() -> int:
             "exactly once via device approval resolution; tenant_members handoff "
             "(partial - team admin UI still out of scope)"
         ),
-        "E6": (
-            "device profile.list/show/scan PATH detection for nine official ids; "
-            "MCP ownmesh_list_profiles with device_id routes to ownmeshd; "
-            "session.open profile_id launch plan + live PTY fallback; "
-            "structured adapter events/native resume matrix still open"
-        ),
         "E7": (
             "MCP git status/diff + private integrity-bound diff spool + fsmonitor off; "
             "bounded single-file unified-diff apply on fs.patch; full multi-file review flow still open"
@@ -117,9 +118,8 @@ def main() -> int:
         ("E8", "networkless elevated broker Full Access mint/custody"),
         ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
     )
-    # E4/E5 have real workerd acceptance; E6-E9 remain incomplete.
+    # E4-E6 have real workerd acceptance; remaining rows stay fail-closed.
     incomplete_acceptance = (
-        ("E6", "nine structured adapters + native resume/events beyond PATH detect + PTY fallback"),
         ("E7", "full Git review workflow (tests/diff pages) beyond single-file unified apply"),
         *still_open,
     )
@@ -140,13 +140,13 @@ def main() -> int:
 
     if incomplete_acceptance:
         print(
-            "E2-E9 workerd gate RED: E6-E9 real binary x local Wrangler/workerd "
+            "E2-E9 workerd gate RED: E7-E9 real binary x local Wrangler/workerd "
             "acceptance is not yet complete (partial rows are not completion). "
             "Refusing exit 0 so incomplete work cannot look green.",
             file=sys.stderr,
         )
         print(
-            "v1.2 E2-E9 workerd loopback entrypoint: E2-E5 proven; E6/E7 partial; "
+            "v1.2 E2-E9 workerd loopback entrypoint: E2-E6 proven; E7 partial; "
             "E8/E9 OPEN; gate fail-closed"
         )
         return 2
