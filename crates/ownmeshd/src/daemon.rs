@@ -15,6 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex};
 
+/// Bound idle interval for reclaiming expired transfer plaintext/state. Every
+/// transfer operation enforces expiry independently; this additionally removes
+/// durable parts and snapshots when the daemon receives no further requests.
+const TRANSFER_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Run ownmeshd until Ctrl-C / shutdown signal.
 pub fn run_foreground() -> Result<(), ExitCode> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -96,6 +101,13 @@ async fn run_async() -> Result<(), ExitCode> {
         }
     });
 
+    let (cleanup_shutdown, cleanup_shutdown_rx) = watch::channel(false);
+    let cleanup_task = spawn_transfer_cleanup(
+        Arc::clone(&runtime),
+        cleanup_shutdown_rx,
+        TRANSFER_CLEANUP_INTERVAL,
+    );
+
     let (transport_shutdown, transport_shutdown_rx) = watch::channel(false);
     let transport_task = match agent_transport::configured_transport(&paths, &cfg) {
         Ok(Some(config)) => Some(tokio::spawn(agent_transport::run(
@@ -118,13 +130,43 @@ async fn run_async() -> Result<(), ExitCode> {
     wait_for_shutdown().await?;
 
     let _ = transport_shutdown.send(true);
+    let _ = cleanup_shutdown.send(true);
     server.request_shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(2), serve_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), cleanup_task).await;
     if let Some(task) = transport_task {
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
     tracing::info!("ownmeshd stopped");
     Ok(())
+}
+
+fn spawn_transfer_cleanup(
+    runtime: Arc<Mutex<DaemonRuntime>>,
+    mut shutdown: watch::Receiver<bool>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = ticker.tick() => {
+                    let mut guard = runtime.lock().await;
+                    if let Err(error) = guard.cleanup_expired_transfers() {
+                        // Cleanup is deliberately retryable: a transient disk
+                        // failure must not terminate the policy/IPC service.
+                        tracing::error!(error = %error, "idle transfer cleanup failed");
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn remove_legacy_token(path: &std::path::Path) -> std::io::Result<bool> {
@@ -498,7 +540,12 @@ mod tests {
         IpcError,
     };
     use ownmesh_policy::{preset_document, AccessPreset, Decision, PolicyDocument, PolicyRule};
+    use ownmesh_transfer::{
+        ChunkSink, JournalLimits, JournalStore, PartFileSink, TransferBinding, TransferGrant,
+        TransferPlan,
+    };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     #[test]
@@ -716,6 +763,68 @@ mod tests {
         std::fs::write(&legacy, b"obsolete").unwrap();
         assert!(remove_legacy_token(&legacy).unwrap());
         assert!(!legacy.exists());
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_removes_expired_transfer_plaintext_without_a_transfer_api_call() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let runtime = Arc::new(Mutex::new(DaemonRuntime::open(&paths).unwrap()));
+        let store = JournalStore::open(paths.state_dir.join("transfers"), JournalLimits::default())
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bytes = b"expired plaintext";
+        let plan = TransferPlan::from_verified(
+            TransferBinding {
+                tenant_id: "tenant".into(),
+                source_principal_id: "source".into(),
+                destination_principal_id: "destination".into(),
+                source_device_id: "source-device".into(),
+                destination_device_id: "destination-device".into(),
+                source_workspace_id: "source-workspace".into(),
+                destination_workspace_id: "destination-workspace".into(),
+                source_relative_path: "source.bin".into(),
+                destination_relative_path: "destination.bin".into(),
+            },
+            TransferGrant {
+                grant_id: "grant".into(),
+                operation_id: "operation".into(),
+                payload_sha256: "a".repeat(64),
+                expires_at_unix: now + 2,
+            },
+            bytes.len() as u64,
+            hex::encode(Sha256::digest(bytes)),
+        )
+        .unwrap();
+        store.save_plan(&plan).unwrap();
+        let lease = store.acquire(&plan, now, now + 1).unwrap();
+        let journal = store
+            .claim(&lease, &plan, "owner", 1, 1, now, now + 1)
+            .unwrap();
+        let mut sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+        sink.write_chunk(0, bytes).unwrap();
+        let part = sink.path().to_path_buf();
+        drop(sink);
+        store.save(&lease, &journal).unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), bytes);
+
+        // No transfer RPC is made after this point. The idle task alone must
+        // acquire the same runtime mutex and delete the expired plaintext.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = spawn_transfer_cleanup(runtime, shutdown_rx, Duration::from_millis(10));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while part.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle cleanup must remove the expired private part");
+        let _ = shutdown.send(true);
+        task.await.unwrap();
     }
 
     fn test_client(endpoint: Endpoint, runtime_dir: impl Into<std::path::PathBuf>) -> IpcClient {

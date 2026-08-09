@@ -6,6 +6,7 @@ use ownmesh_transfer::{
 };
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
+use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
@@ -257,6 +258,26 @@ fn durable_journal_fences_corruption_and_quota_fail_closed() {
 }
 
 #[test]
+fn stale_lease_drop_cannot_remove_a_fresh_cross_process_unique_lease() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"lease");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let stale = store.acquire(&plan, 1, 2).unwrap();
+    // This models a restarted/new process reclaiming an expired lock while an
+    // old holder remains alive long enough to run its Drop implementation.
+    let fresh = store.acquire(&plan, 3, 9_000).unwrap();
+    drop(stale);
+    assert!(
+        matches!(
+            store.acquire(&plan, 3, 9_000),
+            Err(TransferError::LeaseBusy)
+        ),
+        "old lease release must not unlink a fresh UUID-bound lock"
+    );
+    drop(fresh);
+}
+
+#[test]
 fn startup_cleanup_removes_only_expired_owned_part() {
     let dir = tempdir().unwrap();
     let plan = make_plan(b"hello");
@@ -325,6 +346,153 @@ fn source_only_plan_and_snapshot_retries_are_aggregate_quota_bounded() {
         store.open_source_sender_at(second, ws.open_verified_read("input.bin").unwrap(), 0, 0),
         Err(TransferError::JournalQuotaExceeded)
     ));
+}
+
+#[test]
+fn concurrent_store_clones_cannot_overadmit_plan_or_snapshot_quotas() {
+    let dir = tempdir().unwrap();
+    let limits = JournalLimits {
+        max_journals: 4,
+        max_bytes: 4096,
+        max_snapshots: 1,
+        max_snapshot_bytes: 8,
+        max_plans: 1,
+        max_plan_bytes: 4096,
+    };
+    let store = JournalStore::open(dir.path().join("plans"), limits).unwrap();
+    let first = make_plan(b"one");
+    let mut second_binding = binding();
+    second_binding.source_relative_path = "input-two.bin".into();
+    let second = TransferPlan::from_verified(second_binding, grant(), 3, digest(b"two")).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let second_barrier = Arc::clone(&barrier);
+    let (first_result, second_result) = std::thread::scope(|scope| {
+        let first_task = scope.spawn(move || {
+            first_barrier.wait();
+            first_store.save_plan(&first)
+        });
+        let second_task = scope.spawn(move || {
+            second_barrier.wait();
+            second_store.save_plan(&second)
+        });
+        (first_task.join().unwrap(), second_task.join().unwrap())
+    });
+    assert_eq!(
+        usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+        1,
+        "store-wide reservation must admit only one plan"
+    );
+
+    let snapshot_store = JournalStore::open(dir.path().join("snapshots"), limits).unwrap();
+    std::fs::write(dir.path().join("input-one.bin"), b"one").unwrap();
+    std::fs::write(dir.path().join("input-two.bin"), b"two").unwrap();
+    let first = make_plan(b"one");
+    let mut second_binding = binding();
+    second_binding.source_relative_path = "input-two.bin".into();
+    let second = TransferPlan::from_verified(second_binding, grant(), 3, digest(b"two")).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let first_store = snapshot_store.clone();
+    let second_store = snapshot_store.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let second_barrier = Arc::clone(&barrier);
+    let root = dir.path().to_path_buf();
+    let (first_result, second_result) = std::thread::scope(|scope| {
+        let first_task = scope.spawn({
+            let root = root.clone();
+            move || {
+                first_barrier.wait();
+                let ws = WorkspaceRoot::new(root, true).unwrap();
+                first_store.open_source_sender_at(
+                    first,
+                    ws.open_verified_read("input-one.bin").unwrap(),
+                    0,
+                    0,
+                )
+            }
+        });
+        let second_task = scope.spawn(move || {
+            second_barrier.wait();
+            let ws = WorkspaceRoot::new(root, true).unwrap();
+            second_store.open_source_sender_at(
+                second,
+                ws.open_verified_read("input-two.bin").unwrap(),
+                0,
+                0,
+            )
+        });
+        (first_task.join().unwrap(), second_task.join().unwrap())
+    });
+    assert_eq!(
+        usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+        1,
+        "store-wide reservation must admit only one snapshot: {:?} {:?}",
+        first_result.as_ref().err(),
+        second_result.as_ref().err()
+    );
+}
+
+#[test]
+fn concurrent_source_staging_succeeds_when_two_snapshot_reservations_fit() {
+    let dir = tempdir().unwrap();
+    let store = JournalStore::open(
+        dir.path().join("state"),
+        JournalLimits {
+            max_journals: 4,
+            max_bytes: 4096,
+            max_snapshots: 2,
+            max_snapshot_bytes: 8,
+            max_plans: 2,
+            max_plan_bytes: 4096,
+        },
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("one.bin"), b"one").unwrap();
+    std::fs::write(dir.path().join("two.bin"), b"two").unwrap();
+    let first = make_plan(b"one");
+    let mut second_binding = binding();
+    second_binding.source_relative_path = "two.bin".into();
+    let second = TransferPlan::from_verified(second_binding, grant(), 3, digest(b"two")).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let first_store = store.clone();
+    let second_store = store.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let second_barrier = Arc::clone(&barrier);
+    let root = dir.path().to_path_buf();
+    let (first, second) = std::thread::scope(|scope| {
+        let first_task = scope.spawn({
+            let root = root.clone();
+            move || {
+                first_barrier.wait();
+                let ws = WorkspaceRoot::new(root, true).unwrap();
+                first_store.open_source_sender_at(
+                    first,
+                    ws.open_verified_read("one.bin").unwrap(),
+                    0,
+                    0,
+                )
+            }
+        });
+        let second_task = scope.spawn(move || {
+            second_barrier.wait();
+            let ws = WorkspaceRoot::new(root, true).unwrap();
+            second_store.open_source_sender_at(
+                second,
+                ws.open_verified_read("two.bin").unwrap(),
+                0,
+                0,
+            )
+        });
+        (first_task.join().unwrap(), second_task.join().unwrap())
+    });
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "fitting reservations must both stage: {:?} {:?}",
+        first.as_ref().err(),
+        second.as_ref().err()
+    );
 }
 
 #[test]

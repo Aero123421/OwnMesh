@@ -18,6 +18,7 @@
     clippy::too_many_arguments
 )]
 
+use fs2::FileExt;
 use ownmesh_fs::WorkspaceReadHandle;
 use ownmesh_ipc::{
     atomic_write_owner_only, create_owner_only_file_new, open_owner_only_file_append,
@@ -31,6 +32,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Maximum payload held by the transfer core at once.
 pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
@@ -100,6 +102,91 @@ pub type TransferResult<T> = Result<T, TransferError>;
 
 fn io_error(error: std::io::Error) -> TransferError {
     TransferError::Io(error.to_string())
+}
+
+fn open_owner_only_file_append_retry(path: &Path) -> TransferResult<File> {
+    for _ in 0..200 {
+        if let Ok(file) = open_owner_only_file_append(path) {
+            return Ok(file);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Err(TransferError::CustodyUnavailable)
+}
+
+fn open_owner_only_file_read_retry(path: &Path) -> TransferResult<File> {
+    for _ in 0..200 {
+        if let Ok(file) = open_owner_only_file_read(path) {
+            return Ok(file);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Err(TransferError::CustodyUnavailable)
+}
+
+fn remove_owner_only_file_retry(path: &Path) -> TransferResult<()> {
+    for _ in 0..200 {
+        if remove_owner_only_file(path).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Err(TransferError::CustodyUnavailable)
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    Uuid::parse_str(value)
+        .map(|parsed| parsed.hyphenated().to_string() == value)
+        .unwrap_or(false)
+}
+
+fn lease_record(plan_id: &str, expires_at_unix: u64) -> Vec<u8> {
+    format!(
+        "{plan_id}\n{expires_at_unix}\n{}\n",
+        Uuid::new_v4().hyphenated()
+    )
+    .into_bytes()
+}
+
+fn parse_lease_expiry(bytes: &[u8], plan_id: &str) -> Option<u64> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.split_terminator('\n');
+    let record_plan = lines.next()?;
+    let expiry = lines.next()?.parse::<u64>().ok()?;
+    let nonce = lines.next()?;
+    if record_plan != plan_id || !canonical_uuid(nonce) || lines.next().is_some() {
+        return None;
+    }
+    (text == format!("{record_plan}\n{expiry}\n{nonce}\n")).then_some(expiry)
+}
+
+fn source_reservation_record(plan: &TransferPlan) -> Vec<u8> {
+    format!(
+        "{}\n{}\n{}\n{}\n",
+        plan.id(),
+        plan.grant().expires_at_unix,
+        plan.size_bytes,
+        Uuid::new_v4().hyphenated()
+    )
+    .into_bytes()
+}
+
+fn parse_source_reservation(bytes: &[u8], plan_id: &str) -> Option<SourceReservation> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.split_terminator('\n');
+    let record_plan = lines.next()?;
+    let expires_at_unix = lines.next()?.parse::<u64>().ok()?;
+    let bytes = lines.next()?.parse::<u64>().ok()?;
+    let nonce = lines.next()?;
+    if record_plan != plan_id || !canonical_uuid(nonce) || lines.next().is_some() {
+        return None;
+    }
+    (text == format!("{record_plan}\n{expires_at_unix}\n{bytes}\n{nonce}\n")).then_some(
+        SourceReservation {
+            expires_at_unix,
+            bytes,
+        },
+    )
 }
 
 fn valid_id(value: &str, field: &str) -> TransferResult<()> {
@@ -987,10 +1074,30 @@ impl Default for JournalLimits {
 pub struct JournalLease {
     plan_id: String,
     path: PathBuf,
+    store_lock_path: PathBuf,
+    body: Vec<u8>,
+}
+
+struct SourceReservation {
+    expires_at_unix: u64,
+    bytes: u64,
 }
 impl Drop for JournalLease {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // A stale holder must never unlink a newly acquired lease. Serialize
+        // release with stale-lock replacement and remove only our exact nonce.
+        let Ok(store_lock) = open_owner_only_file_append(&self.store_lock_path) else {
+            return;
+        };
+        if FileExt::try_lock_exclusive(&store_lock).is_err() {
+            return;
+        }
+        let is_ours =
+            read_owner_only_file_bounded(&self.path, 512).is_ok_and(|current| current == self.body);
+        if is_ours {
+            let _ = remove_owner_only_file(&self.path);
+        }
+        let _ = FileExt::unlock(&store_lock);
     }
 }
 
@@ -1000,6 +1107,19 @@ impl Drop for JournalLease {
 pub struct JournalStore {
     root: PathBuf,
     limits: JournalLimits,
+}
+
+/// Held OS-level lock for mutations whose admission depends on aggregate
+/// directory counts or byte budgets. Cloned stores and separate processes
+/// therefore cannot both observe spare capacity and over-admit state.
+struct StoreLock {
+    file: File,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 impl JournalStore {
@@ -1033,6 +1153,31 @@ impl JournalStore {
         Ok(self.root.join(format!(".{plan_id}{suffix}")))
     }
 
+    fn lock_store(&self) -> TransferResult<StoreLock> {
+        self.lock_store_with_attempts(20)
+    }
+
+    fn lock_store_with_attempts(&self, attempts: usize) -> TransferResult<StoreLock> {
+        let path = self.root.join(".store.lock");
+        if !path.exists() {
+            // Creation races are harmless: the winner creates the owner-only
+            // inode and every contender verifies it before opening it.
+            let _ = create_owner_only_file_new(&path, b"");
+        }
+        let file =
+            open_owner_only_file_append(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+        // Snapshot staging releases this lock before copying bytes. Use only a
+        // small bounded retry window for those short reservation transactions;
+        // never block an IPC/cleanup worker behind a multi-gigabyte copy.
+        for _ in 0..attempts {
+            if FileExt::try_lock_exclusive(&file).is_ok() {
+                return Ok(StoreLock { file });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Err(TransferError::LeaseBusy)
+    }
+
     fn snapshot_usage(&self) -> TransferResult<(usize, u64)> {
         let mut count = 0_usize;
         let mut bytes = 0_u64;
@@ -1040,16 +1185,43 @@ impl JournalStore {
             let entry = entry.map_err(io_error)?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with(".xfer_") || !name.ends_with(".source") {
+            if !name.starts_with(".xfer_") {
                 continue;
             }
             let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
             if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
                 return Err(TransferError::CustodyUnavailable);
             }
+            let Some(name) = name.strip_prefix('.') else {
+                continue;
+            };
+            let reserved = name.strip_suffix(".source.reserve");
+            let source = name.strip_suffix(".source");
+            let accounted_bytes = if let Some(plan_id) = reserved {
+                if self.path(plan_id, ".source.reserve")? != entry.path() {
+                    continue;
+                }
+                let record = read_owner_only_file_bounded(&entry.path(), 512)
+                    .map_err(|_| TransferError::CustodyUnavailable)?;
+                parse_source_reservation(&record, plan_id)
+                    .ok_or(TransferError::CustodyUnavailable)?
+                    .bytes
+            } else if let Some(plan_id) = source {
+                if self.path(plan_id, ".source")? != entry.path() {
+                    continue;
+                }
+                // A source reservation is authoritative while copy is in
+                // progress; the partial file must not count a second time.
+                if self.path(plan_id, ".source.reserve")?.exists() {
+                    continue;
+                }
+                metadata.len()
+            } else {
+                continue;
+            };
             count = count.checked_add(1).ok_or(TransferError::Overflow)?;
             bytes = bytes
-                .checked_add(metadata.len())
+                .checked_add(accounted_bytes)
                 .ok_or(TransferError::Overflow)?;
         }
         Ok((count, bytes))
@@ -1102,35 +1274,35 @@ impl JournalStore {
         now_unix: u64,
         expires_at_unix: u64,
     ) -> TransferResult<JournalLease> {
+        let _store_lock = self.lock_store()?;
         plan.validate_at(now_unix)?;
         if expires_at_unix <= now_unix {
             return Err(TransferError::Terminal);
         }
         let path = self.path(plan.id(), ".lock")?;
-        let body = format!("{}\n{}\n", plan.id(), expires_at_unix);
-        if create_owner_only_file_new(&path, body.as_bytes()).is_ok() {
+        let body = lease_record(plan.id(), expires_at_unix);
+        if create_owner_only_file_new(&path, &body).is_ok() {
             Ok(JournalLease {
                 plan_id: plan.id.clone(),
                 path,
+                store_lock_path: self.root.join(".store.lock"),
+                body,
             })
         } else {
             let existing =
                 read_owner_only_file_bounded(&path, 512).map_err(|_| TransferError::LeaseBusy)?;
-            let text = std::str::from_utf8(&existing).map_err(|_| TransferError::LeaseBusy)?;
-            let stale = text
-                .lines()
-                .nth(1)
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|expiry| expiry <= now_unix);
+            let stale =
+                parse_lease_expiry(&existing, plan.id()).is_some_and(|expiry| expiry <= now_unix);
             if !stale {
                 return Err(TransferError::LeaseBusy);
             }
             remove_owner_only_file(&path).map_err(|_| TransferError::LeaseBusy)?;
-            create_owner_only_file_new(&path, body.as_bytes())
-                .map_err(|_| TransferError::LeaseBusy)?;
+            create_owner_only_file_new(&path, &body).map_err(|_| TransferError::LeaseBusy)?;
             Ok(JournalLease {
                 plan_id: plan.id.clone(),
                 path,
+                store_lock_path: self.root.join(".store.lock"),
+                body,
             })
         }
     }
@@ -1177,35 +1349,52 @@ impl JournalStore {
         offset: u64,
     ) -> TransferResult<TransferSender> {
         plan.validate_at(now_unix())?;
-        self.cleanup_expired(now_unix())?;
         let snapshot = self.path(plan.id(), ".source")?;
-        if snapshot.exists() {
-            match open_owner_only_file_read(&snapshot)
-                .map_err(|_| TransferError::CustodyUnavailable)
-                .and_then(|file| {
-                    TransferSender::from_retained_file(plan.clone(), file, sequence, offset)
-                }) {
-                Ok(sender) => return Ok(sender),
-                Err(_) => {
-                    // A crash while staging can leave only a partial snapshot.
-                    // It is owner-only and plan-addressed, so remove precisely it
-                    // before making one fresh bounded attempt.
-                    remove_owner_only_file(&snapshot)
-                        .map_err(|_| TransferError::CustodyUnavailable)?;
+        let reservation = self.path(plan.id(), ".source.reserve")?;
+        {
+            let _store_lock = self.lock_store()?;
+            self.cleanup_expired_unlocked(now_unix())?;
+            if reservation.exists() {
+                let record = read_owner_only_file_bounded(&reservation, 512)
+                    .map_err(|_| TransferError::CustodyUnavailable)?;
+                let active = parse_source_reservation(&record, plan.id())
+                    .ok_or(TransferError::CustodyUnavailable)?;
+                if active.expires_at_unix > now_unix() {
+                    // Do not inspect/remove the matching partial snapshot: a
+                    // concurrent owner has already reserved this exact plan.
+                    return Err(TransferError::LeaseBusy);
+                }
+                remove_owner_only_file_retry(&reservation)?;
+            }
+            if snapshot.exists() {
+                match open_owner_only_file_read(&snapshot)
+                    .map_err(|_| TransferError::CustodyUnavailable)
+                    .and_then(|file| {
+                        TransferSender::from_retained_file(plan.clone(), file, sequence, offset)
+                    }) {
+                    Ok(sender) => return Ok(sender),
+                    Err(_) => {
+                        // A crash while staging can leave only a partial snapshot.
+                        remove_owner_only_file(&snapshot)
+                            .map_err(|_| TransferError::CustodyUnavailable)?;
+                    }
                 }
             }
+            // Account for a plan-bound reservation before copy, then release
+            // the store lock. Other plans can stage concurrently whenever the
+            // aggregate quotas allow it; the exact reservation path makes a
+            // duplicate staging attempt for this plan retryable instead.
+            self.ensure_snapshot_capacity(plan.size_bytes)?;
+            create_owner_only_file_new(&reservation, &source_reservation_record(&plan))
+                .map_err(|_| TransferError::LeaseBusy)?;
+            if create_owner_only_file_new(&snapshot, &[]).is_err() {
+                let _ = remove_owner_only_file_retry(&reservation);
+                return Err(TransferError::CustodyUnavailable);
+            }
         }
-
-        // Reserve against the immutable plan size before creating/copying any
-        // snapshot bytes. A repeated fresh generation cannot exhaust state
-        // storage even if it never creates a receiver journal.
-        self.ensure_snapshot_capacity(plan.size_bytes)?;
         let mut input = source.into_file();
-        create_owner_only_file_new(&snapshot, &[])
-            .map_err(|_| TransferError::CustodyUnavailable)?;
         let copy_result = (|| -> TransferResult<()> {
-            let mut output = open_owner_only_file_append(&snapshot)
-                .map_err(|_| TransferError::CustodyUnavailable)?;
+            let mut output = open_owner_only_file_append_retry(&snapshot)?;
             let mut hasher = Sha256::new();
             let mut total = 0_u64;
             let mut buffer = vec![0_u8; MAX_CHUNK_BYTES];
@@ -1230,20 +1419,42 @@ impl JournalStore {
             Ok(())
         })();
         if let Err(error) = copy_result {
-            let _ = remove_owner_only_file(&snapshot);
+            let _ = remove_owner_only_file_retry(&snapshot);
+            let _ = remove_owner_only_file_retry(&reservation);
             return Err(error);
         }
-        let file =
-            open_owner_only_file_read(&snapshot).map_err(|_| TransferError::CustodyUnavailable)?;
+        {
+            // Completion must converge a valid snapshot and its reservation.
+            // The store lock is never held during the copy itself, so this
+            // longer-but-bounded window only contends with short metadata
+            // transactions or an exact cleanup scan.
+            let _store_lock = self.lock_store_with_attempts(2_000)?;
+            if let Err(error) = plan.validate_at(now_unix()) {
+                let _ = remove_owner_only_file_retry(&snapshot);
+                let _ = remove_owner_only_file_retry(&reservation);
+                return Err(error);
+            }
+            remove_owner_only_file_retry(&reservation)?;
+        }
+        let file = open_owner_only_file_read_retry(&snapshot)?;
         TransferSender::from_retained_file(plan, file, sequence, offset)
     }
 
     /// Remove the exact owner-only source snapshot after terminal completion or
     /// cancellation. It cannot select a caller-controlled path.
     pub fn remove_source_snapshot(&self, plan: &TransferPlan) -> TransferResult<()> {
+        let _store_lock = self.lock_store()?;
+        self.remove_source_snapshot_unlocked(plan)
+    }
+
+    fn remove_source_snapshot_unlocked(&self, plan: &TransferPlan) -> TransferResult<()> {
         let path = self.path(plan.id(), ".source")?;
         if path.exists() {
             remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+        }
+        let reservation = self.path(plan.id(), ".source.reserve")?;
+        if reservation.exists() {
+            remove_owner_only_file(&reservation).map_err(|_| TransferError::CustodyUnavailable)?;
         }
         Ok(())
     }
@@ -1253,7 +1464,8 @@ impl JournalStore {
     /// convergence; source snapshots/plans never need to survive terminal EOF
     /// or an authenticated source cancellation.
     pub fn remove_source_terminal_state(&self, plan: &TransferPlan) -> TransferResult<()> {
-        self.remove_source_snapshot(plan)?;
+        let _store_lock = self.lock_store()?;
+        self.remove_source_snapshot_unlocked(plan)?;
         let plan_path = self.path(plan.id(), ".plan.json")?;
         if plan_path.exists() {
             remove_owner_only_file(&plan_path).map_err(|_| TransferError::CustodyUnavailable)?;
@@ -1264,8 +1476,9 @@ impl JournalStore {
     /// Persist immutable plan metadata separately from progress so a restarted
     /// daemon can reopen only the exact authorized transfer id.
     pub fn save_plan(&self, plan: &TransferPlan) -> TransferResult<()> {
+        let _store_lock = self.lock_store()?;
         plan.validate_at(now_unix())?;
-        self.cleanup_expired(now_unix())?;
+        self.cleanup_expired_unlocked(now_unix())?;
         let bytes = serde_json::to_vec(plan)
             .map_err(|_| TransferError::InvalidPlan("serialize plan".into()))?;
         if bytes.len() > self.limits.max_bytes {
@@ -1350,6 +1563,7 @@ impl JournalStore {
         now_unix: u64,
         expires_at_unix: u64,
     ) -> TransferResult<TransferJournal> {
+        let _store_lock = self.lock_store()?;
         plan.validate_at(now_unix)?;
         if lease.plan_id != plan.id || expires_at_unix <= now_unix {
             return Err(TransferError::StaleFence);
@@ -1382,10 +1596,15 @@ impl JournalStore {
             }
             TransferJournal::fresh(plan, owner_id, epoch, fence, expires_at_unix)?
         };
-        self.save(lease, &journal)?;
+        self.save_unlocked(lease, &journal)?;
         Ok(journal)
     }
     pub fn save(&self, lease: &JournalLease, journal: &TransferJournal) -> TransferResult<()> {
+        let _store_lock = self.lock_store()?;
+        self.save_unlocked(lease, journal)
+    }
+
+    fn save_unlocked(&self, lease: &JournalLease, journal: &TransferJournal) -> TransferResult<()> {
         if lease.plan_id != journal.plan_id {
             return Err(TransferError::StaleFence);
         }
@@ -1463,6 +1682,11 @@ impl JournalStore {
     /// Only the exact private part name derived from an expired journal is ever
     /// deleted.
     pub fn cleanup_expired(&self, now_unix: u64) -> TransferResult<usize> {
+        let _store_lock = self.lock_store()?;
+        self.cleanup_expired_unlocked(now_unix)
+    }
+
+    fn cleanup_expired_unlocked(&self, now_unix: u64) -> TransferResult<usize> {
         let entries: Vec<PathBuf> = fs::read_dir(&self.root)
             .map_err(io_error)?
             .filter_map(Result::ok)
@@ -1510,6 +1734,11 @@ impl JournalStore {
                 }
                 remove_owner_only_file(&source).map_err(|_| TransferError::CustodyUnavailable)?;
             }
+            let reservation = self.path(&journal.plan_id, ".source.reserve")?;
+            if reservation.exists() {
+                remove_owner_only_file(&reservation)
+                    .map_err(|_| TransferError::CustodyUnavailable)?;
+            }
             remove_owner_only_file(&journal_path).map_err(|_| TransferError::CustodyUnavailable)?;
             let plan = self.path(&journal.plan_id, ".plan.json")?;
             if plan.exists() {
@@ -1550,6 +1779,11 @@ impl JournalStore {
                     remove_owner_only_file(&source)
                         .map_err(|_| TransferError::CustodyUnavailable)?;
                 }
+                let reservation = self.path(plan_id, ".source.reserve")?;
+                if reservation.exists() {
+                    remove_owner_only_file(&reservation)
+                        .map_err(|_| TransferError::CustodyUnavailable)?;
+                }
                 remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
                 removed += 1;
             } else {
@@ -1567,11 +1801,40 @@ impl JournalStore {
             else {
                 continue;
             };
-            if self.path(plan_id, ".source")? != path || live_plan_ids.contains(plan_id) {
+            if self.path(plan_id, ".source")? != path
+                || live_plan_ids.contains(plan_id)
+                || self.path(plan_id, ".source.reserve")?.exists()
+            {
                 continue;
             }
             remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
             removed += 1;
+        }
+        // A crash can strand a source-staging reservation before its snapshot
+        // exists. It is bounded, plan-addressed state: discard it only when its
+        // own canonical expiry passed or its matching immutable plan vanished.
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(plan_id) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".source.reserve"))
+            else {
+                continue;
+            };
+            if self.path(plan_id, ".source.reserve")? != path {
+                continue;
+            }
+            let bytes = read_owner_only_file_bounded(&path, 512)
+                .map_err(|_| TransferError::CustodyUnavailable)?;
+            let reservation = parse_source_reservation(&bytes, plan_id)
+                .ok_or(TransferError::CustodyUnavailable)?;
+            if reservation.expires_at_unix <= now_unix {
+                remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+                removed += 1;
+            }
         }
         Ok(removed)
     }

@@ -7908,6 +7908,31 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
     pub fn session_state_for_test(&self) -> Value {
         serde_json::to_value(&self.sessions).expect("session manager must serialize")
     }
+
+    /// Sweep expired transfer journals, private parts, and source snapshots.
+    ///
+    /// The daemon owns this behind its runtime mutex, which serializes cleanup
+    /// with every transfer admission and quota mutation performed by IPC or the
+    /// Agent transport. `JournalStore` independently locks its state directory
+    /// for direct cloned-store callers.
+    pub(crate) fn cleanup_expired_transfers(&mut self) -> Result<usize, String> {
+        let now = Self::now() as u64;
+        let removed = self
+            .transfer_store
+            .cleanup_expired(now)
+            .map_err(|error| format!("cleanup transfer state: {error}"))?;
+        if removed != 0 {
+            // Drop only cache entries whose exact immutable plan disappeared
+            // or no longer validates. An unrelated expired transfer must not
+            // interrupt another live long-running source transfer.
+            let store = self.transfer_store.clone();
+            self.transfer_senders
+                .retain(|plan_id, _| store.load_plan(plan_id, now).ok().flatten().is_some());
+            self.transfer_last_chunks
+                .retain(|plan_id, _| store.load_plan(plan_id, now).ok().flatten().is_some());
+        }
+        Ok(removed)
+    }
 }
 
 /// Build the IPC method handler backed by shared runtime state.
@@ -8323,6 +8348,7 @@ mod device_binding_tests {
 #[cfg(test)]
 mod transfer_runtime_tests {
     use super::*;
+    use ownmesh_transfer::ChunkSink;
     use tempfile::tempdir;
 
     fn remote_client() -> ClientIdentity {
@@ -8592,6 +8618,91 @@ mod transfer_runtime_tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn cleanup_of_an_expired_transfer_keeps_an_unrelated_live_sender() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        std::fs::write(
+            paths.state_dir.join("workspace").join("live-source.bin"),
+            b"live transfer bytes",
+        )
+        .unwrap();
+        bind_remote_transfer(&mut runtime);
+        let client = remote_client();
+        let live = runtime
+            .handle_transfer_plan(
+                Some(json!({
+                    "source_path": "live-source.bin",
+                    "destination_path": "live-destination.bin",
+                    "destination_workspace_id": "ws_remote_destination",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let live_id = live["plan_id"].as_str().unwrap().to_owned();
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": live_id, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+
+        let now = DaemonRuntime::now() as u64;
+        let expired = TransferPlan::from_verified(
+            TransferBinding {
+                tenant_id: "tenant_a".into(),
+                source_principal_id: "principal_a".into(),
+                destination_principal_id: "principal_a".into(),
+                source_device_id: "dev_transfer_test".into(),
+                destination_device_id: "dev_transfer_test".into(),
+                source_workspace_id: "ws_default".into(),
+                destination_workspace_id: "ws_default".into(),
+                source_relative_path: "expired-source.bin".into(),
+                destination_relative_path: "expired-destination.bin".into(),
+            },
+            TransferGrant {
+                grant_id: "expired-grant".into(),
+                operation_id: "expired-operation".into(),
+                payload_sha256: "a".repeat(64),
+                expires_at_unix: now + 60,
+            },
+            1,
+            sha256_hex(b"x"),
+        )
+        .unwrap();
+        runtime.transfer_store.save_plan(&expired).unwrap();
+        let lease = runtime
+            .transfer_store
+            .acquire(&expired, now, now + 1)
+            .unwrap();
+        let journal = runtime
+            .transfer_store
+            .claim(&lease, &expired, "expired-owner", 1, 1, now, now + 1)
+            .unwrap();
+        let mut sink = PartFileSink::create(&runtime.transfer_store, &expired, 1, 0).unwrap();
+        sink.write_chunk(0, b"x").unwrap();
+        drop(sink);
+        runtime.transfer_store.save(&lease, &journal).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert_eq!(runtime.cleanup_expired_transfers().unwrap(), 1);
+        assert!(
+            runtime
+                .handle_transfer_source_chunk(
+                    Some(json!({ "plan_id": live_id, "sequence": 0 })),
+                    &client,
+                )
+                .await
+                .is_ok(),
+            "unrelated live sender must survive expired-transfer cleanup"
+        );
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn transfer_streams_binary_resumes_after_restart_and_pages_artifact() {
         let temp = tempdir().unwrap();
