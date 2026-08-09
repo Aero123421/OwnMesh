@@ -158,6 +158,23 @@ export type PrincipalRecord = {
   created_at: string;
 };
 
+/** Cloud authority for a device-local workspace registration (E4).
+ *
+ * The path itself deliberately remains on the device.  The control plane owns
+ * only the tenancy, device binding, owner and monotonically increasing version
+ * that must be included in every exact-action binding.
+ */
+export type WorkspaceRecord = {
+  workspace_id: string;
+  tenant_id: string;
+  device_id: string;
+  owner_principal_id: string;
+  version: number;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
 /** Authoritative MCP operation row (D1 / Memory). Isolate Maps are cache only. */
 export type McpOperationRecord = {
   operation_id: string;
@@ -670,6 +687,27 @@ export interface ControlPlaneStore {
 
   isTenantMember(tenantId: string, principalId: string): Promise<boolean>;
 
+  /** Returns the effective tenant role, if any.  Missing schema fails closed. */
+  getTenantMemberRole(
+    tenantId: string,
+    principalId: string,
+  ): Promise<"owner" | "admin" | "member" | null>;
+
+  /** Create or update cloud workspace custody.  Only admin paths call this. */
+  putWorkspace(workspace: WorkspaceRecord): Promise<void>;
+  getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null>;
+  /**
+   * Fail-closed workspace ACL/version gate.  Device owners and tenant
+   * owners/admins administer workspaces; ordinary members require ownership
+   * (future explicit per-workspace grants can be added without weakening this).
+   */
+  assertWorkspaceOperableForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }>;
+
   appliedMigrations(): Promise<string[]>;
   markMigration(id: string): Promise<void>;
 
@@ -922,6 +960,7 @@ export class MemoryStore implements ControlPlaneStore {
   grants = new Map<string, GrantRecord>();
   /** key = `${tenant_id}\0${principal_id}` */
   tenantMembers = new Map<string, { tenant_id: string; principal_id: string; role: "owner" | "admin" | "member"; created_at: string }>();
+  workspaces = new Map<string, WorkspaceRecord>();
   audits: AuditEvent[] = [];
   migrations = new Set<string>();
 
@@ -1734,6 +1773,47 @@ export class MemoryStore implements ControlPlaneStore {
 
   async isTenantMember(tenantId: string, principalId: string): Promise<boolean> {
     return this.tenantMembers.has(`${tenantId}\0${principalId}`);
+  }
+
+  async getTenantMemberRole(
+    tenantId: string,
+    principalId: string,
+  ): Promise<"owner" | "admin" | "member" | null> {
+    return this.tenantMembers.get(`${tenantId}\0${principalId}`)?.role ?? null;
+  }
+
+  async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
+    this.workspaces.set(workspace.workspace_id, { ...workspace });
+  }
+
+  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
+    const row = this.workspaces.get(workspaceId);
+    return row ? { ...row } : null;
+  }
+
+  async assertWorkspaceOperableForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
+    const workspace = await this.getWorkspace(workspaceId);
+    if (
+      !workspace ||
+      !workspace.active ||
+      workspace.tenant_id !== tenantId ||
+      workspace.device_id !== deviceId
+    ) {
+      return { ok: false, error: "workspace_not_available" };
+    }
+    const device = await this.getDevice(deviceId);
+    const role = await this.getTenantMemberRole(tenantId, principalId);
+    const allowed =
+      workspace.owner_principal_id === principalId ||
+      device?.principal_id === principalId ||
+      role === "owner" ||
+      role === "admin";
+    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
   }
 
   async canOperateDevice(
@@ -3656,6 +3736,75 @@ export class SqlStore implements ControlPlaneStore {
       // Missing table/schema fails closed (not a member).
       return false;
     }
+  }
+
+  async getTenantMemberRole(
+    tenantId: string,
+    principalId: string,
+  ): Promise<"owner" | "admin" | "member" | null> {
+    try {
+      const row = await this.db
+        .prepare(`SELECT role FROM tenant_members WHERE tenant_id = ? AND principal_id = ? LIMIT 1`)
+        .bind(tenantId, principalId)
+        .first<{ role: string }>();
+      return row?.role === "owner" || row?.role === "admin" || row?.role === "member"
+        ? row.role
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO workspaces
+           (workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(workspace_id) DO UPDATE SET
+           tenant_id = excluded.tenant_id, device_id = excluded.device_id,
+           owner_principal_id = excluded.owner_principal_id, version = excluded.version,
+           active = excluded.active, updated_at = excluded.updated_at`,
+      )
+      .bind(workspace.workspace_id, workspace.tenant_id, workspace.device_id,
+        workspace.owner_principal_id, workspace.version, workspace.active ? 1 : 0,
+        workspace.created_at, workspace.updated_at)
+      .run();
+  }
+
+  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
+    try {
+      const row = await this.db
+        .prepare(`SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at FROM workspaces WHERE workspace_id = ? LIMIT 1`)
+        .bind(workspaceId)
+        .first<{
+          workspace_id: string;
+          tenant_id: string;
+          device_id: string;
+          owner_principal_id: string;
+          version: number;
+          active: number;
+          created_at: string;
+          updated_at: string;
+        }>();
+      if (!row) return null;
+      return { ...row, version: Number(row.version), active: Boolean(row.active) };
+    } catch {
+      return null;
+    }
+  }
+
+  async assertWorkspaceOperableForMcp(
+    workspaceId: string, deviceId: string, principalId: string, tenantId: string,
+  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
+    const workspace = await this.getWorkspace(workspaceId);
+    if (!workspace || !workspace.active || workspace.tenant_id !== tenantId || workspace.device_id !== deviceId) {
+      return { ok: false, error: "workspace_not_available" };
+    }
+    const device = await this.getDevice(deviceId);
+    const role = await this.getTenantMemberRole(tenantId, principalId);
+    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin";
+    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
   }
 
   async canOperateDevice(

@@ -356,7 +356,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description: "Required caller idempotency key for exact-once delete retries",
         },
       },
-      required: ["device_id", "path", "idempotency_key"],
+      required: ["device_id", "id", "path", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -2008,13 +2008,16 @@ export async function buildCanonicalAction(opts: {
   tenantId: string;
   /** Authenticated OAuth client id (never client-supplied). */
   oauthClientId?: string;
+  /** Server-authorized E4 custody binding; never accepted from MCP arguments. */
+  workspaceBinding?: { workspace_id: string; version: number };
 }): Promise<Record<string, unknown>> {
   const action = toolAction(opts.toolName);
   const capability = toolCapability(opts.toolName);
   const workspaceId =
-    typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== ""
+    opts.workspaceBinding?.workspace_id ??
+    (typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== ""
       ? String(opts.args.workspace_id)
-      : undefined;
+      : undefined);
 
   const facts: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(opts.args)) {
@@ -2051,6 +2054,7 @@ export async function buildCanonicalAction(opts: {
     tenant_id: opts.tenantId,
     oauth_client_id: opts.oauthClientId ?? null,
     workspace_id: workspaceId ?? null,
+    workspace_version: opts.workspaceBinding?.version ?? null,
     facts,
   };
 }
@@ -2102,6 +2106,8 @@ export async function buildDeviceOperation(opts: {
   canonicalAction?: Record<string, unknown>;
   payloadHash?: string;
   boundAction?: Record<string, unknown>;
+  /** Server-authorized workspace identity/version bound into the exact action. */
+  workspaceBinding?: { workspace_id: string; version: number };
 }): Promise<{
   type: string;
   payload: Record<string, unknown>;
@@ -2157,6 +2163,7 @@ export async function buildDeviceOperation(opts: {
       principalId: opts.principalId,
       tenantId: opts.tenantId,
       oauthClientId: opts.oauthClientId,
+      workspaceBinding: opts.workspaceBinding,
     }));
   const bound =
     opts.boundAction && opts.payloadHash
@@ -2182,7 +2189,10 @@ export async function buildDeviceOperation(opts: {
     arguments: argumentsBody,
   };
   let workspaceId: string | undefined;
-  if (typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== "") {
+  if (opts.workspaceBinding) {
+    workspaceId = opts.workspaceBinding.workspace_id;
+    payload.workspace_id = workspaceId;
+  } else if (typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== "") {
     workspaceId = String(opts.args.workspace_id);
     payload.workspace_id = workspaceId;
   }
@@ -2960,6 +2970,96 @@ export async function handleMcp(
     }
 
     const safeArgs = sanitizeMcpArgs(args, name);
+    // E4: a device being operable never grants a tenant member control over all
+    // of its registered roots.  Resolve the cloud custody record before a
+    // canonical action is built or anything is handed to DeviceRoom.  The
+    // record's monotonically increasing version is then part of payload_hash.
+    const workspaceMutation = new Set([
+      "ownmesh_workspace_add",
+      "ownmesh_workspace_update",
+      "ownmesh_workspace_remove",
+    ]);
+    const workspaceManagementId =
+      name === "ownmesh_workspace_show" || workspaceMutation.has(name)
+        ? typeof safeArgs.id === "string"
+          ? safeArgs.id.trim()
+          : ""
+        : "";
+    const requestedWorkspaceId =
+      workspaceManagementId ||
+      (typeof safeArgs.workspace_id === "string" ? safeArgs.workspace_id.trim() : "");
+    let workspaceBinding: { workspace_id: string; version: number } | undefined;
+    if (requestedWorkspaceId) {
+      if (requestedWorkspaceId.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(requestedWorkspaceId)) {
+        return mcpError(id, -32602, "invalid workspace id", {
+          code: "OWNMESH_E_WORKSPACE_ID_INVALID",
+        });
+      }
+      if (name === "ownmesh_workspace_add") {
+        const device = await store.getDevice(deviceId);
+        const role = await store.getTenantMemberRole(rec.tenant_id, rec.principal);
+        const mayAdminister =
+          device?.principal_id === rec.principal || role === "owner" || role === "admin";
+        if (!mayAdminister) {
+          return mcpError(id, -32004, "workspace_not_available", {
+            code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
+          });
+        }
+        const existing = await store.getWorkspace(requestedWorkspaceId);
+        if (existing) {
+          return mcpError(id, -32602, "workspace id is already registered", {
+            code: "OWNMESH_E_WORKSPACE_ID_CONFLICT",
+          });
+        }
+        const timestamp = nowIso();
+        // Reserve authority before dispatch.  The local daemon still validates
+        // the root and can fail the operation; until then no other principal can
+        // substitute this id during an async/reconnect retry.
+        await store.putWorkspace({
+          workspace_id: requestedWorkspaceId,
+          tenant_id: rec.tenant_id,
+          device_id: deviceId,
+          owner_principal_id: rec.principal,
+          version: 1,
+          active: true,
+          created_at: timestamp,
+          updated_at: timestamp,
+        });
+        workspaceBinding = { workspace_id: requestedWorkspaceId, version: 1 };
+      } else {
+        const workspaceGate = await store.assertWorkspaceOperableForMcp(
+          requestedWorkspaceId,
+          deviceId,
+          rec.principal,
+          rec.tenant_id,
+        );
+        if (!workspaceGate.ok) {
+          return mcpError(id, -32004, workspaceGate.error, {
+            device_id: deviceId,
+            workspace_id: requestedWorkspaceId,
+          });
+        }
+        // Workspace root mutation/removal additionally needs a custodian.
+        if (workspaceMutation.has(name)) {
+          const device = await store.getDevice(deviceId);
+          const role = await store.getTenantMemberRole(rec.tenant_id, rec.principal);
+          const mayAdminister =
+            workspaceGate.workspace.owner_principal_id === rec.principal ||
+            device?.principal_id === rec.principal ||
+            role === "owner" ||
+            role === "admin";
+          if (!mayAdminister) {
+            return mcpError(id, -32004, "workspace_not_available", {
+              code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
+            });
+          }
+        }
+        workspaceBinding = {
+          workspace_id: workspaceGate.workspace.workspace_id,
+          version: workspaceGate.workspace.version,
+        };
+      }
+    }
     const wantAsync = safeArgs.async === true;
     const opType = normalizeOpType(name);
     const isMutating = tool.risk === "write" || tool.risk === "exec";
@@ -3000,6 +3100,7 @@ export async function handleMcp(
       claimVersion,
       oauthClientId: rec.client_id,
       injectionAttempt,
+      workspaceBinding,
     });
     const actionHash = await hashCanonicalAction(deviceOp.canonical_action);
 

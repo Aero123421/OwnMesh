@@ -181,6 +181,48 @@ test("schemaReadiness tracks 0005 MCP objects for both store kinds", async () =>
   assert.equal(sqlR.checks.mcp_approval_outbox, true);
 });
 
+test("public MCP workspace custody denies a tenant member and binds owner action version", async () => {
+  const store = new MemoryStore();
+  const owner = await seedAuthed(store);
+  await store.ensurePrincipal("prin_member", "Member", "human", "ten_default");
+  const member = await seedAuthed(store, "prin_member");
+  const deviceId = "dev_workspace_acl_01abcdef";
+  await putActiveDevice(store, deviceId);
+  await store.putTenantMember("ten_default", "prin_member", "member");
+  await store.putWorkspace({
+    workspace_id: "owner-root",
+    tenant_id: "ten_default",
+    device_id: deviceId,
+    owner_principal_id: "prin_dev",
+    version: 7,
+    active: true,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  let memberRoutes = 0;
+  const denied = await handleMcp(
+    rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: "owner-root", idempotency_key: "member-read" }, member.access_token),
+    store, new URL("https://cp.test/mcp"),
+    { routeToDevice: async () => { memberRoutes += 1; return { status: "routed_to_device" }; } },
+    { tracker: new OperationTracker() },
+  );
+  assert.equal(denied.status, 200);
+  assert.equal(memberRoutes, 0, "ACL denial must happen before DeviceRoom routing");
+  assert.match(await denied.text(), /workspace_not_available/);
+
+  let bound: Record<string, unknown> | undefined;
+  const ownerResult = await handleMcp(
+    rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: "owner-root", idempotency_key: "owner-read" }, owner.access_token),
+    store, new URL("https://cp.test/mcp"),
+    { routeToDevice: async (_id, op) => { bound = ((op.payload.authorization as { bound_action?: Record<string, unknown> })?.bound_action); return { status: "routed_to_device" }; } },
+    { tracker: new OperationTracker() },
+  );
+  assert.equal(ownerResult.status, 200);
+  assert.equal(bound?.workspace_id, "owner-root");
+  assert.equal(bound?.workspace_version, 7);
+});
+
 test("store is authoritative: empty tracker still polls after isolate restart", async () => {
   const store = new MemoryStore();
   const tok = await seedAuthed(store);
