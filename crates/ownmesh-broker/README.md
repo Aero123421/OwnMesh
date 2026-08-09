@@ -2,6 +2,12 @@
 
 Networkless privileged broker for elevated operations.
 
+On Linux, `ownmesh-broker install --trusted-executable <root-owned-ownmeshd>`
+creates a root-only native systemd service. It copies immutable images to
+`/usr/lib/ownmesh`, uses `/run/ownmesh/broker.sock` with mode `0600`, and only
+accepts the strict root-owned configuration at `/etc/ownmesh/ownmesh-broker.json`.
+Windows and macOS lifecycle commands remain unsupported.
+
 ## Production status: **UNSUPPORTED**
 
 Until a secure mint authority is established, production entry points are fixed

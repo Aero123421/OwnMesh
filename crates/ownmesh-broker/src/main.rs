@@ -1,8 +1,7 @@
 //! `OwnMesh` networkless privileged broker binary.
 //!
-//! Production elevated broker entry points are fixed as **unsupported** until a
-//! secure mint authority is established. CLI never binds a serve endpoint or
-//! executes elevated processes.
+//! Linux native lifecycle is backed by a root-owned systemd service.  Other
+//! operating systems remain fail-closed unsupported.
 
 #![allow(
     clippy::doc_markdown,
@@ -15,16 +14,20 @@
 )]
 
 use clap::{Parser, Subcommand};
-use ownmesh_broker::{broker_status, production_elevated_broker_unsupported};
+use ownmesh_broker::{
+    broker_status, install_broker_with_config, load_linux_run_config, run_broker, uninstall_broker,
+    BrokerInstallConfig, UnixSocketSecurity,
+};
+use ownmesh_broker_client::BrokerEndpoint;
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI.
 #[derive(Debug, Parser)]
 #[command(
     name = "ownmesh-broker",
     version,
-    about = "OwnMesh privileged broker (networkless; production elevated unsupported)",
+    about = "OwnMesh privileged broker (Linux native service; networkless)",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -38,73 +41,43 @@ enum Commands {
     Help,
     /// Show version.
     Version,
-    /// Production serve — always unsupported (no bind / no exec).
+    /// Production serve from the root-owned native service configuration.
     Run {
-        /// Endpoint override (ignored; production serve is unsupported).
+        /// Exact root-owned configuration installed by `install`.
         #[arg(long)]
-        endpoint: Option<String>,
-        /// Legacy bind address (ignored).
-        #[arg(long)]
-        bind: Option<String>,
-        /// Path to request-MAC secret file (ignored).
-        #[arg(long)]
-        secret_file: Option<PathBuf>,
-        /// Path to capability Ed25519 signing key (ignored).
-        #[arg(long)]
-        signing_key_file: Option<PathBuf>,
-        /// Addr file (ignored).
-        #[arg(long)]
-        addr_file: Option<PathBuf>,
-        /// Runtime dir (ignored).
-        #[arg(long)]
-        runtime_dir: Option<PathBuf>,
-        /// Trusted executable (ignored).
-        #[arg(long)]
-        trusted_executable: Option<PathBuf>,
-        /// Socket owner UID (ignored).
-        #[arg(long)]
-        socket_owner_uid: Option<u32>,
-        /// Socket group GID (ignored).
-        #[arg(long)]
-        socket_group_gid: Option<u32>,
-        /// Socket mode (ignored).
-        #[arg(long, value_parser = parse_octal_mode)]
-        socket_mode: Option<u32>,
-        /// Allowed UIDs (ignored).
-        #[arg(long = "allowed-uid")]
-        allowed_uids: Vec<u32>,
+        config: PathBuf,
     },
-    /// Status (always local; always unsupported / installed=false).
+    /// Status of the Linux native service.
     Status {
         /// State base directory (defaults to ./ownmesh-broker-state for bare binary).
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Install — always unsupported / installed=false.
+    /// Install the Linux native service (requires root).
     Install {
-        /// Legacy state directory (ignored).
+        /// Legacy state directory (ignored; Linux state is fixed under /var/lib).
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Legacy endpoint (ignored).
+        /// Endpoint must be the fixed Linux UDS if supplied.
         #[arg(long)]
         endpoint: Option<String>,
-        /// Legacy trusted executable (ignored).
+        /// Source ownmeshd image to install beside the broker.
         #[arg(long)]
         trusted_executable: Option<PathBuf>,
-        /// Legacy socket owner UID (ignored).
+        /// Must be 0 on the Linux native service.
         #[arg(long)]
         socket_owner_uid: Option<u32>,
-        /// Legacy socket group GID (ignored).
+        /// Must be 0 on the Linux native service.
         #[arg(long)]
         socket_group_gid: Option<u32>,
-        /// Legacy socket mode (ignored).
+        /// Must be 0600 on the Linux native service.
         #[arg(long, value_parser = parse_octal_mode)]
         socket_mode: Option<u32>,
-        /// Legacy allowed UIDs (ignored).
+        /// Must contain exactly UID 0 on the Linux native service.
         #[arg(long = "allowed-uid")]
         allowed_uids: Vec<u32>,
     },
-    /// Uninstall — unsupported and side-effect-free.
+    /// Uninstall the Linux native service (requires root).
     Uninstall {
         /// Legacy state directory (ignored).
         #[arg(long)]
@@ -152,7 +125,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 "ownmesh-broker — networkless privileged broker\n\
                  endpoint basename: {DEFAULT_BROKER_ENDPOINT}\n\
                  commands: help, version, run, status, install, uninstall, exec\n\
-                 PRODUCTION: elevated install/status/serve/exec are unsupported until secure mint authority"
+                 Linux: install/status/run/uninstall use a root-owned systemd service; Windows/macOS unsupported"
             );
             Ok(())
         }
@@ -164,7 +137,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             let base = state_dir.unwrap_or_else(|| PathBuf::from("."));
             let st = broker_status(&base)?;
             println!(
-                "status=unsupported support={} network={} endpoint={} kind={} secret={} signing={} verify={}",
+                "status={} support={} network={} endpoint={} kind={} secret={} signing={} verify={}",
+                if st.installed { "installed" } else { "absent" },
                 st.support,
                 st.network,
                 st.endpoint.as_deref().unwrap_or("-"),
@@ -176,39 +150,21 @@ async fn run(cli: Cli) -> Result<(), String> {
             for n in &st.notes {
                 println!("note: {n}");
             }
-            Err(format!(
-                "unsupported: privileged broker not available ({})",
-                st.notes
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| st.support.clone())
-            ))
+            if st.installed { Ok(()) } else { Err(st.notes.first().cloned().unwrap_or_else(|| "broker is not installed".into())) }
         }
-        Commands::Install {
-            state_dir: _,
-            endpoint: _,
-            trusted_executable: _,
-            socket_owner_uid: _,
-            socket_group_gid: _,
-            socket_mode: _,
-            allowed_uids: _,
-        } => Err("unsupported: elevated broker production install is disabled until a secure mint authority is established; no native service was activated or verified; no filesystem changes were made (fail-closed)".into()),
-        Commands::Uninstall { state_dir: _ } => Err(
-            "unsupported: elevated broker production uninstall is disabled; native service absence cannot be verified; no filesystem changes were made (fail-closed)".into(),
-        ),
-        Commands::Run {
-            endpoint: _,
-            bind: _,
-            secret_file: _,
-            signing_key_file: _,
-            addr_file: _,
-            runtime_dir: _,
-            trusted_executable: _,
-            socket_owner_uid: _,
-            socket_group_gid: _,
-            socket_mode: _,
-            allowed_uids: _,
-        } => Err(production_elevated_broker_unsupported()),
+        Commands::Install { state_dir, endpoint, trusted_executable, socket_owner_uid, socket_group_gid, socket_mode, allowed_uids } => {
+            let endpoint = endpoint.map(|raw| raw.strip_prefix("unix:").map(PathBuf::from).map(BrokerEndpoint::UnixSocket).ok_or_else(|| "install endpoint must use unix:/run/ownmesh/broker.sock".to_string())).transpose()?;
+            let broker = std::env::current_exe().map_err(|e| format!("resolve broker executable: {e}"))?;
+            let trusted = trusted_executable.unwrap_or_else(|| broker.with_file_name("ownmeshd"));
+            let rec = install_broker_with_config(state_dir.as_deref().unwrap_or_else(|| Path::new(".")), BrokerInstallConfig {
+                endpoint, trusted_executable: trusted,
+                socket_security: UnixSocketSecurity { owner_uid: socket_owner_uid.unwrap_or(0), group_gid: socket_group_gid.unwrap_or(0), mode: socket_mode.unwrap_or(0o600) },
+                allowed_uids: if allowed_uids.is_empty() { vec![0] } else { allowed_uids },
+            })?;
+            println!("installed=true support={} endpoint={}", rec.support, rec.endpoint); Ok(())
+        }
+        Commands::Uninstall { state_dir } => { uninstall_broker(state_dir.as_deref().unwrap_or_else(|| Path::new(".")))?; println!("installed=false"); Ok(()) }
+        Commands::Run { config } => run_broker(load_linux_run_config(&config)?).await,
         Commands::Exec {
             secret_file: _,
             signing_key_file: _,
@@ -229,13 +185,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn unsupported_commands_accept_no_legacy_arguments() {
-        for command in ["run", "install", "exec", "uninstall"] {
-            let cli = Cli::try_parse_from(["ownmesh-broker", command]).unwrap();
-            let err = run(cli)
-                .await
-                .expect_err("production path must be unsupported");
-            assert!(err.contains("unsupported"), "{command}: {err}");
-        }
+    async fn run_requires_strict_config_argument() {
+        assert!(Cli::try_parse_from(["ownmesh-broker", "run"]).is_err());
     }
 }

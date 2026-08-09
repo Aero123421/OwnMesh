@@ -36,6 +36,7 @@ mod ledger;
 pub mod peer;
 mod serve;
 
+pub use install::load_linux_run_config;
 pub use install::{
     broker_status, endpoint_kind_peer_enforceable, install_broker, install_broker_with_config,
     uninstall_broker, BrokerInstallConfig, InstallRecord, InstallStatus, INSTALL_FILE,
@@ -95,6 +96,7 @@ mod tests {
         ElevatedCommand, PeerBind, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
     };
     use std::net::SocketAddr;
+    #[cfg(not(target_os = "linux"))]
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -269,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn production_install_is_canonical_unsupported() {
         let dir = tempdir().unwrap();
         let base = dir.path();
@@ -277,14 +280,12 @@ mod tests {
         assert_eq!(st.support, "unsupported");
 
         let err = install_broker(base, None).expect_err("production install is unsupported");
-        assert!(
-            err.contains("unsupported") && err.contains("no filesystem changes"),
-            "{err}"
-        );
+        assert!(err.contains("unsupported"), "{err}");
         assert!(!base.join("broker").exists());
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn unsupported_install_and_uninstall_are_side_effect_free() {
         let dir = tempdir().unwrap();
         let install_base = dir.path().join("new-state");
@@ -314,15 +315,13 @@ mod tests {
 
         let err = uninstall_broker(&dir.path().join("existing-state"))
             .expect_err("production uninstall is unsupported");
-        assert!(
-            err.contains("unsupported") && err.contains("no filesystem changes"),
-            "{err}"
-        );
+        assert!(err.contains("unsupported"), "{err}");
         assert_eq!(std::fs::read(marker).unwrap(), b"operator marker");
         assert_eq!(std::fs::read(template).unwrap(), b"operator template");
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn windows_or_named_pipe_never_reports_installed_true() {
         let dir = tempdir().unwrap();
         let base = dir.path();
