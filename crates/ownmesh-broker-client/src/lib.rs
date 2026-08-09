@@ -502,6 +502,11 @@ pub struct ExecutablePinV2 {
     pub canonical_path: String,
     /// SHA-256 of the executable image, lower-case hex.
     pub image_sha256: String,
+    /// Exact length checked on the already-open source descriptor before
+    /// broker-private staging. A pathname and digest alone cannot close a
+    /// replacement race.
+    #[serde(default)]
+    pub image_len: u64,
 }
 
 /// OS-derived process identity captured while the authenticated daemon peer is
@@ -584,6 +589,64 @@ pub struct BrokerRequestV2 {
     pub mac: String,
 }
 
+/// Unprivileged production wire. This is intentionally separate from
+/// [`BrokerRequestV2`], the broker-internal prepared envelope which can carry
+/// a minted capability. A daemon cannot put a capability on this wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "intent", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrokerWireIntentV2 {
+    Execute(ExecuteIntentV2),
+    Cancel(CancelIntentV2),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteIntentV2 {
+    pub protocol_version: u32,
+    pub request_id: String,
+    pub operation_id: String,
+    pub nonce: String,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub facts: OperationFactsV2,
+    pub mac: String,
+}
+
+/// Cancellation has a separate fresh nonce and is fenced to the exact
+/// original request/action digest. It is never a free-form operation ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CancelIntentV2 {
+    pub protocol_version: u32,
+    pub request_id: String,
+    pub operation_id: String,
+    pub nonce: String,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub target_request_id: String,
+    pub target_operation_id: String,
+    pub target_nonce: String,
+    pub target_facts_digest: String,
+    pub mac: String,
+}
+
+impl ExecuteIntentV2 {
+    #[must_use]
+    pub fn into_unprepared_request(self) -> BrokerRequestV2 {
+        BrokerRequestV2 {
+            protocol_version: self.protocol_version,
+            request_id: self.request_id,
+            operation_id: self.operation_id,
+            nonce: self.nonce,
+            issued_at_unix: self.issued_at_unix,
+            expires_at_unix: self.expires_at_unix,
+            facts: self.facts,
+            capability: None,
+            mac: self.mac,
+        }
+    }
+}
+
 impl CapabilityTokenV2 {
     /// Issue a v2 token from broker-only signing material.
     #[must_use]
@@ -627,6 +690,67 @@ pub fn parse_broker_request_v2(bytes: &[u8]) -> BrokerResult<BrokerRequestV2> {
     }
     serde_json::from_slice(bytes)
         .map_err(|e| BrokerError::Protocol(format!("invalid strict v2 request: {e}")))
+}
+
+/// Decode the sole accepted production wire format. Capability-bearing
+/// `BrokerRequestV2` values are internal and deliberately cannot decode here.
+pub fn parse_broker_wire_intent_v2(bytes: &[u8]) -> BrokerResult<BrokerWireIntentV2> {
+    if bytes.len() > MAX_BROKER_REQUEST_BYTES {
+        return Err(BrokerError::Protocol("request exceeds byte limit".into()));
+    }
+    serde_json::from_slice(bytes)
+        .map_err(|e| BrokerError::Protocol(format!("invalid strict v2 intent: {e}")))
+}
+
+#[must_use]
+pub fn compute_execute_intent_mac_v2(secret: &BrokerSecret, intent: &ExecuteIntentV2) -> String {
+    compute_mac_v2(secret, &intent.clone().into_unprepared_request())
+}
+
+pub fn verify_execute_intent_v2_message_auth(
+    secret: &BrokerSecret,
+    intent: &ExecuteIntentV2,
+    now_unix: i64,
+) -> BrokerResult<()> {
+    verify_request_v2_message_auth(secret, &intent.clone().into_unprepared_request(), now_unix)
+}
+
+#[must_use]
+pub fn compute_cancel_intent_mac_v2(secret: &BrokerSecret, intent: &CancelIntentV2) -> String {
+    hmac_hex(secret, &canonical_cancel_intent_v2_bytes(intent))
+}
+
+pub fn verify_cancel_intent_v2_message_auth(
+    secret: &BrokerSecret,
+    intent: &CancelIntentV2,
+    now_unix: i64,
+) -> BrokerResult<()> {
+    if intent.protocol_version != BROKER_PROTOCOL_V2
+        || now_unix > intent.expires_at_unix
+        || intent.issued_at_unix > now_unix
+        || intent.expires_at_unix < intent.issued_at_unix
+        || intent.expires_at_unix.saturating_sub(intent.issued_at_unix)
+            > DEFAULT_CAPABILITY_TTL_SECS
+        || !is_sha256_hex(&intent.target_facts_digest)
+    {
+        return Err(BrokerError::Protocol(
+            "invalid bounded cancel intent".into(),
+        ));
+    }
+    for (name, value) in [
+        ("request_id", intent.request_id.as_str()),
+        ("operation_id", intent.operation_id.as_str()),
+        ("nonce", intent.nonce.as_str()),
+        ("target_request_id", intent.target_request_id.as_str()),
+        ("target_operation_id", intent.target_operation_id.as_str()),
+        ("target_nonce", intent.target_nonce.as_str()),
+    ] {
+        validate_bounded_field(name, value)?;
+    }
+    if !constant_time_hex_eq(&compute_cancel_intent_mac_v2(secret, intent), &intent.mac) {
+        return Err(BrokerError::BadSignature);
+    }
+    Ok(())
 }
 
 /// SHA-256 digest of typed canonical operation facts.  This is the exact
@@ -779,6 +903,7 @@ fn canonical_operation_facts_v2_bytes(facts: &OperationFactsV2) -> Vec<u8> {
     put_map(&mut buf, &facts.sanitized_env);
     put_str(&mut buf, &facts.executable.canonical_path);
     put_str(&mut buf, &facts.executable.image_sha256);
+    put_u64(&mut buf, facts.executable.image_len);
     buf
 }
 
@@ -830,6 +955,22 @@ fn canonical_request_v2_bytes(req: &BrokerRequestV2) -> Vec<u8> {
         }
         None => buf.push(0),
     }
+    buf
+}
+
+fn canonical_cancel_intent_v2_bytes(intent: &CancelIntentV2) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
+    buf.extend_from_slice(b"ownmesh.broker.cancel-intent.v2\0");
+    put_u32(&mut buf, intent.protocol_version);
+    put_str(&mut buf, &intent.request_id);
+    put_str(&mut buf, &intent.operation_id);
+    put_str(&mut buf, &intent.nonce);
+    put_i64(&mut buf, intent.issued_at_unix);
+    put_i64(&mut buf, intent.expires_at_unix);
+    put_str(&mut buf, &intent.target_request_id);
+    put_str(&mut buf, &intent.target_operation_id);
+    put_str(&mut buf, &intent.target_nonce);
+    put_str(&mut buf, &intent.target_facts_digest);
     buf
 }
 
@@ -891,6 +1032,8 @@ fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResu
         || req.facts.timeout_ms > MAX_BROKER_TIMEOUT_MS
         || req.facts.max_output_bytes == 0
         || req.facts.max_output_bytes > MAX_BROKER_OUTPUT_BYTES
+        || req.facts.executable.image_len == 0
+        || req.facts.executable.image_len > 64 * 1024 * 1024
     {
         return Err(BrokerError::Protocol(
             "invalid bounded operation facts".into(),
@@ -1595,6 +1738,7 @@ mod v2_tests {
             executable: ExecutablePinV2 {
                 canonical_path: "/usr/bin/id".into(),
                 image_sha256: "b".repeat(64),
+                image_len: 1,
             },
         }
     }
@@ -1731,6 +1875,48 @@ mod v2_tests {
             .insert("forged_authority".into(), serde_json::Value::Bool(true));
         assert!(parse_broker_request_v2(&serde_json::to_vec(&value).unwrap()).is_err());
         assert!(parse_broker_request_v2(&vec![b'x'; MAX_BROKER_REQUEST_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn production_wire_never_accepts_capability_and_cancel_mac_is_fenced() {
+        let (secret, _verify, request, _peer) = signed_v2();
+        let execute = ExecuteIntentV2 {
+            protocol_version: request.protocol_version,
+            request_id: request.request_id.clone(),
+            operation_id: request.operation_id.clone(),
+            nonce: request.nonce.clone(),
+            issued_at_unix: request.issued_at_unix,
+            expires_at_unix: request.expires_at_unix,
+            facts: request.facts.clone(),
+            mac: String::new(),
+        };
+        let mut execute = execute;
+        execute.mac = compute_execute_intent_mac_v2(&secret, &execute);
+        let wire = serde_json::to_vec(&BrokerWireIntentV2::Execute(execute)).unwrap();
+        assert!(matches!(
+            parse_broker_wire_intent_v2(&wire),
+            Ok(BrokerWireIntentV2::Execute(_))
+        ));
+        let capability_wire = serde_json::to_vec(&request).unwrap();
+        assert!(parse_broker_wire_intent_v2(&capability_wire).is_err());
+
+        let mut cancel = CancelIntentV2 {
+            protocol_version: BROKER_PROTOCOL_V2,
+            request_id: "cancel-request".into(),
+            operation_id: "command.exec.elevated".into(),
+            nonce: "fresh-cancel-nonce".into(),
+            issued_at_unix: 100,
+            expires_at_unix: 130,
+            target_request_id: request.request_id,
+            target_operation_id: request.operation_id,
+            target_nonce: request.nonce,
+            target_facts_digest: operation_facts_digest(&request.facts),
+            mac: String::new(),
+        };
+        cancel.mac = compute_cancel_intent_mac_v2(&secret, &cancel);
+        verify_cancel_intent_v2_message_auth(&secret, &cancel, 110).unwrap();
+        cancel.target_nonce.push('x');
+        assert!(verify_cancel_intent_v2_message_auth(&secret, &cancel, 110).is_err());
     }
 
     #[test]

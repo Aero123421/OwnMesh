@@ -390,6 +390,7 @@ fn sync_directory(path: &Path) -> Result<(), ReplayLedgerError> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn digest(fill: char) -> String {
         std::iter::repeat_n(fill, DIGEST_HEX_BYTES).collect()
@@ -457,7 +458,6 @@ mod tests {
 
         let corrupt = path.with_file_name("corrupt.json");
         std::fs::write(&corrupt, b"not json").unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
             ReplayLedger::open(corrupt, 4),

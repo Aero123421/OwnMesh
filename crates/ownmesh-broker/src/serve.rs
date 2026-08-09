@@ -6,8 +6,9 @@ use crate::peer::{self, AuthorizedPeer};
 use crate::{ReplayLedger, ReplayLedgerError};
 #[cfg(target_os = "linux")]
 use ownmesh_broker_client::{
-    operation_facts_digest, parse_broker_request_v2, verify_capability_v2,
-    verify_request_v2_message_auth, BrokerRequestV2, CapabilityTokenV2, MAX_BROKER_REQUEST_BYTES,
+    operation_facts_digest, parse_broker_wire_intent_v2, verify_cancel_intent_v2_message_auth,
+    verify_capability_v2, verify_execute_intent_v2_message_auth, BrokerRequestV2,
+    BrokerWireIntentV2, CapabilityTokenV2, MAX_BROKER_REQUEST_BYTES,
 };
 use ownmesh_broker_client::{
     verify_request, verify_request_mac, BrokerEndpoint, BrokerRequest, BrokerResponse,
@@ -15,9 +16,11 @@ use ownmesh_broker_client::{
     PeerBind, ReplayCache, DEFAULT_CAPABILITY_TTL_SECS, ELEVATED_CAPABILITY_SCOPE,
 };
 #[cfg(target_os = "linux")]
-use ownmesh_exec::{classify_command_kind_in_dir, run_command, CommandKind, RunRequest};
+use ownmesh_exec::{classify_command_kind_in_dir, CommandKind, RunRequest};
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,6 +28,8 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(target_os = "linux")]
+use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 #[cfg(target_os = "linux")]
 use tokio::sync::Semaphore;
@@ -828,6 +833,20 @@ struct ProductionState {
     broker_instance_id: String,
     broker_key_id: String,
     ledger: StdMutex<ReplayLedger>,
+    /// Root-only immutable executable copies. The runner never uses an
+    /// executable pathname supplied by the unprivileged peer.
+    staging_dir: PathBuf,
+    active: AsyncMutex<HashMap<String, ActiveExecution>>,
+}
+
+#[cfg(target_os = "linux")]
+struct ActiveExecution {
+    request_id: String,
+    operation_id: String,
+    nonce: String,
+    facts_digest: String,
+    peer: ownmesh_broker_client::PeerProcessBindV2,
+    cancel: watch::Sender<bool>,
 }
 
 #[cfg(target_os = "linux")]
@@ -854,6 +873,8 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
     ));
     let ledger_path = cfg.signing_key_file.with_file_name("replay-ledger.json");
     let ledger = ReplayLedger::open(ledger_path, 16_384).map_err(|error| replay_error(&error))?;
+    let staging_dir = cfg.signing_key_file.with_file_name("staged");
+    prepare_staging_dir(&staging_dir)?;
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .map_err(|error| format!("bind broker socket {}: {error}", socket_path.display()))?;
     apply_linux_socket_custody(&socket_path, cfg.socket_security)?;
@@ -864,29 +885,28 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
         broker_instance_id,
         broker_key_id,
         ledger: StdMutex::new(ledger),
+        staging_dir,
+        active: AsyncMutex::new(HashMap::new()),
     });
     // A full broker returns a bounded error rather than allowing an attacker to
     // create unbounded pending local IPC tasks.
     let concurrency = Arc::new(Semaphore::new(16));
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
-        let permit = match Arc::clone(&concurrency).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                let _ = write_resp(
-                    &mut stream,
-                    &BrokerResponse {
-                        request_id: "unknown".into(),
-                        ok: false,
-                        exit_code: None,
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        error: Some("broker busy; bounded concurrency limit reached".into()),
-                    },
-                )
-                .await;
-                continue;
-            }
+        let Ok(permit) = Arc::clone(&concurrency).try_acquire_owned() else {
+            let _ = write_resp(
+                &mut stream,
+                &BrokerResponse {
+                    request_id: "unknown".into(),
+                    ok: false,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some("broker busy; bounded concurrency limit reached".into()),
+                },
+            )
+            .await;
+            continue;
         };
         let policy = policy.clone();
         let state = Arc::clone(&state);
@@ -913,18 +933,77 @@ async fn handle_linux_production_connection(
         )
         .await
         .map_err(|_| "broker request frame timed out".to_string())??;
-        let external = parse_broker_request_v2(&bytes).map_err(|error| error.to_string())?;
-        if external.capability.is_some() {
-            return Err(
-                "external v2 requests must not carry a capability token (fail-closed)".into(),
-            );
+        let intent = parse_broker_wire_intent_v2(&bytes).map_err(|error| error.to_string())?;
+        if let BrokerWireIntentV2::Cancel(cancel) = intent {
+            verify_cancel_intent_v2_message_auth(&state.secret, &cancel, crate::now_unix())
+                .map_err(|error| error.to_string())?;
+            let cancel_digest = hex::encode(Sha256::digest(
+                [
+                    b"ownmesh.broker.cancel-ledger.v2\0".as_slice(),
+                    cancel.request_id.as_bytes(),
+                    cancel.operation_id.as_bytes(),
+                    cancel.target_request_id.as_bytes(),
+                    cancel.target_operation_id.as_bytes(),
+                    cancel.target_nonce.as_bytes(),
+                    cancel.target_facts_digest.as_bytes(),
+                ]
+                .concat(),
+            ));
+            state
+                .ledger
+                .lock()
+                .map_err(|_| "replay ledger lock poisoned".to_string())?
+                .reserve(
+                    &cancel.nonce,
+                    &cancel_digest,
+                    cancel.expires_at_unix,
+                    crate::now_unix(),
+                )
+                .map_err(|error| replay_error(&error))?;
+            let refreshed = policy.authorize_process(accepted.peer_bind().pid)?;
+            accepted.validate_refresh(&refreshed)?;
+            let peer = refreshed.process_bind_v2();
+            let active = state.active.lock().await;
+            let target = active.get(&cancel.target_nonce).ok_or_else(|| {
+                "cancel target is not an active prepared intent (fail-closed)".to_string()
+            })?;
+            if target.request_id != cancel.target_request_id
+                || target.operation_id != cancel.target_operation_id
+                || target.nonce != cancel.target_nonce
+                || target.facts_digest != cancel.target_facts_digest
+                || target.peer != peer
+            {
+                return Err("cancel fence or OS peer identity mismatch (fail-closed)".into());
+            }
+            target
+                .cancel
+                .send(true)
+                .map_err(|_| "active process cancel watch unavailable".to_string())?;
+            state
+                .ledger
+                .lock()
+                .map_err(|_| "replay ledger lock poisoned".to_string())?
+                .mark_completed(&cancel.nonce, &cancel_digest)
+                .map_err(|error| replay_error(&error))?;
+            return Ok(BrokerResponse {
+                request_id: cancel.request_id,
+                ok: true,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            });
         }
-        verify_request_v2_message_auth(&state.secret, &external, crate::now_unix())
+        let BrokerWireIntentV2::Execute(execute) = intent else {
+            unreachable!()
+        };
+        verify_execute_intent_v2_message_auth(&state.secret, &execute, crate::now_unix())
             .map_err(|error| error.to_string())?;
         let refreshed = policy.authorize_process(accepted.peer_bind().pid)?;
         accepted.validate_refresh(&refreshed)?;
         let peer = refreshed.process_bind_v2();
-        validate_executable_facts(&external)?;
+        let external = execute.into_unprepared_request();
+        let staged = stage_linux_executable(&external, &state.staging_dir)?;
         let now = crate::now_unix();
         let capability = CapabilityTokenV2::issue(
             &state.signing_key,
@@ -955,8 +1034,25 @@ async fn handle_linux_production_connection(
             .map_err(|_| "replay ledger lock poisoned".to_string())?
             .reserve_verified_request(&internal, now)
             .map_err(|error| replay_error(&error))?;
-        let mut response = run_v2_elevated(&internal).await;
         let digest = operation_facts_digest(&internal.facts);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        state.active.lock().await.insert(
+            internal.nonce.clone(),
+            ActiveExecution {
+                request_id: internal.request_id.clone(),
+                operation_id: internal.operation_id.clone(),
+                nonce: internal.nonce.clone(),
+                facts_digest: digest.clone(),
+                peer: peer.clone(),
+                cancel: cancel_tx,
+            },
+        );
+        let mut response = run_v2_elevated(&internal, &staged.path, Some(cancel_rx)).await;
+        state.active.lock().await.remove(&internal.nonce);
+        // The broker owns this exact stage path. Best-effort cleanup is safe
+        // only after the running child has been awaited; an uncertain ledger
+        // entry never triggers execution during crash recovery.
+        let _ = std::fs::remove_file(&staged.path);
         if let Err(error) = state
             .ledger
             .lock()
@@ -1077,92 +1173,146 @@ fn apply_linux_socket_custody(path: &Path, expected: UnixSocketSecurity) -> Resu
 }
 
 #[cfg(target_os = "linux")]
-fn validate_executable_facts(request: &BrokerRequestV2) -> Result<(), String> {
-    let facts = &request.facts;
-    let actual_path = std::fs::canonicalize(&facts.argv[0])
-        .map_err(|error| format!("canonicalize pinned executable: {error}"))?;
-    if actual_path != Path::new(&facts.executable.canonical_path) {
+struct StagedExecutable {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_staging_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    match std::fs::create_dir(path) {
+        Ok(()) => std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "create broker staging directory {}: {error}",
+                path.display()
+            ))
+        }
+    }
+    let md = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !md.file_type().is_dir()
+        || md.file_type().is_symlink()
+        || md.uid() != 0
+        || md.mode() & 0o077 != 0
+    {
         return Err(
-            "structured argv[0] does not resolve to the pinned executable (fail-closed)".into(),
+            "broker staging directory must be root-owned private non-symlink (fail-closed)".into(),
         );
     }
-    let metadata = std::fs::metadata(&actual_path).map_err(|error| error.to_string())?;
-    if !metadata.is_file() {
-        return Err("pinned executable is not a regular file (fail-closed)".into());
-    }
-    validate_root_controlled_path(&actual_path, false)?;
-    if let Some(cwd) = &facts.canonical_cwd {
-        validate_root_controlled_path(Path::new(cwd), true)?;
-    }
-    let mut file = std::fs::File::open(&actual_path).map_err(|error| error.to_string())?;
-    let mut digest = Sha256::new();
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let read = std::io::Read::read(&mut file, &mut chunk).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&chunk[..read]);
-    }
-    if hex::encode(digest.finalize()) != facts.executable.image_sha256 {
-        return Err("pinned executable image hash changed (fail-closed)".into());
-    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn validate_root_controlled_path(path: &Path, directory: bool) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let canonical = std::fs::canonicalize(path).map_err(|error| {
-        format!(
-            "canonicalize root-controlled path {}: {error}",
-            path.display()
-        )
-    })?;
-    if canonical != path {
-        return Err("path must already be canonical (fail-closed)".into());
-    }
-    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink()
-        || metadata.uid() != 0
-        || metadata.mode() & 0o022 != 0
-        || (directory && !metadata.file_type().is_dir())
-        || (!directory && !metadata.file_type().is_file())
-    {
-        return Err("executable/cwd must be root-owned, canonical, and not group/other writable (fail-closed)".into());
-    }
-    let mut ancestor = path.parent();
-    while let Some(current) = ancestor {
-        let metadata = std::fs::symlink_metadata(current).map_err(|error| error.to_string())?;
-        if !metadata.file_type().is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != 0
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err("executable/cwd ancestry is not root-controlled (fail-closed)".into());
-        }
-        ancestor = current.parent();
-    }
-    Ok(())
-}
+fn stage_linux_executable(
+    request: &BrokerRequestV2,
+    staging_dir: &Path,
+) -> Result<StagedExecutable, String> {
+    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD};
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-#[cfg(target_os = "linux")]
-async fn run_v2_elevated(request: &BrokerRequestV2) -> BrokerResponse {
     let facts = &request.facts;
-    if let Err(error) = validate_executable_facts(request) {
+    if facts.canonical_cwd.is_some() {
+        return Err("non-None cwd is unsupported for privileged broker execution; safe pinned cwd handoff is not implemented".into());
+    }
+    let source = Path::new(&facts.executable.canonical_path);
+    if !source.is_absolute() {
+        return Err("source executable must be absolute (fail-closed)".into());
+    }
+    let fd = openat2(
+        CWD,
+        source.as_os_str().as_encoded_bytes(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|e| format!("openat2 pinned source executable: {e}"))?;
+    let before = rustix::fs::fstat(&fd).map_err(|e| e.to_string())?;
+    if before.st_mode & 0o170_000 != 0o100_000
+        || before.st_size < 0
+        || before.st_size.cast_unsigned() != facts.executable.image_len
+        || before.st_size.cast_unsigned() > 64 * 1024 * 1024
+    {
+        return Err("source executable type or bounded length changed (fail-closed)".into());
+    }
+    let stage = staging_dir.join(format!("exec-{}", uuid::Uuid::new_v4().simple()));
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o500)
+        .open(&stage)
+        .map_err(|e| format!("create private staged executable: {e}"))?;
+    let copy = (|| -> Result<(), String> {
+        let mut hash = Sha256::new();
+        let mut total = 0_u64;
+        let mut buf = [0_u8; 8192];
+        loop {
+            let n = rustix::io::read(&fd, &mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            total = total
+                .checked_add(n as u64)
+                .ok_or_else(|| "source executable length overflow".to_string())?;
+            if total > 64 * 1024 * 1024 {
+                return Err("source executable exceeds staging bound".into());
+            }
+            hash.update(&buf[..n]);
+            output.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        }
+        output.sync_all().map_err(|e| e.to_string())?;
+        let after = rustix::fs::fstat(&fd).map_err(|e| e.to_string())?;
+        if after.st_dev != before.st_dev
+            || after.st_ino != before.st_ino
+            || after.st_size != before.st_size
+            || total != facts.executable.image_len
+            || hex::encode(hash.finalize()) != facts.executable.image_sha256
+        {
+            return Err("pinned source executable identity/hash mismatch (fail-closed)".into());
+        }
+        std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o500))
+            .map_err(|e| e.to_string())?;
+        let staged = std::fs::symlink_metadata(&stage).map_err(|e| e.to_string())?;
+        if !staged.file_type().is_file()
+            || staged.file_type().is_symlink()
+            || staged.uid() != 0
+            || staged.mode() & 0o277 != 0
+            || staged.len() != total
+        {
+            return Err("staged executable lost root-only immutable custody".into());
+        }
+        Ok(())
+    })();
+    if copy.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
+    copy?;
+    Ok(StagedExecutable { path: stage })
+}
+
+#[cfg(target_os = "linux")]
+async fn run_v2_elevated(
+    request: &BrokerRequestV2,
+    staged_program: &Path,
+    cancel: Option<watch::Receiver<bool>>,
+) -> BrokerResponse {
+    let facts = &request.facts;
+    if facts.canonical_cwd.is_some() {
         return BrokerResponse {
             request_id: request.request_id.clone(),
             ok: false,
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
-            error: Some(error),
+            error: Some("non-None cwd is unsupported for privileged broker execution".into()),
         };
     }
-    let cwd = facts.canonical_cwd.as_ref().map(PathBuf::from);
+    let cwd = None;
     if classify_command_kind_in_dir(
         CommandKind::Structured,
-        &facts.executable.canonical_path,
+        staged_program.to_string_lossy().as_ref(),
         &facts.argv[1..],
         cwd.as_deref(),
     ) != CommandKind::Structured
@@ -1176,10 +1326,10 @@ async fn run_v2_elevated(request: &BrokerRequestV2) -> BrokerResponse {
             error: Some("shell-classified executable is forbidden in broker v2".into()),
         };
     }
-    let result = run_command(
+    let result = ownmesh_exec::run_command_cancellable(
         &RunRequest {
             kind: CommandKind::Structured,
-            program: facts.executable.canonical_path.clone(),
+            program: staged_program.display().to_string(),
             args: facts.argv[1..].to_vec(),
             cwd,
             env: facts.sanitized_env.clone().into_iter().collect(),
@@ -1189,6 +1339,7 @@ async fn run_v2_elevated(request: &BrokerRequestV2) -> BrokerResponse {
             idempotency_key: None,
         },
         None,
+        cancel,
     )
     .await;
     match result {
@@ -1212,7 +1363,11 @@ async fn run_v2_elevated(request: &BrokerRequestV2) -> BrokerResponse {
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
-            error: Some(error.to_string()),
+            error: Some(if matches!(error, ownmesh_exec::ExecError::Cancelled) {
+                "broker execution cancelled; process tree killed".into()
+            } else {
+                error.to_string()
+            }),
         },
     }
 }
