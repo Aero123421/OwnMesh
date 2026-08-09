@@ -1724,6 +1724,18 @@ fn map_request_to_method(
             }
             crate::runtime::session_methods::CLAIM
         }
+        ("session.renew" | "session", "session.renew" | "ownmesh_session_renew" | "renew") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::RENEW
+        }
+        ("session.detach" | "session", "session.detach" | "ownmesh_session_detach" | "detach") => {
+            if let Some(sid) = args.get("session_id").cloned() {
+                args.entry("id".to_owned()).or_insert(sid);
+            }
+            crate::runtime::session_methods::DETACH
+        }
         (
             "session.release" | "session",
             "session.release" | "ownmesh_session_release" | "release",
@@ -3152,5 +3164,45 @@ mod tests {
     fn session_attach_invalid_role_fail_closed() {
         let err = map_request_to_method(&session_attach_request(Some("admin"))).unwrap_err();
         assert!(err.contains("observer|controller"), "{err}");
+    }
+
+    #[test]
+    fn session_renew_and_detach_map_to_exact_lease_methods() {
+        for (action, capability, expected) in [
+            (
+                "session.renew",
+                "session.renew",
+                crate::runtime::session_methods::RENEW,
+            ),
+            (
+                "session.detach",
+                "session.detach",
+                crate::runtime::session_methods::DETACH,
+            ),
+        ] {
+            let mut arguments = Map::new();
+            arguments.insert("action".into(), json!(action));
+            arguments.insert("session_id".into(), json!("ses_test1"));
+            arguments.insert("lease_id".into(), json!("lease_exact"));
+            arguments.insert("controller_epoch".into(), json!(2));
+            if action == "session.renew" {
+                arguments.insert("ttl_secs".into(), json!(60));
+            }
+            let request = OperationRequestPayload {
+                operation_contract: ownmesh_protocol::OperationContract::V1,
+                operation_id: ownmesh_domain::OperationId::parse("op_ses_lease_1").unwrap(),
+                capability: capability.into(),
+                workspace_id: None,
+                idempotency_key: "idem_ses_lease".into(),
+                payload_hash: None,
+                authorization: None,
+                arguments: Value::Object(arguments),
+            };
+            let (method, args) = map_request_to_method(&request).unwrap();
+            assert_eq!(method, expected);
+            assert_eq!(args.get("id"), Some(&json!("ses_test1")));
+            assert_eq!(args.get("lease_id"), Some(&json!("lease_exact")));
+            assert_eq!(args.get("controller_epoch"), Some(&json!(2)));
+        }
     }
 }

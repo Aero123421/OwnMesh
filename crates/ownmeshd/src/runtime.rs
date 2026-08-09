@@ -65,6 +65,8 @@ pub mod session_methods {
     pub const SHOW: &str = "session.show";
     pub const ATTACH: &str = "session.attach";
     pub const CLAIM: &str = "session.claim";
+    pub const RENEW: &str = "session.renew";
+    pub const DETACH: &str = "session.detach";
     pub const RELEASE: &str = "session.release";
     pub const GIVE: &str = "session.give";
     pub const CLOSE: &str = "session.close";
@@ -2461,6 +2463,8 @@ full_user_access/full_access for arbitrary commands",
             session_methods::SHOW => self.handle_session_show(params, client),
             session_methods::ATTACH => self.handle_session_attach(params, client),
             session_methods::CLAIM => self.handle_session_claim(params, client),
+            session_methods::RENEW => self.handle_session_renew(params, client),
+            session_methods::DETACH => self.handle_session_detach(params, client),
             session_methods::RELEASE => self.handle_session_release(params, client),
             session_methods::GIVE => self.handle_session_give(params, client),
             session_methods::CLOSE => self.handle_session_close(params, client),
@@ -2914,14 +2918,17 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             },
         };
         let now = self.prepare_session_access()?;
+        // A session attachment is not a discovery/invitation primitive. The
+        // authenticated caller must already be a reader (via open, handoff, or
+        // prior authenticated attachment) before it can reattach/claim.
+        self.require_reader(&p.id, &client.client_name, now)?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
         if read_only {
-            // A workspace-granted principal may join as an observer. Session id
-            // alone is not enough: cloud workspace ACL has already been bound
-            // into this Agent request and the local workspace/session binding is
-            // rechecked above. Observer attach never grants controller rights.
+            // Reattachment keeps an existing reader in observer mode. Session id
+            // alone is never an invitation, and observer attach never grants
+            // controller rights.
             // Exact-action: observer attach must not leave an active controller lease
             // on the same principal (would silently keep write/resize rights).
             if self
@@ -3013,6 +3020,86 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             .map_err(session_err)?;
         self.commit_sessions(snapshot)?;
         Ok(json!({ "released": true, "session_id": p.id, "workspace_id": bound_ws }))
+    }
+
+    /// Renew the exact controller seat without changing its epoch. Remote callers
+    /// must echo the opaque lease id and generation, so a stale controller cannot
+    /// extend a handed-off or reclaimed seat.
+    fn handle_session_renew(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            lease_id: String,
+            controller_epoch: u64,
+            ttl_secs: i64,
+            #[serde(default)]
+            principal: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        let now = self.prepare_session_access()?;
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        let snapshot = self.sessions.clone();
+        let lease = self
+            .sessions
+            .renew_controller_lease(
+                &p.id,
+                &client.client_name,
+                &p.lease_id,
+                p.controller_epoch,
+                now,
+                p.ttl_secs,
+            )
+            .map_err(session_err)?;
+        self.commit_sessions(snapshot)?;
+        Ok(json!({ "lease": lease, "session_id": p.id, "workspace_id": bound_ws }))
+    }
+
+    /// Explicitly detach the current controller while retaining the PTY and its
+    /// bounded replay. This is deliberately separate from legacy release: remote
+    /// calls are exact-seat bound and cannot detach a successor's controller.
+    fn handle_session_detach(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+            lease_id: String,
+            controller_epoch: u64,
+            #[serde(default)]
+            principal: Option<String>,
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: P = parse_params(params)?;
+        reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        let now = self.prepare_session_access()?;
+        let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        let snapshot = self.sessions.clone();
+        self.sessions
+            .detach_controller_lease(
+                &p.id,
+                &client.client_name,
+                &p.lease_id,
+                p.controller_epoch,
+                now,
+            )
+            .map_err(session_err)?;
+        self.commit_sessions(snapshot)?;
+        Ok(json!({
+            "detached": true,
+            "session_id": p.id,
+            "workspace_id": bound_ws,
+            "live_pty": self.live_hosts.contains_key(&p.id),
+        }))
     }
 
     fn handle_session_give(

@@ -1233,6 +1233,116 @@ mod tests {
     }
 
     #[test]
+    fn renew_and_detach_require_the_exact_active_controller_seat() {
+        let mut mgr = SessionManager::new();
+        let now = 10_000i64;
+        let ses = mgr
+            .open(SessionKind::Pty, "lease", "owner", now, None)
+            .unwrap();
+        let initial = mgr.get(&ses.id).unwrap().controller.clone().unwrap();
+
+        let renewed = mgr
+            .renew_controller_lease(
+                &ses.id,
+                "owner",
+                &initial.lease_id,
+                initial.epoch,
+                now + 1,
+                60,
+            )
+            .unwrap();
+        assert_eq!(
+            renewed.epoch, initial.epoch,
+            "renew does not mint a new seat"
+        );
+        assert_eq!(renewed.expires_unix, now + 61);
+
+        assert_eq!(
+            mgr.renew_controller_lease(
+                &ses.id,
+                "other",
+                &initial.lease_id,
+                initial.epoch,
+                now + 2,
+                60,
+            ),
+            Err(SessionError::NotController)
+        );
+        assert_eq!(
+            mgr.renew_controller_lease(&ses.id, "owner", "wrong", initial.epoch, now + 2, 60),
+            Err(SessionError::NotController)
+        );
+        assert_eq!(
+            mgr.renew_controller_lease(
+                &ses.id,
+                "owner",
+                &initial.lease_id,
+                initial.epoch + 1,
+                now + 2,
+                60,
+            ),
+            Err(SessionError::NotController)
+        );
+
+        mgr.detach_controller_lease(&ses.id, "owner", &initial.lease_id, initial.epoch, now + 2)
+            .unwrap();
+        let info = mgr.get(&ses.id).unwrap();
+        assert!(info.controller.is_none());
+        assert_eq!(info.state, SessionState::Detached);
+        assert!(info.observers.contains(&"owner".to_string()));
+        // Detach is a lease transition, not process termination; output/replay remains.
+        mgr.push_output(&ses.id, "still-running\n", StreamKind::Stdout)
+            .unwrap();
+        assert_eq!(
+            mgr.detach_controller_lease(
+                &ses.id,
+                "owner",
+                &initial.lease_id,
+                initial.epoch,
+                now + 3,
+            ),
+            Err(SessionError::NotController)
+        );
+    }
+
+    #[test]
+    fn renew_rejects_expired_bounds_and_expiry_overflow() {
+        let mut mgr = SessionManager::new();
+        let ses = mgr
+            .open(SessionKind::Pty, "lease", "owner", 0, None)
+            .unwrap();
+        let lease = mgr.get(&ses.id).unwrap().controller.clone().unwrap();
+        for ttl in [0, 3601] {
+            assert!(matches!(
+                mgr.renew_controller_lease(&ses.id, "owner", &lease.lease_id, lease.epoch, 1, ttl),
+                Err(SessionError::Invalid(_))
+            ));
+        }
+        assert_eq!(
+            mgr.renew_controller_lease(&ses.id, "owner", &lease.lease_id, lease.epoch, 3_600, 60),
+            Err(SessionError::NotController),
+            "expired controller cannot renew"
+        );
+
+        let ses2 = mgr
+            .open(SessionKind::Pty, "overflow", "overflow-owner", 1, None)
+            .unwrap();
+        let lease2 = mgr.get(&ses2.id).unwrap().controller.clone().unwrap();
+        mgr.set_controller_expires_unix(&ses2.id, i64::MAX).unwrap();
+        assert!(matches!(
+            mgr.renew_controller_lease(
+                &ses2.id,
+                "overflow-owner",
+                &lease2.lease_id,
+                lease2.epoch,
+                i64::MAX - 1,
+                2,
+            ),
+            Err(SessionError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn push_output_rejects_oversized_chunk_and_bounds_replay_page() {
         let mut mgr = SessionManager::new();
         let now = 1i64;

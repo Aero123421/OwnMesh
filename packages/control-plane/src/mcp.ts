@@ -807,6 +807,45 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "session",
   },
   {
+    name: "ownmesh_session_renew",
+    description: "Renew the current controller lease for a device session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        lease_id: str,
+        controller_epoch: { type: "integer", minimum: 1 },
+        ttl_secs: { type: "integer", minimum: 1, maximum: 3600 },
+        workspace_id: str,
+        idempotency_key: { type: "string", description: "Required caller idempotency key" },
+      },
+      required: ["device_id", "session_id", "lease_id", "controller_epoch", "ttl_secs", "workspace_id", "idempotency_key"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
+    name: "ownmesh_session_detach",
+    description: "Explicitly detach the current controller while keeping the device session alive",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        session_id: str,
+        lease_id: str,
+        controller_epoch: { type: "integer", minimum: 1 },
+        workspace_id: str,
+        idempotency_key: { type: "string", description: "Required caller idempotency key" },
+      },
+      required: ["device_id", "session_id", "lease_id", "controller_epoch", "workspace_id", "idempotency_key"],
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    scope: "ownmesh.session",
+    risk: "session",
+  },
+  {
     name: "ownmesh_session_release",
     description: "Release the controller lease on a device session",
     inputSchema: {
@@ -1778,6 +1817,10 @@ function toolCapability(toolName: string): string {
       return "session.replay";
     case "ownmesh_session_claim":
       return "session.claim";
+    case "ownmesh_session_renew":
+      return "session.renew";
+    case "ownmesh_session_detach":
+      return "session.detach";
     case "ownmesh_session_release":
       return "session.release";
     case "ownmesh_session_give":
@@ -1842,6 +1885,10 @@ function toolAction(toolName: string): string {
       return "session.replay";
     case "ownmesh_session_claim":
       return "session.claim";
+    case "ownmesh_session_renew":
+      return "session.renew";
+    case "ownmesh_session_detach":
+      return "session.detach";
     case "ownmesh_session_release":
       return "session.release";
     case "ownmesh_session_give":

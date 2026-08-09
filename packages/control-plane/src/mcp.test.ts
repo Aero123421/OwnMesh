@@ -526,6 +526,21 @@ test("session_open routes to device room", async () => {
   assert.equal(sc.session_id, "ses_test1");
 });
 
+test("session renew and detach expose exact lease-bound idempotent tools", () => {
+  for (const name of ["ownmesh_session_renew", "ownmesh_session_detach"]) {
+    const tool = MCP_TOOLS.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} is advertised`);
+    assert.equal(tool.scope, "ownmesh.session");
+    assert.equal(tool.risk, "session");
+    assert.equal(tool.annotations.idempotentHint, true);
+    assert.ok(tool.inputSchema.required?.includes("lease_id"));
+    assert.ok(tool.inputSchema.required?.includes("controller_epoch"));
+    assert.ok(tool.inputSchema.required?.includes("idempotency_key"));
+  }
+  const renew = MCP_TOOLS.find((candidate) => candidate.name === "ownmesh_session_renew")!;
+  assert.ok(renew.inputSchema.required?.includes("ttl_secs"));
+});
+
 // ---------------------------------------------------------------------------
 // Prompt injection — final force is always OwnMesh policy
 // ---------------------------------------------------------------------------
