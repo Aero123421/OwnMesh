@@ -32,6 +32,18 @@ pub mod methods {
     /// Log query.
     pub const OPS_LOGS_QUERY: &str = "ops.logs.query";
 
+    /// Authenticated bounded transfer state-machine operations.
+    pub const TRANSFER_PLAN: &str = "transfer.plan";
+    pub const TRANSFER_SOURCE_OPEN: &str = "transfer.source_open";
+    pub const TRANSFER_SOURCE_CHUNK: &str = "transfer.source_chunk";
+    pub const TRANSFER_DESTINATION_PREPARE: &str = "transfer.destination_prepare";
+    pub const TRANSFER_DESTINATION_CHUNK: &str = "transfer.destination_chunk";
+    pub const TRANSFER_FINALIZE: &str = "transfer.finalize";
+    pub const TRANSFER_STATUS: &str = "transfer.status";
+    pub const TRANSFER_LIST: &str = "transfer.list";
+    pub const TRANSFER_CANCEL: &str = "transfer.cancel";
+    pub const TRANSFER_ARTIFACT_GET: &str = "transfer.artifact_get";
+
     /// List pending / recent approvals.
     pub const APPROVAL_LIST: &str = "approval.list";
     /// Show one approval.

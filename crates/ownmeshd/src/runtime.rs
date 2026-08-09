@@ -63,6 +63,11 @@ use ownmesh_session_host::{
     default_shell_command, HostIoMode, LiveHost, SupervisorBinding, SupervisorClient,
     SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest,
 };
+use ownmesh_transfer::{
+    JournalLimits, JournalState, JournalStore, PartFileSink, PlanLimits, TransferBinding,
+    TransferChunk, TransferError, TransferGrant, TransferPlan, TransferReceiver, TransferSender,
+    MAX_CHUNK_BYTES,
+};
 use review_manifest::{
     ResultKind, ReviewCommand, ReviewManifest, ReviewManifestStore, ReviewPhase, ReviewResultChunk,
     ReviewResultStore, TestRequest,
@@ -73,6 +78,7 @@ use session_transition_journal::{
     SessionTransitionJournal, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
 };
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(test)]
@@ -345,6 +351,16 @@ pub struct FsDeleteParams {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TransferAuthority {
+    tenant_id: String,
+    principal_id: String,
+    device_id: String,
+    operation_id: String,
+    payload_sha256: String,
+    expires_at_unix: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogsQueryParams {
     #[serde(default = "default_log_provider")]
@@ -485,6 +501,14 @@ pub struct DaemonRuntime {
     /// Verified Agent device identity for the active remote dispatch only.
     /// This is never populated from MCP arguments or local IPC parameters.
     active_remote_device_id: Option<String>,
+    /// Owner-only immutable plans and receiver progress.  The sender itself is
+    /// intentionally ephemeral; after a restart the authenticated caller must
+    /// reopen it at the durable receiver cursor.
+    transfer_store: JournalStore,
+    transfer_senders: HashMap<String, TransferSender>,
+    /// Last returned chunk gives an at-least-once caller a bounded replay window
+    /// without advancing the source stream twice after a lost response.
+    transfer_last_chunks: HashMap<String, (u64, String)>,
     #[cfg(test)]
     op_journal_persist_fault: AtomicUsize,
     #[cfg(test)]
@@ -551,6 +575,12 @@ impl DaemonRuntime {
             })?;
         }
         let (broker_endpoint, broker_secret) = load_broker_client(paths);
+        let transfer_store =
+            JournalStore::open(paths.state_dir.join("transfers"), JournalLimits::default())
+                .map_err(|error| format!("open transfer state: {error}"))?;
+        transfer_store
+            .cleanup_expired(Self::now() as u64)
+            .map_err(|error| format!("cleanup transfer state: {error}"))?;
         Ok(Self {
             paths: paths.clone(),
             policy,
@@ -582,6 +612,9 @@ impl DaemonRuntime {
             active_remote_expires_at_unix: None,
             active_remote_payload_hash: None,
             active_remote_device_id: None,
+            transfer_store,
+            transfer_senders: HashMap::new(),
+            transfer_last_chunks: HashMap::new(),
             #[cfg(test)]
             op_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1701,6 +1734,656 @@ full_user_access/full_access for arbitrary commands",
         let key = p.idempotency_key.clone();
         self.gate_and_run(facts, key, PendingRequest::Exec(Box::new(p)), client)
             .await
+    }
+
+    fn transfer_error(error: TransferError) -> IpcError {
+        let code = match error {
+            TransferError::DestinationExists | TransferError::Replay | TransferError::Gap => {
+                app_error::CONFLICT
+            }
+            TransferError::InvalidBinding(_)
+            | TransferError::InvalidPlan(_)
+            | TransferError::ChunkTooLarge
+            | TransferError::MalformedChunk
+            | TransferError::ChunkHashMismatch
+            | TransferError::Overflow => app_error::INVALID_PARAMS,
+            TransferError::SourceChanged
+            | TransferError::HashMismatch
+            | TransferError::StaleFence
+            | TransferError::Terminal
+            | TransferError::LeaseBusy => app_error::CONFLICT,
+            _ => app_error::INTERNAL,
+        };
+        IpcError::Remote {
+            code,
+            message: error.to_string(),
+        }
+    }
+
+    /// Derive every transfer authority fact from the authenticated remote
+    /// dispatch.  In particular no transfer RPC parameter can nominate a
+    /// principal, tenant, device, consent, payload hash, expiry, relay, or
+    /// overwrite behavior.
+    fn transfer_authority(&self, client: &ClientIdentity) -> IpcResult<TransferAuthority> {
+        let Some(operation_id) = self.active_remote_operation_id.as_deref() else {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer requires an authenticated remote operation binding".into(),
+            });
+        };
+        let Some(payload_sha256) = self.active_remote_payload_hash.as_deref() else {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer requires a verified remote payload hash".into(),
+            });
+        };
+        let Some(device_id) = self.active_remote_device_id.as_deref() else {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer requires a verified remote device identity".into(),
+            });
+        };
+        let Some(expires_at) = self.active_remote_expires_at_unix else {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer requires a verified remote expiry".into(),
+            });
+        };
+        let expires_at_unix = u64::try_from(expires_at).map_err(|_| IpcError::Remote {
+            code: app_error::UNAUTHORIZED,
+            message: "transfer remote expiry is invalid".into(),
+        })?;
+        if expires_at_unix <= Self::now() as u64 {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer remote grant has expired".into(),
+            });
+        }
+        let mut parts = client.principal_key().split(':');
+        let (Some("client"), Some("remote"), Some(tenant_id), Some(principal_id), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer caller is not a verified remote principal".into(),
+            });
+        };
+        if tenant_id.is_empty() || principal_id.is_empty() || device_id.is_empty() {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer binding identity is empty".into(),
+            });
+        }
+        Ok(TransferAuthority {
+            tenant_id: tenant_id.to_owned(),
+            principal_id: principal_id.to_owned(),
+            device_id: device_id.to_owned(),
+            operation_id: operation_id.to_owned(),
+            payload_sha256: payload_sha256.to_owned(),
+            expires_at_unix,
+        })
+    }
+
+    fn verify_local_transfer_identity(
+        plan: &TransferPlan,
+        authority: &TransferAuthority,
+    ) -> IpcResult<()> {
+        let binding = plan.binding();
+        if binding.tenant_id != authority.tenant_id
+            || binding.source_principal_id != authority.principal_id
+            || binding.destination_principal_id != authority.principal_id
+            || binding.source_device_id != authority.device_id
+            || binding.destination_device_id != authority.device_id
+        {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer plan is not bound to this authenticated local device/principal"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn handle_transfer_plan(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            source_path: String,
+            destination_path: String,
+            destination_workspace_id: String,
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let source_workspace_id = p.workspace_id.unwrap_or_else(|| "ws_default".into());
+        let binding = TransferBinding {
+            tenant_id: authority.tenant_id.clone(),
+            source_principal_id: authority.principal_id.clone(),
+            destination_principal_id: authority.principal_id.clone(),
+            source_device_id: authority.device_id.clone(),
+            destination_device_id: authority.device_id.clone(),
+            source_workspace_id: source_workspace_id.clone(),
+            destination_workspace_id: p.destination_workspace_id.clone(),
+            source_relative_path: p.source_path,
+            destination_relative_path: p.destination_path,
+        };
+        binding.validate().map_err(Self::transfer_error)?;
+        // Resolve both registered roots before creating any durable state.  This
+        // rejects unknown workspaces and absolute/traversal source/destination
+        // paths before they can become part of an immutable plan.
+        let source = self.workspace_for(Some(&source_workspace_id))?;
+        let _destination = self.workspace_for(Some(&p.destination_workspace_id))?;
+        let source_path = source
+            .resolve(Path::new(&binding.source_relative_path))
+            .map_err(fs_err)?;
+        let grant = TransferGrant {
+            grant_id: format!("grant_{}", authority.operation_id),
+            operation_id: authority.operation_id.clone(),
+            payload_sha256: authority.payload_sha256.clone(),
+            expires_at_unix: authority.expires_at_unix,
+        };
+        let plan = TransferPlan::for_source(
+            &source_path,
+            binding,
+            grant,
+            PlanLimits::default(),
+            Self::now() as u64,
+        )
+        .map_err(Self::transfer_error)?;
+        self.transfer_store
+            .save_plan(&plan)
+            .map_err(Self::transfer_error)?;
+        Ok(json!({
+            "plan_id": plan.id(),
+            "size_bytes": plan.size_bytes(),
+            "sha256": plan.sha256(),
+            "source_workspace_id": plan.binding().source_workspace_id,
+            "destination_workspace_id": plan.binding().destination_workspace_id,
+            "expires_at_unix": authority.expires_at_unix,
+        }))
+    }
+
+    fn transfer_plan_for(
+        &self,
+        plan_id: &str,
+        authority: &TransferAuthority,
+    ) -> IpcResult<TransferPlan> {
+        let plan = self
+            .transfer_store
+            .load_plan(plan_id, Self::now() as u64)
+            .map_err(Self::transfer_error)?
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "transfer plan was not found".into(),
+            })?;
+        Self::verify_local_transfer_identity(&plan, authority)?;
+        Ok(plan)
+    }
+
+    async fn handle_transfer_source_open(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+            #[serde(default)]
+            sequence: u64,
+            #[serde(default)]
+            offset: u64,
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        if p.workspace_id.as_deref().unwrap_or("ws_default") != plan.binding().source_workspace_id {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "source open workspace does not match immutable plan".into(),
+            });
+        }
+        let workspace = self.workspace_for(Some(&plan.binding().source_workspace_id))?;
+        let source = workspace
+            .resolve(Path::new(&plan.binding().source_relative_path))
+            .map_err(fs_err)?;
+        let sender = TransferSender::open_at(plan.clone(), &source, p.sequence, p.offset)
+            .map_err(Self::transfer_error)?;
+        self.transfer_senders.insert(plan.id().to_owned(), sender);
+        self.transfer_last_chunks.remove(plan.id());
+        Ok(
+            json!({ "plan_id": plan.id(), "next_sequence": p.sequence, "next_offset": p.offset, "chunk_max_bytes": MAX_CHUNK_BYTES }),
+        )
+    }
+
+    async fn handle_transfer_source_chunk(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+            sequence: u64,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        if let Some((sequence, frame)) = self.transfer_last_chunks.get(plan.id()) {
+            if *sequence == p.sequence {
+                return Ok(
+                    json!({ "plan_id": plan.id(), "sequence": sequence, "frame_base64": frame, "replayed": true }),
+                );
+            }
+        }
+        let sender = self
+            .transfer_senders
+            .get_mut(plan.id())
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "source is not open; reopen at the durable receiver cursor".into(),
+            })?;
+        let chunk = sender
+            .next_chunk()
+            .map_err(Self::transfer_error)?
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "source reached end of plan".into(),
+            })?;
+        if chunk.sequence != p.sequence {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "source chunk sequence is not the requested contiguous cursor".into(),
+            });
+        }
+        let frame = base64_standard(&chunk.encode().map_err(Self::transfer_error)?);
+        self.transfer_last_chunks
+            .insert(plan.id().to_owned(), (chunk.sequence, frame.clone()));
+        Ok(
+            json!({ "plan_id": plan.id(), "sequence": chunk.sequence, "offset": chunk.offset, "bytes": chunk.bytes.len(), "sha256": chunk.sha256, "frame_base64": frame, "replayed": false }),
+        )
+    }
+
+    async fn handle_transfer_destination_prepare(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+            epoch: u64,
+            fence: u64,
+            workspace_id: String,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        if p.workspace_id != plan.binding().destination_workspace_id {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "destination workspace does not match immutable plan".into(),
+            });
+        }
+        let workspace = self.workspace_for(Some(&p.workspace_id))?;
+        let destination = workspace
+            .resolve(Path::new(&plan.binding().destination_relative_path))
+            .map_err(fs_err)?;
+        if destination.exists() {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "destination already exists; overwrite is forbidden".into(),
+            });
+        }
+        let now = Self::now() as u64;
+        let lease = self
+            .transfer_store
+            .acquire(&plan, now, authority.expires_at_unix)
+            .map_err(Self::transfer_error)?;
+        let journal = self
+            .transfer_store
+            .claim(
+                &lease,
+                &plan,
+                &authority.principal_id,
+                p.epoch,
+                p.fence,
+                now,
+                authority.expires_at_unix,
+            )
+            .map_err(Self::transfer_error)?;
+        let _sink = PartFileSink::create(
+            &self.transfer_store,
+            &plan,
+            p.epoch,
+            journal.bytes_received(),
+        )
+        .map_err(Self::transfer_error)?;
+        Ok(
+            json!({ "plan_id": plan.id(), "state": journal.state(), "next_sequence": journal.contiguous_ack().map(|v| v + 1).unwrap_or(0), "next_offset": journal.bytes_received(), "epoch": journal.epoch(), "fence": journal.fence() }),
+        )
+    }
+
+    async fn handle_transfer_destination_chunk(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+            epoch: u64,
+            fence: u64,
+            frame_base64: String,
+            workspace_id: String,
+        }
+        let p: Params = parse_params(params)?;
+        if p.frame_base64.len() > (MAX_CHUNK_BYTES + 52).div_ceil(3) * 4 {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "transfer frame exceeds bounded base64 budget".into(),
+            });
+        }
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        if p.workspace_id != plan.binding().destination_workspace_id {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "destination chunk workspace does not match immutable plan".into(),
+            });
+        }
+        let frame = base64_decode_strict(&p.frame_base64).ok_or_else(|| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: "transfer frame is not canonical base64".into(),
+        })?;
+        let chunk = TransferChunk::decode(&frame).map_err(Self::transfer_error)?;
+        let now = Self::now() as u64;
+        let lease = self
+            .transfer_store
+            .acquire(&plan, now, authority.expires_at_unix)
+            .map_err(Self::transfer_error)?;
+        let journal = self
+            .transfer_store
+            .load_for_fence(&plan, p.epoch, p.fence)
+            .map_err(Self::transfer_error)?;
+        let mut sink = PartFileSink::create(
+            &self.transfer_store,
+            &plan,
+            p.epoch,
+            journal.bytes_received(),
+        )
+        .map_err(Self::transfer_error)?;
+        let mut receiver = TransferReceiver::resume_from_part(plan.clone(), journal, sink.path())
+            .map_err(Self::transfer_error)?;
+        receiver
+            .receive(&mut sink, chunk)
+            .map_err(Self::transfer_error)?;
+        let updated = receiver.journal_snapshot();
+        self.transfer_store
+            .save(&lease, &updated)
+            .map_err(Self::transfer_error)?;
+        Ok(
+            json!({ "plan_id": plan.id(), "state": updated.state(), "contiguous_ack": updated.contiguous_ack(), "bytes_received": updated.bytes_received(), "completed": updated.state() == JournalState::Completed }),
+        )
+    }
+
+    async fn handle_transfer_finalize(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+            epoch: u64,
+            fence: u64,
+            workspace_id: String,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        if p.workspace_id != plan.binding().destination_workspace_id {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "finalize workspace does not match immutable plan".into(),
+            });
+        }
+        let journal = self
+            .transfer_store
+            .load_for_fence(&plan, p.epoch, p.fence)
+            .map_err(Self::transfer_error)?;
+        if journal.state() != JournalState::Completed {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "transfer is incomplete".into(),
+            });
+        }
+        let destination = self
+            .workspace_for(Some(&p.workspace_id))?
+            .resolve(Path::new(&plan.binding().destination_relative_path))
+            .map_err(fs_err)?;
+        self.transfer_store
+            .publish_completed_no_replace(&plan, &destination)
+            .map_err(Self::transfer_error)?;
+        Ok(
+            json!({ "plan_id": plan.id(), "published": true, "sha256": plan.sha256(), "size_bytes": plan.size_bytes() }),
+        )
+    }
+
+    async fn handle_transfer_status(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let journal = self
+            .transfer_store
+            .load(&plan)
+            .map_err(Self::transfer_error)?;
+        Ok(
+            json!({ "plan_id": plan.id(), "size_bytes": plan.size_bytes(), "sha256": plan.sha256(), "state": journal.as_ref().map(ownmesh_transfer::TransferJournal::state), "contiguous_ack": journal.as_ref().and_then(ownmesh_transfer::TransferJournal::contiguous_ack), "bytes_received": journal.as_ref().map(ownmesh_transfer::TransferJournal::bytes_received).unwrap_or(0) }),
+        )
+    }
+
+    async fn handle_transfer_list(
+        &mut self,
+        _params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let authority = self.transfer_authority(client)?;
+        let plans = self
+            .transfer_store
+            .list_plans(Self::now() as u64)
+            .map_err(Self::transfer_error)?;
+        let mut entries = Vec::new();
+        for plan in plans {
+            if Self::verify_local_transfer_identity(&plan, &authority).is_ok() {
+                let journal = self
+                    .transfer_store
+                    .load(&plan)
+                    .map_err(Self::transfer_error)?;
+                entries.push(json!({ "plan_id": plan.id(), "source_workspace_id": plan.binding().source_workspace_id, "destination_workspace_id": plan.binding().destination_workspace_id, "size_bytes": plan.size_bytes(), "sha256": plan.sha256(), "state": journal.as_ref().map(ownmesh_transfer::TransferJournal::state), "bytes_received": journal.as_ref().map(ownmesh_transfer::TransferJournal::bytes_received).unwrap_or(0) }));
+            }
+        }
+        Ok(json!({ "transfers": entries }))
+    }
+
+    async fn handle_transfer_cancel(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+            epoch: u64,
+            fence: u64,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let journal = self
+            .transfer_store
+            .load_for_fence(&plan, p.epoch, p.fence)
+            .map_err(Self::transfer_error)?;
+        if journal.state() == JournalState::Cancelled {
+            return Ok(
+                json!({ "plan_id": plan.id(), "cancelled": true, "state": journal.state(), "replayed": true }),
+            );
+        }
+        if matches!(
+            journal.state(),
+            JournalState::Completed | JournalState::Failed
+        ) {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "completed or failed transfer cannot be cancelled".into(),
+            });
+        }
+        let now = Self::now() as u64;
+        let lease = self
+            .transfer_store
+            .acquire(&plan, now, authority.expires_at_unix)
+            .map_err(Self::transfer_error)?;
+        let mut sink = PartFileSink::create(
+            &self.transfer_store,
+            &plan,
+            p.epoch,
+            journal.bytes_received(),
+        )
+        .map_err(Self::transfer_error)?;
+        let mut receiver = TransferReceiver::resume_from_part(plan.clone(), journal, sink.path())
+            .map_err(Self::transfer_error)?;
+        receiver.cancel(&mut sink).map_err(Self::transfer_error)?;
+        let updated = receiver.journal_snapshot();
+        self.transfer_store
+            .save(&lease, &updated)
+            .map_err(Self::transfer_error)?;
+        self.transfer_senders.remove(plan.id());
+        self.transfer_last_chunks.remove(plan.id());
+        Ok(json!({ "plan_id": plan.id(), "cancelled": true, "state": updated.state() }))
+    }
+
+    async fn handle_transfer_artifact_get(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            plan_id: String,
+            workspace_id: String,
+            #[serde(default)]
+            offset: u64,
+            #[serde(default)]
+            max_bytes: Option<u64>,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        if p.workspace_id != plan.binding().destination_workspace_id {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "artifact workspace does not match immutable plan".into(),
+            });
+        }
+        let journal = self
+            .transfer_store
+            .load(&plan)
+            .map_err(Self::transfer_error)?
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "artifact is not prepared".into(),
+            })?;
+        if journal.state() != JournalState::Completed {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "artifact is incomplete".into(),
+            });
+        }
+        let ws = self.workspace_for(Some(&p.workspace_id))?;
+        let artifact_path = ws
+            .resolve(Path::new(&plan.binding().destination_relative_path))
+            .map_err(fs_err)?;
+        // The completed artifact is deliberately a no-replace hardlink to the
+        // private verified part.  `ownmesh-fs` correctly rejects that
+        // cross-boundary hardlink for ordinary path-selected reads; this is the
+        // narrow exception for an already authenticated immutable plan.  The
+        // caller cannot choose this path, and the read remains regular-file,
+        // no-symlink, offset/page bounded.
+        let initial =
+            std::fs::symlink_metadata(&artifact_path).map_err(|error| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("stat transfer artifact: {error}"),
+            })?;
+        if !initial.is_file() || initial.file_type().is_symlink() {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "transfer artifact custody changed after publication".into(),
+            });
+        }
+        let want = p
+            .max_bytes
+            .unwrap_or(64 * 1024)
+            .clamp(1, MAX_CHUNK_BYTES as u64);
+        let mut file = std::fs::File::open(&artifact_path).map_err(|error| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: format!("open transfer artifact: {error}"),
+        })?;
+        let opened = file.metadata().map_err(|error| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: format!("inspect transfer artifact: {error}"),
+        })?;
+        if !opened.is_file() || opened.len() != initial.len() {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "transfer artifact changed while opening".into(),
+            });
+        }
+        file.seek(SeekFrom::Start(p.offset))
+            .map_err(|error| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("seek transfer artifact: {error}"),
+            })?;
+        let mut data = vec![0_u8; usize::try_from(want).unwrap_or(MAX_CHUNK_BYTES)];
+        let returned = file.read(&mut data).map_err(|error| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: format!("read transfer artifact: {error}"),
+        })?;
+        data.truncate(returned);
+        let total = opened.len();
+        let truncated = p
+            .offset
+            .saturating_add(u64::try_from(returned).unwrap_or(u64::MAX))
+            < total;
+        let returned = data.len() as u64;
+        Ok(
+            json!({ "plan_id": plan.id(), "offset": p.offset, "bytes": returned, "total_bytes": total, "next_offset": if truncated { Value::from(p.offset.saturating_add(returned)) } else { Value::Null }, "truncated": truncated, "encoding": "base64", "content_base64": base64_standard(&data), "page_sha256": sha256_hex(&data), "sha256": plan.sha256() }),
+        )
     }
 
     async fn handle_fs_list(
@@ -3247,6 +3930,25 @@ full_user_access/full_access for arbitrary commands",
             methods::OPS_FS_WRITE => self.handle_fs_write(params, client).await,
             methods::OPS_FS_DELETE => self.handle_fs_delete(params, client).await,
             methods::OPS_LOGS_QUERY => self.handle_logs_query(params, client).await,
+            methods::TRANSFER_PLAN => self.handle_transfer_plan(params, client).await,
+            methods::TRANSFER_SOURCE_OPEN => self.handle_transfer_source_open(params, client).await,
+            methods::TRANSFER_SOURCE_CHUNK => {
+                self.handle_transfer_source_chunk(params, client).await
+            }
+            methods::TRANSFER_DESTINATION_PREPARE => {
+                self.handle_transfer_destination_prepare(params, client)
+                    .await
+            }
+            methods::TRANSFER_DESTINATION_CHUNK => {
+                self.handle_transfer_destination_chunk(params, client).await
+            }
+            methods::TRANSFER_FINALIZE => self.handle_transfer_finalize(params, client).await,
+            methods::TRANSFER_STATUS => self.handle_transfer_status(params, client).await,
+            methods::TRANSFER_LIST => self.handle_transfer_list(params, client).await,
+            methods::TRANSFER_CANCEL => self.handle_transfer_cancel(params, client).await,
+            methods::TRANSFER_ARTIFACT_GET => {
+                self.handle_transfer_artifact_get(params, client).await
+            }
             ops_methods::LOGS_LIST_PROVIDERS => self.handle_logs_list_providers(params),
             ops_methods::GIT_STATUS => self.handle_git_status(params, client).await,
             ops_methods::GIT_DIFF => self.handle_git_diff(params, client).await,
@@ -6779,6 +7481,155 @@ mod device_binding_tests {
     }
 }
 
+#[cfg(test)]
+mod transfer_runtime_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn remote_client() -> ClientIdentity {
+        ClientIdentity::new("client:remote:tenant_a:principal_a", "test")
+    }
+
+    fn bind_remote_transfer(runtime: &mut DaemonRuntime) {
+        runtime.active_remote_operation_id = Some("op_transfer_test".into());
+        runtime.active_remote_payload_hash = Some("a".repeat(64));
+        runtime.active_remote_device_id = Some("dev_transfer_test".into());
+        runtime.active_remote_expires_at_unix = Some(DaemonRuntime::now() + 300);
+    }
+
+    #[tokio::test]
+    async fn transfer_streams_binary_resumes_after_restart_and_pages_artifact() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let destination_root = temp.path().join("destination");
+        runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_destination".into(),
+                root: destination_root,
+                label: Some("destination".into()),
+            })
+            .unwrap();
+        let source = paths.state_dir.join("workspace").join("source.bin");
+        let mut bytes = vec![0_u8; MAX_CHUNK_BYTES * 3 + 17];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        std::fs::write(&source, &bytes).unwrap();
+        bind_remote_transfer(&mut runtime);
+        let client = remote_client();
+        let plan = runtime
+            .handle_transfer_plan(
+                Some(json!({
+                    "source_path": "source.bin",
+                    "destination_path": "received.bin",
+                    "destination_workspace_id": "ws_destination",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
+        runtime
+            .handle_transfer_destination_prepare(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let first = runtime
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 0 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let frame = first["frame_base64"].as_str().unwrap().to_owned();
+        runtime
+            .handle_transfer_destination_chunk(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination", "frame_base64": frame })),
+                &client,
+            )
+            .await
+            .unwrap();
+        // A retry must not append the first chunk twice.
+        assert!(runtime
+            .handle_transfer_destination_chunk(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination", "frame_base64": first["frame_base64"] })),
+                &client,
+            )
+            .await
+            .is_err());
+        drop(runtime);
+
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        bind_remote_transfer(&mut runtime);
+        runtime
+            .handle_transfer_destination_prepare(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "sequence": 1, "offset": MAX_CHUNK_BYTES, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        for sequence in 1..4_u64 {
+            let chunk = runtime
+                .handle_transfer_source_chunk(
+                    Some(json!({ "plan_id": plan_id, "sequence": sequence })),
+                    &client,
+                )
+                .await
+                .unwrap();
+            runtime
+                .handle_transfer_destination_chunk(
+                    Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination", "frame_base64": chunk["frame_base64"] })),
+                    &client,
+                )
+                .await
+                .unwrap();
+        }
+        runtime
+            .handle_transfer_finalize(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let mut reconstructed = Vec::new();
+        let mut offset = 0_u64;
+        loop {
+            let page = runtime
+                .handle_transfer_artifact_get(
+                    Some(json!({ "plan_id": plan_id, "workspace_id": "ws_destination", "offset": offset, "max_bytes": MAX_CHUNK_BYTES })),
+                    &client,
+                )
+                .await
+                .unwrap();
+            reconstructed
+                .extend(base64_decode_strict(page["content_base64"].as_str().unwrap()).unwrap());
+            if !page["truncated"].as_bool().unwrap() {
+                break;
+            }
+            offset = page["next_offset"].as_u64().unwrap();
+        }
+        assert_eq!(reconstructed, bytes);
+    }
+}
+
 fn base64_standard(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -6802,6 +7653,63 @@ fn base64_standard(bytes: &[u8]) -> String {
         i += 3;
     }
     out
+}
+
+/// Decode only canonical RFC 4648 base64.  The caller checks its encoded-size
+/// ceiling before this routine allocates, so malformed transport input cannot
+/// become an oversized binary frame.
+fn base64_decode_strict(value: &str) -> Option<Vec<u8>> {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = value
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|&&b| b == b'=')
+        .count();
+    if padding > 2 || value[..value.len() - padding].bytes().any(|b| b == b'=') {
+        return None;
+    }
+    let mut out = Vec::with_capacity(value.len() / 4 * 3 - padding);
+    let decode = |b: u8| match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    for (group, raw) in value.as_bytes().chunks_exact(4).enumerate() {
+        let last = group + 1 == value.len() / 4;
+        let a = decode(raw[0])?;
+        let b = decode(raw[1])?;
+        let c = if raw[2] == b'=' { 0 } else { decode(raw[2])? };
+        let d = if raw[3] == b'=' { 0 } else { decode(raw[3])? };
+        if !last && raw[2] == b'=' {
+            return None;
+        }
+        if !last && raw[3] == b'=' {
+            return None;
+        }
+        if raw[2] == b'=' && raw[3] != b'=' {
+            return None;
+        }
+        if raw[2] == b'=' && (b & 0x0f) != 0 {
+            return None;
+        }
+        if raw[3] == b'=' && raw[2] != b'=' && (c & 0x03) != 0 {
+            return None;
+        }
+        out.push((a << 2) | (b >> 4));
+        if raw[2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if raw[3] != b'=' {
+            out.push((c << 6) | d);
+        }
+    }
+    Some(out)
 }
 
 fn policy_from_file(file: &PolicyFile) -> PolicyDocument {

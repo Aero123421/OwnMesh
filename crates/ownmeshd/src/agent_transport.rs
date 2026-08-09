@@ -1608,12 +1608,38 @@ fn map_request_to_method(
 ) -> Result<(&'static str, Value), String> {
     let action = action_of(request);
     let mut args = args_object(request);
+    if request.capability.starts_with("transfer.") || action.starts_with("transfer.") {
+        for forbidden in [
+            "tenant_id",
+            "principal_id",
+            "source_principal_id",
+            "destination_principal_id",
+            "source_device_id",
+            "destination_device_id",
+            "payload_hash",
+            "grant_id",
+            "expires_at",
+            "consent",
+            "approved",
+            "allow",
+            "relay",
+            "relay_url",
+            "overwrite",
+            "force",
+        ] {
+            if args.contains_key(forbidden) {
+                return Err(format!(
+                    "transfer parameter '{forbidden}' is server-derived or unsupported"
+                ));
+            }
+        }
+    }
     strip_control_fields(&mut args);
 
     // Cancel targets another operation; it does not re-run a side effect.
     if request.capability == "operation.cancel"
-        || action == "cancel"
-        || action == "ownmesh_cancel_operation"
+        || ((action == "cancel" || action == "ownmesh_cancel_operation")
+            && request.capability != "transfer.cancel")
     {
         return Ok(("__cancel__", Value::Object(args)));
     }
@@ -1836,6 +1862,27 @@ fn map_request_to_method(
         ("fs.read", _) => methods::OPS_FS_READ,
         ("fs.write", _) => methods::OPS_FS_WRITE,
         ("fs.list", _) => methods::OPS_FS_LIST,
+        ("transfer.plan", "transfer.plan" | "plan") => methods::TRANSFER_PLAN,
+        ("transfer.source_open", "transfer.source_open" | "source_open") => {
+            methods::TRANSFER_SOURCE_OPEN
+        }
+        ("transfer.source_chunk", "transfer.source_chunk" | "source_chunk") => {
+            methods::TRANSFER_SOURCE_CHUNK
+        }
+        (
+            "transfer.destination_prepare",
+            "transfer.destination_prepare" | "destination_prepare",
+        ) => methods::TRANSFER_DESTINATION_PREPARE,
+        ("transfer.destination_chunk", "transfer.destination_chunk" | "destination_chunk") => {
+            methods::TRANSFER_DESTINATION_CHUNK
+        }
+        ("transfer.finalize", "transfer.finalize" | "finalize") => methods::TRANSFER_FINALIZE,
+        ("transfer.status", "transfer.status" | "status") => methods::TRANSFER_STATUS,
+        ("transfer.list", "transfer.list" | "list") => methods::TRANSFER_LIST,
+        ("transfer.cancel", "transfer.cancel" | "cancel") => methods::TRANSFER_CANCEL,
+        ("transfer.artifact_get", "transfer.artifact_get" | "artifact_get") => {
+            methods::TRANSFER_ARTIFACT_GET
+        }
         (other_cap, other_action) => {
             return Err(format!(
                 "unsupported remote capability '{other_cap}' action '{other_action}'"

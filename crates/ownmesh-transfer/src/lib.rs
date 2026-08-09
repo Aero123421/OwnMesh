@@ -531,6 +531,52 @@ impl TransferSender {
         })
     }
 
+    /// Reopen a source at a receiver-provided contiguous cursor after daemon
+    /// restart.  The already-sent prefix is re-hashed without buffering so the
+    /// final source-change check still covers the complete immutable content.
+    pub fn open_at(
+        plan: TransferPlan,
+        source: &Path,
+        sequence: u64,
+        offset: u64,
+    ) -> TransferResult<Self> {
+        plan.validate_at(now_unix())?;
+        validate_source_custody(source)?;
+        if offset > plan.size_bytes {
+            return Err(TransferError::Overflow);
+        }
+        let metadata = fs::metadata(source).map_err(io_error)?;
+        if metadata.len() != plan.size_bytes {
+            return Err(TransferError::SourceChanged);
+        }
+        let mut file = File::open(source).map_err(io_error)?;
+        let mut hasher = Sha256::new();
+        let mut remaining_prefix = offset;
+        let mut buffer = vec![0_u8; MAX_CHUNK_BYTES];
+        while remaining_prefix != 0 {
+            let want = usize::try_from(remaining_prefix.min(MAX_CHUNK_BYTES as u64))
+                .map_err(|_| TransferError::Overflow)?;
+            file.read_exact(&mut buffer[..want]).map_err(io_error)?;
+            hasher.update(&buffer[..want]);
+            remaining_prefix = remaining_prefix
+                .checked_sub(u64::try_from(want).map_err(|_| TransferError::Overflow)?)
+                .ok_or(TransferError::Overflow)?;
+        }
+        Ok(Self {
+            remaining: plan
+                .size_bytes
+                .checked_sub(offset)
+                .ok_or(TransferError::Overflow)?,
+            plan,
+            source: source.to_path_buf(),
+            file,
+            sequence,
+            offset,
+            hasher,
+            done: false,
+        })
+    }
+
     pub fn next_chunk(&mut self) -> TransferResult<Option<TransferChunk>> {
         self.plan.validate_at(now_unix())?;
         if self.done {
@@ -979,6 +1025,22 @@ impl JournalStore {
         Ok(Some(journal))
     }
 
+    /// Load progress only when the caller presents the currently held epoch and
+    /// fence.  This is deliberately narrower than `load`: a stale retry must
+    /// not append, publish, or cancel a newer receiver's part file.
+    pub fn load_for_fence(
+        &self,
+        plan: &TransferPlan,
+        epoch: u64,
+        fence: u64,
+    ) -> TransferResult<TransferJournal> {
+        let journal = self.load(plan)?.ok_or(TransferError::Terminal)?;
+        if journal.epoch != epoch || journal.fence != fence {
+            return Err(TransferError::StaleFence);
+        }
+        Ok(journal)
+    }
+
     /// Persist immutable plan metadata separately from progress so a restarted
     /// daemon can reopen only the exact authorized transfer id.
     pub fn save_plan(&self, plan: &TransferPlan) -> TransferResult<()> {
@@ -1007,6 +1069,38 @@ impl JournalStore {
             return Err(TransferError::CorruptJournal);
         }
         Ok(Some(plan))
+    }
+
+    /// Return only immutable plans whose bounded owner-only records validate at
+    /// `now_unix`.  This is intended for status/list presentation; it never
+    /// exposes private part paths or journal ownership fields.
+    pub fn list_plans(&self, now_unix: u64) -> TransferResult<Vec<TransferPlan>> {
+        let entries: Vec<PathBuf> = fs::read_dir(&self.root)
+            .map_err(io_error)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".plan.json"))
+            })
+            .collect();
+        if entries.len() > self.limits.max_journals {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        let mut plans = Vec::with_capacity(entries.len());
+        for path in entries {
+            let bytes = read_owner_only_file_bounded(&path, self.limits.max_bytes)
+                .map_err(|_| TransferError::CorruptJournal)?;
+            let plan: TransferPlan =
+                serde_json::from_slice(&bytes).map_err(|_| TransferError::CorruptJournal)?;
+            plan.validate_at(now_unix)?;
+            if self.path(plan.id(), ".plan.json")? != path {
+                return Err(TransferError::CorruptJournal);
+            }
+            plans.push(plan);
+        }
+        plans.sort_by(|left, right| left.id().cmp(right.id()));
+        Ok(plans)
     }
     pub fn claim(
         &self,
@@ -1065,6 +1159,37 @@ impl JournalStore {
         atomic_write_owner_only(&path, &bytes).map_err(|_| TransferError::CustodyUnavailable)
     }
 
+    /// Publish a fully received private part without replacing an existing
+    /// destination.  The completed journal, immutable plan, and part hash are
+    /// all revalidated here so a daemon restart cannot turn a path supplied by
+    /// a later caller into authority to publish an incomplete transfer.
+    pub fn publish_completed_no_replace(
+        &self,
+        plan: &TransferPlan,
+        destination: &Path,
+    ) -> TransferResult<()> {
+        plan.validate_at(now_unix())?;
+        let journal = self.load(plan)?.ok_or(TransferError::Terminal)?;
+        if journal.state != JournalState::Completed || journal.bytes_received != plan.size_bytes {
+            return Err(TransferError::Terminal);
+        }
+        let part = self.path(plan.id(), ".part")?;
+        let mut file =
+            open_owner_only_file_append(&part).map_err(|_| TransferError::CustodyUnavailable)?;
+        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        let (size, digest) = hash_reader(&mut file, plan.size_bytes)?;
+        if size != plan.size_bytes || digest != plan.sha256 {
+            return Err(TransferError::HashMismatch);
+        }
+        publish_owner_only_file_no_replace(&file, &part, destination).map_err(|error| {
+            if matches!(&error, ownmesh_ipc::IpcError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists) {
+                TransferError::DestinationExists
+            } else {
+                TransferError::CustodyUnavailable
+            }
+        })
+    }
+
     /// Startup/TTL cleanup. It first validates every journal within the bounded
     /// directory; a corrupt journal stops cleanup before any part is removed.
     /// Only the exact private part name derived from an expired journal is ever
@@ -1103,7 +1228,7 @@ impl JournalStore {
         }
         let mut removed = 0;
         for (journal_path, journal) in expired {
-            let part = self.path(&journal.plan_id, &format!(".{}.part", journal.epoch))?;
+            let part = self.path(&journal.plan_id, ".part")?;
             if let Ok(metadata) = fs::symlink_metadata(&part) {
                 if !metadata.is_file() || metadata.file_type().is_symlink() {
                     return Err(TransferError::CustodyUnavailable);
@@ -1141,7 +1266,8 @@ impl PartFileSink {
         resume_at: u64,
     ) -> TransferResult<Self> {
         plan.validate_at(now_unix())?;
-        let path = store.path(plan.id(), &format!(".{epoch}.part"))?;
+        let _ = epoch;
+        let path = store.path(plan.id(), ".part")?;
         if create_owner_only_file_new(&path, &[]).is_err() && !path.exists() {
             return Err(TransferError::CustodyUnavailable);
         }

@@ -2163,6 +2163,7 @@ dependencies = [
  "ownmesh-protocol",
  "ownmesh-session",
  "ownmesh-session-host",
+ "ownmesh-transfer",
  "rustls",
  "serde",
  "serde_json",
