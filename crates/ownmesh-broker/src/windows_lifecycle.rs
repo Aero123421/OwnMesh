@@ -53,7 +53,7 @@ const STAGING_NAME: &str = "staged";
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct WindowsBrokerConfig {
     schema_version: u32,
@@ -660,10 +660,7 @@ pub fn install_windows_broker(_base: &Path) -> Result<InstallRecord, String> {
         let existing: WindowsBrokerConfig =
             serde_json::from_slice(&std::fs::read(&config_path).map_err(|e| e.to_string())?)
                 .map_err(|e| format!("parse existing Windows broker config: {e}"))?;
-        if existing.broker_binary != cfg.broker_binary
-            || existing.trust_record != cfg.trust_record
-            || existing.daemon_service_name != cfg.daemon_service_name
-        {
+        if existing != cfg {
             return Err("existing Windows broker config mismatch; refusing overwrite".into());
         }
     } else {
@@ -763,7 +760,10 @@ fn load_service_config() -> Result<WindowsBrokerConfig, String> {
     if cfg.schema_version != 1
         || cfg.broker_service_name != BROKER_SERVICE
         || cfg.daemon_service_name != DAEMON_SERVICE
+        || cfg.broker_binary != binary_path()?
         || cfg.trust_record != data_root()?.join(TRUST_NAME)
+        || cfg.request_secret != data_root()?.join(SECRET_NAME)
+        || cfg.signing_key != data_root()?.join(SIGNING_NAME)
         || cfg.replay_ledger != data_root()?.join(LEDGER_NAME)
         || cfg.staging_dir != data_root()?.join(STAGING_NAME)
     {
