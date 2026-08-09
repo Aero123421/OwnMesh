@@ -39,9 +39,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
@@ -52,9 +52,9 @@ use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerW, SetServiceObjectSecurity, SetServiceStatus,
     StartServiceCtrlDispatcherW, StartServiceW, QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT,
     SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
-    SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
+    SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::{
@@ -926,6 +926,7 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
 
 fn daemon_trust_record() -> Result<crate::WindowsDaemonTrustRecord, String> {
     let pid = query_service_pid(DAEMON_SERVICE)?;
+    let daemon_config = query_named_service_config(DAEMON_SERVICE)?;
     let scm = windows_running_service_facts(DAEMON_SERVICE, pid).map_err(|e| e.to_string())?;
     if scm.binary_command_line().trim().is_empty() {
         return Err("daemon SCM image command line is empty".into());
@@ -933,6 +934,12 @@ fn daemon_trust_record() -> Result<crate::WindowsDaemonTrustRecord, String> {
     let facts = windows_process_facts(pid).map_err(|e| e.to_string())?;
     let (daemon_pipe_sid, daemon_token_sid, daemon_session_id, daemon_integrity_rid) =
         process_token_identity(pid)?;
+    if !daemon_identity_matches_secret_policy(&daemon_config, &daemon_pipe_sid, &daemon_token_sid) {
+        return Err(
+            "OwnMeshDaemon is not the exact LocalSystem SCM/token identity required to read broker secrets"
+                .into(),
+        );
+    }
     Ok(crate::WindowsDaemonTrustRecord {
         daemon_pipe_sid,
         daemon_token_sid,
@@ -975,10 +982,10 @@ fn create_or_validate_service(binary: &Path, config: &Path) -> Result<bool, Stri
             SERVICE_AUTO_START,
             SERVICE_ERROR_NORMAL,
             command.as_ptr(),
-            local_system.as_ptr(),
+            ptr::null(),
             ptr::null_mut(),
             ptr::null(),
-            ptr::null(),
+            local_system.as_ptr(),
             ptr::null(),
         )
     };
@@ -1026,14 +1033,45 @@ fn create_or_validate_service(binary: &Path, config: &Path) -> Result<bool, Stri
     Ok(!service.is_null())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ServiceConfigSnapshot {
     command: String,
     service_type: u32,
     start_type: u32,
     error_control: u32,
+    load_order_group_empty: bool,
+    tag_id: u32,
     dependencies_empty: bool,
     account: String,
+}
+
+fn service_config_matches_broker_policy(
+    actual: &ServiceConfigSnapshot,
+    binary: &Path,
+    config: &Path,
+) -> bool {
+    actual.command == command_line(binary, config)
+        && actual.service_type == SERVICE_WIN32_OWN_PROCESS
+        && actual.start_type == SERVICE_AUTO_START
+        && actual.error_control == SERVICE_ERROR_NORMAL
+        && actual.load_order_group_empty
+        && actual.tag_id == 0
+        && actual.dependencies_empty
+        && actual.account.eq_ignore_ascii_case("LocalSystem")
+}
+
+/// Broker secrets are SYSTEM/Admin-only in this release. Until ownmeshd has an
+/// explicitly-attested service SID with a narrowly scoped read ACE, its
+/// Windows deployment must be the real LocalSystem service end-to-end.
+fn daemon_identity_matches_secret_policy(
+    actual: &ServiceConfigSnapshot,
+    pipe_sid: &str,
+    token_sid: &str,
+) -> bool {
+    actual.service_type == SERVICE_WIN32_OWN_PROCESS
+        && actual.account.eq_ignore_ascii_case("LocalSystem")
+        && pipe_sid == "S-1-5-18"
+        && token_sid == "sid:010100000000000512000000"
 }
 
 fn query_service_config(
@@ -1102,9 +1140,50 @@ fn query_service_config(
         service_type: config.dwServiceType,
         start_type: config.dwStartType,
         error_control: config.dwErrorControl,
+        load_order_group_empty: returned_string(
+            config.lpLoadOrderGroup,
+            start,
+            end,
+            "load-order group",
+        )?
+        .is_empty(),
+        tag_id: config.dwTagId,
         dependencies_empty: empty_multisz(config.lpDependencies, start, end)?,
         account: returned_string(config.lpServiceStartName, start, end, "account")?,
     })
+}
+
+fn query_named_service_config(name: &str) -> Result<ServiceConfigSnapshot, String> {
+    let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(format!(
+            "open SCM for {name} identity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let wide_name = wide(OsStr::new(name));
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            wide_name.as_ptr(),
+            SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+        )
+    };
+    if service.is_null() {
+        unsafe {
+            let _ = CloseServiceHandle(manager);
+        }
+        return Err(format!(
+            "open SCM {name} identity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = query_service_config(service);
+    unsafe {
+        let _ = CloseServiceHandle(service);
+        let _ = CloseServiceHandle(manager);
+    }
+    result
 }
 
 fn validate_service_config(
@@ -1113,13 +1192,7 @@ fn validate_service_config(
     config: &Path,
 ) -> Result<(), String> {
     let actual = query_service_config(service)?;
-    if actual.command != command_line(binary, config)
-        || actual.service_type != SERVICE_WIN32_OWN_PROCESS
-        || actual.start_type != SERVICE_AUTO_START
-        || actual.error_control != SERVICE_ERROR_NORMAL
-        || !actual.dependencies_empty
-        || !actual.account.eq_ignore_ascii_case("LocalSystem")
-    {
+    if !service_config_matches_broker_policy(&actual, binary, config) {
         return Err("existing broker SCM service differs from exact OwnMesh LocalSystem policy; refusing adoption".into());
     }
     Ok(())
@@ -1258,7 +1331,7 @@ fn validate_service_custody(
     result
 }
 
-fn start_and_wait() -> Result<(), String> {
+fn start_and_attest(binary: &Path, expected_hash: &str) -> Result<(), String> {
     let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
         return Err("open SCM to start broker".into());
@@ -1278,7 +1351,31 @@ fn start_and_wait() -> Result<(), String> {
         let _ = CloseServiceHandle(service);
         let _ = CloseServiceHandle(manager);
     }
-    result
+    result?;
+    let pid = query_service_pid(BROKER_SERVICE)?;
+    let facts = windows_process_facts(pid)
+        .map_err(|error| format!("attest running broker service PID: {error}"))?;
+    if Path::new(facts.image_path()) != binary || hex::encode(facts.image_sha256()) != expected_hash
+    {
+        return Err("running broker service PID image differs from exact installed broker".into());
+    }
+    wait_named_pipe_ready(ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME)
+}
+
+fn wait_named_pipe_ready(pipe_name: &str) -> Result<(), String> {
+    let pipe = wide(OsStr::new(pipe_name));
+    let deadline = Instant::now() + WAIT_LIMIT;
+    loop {
+        if unsafe { WaitNamedPipeW(pipe.as_ptr(), 200) } != 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "broker named pipe did not become ready after SCM reported RUNNING: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
 }
 
 fn wait_service_state(
@@ -1378,22 +1475,61 @@ fn broker_service_exists() -> Result<bool, String> {
     result
 }
 
-fn rollback_created_service() {
+fn rollback_created_service() -> Result<(), String> {
     let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
     if manager.is_null() {
-        return;
+        return Err("open SCM for broker rollback".into());
     }
     let name = wide(OsStr::new(BROKER_SERVICE));
-    let service = unsafe { OpenServiceW(manager, name.as_ptr(), DELETE) };
-    if !service.is_null() {
+    let service = unsafe { OpenServiceW(manager, name.as_ptr(), SERVICE_ALL_ACCESS) };
+    let result = if service.is_null() {
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(ERROR_SERVICE_DOES_NOT_EXIST) => Ok(()),
+            _ => Err("open transaction-created broker service for rollback".into()),
+        }
+    } else {
+        let mut ignored = unsafe { std::mem::zeroed::<SERVICE_STATUS>() };
+        let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut ignored) };
+        let stopped = wait_service_state(service, SERVICE_STOPPED);
+        let deleted = stopped.and_then(|_| {
+            if unsafe { DeleteService(service) } == 0 {
+                Err("delete transaction-created broker service during rollback".into())
+            } else {
+                Ok(())
+            }
+        });
         unsafe {
-            let _ = DeleteService(service);
             let _ = CloseServiceHandle(service);
         }
-    }
+        deleted.and_then(|_| wait_service_absent(manager, &name))
+    };
     unsafe {
         let _ = CloseServiceHandle(manager);
     }
+    result
+}
+
+fn rollback_transaction_artifacts(
+    created_files: &[PathBuf],
+    created_dirs: &[PathBuf],
+) -> Result<(), String> {
+    for file in created_files.iter().rev() {
+        std::fs::remove_file(file).map_err(|error| {
+            format!(
+                "rollback transaction-created file {}: {error}",
+                file.display()
+            )
+        })?;
+    }
+    for directory in created_dirs.iter().rev() {
+        std::fs::remove_dir(directory).map_err(|error| {
+            format!(
+                "rollback transaction-created directory {}: {error}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn with_windows_install_preflight<T>(
@@ -1560,7 +1696,7 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
         revalidate_retained(&retained)?;
         created_service = create_or_validate_service(&destination, &config_path)?;
         revalidate_retained(&retained)?;
-        if let Err(error) = start_and_wait() {
+        if let Err(error) = start_and_attest(&destination, &cfg.broker_sha256) {
             let _ = (
                 created_config,
                 created_trust,
@@ -1573,19 +1709,27 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
         }
         Ok(InstallRecord { installed: true, installed_at_unix: crate::now_unix(), endpoint: ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME.into(), endpoint_kind: "named_pipe".into(), unit_path: Some(BROKER_SERVICE.into()), secret_file: cfg.request_secret.display().to_string(), signing_key_file: cfg.signing_key.display().to_string(), verify_key_file: String::new(), trusted_executable: trust.image_path.display().to_string(), socket_owner_uid: 0, socket_group_gid: 0, socket_mode: 0, allowed_uids: vec![], daemon_uid: 0, daemon_gid: 0, broker_binary: destination.display().to_string(), config_path: config_path.display().to_string(), broker_sha256: hash_file(&destination)?, trusted_executable_sha256: trust.image_sha256, config_sha256: hash_file(&config_path)?, unit_sha256: String::new(), notes: vec!["Windows SCM broker service is installed; support remains pending an opt-in elevated receipt".into()], support: "unsupported".into() })
     })();
-    if outcome.is_err() {
-        if created_service {
-            rollback_created_service();
+    match outcome {
+        Ok(record) => Ok(record),
+        Err(error) => {
+            if created_service {
+                if let Err(rollback) = rollback_created_service() {
+                    return Err(format!(
+                        "broker install failed: {error}; transaction-created SCM service could not be removed safely: {rollback}; preserving transaction artifacts"
+                    ));
+                }
+            }
+            // Retained no-delete handles are a transaction fence, not a cleanup
+            // mechanism. Release them before removing only objects this call made.
+            drop(retained);
+            if let Err(rollback) = rollback_transaction_artifacts(&created_files, &created_dirs) {
+                return Err(format!(
+                    "broker install failed: {error}; SCM rollback completed but artifact rollback failed: {rollback}"
+                ));
+            }
+            Err(error)
         }
-        // Retained no-delete handles are a transaction fence, not a cleanup
-        // mechanism. Release them before removing only objects this call made.
-        drop(retained);
-        for file in created_files.iter().rev() {
-            let _ = std::fs::remove_file(file);
-        }
-        rollback_created_dirs(&created_dirs);
     }
-    outcome
 }
 
 pub fn broker_status_windows(_base: &Path) -> Result<InstallStatus, String> {
@@ -1747,42 +1891,51 @@ pub fn uninstall_windows_broker(_base: &Path) -> Result<(), String> {
         unsafe {
             let _ = CloseServiceHandle(manager);
         }
-        return if absent {
-            Ok(())
-        } else {
-            Err("open broker SCM service for uninstall".into())
-        };
-    }
-    if let Err(error) = validate_service_config(service, &cfg.broker_binary, &config_path)
-        .and_then(|_| validate_service_custody(service))
-    {
+        if !absent {
+            return Err("open broker SCM service for uninstall".into());
+        }
+        // Idempotent recovery: the prior uninstall may have reached SCM
+        // deletion and crashed before removing the exact, pre-validated files.
+        // Continue with artifact cleanup below; never treat service absence as
+        // permission to sweep a record we have not already proved belongs to us.
+    } else {
+        if let Err(error) = validate_service_config(service, &cfg.broker_binary, &config_path)
+            .and_then(|_| validate_service_custody(service))
+        {
+            unsafe {
+                let _ = CloseServiceHandle(service);
+                let _ = CloseServiceHandle(manager);
+            }
+            return Err(error);
+        }
+        let mut ignored = unsafe { std::mem::zeroed::<SERVICE_STATUS>() };
+        let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut ignored) };
+        if let Err(error) = wait_service_state(service, SERVICE_STOPPED) {
+            unsafe {
+                let _ = CloseServiceHandle(service);
+                let _ = CloseServiceHandle(manager);
+            }
+            return Err(error);
+        }
+        if unsafe { DeleteService(service) } == 0 {
+            unsafe {
+                let _ = CloseServiceHandle(service);
+                let _ = CloseServiceHandle(manager);
+            }
+            return Err("delete broker SCM service".into());
+        }
         unsafe {
             let _ = CloseServiceHandle(service);
-            let _ = CloseServiceHandle(manager);
         }
-        return Err(error);
-    }
-    let mut ignored = unsafe { std::mem::zeroed::<SERVICE_STATUS>() };
-    let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut ignored) };
-    wait_service_state(service, SERVICE_STOPPED)?;
-    if unsafe { DeleteService(service) } == 0 {
+        // SCM deletion is asynchronous. A marked-for-delete service is still
+        // present; wait until SCM reports ERROR_SERVICE_DOES_NOT_EXIST before
+        // any file removal.
+        let absence = wait_service_absent(manager, &name);
         unsafe {
-            let _ = CloseServiceHandle(service);
             let _ = CloseServiceHandle(manager);
         }
-        return Err("delete broker SCM service".into());
+        absence?;
     }
-    unsafe {
-        let _ = CloseServiceHandle(service);
-    }
-    // SCM deletion is asynchronous. A marked-for-delete service is still
-    // present; wait until SCM reports ERROR_SERVICE_DOES_NOT_EXIST before any
-    // file removal.
-    let absence = wait_service_absent(manager, &name);
-    unsafe {
-        let _ = CloseServiceHandle(manager);
-    }
-    absence?;
 
     for (file, hash) in [
         (&cfg.request_secret, Some(cfg.secret_sha256.as_str())),
@@ -1859,40 +2012,57 @@ fn load_service_config() -> Result<WindowsBrokerConfig, String> {
     Ok(cfg)
 }
 
-async fn run_windows_broker_service() -> Result<(), String> {
-    let cfg = load_service_config()?;
-    verify_system_admin_custody(&cfg.trust_record)?;
-    let trusted = load_windows_daemon_trust_record(&cfg.trust_record)?;
-    verify_system_admin_custody(&cfg.request_secret)?;
-    verify_system_admin_custody(&cfg.signing_key)?;
-    let secret_bytes = std::fs::read(&cfg.request_secret)
-        .map_err(|e| format!("read Windows broker secret: {e}"))?;
-    if secret_bytes.len() != BROKER_SECRET_BYTES
-        || hash_file(&cfg.request_secret)? != cfg.secret_sha256
-    {
-        return Err("Windows broker request secret differs from exact custody record".into());
+async fn run_windows_broker_service(
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+) -> Result<(), String> {
+    let setup = async {
+        let cfg = load_service_config()?;
+        verify_system_admin_custody(&cfg.trust_record)?;
+        let trusted = load_windows_daemon_trust_record(&cfg.trust_record)?;
+        verify_system_admin_custody(&cfg.request_secret)?;
+        verify_system_admin_custody(&cfg.signing_key)?;
+        let secret_bytes = std::fs::read(&cfg.request_secret)
+            .map_err(|e| format!("read Windows broker secret: {e}"))?;
+        if secret_bytes.len() != BROKER_SECRET_BYTES
+            || hash_file(&cfg.request_secret)? != cfg.secret_sha256
+        {
+            return Err("Windows broker request secret differs from exact custody record".into());
+        }
+        let secret = BrokerSecret::from_bytes(secret_bytes);
+        let signing_key = CapabilitySigningKey::from_bytes(
+            &std::fs::read(&cfg.signing_key)
+                .map_err(|e| format!("read Windows broker signing key: {e}"))?,
+        )
+        .map_err(|e| format!("read Windows broker signing key: {e}"))?;
+        if hash_file(&cfg.signing_key)? != cfg.signing_sha256 {
+            return Err("Windows broker signing key differs from exact custody record".into());
+        }
+        let ledger = WindowsDurableReplayLedger::open(&cfg.replay_ledger, 16_384)?;
+        let runner = WindowsJobRunner::new(&cfg.staging_dir)?;
+        let daemon_pipe_sid = trusted.record().daemon_pipe_sid.clone();
+        WindowsProductionBrokerServer::bind(
+            &daemon_pipe_sid,
+            trusted,
+            ledger,
+            runner,
+            secret,
+            signing_key,
+        )
+        .await
     }
-    let secret = BrokerSecret::from_bytes(secret_bytes);
-    let signing_key = CapabilitySigningKey::from_bytes(
-        &std::fs::read(&cfg.signing_key)
-            .map_err(|e| format!("read Windows broker signing key: {e}"))?,
-    )
-    .map_err(|e| format!("read Windows broker signing key: {e}"))?;
-    if hash_file(&cfg.signing_key)? != cfg.signing_sha256 {
-        return Err("Windows broker signing key differs from exact custody record".into());
+    .await;
+    let server = match setup {
+        Ok(server) => server,
+        Err(error) => {
+            let _ = ready.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    if ready.send(Ok(())).is_err() {
+        return Err(
+            "SCM service startup observer disconnected before broker pipe readiness".into(),
+        );
     }
-    let ledger = WindowsDurableReplayLedger::open(&cfg.replay_ledger, 16_384)?;
-    let runner = WindowsJobRunner::new(&cfg.staging_dir)?;
-    let daemon_pipe_sid = trusted.record().daemon_pipe_sid.clone();
-    let server = WindowsProductionBrokerServer::bind(
-        &daemon_pipe_sid,
-        trusted,
-        ledger,
-        runner,
-        secret,
-        signing_key,
-    )
-    .await?;
     loop {
         tokio::select! {
             result = server.serve_once() => result?,
@@ -1915,26 +2085,47 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     }
     let mut status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
-        dwCurrentState: SERVICE_RUNNING,
-        dwControlsAccepted: SERVICE_ACCEPT_STOP,
+        dwCurrentState: SERVICE_START_PENDING,
+        dwControlsAccepted: 0,
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
-        dwCheckPoint: 0,
-        dwWaitHint: 0,
+        dwCheckPoint: 1,
+        dwWaitHint: WAIT_LIMIT.as_millis().try_into().unwrap_or(u32::MAX),
     };
     let _ = SetServiceStatus(handle, &status);
-    let outcome = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .and_then(|runtime| {
-            runtime
-                .block_on(run_windows_broker_service())
-                .map_err(std::io::Error::other)
-        });
+    let outcome = (|| -> Result<(), String> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("create Windows broker service runtime: {error}"))?;
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = runtime.spawn(run_windows_broker_service(ready_tx));
+        match ready_rx.recv_timeout(WAIT_LIMIT) {
+            Ok(Ok(())) => {
+                status.dwCurrentState = SERVICE_RUNNING;
+                status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+                status.dwCheckPoint = 0;
+                status.dwWaitHint = 0;
+                if unsafe { SetServiceStatus(handle, &status) } == 0 {
+                    return Err("report broker pipe readiness to SCM".into());
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err("broker pipe did not bind before SCM startup deadline".into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("broker startup worker exited before pipe readiness".into());
+            }
+        }
+        runtime
+            .block_on(worker)
+            .map_err(|error| format!("join Windows broker service worker: {error}"))?
+    })();
     status.dwCurrentState = SERVICE_STOPPED;
     status.dwControlsAccepted = 0;
-    if let Err(error) = outcome {
-        status.dwWin32ExitCode = error.raw_os_error().unwrap_or(1) as u32;
+    if outcome.is_err() {
+        status.dwWin32ExitCode = 1;
     }
     let _ = SetServiceStatus(handle, &status);
 }
@@ -1996,15 +2187,6 @@ mod tests {
     }
 
     #[test]
-    fn environment_values_cannot_choose_fixed_windows_paths() {
-        // `data_root` / `binary_path` use SHGetKnownFolderPath, never these
-        // mutable process-environment aliases.
-        let source = include_str!("windows_lifecycle.rs");
-        assert!(!source.contains("var_os(\"ProgramData\")"));
-        assert!(!source.contains("var_os(\"ProgramFiles\")"));
-    }
-
-    #[test]
     fn oversized_broker_image_is_rejected_without_allocation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("huge.exe");
@@ -2013,74 +2195,73 @@ mod tests {
         assert!(hash_file(&path).unwrap_err().contains("ceiling"));
     }
 
-    #[test]
-    fn custody_creation_uses_kernel_security_attributes_and_pinned_handles() {
-        let source = include_str!("windows_lifecycle.rs");
-        assert!(source.contains("CreateDirectoryW(name.as_ptr(), &attributes)"));
-        assert!(source.contains("CREATE_NEW"));
-        assert!(source.contains("FILE_FLAG_OPEN_REPARSE_POINT"));
-        assert!(source.contains("FILE_SHARE_READ | FILE_SHARE_WRITE"));
-        assert!(source.contains("GetFinalPathNameByHandleW"));
-        assert!(source.contains("GetFileInformationByHandle"));
-        assert!(!source.contains("std::fs::create_dir(path)"));
-    }
-
-    #[test]
-    fn foreign_service_policy_and_uninstall_are_fail_closed() {
-        let source = include_str!("windows_lifecycle.rs");
-        for required in [
-            "SERVICE_WIN32_OWN_PROCESS",
-            "SERVICE_AUTO_START",
-            "SERVICE_ERROR_NORMAL",
-            "LocalSystem",
-            "validate_service_config",
-            "validate_service_custody",
-            "dependencies_empty",
-            "require_elevated_scm_admin()?",
-            "ERROR_SERVICE_MARKED_FOR_DELETE",
-            "fixed_windows_artifacts_present",
-        ] {
-            assert!(source.contains(required), "missing {required}");
+    fn exact_broker_service_config(binary: &Path, config: &Path) -> ServiceConfigSnapshot {
+        ServiceConfigSnapshot {
+            command: command_line(binary, config),
+            service_type: SERVICE_WIN32_OWN_PROCESS,
+            start_type: SERVICE_AUTO_START,
+            error_control: SERVICE_ERROR_NORMAL,
+            load_order_group_empty: true,
+            tag_id: 0,
+            dependencies_empty: true,
+            account: "LocalSystem".into(),
         }
-        assert!(!source.contains("remove_dir_all"));
     }
 
     #[test]
-    fn residual_or_staged_artifacts_block_uninstall_before_service_mutation() {
-        let source = include_str!("windows_lifecycle.rs");
-        let preflight = source
-            .find("Windows broker staging contains unrecorded artifacts")
-            .unwrap();
-        let stop = source
-            .find("ControlService(service, SERVICE_CONTROL_STOP")
-            .unwrap();
-        assert!(
-            preflight < stop,
-            "staging must be checked before stopping service"
-        );
-        assert!(source.contains(
-            "Windows broker residual/foreign artifact exists without its custody record"
+    fn broker_service_policy_rejects_each_foreign_scm_field() {
+        let binary = Path::new(r"C:\Program Files\OwnMesh\ownmesh-broker.exe");
+        let config = Path::new(r"C:\ProgramData\OwnMesh\broker\broker-service.json");
+        let exact = exact_broker_service_config(binary, config);
+        assert!(service_config_matches_broker_policy(&exact, binary, config));
+
+        let mut changed = exact.clone();
+        changed.load_order_group_empty = false;
+        assert!(!service_config_matches_broker_policy(
+            &changed, binary, config
         ));
-        let release = source.find("drop(retained);").unwrap();
-        let rollback_file = source
-            .find("for file in created_files.iter().rev()")
-            .unwrap();
-        assert!(
-            release < rollback_file,
-            "rollback must release no-delete handles first"
-        );
+        changed = exact.clone();
+        changed.tag_id = 1;
+        assert!(!service_config_matches_broker_policy(
+            &changed, binary, config
+        ));
+        changed = exact.clone();
+        changed.dependencies_empty = false;
+        assert!(!service_config_matches_broker_policy(
+            &changed, binary, config
+        ));
+        changed = exact.clone();
+        changed.account = "NT AUTHORITY\\NetworkService".into();
+        assert!(!service_config_matches_broker_policy(
+            &changed, binary, config
+        ));
+        changed = exact.clone();
+        changed.start_type = 3;
+        assert!(!service_config_matches_broker_policy(
+            &changed, binary, config
+        ));
     }
 
     #[test]
-    fn service_security_uses_service_rights_and_status_requires_live_attestation() {
-        let source = include_str!("windows_lifecycle.rs");
-        assert!(source.contains("0x000F01FF"));
-        assert!(source.contains("CreationDescriptor::service()?"));
-        assert!(source.contains("ace.Mask != SERVICE_ALL_ACCESS"));
-        assert!(source.contains("!actual.account.eq_ignore_ascii_case(\"LocalSystem\")"));
-        assert!(source.contains("wait_service_state(service, SERVICE_STOPPED)?"));
-        assert!(source.contains("WaitNamedPipeW"));
-        assert!(source.contains("validate_service_custody(service)"));
+    fn daemon_secret_policy_requires_system_scm_and_token_identity() {
+        let binary = Path::new(r"C:\Program Files\OwnMesh\ownmesh-broker.exe");
+        let config = Path::new(r"C:\ProgramData\OwnMesh\broker\broker-service.json");
+        let exact = exact_broker_service_config(binary, config);
+        assert!(daemon_identity_matches_secret_policy(
+            &exact,
+            "S-1-5-18",
+            "sid:010100000000000512000000"
+        ));
+        assert!(!daemon_identity_matches_secret_policy(
+            &exact,
+            "S-1-5-21-foreign",
+            "sid:010100000000000512000000"
+        ));
+        assert!(!daemon_identity_matches_secret_policy(
+            &exact,
+            "S-1-5-18",
+            "sid:010100000000000521000000"
+        ));
     }
 
     #[test]

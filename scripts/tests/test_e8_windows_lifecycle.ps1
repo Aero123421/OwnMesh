@@ -46,7 +46,10 @@ if ($PSCmdlet.ShouldProcess('OwnMeshPrivilegedBroker', 'install/start and verify
     Start-Sleep -Milliseconds 500
     if ((sc.exe query OwnMeshPrivilegedBroker) -notmatch 'RUNNING') { throw 'broker did not reach RUNNING after SCM start' }
 
-    $receiptDir = Join-Path $env:ProgramData 'OwnMesh\broker\receipts'
+    # Receipts are evidence, not a broker-managed artifact. Keeping them
+    # outside `OwnMesh\broker` means a successful uninstall can remove the
+    # complete managed root without a retained receipt making it look foreign.
+    $receiptDir = Join-Path $env:ProgramData 'OwnMesh\receipts'
     New-Item -ItemType Directory -Force -Path $receiptDir | Out-Null
     $receipt = [ordered]@{
         schema_version = 1
