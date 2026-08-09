@@ -2684,7 +2684,7 @@ export function buildTicketlessTransferStartOutbox(deviceOp: {
  * in Rust: the hash includes every custody/grant/content fact and is therefore
  * safe to use as the single plan identity in both tickets.
  */
-function finalTransferAction(meta: TransferPlanMeta, contentSha256: string, sizeBytes: number): Record<string, unknown> {
+function immutableTransferGrantAction(meta: TransferPlanMeta, contentSha256: string, sizeBytes: number): Record<string, unknown> {
   return {
     capability: "transfer.start", action: "transfer.start", tool: "__transfer_start",
     transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, principal_id: meta.principal_id,
@@ -2692,9 +2692,20 @@ function finalTransferAction(meta: TransferPlanMeta, contentSha256: string, size
     source_workspace_id: meta.source_workspace_id, destination_workspace_id: meta.destination_workspace_id,
     source_path: meta.source_path, destination_path: meta.destination_path,
     source_workspace_version: meta.source_workspace_version, destination_workspace_version: meta.destination_workspace_version,
-    epoch: meta.epoch, fence: meta.fence, content_sha256: contentSha256, size_bytes: sizeBytes,
+    content_sha256: contentSha256, size_bytes: sizeBytes,
     expires_at: meta.expires_at,
   };
+}
+
+/** The local TransferPlan and its durable ACK journal survive a reconnect.
+ * Epoch/fence are exact-bound by each preflight/start operation and ticket,
+ * but are deliberately not part of this immutable plan grant identity. */
+export async function transferGrantPayloadHash(meta: TransferPlanMeta, contentSha256: string, sizeBytes: number): Promise<string> {
+  return hashCanonicalAction(immutableTransferGrantAction(meta, contentSha256, sizeBytes));
+}
+
+function finalTransferAction(meta: TransferPlanMeta, contentSha256: string, sizeBytes: number): Record<string, unknown> {
+  return { ...immutableTransferGrantAction(meta, contentSha256, sizeBytes), epoch: meta.epoch, fence: meta.fence };
 }
 
 /** Exact Rust `TransferPlan::from_verified` byte stream (UTF-8 length prefixes). */
@@ -2956,7 +2967,7 @@ async function buildTransferPreflightOperation(opts: {
     args.size_bytes = m.source_size_bytes;
     args.grant_id = m.transfer_id;
     args.grant_operation_id = m.transfer_id;
-    args.grant_payload_sha256 = await hashCanonicalAction(finalTransferAction(m, m.source_sha256, m.source_size_bytes));
+    args.grant_payload_sha256 = await transferGrantPayloadHash(m, m.source_sha256, m.source_size_bytes);
     args.grant_expires_at_unix = Math.floor(Date.parse(m.expires_at) / 1000);
   }
   const canonical = {
@@ -3411,7 +3422,7 @@ export async function handleMcp(
         // grant.  Reopen/re-hash under the common send grant before the
         // source signs an ephemeral proof for the plan either peer can run.
         const preliminary: TransferPlanMeta = { ...meta, source_plan_id: sourcePlanId, source_size_bytes: sourceSize, source_sha256: sourceDigest };
-        const grantPayloadHash = await hashCanonicalAction(finalTransferAction(preliminary, sourceDigest, sourceSize));
+        const grantPayloadHash = await transferGrantPayloadHash(preliminary, sourceDigest, sourceSize);
         const finalPlanSha256 = await finalTransferPlanHash(preliminary, grantPayloadHash, sourceDigest, sourceSize);
         const bound: TransferPlanMeta = { ...preliminary, plan_sha256: finalPlanSha256 };
         const finalSourceId = randomId("op_");
@@ -3470,7 +3481,7 @@ export async function handleMcp(
         const sourceSizeBytes = meta.source_size_bytes;
         const [sourceDevice, destinationDevice] = await Promise.all([store.getDevice(meta.source_device_id), store.getDevice(meta.destination_device_id)]);
         if (!sourceDevice || !destinationDevice) return mcpError(id, -32004, "transfer_not_available");
-        const grantPayloadHash = await hashCanonicalAction(finalTransferAction(meta, meta.source_sha256, meta.source_size_bytes));
+        const grantPayloadHash = await transferGrantPayloadHash(meta, meta.source_sha256, meta.source_size_bytes);
         const sourceStartId = randomId("op_"); const destinationStartId = randomId("op_");
         const claim = await claimTransferStartDispatch(
           store, tracker, plan.operation_id, meta, sourceStartId, destinationStartId,

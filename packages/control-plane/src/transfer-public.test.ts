@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildTicketlessTransferStartOutbox, finalTransferPlanHash, handleMcp, MCP_TOOLS, OperationTracker, transferStartAuditedFacts, type OperationRouter, type TransferPlanMeta } from "./mcp.ts";
+import { buildTicketlessTransferStartOutbox, finalTransferPlanHash, handleMcp, MCP_TOOLS, OperationTracker, transferGrantPayloadHash, transferStartAuditedFacts, type OperationRouter, type TransferPlanMeta } from "./mcp.ts";
 import { MemoryStore } from "./store.ts";
 import { canonicalTransferEphemeralProof, type TransferTicketClaims } from "./transfer-room.ts";
 
@@ -307,6 +307,20 @@ test("final transfer-plan digest uses UTF-8 byte lengths for Japanese and emoji 
     epoch: 1, fence: 1, ttl_seconds: 3600, expires_at: new Date(1_700_000_000_000).toISOString(), state: "ready",
   };
   assert.equal(await finalTransferPlanHash(meta, "a".repeat(64), "b".repeat(64), 7), "0756a7508b6e927c63b8e58542d64c2a5b8e25821c69d00c926d154f575de23c");
+});
+
+test("durable plan grant identity survives epoch/fence advance but binds immutable custody", async () => {
+  const meta: TransferPlanMeta = {
+    transfer_id: "op_resume", tenant_id: "ten_a", principal_id: "prin_a",
+    source_device_id: "dev_s", destination_device_id: "dev_d",
+    source_workspace_id: "ws_s", destination_workspace_id: "ws_d",
+    source_path: "in/a.bin", destination_path: "out/a.bin",
+    source_workspace_version: 1, destination_workspace_version: 1,
+    epoch: 1, fence: 1, ttl_seconds: 3600, expires_at: new Date(1_900_000_000_000).toISOString(), state: "sending",
+  };
+  const first = await transferGrantPayloadHash(meta, "a".repeat(64), 7);
+  assert.equal(await transferGrantPayloadHash({ ...meta, epoch: 2, fence: 2 }, "a".repeat(64), 7), first);
+  assert.notEqual(await transferGrantPayloadHash({ ...meta, destination_path: "out/other.bin" }, "a".repeat(64), 7), first);
 });
 
 test("durable transfer-start outbox recursively excludes bearer, JTI, and ephemeral fields", () => {
