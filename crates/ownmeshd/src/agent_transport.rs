@@ -1794,6 +1794,12 @@ fn map_request_to_method(
         ("git.diff" | "git", "git.diff" | "ownmesh_git_diff" | "diff") => {
             crate::runtime::ops_methods::GIT_DIFF
         }
+        ("review.start" | "review", "review.start" | "ownmesh_review_start" | "start") => {
+            crate::runtime::ops_methods::REVIEW_START
+        }
+        ("review.show" | "review", "review.show" | "ownmesh_review_show" | "show") => {
+            crate::runtime::ops_methods::REVIEW_SHOW
+        }
         // Device-local workspace registry CRUD (E4 configuration).
         ("workspace.list" | "workspace", "workspace.list" | "ownmesh_workspace_list" | "list") => {
             crate::runtime::ops_methods::WORKSPACE_LIST

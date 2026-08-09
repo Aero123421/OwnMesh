@@ -1042,6 +1042,18 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "read",
   },
   {
+    name: "ownmesh_review_start",
+    description: "Create a bounded, device-local Git review receipt for one exact workspace repository and argv-only tests.",
+    inputSchema: { type: "object", properties: { ...deviceProp, workspace_id: str, path: str, tests: { type: "array", maxItems: 16 }, idempotency_key: str }, required: ["device_id", "workspace_id", "tests", "idempotency_key"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true }, scope: "ownmesh.write", risk: "write",
+  },
+  {
+    name: "ownmesh_review_show",
+    description: "Read a bounded Git review receipt; result bytes remain device-local paged spools.",
+    inputSchema: { type: "object", properties: { ...deviceProp, review_id: str, idempotency_key: str }, required: ["device_id", "review_id", "idempotency_key"], additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false, idempotentHint: true }, scope: "ownmesh.read", risk: "read",
+  },
+  {
     name: "ownmesh_workspace_list",
     description: "List device-local workspace roots registered on a PC (CRUD configuration)",
     inputSchema: {
@@ -1896,6 +1908,10 @@ function toolCapability(toolName: string): string {
       return "git.status";
     case "ownmesh_git_diff":
       return "git.diff";
+    case "ownmesh_review_start":
+      return "review.start";
+    case "ownmesh_review_show":
+      return "review.show";
     case "ownmesh_workspace_list":
       return "workspace.list";
     case "ownmesh_workspace_show":
@@ -1964,6 +1980,10 @@ function toolAction(toolName: string): string {
       return "git.status";
     case "ownmesh_git_diff":
       return "git.diff";
+    case "ownmesh_review_start":
+      return "review.start";
+    case "ownmesh_review_show":
+      return "review.show";
     case "ownmesh_workspace_list":
       return "workspace.list";
     case "ownmesh_workspace_show":

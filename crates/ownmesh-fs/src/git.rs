@@ -176,6 +176,26 @@ pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatu
     })
 }
 
+/// Return the exact, bounded repository HEAD object id for a workspace path.
+/// This shares the no-hooks/no-fsmonitor, timeout and capped-child handling
+/// used by the other read-only Git helpers.
+pub fn git_head_oid(ws: &WorkspaceRoot, path: &Path) -> FsResult<String> {
+    let cwd = resolve_repo_cwd(ws, path)?;
+    let (output, truncated) = run_git_capped(&cwd, &["rev-parse", "--verify", "HEAD"], 128)?;
+    let oid = output.trim();
+    if truncated
+        || !matches!(oid.len(), 40 | 64)
+        || !oid
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(FsError::InvalidPath(
+            "invalid bounded git HEAD object id".into(),
+        ));
+    }
+    Ok(oid.to_owned())
+}
+
 /// Run read-only `git diff` (or `--cached`) with line pagination.
 ///
 /// Stdout is streamed with a hard byte cap before line paging so an attacker-

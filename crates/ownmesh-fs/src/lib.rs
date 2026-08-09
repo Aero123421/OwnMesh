@@ -18,7 +18,8 @@ mod custody;
 mod git;
 
 pub use git::{
-    git_diff, git_status, GitDiffOpts, GitDiffPage, GitStatusEntry, GitStatusOpts, GitStatusPage,
+    git_diff, git_head_oid, git_status, GitDiffOpts, GitDiffPage, GitStatusEntry, GitStatusOpts,
+    GitStatusPage,
 };
 
 use serde::{Deserialize, Serialize};

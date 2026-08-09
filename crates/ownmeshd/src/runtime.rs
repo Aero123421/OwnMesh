@@ -25,6 +25,9 @@
 mod session_transition_journal;
 #[path = "structured_adapter.rs"]
 mod structured_adapter;
+use crate::review_manifest::{
+    ReviewManifest, ReviewManifestStore, ReviewPhase, ReviewResultStore, TestRequest,
+};
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
@@ -32,8 +35,9 @@ use ownmesh_exec::{
     verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
 };
 use ownmesh_fs::{
-    apply_patch, apply_unified_diff, delete_path, git_diff, git_status, list_dir_page,
-    looks_like_unified_diff, stat_path, write_file, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
+    apply_patch, apply_unified_diff, delete_path, git_diff, git_head_oid, git_status,
+    list_dir_page, looks_like_unified_diff, stat_path, write_file, GitDiffOpts, GitStatusOpts,
+    WorkspaceRoot,
 };
 use ownmesh_ipc::{
     app_error, canonicalize_principal_key, is_credentialed_client_principal, is_human_os_principal,
@@ -99,6 +103,8 @@ pub mod session_methods {
 pub mod ops_methods {
     pub const GIT_STATUS: &str = "ops.git.status";
     pub const GIT_DIFF: &str = "ops.git.diff";
+    pub const REVIEW_START: &str = "ops.review.start";
+    pub const REVIEW_SHOW: &str = "ops.review.show";
     pub const LOGS_LIST_PROVIDERS: &str = "ops.logs.list_providers";
     pub const WORKSPACE_LIST: &str = "ops.workspace.list";
     pub const WORKSPACE_SHOW: &str = "ops.workspace.show";
@@ -389,6 +395,8 @@ pub struct DaemonRuntime {
     /// compatibility keeps the legacy embedded host path until fully migrated.
     supervisor: Option<SupervisorClient>,
     transition_journal: SessionTransitionJournal,
+    review_manifests: ReviewManifestStore,
+    review_results: ReviewResultStore,
     transition_recovery_running: bool,
     broker_endpoint: Option<BrokerEndpoint>,
     broker_secret: Option<BrokerSecret>,
@@ -451,6 +459,9 @@ impl DaemonRuntime {
         let sessions_path = paths.state_dir.join("sessions").join("sessions.json");
         let transition_journal =
             SessionTransitionJournal::open(paths.state_dir.join("session-transitions"))?;
+        let review_manifests = ReviewManifestStore::open(paths.state_dir.join("reviews"))?;
+        let review_results =
+            ReviewResultStore::open(paths.state_dir.join("reviews").join("results"))?;
         let mut sessions = SessionManager::load_from_path(&sessions_path).map_err(|e| {
             format!(
                 "failed to load sessions from {}: {e}",
@@ -489,6 +500,8 @@ impl DaemonRuntime {
             live_hosts: HashMap::new(),
             supervisor: None,
             transition_journal,
+            review_manifests,
+            review_results,
             transition_recovery_running: false,
             broker_endpoint,
             broker_secret,
@@ -1769,6 +1782,109 @@ full_user_access/full_access for arbitrary commands",
             .await
     }
 
+    async fn handle_review_start(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct P {
+            workspace_id: String,
+            #[serde(default)]
+            path: String,
+            tests: Vec<TestRequest>,
+        }
+        let p: P = parse_params(params)?;
+        let device_id = self
+            .active_remote_device_id
+            .as_deref()
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "review.start requires verified Agent device identity".into(),
+            })?
+            .to_owned();
+        let ws = self.workspace_for(Some(&p.workspace_id))?;
+        let status = git_status(
+            &ws,
+            &GitStatusOpts {
+                path: PathBuf::from(&p.path),
+                cursor: None,
+                limit: 1,
+            },
+        )
+        .map_err(fs_err)?;
+        let head_oid = git_head_oid(&ws, Path::new(&p.path)).map_err(fs_err)?;
+        let now = Self::now();
+        let manifest = ReviewManifest {
+            review_id: Self::new_id("rev_"),
+            device_id,
+            workspace_id: p.workspace_id,
+            repo_root: status.repo_root,
+            head_oid,
+            principal: client.client_name.clone(),
+            phase: ReviewPhase::Planned,
+            tests: p.tests,
+            status_cursor: 0,
+            diff_cursor: 0,
+            result_sha256: None,
+            created_unix: now,
+            expires_unix: now.saturating_add(3600),
+        };
+        let saved = self
+            .review_manifests
+            .begin(manifest)
+            .map_err(|message| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message,
+            })?;
+        self.review_results
+            .write(&saved.review_id, saved.expires_unix, Vec::new())
+            .map_err(|message| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message,
+            })?;
+        serde_json::to_value(saved).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: e.to_string(),
+        })
+    }
+
+    fn handle_review_show(
+        &self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            review_id: String,
+        }
+        let p: P = parse_params(params)?;
+        let review = self
+            .review_manifests
+            .get(&p.review_id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "review not found".into(),
+            })?;
+        if review.principal != client.client_name
+            || self.active_remote_device_id.as_deref() != Some(review.device_id.as_str())
+        {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: "review binding mismatch".into(),
+            });
+        }
+        let result = self
+            .review_results
+            .page(&p.review_id, 0, 1, Self::now())
+            .map_err(|message| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message,
+            })?;
+        Ok(json!({ "review": review, "result": result }))
+    }
+
     fn handle_approval_list(&self) -> IpcResult<Value> {
         let mut list: Vec<&ApprovalRecord> = self.approvals.values().collect();
         list.sort_by(|a, b| b.created_at_unix.cmp(&a.created_at_unix));
@@ -2562,6 +2678,8 @@ full_user_access/full_access for arbitrary commands",
             ops_methods::LOGS_LIST_PROVIDERS => self.handle_logs_list_providers(params),
             ops_methods::GIT_STATUS => self.handle_git_status(params, client).await,
             ops_methods::GIT_DIFF => self.handle_git_diff(params, client).await,
+            ops_methods::REVIEW_START => self.handle_review_start(params, client).await,
+            ops_methods::REVIEW_SHOW => self.handle_review_show(params, client),
             ops_methods::WORKSPACE_LIST => self.handle_workspace_list(client),
             ops_methods::WORKSPACE_SHOW => self.handle_workspace_show(params),
             ops_methods::WORKSPACE_ADD => self.handle_workspace_add(params, client),

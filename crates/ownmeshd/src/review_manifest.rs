@@ -5,8 +5,6 @@
 //! request, or unbounded diff/test output. Runtime wiring consumes this
 //! manifest before running a review and pages the underlying bounded spools.
 
-#![allow(dead_code)] // Runtime review RPC wiring follows this durable substrate.
-
 use ownmesh_ipc::{
     atomic_write_owner_only, prepare_owner_only_state_dir, read_owner_only_file_bounded,
 };
@@ -21,6 +19,8 @@ const MAX_TESTS: usize = 16;
 const MAX_ARGV_ITEMS: usize = 64;
 const MAX_ARG_BYTES: usize = 8 * 1024;
 const FILE: &str = "review-manifests.json";
+const MAX_RESULT_BYTES: usize = 512 * 1024;
+const MAX_RESULT_FILE_BYTES: usize = 900 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +77,168 @@ struct Disk {
 pub struct ReviewManifestStore {
     dir: PathBuf,
     entries: BTreeMap<String, ReviewManifest>,
+}
+
+/// Typed, owner-only bounded output spool. Command and each test retain their
+/// own stdout/stderr chunks; callers page with absolute byte cursors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultKind {
+    CommandStdout,
+    CommandStderr,
+    TestStdout,
+    TestStderr,
+    System,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewResultChunk {
+    pub kind: ResultKind,
+    pub test_index: Option<u8>,
+    pub bytes: Vec<u8>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewResultPage {
+    pub base_cursor: u64,
+    pub next_cursor: u64,
+    pub total_bytes: u64,
+    pub truncated: bool,
+    pub sha256: String,
+    pub chunks: Vec<ReviewResultChunk>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultDisk {
+    version: u32,
+    expires_unix: i64,
+    chunks: Vec<ReviewResultChunk>,
+}
+pub struct ReviewResultStore {
+    dir: PathBuf,
+}
+impl ReviewResultStore {
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self, String> {
+        let dir = dir.as_ref().to_path_buf();
+        prepare_owner_only_state_dir(&dir).map_err(|e| format!("prepare review results: {e}"))?;
+        Ok(Self { dir })
+    }
+    pub fn write(
+        &self,
+        review_id: &str,
+        expires_unix: i64,
+        chunks: Vec<ReviewResultChunk>,
+    ) -> Result<(), String> {
+        if !valid_review_id(review_id)
+            || chunks.len() > 64
+            || chunks.iter().any(|chunk| {
+                chunk.bytes.len() > 64 * 1024
+                    || chunk.test_index.is_some_and(|i| i as usize >= MAX_TESTS)
+                    || !kind_index_valid(chunk)
+            })
+        {
+            return Err("invalid bounded review result chunks".into());
+        }
+        let total: usize = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
+        if total > MAX_RESULT_BYTES {
+            return Err("review result aggregate cap exceeded".into());
+        }
+        let raw = serde_json::to_vec(&ResultDisk {
+            version: VERSION,
+            expires_unix,
+            chunks,
+        })
+        .map_err(|e| e.to_string())?;
+        if raw.len() > MAX_RESULT_FILE_BYTES {
+            return Err("encoded review result cap exceeded".into());
+        }
+        atomic_write_owner_only(&self.dir.join(format!("{review_id}.json")), &raw)
+            .map_err(|e| format!("persist review result: {e}"))
+    }
+    pub fn page(
+        &self,
+        review_id: &str,
+        cursor: u64,
+        max_bytes: usize,
+        now_unix: i64,
+    ) -> Result<ReviewResultPage, String> {
+        if !valid_review_id(review_id) {
+            return Err("invalid review id".into());
+        }
+        let path = self.dir.join(format!("{review_id}.json"));
+        let raw = read_owner_only_file_bounded(&path, MAX_RESULT_FILE_BYTES)
+            .map_err(|e| format!("read review result: {e}"))?;
+        let disk: ResultDisk =
+            serde_json::from_slice(&raw).map_err(|e| format!("parse review result: {e}"))?;
+        if disk.version != VERSION || disk.expires_unix < now_unix {
+            return Err("expired or invalid review result".into());
+        }
+        if disk.chunks.len() > 64
+            || disk.chunks.iter().any(|chunk| {
+                chunk.bytes.len() > 64 * 1024
+                    || chunk.test_index.is_some_and(|i| i as usize >= MAX_TESTS)
+                    || !kind_index_valid(chunk)
+            })
+        {
+            return Err("invalid typed review result".into());
+        }
+        let total_usize: usize = disk.chunks.iter().map(|chunk| chunk.bytes.len()).sum();
+        if total_usize > MAX_RESULT_BYTES {
+            return Err("oversized review result".into());
+        }
+        let total = total_usize as u64;
+        if cursor > total {
+            return Err("future review cursor".into());
+        }
+        let cap = max_bytes.clamp(1, 64 * 1024);
+        let mut remaining = cap;
+        let mut offset = 0usize;
+        let mut chunks = Vec::new();
+        for chunk in &disk.chunks {
+            let chunk_end = offset + chunk.bytes.len();
+            if cursor as usize >= chunk_end {
+                offset = chunk_end;
+                continue;
+            }
+            if remaining == 0 {
+                break;
+            }
+            let start = (cursor as usize).saturating_sub(offset);
+            let take = remaining.min(chunk.bytes.len() - start);
+            chunks.push(ReviewResultChunk {
+                kind: chunk.kind.clone(),
+                test_index: chunk.test_index,
+                bytes: chunk.bytes[start..start + take].to_vec(),
+            });
+            remaining -= take;
+            offset = chunk_end;
+        }
+        let end = cursor + (cap - remaining) as u64;
+        use sha2::{Digest, Sha256};
+        let canonical = serde_json::to_vec(&disk.chunks).map_err(|e| e.to_string())?;
+        let sha256 = format!("{:x}", Sha256::digest(canonical));
+        Ok(ReviewResultPage {
+            base_cursor: cursor,
+            next_cursor: end as u64,
+            total_bytes: total,
+            truncated: end < total,
+            sha256,
+            chunks,
+        })
+    }
+}
+
+fn valid_review_id(id: &str) -> bool {
+    id.len() <= 128
+        && id.starts_with("rev_")
+        && id
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+fn kind_index_valid(chunk: &ReviewResultChunk) -> bool {
+    matches!(chunk.kind, ResultKind::TestStdout | ResultKind::TestStderr)
+        == chunk.test_index.is_some()
 }
 
 impl ReviewManifestStore {
@@ -137,6 +299,7 @@ impl ReviewManifestStore {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_phase(&mut self, id: &str, phase: ReviewPhase) -> Result<ReviewManifest, String> {
         let entry = self.entries.get(id).ok_or("review manifest not found")?;
         let valid = entry.phase == phase
@@ -288,5 +451,25 @@ mod tests {
         assert!(validate(&m).is_err());
         m.tests[0].args = vec!["x".repeat(MAX_ARG_BYTES + 1)];
         assert!(validate(&m).is_err());
+    }
+    #[test]
+    fn result_spool_pages_and_rejects_future_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ReviewResultStore::open(dir.path()).unwrap();
+        store
+            .write(
+                "rev_1",
+                100,
+                vec![ReviewResultChunk {
+                    kind: ResultKind::TestStdout,
+                    test_index: Some(0),
+                    bytes: b"abcdef".to_vec(),
+                }],
+            )
+            .unwrap();
+        let page = store.page("rev_1", 0, 3, 10).unwrap();
+        assert_eq!(page.next_cursor, 3);
+        assert!(page.truncated);
+        assert!(store.page("rev_1", 7, 3, 10).is_err());
     }
 }
