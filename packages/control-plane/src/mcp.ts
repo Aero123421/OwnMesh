@@ -2835,6 +2835,40 @@ function retryableTransferStartFailure(op: McpOperationRecord | null): boolean {
   return code === "OWNMESH_E_TRANSFER_RECONNECT" || code === "OWNMESH_E_TRANSFER_SESSION_LOST";
 }
 
+/** Atomically claim the one live start pair for an authenticated preflight
+ * generation. Moving the parent pending→running is the store CAS; the same
+ * write durably binds the exact epoch/fence/generation and both operation IDs
+ * before any bearer is minted or routed. */
+export async function claimTransferStartDispatch(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  operationId: string,
+  meta: TransferPlanMeta,
+  sourceOperationId: string,
+  destinationOperationId: string,
+): Promise<{ claimed: boolean; plan: TrackedOperation; meta: TransferPlanMeta }> {
+  const claimedMeta: TransferPlanMeta = {
+    ...meta,
+    state: "sending",
+    source_start_operation_id: sourceOperationId,
+    destination_start_operation_id: destinationOperationId,
+    source_start_routed: false,
+    destination_start_routed: false,
+    live_ticket_deadline_ms: Date.now() + TRANSFER_TICKET_TTL_MS,
+    pair_generation: (meta.pair_generation || 0) + 1,
+  };
+  const claimed = await patchOp(store, tracker, operationId, {
+    status: "running",
+    summary: "ticket-bound transfer dispatch claimed",
+    data: { [TRANSFER_META_KEY]: claimedMeta },
+  }, ["pending"]);
+  if (claimed) return { claimed: true, plan: claimed, meta: claimedMeta };
+  const current = await loadOp(store, tracker, operationId);
+  const currentMeta = current ? transferMeta(current.data) : null;
+  if (!current || !currentMeta) throw new Error("transfer_start_claim_lost");
+  return { claimed: false, plan: current, meta: currentMeta };
+}
+
 function destinationPublishedReceipt(op: McpOperationRecord, meta: TransferPlanMeta): boolean {
   const receipt = op.data;
   return receipt.role === "destination" && receipt.published === true
@@ -3429,25 +3463,38 @@ export async function handleMcp(
           || !meta.plan_sha256 || !meta.source_sha256 || meta.source_size_bytes === undefined) {
           return mcpError(id, -32009, "transfer execution bridge unavailable");
         }
+        const planSha256 = meta.plan_sha256;
+        const sourceSizeBytes = meta.source_size_bytes;
         const [sourceDevice, destinationDevice] = await Promise.all([store.getDevice(meta.source_device_id), store.getDevice(meta.destination_device_id)]);
         if (!sourceDevice || !destinationDevice) return mcpError(id, -32004, "transfer_not_available");
         const grantPayloadHash = await hashCanonicalAction(finalTransferAction(meta, meta.source_sha256, meta.source_size_bytes));
+        const sourceStartId = randomId("op_"); const destinationStartId = randomId("op_");
+        const claim = await claimTransferStartDispatch(
+          store, tracker, plan.operation_id, meta, sourceStartId, destinationStartId,
+        );
+        if (!claim.claimed) {
+          return mcpResult(id, toolContent({
+            ...claim.plan,
+            data: { transfer: publicTransferMeta(claim.meta), next: "start generation already claimed" },
+          }));
+        }
+        plan = claim.plan;
+        meta = claim.meta;
         let tickets: Awaited<ReturnType<typeof mintTransferTicketPair>>;
         try {
           tickets = await mintTransferTicketPair(opts.transferTicketSecret, {
             transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, principal_id: meta.principal_id,
             source_device_id: meta.source_device_id, destination_device_id: meta.destination_device_id,
             source_workspace_id: meta.source_workspace_id, destination_workspace_id: meta.destination_workspace_id,
-            plan_sha256: meta.plan_sha256, max_bytes: meta.source_size_bytes, epoch: meta.epoch, fence: meta.fence,
+            plan_sha256: planSha256, max_bytes: sourceSizeBytes, epoch: meta.epoch, fence: meta.fence,
             ticket_exp: Math.min(Date.now() + TRANSFER_TICKET_TTL_MS, Date.parse(meta.expires_at)),
             transfer_expires_at: Date.parse(meta.expires_at), source_device_public_key: sourceDevice.public_key,
             destination_device_public_key: destinationDevice.public_key,
           }, sourceReply as never, destinationReply as never, `nonce_${meta.transfer_id}`, randomId("jti_"), randomId("jti_"));
         } catch { return mcpError(id, -32009, "transfer execution proof invalid"); }
-        const sourceStartId = randomId("op_"); const destinationStartId = randomId("op_");
         const [sourceStart, destinationStart] = await Promise.all([
-          buildTransferStartOperation({ transfer: meta, role: "source", operationId: sourceStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.source_ticket, planSha256: meta.plan_sha256, grantPayloadHash, principalCredentialGeneration }),
-          buildTransferStartOperation({ transfer: meta, role: "destination", operationId: destinationStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.destination_ticket, planSha256: meta.plan_sha256, grantPayloadHash, principalCredentialGeneration }),
+          buildTransferStartOperation({ transfer: meta, role: "source", operationId: sourceStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.source_ticket, planSha256, grantPayloadHash, principalCredentialGeneration }),
+          buildTransferStartOperation({ transfer: meta, role: "destination", operationId: destinationStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.destination_ticket, planSha256, grantPayloadHash, principalCredentialGeneration }),
         ]);
         // D1 retains only a redacted non-redeliverable recipe. The raw bearer
         // is delivered exactly once over a ready Agent socket; neither an MCP
@@ -3455,13 +3502,8 @@ export async function handleMcp(
         for (const [operation, deviceId, workspaceId, tool] of [[sourceStart, meta.source_device_id, meta.source_workspace_id, "__transfer_start_source"], [destinationStart, meta.destination_device_id, meta.destination_workspace_id, "__transfer_start_destination"]] as const) {
           await store.putMcpOperation({ operation_id: operation.correlation_id, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: deviceId, tool, status: "pending", summary: "ticket-bound transfer start", data: { [DISPATCH_OUTBOX_KEY]: buildTicketlessTransferStartOutbox(operation) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operation.correlation_id, payload_hash: operation.payload_hash, idempotency_key: operation.correlation_id, workspace_id: workspaceId, expires_at: meta.expires_at, claim_version: 1, action: operation.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         }
-        // Persist the pair generation and exact operation IDs before either
-        // live bearer is routed. A crash/partial route can then only reconcile
-        // or fence into a fresh generation; it can never mint the old proof
-        // pair again under the same epoch.
-        const next: TransferPlanMeta = { ...meta, state: "sending", source_start_operation_id: sourceStartId, destination_start_operation_id: destinationStartId, source_start_routed: false, destination_start_routed: false, live_ticket_deadline_ms: Date.now() + TRANSFER_TICKET_TTL_MS, pair_generation: (meta.pair_generation || 0) + 1 };
-        const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "ticket-bound transfer dispatch prepared", data: { [TRANSFER_META_KEY]: next } }, ["pending", "running"]);
-        if (!updated) return mcpError(id, -32009, "transfer plan race");
+        const next = meta;
+        const updated = plan;
         // Persist each live route acknowledgement independently.  A process
         // death between these lines leaves a durable asymmetric state which
         // send() turns into a +1 epoch/fence recovery; it never reuses either

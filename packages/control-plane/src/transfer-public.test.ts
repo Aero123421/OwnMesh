@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildTicketlessTransferStartOutbox, finalTransferPlanHash, handleMcp, MCP_TOOLS, OperationTracker, transferStartAuditedFacts, type OperationRouter, type TransferPlanMeta } from "./mcp.ts";
 import { MemoryStore } from "./store.ts";
+import { canonicalTransferEphemeralProof, type TransferTicketClaims } from "./transfer-room.ts";
+
+const hex = (bytes: Uint8Array) => [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 
 function request(token: string, name: string, args: Record<string, unknown>): Request {
   return new Request("https://cp.test/mcp", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) });
@@ -15,12 +18,16 @@ async function fixture() {
   await store.putWorkspace({ workspace_id: "ws_source", tenant_id: "ten_default", device_id: "dev_source", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   await store.putWorkspace({ workspace_id: "ws_destination", tenant_id: "ten_default", device_id: "dev_destination", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const routed: Array<{ deviceId: string; operation: Record<string, unknown> }> = [];
-  const router: OperationRouter = { async routeToDevice(deviceId, operation) { routed.push({ deviceId, operation: operation as unknown as Record<string, unknown> }); return { status: "routed_to_device" }; } };
-  return { store, token: token.access_token, foreignToken: foreign.access_token, router, routed };
+  const liveRouted: Array<{ deviceId: string; operation: Record<string, unknown> }> = [];
+  const router: OperationRouter = {
+    async routeToDevice(deviceId, operation) { routed.push({ deviceId, operation: operation as unknown as Record<string, unknown> }); return { status: "routed_to_device" }; },
+    async routeLiveToDevice(deviceId, operation) { liveRouted.push({ deviceId, operation: operation as unknown as Record<string, unknown> }); return { status: "routed_to_device" }; },
+  };
+  return { store, token: token.access_token, foreignToken: foreign.access_token, router, routed, liveRouted };
 }
 
 async function invoke(f: Awaited<ReturnType<typeof fixture>>, name: string, args: Record<string, unknown>, token = f.token) {
-  const response = await handleMcp(request(token, name, args), f.store, new URL("https://cp.test/mcp"), f.router, { tracker: new OperationTracker() });
+  const response = await handleMcp(request(token, name, args), f.store, new URL("https://cp.test/mcp"), f.router, { tracker: new OperationTracker(), transferTicketSecret: "transfer-public-test-secret" });
   return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown> } }; error?: { message: string } };
 }
 
@@ -156,6 +163,85 @@ test("cancel fans out exact generic cancel controls and never retries them as a 
   assert.equal((settled.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelled");
   const repeat = await invoke(f, "ownmesh_transfer_cancel", { transfer_id: transferId, idempotency_key: "cancel-key" });
   assert.equal((repeat.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelled"); assert.equal(f.routed.length, 2, "cancel receipt polling must not route controls again");
+});
+
+test("concurrent public sends claim one start pair and cancel targets only that generation", async () => {
+  const f = await fixture();
+  const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "concurrent-plan" });
+  const transferId = created.result!.structuredContent!.operation_id;
+  const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
+  const original = parent.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  const sourceKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const destinationKey = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  if (!("publicKey" in sourceKey) || !("publicKey" in destinationKey)) throw new Error("Ed25519 unavailable");
+  const sourcePublicKey = hex(new Uint8Array(await crypto.subtle.exportKey("raw", sourceKey.publicKey) as ArrayBuffer));
+  const destinationPublicKey = hex(new Uint8Array(await crypto.subtle.exportKey("raw", destinationKey.publicKey) as ArrayBuffer));
+  const sourceDevice = await f.store.getDevice("dev_source"); const destinationDevice = await f.store.getDevice("dev_destination");
+  assert.ok(sourceDevice); assert.ok(destinationDevice);
+  await f.store.putDevice({ ...sourceDevice, public_key: sourcePublicKey });
+  await f.store.putDevice({ ...destinationDevice, public_key: destinationPublicKey });
+  const planSha256 = "a".repeat(64); const sourceSha256 = "b".repeat(64);
+  const sourcePreflightId = "op_concurrent_source_preflight"; const destinationPreflightId = "op_concurrent_destination_preflight";
+  const expiresAt = Date.parse(original.expires_at);
+  const sourceReply = {
+    role: "source" as const, transfer_id: transferId, tenant_id: original.tenant_id, device_id: original.source_device_id,
+    workspace_id: original.source_workspace_id, plan_sha256: planSha256, epoch: original.epoch, fence: original.fence,
+    session_nonce: `nonce_${transferId}`, expires_at: expiresAt, ephemeral_public_key: "11".repeat(32), ephemeral_signature: "",
+  };
+  const destinationReply = {
+    role: "destination" as const, transfer_id: transferId, tenant_id: original.tenant_id, device_id: original.destination_device_id,
+    workspace_id: original.destination_workspace_id, plan_sha256: planSha256, epoch: original.epoch, fence: original.fence,
+    session_nonce: `nonce_${transferId}`, expires_at: expiresAt, ephemeral_public_key: "22".repeat(32), ephemeral_signature: "",
+  };
+  const proofClaims = (role: "source" | "destination"): TransferTicketClaims => ({
+    v: 1, jti: "proof_only", session_nonce: `nonce_${transferId}`, transfer_id: transferId, tenant_id: original.tenant_id,
+    principal_id: original.principal_id, device_id: role === "source" ? original.source_device_id : original.destination_device_id, role,
+    source_device_id: original.source_device_id, destination_device_id: original.destination_device_id,
+    source_workspace_id: original.source_workspace_id, destination_workspace_id: original.destination_workspace_id,
+    plan_sha256: planSha256, epoch: original.epoch, fence: original.fence, max_bytes: 3,
+    ticket_exp: Date.now() + 30_000, transfer_expires_at: expiresAt,
+    source_device_public_key: sourcePublicKey, destination_device_public_key: destinationPublicKey,
+    source_ephemeral_public_key: sourceReply.ephemeral_public_key, destination_ephemeral_public_key: destinationReply.ephemeral_public_key,
+    source_ephemeral_signature: sourceReply.ephemeral_signature, destination_ephemeral_signature: destinationReply.ephemeral_signature,
+  });
+  sourceReply.ephemeral_signature = hex(new Uint8Array(await crypto.subtle.sign("Ed25519", sourceKey.privateKey, canonicalTransferEphemeralProof(proofClaims("source"), "source"))));
+  destinationReply.ephemeral_signature = hex(new Uint8Array(await crypto.subtle.sign("Ed25519", destinationKey.privateKey, canonicalTransferEphemeralProof(proofClaims("destination"), "destination"))));
+  const ready: TransferPlanMeta = {
+    ...original, state: "destination_preflight", plan_sha256: planSha256, source_sha256: sourceSha256, source_size_bytes: 3,
+    source_plan_id: "plan_concurrent_source", source_preflight_operation_id: sourcePreflightId,
+    destination_preflight_operation_id: destinationPreflightId, send_idempotency_key: "concurrent-send",
+  };
+  await f.store.updateMcpOperation(transferId, { status: "pending", data: { __ownmesh_transfer_plan: ready } });
+  for (const [operation_id, device_id, tool, reply] of [
+    [sourcePreflightId, "dev_source", "__transfer_preflight_source_final", sourceReply],
+    [destinationPreflightId, "dev_destination", "__transfer_preflight_destination", destinationReply],
+  ] as const) {
+    await f.store.putMcpOperation({ ...parent, operation_id, correlation_id: operation_id, device_id, tool, status: "completed", summary: "authenticated preflight", data: { transfer_preflight: reply }, idempotency_key: operation_id, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  }
+
+  const sends = await Promise.all([
+    invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "concurrent-send" }),
+    invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "concurrent-send" }),
+  ]);
+  assert.ok(sends.every((result) => !result.error));
+  assert.equal(f.liveRouted.length, 2, "only one source/destination start pair may be delivered live");
+  const activeIds = f.liveRouted.map((entry) => entry.operation.correlation_id as string).sort();
+  const claimed = await f.store.getMcpOperation(transferId); assert.ok(claimed);
+  const claimedMeta = claimed.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  assert.equal(claimedMeta.pair_generation, 1);
+  assert.deepEqual([claimedMeta.source_start_operation_id, claimedMeta.destination_start_operation_id].sort(), activeIds);
+
+  const cancelled = await invoke(f, "ownmesh_transfer_cancel", { transfer_id: transferId, idempotency_key: "cancel-concurrent" });
+  assert.equal((cancelled.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelling");
+  assert.deepEqual(f.routed.map((entry) => ((entry.operation.payload as Record<string, unknown>).arguments as Record<string, unknown>).target_operation_id).sort(), activeIds);
+  const cancelling = await f.store.getMcpOperation(transferId); assert.ok(cancelling);
+  const cancelMeta = cancelling.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  for (const [controlId, target] of [[cancelMeta.source_cancel_operation_id, claimedMeta.source_start_operation_id], [cancelMeta.destination_cancel_operation_id, claimedMeta.destination_start_operation_id]]) {
+    assert.equal(typeof controlId, "string"); assert.equal(typeof target, "string");
+    await f.store.updateMcpOperation(controlId!, { status: "completed", summary: "cleanup proven", data: { target_operation_id: target, cancelled: true, signal_delivered: true } }, ["pending"]);
+  }
+  const settled = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+  assert.equal((settled.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelled");
 });
 
 test("cancel remains unresolved when a restarted Agent cannot prove durable cleanup", async () => {
