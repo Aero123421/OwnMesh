@@ -15,6 +15,8 @@ use ownmesh_broker_client::{
     PeerBind, ReplayCache, DEFAULT_CAPABILITY_TTL_SECS, ELEVATED_CAPABILITY_SCOPE,
 };
 #[cfg(target_os = "linux")]
+use ownmesh_exec::{classify_command_kind_in_dir, run_command, CommandKind, RunRequest};
+#[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -924,7 +926,7 @@ async fn handle_linux_production_connection(
             .ledger
             .reserve_verified_request(&internal, now)
             .map_err(|error| replay_error(&error))?;
-        let mut response = run_v2_elevated(&internal);
+        let mut response = run_v2_elevated(&internal).await;
         let digest = operation_facts_digest(&internal.facts);
         if let Err(error) = state.ledger.mark_completed(&internal.nonce, &digest) {
             response.ok = false;
@@ -1054,6 +1056,10 @@ fn validate_executable_facts(request: &BrokerRequestV2) -> Result<(), String> {
     if !metadata.is_file() {
         return Err("pinned executable is not a regular file (fail-closed)".into());
     }
+    validate_root_controlled_path(&actual_path, false)?;
+    if let Some(cwd) = &facts.canonical_cwd {
+        validate_root_controlled_path(Path::new(cwd), true)?;
+    }
     let mut file = std::fs::File::open(&actual_path).map_err(|error| error.to_string())?;
     let mut digest = Sha256::new();
     let mut chunk = [0_u8; 8192];
@@ -1071,19 +1077,110 @@ fn validate_executable_facts(request: &BrokerRequestV2) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
-fn run_v2_elevated(request: &BrokerRequestV2) -> BrokerResponse {
+fn validate_root_controlled_path(path: &Path, directory: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "canonicalize root-controlled path {}: {error}",
+            path.display()
+        )
+    })?;
+    if canonical != path {
+        return Err("path must already be canonical (fail-closed)".into());
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || (directory && !metadata.file_type().is_dir())
+        || (!directory && !metadata.file_type().is_file())
+    {
+        return Err("executable/cwd must be root-owned, canonical, and not group/other writable (fail-closed)".into());
+    }
+    let mut ancestor = path.parent();
+    while let Some(current) = ancestor {
+        let metadata = std::fs::symlink_metadata(current).map_err(|error| error.to_string())?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err("executable/cwd ancestry is not root-controlled (fail-closed)".into());
+        }
+        ancestor = current.parent();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn run_v2_elevated(request: &BrokerRequestV2) -> BrokerResponse {
     let facts = &request.facts;
-    let command = ElevatedCommand {
-        program: facts.executable.canonical_path.clone(),
-        args: facts.argv[1..].to_vec(),
-        cwd: facts.canonical_cwd.clone(),
-        env: facts
-            .sanitized_env
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect(),
-    };
-    run_elevated(&request.request_id, &command)
+    if let Err(error) = validate_executable_facts(request) {
+        return BrokerResponse {
+            request_id: request.request_id.clone(),
+            ok: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(error),
+        };
+    }
+    let cwd = facts.canonical_cwd.as_ref().map(PathBuf::from);
+    if classify_command_kind_in_dir(
+        CommandKind::Structured,
+        &facts.executable.canonical_path,
+        &facts.argv[1..],
+        cwd.as_deref(),
+    ) != CommandKind::Structured
+    {
+        return BrokerResponse {
+            request_id: request.request_id.clone(),
+            ok: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some("shell-classified executable is forbidden in broker v2".into()),
+        };
+    }
+    let result = run_command(
+        &RunRequest {
+            kind: CommandKind::Structured,
+            program: facts.executable.canonical_path.clone(),
+            args: facts.argv[1..].to_vec(),
+            cwd,
+            env: facts.sanitized_env.clone().into_iter().collect(),
+            stdin: None,
+            timeout_ms: Some(facts.timeout_ms),
+            max_output_bytes: facts.max_output_bytes,
+            idempotency_key: None,
+        },
+        None,
+    )
+    .await;
+    match result {
+        Ok(result) => BrokerResponse {
+            request_id: request.request_id.clone(),
+            ok: result.exit_code == Some(0) && !result.timed_out,
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            error: if result.timed_out {
+                Some("broker execution timed out; process tree killed".into())
+            } else if result.truncated {
+                Some("broker execution output limit reached; process tree killed".into())
+            } else {
+                None
+            },
+        },
+        Err(error) => BrokerResponse {
+            request_id: request.request_id.clone(),
+            ok: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 /// Handle a TCP connection (public for tests of strict MAC/capability path only).

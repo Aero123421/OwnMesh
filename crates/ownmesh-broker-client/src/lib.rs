@@ -68,6 +68,9 @@ pub const MAX_BROKER_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_BROKER_ARGV: usize = 128;
 pub const MAX_BROKER_ENV: usize = 64;
 pub const MAX_BROKER_FIELD_BYTES: usize = 4096;
+/// Maximum exact action limits accepted by protocol v2.
+pub const MAX_BROKER_TIMEOUT_MS: u64 = 300_000;
+pub const MAX_BROKER_OUTPUT_BYTES: usize = 1_000_000;
 
 /// Default local endpoint basename (pipe / socket).
 pub const DEFAULT_BROKER_ENDPOINT: &str = "ownmesh-privileged";
@@ -527,6 +530,8 @@ pub struct OperationFactsV2 {
     pub remote_payload_sha256: String,
     pub principal_id: String,
     pub principal_credential_generation: u64,
+    pub timeout_ms: u64,
+    pub max_output_bytes: usize,
     pub device_id: String,
     pub workspace_id: String,
     /// Structured argv, including argv[0]; opaque shell strings are absent.
@@ -750,6 +755,11 @@ fn canonical_operation_facts_v2_bytes(facts: &OperationFactsV2) -> Vec<u8> {
     put_str(&mut buf, &facts.remote_payload_sha256);
     put_str(&mut buf, &facts.principal_id);
     put_u64(&mut buf, facts.principal_credential_generation);
+    put_u64(&mut buf, facts.timeout_ms);
+    put_u32(
+        &mut buf,
+        u32::try_from(facts.max_output_bytes).unwrap_or(u32::MAX),
+    );
     put_str(&mut buf, &facts.device_id);
     put_str(&mut buf, &facts.workspace_id);
     put_u32(
@@ -870,9 +880,17 @@ fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResu
         || req.facts.argv.is_empty()
         || req.facts.argv.len() > MAX_BROKER_ARGV
         || req.facts.sanitized_env.len() > MAX_BROKER_ENV
+        // Production broker v2 deliberately has a fixed empty environment.
+        // Accepting a caller-selected loader/runtime/PATH variable would turn a
+        // signed command fact into a confused-deputy executable selection.
+        || !req.facts.sanitized_env.is_empty()
         || !is_sha256_hex(&req.facts.remote_payload_sha256)
         || !is_sha256_hex(&req.facts.executable.image_sha256)
         || req.facts.argv[0] != req.facts.executable.canonical_path
+        || req.facts.timeout_ms == 0
+        || req.facts.timeout_ms > MAX_BROKER_TIMEOUT_MS
+        || req.facts.max_output_bytes == 0
+        || req.facts.max_output_bytes > MAX_BROKER_OUTPUT_BYTES
     {
         return Err(BrokerError::Protocol(
             "invalid bounded operation facts".into(),
@@ -1567,14 +1585,13 @@ mod v2_tests {
             remote_payload_sha256: "a".repeat(64),
             principal_id: "principal-1".into(),
             principal_credential_generation: 7,
+            timeout_ms: 30_000,
+            max_output_bytes: 64 * 1024,
             device_id: "device_1".into(),
             workspace_id: "workspace_1".into(),
             argv: vec!["/usr/bin/id".into(), "-u".into()],
             canonical_cwd: Some(std::env::temp_dir().display().to_string()),
-            sanitized_env: BTreeMap::from([
-                ("LANG".into(), "C".into()),
-                ("PATH".into(), "/usr/bin".into()),
-            ]),
+            sanitized_env: BTreeMap::new(),
             executable: ExecutablePinV2 {
                 canonical_path: "/usr/bin/id".into(),
                 image_sha256: "b".repeat(64),
@@ -1720,16 +1737,13 @@ mod v2_tests {
     fn v2_digest_is_map_order_independent_but_value_sensitive() {
         let mut left = facts();
         let mut right = left.clone();
-        right.sanitized_env = BTreeMap::from([
-            ("PATH".into(), "/usr/bin".into()),
-            ("LANG".into(), "C".into()),
-        ]);
+        right.sanitized_env = BTreeMap::new();
         assert_eq!(
             operation_facts_digest(&left),
             operation_facts_digest(&right)
         );
         left.sanitized_env
-            .insert("LANG".into(), "ja_JP.UTF-8".into());
+            .insert("LD_PRELOAD".into(), "evil.so".into());
         assert_ne!(
             operation_facts_digest(&left),
             operation_facts_digest(&right)

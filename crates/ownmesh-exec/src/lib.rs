@@ -858,7 +858,6 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     // the whole tree, including backgrounded descendants of shells.
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
     cmd.stdin(Stdio::piped())
