@@ -32,7 +32,8 @@ pub use transport::{
 };
 #[cfg(windows)]
 pub use transport::{
-    connect_verified_windows_broker, VerifiedWindowsBrokerConnection, WindowsBrokerTrust,
+    connect_and_cancel_v2_windows, connect_and_execute_v2_windows, connect_verified_windows_broker,
+    VerifiedWindowsBrokerConnection, WindowsBrokerTrust,
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};

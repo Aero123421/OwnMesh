@@ -23,11 +23,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::MAX_BROKER_RESPONSE_BYTES;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 /// Timeout phase for the strict v2 Unix-socket client path.
@@ -79,11 +79,11 @@ pub enum BrokerV2ClientError {
 /// Result type for the production v2 client path.
 pub type BrokerV2ClientResult<T> = Result<T, BrokerV2ClientError>;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const V2_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const V2_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const V2_RESPONSE_GRACE: Duration = Duration::from_secs(5);
 
 /// Transport kind selected for a broker endpoint.
@@ -500,6 +500,62 @@ pub async fn connect_and_execute_v2(
     read_execute_response_v2(&mut stream, &request_id, execute.facts.timeout_ms).await
 }
 
+/// Submit one exact capability-free v2 Execute intent through a Windows pipe
+/// only after its server has passed the fixed-pipe, SCM, process-birth, and
+/// image-identity checks.  There is no TCP or generic-NamedPipe fallback.
+#[cfg(windows)]
+pub async fn connect_and_execute_v2_windows(
+    endpoint: &BrokerEndpoint,
+    trust: &WindowsBrokerTrust,
+    execute: &ExecuteIntentV2,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let frame = serialize_v2_intent(&BrokerWireIntentV2::Execute(execute.clone()))?;
+    let request_id = execute.request_id.clone();
+    let mut connection = connect_verified_windows_broker(endpoint, trust).await?;
+    write_v2_frame(connection.connection_mut(), &frame)
+        .await
+        .map_err(|error| {
+            BrokerV2ClientError::ExecutionUncertain(format!("execute write: {error}"))
+        })?;
+    let timeout = Duration::from_millis(execute.facts.timeout_ms).saturating_add(V2_RESPONSE_GRACE);
+    let response = read_v2_response(connection.connection_mut(), &request_id, timeout)
+        .await
+        .map_err(|error| match error {
+            BrokerV2ClientError::Timeout { .. }
+            | BrokerV2ClientError::Connect(_)
+            | BrokerV2ClientError::ExecutionUncertain(_) => {
+                BrokerV2ClientError::ExecutionUncertain(error.to_string())
+            }
+            other => other,
+        })?;
+    connection.revalidate_server()?;
+    Ok(response)
+}
+
+/// Submit a fenced v2 Cancel intent through the same verified Windows service
+/// identity boundary.  Cancel is always a new connection and cannot become a
+/// free-form command.
+#[cfg(windows)]
+pub async fn connect_and_cancel_v2_windows(
+    endpoint: &BrokerEndpoint,
+    trust: &WindowsBrokerTrust,
+    cancel: &CancelIntentV2,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let frame = serialize_v2_intent(&BrokerWireIntentV2::Cancel(cancel.clone()))?;
+    let request_id = cancel.request_id.clone();
+    let mut connection = connect_verified_windows_broker(endpoint, trust).await?;
+    write_v2_frame(connection.connection_mut(), &frame)
+        .await
+        .map_err(|error| {
+            BrokerV2ClientError::ExecutionUncertain(format!("cancel write: {error}"))
+        })?;
+    let response = read_v2_response(connection.connection_mut(), &request_id, V2_CONNECT_TIMEOUT)
+        .await
+        .map_err(cancel_response_error)?;
+    connection.revalidate_server()?;
+    Ok(response)
+}
+
 /// Send an already-MACed, exact v2 Cancel intent over a fresh Unix socket.
 /// This deliberately does not reuse the execute socket, which is held open by
 /// the pending execution and is itself part of the broker's disconnect fence.
@@ -622,7 +678,7 @@ async fn connect_v2_unix(
         .map_err(|error| BrokerV2ClientError::Connect(format!("{}: {error}", path.display())))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn write_v2_frame<S>(stream: &mut S, frame: &[u8]) -> Result<(), String>
 where
     S: AsyncWrite + Unpin,
@@ -669,7 +725,7 @@ async fn read_execute_response_v2(
     Err(BrokerV2ClientError::UnixSocketRequired)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn read_v2_response<S>(
     stream: &mut S,
     request_id: &str,
@@ -700,7 +756,7 @@ where
     Ok(response)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn read_bounded_v2_line<S>(stream: &mut S) -> BrokerV2ClientResult<Vec<u8>>
 where
     S: AsyncRead + Unpin,
@@ -727,7 +783,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn cancel_response_error(error: BrokerV2ClientError) -> BrokerV2ClientError {
     match error {
         BrokerV2ClientError::Timeout { .. }
