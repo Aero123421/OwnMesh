@@ -44,9 +44,9 @@ struct Hosted {
     host: LiveHost,
 }
 
-/// Bounded supervisor host map. Dropping this value does not terminate hosts;
-/// only explicit `terminate` owns tree cleanup. The sidecar process itself owns
-/// its lifecycle independently from a disconnected daemon client.
+/// Bounded supervisor host map. A disconnected daemon client leaves this
+/// singleton state alive; an actual sidecar process exit drops `LiveHost` and
+/// terminates its process tree as a deliberate crash-cleanup policy.
 pub struct SupervisorState {
     hosts: Mutex<HashMap<String, Hosted>>,
     root: std::path::PathBuf,
@@ -73,8 +73,10 @@ impl SupervisorState {
         if hosts.contains_key(&manifest.session_id) {
             return Err("supervisor host already live".into());
         }
-        let spool = OwnerSpool::create(&self.root, manifest.clone())?;
         let host = LiveHost::spawn(&command, size)?;
+        // Do not reserve durable identity until a PTY exists. If custody/spool
+        // creation fails, dropping this newly spawned host cleans its tree.
+        let spool = OwnerSpool::create(&self.root, manifest.clone())?;
         let binding = binding_of(&manifest);
         hosts.insert(
             manifest.session_id.clone(),
@@ -169,6 +171,13 @@ fn binding_of(manifest: &HostManifest) -> SupervisorBinding {
     }
 }
 fn exact(binding: &SupervisorBinding, manifest: &HostManifest) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(i64::MAX);
+    if manifest.expires_unix <= now {
+        return Err("supervisor binding expired".into());
+    }
     if binding.matches(manifest) {
         Ok(())
     } else {
