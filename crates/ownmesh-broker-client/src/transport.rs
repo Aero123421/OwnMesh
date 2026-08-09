@@ -504,11 +504,11 @@ pub async fn connect_and_execute_v2(
 /// only after its server has passed the fixed-pipe, SCM, process-birth, and
 /// image-identity checks.  There is no TCP or generic-NamedPipe fallback.
 #[cfg(windows)]
-pub async fn connect_and_execute_v2_windows(
+pub async fn submit_execute_v2_windows(
     endpoint: &BrokerEndpoint,
     trust: &WindowsBrokerTrust,
     execute: &ExecuteIntentV2,
-) -> BrokerV2ClientResult<BrokerResponseV2> {
+) -> BrokerV2ClientResult<(VerifiedWindowsBrokerConnection, String)> {
     let frame = serialize_v2_intent(&BrokerWireIntentV2::Execute(execute.clone()))?;
     let request_id = execute.request_id.clone();
     let mut connection = connect_verified_windows_broker(endpoint, trust).await?;
@@ -517,7 +517,19 @@ pub async fn connect_and_execute_v2_windows(
         .map_err(|error| {
             BrokerV2ClientError::ExecutionUncertain(format!("execute write: {error}"))
         })?;
-    let timeout = Duration::from_millis(execute.facts.timeout_ms).saturating_add(V2_RESPONSE_GRACE);
+    Ok((connection, request_id))
+}
+
+/// Await an already-submitted exact Windows Execute request. Dropping the
+/// retained connection before this future completes is an intentional
+/// cancellation fence at the broker boundary, not a retry signal.
+#[cfg(windows)]
+pub async fn read_submitted_execute_v2_windows(
+    connection: &mut VerifiedWindowsBrokerConnection,
+    request_id: &str,
+    execution_timeout_ms: u64,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let timeout = Duration::from_millis(execution_timeout_ms).saturating_add(V2_RESPONSE_GRACE);
     let response = read_v2_response(connection.connection_mut(), &request_id, timeout)
         .await
         .map_err(|error| match error {
@@ -530,6 +542,17 @@ pub async fn connect_and_execute_v2_windows(
         })?;
     connection.revalidate_server()?;
     Ok(response)
+}
+
+/// Submit and await one exact Windows v2 Execute intent.
+#[cfg(windows)]
+pub async fn connect_and_execute_v2_windows(
+    endpoint: &BrokerEndpoint,
+    trust: &WindowsBrokerTrust,
+    execute: &ExecuteIntentV2,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let (mut connection, request_id) = submit_execute_v2_windows(endpoint, trust, execute).await?;
+    read_submitted_execute_v2_windows(&mut connection, &request_id, execute.facts.timeout_ms).await
 }
 
 /// Submit a fenced v2 Cancel intent through the same verified Windows service

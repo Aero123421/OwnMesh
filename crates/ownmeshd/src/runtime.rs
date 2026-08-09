@@ -36,6 +36,7 @@ use broker_runtime::load_windows_broker_client;
 #[cfg(windows)]
 use ownmesh_broker_client::{
     build_cancel_intent_v2, connect_and_cancel_v2_windows, connect_and_execute_v2_windows,
+    read_submitted_execute_v2_windows, submit_execute_v2_windows,
 };
 use ownmesh_broker_client::{
     compute_execute_intent_mac_v2, BrokerV2ClientError, ExecutablePinV2, ExecuteIntentV2,
@@ -1570,31 +1571,67 @@ impl DaemonRuntime {
         let Some(mut cancel) = self.active_cancel.clone() else {
             return connect_and_execute_v2_windows(&broker.endpoint, &broker.trust, execute).await;
         };
-        let mut execute_result = Box::pin(connect_and_execute_v2_windows(
-            &broker.endpoint,
-            &broker.trust,
-            execute,
+        if *cancel.borrow_and_update() {
+            return Err(BrokerV2ClientError::ExecutionUncertain(
+                "Windows broker execution was cancelled before submission; outer operation must not retry automatically".into(),
+            ));
+        }
+        let (mut connection, request_id) =
+            submit_execute_v2_windows(&broker.endpoint, &broker.trust, execute).await?;
+        let mut execute_result = Box::pin(read_submitted_execute_v2_windows(
+            &mut connection,
+            &request_id,
+            execute.facts.timeout_ms,
         ));
-        let mut cancel_sent = false;
+        let mut cancel_channel_open = true;
         loop {
             tokio::select! {
+                biased;
                 response = &mut execute_result => return response,
-                changed = cancel.changed(), if !cancel_sent => {
-                    if changed.is_err() || !*cancel.borrow_and_update() {
+                changed = cancel.changed(), if cancel_channel_open => {
+                    if changed.is_err() {
+                        // A dropped sender is not a cancellation request. More
+                        // importantly, `changed()` would remain immediately
+                        // ready with Err and starve the execute response.
+                        cancel_channel_open = false;
                         continue;
                     }
-                    cancel_sent = true;
+                    if !*cancel.borrow_and_update() {
+                        continue;
+                    }
                     // Cancellation gets its own verified pipe connection and a
                     // freshly MACed, target-fenced intent. Its result cannot
                     // replace the execute receipt; only the original response
-                    // decides the durable outer operation outcome.
+                    // can prove success. If that delivery is busy, rejected,
+                    // or times out, dropping this original pipe is the
+                    // mandatory broker-side disconnect fence; no retry occurs.
                     let cancel_intent = build_cancel_intent_v2(&broker.secret, execute, Self::now());
-                    let _ = connect_and_cancel_v2_windows(
-                        &broker.endpoint,
-                        &broker.trust,
-                        &cancel_intent,
-                    )
-                    .await;
+                    let mut cancel_delivery = Box::pin(tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        connect_and_cancel_v2_windows(
+                            &broker.endpoint,
+                            &broker.trust,
+                            &cancel_intent,
+                        ),
+                    ));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            response = &mut execute_result => return response,
+                            _ = &mut cancel_delivery => {
+                                // Drop the read future before its borrowed
+                                // connection. This closes the exact execute
+                                // pipe and forces the broker to fence the Job,
+                                // even when the independent Cancel pipe was
+                                // rejected by bounded admission.
+                                drop(execute_result);
+                                drop(connection);
+                                return Err(BrokerV2ClientError::ExecutionUncertain(
+                                    "local cancellation closed the original Windows execute pipe; broker outcome is non-retriable".into(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -9528,6 +9565,36 @@ mod broker_intent_tests {
             .build_broker_execute_intent(&params, &ownmesh_broker_client::BrokerSecret::generate())
             .unwrap_err();
         assert!(err.to_string().contains("workspace id"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_cancel_watch_false_does_not_preempt_execute() {
+        let (_sender, mut cancel) = tokio::sync::watch::channel(false);
+        assert!(!*cancel.borrow_and_update());
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_millis(20), cancel.changed()).await;
+        assert!(
+            pending.is_err(),
+            "false cancel state must not preempt execute"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn closed_windows_cancel_watch_is_disabled_after_one_error() {
+        let (sender, mut cancel) = tokio::sync::watch::channel(false);
+        drop(sender);
+        let mut channel_open = true;
+        assert!(cancel.changed().await.is_err());
+        assert!(channel_open);
+        channel_open = false;
+        tokio::select! {
+            biased;
+            _ = std::future::pending::<()>() => panic!("pending execute cannot complete"),
+            _ = cancel.changed(), if channel_open => panic!("closed cancel watch must be disabled"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+        }
     }
 
     #[tokio::test]
