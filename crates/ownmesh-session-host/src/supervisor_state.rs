@@ -99,7 +99,7 @@ impl SupervisorState {
         let hosted = hosts
             .get(&binding.session_id)
             .ok_or("supervisor host unavailable")?;
-        exact(binding, &hosted.manifest)?;
+        exact_identity(binding, &hosted.manifest)?;
         Ok(status(&hosted.host))
     }
 
@@ -220,6 +220,68 @@ impl SupervisorState {
         Ok(binding_of(&next))
     }
 
+    /// Detach an exact active controller while preserving the host/spool. The
+    /// successor nonce and epoch make all prior write/resize/terminate facts
+    /// stale before any later claim can attach a new controller.
+    pub async fn detach_binding(
+        &self,
+        previous: &SupervisorBinding,
+        next_epoch: u64,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        exact(previous, &hosted.manifest)?;
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
+        let mut next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            hosted.manifest.owner_principal.clone(),
+            next_epoch,
+            hosted.manifest.binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.controller_attached = false;
+        hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
+    /// Claim only a durable detached manifest. The caller must provide the
+    /// exact detached nonce/epoch; active controllers cannot be taken over.
+    pub async fn claim_detached_binding(
+        &self,
+        previous: &SupervisorBinding,
+        next_owner_principal: impl Into<String>,
+        next_epoch: u64,
+        next_binding_expires_unix: i64,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        exact_identity(previous, &hosted.manifest)?;
+        if hosted.manifest.controller_attached {
+            return Err("supervisor controller is still attached".into());
+        }
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
+        let next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            next_owner_principal,
+            next_epoch,
+            next_binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.validate_runtime_lifetimes(unix_now())?;
+        hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
     /// Terminate expired hosts in a bounded sweep. A running sidecar invokes
     /// this periodically; every operation independently enforces expiry too.
     pub async fn sweep_expired(&self) -> usize {
@@ -270,15 +332,22 @@ fn binding_of(manifest: &HostManifest) -> SupervisorBinding {
     }
 }
 fn exact(binding: &SupervisorBinding, manifest: &HostManifest) -> Result<(), String> {
+    exact_identity(binding, manifest)?;
+    if !manifest.controller_attached {
+        return Err("supervisor controller is detached".into());
+    }
+    Ok(())
+}
+
+fn exact_identity(binding: &SupervisorBinding, manifest: &HostManifest) -> Result<(), String> {
     let now = unix_now();
     if manifest.binding_expires_unix <= now {
         return Err("supervisor binding expired".into());
     }
-    if binding.matches(manifest) {
-        Ok(())
-    } else {
-        Err("supervisor binding mismatch".into())
-    }
+    binding
+        .matches(manifest)
+        .then_some(())
+        .ok_or_else(|| "supervisor binding mismatch".into())
 }
 
 fn rotate_epoch(current: u64, next: u64) -> Result<(), String> {
