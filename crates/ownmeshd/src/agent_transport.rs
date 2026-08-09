@@ -2096,6 +2096,7 @@ async fn dispatch_remote_operation(
                 Some(operation_id.clone()),
                 remote_expires_unix,
                 remote_payload_hash,
+                Some(device_id.as_str().to_owned()),
             )
             .await
     };

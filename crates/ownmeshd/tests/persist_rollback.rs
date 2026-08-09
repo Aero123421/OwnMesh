@@ -143,6 +143,7 @@ async fn delegated_remote_mcp_executes_exact_bound_ask_without_local_approval() 
             Some("op_delegated_1".into()),
             Some(i64::MAX),
             Some("a".repeat(64)),
+            None,
         )
         .await
         .expect("delegated exact-bound write executes");
@@ -159,6 +160,7 @@ async fn delegated_remote_mcp_executes_exact_bound_ask_without_local_approval() 
             &remote,
             None,
             Some("op_delegated_2".into()),
+            None,
             None,
             None,
         )

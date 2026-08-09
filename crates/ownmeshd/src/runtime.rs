@@ -396,6 +396,9 @@ pub struct DaemonRuntime {
     active_remote_expires_at_unix: Option<i64>,
     /// Server payload_hash of the active remote exact action, if any.
     active_remote_payload_hash: Option<String>,
+    /// Verified Agent device identity for the active remote dispatch only.
+    /// This is never populated from MCP arguments or local IPC parameters.
+    active_remote_device_id: Option<String>,
     #[cfg(test)]
     op_journal_persist_fault: AtomicUsize,
     #[cfg(test)]
@@ -487,6 +490,7 @@ impl DaemonRuntime {
             active_remote_operation_id: None,
             active_remote_expires_at_unix: None,
             active_remote_payload_hash: None,
+            active_remote_device_id: None,
             #[cfg(test)]
             op_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
@@ -2157,6 +2161,7 @@ full_user_access/full_access for arbitrary commands",
             remote_operation_id,
             None,
             None,
+            None,
         )
         .await
     }
@@ -2171,6 +2176,7 @@ full_user_access/full_access for arbitrary commands",
         remote_operation_id: Option<String>,
         remote_expires_at_unix: Option<i64>,
         remote_payload_hash: Option<String>,
+        remote_device_id: Option<String>,
     ) -> IpcResult<Value> {
         self.active_cancel = cancel;
         self.active_remote_operation_id = remote_operation_id
@@ -2180,11 +2186,15 @@ full_user_access/full_access for arbitrary commands",
         self.active_remote_payload_hash = remote_payload_hash
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
+        self.active_remote_device_id = remote_device_id
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
         let outcome = self.dispatch(method, params, client).await;
         self.active_cancel = None;
         self.active_remote_operation_id = None;
         self.active_remote_expires_at_unix = None;
         self.active_remote_payload_hash = None;
+        self.active_remote_device_id = None;
         outcome
     }
 
@@ -2549,12 +2559,27 @@ full_user_access/full_access for arbitrary commands",
             {
                 use std::os::windows::process::CommandExt;
                 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                command.creation_flags(CREATE_NO_WINDOW);
+                const DETACHED_PROCESS: u32 = 0x0000_0008;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+                command
+                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // The sidecar owns the PTY after daemon exit. Production
+                // service managers should additionally supervise it; this
+                // independent process group keeps an ordinary daemon restart
+                // from coupling its lifetime to the daemon's process group.
+                command.process_group(0);
             }
             // A second daemon may race this launch. The sidecar listener is the
             // singleton authority; a duplicate immediately fails bind and is
             // harmless. We never fall back to an embedded remote PTY.
-            let _ = command.spawn();
+            command.spawn().map_err(|error| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!("launch persistent session sidecar: {error}"),
+            })?;
             let credential_dir = state_dir.join("session-supervisor-credentials");
             let mut last = "sidecar did not provision management credential".to_owned();
             for _ in 0..40 {
@@ -2583,10 +2608,52 @@ full_user_access/full_access for arbitrary commands",
             }
         }
         self.recover_sidecar_transitions().await?;
+        self.reattach_persistent_sidecars().await?;
         self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
             code: app_error::INTERNAL,
             message: "persistent session sidecar state unavailable".into(),
         })
+    }
+
+    /// Reattach every persisted, non-terminal sidecar without spawning a
+    /// replacement PTY. A missing active host is an explicit conflict; an
+    /// expired controller binding is deliberately left for exact reclaim so
+    /// expiry never kills a still-valid host TTL.
+    async fn reattach_persistent_sidecars(&self) -> IpcResult<()> {
+        const MAX_REATTACH: usize = 64;
+        let now = Self::now();
+        let bindings: Vec<_> = self
+            .sessions
+            .list()
+            .into_iter()
+            .filter_map(|info| info.sidecar_host.map(|binding| (info.id, binding)))
+            .collect();
+        if bindings.len() > MAX_REATTACH {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "persistent sidecar reattach quota exceeded".into(),
+            });
+        }
+        let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: "sidecar unavailable during reattach".into(),
+        })?;
+        for (session_id, binding) in bindings {
+            if binding.binding_expires_unix <= now {
+                continue;
+            }
+            let exact = supervisor_binding_from(&session_id, &binding);
+            proxy
+                .status(&exact)
+                .await
+                .map_err(|error| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!(
+                        "persistent session {session_id} cannot reattach without respawn: {error}"
+                    ),
+                })?;
+        }
+        Ok(())
     }
 
     async fn recover_sidecar_transitions(&mut self) -> IpcResult<()> {
@@ -2964,15 +3031,25 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 rows: info.rows,
             };
             if is_remote_runtime_principal(&client.client_name) {
+                let device_id = self
+                    .active_remote_device_id
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| IpcError::Remote {
+                        code: app_error::UNAUTHORIZED,
+                        message: "remote session.open requires verified Agent device identity"
+                            .into(),
+                    })?
+                    .to_owned();
                 let lease = info.controller.as_ref().ok_or_else(|| IpcError::Remote {
                     code: app_error::CONFLICT,
                     message: "remote session open did not produce a controller lease".into(),
                 })?;
                 let request = SupervisorSpawnRequest {
                     session_id: info.id.clone(),
-                    // Device identity is local custody context; remote callers
-                    // cannot choose it and workspace is checked above.
-                    device_id: "device-local".into(),
+                    // Verified Agent transport identity — never a caller
+                    // argument or process-local placeholder.
+                    device_id: device_id.clone(),
                     workspace_id: workspace_id.clone(),
                     owner_principal: client.client_name.clone(),
                     controller_epoch: info.controller_epoch,
@@ -3021,7 +3098,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     return Err(session_err(err));
                 }
                 let durable = SidecarHostBinding {
-                    device_id: "device-local".into(),
+                    device_id,
                     workspace_id: workspace_id.clone(),
                     owner_principal: client.client_name.clone(),
                     host_nonce: binding.host_nonce.clone(),
@@ -3449,7 +3526,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar claim journal: {e}"),
                 })?;
-            let old = supervisor_binding_from(&p.id, &old_binding);
+            let old = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
@@ -3619,7 +3696,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar renew journal: {e}"),
                 })?;
-            let old = supervisor_binding_from(&p.id, &old_binding);
+            let old = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
@@ -3741,7 +3818,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar detach journal: {e}"),
                 })?;
-            let old = supervisor_binding_from(&p.id, &old_binding);
+            let old = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
@@ -3895,7 +3972,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar give journal: {e}"),
                 })?;
-            let old = supervisor_binding_from(&p.id, &old_binding);
+            let old = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
@@ -4044,7 +4121,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar close journal: {e}"),
                 })?;
-            let binding = supervisor_binding_from(&p.id, &old_binding);
+            let binding = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
@@ -4217,7 +4294,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar terminate journal: {e}"),
                 })?;
-            let binding = supervisor_binding_from(&id, &old_binding);
+            let binding = self.verified_sidecar_binding_from(&id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
@@ -5026,6 +5103,17 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             code: app_error::CONFLICT,
             message: format!("session {session_id} has no persistent sidecar binding"),
         })?;
+        if let Some(active_device_id) = self.active_remote_device_id.as_deref() {
+            if binding.device_id != active_device_id {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!(
+                        "persistent session {session_id} is bound to device {}, not verified device {active_device_id}",
+                        binding.device_id
+                    ),
+                });
+            }
+        }
         Ok(SupervisorBinding {
             session_id: info.id.clone(),
             device_id: binding.device_id,
@@ -5034,6 +5122,25 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             host_nonce: binding.host_nonce,
             controller_epoch: binding.controller_epoch,
         })
+    }
+
+    fn verified_sidecar_binding_from(
+        &self,
+        session_id: &str,
+        binding: &SidecarHostBinding,
+    ) -> IpcResult<SupervisorBinding> {
+        if let Some(active_device_id) = self.active_remote_device_id.as_deref() {
+            if binding.device_id != active_device_id {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!(
+                        "persistent session {session_id} is bound to device {}, not verified device {active_device_id}",
+                        binding.device_id
+                    ),
+                });
+            }
+        }
+        Ok(supervisor_binding_from(session_id, binding))
     }
 
     /// Move pending live-host bytes into the session replay ring (bounded chunks).
@@ -5623,6 +5730,59 @@ fn supervisor_binding_from(session_id: &str, binding: &SidecarHostBinding) -> Su
         owner_principal: binding.owner_principal.clone(),
         host_nonce: binding.host_nonce.clone(),
         controller_epoch: binding.controller_epoch,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod device_binding_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn verified_remote_device_cannot_substitute_a_persistent_sidecar_binding() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let session = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "device-bound",
+                "client:remote:tenant:owner",
+                DaemonRuntime::now(),
+                None,
+            )
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(
+                &session.id,
+                Some(SidecarHostBinding {
+                    device_id: "dev_a".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "client:remote:tenant:owner".into(),
+                    host_nonce: "host_nonce".into(),
+                    controller_epoch: 1,
+                    binding_expires_unix: DaemonRuntime::now() + 60,
+                    host_expires_unix: DaemonRuntime::now() + 600,
+                }),
+            )
+            .unwrap();
+        runtime.active_remote_device_id = Some("dev_b".into());
+        let error = runtime.sidecar_binding(&session.id).unwrap_err();
+        assert!(matches!(
+            error,
+            IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                ..
+            }
+        ));
+        runtime.active_remote_device_id = Some("dev_a".into());
+        assert_eq!(
+            runtime.sidecar_binding(&session.id).unwrap().device_id,
+            "dev_a"
+        );
     }
 }
 
