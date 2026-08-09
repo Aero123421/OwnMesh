@@ -33,7 +33,7 @@ use hmac::{Hmac, Mac};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -57,6 +57,18 @@ pub const fn crate_version() -> &'static str {
 /// Protocol version.
 pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 
+/// Production broker wire protocol.  Version 1 remains available only for
+/// compatibility with the pre-E8 in-process test helpers; it is never a
+/// substitute for this exact-action protocol.
+pub const BROKER_PROTOCOL_V2: u32 = 2;
+
+/// Hard byte ceiling for one JSON broker request before deserialization.
+pub const MAX_BROKER_REQUEST_BYTES: usize = 64 * 1024;
+/// Bounded cardinality ceilings for an exact structured command.
+pub const MAX_BROKER_ARGV: usize = 128;
+pub const MAX_BROKER_ENV: usize = 64;
+pub const MAX_BROKER_FIELD_BYTES: usize = 4096;
+
 /// Default local endpoint basename (pipe / socket).
 pub const DEFAULT_BROKER_ENDPOINT: &str = "ownmesh-privileged";
 
@@ -71,6 +83,9 @@ const REQUEST_MAC_DOMAIN: &[u8] = b"ownmesh-broker-req-mac-v1";
 
 /// Domain separation tag for capability signature payload.
 const CAPABILITY_SIG_DOMAIN: &[u8] = b"ownmesh-broker-cap-ed25519-v1";
+const REQUEST_V2_MAC_DOMAIN: &[u8] = b"ownmesh-broker-req-mac-v2";
+const CAPABILITY_V2_SIG_DOMAIN: &[u8] = b"ownmesh-broker-cap-ed25519-v2";
+const OPERATION_FACTS_V2_DOMAIN: &[u8] = b"ownmesh-broker-operation-facts-v2";
 
 /// Broker client errors.
 #[derive(Debug, Error)]
@@ -475,6 +490,184 @@ pub struct BrokerResponse {
     pub error: Option<String>,
 }
 
+/// Pin for the executable selected by the unprivileged operation planner.
+/// The broker compares this immutable fact with its independently checked peer
+/// and executable policy before starting a process.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutablePinV2 {
+    pub canonical_path: String,
+    /// SHA-256 of the executable image, lower-case hex.
+    pub image_sha256: String,
+}
+
+/// OS-derived process identity captured while the authenticated daemon peer is
+/// live. `birth_id` prevents a later PID reuse from satisfying the binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerProcessBindV2 {
+    pub pid: i32,
+    pub uid: u32,
+    pub executable_path: String,
+    pub process_birth_id: u64,
+    /// OS-derived identity of the image held by the peer process (for example
+    /// a device/inode tuple encoded by the platform-specific verifier).
+    pub image_identity: String,
+}
+
+/// Complete, canonical facts of the action that was policy-authorized.
+///
+/// A `BTreeMap` is intentional: environment ordering supplied by an untrusted
+/// caller can never change the action digest.  Values are still signed and are
+/// not normalized or silently filtered by this transport layer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OperationFactsV2 {
+    pub operation: String,
+    pub remote_payload_sha256: String,
+    pub principal_credential_generation: u64,
+    pub device_id: String,
+    pub workspace_id: String,
+    /// Structured argv, including argv[0]; opaque shell strings are absent.
+    pub argv: Vec<String>,
+    pub canonical_cwd: Option<String>,
+    pub sanitized_env: BTreeMap<String, String>,
+    pub executable: ExecutablePinV2,
+}
+
+/// Broker-issued v2 capability.  Unlike a daemon-readable request MAC, this
+/// is signed under the broker-private key and cannot be minted from the MAC
+/// secret.  It is bound to exactly one nonce and one facts digest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityTokenV2 {
+    pub token_id: String,
+    pub broker_instance_id: String,
+    pub broker_key_id: String,
+    pub principal: String,
+    pub scope: String,
+    pub operation_id: String,
+    pub operation_facts_digest: String,
+    pub nonce: String,
+    pub peer: PeerProcessBindV2,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+    /// Hex Ed25519 signature over the canonical fields above (except itself).
+    pub signature: String,
+}
+
+/// Strict production v2 request wire envelope.  All unknown JSON keys are
+/// rejected at every level, so adding an authority-bearing field needs an
+/// intentional protocol version and reauthorization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerRequestV2 {
+    pub protocol_version: u32,
+    pub request_id: String,
+    pub operation_id: String,
+    pub nonce: String,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub facts: OperationFactsV2,
+    pub capability: CapabilityTokenV2,
+    /// HMAC is message authentication only; it is never capability authority.
+    pub mac: String,
+}
+
+impl CapabilityTokenV2 {
+    /// Issue a v2 token from broker-only signing material.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        signing_key: &CapabilitySigningKey,
+        broker_instance_id: impl Into<String>,
+        broker_key_id: impl Into<String>,
+        principal: impl Into<String>,
+        operation_id: impl Into<String>,
+        facts: &OperationFactsV2,
+        nonce: impl Into<String>,
+        peer: PeerProcessBindV2,
+        now_unix: i64,
+        ttl_secs: i64,
+    ) -> Self {
+        let mut token = Self {
+            token_id: format!("cap2_{}", Uuid::new_v4().simple()),
+            broker_instance_id: broker_instance_id.into(),
+            broker_key_id: broker_key_id.into(),
+            principal: principal.into(),
+            scope: ELEVATED_CAPABILITY_SCOPE.into(),
+            operation_id: operation_id.into(),
+            operation_facts_digest: operation_facts_digest(facts),
+            nonce: nonce.into(),
+            peer,
+            issued_at_unix: now_unix,
+            expires_at_unix: now_unix.saturating_add(ttl_secs),
+            signature: String::new(),
+        };
+        token.signature = hex::encode(signing_key.sign(&canonical_capability_v2_bytes(&token)));
+        token
+    }
+}
+
+/// Decode a bounded strict v2 envelope.  This must be used at the socket
+/// boundary instead of an unbounded line/String deserializer.
+pub fn parse_broker_request_v2(bytes: &[u8]) -> BrokerResult<BrokerRequestV2> {
+    if bytes.len() > MAX_BROKER_REQUEST_BYTES {
+        return Err(BrokerError::Protocol("request exceeds byte limit".into()));
+    }
+    serde_json::from_slice(bytes)
+        .map_err(|e| BrokerError::Protocol(format!("invalid strict v2 request: {e}")))
+}
+
+/// SHA-256 digest of typed canonical operation facts.  This is the exact
+/// action commitment signed by a v2 capability and persisted in the replay
+/// ledger; JSON formatting or map iteration cannot alter it.
+#[must_use]
+pub fn operation_facts_digest(facts: &OperationFactsV2) -> String {
+    hex::encode(Sha256::digest(canonical_operation_facts_v2_bytes(facts)))
+}
+
+/// Compute the v2 request MAC.  Possession proves only access to the local IPC
+/// request secret; the separately signed capability is still mandatory.
+#[must_use]
+pub fn compute_mac_v2(secret: &BrokerSecret, req: &BrokerRequestV2) -> String {
+    hmac_hex(secret, &canonical_request_v2_bytes(req))
+}
+
+/// Verify the strict v2 envelope, message MAC, capability signature, exact
+/// facts digest, expiry, broker binding, and live peer process identity.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_request_v2(
+    secret: &BrokerSecret,
+    verify_key: &CapabilityVerifyKey,
+    req: &BrokerRequestV2,
+    expected_broker_instance_id: &str,
+    expected_broker_key_id: &str,
+    peer: &PeerProcessBindV2,
+    now_unix: i64,
+) -> BrokerResult<()> {
+    validate_v2_request_shape(req, now_unix)?;
+    if !constant_time_hex_eq(&compute_mac_v2(secret, req), &req.mac) {
+        return Err(BrokerError::BadSignature);
+    }
+    let cap = &req.capability;
+    if now_unix > cap.expires_at_unix || cap.issued_at_unix > now_unix {
+        return Err(BrokerError::Expired);
+    }
+    if cap.scope != ELEVATED_CAPABILITY_SCOPE
+        || cap.operation_id != req.operation_id
+        || cap.nonce != req.nonce
+        || cap.broker_instance_id != expected_broker_instance_id
+        || cap.broker_key_id != expected_broker_key_id
+        || cap.operation_facts_digest != operation_facts_digest(&req.facts)
+        || &cap.peer != peer
+    {
+        return Err(BrokerError::Unauthorized);
+    }
+    let signature = hex::decode(&cap.signature).map_err(|_| BrokerError::BadSignature)?;
+    verify_key.verify(&canonical_capability_v2_bytes(cap), &signature)
+}
+
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
@@ -494,6 +687,184 @@ fn put_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     put_bytes(buf, s.as_bytes());
+}
+
+fn put_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_map(buf: &mut Vec<u8>, values: &BTreeMap<String, String>) {
+    put_u32(buf, u32::try_from(values.len()).unwrap_or(u32::MAX));
+    for (key, value) in values {
+        put_str(buf, key);
+        put_str(buf, value);
+    }
+}
+
+fn canonical_operation_facts_v2_bytes(facts: &OperationFactsV2) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
+    buf.extend_from_slice(OPERATION_FACTS_V2_DOMAIN);
+    put_str(&mut buf, &facts.operation);
+    put_str(&mut buf, &facts.remote_payload_sha256);
+    put_u64(&mut buf, facts.principal_credential_generation);
+    put_str(&mut buf, &facts.device_id);
+    put_str(&mut buf, &facts.workspace_id);
+    put_u32(
+        &mut buf,
+        u32::try_from(facts.argv.len()).unwrap_or(u32::MAX),
+    );
+    for arg in &facts.argv {
+        put_str(&mut buf, arg);
+    }
+    match &facts.canonical_cwd {
+        Some(cwd) => {
+            buf.push(1);
+            put_str(&mut buf, cwd);
+        }
+        None => buf.push(0),
+    }
+    put_map(&mut buf, &facts.sanitized_env);
+    put_str(&mut buf, &facts.executable.canonical_path);
+    put_str(&mut buf, &facts.executable.image_sha256);
+    buf
+}
+
+fn canonical_peer_process_v2_bytes(buf: &mut Vec<u8>, peer: &PeerProcessBindV2) {
+    put_i32(buf, peer.pid);
+    put_u32(buf, peer.uid);
+    put_str(buf, &peer.executable_path);
+    put_u64(buf, peer.process_birth_id);
+    put_str(buf, &peer.image_identity);
+}
+
+fn canonical_capability_v2_bytes(token: &CapabilityTokenV2) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(384);
+    buf.extend_from_slice(CAPABILITY_V2_SIG_DOMAIN);
+    put_str(&mut buf, &token.token_id);
+    put_str(&mut buf, &token.broker_instance_id);
+    put_str(&mut buf, &token.broker_key_id);
+    put_str(&mut buf, &token.principal);
+    put_str(&mut buf, &token.scope);
+    put_str(&mut buf, &token.operation_id);
+    put_str(&mut buf, &token.operation_facts_digest);
+    put_str(&mut buf, &token.nonce);
+    canonical_peer_process_v2_bytes(&mut buf, &token.peer);
+    put_i64(&mut buf, token.issued_at_unix);
+    put_i64(&mut buf, token.expires_at_unix);
+    buf
+}
+
+fn canonical_request_v2_bytes(req: &BrokerRequestV2) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(768);
+    buf.extend_from_slice(REQUEST_V2_MAC_DOMAIN);
+    put_u32(&mut buf, req.protocol_version);
+    put_str(&mut buf, &req.request_id);
+    put_str(&mut buf, &req.operation_id);
+    put_str(&mut buf, &req.nonce);
+    put_i64(&mut buf, req.issued_at_unix);
+    put_i64(&mut buf, req.expires_at_unix);
+    let facts = canonical_operation_facts_v2_bytes(&req.facts);
+    put_bytes(&mut buf, &facts);
+    let capability = canonical_capability_v2_bytes(&req.capability);
+    put_bytes(&mut buf, &capability);
+    put_str(&mut buf, &req.capability.signature);
+    buf
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value.as_bytes().iter().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+}
+
+fn validate_bounded_field(name: &str, value: &str) -> BrokerResult<()> {
+    if value.trim().is_empty() || value.len() > MAX_BROKER_FIELD_BYTES || value.contains('\0') {
+        return Err(BrokerError::Protocol(format!("invalid {name}")));
+    }
+    Ok(())
+}
+
+fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResult<()> {
+    if req.protocol_version != BROKER_PROTOCOL_V2 {
+        return Err(BrokerError::Protocol(
+            "unsupported v2 protocol version".into(),
+        ));
+    }
+    if now_unix > req.expires_at_unix || req.issued_at_unix > now_unix {
+        return Err(BrokerError::Expired);
+    }
+    if req.expires_at_unix < req.issued_at_unix
+        || req.expires_at_unix.saturating_sub(req.issued_at_unix) > DEFAULT_CAPABILITY_TTL_SECS
+    {
+        return Err(BrokerError::Protocol("invalid request lifetime".into()));
+    }
+    for (name, value) in [
+        ("request_id", req.request_id.as_str()),
+        ("operation_id", req.operation_id.as_str()),
+        ("nonce", req.nonce.as_str()),
+        ("facts.operation", req.facts.operation.as_str()),
+        ("device_id", req.facts.device_id.as_str()),
+        ("workspace_id", req.facts.workspace_id.as_str()),
+        (
+            "executable path",
+            req.facts.executable.canonical_path.as_str(),
+        ),
+        ("capability token id", req.capability.token_id.as_str()),
+        (
+            "broker instance id",
+            req.capability.broker_instance_id.as_str(),
+        ),
+        ("broker key id", req.capability.broker_key_id.as_str()),
+        ("capability principal", req.capability.principal.as_str()),
+        (
+            "peer executable path",
+            req.capability.peer.executable_path.as_str(),
+        ),
+        (
+            "peer image identity",
+            req.capability.peer.image_identity.as_str(),
+        ),
+    ] {
+        validate_bounded_field(name, value)?;
+    }
+    if req.facts.operation != req.operation_id
+        || req.facts.argv.is_empty()
+        || req.facts.argv.len() > MAX_BROKER_ARGV
+        || req.facts.sanitized_env.len() > MAX_BROKER_ENV
+        || !is_sha256_hex(&req.facts.remote_payload_sha256)
+        || !is_sha256_hex(&req.facts.executable.image_sha256)
+        || !is_sha256_hex(&req.capability.operation_facts_digest)
+        || req.capability.peer.pid <= 0
+        || req.capability.peer.process_birth_id == 0
+    {
+        return Err(BrokerError::Protocol(
+            "invalid bounded operation facts".into(),
+        ));
+    }
+    for arg in &req.facts.argv {
+        validate_bounded_field("argv", arg)?;
+    }
+    if let Some(cwd) = &req.facts.canonical_cwd {
+        validate_bounded_field("canonical cwd", cwd)?;
+        if !std::path::Path::new(cwd).is_absolute() {
+            return Err(BrokerError::Protocol(
+                "canonical cwd must be absolute".into(),
+            ));
+        }
+    }
+    for (key, value) in &req.facts.sanitized_env {
+        validate_bounded_field("environment name", key)?;
+        if key.contains('=') {
+            return Err(BrokerError::Protocol(
+                "environment name contains '='".into(),
+            ));
+        }
+        if value.len() > MAX_BROKER_FIELD_BYTES || value.contains('\0') {
+            return Err(BrokerError::Protocol("invalid environment value".into()));
+        }
+    }
+    Ok(())
 }
 
 /// Typed, field-fixed canonical bytes for a capability token (excludes signature).
@@ -1128,6 +1499,165 @@ mod tests {
         assert!(
             req.capability.is_none(),
             "client build_request must not mint capabilities"
+        );
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    fn facts() -> OperationFactsV2 {
+        OperationFactsV2 {
+            operation: "command.exec.elevated".into(),
+            remote_payload_sha256: "a".repeat(64),
+            principal_credential_generation: 7,
+            device_id: "device_1".into(),
+            workspace_id: "workspace_1".into(),
+            argv: vec!["/usr/bin/id".into(), "-u".into()],
+            canonical_cwd: Some(std::env::temp_dir().display().to_string()),
+            sanitized_env: BTreeMap::from([
+                ("LANG".into(), "C".into()),
+                ("PATH".into(), "/usr/bin".into()),
+            ]),
+            executable: ExecutablePinV2 {
+                canonical_path: "/usr/bin/id".into(),
+                image_sha256: "b".repeat(64),
+            },
+        }
+    }
+
+    fn peer() -> PeerProcessBindV2 {
+        PeerProcessBindV2 {
+            pid: 42,
+            uid: 1000,
+            executable_path: "/usr/bin/ownmeshd".into(),
+            process_birth_id: 99,
+            image_identity: "dev=1;ino=2".into(),
+        }
+    }
+
+    fn signed_v2() -> (
+        BrokerSecret,
+        CapabilityVerifyKey,
+        BrokerRequestV2,
+        PeerProcessBindV2,
+    ) {
+        let secret = BrokerSecret::generate();
+        let signing = CapabilitySigningKey::generate();
+        let verify = signing.verify_key();
+        let facts = facts();
+        let peer = peer();
+        let cap = CapabilityTokenV2::issue(
+            &signing,
+            "broker-instance",
+            "broker-key-1",
+            "principal-1",
+            "command.exec.elevated",
+            &facts,
+            "nonce-1",
+            peer.clone(),
+            100,
+            30,
+        );
+        let mut request = BrokerRequestV2 {
+            protocol_version: BROKER_PROTOCOL_V2,
+            request_id: "request-1".into(),
+            operation_id: "command.exec.elevated".into(),
+            nonce: "nonce-1".into(),
+            issued_at_unix: 100,
+            expires_at_unix: 130,
+            facts,
+            capability: cap,
+            mac: String::new(),
+        };
+        request.mac = compute_mac_v2(&secret, &request);
+        (secret, verify, request, peer)
+    }
+
+    #[test]
+    fn v2_binds_all_action_facts_and_peer_lifetime() {
+        let (secret, verify, request, peer) = signed_v2();
+        verify_request_v2(
+            &secret,
+            &verify,
+            &request,
+            "broker-instance",
+            "broker-key-1",
+            &peer,
+            110,
+        )
+        .unwrap();
+
+        let mut changed = request.clone();
+        changed.facts.argv.push("--changed".into());
+        changed.mac = compute_mac_v2(&secret, &changed);
+        assert!(verify_request_v2(
+            &secret,
+            &verify,
+            &changed,
+            "broker-instance",
+            "broker-key-1",
+            &peer,
+            110,
+        )
+        .is_err());
+
+        let reused_pid = PeerProcessBindV2 {
+            process_birth_id: peer.process_birth_id + 1,
+            ..peer.clone()
+        };
+        assert!(verify_request_v2(
+            &secret,
+            &verify,
+            &request,
+            "broker-instance",
+            "broker-key-1",
+            &reused_pid,
+            110,
+        )
+        .is_err());
+        assert!(verify_request_v2(
+            &secret,
+            &verify,
+            &request,
+            "broker-instance",
+            "broker-key-1",
+            &peer,
+            131,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v2_rejects_unknown_and_oversized_wire_fields() {
+        let (_, _, request, _) = signed_v2();
+        let mut value = serde_json::to_value(request).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("forged_authority".into(), serde_json::Value::Bool(true));
+        assert!(parse_broker_request_v2(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert!(parse_broker_request_v2(&vec![b'x'; MAX_BROKER_REQUEST_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn v2_digest_is_map_order_independent_but_value_sensitive() {
+        let mut left = facts();
+        let mut right = left.clone();
+        right.sanitized_env = BTreeMap::from([
+            ("PATH".into(), "/usr/bin".into()),
+            ("LANG".into(), "C".into()),
+        ]);
+        assert_eq!(
+            operation_facts_digest(&left),
+            operation_facts_digest(&right)
+        );
+        left.sanitized_env
+            .insert("LANG".into(), "ja_JP.UTF-8".into());
+        assert_ne!(
+            operation_facts_digest(&left),
+            operation_facts_digest(&right)
         );
     }
 }

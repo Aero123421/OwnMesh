@@ -18,6 +18,11 @@ use tokio::sync::Mutex as AsyncMutex;
 pub const CAPABILITY_SIGNING_FILE: &str = "broker.cap.signing";
 /// Default relative name for the capability verify key (distributable).
 pub const CAPABILITY_VERIFY_FILE: &str = "broker.cap.verify";
+/// Maximum retained bytes for each elevated stdout/stderr stream.  Readers
+/// continue draining after the cap so a noisy child cannot deadlock on a full
+/// pipe; callers receive an explicit truncation marker instead of an unbounded
+/// response allocation.
+const MAX_ELEVATED_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Runtime broker state.
 pub struct BrokerState {
@@ -701,15 +706,34 @@ fn run_elevated(request_id: &str, command: &ElevatedCommand) -> BrokerResponse {
     }
     // On Windows, Job Object management is best-effort via process group later;
     // kill_on_drop is handled by the OS when broker exits.
-    match cmd.output() {
-        Ok(out) => BrokerResponse {
-            request_id: request_id.to_string(),
-            ok: out.status.success(),
-            exit_code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-            error: None,
-        },
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let stdout_reader = stdout.map(|pipe| std::thread::spawn(move || drain_bounded(pipe)));
+            let stderr_reader = stderr.map(|pipe| std::thread::spawn(move || drain_bounded(pipe)));
+            let status = child.wait();
+            let stdout = join_bounded_output(stdout_reader);
+            let stderr = join_bounded_output(stderr_reader);
+            match status {
+                Ok(status) => BrokerResponse {
+                    request_id: request_id.to_string(),
+                    ok: status.success(),
+                    exit_code: status.code(),
+                    stdout,
+                    stderr,
+                    error: None,
+                },
+                Err(error) => BrokerResponse {
+                    request_id: request_id.to_string(),
+                    ok: false,
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
         Err(e) => BrokerResponse {
             request_id: request_id.to_string(),
             ok: false,
@@ -719,6 +743,38 @@ fn run_elevated(request_id: &str, command: &ElevatedCommand) -> BrokerResponse {
             error: Some(e.to_string()),
         },
     }
+}
+
+fn drain_bounded<R: std::io::Read>(mut reader: R) -> String {
+    let mut retained = Vec::with_capacity(MAX_ELEVATED_OUTPUT_BYTES);
+    let mut chunk = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                let room = MAX_ELEVATED_OUTPUT_BYTES.saturating_sub(retained.len());
+                let keep = room.min(read);
+                retained.extend_from_slice(&chunk[..keep]);
+                truncated |= keep != read;
+            }
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    let mut result = String::from_utf8_lossy(&retained).into_owned();
+    if truncated {
+        result.push_str("\n[ownmesh broker output truncated]\n");
+    }
+    result
+}
+
+fn join_bounded_output(handle: Option<std::thread::JoinHandle<String>>) -> String {
+    handle
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_else(|| "[ownmesh broker output reader unavailable]".into())
 }
 
 /// Production elevated broker serve is fixed as **unsupported** until a secure
@@ -824,6 +880,19 @@ async fn write_resp<W: AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    #[test]
+    fn elevated_output_is_drained_but_retained_with_a_hard_cap() {
+        let output = drain_bounded(std::io::Cursor::new(vec![
+            b'x';
+            MAX_ELEVATED_OUTPUT_BYTES + 1
+        ]));
+        assert!(output.contains("output truncated"));
+        assert!(
+            output.len() <= MAX_ELEVATED_OUTPUT_BYTES + 64,
+            "retained output must remain bounded"
+        );
+    }
 
     #[test]
     fn custody_metadata_requires_root_0600_key_and_safe_parent() {

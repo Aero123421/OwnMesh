@@ -31,6 +31,7 @@
 )]
 
 mod install;
+mod ledger;
 pub mod peer;
 mod serve;
 
@@ -38,6 +39,7 @@ pub use install::{
     broker_status, endpoint_kind_peer_enforceable, install_broker, install_broker_with_config,
     uninstall_broker, BrokerInstallConfig, InstallRecord, InstallStatus, INSTALL_FILE,
 };
+pub use ledger::{ReplayLedger, ReplayLedgerError, ReplayReservation};
 pub use peer::{
     assert_endpoint_peer_verifiable, endpoint_supports_peer_cred_enforcement,
     load_trusted_peer_policy, peer_uid_allowed, PeerCheck, TrustedPeerPolicy,
@@ -87,15 +89,13 @@ pub fn now_unix() -> i64 {
 mod tests {
     use super::*;
     use ownmesh_broker_client::{
-        build_request, build_request_with_capability, connect_and_call, elevate, verify_request,
+        build_request, build_request_with_capability, connect_and_call, verify_request,
         BrokerEndpoint, BrokerRequest, BrokerSecret, CapabilitySigningKey, CapabilityToken,
         ElevatedCommand, PeerBind, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
     };
     use std::net::SocketAddr;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use tempfile::tempdir;
-    use tokio::sync::Mutex as AsyncMutex;
 
     fn test_peer() -> PeerBind {
         PeerBind::new(4242, peer::current_uid(), "ownmeshd-test")
@@ -406,191 +406,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn e2e_loopback_exec_and_replay_defense() {
-        let dir = tempdir().unwrap();
-        let secret_path = dir.path().join("secret.bin");
-        let secret = load_or_create_secret(&secret_path).unwrap();
-        let signing_key = CapabilitySigningKey::generate();
-        let verify_key = signing_key.verify_key();
-        let signing_for_request =
-            CapabilitySigningKey::from_bytes(&signing_key.to_bytes()).unwrap();
-        let secret_bytes = secret.as_bytes().to_vec();
-        let peer = test_peer();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        assert!(addr.ip().is_loopback());
-
-        let state = Arc::new(AsyncMutex::new(BrokerState {
-            secret: BrokerSecret::from_bytes(secret_bytes.clone()),
-            signing_key,
-            verify_key,
-            replay: ReplayCache::new(),
-        }));
-
-        let st = Arc::clone(&state);
-        let peer_srv = peer.clone();
-        let server = tokio::spawn(async move {
-            let (sock, peer_addr) = listener.accept().await.unwrap();
-            assert!(peer_addr.ip().is_loopback());
-            serve::handle_tcp_conn(sock, st, peer_srv).await.unwrap();
-        });
-
-        let endpoint = BrokerEndpoint::LoopbackTcp(addr);
-        let secret = BrokerSecret::from_bytes(secret_bytes);
-        let resp = elevate(
-            &endpoint,
+    async fn production_client_rejects_loopback_tcp_before_connect() {
+        let secret = BrokerSecret::generate();
+        let req = build_request(
             &secret,
             "ownmeshd",
-            "op_e2e",
-            ElevatedCommand {
-                program: if cfg!(windows) {
-                    "cmd.exe".into()
-                } else {
-                    "echo".into()
-                },
-                args: if cfg!(windows) {
-                    vec!["/C".into(), "echo broker-ok".into()]
-                } else {
-                    vec!["broker-ok".into()]
-                },
-                cwd: None,
-                env: vec![],
-            },
-            now_unix(),
-            60,
-        )
-        .await
-        .unwrap();
-        assert!(!resp.ok, "synthetic TCP must not mint: {resp:?}");
-        assert!(
-            resp.error.as_deref().unwrap_or("").contains("mint denied"),
-            "{resp:?}"
-        );
-
-        // A genuinely broker-signed capability is accepted once and replayed requests fail.
-        let now = now_unix();
-        let cap = CapabilityToken::issue_for_operation(
-            &signing_for_request,
-            &peer,
-            "ownmeshd",
-            ELEVATED_CAPABILITY_SCOPE,
-            "op_replay",
-            now,
-            60,
-        );
-        let req = build_request_with_capability(
-            &secret,
-            "ownmeshd",
-            "op_replay",
-            ElevatedCommand {
-                program: if cfg!(windows) {
-                    "cmd.exe".into()
-                } else {
-                    "echo".into()
-                },
-                args: if cfg!(windows) {
-                    vec!["/C".into(), "echo x".into()]
-                } else {
-                    vec!["x".into()]
-                },
-                cwd: None,
-                env: vec![],
-            },
-            Some(cap),
-            now,
-            60,
-        );
-        // start second accept loop
-        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr2 = listener2.local_addr().unwrap();
-        let st2 = Arc::clone(&state);
-        let peer2 = peer.clone();
-        let server2 = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (sock, _) = listener2.accept().await.unwrap();
-                let st = Arc::clone(&st2);
-                let _ = serve::handle_tcp_conn(sock, st, peer2.clone()).await;
-            }
-        });
-        let ep2 = BrokerEndpoint::LoopbackTcp(addr2);
-        let r1 = connect_and_call(&ep2, &req).await.unwrap();
-        assert!(
-            r1.ok || r1.error.is_none() || r1.exit_code.is_some(),
-            "{r1:?}"
-        );
-        let r2 = connect_and_call(&ep2, &req).await.unwrap();
-        assert!(!r2.ok);
-        assert!(
-            r2.error
-                .as_deref()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("replay"),
-            "{r2:?}"
-        );
-
-        let _ = server.await;
-        let _ = server2.await;
-    }
-
-    #[tokio::test]
-    async fn forged_capability_over_wire_rejected() {
-        let dir = tempdir().unwrap();
-        let secret = load_or_create_secret(&dir.path().join("s")).unwrap();
-        let sk = CapabilitySigningKey::generate();
-        let vk = sk.verify_key();
-        let secret_bytes = secret.as_bytes().to_vec();
-        let peer = test_peer();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let state = Arc::new(AsyncMutex::new(BrokerState {
-            secret: BrokerSecret::from_bytes(secret_bytes.clone()),
-            signing_key: sk,
-            verify_key: vk,
-            replay: ReplayCache::new(),
-        }));
-        let st = Arc::clone(&state);
-        let peer_srv = peer.clone();
-        let server = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            serve::handle_tcp_conn(sock, st, peer_srv).await.unwrap();
-        });
-        let secret = BrokerSecret::from_bytes(secret_bytes);
-        // Mint with a key derived from the MAC secret (ownmeshd-equivalent attacker).
-        let evil = CapabilitySigningKey::from_bytes(secret.as_bytes()).unwrap();
-        let forged = CapabilityToken::issue_for_operation(
-            &evil,
-            &peer,
-            "ownmeshd",
-            ELEVATED_CAPABILITY_SCOPE,
-            "op",
-            now_unix(),
-            30,
-        );
-        let req = build_request_with_capability(
-            &secret,
-            "ownmeshd",
-            "op",
+            "op_loopback",
             ElevatedCommand {
                 program: "echo".into(),
                 args: vec!["x".into()],
                 cwd: None,
                 env: vec![],
             },
-            Some(forged),
             now_unix(),
             30,
         );
-        let resp = connect_and_call(&BrokerEndpoint::LoopbackTcp(addr), &req)
-            .await
-            .unwrap();
-        assert!(!resp.ok);
-        let err = resp.error.unwrap_or_default().to_ascii_lowercase();
-        assert!(
-            err.contains("signature") || err.contains("invalid") || err.contains("unauthor"),
-            "{err}"
-        );
-        let _ = server.await;
+        let endpoint = BrokerEndpoint::LoopbackTcp("127.0.0.1:9".parse().unwrap());
+        let error = connect_and_call(&endpoint, &req).await.unwrap_err();
+        assert!(error.to_string().contains("LoopbackTcp"), "{error}");
     }
 }

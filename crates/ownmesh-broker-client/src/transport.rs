@@ -180,12 +180,12 @@ pub async fn connect_and_call(
 ) -> BrokerResult<BrokerResponse> {
     endpoint.enforce_networkless()?;
     match endpoint {
-        BrokerEndpoint::LoopbackTcp(addr) => {
-            let mut stream = tokio::net::TcpStream::connect(addr)
-                .await
-                .map_err(|e| BrokerError::Io(e.to_string()))?;
-            write_req_read_resp(&mut stream, req).await
-        }
+        // TCP cannot carry OS peer credentials.  A loopback address is not a
+        // production privilege boundary, so callers must never silently fall
+        // back to it.  In-process socket tests use the broker's direct helper.
+        BrokerEndpoint::LoopbackTcp(addr) => Err(BrokerError::Networkless(format!(
+            "refusing LoopbackTcp broker client path at {addr}; production requires a peer-verifiable local IPC endpoint"
+        ))),
         #[cfg(windows)]
         BrokerEndpoint::NamedPipe(name) => {
             use tokio::net::windows::named_pipe::ClientOptions;
