@@ -289,6 +289,43 @@ impl SupervisorState {
         Ok(binding_of(&next))
     }
 
+    /// Receipt-aware detach. A retry after a daemon crash returns the detached
+    /// successor nonce instead of applying another epoch transition.
+    pub async fn detach_idempotent(
+        &self,
+        previous: &SupervisorBinding,
+        next_epoch: u64,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        if hosted
+            .manifest
+            .matches_transition(transition_id, payload_digest)?
+        {
+            return Ok(binding_of(&hosted.manifest));
+        }
+        exact(previous, &hosted.manifest)?;
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
+        let mut next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            hosted.manifest.owner_principal.clone(),
+            next_epoch,
+            hosted.manifest.binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.controller_attached = false;
+        next.record_transition(transition_id, payload_digest)?;
+        hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
     /// Claim only a durable detached manifest. The caller must provide the
     /// exact detached nonce/epoch; active controllers cannot be taken over.
     pub async fn claim_detached_binding(
@@ -318,6 +355,126 @@ impl SupervisorState {
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
+    /// Receipt-aware claim of a controller-free durable host.
+    pub async fn claim_idempotent(
+        &self,
+        previous: &SupervisorBinding,
+        next_owner_principal: impl Into<String>,
+        next_epoch: u64,
+        next_binding_expires_unix: i64,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        if hosted
+            .manifest
+            .matches_transition(transition_id, payload_digest)?
+        {
+            return Ok(binding_of(&hosted.manifest));
+        }
+        exact_identity(previous, &hosted.manifest)?;
+        if hosted.manifest.controller_attached {
+            return Err("supervisor controller is still attached".into());
+        }
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
+        let mut next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            next_owner_principal,
+            next_epoch,
+            next_binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.validate_runtime_lifetimes(unix_now())?;
+        next.record_transition(transition_id, payload_digest)?;
+        hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
+    /// Receipt-aware reclaim of an expired active capability.
+    pub async fn reclaim_idempotent(
+        &self,
+        previous: &SupervisorBinding,
+        next_owner_principal: impl Into<String>,
+        next_epoch: u64,
+        next_binding_expires_unix: i64,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        if hosted
+            .manifest
+            .matches_transition(transition_id, payload_digest)?
+        {
+            return Ok(binding_of(&hosted.manifest));
+        }
+        if !previous.matches(&hosted.manifest) {
+            return Err("supervisor binding mismatch".into());
+        }
+        if hosted.manifest.binding_expires_unix > unix_now() {
+            return Err("supervisor binding has not expired".into());
+        }
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
+        let mut next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            next_owner_principal,
+            next_epoch,
+            next_binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.validate_runtime_lifetimes(unix_now())?;
+        next.record_transition(transition_id, payload_digest)?;
+        hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
+    /// Receipt-aware exact renewal: owner and epoch stay fixed, capability
+    /// expiry and nonce rotate atomically, and stale write facts are invalid.
+    pub async fn renew_idempotent(
+        &self,
+        previous: &SupervisorBinding,
+        next_binding_expires_unix: i64,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        if hosted
+            .manifest
+            .matches_transition(transition_id, payload_digest)?
+        {
+            return Ok(binding_of(&hosted.manifest));
+        }
+        exact(previous, &hosted.manifest)?;
+        let mut next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            hosted.manifest.owner_principal.clone(),
+            hosted.manifest.controller_epoch,
+            next_binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.validate_runtime_lifetimes(unix_now())?;
+        next.record_transition(transition_id, payload_digest)?;
+        hosted.spool.renew_manifest(next.clone())?;
         hosted.manifest = next.clone();
         Ok(binding_of(&next))
     }
@@ -557,6 +714,66 @@ mod tests {
             .await
             .is_err());
         state.terminate(&first).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detach_claim_and_renew_are_exact_and_idempotent() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let active = state
+            .spawn(
+                HostManifest::new(
+                    "ses_lifecycle",
+                    "dev",
+                    "ws",
+                    "owner_a",
+                    1,
+                    unix_now() + 60,
+                    unix_now() + 600,
+                )
+                .unwrap(),
+                shell_command(),
+                PtySize::default(),
+            )
+            .await
+            .unwrap();
+        let detached = state
+            .detach_idempotent(&active, 2, "tr_detach", "d_detach")
+            .await
+            .unwrap();
+        assert!(state.write(&detached, b"no").await.is_err());
+        assert_eq!(
+            detached,
+            state
+                .detach_idempotent(&active, 2, "tr_detach", "d_detach")
+                .await
+                .unwrap()
+        );
+        let claimed = state
+            .claim_idempotent(
+                &detached,
+                "owner_b",
+                3,
+                unix_now() + 60,
+                "tr_claim",
+                "d_claim",
+            )
+            .await
+            .unwrap();
+        let renewed = state
+            .renew_idempotent(&claimed, unix_now() + 60, "tr_renew", "d_renew")
+            .await
+            .unwrap();
+        assert_ne!(renewed.host_nonce, claimed.host_nonce);
+        assert!(state.write(&claimed, b"stale").await.is_err());
+        assert_eq!(
+            renewed,
+            state
+                .renew_idempotent(&claimed, unix_now() + 60, "tr_renew", "d_renew")
+                .await
+                .unwrap()
+        );
+        state.terminate(&renewed).await.unwrap();
     }
 
     fn shell_command() -> PtyCommand {

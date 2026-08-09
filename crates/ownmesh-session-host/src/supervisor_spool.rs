@@ -268,6 +268,28 @@ impl OwnerSpool {
         Ok(())
     }
 
+    /// Atomically replace controller capability facts without advancing the
+    /// epoch. This is reserved for exact active-controller renewal; all other
+    /// transitions must use [`Self::rotate_manifest`] and advance generation.
+    pub fn renew_manifest(&mut self, next: HostManifest) -> Result<(), String> {
+        next.validate()?;
+        if next.session_id != self.manifest.session_id
+            || next.device_id != self.manifest.device_id
+            || next.workspace_id != self.manifest.workspace_id
+            || next.owner_principal != self.manifest.owner_principal
+            || next.controller_epoch != self.manifest.controller_epoch
+            || !next.controller_attached
+        {
+            return Err("supervisor renewal identity cannot change".into());
+        }
+        let bytes = serde_json::to_vec(&next)
+            .map_err(|e| format!("encode renewed supervisor manifest: {e}"))?;
+        atomic_write_owner_only(&self.dir.join(MANIFEST_FILE), &bytes)
+            .map_err(|e| format!("renew supervisor manifest: {e}"))?;
+        self.manifest = next;
+        Ok(())
+    }
+
     /// Atomically append bounded output. Dropping head bytes increments the
     /// durable absolute base offset, so cursors never rewind into different data.
     pub fn append(&self, bytes: &[u8]) -> Result<(), String> {
