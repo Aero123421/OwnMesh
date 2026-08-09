@@ -29,11 +29,24 @@ pub struct WindowsJobRunner {
     staging_dir: PathBuf,
     active: Arc<Mutex<BTreeMap<String, ActiveExecution>>>,
     stopping: Arc<AtomicBool>,
+    #[cfg(test)]
+    before_resume: Arc<Mutex<Option<TestBeforeResumeGate>>>,
 }
 
 struct ActiveExecution {
     request_id: String,
     cancelled: Arc<AtomicBool>,
+    /// Serializes the one-way transition from a suspended, contained child to
+    /// `ResumeThread` with cancellation.  A Cancel which linearizes first
+    /// must never allow that child to begin executing.
+    launch_gate: Arc<Mutex<()>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestBeforeResumeGate {
+    reached: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
 }
 
 impl WindowsJobRunner {
@@ -57,7 +70,14 @@ impl WindowsJobRunner {
             staging_dir: canonical,
             active: Arc::new(Mutex::new(BTreeMap::new())),
             stopping: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            before_resume: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    fn set_before_resume_gate(&self, gate: TestBeforeResumeGate) {
+        *self.before_resume.lock().unwrap() = Some(gate);
     }
 }
 
@@ -70,12 +90,14 @@ impl WindowsBrokerRunner for WindowsJobRunner {
             );
         }
         let cancellation = Arc::new(AtomicBool::new(false));
+        let launch_gate = Arc::new(Mutex::new(()));
         let registered = self.active.lock().map(|mut active| {
             active.insert(
                 request.nonce.clone(),
                 ActiveExecution {
                     request_id: request.request_id.clone(),
                     cancelled: Arc::clone(&cancellation),
+                    launch_gate: Arc::clone(&launch_gate),
                 },
             );
             // Close the tiny race between the first stop fence and this
@@ -91,7 +113,7 @@ impl WindowsBrokerRunner for WindowsJobRunner {
                 "Windows active execution lock poisoned".into(),
             );
         }
-        let result = self.run_checked(request, &cancellation);
+        let result = self.run_checked(request, &cancellation, &launch_gate);
         if let Ok(mut active) = self.active.lock() {
             active.remove(&request.nonce);
         }
@@ -111,7 +133,16 @@ impl WindowsBrokerRunner for WindowsJobRunner {
         if execution.request_id != request_id {
             return false;
         }
-        execution.cancelled.store(true, Ordering::Release);
+        let cancellation = Arc::clone(&execution.cancelled);
+        let launch_gate = Arc::clone(&execution.launch_gate);
+        drop(active);
+        // This establishes an exact linearization point with `resume`: if the
+        // child has not yet started, it remains suspended and its private Job
+        // is dropped instead of executing even one instruction.
+        let _launch = launch_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cancellation.store(true, Ordering::Release);
         true
     }
 
@@ -120,10 +151,23 @@ impl WindowsBrokerRunner for WindowsJobRunner {
         let Ok(active) = self.active.lock() else {
             return 0;
         };
-        for execution in active.values() {
-            execution.cancelled.store(true, Ordering::Release);
+        let executions = active
+            .values()
+            .map(|execution| {
+                (
+                    Arc::clone(&execution.cancelled),
+                    Arc::clone(&execution.launch_gate),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(active);
+        for (cancellation, launch_gate) in &executions {
+            let _launch = launch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cancellation.store(true, Ordering::Release);
         }
-        active.len()
+        executions.len()
     }
 }
 
@@ -132,6 +176,7 @@ impl WindowsJobRunner {
         &self,
         request: &BrokerRequestV2,
         cancellation: &Arc<AtomicBool>,
+        launch_gate: &Arc<Mutex<()>>,
     ) -> Result<BrokerResponseV2, String> {
         let facts = &request.facts;
         if facts.canonical_cwd.is_some() || !facts.sanitized_env.is_empty() || facts.argv.is_empty()
@@ -142,9 +187,16 @@ impl WindowsJobRunner {
         if facts.max_output_bytes == 0 || facts.max_output_bytes > MAX_BROKER_OUTPUT_BYTES {
             return Err("Windows runner output bound is invalid".into());
         }
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(cancelled_before_launch_response(&request.request_id));
+        }
         let staged = stage_pinned_executable(request, &self.staging_dir)?;
         let staged_path = staged.path.clone();
-        let result = self.run_staged(request, &staged, cancellation);
+        let result = if cancellation.load(Ordering::Acquire) {
+            Ok(cancelled_before_launch_response(&request.request_id))
+        } else {
+            self.run_staged(request, &staged, cancellation, launch_gate)
+        };
         // The broker created this exact unique path. Best-effort cleanup occurs
         // after the retained stage handle and Job have been dropped.
         drop(staged);
@@ -161,7 +213,11 @@ impl WindowsJobRunner {
         request: &BrokerRequestV2,
         staged: &StagedWindowsExecutable,
         cancellation: &Arc<AtomicBool>,
+        launch_gate: &Arc<Mutex<()>>,
     ) -> Result<BrokerResponseV2, String> {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(cancelled_before_launch_response(&request.request_id));
+        }
         let facts = &request.facts;
         recheck_retained_stage(
             staged,
@@ -185,10 +241,44 @@ impl WindowsJobRunner {
             std::thread::spawn(move || drain_pipe_bounded(stdout, output_limit, &stdout_signal));
         let stderr_reader =
             std::thread::spawn(move || drain_pipe_bounded(stderr, output_limit, &stderr_signal));
-        process
-            .resume()
-            .map_err(|error| format!("resume contained Windows child: {error}"))?;
-
+        #[cfg(test)]
+        if let Some(gate) = self.before_resume.lock().unwrap().clone() {
+            gate.reached.wait();
+            gate.release.wait();
+        }
+        let resumed = {
+            // Hold this gate across the final cancellation check and
+            // `ResumeThread`. `cancel`/`cancel_all` take the same gate, so a
+            // cancellation which arrives first cannot race a suspended child
+            // into execution.
+            let _launch = launch_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cancellation.load(Ordering::Acquire) {
+                false
+            } else {
+                process
+                    .resume()
+                    .map_err(|error| format!("resume contained Windows child: {error}"))?;
+                true
+            }
+        };
+        if !resumed {
+            // The child was never resumed. Dropping its private kill-on-close
+            // Job closes the inherited writers so the already-started drains
+            // terminate before this runner returns.
+            process
+                .terminate_and_wait(KILL_WAIT)
+                .map_err(|error| format!("terminate unresumed Windows Job: {error}"))?;
+            drop(process);
+            let _ = stdout_reader
+                .join()
+                .map_err(|_| "Windows stdout drain thread panicked")?;
+            let _ = stderr_reader
+                .join()
+                .map_err(|_| "Windows stderr drain thread panicked")?;
+            return Ok(cancelled_before_launch_response(&request.request_id));
+        }
         let started = Instant::now();
         let mut timed_out = false;
         let mut cancelled = false;
@@ -434,6 +524,21 @@ fn response_error(request_id: &str, error: String) -> BrokerResponseV2 {
     }
 }
 
+fn cancelled_before_launch_response(request_id: &str) -> BrokerResponseV2 {
+    BrokerResponseV2 {
+        request_id: request_id.into(),
+        ok: false,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: Some("broker execution cancelled before Windows Job launch".into()),
+        timed_out: false,
+        cancelled: true,
+        truncated: false,
+        duration_ms: 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +615,41 @@ mod tests {
         let response = task.join().unwrap();
         assert!(response.cancelled, "{response:?}");
         assert!(!response.ok, "{response:?}");
+    }
+
+    #[test]
+    fn cancel_before_resume_never_starts_the_contained_child() {
+        let Some(request) = long_running_ping_request("cancel-before-resume") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let runner = WindowsJobRunner::new(dir.path()).unwrap();
+        let gate = TestBeforeResumeGate {
+            reached: Arc::new(std::sync::Barrier::new(2)),
+            release: Arc::new(std::sync::Barrier::new(2)),
+        };
+        runner.set_before_resume_gate(gate.clone());
+        let executing = runner.clone();
+        let request_for_thread = request.clone();
+        let task = std::thread::spawn(move || executing.run(&request_for_thread));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if runner.active.lock().is_ok_and(|active| !active.is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(runner.active.lock().is_ok_and(|active| !active.is_empty()));
+        gate.reached.wait();
+        assert!(runner.cancel(&request.request_id, &request.nonce));
+        gate.release.wait();
+        let response = task.join().unwrap();
+        assert!(response.cancelled, "{response:?}");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("broker execution cancelled before Windows Job launch")
+        );
+        assert!(runner.active.lock().unwrap().is_empty());
     }
 
     #[test]

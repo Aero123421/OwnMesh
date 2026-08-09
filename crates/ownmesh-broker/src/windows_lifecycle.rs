@@ -5,8 +5,9 @@
 //! daemon/runtime client integration is a separate authority-bearing change.
 
 use crate::{
-    load_windows_daemon_trust_record, InstallRecord, InstallStatus, WindowsDurableReplayLedger,
-    WindowsJobRunner, WindowsProductionBrokerServer,
+    load_windows_daemon_trust_record, InstallRecord, InstallStatus, WindowsBrokerRunner,
+    WindowsDurableReplayLedger, WindowsJobRunner, WindowsPeerAuthorizer,
+    WindowsProductionBrokerServer, WindowsReplayLedger,
 };
 use ownmesh_broker_client::{
     BrokerEndpoint, BrokerSecret, CapabilitySigningKey, WindowsBrokerTrust,
@@ -20,7 +21,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
@@ -58,7 +59,8 @@ use windows_sys::Win32::System::Services::{
     SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
     SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
+    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::{
@@ -79,6 +81,8 @@ const BROKER_SECRET_BYTES: usize = 32;
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SERVICE_STATUS_HANDLE_RAW: AtomicIsize = AtomicIsize::new(0);
+static STOP_CHECKPOINT: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -2142,6 +2146,75 @@ pub fn load_windows_daemon_broker_client(
     })
 }
 
+fn report_windows_stop_pending() {
+    let raw = SERVICE_STATUS_HANDLE_RAW.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    let checkpoint = STOP_CHECKPOINT
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    let status = SERVICE_STATUS {
+        dwServiceType: SERVICE_WIN32_OWN_PROCESS,
+        dwCurrentState: SERVICE_STOP_PENDING,
+        dwControlsAccepted: 0,
+        dwWin32ExitCode: 0,
+        dwServiceSpecificExitCode: 0,
+        dwCheckPoint: checkpoint,
+        dwWaitHint: WAIT_LIMIT.as_millis().try_into().unwrap_or(u32::MAX),
+    };
+    // SAFETY: the SCM callback publishes the handle only while `service_main`
+    // owns it, and clears it immediately before returning from that function.
+    let _ = unsafe { SetServiceStatus(raw as SERVICE_STATUS_HANDLE, &raw const status) };
+}
+
+pub(crate) async fn shutdown_and_drain_windows_broker<A, L, R>(
+    server: &Arc<WindowsProductionBrokerServer<A, L, R>>,
+    connections: &mut JoinSet<Result<(), String>>,
+) -> Result<(), String>
+where
+    A: WindowsPeerAuthorizer + 'static,
+    L: WindowsReplayLedger + 'static,
+    R: WindowsBrokerRunner + 'static,
+{
+    // This must happen on every exit path, including a broken pipe factory or
+    // a handler panic. Dropping a JoinSet aborts async handlers but does not
+    // stop their `spawn_blocking` Windows Job calls.
+    server.begin_shutdown();
+    report_windows_stop_pending();
+    let deadline = Instant::now() + WAIT_LIMIT;
+    let mut panic_error = None;
+    while !connections.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            connections.abort_all();
+            return Err("Windows broker Jobs did not terminate before SCM stop deadline".into());
+        }
+        let slice = remaining.min(Duration::from_secs(1));
+        match tokio::time::timeout(slice, connections.join_next()).await {
+            Ok(Some(Ok(Ok(()) | Err(_)))) => {
+                // Connection-local failures (notably a peer that disconnected
+                // during its response write) are already fenced by the runner
+                // and must not stop unrelated service traffic.
+            }
+            Ok(Some(Err(error))) => {
+                // Keep draining after a panic: the durable reservation remains
+                // Reserved/uncertain and `cancel_all` has fenced every Job.
+                panic_error.get_or_insert_with(|| {
+                    format!("Windows broker connection task panicked: {error}")
+                });
+            }
+            Ok(None) => break,
+            Err(_) => report_windows_stop_pending(),
+        }
+    }
+    if let Some(error) = panic_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
 async fn run_windows_broker_service(
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
@@ -2196,41 +2269,48 @@ async fn run_windows_broker_service(
     let server = Arc::new(server);
     let mut connections = JoinSet::new();
     let mut stop_poll = tokio::time::interval(Duration::from_millis(200));
-    loop {
+    let serve_result = loop {
         tokio::select! {
             joined = connections.join_next(), if !connections.is_empty() => {
-                // A peer may disconnect after submitting its frame. That is a
-                // per-connection outcome (the handler fences the Job and
-                // finalizes its ledger); it must not take down the SCM broker.
                 if let Some(Err(error)) = joined {
-                    return Err(format!("Windows broker connection task panicked: {error}"));
+                    // Do not return early: all surviving Jobs must first be
+                    // fenced and drained by the common shutdown path below.
+                    break Err(format!("Windows broker connection task panicked: {error}"));
                 }
             }
             accepted = server.accept_connection() => {
-                let connection = accepted?;
-                let server = Arc::clone(&server);
-                connections.spawn(async move { server.serve_connection(connection).await });
+                match accepted {
+                    Ok(connection) => match server.try_acquire_connection_permit() {
+                        Ok(permit) => {
+                            let server = Arc::clone(&server);
+                            connections.spawn(async move {
+                                server.serve_connection_with_permit(connection, permit).await
+                            });
+                        }
+                        Err(_) => {
+                            // Admission is full. Closing this unactioned pipe is
+                            // bounded; never spawn a task merely to wait for a
+                            // peer that may refuse to read a `busy` response.
+                            drop(connection);
+                        }
+                    },
+                    Err(error) => break Err(error),
+                }
             }
-            _ = stop_poll.tick() => if STOP_REQUESTED.load(Ordering::Acquire) { break; },
+            _ = stop_poll.tick() => if STOP_REQUESTED.load(Ordering::Acquire) { break Ok(()); },
         }
-    }
-    server.begin_shutdown();
-    let drain = async {
-        while let Some(joined) = connections.join_next().await {
-            if let Err(error) = joined {
-                return Err(format!("Windows broker shutdown task panicked: {error}"));
-            }
-        }
-        Ok(())
     };
-    tokio::time::timeout(WAIT_LIMIT, drain)
-        .await
-        .map_err(|_| "Windows broker Jobs did not terminate before SCM stop deadline".to_string())?
+    let drain_result = shutdown_and_drain_windows_broker(&server, &mut connections).await;
+    match (serve_result, drain_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 unsafe extern "system" fn service_control(control: u32) {
     if control == SERVICE_CONTROL_STOP {
         STOP_REQUESTED.store(true, Ordering::Release);
+        report_windows_stop_pending();
     }
 }
 
@@ -2240,6 +2320,8 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     if handle.is_null() {
         return;
     }
+    SERVICE_STATUS_HANDLE_RAW.store(handle as isize, Ordering::Release);
+    STOP_CHECKPOINT.store(0, Ordering::Release);
     let mut status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: SERVICE_START_PENDING,
@@ -2285,6 +2367,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         status.dwWin32ExitCode = 1;
     }
     let _ = SetServiceStatus(handle, &status);
+    SERVICE_STATUS_HANDLE_RAW.store(0, Ordering::Release);
 }
 
 /// Enter the SCM dispatcher. This may only be called by SCM's process launch;

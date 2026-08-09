@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 const MAX_TRUST_RECORD_BYTES: u64 = 64 * 1024;
 /// Bound all accepted pipe handlers, including clients which never finish a
@@ -27,6 +27,7 @@ const MAX_TRUST_RECORD_BYTES: u64 = 64 * 1024;
 /// Cancel can still reach a running Job at saturation.
 const MAX_WINDOWS_BROKER_CONNECTIONS: usize = 16;
 const MAX_WINDOWS_EXECUTE_CONCURRENCY: usize = MAX_WINDOWS_BROKER_CONNECTIONS - 1;
+const WINDOWS_RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Immutable fields recorded by the elevated installer after it has copied the
 /// daemon image into the Admin-controlled installation root. `image_file_id`
@@ -209,15 +210,31 @@ where
     /// dropped handler would detach the blocking Windows Job task.
     pub async fn serve_connection(
         &self,
-        mut connection: ownmesh_ipc::ServerConnection,
+        connection: ownmesh_ipc::ServerConnection,
     ) -> Result<(), String> {
-        let permit = self
-            .connection_concurrency
+        let permit = self.try_acquire_connection_permit()?;
+        self.serve_connection_with_permit(connection, permit).await
+    }
+
+    /// Acquire a bounded admission slot before a connection becomes a handler
+    /// task.  The service loop drops an over-capacity pipe immediately rather
+    /// than creating an unbounded collection of tasks waiting to reply `busy`.
+    pub(crate) fn try_acquire_connection_permit(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.connection_concurrency
             .clone()
             .try_acquire_owned()
-            .map_err(|_| "Windows broker busy (bounded concurrency)".to_string())?;
+            .map_err(|_| "Windows broker busy (bounded concurrency)".to_string())
+    }
+
+    /// Handle one already-admitted connection.  The caller keeps `permit`
+    /// alive through the bounded response write: a peer which never reads a
+    /// response cannot leave an unbounded set of pipe handles/tasks behind.
+    pub(crate) async fn serve_connection_with_permit(
+        &self,
+        mut connection: ownmesh_ipc::ServerConnection,
+        _permit: OwnedSemaphorePermit,
+    ) -> Result<(), String> {
         let response = self.handle_connection(&mut connection).await;
-        drop(permit);
         write_windows_response(&mut connection, &response).await
     }
 
@@ -488,11 +505,13 @@ async fn write_windows_response(
 ) -> Result<(), String> {
     let mut line = serde_json::to_vec(response).map_err(|error| error.to_string())?;
     line.push(b'\n');
-    connection
-        .write_all(&line)
-        .await
-        .map_err(|error| error.to_string())?;
-    connection.flush().await.map_err(|error| error.to_string())
+    tokio::time::timeout(WINDOWS_RESPONSE_WRITE_TIMEOUT, async {
+        connection.write_all(&line).await?;
+        connection.flush().await
+    })
+    .await
+    .map_err(|_| "Windows broker response write timed out".to_string())?
+    .map_err(|error| error.to_string())
 }
 
 fn reject_windows_external_action(
@@ -871,9 +890,11 @@ mod tests {
         }
     }
 
+    type TestActiveExecutions = BTreeMap<String, (String, Arc<AtomicBool>)>;
+
     #[derive(Clone, Default)]
     struct BlockingRunner {
-        active: Arc<Mutex<BTreeMap<String, (String, Arc<AtomicBool>)>>>,
+        active: Arc<Mutex<TestActiveExecutions>>,
         started: Arc<Notify>,
     }
 
@@ -914,9 +935,21 @@ mod tests {
             cancelled.store(true, Ordering::Release);
             true
         }
+
+        fn cancel_all(&self) -> usize {
+            let active = self.active.lock().unwrap();
+            for (_, cancelled) in active.values() {
+                cancelled.store(true, Ordering::Release);
+            }
+            active.len()
+        }
     }
 
     fn test_execute(secret: &BrokerSecret) -> ExecuteIntentV2 {
+        test_execute_named(secret, "concurrent-execute")
+    }
+
+    fn test_execute_named(secret: &BrokerSecret, name: &str) -> ExecuteIntentV2 {
         let now = crate::now_unix();
         let executable = std::fs::canonicalize(
             PathBuf::from(std::env::var_os("SystemRoot").unwrap())
@@ -926,13 +959,13 @@ mod tests {
         .unwrap();
         let mut execute = ExecuteIntentV2 {
             protocol_version: BROKER_PROTOCOL_V2,
-            request_id: "concurrent-execute".into(),
-            operation_id: "concurrent-execute".into(),
-            nonce: "concurrent-execute-nonce".into(),
+            request_id: name.into(),
+            operation_id: name.into(),
+            nonce: format!("{name}-nonce"),
             issued_at_unix: now,
             expires_at_unix: now + 30,
             facts: OperationFactsV2 {
-                operation: "concurrent-execute".into(),
+                operation: name.into(),
                 remote_payload_sha256: "a".repeat(64),
                 principal_id: "test-principal".into(),
                 tenant_id: "test-tenant".into(),
@@ -1049,6 +1082,110 @@ mod tests {
         assert!(execute_response.cancelled, "{execute_response:?}");
         cancel_task.await.unwrap();
         execute_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_cancel_slot_survives_fifteen_running_execute_jobs() {
+        let endpoint = Endpoint::NamedPipe(format!(
+            r"\\.\pipe\ownmesh-broker-cancel-reserve-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let secret = BrokerSecret::generate();
+        let runner = BlockingRunner::default();
+        let server = test_server(&endpoint, secret.clone(), runner.clone()).await;
+        let mut execute_clients = Vec::new();
+        let mut execute_tasks = Vec::new();
+        let mut first = None;
+        for index in 0..MAX_WINDOWS_EXECUTE_CONCURRENCY {
+            let execute = test_execute_named(&secret, &format!("saturated-execute-{index}"));
+            if first.is_none() {
+                first = Some(execute.clone());
+            }
+            let execute_server = Arc::clone(&server);
+            execute_tasks.push(tokio::spawn(async move {
+                let connection = execute_server.accept_connection().await.unwrap();
+                execute_server.serve_connection(connection).await
+            }));
+            let mut client = ownmesh_ipc::connect(&endpoint).await.unwrap();
+            write_intent(&mut client, BrokerWireIntentV2::Execute(execute)).await;
+            execute_clients.push(client);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if runner.active.lock().unwrap().len() == MAX_WINDOWS_EXECUTE_CONCURRENCY {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "all execute Jobs must be active before testing reserved Cancel slot (active={})",
+                runner.active.lock().unwrap().len()
+            )
+        });
+
+        let target = first.expect("first execute exists");
+        let cancel_server = Arc::clone(&server);
+        let cancel_task = tokio::spawn(async move {
+            let connection = cancel_server.accept_connection().await.unwrap();
+            cancel_server.serve_connection(connection).await
+        });
+        let cancel = build_cancel_intent_v2(&secret, &target, crate::now_unix());
+        let mut cancel_client = ownmesh_ipc::connect(&endpoint).await.unwrap();
+        write_intent(&mut cancel_client, BrokerWireIntentV2::Cancel(cancel)).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_response(&mut cancel_client),
+        )
+        .await
+        .expect("Cancel must be admitted while all execute slots are occupied");
+        assert!(response.cancelled, "{response:?}");
+        let first_response = read_response(&mut execute_clients.remove(0)).await;
+        assert!(first_response.cancelled, "{first_response:?}");
+        cancel_task.await.unwrap().unwrap();
+
+        server.begin_shutdown();
+        for task in execute_tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert!(runner.active.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn common_service_cleanup_fences_a_live_job_before_dropping_handlers() {
+        let endpoint = Endpoint::NamedPipe(format!(
+            r"\\.\pipe\ownmesh-broker-shutdown-drain-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let secret = BrokerSecret::generate();
+        let runner = BlockingRunner::default();
+        let server = test_server(&endpoint, secret.clone(), runner.clone()).await;
+        let execute = test_execute(&secret);
+        let handler_server = Arc::clone(&server);
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async move {
+            let connection = handler_server.accept_connection().await.unwrap();
+            handler_server.serve_connection(connection).await
+        });
+        let mut client = ownmesh_ipc::connect(&endpoint).await.unwrap();
+        write_intent(&mut client, BrokerWireIntentV2::Execute(execute)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.notified())
+            .await
+            .expect("execute must be active before the common cleanup path runs");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::windows_lifecycle::shutdown_and_drain_windows_broker(&server, &mut connections),
+        )
+        .await
+        .expect("common cleanup must wait for the fenced Job")
+        .expect("common cleanup must finish after cancelling the live Job");
+        assert!(connections.is_empty());
+        assert!(runner.active.lock().unwrap().is_empty());
+        let response = read_response(&mut client).await;
+        assert!(response.cancelled, "{response:?}");
     }
 
     #[tokio::test]
