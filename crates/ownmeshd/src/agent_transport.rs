@@ -2699,10 +2699,18 @@ fn map_request_to_method(
             return Err("arguments idempotency_key differs from operation contract".into());
         }
     }
-    args.insert(
-        "idempotency_key".into(),
-        Value::String(request.idempotency_key.clone()),
-    );
+    // The private transfer admission methods do not use the generic local
+    // side-effect journal and deliberately expose strict, ticket/plan-bound
+    // parameter schemas.  Still validate any duplicate arguments-side key
+    // above, but do not leak the transport contract field into those schemas.
+    if internal_preflight || internal_start {
+        args.remove("idempotency_key");
+    } else {
+        args.insert(
+            "idempotency_key".into(),
+            Value::String(request.idempotency_key.clone()),
+        );
+    }
     Ok((method, Value::Object(args)))
 }
 
@@ -4621,6 +4629,13 @@ mod tests {
         let (method, args) = map_request_to_method(&request).unwrap();
         assert_eq!(method, methods::TRANSFER_PREFLIGHT_SOURCE);
         assert_eq!(args["destination_device_id"], json!("dev_destination"));
+        assert!(args.get("idempotency_key").is_none());
+
+        let mut mismatched_preflight = request.clone();
+        mismatched_preflight.arguments["idempotency_key"] = json!("other-contract");
+        assert!(map_request_to_method(&mismatched_preflight)
+            .unwrap_err()
+            .contains("differs from operation contract"));
 
         let mut normal = request;
         normal.capability = "transfer.plan".into();
@@ -4654,6 +4669,7 @@ mod tests {
         assert_eq!(method, "transfer.start");
         assert_eq!(args["source_device_id"], json!("dev_source"));
         assert_eq!(args["grant_id"], json!("xfer_start_1"));
+        assert!(args.get("idempotency_key").is_none());
 
         start.authorization = None;
         let error = map_request_to_method(&start).unwrap_err();
