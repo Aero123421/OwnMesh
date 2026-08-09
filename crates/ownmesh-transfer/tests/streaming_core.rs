@@ -30,7 +30,7 @@ fn grant() -> TransferGrant {
         grant_id: "grant-1".into(),
         operation_id: "operation-1".into(),
         payload_sha256: "a".repeat(64),
-        expires_at_unix: 10_000,
+        expires_at_unix: u64::MAX,
     }
 }
 
@@ -267,5 +267,54 @@ fn relative_paths_and_generic_nonempty_resume_fail_closed() {
     assert!(matches!(
         TransferReceiver::resume_from_reader(plan, receiver.journal_snapshot(), &mut cursor),
         Err(TransferError::Terminal)
+    ));
+}
+
+#[test]
+fn expired_grants_are_rejected_at_every_live_side_effect_boundary() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.bin");
+    std::fs::write(&source, b"x").unwrap();
+    let mut expired_grant = grant();
+    expired_grant.expires_at_unix = 1;
+    let expired = TransferPlan::from_verified(binding(), expired_grant, 1, digest(b"x")).unwrap();
+    assert!(matches!(
+        TransferSender::open(expired.clone(), &source),
+        Err(TransferError::InvalidPlan(_))
+    ));
+    assert!(matches!(
+        TransferReceiver::new(expired.clone(), "owner-a", 1, 1, 9_000),
+        Err(TransferError::InvalidPlan(_))
+    ));
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    assert!(matches!(
+        PartFileSink::create(&store, &expired, 1, 0),
+        Err(TransferError::InvalidPlan(_))
+    ));
+}
+
+#[test]
+fn substituted_private_part_and_stale_lock_are_never_reused() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"x");
+    let root = dir.path().join("state");
+    let store = JournalStore::open(&root, JournalLimits::default()).unwrap();
+    let sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+    let part = sink.path().to_path_buf();
+    drop(sink);
+    std::fs::remove_file(&part).unwrap();
+    std::fs::create_dir(&part).unwrap();
+    assert!(matches!(
+        PartFileSink::create(&store, &plan, 1, 0),
+        Err(TransferError::CustodyUnavailable)
+    ));
+
+    let lock = root.join(format!(".{}.lock", plan.id()));
+    std::fs::write(&lock, format!("{}\n1\n", plan.id())).unwrap();
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    assert!(matches!(
+        store.acquire(&plan, 2, 9_000),
+        Err(TransferError::LeaseBusy)
     ));
 }

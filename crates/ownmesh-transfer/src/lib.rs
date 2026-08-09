@@ -19,14 +19,16 @@
 )]
 
 use ownmesh_ipc::{
-    atomic_write_owner_only, create_owner_only_file_new, prepare_owner_only_state_dir,
-    read_owner_only_file_bounded,
+    atomic_write_owner_only, create_owner_only_file_new, open_owner_only_file_append,
+    open_owner_only_file_read, prepare_owner_only_state_dir, publish_owner_only_file_no_replace,
+    read_owner_only_file_bounded, remove_owner_only_file,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Maximum payload held by the transfer core at once.
@@ -138,6 +140,13 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 fn hash_reader(reader: &mut impl Read, max_bytes: u64) -> TransferResult<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
@@ -218,6 +227,15 @@ impl TransferGrant {
         validate_hash(&self.payload_sha256, "grant payload_sha256")?;
         if self.expires_at_unix == 0 {
             return Err(TransferError::InvalidBinding("grant expiry".into()));
+        }
+        Ok(())
+    }
+
+    /// Verify this authenticated grant at a live side-effect boundary.
+    pub fn validate_at(&self, now_unix: u64) -> TransferResult<()> {
+        self.validate()?;
+        if self.expires_at_unix <= now_unix {
+            return Err(TransferError::InvalidPlan("expired transfer grant".into()));
         }
         Ok(())
     }
@@ -335,6 +353,12 @@ impl TransferPlan {
             return Err(TransferError::InvalidPlan("plan binding digest".into()));
         }
         Ok(())
+    }
+
+    /// Verify immutable metadata and that its authenticated grant is still live.
+    pub fn validate_at(&self, now_unix: u64) -> TransferResult<()> {
+        self.validate()?;
+        self.grant.validate_at(now_unix)
     }
 
     #[must_use]
@@ -488,7 +512,7 @@ pub struct TransferSender {
 
 impl TransferSender {
     pub fn open(plan: TransferPlan, source: &Path) -> TransferResult<Self> {
-        plan.validate()?;
+        plan.validate_at(now_unix())?;
         validate_source_custody(source)?;
         let metadata = fs::metadata(source).map_err(io_error)?;
         if metadata.len() != plan.size_bytes {
@@ -508,6 +532,7 @@ impl TransferSender {
     }
 
     pub fn next_chunk(&mut self) -> TransferResult<Option<TransferChunk>> {
+        self.plan.validate_at(now_unix())?;
         if self.done {
             return Ok(None);
         }
@@ -674,7 +699,7 @@ impl TransferReceiver {
         fence: u64,
         expires_at_unix: u64,
     ) -> TransferResult<Self> {
-        plan.validate()?;
+        plan.validate_at(now_unix())?;
         let journal = TransferJournal::fresh(&plan, owner_id, epoch, fence, expires_at_unix)?;
         Ok(Self {
             plan,
@@ -693,7 +718,7 @@ impl TransferReceiver {
         journal: TransferJournal,
         reader: &mut impl Read,
     ) -> TransferResult<Self> {
-        plan.validate()?;
+        plan.validate_at(now_unix())?;
         journal.validate_for(&plan)?;
         if journal.state.terminal() {
             return Err(TransferError::Terminal);
@@ -732,8 +757,9 @@ impl TransferReceiver {
         journal: TransferJournal,
         part: &Path,
     ) -> TransferResult<Self> {
-        plan.validate()?;
-        let mut file = File::open(part).map_err(io_error)?;
+        plan.validate_at(now_unix())?;
+        let mut file =
+            open_owner_only_file_read(part).map_err(|_| TransferError::CustodyUnavailable)?;
         let bytes = file.metadata().map_err(io_error)?.len();
         if bytes != journal.bytes_received {
             return Err(TransferError::CorruptJournal);
@@ -770,6 +796,7 @@ impl TransferReceiver {
         sink: &mut impl ChunkSink,
         chunk: TransferChunk,
     ) -> TransferResult<()> {
+        self.plan.validate_at(now_unix())?;
         if self.journal.state.terminal() || self.in_flight {
             return Err(TransferError::Terminal);
         }
@@ -822,6 +849,7 @@ impl TransferReceiver {
     }
 
     pub fn cancel(&mut self, sink: &mut impl ChunkSink) -> TransferResult<()> {
+        self.plan.validate_at(now_unix())?;
         if self.journal.state.terminal() {
             return Err(TransferError::Terminal);
         }
@@ -905,7 +933,7 @@ impl JournalStore {
         now_unix: u64,
         expires_at_unix: u64,
     ) -> TransferResult<JournalLease> {
-        plan.validate()?;
+        plan.validate_at(now_unix)?;
         if expires_at_unix <= now_unix {
             return Err(TransferError::Terminal);
         }
@@ -928,7 +956,7 @@ impl JournalStore {
             if !stale {
                 return Err(TransferError::LeaseBusy);
             }
-            fs::remove_file(&path).map_err(io_error)?;
+            remove_owner_only_file(&path).map_err(|_| TransferError::LeaseBusy)?;
             create_owner_only_file_new(&path, body.as_bytes())
                 .map_err(|_| TransferError::LeaseBusy)?;
             Ok(JournalLease {
@@ -938,7 +966,7 @@ impl JournalStore {
         }
     }
     pub fn load(&self, plan: &TransferPlan) -> TransferResult<Option<TransferJournal>> {
-        plan.validate()?;
+        plan.validate_at(now_unix())?;
         let path = self.path(plan.id(), ".json")?;
         if !path.exists() {
             return Ok(None);
@@ -960,7 +988,7 @@ impl JournalStore {
         now_unix: u64,
         expires_at_unix: u64,
     ) -> TransferResult<TransferJournal> {
-        plan.validate()?;
+        plan.validate_at(now_unix)?;
         if lease.plan_id != plan.id || expires_at_unix <= now_unix {
             return Err(TransferError::StaleFence);
         }
@@ -1044,9 +1072,9 @@ impl JournalStore {
                 if !metadata.is_file() || metadata.file_type().is_symlink() {
                     return Err(TransferError::CustodyUnavailable);
                 }
-                fs::remove_file(&part).map_err(io_error)?;
+                remove_owner_only_file(&part).map_err(|_| TransferError::CustodyUnavailable)?;
             }
-            fs::remove_file(journal_path).map_err(io_error)?;
+            remove_owner_only_file(&journal_path).map_err(|_| TransferError::CustodyUnavailable)?;
             removed += 1;
         }
         Ok(removed)
@@ -1057,10 +1085,11 @@ impl JournalStore {
 /// deletes only its exact generated part on cancellation.
 pub struct PartFileSink {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
     expected_offset: u64,
     expected_size: u64,
     expected_sha256: String,
+    expires_at_unix: u64,
     closed: bool,
     verified: bool,
 }
@@ -1071,26 +1100,24 @@ impl PartFileSink {
         epoch: u64,
         resume_at: u64,
     ) -> TransferResult<Self> {
-        plan.validate()?;
+        plan.validate_at(now_unix())?;
         let path = store.path(plan.id(), &format!(".{epoch}.part"))?;
-        if !path.exists() {
-            create_owner_only_file_new(&path, &[])
-                .map_err(|_| TransferError::CustodyUnavailable)?;
+        if create_owner_only_file_new(&path, &[]).is_err() && !path.exists() {
+            return Err(TransferError::CustodyUnavailable);
         }
-        let meta = fs::symlink_metadata(&path).map_err(io_error)?;
-        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != resume_at {
+        let mut file =
+            open_owner_only_file_append(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+        if file.metadata().map_err(io_error)?.len() != resume_at {
             return Err(TransferError::CorruptJournal);
         }
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(io_error)?;
+        file.seek(SeekFrom::End(0)).map_err(io_error)?;
         Ok(Self {
             path,
-            file,
+            file: Some(file),
             expected_offset: resume_at,
             expected_size: plan.size_bytes,
             expected_sha256: plan.sha256.clone(),
+            expires_at_unix: plan.grant.expires_at_unix,
             closed: false,
             verified: false,
         })
@@ -1102,10 +1129,20 @@ impl PartFileSink {
 
     /// Publish only after this sink has streamed and verified the complete part.
     pub fn publish_no_replace(&mut self, destination: &Path) -> TransferResult<()> {
+        if self.expires_at_unix <= now_unix() {
+            return Err(TransferError::InvalidPlan("expired transfer grant".into()));
+        }
         if !self.verified {
             return Err(TransferError::HashMismatch);
         }
-        publish_part_no_replace(&self.path, destination)
+        let file = self.file.as_ref().ok_or(TransferError::Terminal)?;
+        publish_owner_only_file_no_replace(file, &self.path, destination).map_err(|error| {
+            if matches!(&error, ownmesh_ipc::IpcError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists) {
+                TransferError::DestinationExists
+            } else {
+                TransferError::CustodyUnavailable
+            }
+        })
     }
 }
 impl ChunkSink for PartFileSink {
@@ -1113,10 +1150,9 @@ impl ChunkSink for PartFileSink {
         if self.closed || offset != self.expected_offset || bytes.len() > MAX_CHUNK_BYTES {
             return Err("invalid part write".into());
         }
-        self.file
-            .write_all(bytes)
-            .map_err(|error| error.to_string())?;
-        self.file.sync_data().map_err(|error| error.to_string())?;
+        let file = self.file.as_mut().ok_or_else(|| "closed part".to_owned())?;
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.sync_data().map_err(|error| error.to_string())?;
         self.expected_offset = self
             .expected_offset
             .checked_add(u64::try_from(bytes.len()).map_err(|_| "overflow")?)
@@ -1124,13 +1160,18 @@ impl ChunkSink for PartFileSink {
         Ok(())
     }
     fn finalize(&mut self) -> Result<(), String> {
+        if self.expires_at_unix <= now_unix() {
+            return Err("expired transfer grant".into());
+        }
         if self.expected_offset != self.expected_size {
             return Err("incomplete part".into());
         }
-        self.file.sync_all().map_err(|error| error.to_string())?;
-        let mut verification = File::open(&self.path).map_err(|error| error.to_string())?;
-        let (bytes, sha256) = hash_reader(&mut verification, self.expected_size)
+        let file = self.file.as_mut().ok_or_else(|| "closed part".to_owned())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        file.seek(SeekFrom::Start(0))
             .map_err(|error| error.to_string())?;
+        let (bytes, sha256) =
+            hash_reader(file, self.expected_size).map_err(|error| error.to_string())?;
         if bytes != self.expected_size || sha256 != self.expected_sha256 {
             return Err("part hash mismatch".into());
         }
@@ -1139,26 +1180,10 @@ impl ChunkSink for PartFileSink {
     }
     fn cancel(&mut self) -> Result<(), String> {
         self.closed = true;
-        self.file.sync_all().map_err(|error| error.to_string())?;
-        fs::remove_file(&self.path).map_err(|error| error.to_string())
-    }
-}
-
-/// Atomically publish a verified private part without replacing an existing
-/// destination. A custody-aware integration must pass an already pinned,
-/// workspace-authorized destination path. Hard-link publication is no-replace on
-/// supported local filesystems; if unavailable it fails rather than copying.
-fn publish_part_no_replace(part: &Path, destination: &Path) -> TransferResult<()> {
-    let metadata = fs::symlink_metadata(part).map_err(io_error)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(TransferError::CustodyUnavailable);
-    }
-    match fs::hard_link(part, destination) {
-        Ok(()) => fs::remove_file(part).map_err(io_error),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(TransferError::DestinationExists)
-        }
-        Err(error) => Err(io_error(error)),
+        let file = self.file.take().ok_or_else(|| "closed part".to_owned())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+        remove_owner_only_file(&self.path).map_err(|error| error.to_string())
     }
 }
 

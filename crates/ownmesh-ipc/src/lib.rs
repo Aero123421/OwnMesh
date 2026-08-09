@@ -50,9 +50,10 @@ pub use endpoint::{Endpoint, IpcBus};
 pub use error::{IpcError, IpcResult};
 pub use frame::{read_frame, write_frame, FrameDecoder, MAX_FRAME_BYTES};
 pub use registry::{
-    atomic_write_owner_only, create_owner_only_file_new, prepare_owner_only_state_dir,
-    read_management_credential, read_owner_only_file_bounded, BootstrapStatus,
-    CLIENT_CREDENTIAL_ENV, MANAGEMENT_CREDENTIAL_FILE_NAME,
+    atomic_write_owner_only, create_owner_only_file_new, open_owner_only_file_append,
+    open_owner_only_file_read, prepare_owner_only_state_dir, publish_owner_only_file_no_replace,
+    read_management_credential, read_owner_only_file_bounded, remove_owner_only_file,
+    BootstrapStatus, CLIENT_CREDENTIAL_ENV, MANAGEMENT_CREDENTIAL_FILE_NAME,
 };
 pub use rpc::{
     app_error, methods, CredentialClientParams, CredentialProvisionParams, CredentialSecretResult,

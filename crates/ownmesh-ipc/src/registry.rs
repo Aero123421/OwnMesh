@@ -828,6 +828,52 @@ pub fn read_owner_only_file_bounded(path: &Path, max_bytes: usize) -> IpcResult<
     Ok(bytes)
 }
 
+/// Open an existing owner-only regular file through the no-follow custody path.
+/// The returned handle is pinned to the attested file, so callers can stream it
+/// without reopening a replaceable pathname.
+pub fn open_owner_only_file_read(path: &Path) -> IpcResult<fs::File> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let file = open_existing_nofollow_read(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    Ok(file)
+}
+
+/// Open an existing owner-only regular file for append through a no-follow,
+/// custody-attested handle. This intentionally never creates a file: callers
+/// must use [`create_owner_only_file_new`] for the exclusive creation step.
+pub fn open_owner_only_file_append(path: &Path) -> IpcResult<fs::File> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let file = open_existing_nofollow_append(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    Ok(file)
+}
+
+/// Remove only an existing owner-only regular file. Symlink/reparse nodes are
+/// rejected rather than followed or reused as stale state.
+pub fn remove_owner_only_file(path: &Path) -> IpcResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let file = open_existing_nofollow_read(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    drop(file);
+    fs::remove_file(path)?;
+    Ok(())
+}
+
 /// Create an owner-only regular file exactly once, refusing a pre-existing,
 /// symlink, reparse, or replacement target. The data is flushed before the
 /// caller receives success.
@@ -941,6 +987,91 @@ fn open_existing_nofollow_read(path: &Path) -> IpcResult<fs::File> {
     #[cfg(windows)]
     {
         open_windows_path(path, false, false, true)
+    }
+}
+
+fn open_existing_nofollow_append(path: &Path) -> IpcResult<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::APPEND | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        Ok(unsafe { fs::File::from_raw_fd(fd.into_raw_fd()) })
+    }
+    #[cfg(windows)]
+    {
+        open_windows_path(path, false, false, false)
+    }
+}
+
+/// Publish the exact currently-held owner-only source file without replacing an
+/// existing destination. The caller retains `file` through this call, so the
+/// source cannot be swapped between verification and publication.
+///
+/// Destination workspace custody is intentionally the caller's responsibility;
+/// this primitive only supplies exact-source/no-replace publication.
+pub fn publish_owner_only_file_no_replace(
+    file: &fs::File,
+    source_path: &Path,
+    destination: &Path,
+) -> IpcResult<()> {
+    validate_open_regular_owned_file(file, source_path, true)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        let empty =
+            CString::new("").map_err(|_| IpcError::Protocol("invalid empty source".into()))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| IpcError::Protocol("destination contains NUL".into()))?;
+        let result = unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                empty.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::iter;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
+        let source: Vec<u16> = source_path
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        let destination: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        // `open_windows_path` intentionally omitted FILE_SHARE_DELETE, so the
+        // held source handle pins this pathname through CreateHardLinkW.
+        if unsafe { CreateHardLinkW(destination.as_ptr(), source.as_ptr(), std::ptr::null()) } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = destination;
+        Err(IpcError::Protocol(
+            "exact-handle no-replace publish unsupported on this platform".into(),
+        ))
     }
 }
 
