@@ -21,7 +21,9 @@ use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_SERVICE_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE,
     INVALID_HANDLE_VALUE,
@@ -2191,12 +2193,39 @@ async fn run_windows_broker_service(
             "SCM service startup observer disconnected before broker pipe readiness".into(),
         );
     }
+    let server = Arc::new(server);
+    let mut connections = JoinSet::new();
+    let mut stop_poll = tokio::time::interval(Duration::from_millis(200));
     loop {
         tokio::select! {
-            result = server.serve_once() => result?,
-            _ = tokio::time::sleep(Duration::from_millis(200)) => if STOP_REQUESTED.load(Ordering::Acquire) { return Ok(()); },
+            joined = connections.join_next(), if !connections.is_empty() => {
+                // A peer may disconnect after submitting its frame. That is a
+                // per-connection outcome (the handler fences the Job and
+                // finalizes its ledger); it must not take down the SCM broker.
+                if let Some(Err(error)) = joined {
+                    return Err(format!("Windows broker connection task panicked: {error}"));
+                }
+            }
+            accepted = server.accept_connection() => {
+                let connection = accepted?;
+                let server = Arc::clone(&server);
+                connections.spawn(async move { server.serve_connection(connection).await });
+            }
+            _ = stop_poll.tick() => if STOP_REQUESTED.load(Ordering::Acquire) { break; },
         }
     }
+    server.begin_shutdown();
+    let drain = async {
+        while let Some(joined) = connections.join_next().await {
+            if let Err(error) = joined {
+                return Err(format!("Windows broker shutdown task panicked: {error}"));
+            }
+        }
+        Ok(())
+    };
+    tokio::time::timeout(WAIT_LIMIT, drain)
+        .await
+        .map_err(|_| "Windows broker Jobs did not terminate before SCM stop deadline".to_string())?
 }
 
 unsafe extern "system" fn service_control(control: u32) {

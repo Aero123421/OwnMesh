@@ -19,10 +19,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 
 const MAX_TRUST_RECORD_BYTES: u64 = 64 * 1024;
-const MAX_WINDOWS_BROKER_CONCURRENCY: usize = 16;
+/// Bound all accepted pipe handlers, including clients which never finish a
+/// frame. One slot is deliberately held back from execution so an authenticated
+/// Cancel can still reach a running Job at saturation.
+const MAX_WINDOWS_BROKER_CONNECTIONS: usize = 16;
+const MAX_WINDOWS_EXECUTE_CONCURRENCY: usize = MAX_WINDOWS_BROKER_CONNECTIONS - 1;
 
 /// Immutable fields recorded by the elevated installer after it has copied the
 /// daemon image into the Admin-controlled installation root. `image_file_id`
@@ -109,6 +113,14 @@ pub trait WindowsBrokerRunner: Send + Sync {
     fn cancel(&self, _request_id: &str, _nonce: &str) -> bool {
         false
     }
+
+    /// Fence every in-flight request before the hosting SCM service exits.
+    /// Production runners must make a later `run` observe this fence too, so
+    /// a request which was accepted just as shutdown began cannot create an
+    /// orphaned privileged process tree.
+    fn cancel_all(&self) -> usize {
+        0
+    }
 }
 
 /// Dedicated Windows v2 data-plane handler. It is intentionally not reachable
@@ -124,7 +136,9 @@ pub struct WindowsProductionBrokerServer<A, L, R> {
     verify_key: CapabilityVerifyKey,
     broker_instance_id: String,
     broker_key_id: String,
-    concurrency: Arc<Semaphore>,
+    connection_concurrency: Arc<Semaphore>,
+    execution_concurrency: Arc<Semaphore>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl<A, L, R> WindowsProductionBrokerServer<A, L, R>
@@ -154,6 +168,7 @@ where
             ]
             .concat(),
         ));
+        let (shutdown, _) = watch::channel(false);
         Ok(Self {
             listener,
             authorizer: Arc::new(authorizer),
@@ -164,26 +179,54 @@ where
             verify_key,
             broker_instance_id,
             broker_key_id,
-            concurrency: Arc::new(Semaphore::new(MAX_WINDOWS_BROKER_CONCURRENCY)),
+            connection_concurrency: Arc::new(Semaphore::new(MAX_WINDOWS_BROKER_CONNECTIONS)),
+            execution_concurrency: Arc::new(Semaphore::new(MAX_WINDOWS_EXECUTE_CONCURRENCY)),
+            shutdown,
         })
     }
 
     /// Accept exactly one client, apply the bounded handler, and write one
     /// bounded response. Callers may schedule this under their service loop.
     pub async fn serve_once(&self) -> Result<(), String> {
-        let mut connection = self
-            .listener
+        let connection = self.accept_connection().await?;
+        self.serve_connection(connection).await
+    }
+
+    /// Accept one connection without coupling its lifetime to the next
+    /// accept.  The SCM loop must call [`Self::serve_connection`] in a
+    /// separately owned task so an explicit Cancel pipe can be accepted while
+    /// an Execute Job is still running.
+    pub async fn accept_connection(&self) -> Result<ownmesh_ipc::ServerConnection, String> {
+        self.listener
             .accept()
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+    }
+
+    /// Handle a previously accepted connection under the bounded execution
+    /// semaphore.  Keeping the connection owned by this future is essential:
+    /// callers must never drop it merely to poll the SCM stop flag, because a
+    /// dropped handler would detach the blocking Windows Job task.
+    pub async fn serve_connection(
+        &self,
+        mut connection: ownmesh_ipc::ServerConnection,
+    ) -> Result<(), String> {
         let permit = self
-            .concurrency
+            .connection_concurrency
             .clone()
             .try_acquire_owned()
             .map_err(|_| "Windows broker busy (bounded concurrency)".to_string())?;
         let response = self.handle_connection(&mut connection).await;
         drop(permit);
         write_windows_response(&mut connection, &response).await
+    }
+
+    /// Begin a terminal SCM shutdown. This is intentionally one-way for a
+    /// server instance: all active and racing runner calls are fenced before
+    /// the service reports stopped.
+    pub fn begin_shutdown(&self) -> usize {
+        let _ = self.shutdown.send(true);
+        self.runner.cancel_all()
     }
 
     async fn handle_connection(
@@ -295,6 +338,15 @@ where
                         now,
                     )
                     .map_err(|error| error.to_string())?;
+                    // Preserve one of the 16 accepted-handler slots for a
+                    // fenced Cancel connection. Without this separate limit,
+                    // 16 long Jobs could make their own cancellation request
+                    // fail admission before it reaches `runner.cancel`.
+                    let _execution_permit = self
+                        .execution_concurrency
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| "Windows broker execute capacity is full".to_string())?;
                     let digest = operation_facts_digest(&internal.facts);
                     self.ledger
                         .lock()
@@ -346,10 +398,39 @@ where
     ) -> Result<BrokerResponseV2, String> {
         let runner = Arc::clone(&self.runner);
         let request_for_runner = request.clone();
+        let mut shutdown = self.shutdown.subscribe();
+        if *shutdown.borrow() {
+            // The caller reached a durably reserved request, but no Job was
+            // started. Return an exact terminal receipt so the enclosing
+            // handler can complete that reservation rather than leaving a
+            // misleadingly uncertain replay entry behind during SCM stop.
+            return Ok(BrokerResponseV2 {
+                request_id: request.request_id,
+                ok: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some("Windows broker is stopping before Job execution".into()),
+                timed_out: false,
+                cancelled: true,
+                truncated: false,
+                duration_ms: 0,
+            });
+        }
         let mut execution = tokio::task::spawn_blocking(move || runner.run(&request_for_runner));
         let mut probe = [0_u8; 1];
         tokio::select! {
             result = &mut execution => result.map_err(|error| format!("Windows Job execution task failed: {error}")),
+            changed = shutdown.changed() => {
+                // `begin_shutdown` first fences the production runner's
+                // current and future registrations. Await its terminal Job
+                // receipt before allowing the service task to disappear.
+                let _ = changed;
+                let _ = self.runner.cancel(&request.request_id, &request.nonce);
+                execution
+                    .await
+                    .map_err(|error| format!("Windows Job shutdown task failed: {error}"))
+            }
             read = connection.read(&mut probe) => {
                 // Treat EOF, a pipe reset/error, and an unexpected second byte
                 // identically.  In particular, never propagate a read error
@@ -755,7 +836,252 @@ fn same_windows_path(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ownmesh_broker_client::{
+        build_cancel_intent_v2, compute_execute_intent_mac_v2, ExecutablePinV2, ExecuteIntentV2,
+        OperationFactsV2, BROKER_PROTOCOL_V2,
+    };
+    use ownmesh_ipc::Endpoint;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct AcceptAnyPeer;
+
+    impl WindowsPeerAuthorizer for AcceptAnyPeer {
+        fn authorize(&self, _peer: &WindowsPipePeerFacts) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reauthorize_before_spawn(&self, _peer: &WindowsPipePeerFacts) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestLedger;
+
+    impl WindowsReplayLedger for TestLedger {
+        fn reserve(&mut self, _request: &BrokerRequestV2, _now_unix: i64) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn complete(&mut self, _nonce: &str, _digest: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockingRunner {
+        active: Arc<Mutex<BTreeMap<String, (String, Arc<AtomicBool>)>>>,
+        started: Arc<Notify>,
+    }
+
+    impl WindowsBrokerRunner for BlockingRunner {
+        fn run(&self, request: &BrokerRequestV2) -> BrokerResponseV2 {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.active.lock().unwrap().insert(
+                request.nonce.clone(),
+                (request.request_id.clone(), Arc::clone(&cancelled)),
+            );
+            self.started.notify_one();
+            while !cancelled.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            self.active.lock().unwrap().remove(&request.nonce);
+            BrokerResponseV2 {
+                request_id: request.request_id.clone(),
+                ok: false,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some("test execution cancelled".into()),
+                timed_out: false,
+                cancelled: true,
+                truncated: false,
+                duration_ms: 1,
+            }
+        }
+
+        fn cancel(&self, request_id: &str, nonce: &str) -> bool {
+            let active = self.active.lock().unwrap();
+            let Some((registered_id, cancelled)) = active.get(nonce) else {
+                return false;
+            };
+            if registered_id != request_id {
+                return false;
+            }
+            cancelled.store(true, Ordering::Release);
+            true
+        }
+    }
+
+    fn test_execute(secret: &BrokerSecret) -> ExecuteIntentV2 {
+        let now = crate::now_unix();
+        let executable = std::fs::canonicalize(
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32")
+                .join("PING.EXE"),
+        )
+        .unwrap();
+        let mut execute = ExecuteIntentV2 {
+            protocol_version: BROKER_PROTOCOL_V2,
+            request_id: "concurrent-execute".into(),
+            operation_id: "concurrent-execute".into(),
+            nonce: "concurrent-execute-nonce".into(),
+            issued_at_unix: now,
+            expires_at_unix: now + 30,
+            facts: OperationFactsV2 {
+                operation: "concurrent-execute".into(),
+                remote_payload_sha256: "a".repeat(64),
+                principal_id: "test-principal".into(),
+                tenant_id: "test-tenant".into(),
+                principal_credential_generation: 1,
+                timeout_ms: 30_000,
+                max_output_bytes: 4 * 1024,
+                device_id: "test-device".into(),
+                workspace_id: "test-workspace".into(),
+                argv: vec![executable.display().to_string(), "-n".into(), "20".into()],
+                canonical_cwd: None,
+                sanitized_env: BTreeMap::new(),
+                executable: ExecutablePinV2 {
+                    canonical_path: executable.display().to_string(),
+                    image_sha256: "b".repeat(64),
+                    image_len: 1,
+                },
+            },
+            mac: String::new(),
+        };
+        execute.mac = compute_execute_intent_mac_v2(secret, &execute);
+        execute
+    }
+
+    async fn write_intent(
+        connection: &mut ownmesh_ipc::ClientConnection,
+        intent: BrokerWireIntentV2,
+    ) {
+        let mut frame = serde_json::to_vec(&intent).unwrap();
+        frame.push(b'\n');
+        connection.write_all(&frame).await.unwrap();
+        connection.flush().await.unwrap();
+    }
+
+    async fn read_response(connection: &mut ownmesh_ipc::ClientConnection) -> BrokerResponseV2 {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            assert_eq!(connection.read(&mut byte).await.unwrap(), 1);
+            if byte[0] == b'\n' {
+                return serde_json::from_slice(&line).unwrap();
+            }
+            line.push(byte[0]);
+        }
+    }
+
+    async fn test_server(
+        endpoint: &Endpoint,
+        secret: BrokerSecret,
+        runner: BlockingRunner,
+    ) -> Arc<WindowsProductionBrokerServer<AcceptAnyPeer, TestLedger, BlockingRunner>> {
+        let listener = ownmesh_ipc::LocalListener::bind(endpoint.clone())
+            .await
+            .unwrap();
+        let signing_key = CapabilitySigningKey::generate();
+        let verify_key = signing_key.verify_key();
+        let (shutdown, _) = watch::channel(false);
+        Arc::new(WindowsProductionBrokerServer {
+            listener,
+            authorizer: Arc::new(AcceptAnyPeer),
+            ledger: Arc::new(Mutex::new(TestLedger)),
+            runner: Arc::new(runner),
+            secret,
+            signing_key,
+            verify_key,
+            broker_instance_id: "test-instance".into(),
+            broker_key_id: "test-key".into(),
+            connection_concurrency: Arc::new(Semaphore::new(MAX_WINDOWS_BROKER_CONNECTIONS)),
+            execution_concurrency: Arc::new(Semaphore::new(MAX_WINDOWS_EXECUTE_CONCURRENCY)),
+            shutdown,
+        })
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_is_accepted_while_an_execute_connection_is_running() {
+        let endpoint = Endpoint::NamedPipe(format!(
+            r"\\.\pipe\ownmesh-broker-concurrency-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let secret = BrokerSecret::generate();
+        let runner = BlockingRunner::default();
+        let server = test_server(&endpoint, secret.clone(), runner.clone()).await;
+        let execute = test_execute(&secret);
+        let execute_server = Arc::clone(&server);
+        let execute_task = tokio::spawn(async move {
+            let connection = execute_server.accept_connection().await.unwrap();
+            execute_server.serve_connection(connection).await.unwrap();
+        });
+        let mut execute_client = ownmesh_ipc::connect(&endpoint).await.unwrap();
+        write_intent(
+            &mut execute_client,
+            BrokerWireIntentV2::Execute(execute.clone()),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.notified())
+            .await
+            .expect("execute must be running before explicit cancellation");
+
+        let cancel_server = Arc::clone(&server);
+        let cancel_task = tokio::spawn(async move {
+            let connection = cancel_server.accept_connection().await.unwrap();
+            cancel_server.serve_connection(connection).await.unwrap();
+        });
+        let cancel = build_cancel_intent_v2(&secret, &execute, crate::now_unix());
+        let mut cancel_client = ownmesh_ipc::connect(&endpoint).await.unwrap();
+        write_intent(&mut cancel_client, BrokerWireIntentV2::Cancel(cancel)).await;
+        let cancel_response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_response(&mut cancel_client),
+        )
+        .await
+        .expect("Cancel must be accepted before the Execute response");
+        assert!(cancel_response.cancelled, "{cancel_response:?}");
+        let execute_response = read_response(&mut execute_client).await;
+        assert!(execute_response.cancelled, "{execute_response:?}");
+        cancel_task.await.unwrap();
+        execute_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_disconnect_fences_the_running_job_before_handler_returns() {
+        let endpoint = Endpoint::NamedPipe(format!(
+            r"\\.\pipe\ownmesh-broker-disconnect-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let secret = BrokerSecret::generate();
+        let runner = BlockingRunner::default();
+        let server = test_server(&endpoint, secret.clone(), runner.clone()).await;
+        let execute = test_execute(&secret);
+        let handler_server = Arc::clone(&server);
+        let handler = tokio::spawn(async move {
+            let connection = handler_server.accept_connection().await.unwrap();
+            handler_server.serve_connection(connection).await
+        });
+        let mut client = ownmesh_ipc::connect(&endpoint).await.unwrap();
+        write_intent(&mut client, BrokerWireIntentV2::Execute(execute)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.notified())
+            .await
+            .expect("execute must be running before disconnect");
+        drop(client);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handler)
+            .await
+            .expect("disconnect handler must await the runner's terminal receipt")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "dropped client cannot receive the response"
+        );
+        assert!(runner.active.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn trust_record_rejects_synthetic_identity_fields_before_any_pipe_accept() {

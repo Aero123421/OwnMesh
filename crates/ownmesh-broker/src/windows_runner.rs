@@ -28,6 +28,7 @@ const POLL_WAIT: Duration = Duration::from_millis(20);
 pub struct WindowsJobRunner {
     staging_dir: PathBuf,
     active: Arc<Mutex<BTreeMap<String, ActiveExecution>>>,
+    stopping: Arc<AtomicBool>,
 }
 
 struct ActiveExecution {
@@ -55,12 +56,19 @@ impl WindowsJobRunner {
         Ok(Self {
             staging_dir: canonical,
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            stopping: Arc::new(AtomicBool::new(false)),
         })
     }
 }
 
 impl WindowsBrokerRunner for WindowsJobRunner {
     fn run(&self, request: &BrokerRequestV2) -> BrokerResponseV2 {
+        if self.stopping.load(Ordering::Acquire) {
+            return response_error(
+                &request.request_id,
+                "Windows broker is stopping; refusing new Job execution".into(),
+            );
+        }
         let cancellation = Arc::new(AtomicBool::new(false));
         let registered = self.active.lock().map(|mut active| {
             active.insert(
@@ -70,6 +78,12 @@ impl WindowsBrokerRunner for WindowsJobRunner {
                     cancelled: Arc::clone(&cancellation),
                 },
             );
+            // Close the tiny race between the first stop fence and this
+            // insertion. A runner which registers after shutdown starts must
+            // enter its polling loop already cancelled.
+            if self.stopping.load(Ordering::Acquire) {
+                cancellation.store(true, Ordering::Release);
+            }
         });
         if registered.is_err() {
             return response_error(
@@ -99,6 +113,17 @@ impl WindowsBrokerRunner for WindowsJobRunner {
         }
         execution.cancelled.store(true, Ordering::Release);
         true
+    }
+
+    fn cancel_all(&self) -> usize {
+        self.stopping.store(true, Ordering::Release);
+        let Ok(active) = self.active.lock() else {
+            return 0;
+        };
+        for execution in active.values() {
+            execution.cancelled.store(true, Ordering::Release);
+        }
+        active.len()
     }
 }
 
@@ -406,5 +431,115 @@ fn response_error(request_id: &str, error: String) -> BrokerResponseV2 {
         cancelled: false,
         truncated: false,
         duration_ms: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ownmesh_broker_client::{ExecutablePinV2, OperationFactsV2};
+
+    fn long_running_ping_request(nonce: &str) -> Option<BrokerRequestV2> {
+        let system_root = std::env::var_os("SystemRoot")?;
+        let executable = PathBuf::from(system_root).join("System32").join("PING.EXE");
+        let bytes = std::fs::read(&executable).ok()?;
+        let metadata = std::fs::metadata(&executable).ok()?;
+        Some(BrokerRequestV2 {
+            protocol_version: 2,
+            request_id: "windows-job-cancel-test".into(),
+            operation_id: "windows-job-cancel-test".into(),
+            nonce: nonce.into(),
+            issued_at_unix: 1,
+            expires_at_unix: i64::MAX,
+            facts: OperationFactsV2 {
+                operation: "windows-job-cancel-test".into(),
+                remote_payload_sha256: "a".repeat(64),
+                principal_id: "test".into(),
+                tenant_id: "test".into(),
+                principal_credential_generation: 1,
+                timeout_ms: 30_000,
+                max_output_bytes: 4 * 1024,
+                device_id: "test".into(),
+                workspace_id: "test".into(),
+                // `ping -n 20` is a real Windows child which remains alive
+                // long enough to prove that the Job cancellation signal
+                // reaches a running contained process, not merely a mock.
+                argv: vec![
+                    executable.display().to_string(),
+                    "-n".into(),
+                    "20".into(),
+                    "127.0.0.1".into(),
+                ],
+                canonical_cwd: None,
+                sanitized_env: BTreeMap::new(),
+                executable: ExecutablePinV2 {
+                    canonical_path: executable.display().to_string(),
+                    image_sha256: hex::encode(Sha256::digest(bytes)),
+                    image_len: metadata.len(),
+                },
+            },
+            capability: None,
+            mac: "test".into(),
+        })
+    }
+
+    fn wait_until_cancelable(runner: &WindowsJobRunner, request: &BrokerRequestV2) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if runner.cancel(&request.request_id, &request.nonce) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("real Windows Job did not become cancelable before deadline");
+    }
+
+    #[test]
+    fn explicit_cancel_terminates_a_real_windows_job() {
+        let Some(request) = long_running_ping_request("explicit-cancel") else {
+            // Windows Server Core images without ping.exe cannot provide this
+            // opt-in process receipt. Production behavior stays fail-closed.
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let runner = WindowsJobRunner::new(dir.path()).unwrap();
+        let executing = runner.clone();
+        let request_for_thread = request.clone();
+        let task = std::thread::spawn(move || executing.run(&request_for_thread));
+        wait_until_cancelable(&runner, &request);
+        let response = task.join().unwrap();
+        assert!(response.cancelled, "{response:?}");
+        assert!(!response.ok, "{response:?}");
+    }
+
+    #[test]
+    fn shutdown_fence_terminates_a_real_windows_job() {
+        let Some(request) = long_running_ping_request("shutdown-cancel") else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let runner = WindowsJobRunner::new(dir.path()).unwrap();
+        let executing = runner.clone();
+        let request_for_thread = request.clone();
+        let task = std::thread::spawn(move || executing.run(&request_for_thread));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if runner.active.lock().is_ok_and(|active| !active.is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            runner.active.lock().is_ok_and(|active| !active.is_empty()),
+            "real Windows Job did not register before stop"
+        );
+        let cancelled = runner.cancel_all();
+        assert_eq!(
+            cancelled, 1,
+            "real Windows Job did not register before stop"
+        );
+        let response = task.join().unwrap();
+        assert!(response.cancelled, "{response:?}");
+        assert!(!response.ok, "{response:?}");
     }
 }
