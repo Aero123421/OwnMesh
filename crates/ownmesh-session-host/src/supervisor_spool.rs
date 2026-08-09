@@ -23,6 +23,8 @@ const MANIFEST_FILE: &str = "host-manifest.json";
 const SPOOL_FILE: &str = "owner-output.spool";
 const CLAIM_FILE: &str = "host.claim";
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
+const MAX_TRANSITION_ID_BYTES: usize = 128;
+const MAX_TRANSITION_DIGEST_BYTES: usize = 128;
 const SPOOL_MAGIC: &[u8; 8] = b"OMSP001\0";
 const SPOOL_HEADER_BYTES: usize = 16;
 
@@ -44,6 +46,17 @@ pub struct HostManifest {
     pub binding_expires_unix: i64,
     /// Hard process lifetime. Expiry causes bounded sweep/cleanup.
     pub host_expires_unix: i64,
+    /// Last atomically applied transition receipt. It lets a restarted daemon
+    /// retry an interrupted transition without rotating the successor twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition: Option<TransitionReceipt>,
+}
+
+/// Bounded non-secret idempotency witness persisted with the manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransitionReceipt {
+    pub transition_id: String,
+    pub payload_digest: String,
 }
 
 impl HostManifest {
@@ -66,6 +79,7 @@ impl HostManifest {
             controller_epoch,
             binding_expires_unix,
             host_expires_unix,
+            last_transition: None,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -92,6 +106,39 @@ impl HostManifest {
         Ok(())
     }
 
+    pub fn matches_transition(
+        &self,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<bool, String> {
+        validate_transition(transition_id, payload_digest)?;
+        match &self.last_transition {
+            Some(receipt)
+                if receipt.transition_id == transition_id
+                    && receipt.payload_digest == payload_digest =>
+            {
+                Ok(true)
+            }
+            Some(receipt) if receipt.transition_id == transition_id => {
+                Err("supervisor transition id payload conflict".into())
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn record_transition(
+        &mut self,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<(), String> {
+        validate_transition(transition_id, payload_digest)?;
+        self.last_transition = Some(TransitionReceipt {
+            transition_id: transition_id.into(),
+            payload_digest: payload_digest.into(),
+        });
+        Ok(())
+    }
+
     /// Validate dynamic time policy immediately before sidecar state changes.
     pub fn validate_runtime_lifetimes(&self, now: i64) -> Result<(), String> {
         if self.binding_expires_unix <= now || self.host_expires_unix <= now {
@@ -105,6 +152,19 @@ impl HostManifest {
         }
         Ok(())
     }
+}
+
+fn validate_transition(transition_id: &str, payload_digest: &str) -> Result<(), String> {
+    if transition_id.is_empty()
+        || transition_id.len() > MAX_TRANSITION_ID_BYTES
+        || payload_digest.is_empty()
+        || payload_digest.len() > MAX_TRANSITION_DIGEST_BYTES
+        || transition_id.chars().any(char::is_control)
+        || payload_digest.chars().any(char::is_control)
+    {
+        return Err("invalid supervisor transition receipt".into());
+    }
+    Ok(())
 }
 
 const fn default_controller_attached() -> bool {

@@ -184,6 +184,46 @@ impl SupervisorState {
         Ok(binding_of(&next))
     }
 
+    /// Idempotent controller handoff/claim transition. Replaying the same
+    /// transition id and payload returns the already-issued successor binding;
+    /// reusing its id with different facts fails closed.
+    pub async fn rotate_binding_idempotent(
+        &self,
+        previous: &SupervisorBinding,
+        next_owner_principal: impl Into<String>,
+        next_epoch: u64,
+        next_binding_expires_unix: i64,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<SupervisorBinding, String> {
+        let mut hosts = self.hosts.lock().await;
+        let hosted = hosts
+            .get_mut(&previous.session_id)
+            .ok_or("supervisor host unavailable")?;
+        if hosted
+            .manifest
+            .matches_transition(transition_id, payload_digest)?
+        {
+            return Ok(binding_of(&hosted.manifest));
+        }
+        exact(previous, &hosted.manifest)?;
+        rotate_epoch(previous.controller_epoch, next_epoch)?;
+        let mut next = HostManifest::new(
+            hosted.manifest.session_id.clone(),
+            hosted.manifest.device_id.clone(),
+            hosted.manifest.workspace_id.clone(),
+            next_owner_principal,
+            next_epoch,
+            next_binding_expires_unix,
+            hosted.manifest.host_expires_unix,
+        )?;
+        next.validate_runtime_lifetimes(unix_now())?;
+        next.record_transition(transition_id, payload_digest)?;
+        hosted.spool.rotate_manifest(next.clone())?;
+        hosted.manifest = next.clone();
+        Ok(binding_of(&next))
+    }
+
     /// CAS-reclaim an expired daemon binding while retaining the live PTY.
     /// The exact stale nonce/epoch is accepted only as evidence for recovery;
     /// all mutation methods reject it until this operation issues a successor.
@@ -480,6 +520,43 @@ mod tests {
             .spawn(huge, shell_command(), PtySize::default())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn transition_id_replay_is_idempotent_and_conflicts_on_payload_reuse() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let binding = state
+            .spawn(
+                HostManifest::new(
+                    "ses_transition",
+                    "dev",
+                    "ws",
+                    "owner_a",
+                    1,
+                    unix_now() + 60,
+                    unix_now() + 600,
+                )
+                .unwrap(),
+                shell_command(),
+                PtySize::default(),
+            )
+            .await
+            .unwrap();
+        let first = state
+            .rotate_binding_idempotent(&binding, "owner_b", 2, unix_now() + 60, "tr_1", "digest_a")
+            .await
+            .unwrap();
+        let replay = state
+            .rotate_binding_idempotent(&binding, "owner_b", 2, unix_now() + 60, "tr_1", "digest_a")
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
+        assert!(state
+            .rotate_binding_idempotent(&binding, "owner_b", 2, unix_now() + 60, "tr_1", "digest_b")
+            .await
+            .is_err());
+        state.terminate(&first).await.unwrap();
     }
 
     fn shell_command() -> PtyCommand {
