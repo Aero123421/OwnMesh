@@ -2665,6 +2665,74 @@ function sanitizeTransferPreflightResult(
   };
 }
 
+/** Accept only the exact bounded destination artifact page contract.  This is
+ * a distinct capability from fs.read: the Agent chooses the immutable plan
+ * path, and the control plane retains at most one 64 KiB user-requested page. */
+async function sanitizeTransferArtifactResult(
+  op: McpOperationRecord,
+  payload: Record<string, unknown>,
+): Promise<{ data: Record<string, unknown> } | { error: string }> {
+  const result = payload.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return { error: "transfer_artifact_result_invalid" };
+  const raw = result as Record<string, unknown>;
+  const allowed = ["plan_id", "offset", "bytes", "total_bytes", "next_offset", "truncated", "encoding", "content_base64", "page_sha256", "sha256"];
+  if (Object.keys(raw).some((key) => !allowed.includes(key))) return { error: "transfer_artifact_result_unknown_field" };
+  const actionFacts = op.action?.facts;
+  const expectedPlan = actionFacts && typeof actionFacts === "object" && !Array.isArray(actionFacts)
+    ? (actionFacts as Record<string, unknown>).plan_id
+    : undefined;
+  const expectedOffset = op.data.offset;
+  const expectedMax = op.data.max_bytes;
+  if (typeof expectedPlan !== "string" || typeof expectedOffset !== "number" || typeof expectedMax !== "number"
+    || raw.plan_id !== expectedPlan || raw.offset !== expectedOffset || raw.encoding !== "base64"
+    || typeof raw.content_base64 !== "string" || typeof raw.page_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.page_sha256)
+    || typeof raw.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.sha256)
+    || typeof raw.bytes !== "number" || !Number.isSafeInteger(raw.bytes) || raw.bytes < 0 || raw.bytes > 65536 || raw.bytes > expectedMax
+    || typeof raw.total_bytes !== "number" || !Number.isSafeInteger(raw.total_bytes) || raw.total_bytes < raw.bytes
+    || typeof raw.truncated !== "boolean") return { error: "transfer_artifact_result_binding_mismatch" };
+  let page: Uint8Array;
+  try {
+    // A 64 KiB decoded page has at most 87,384 canonical base64 characters.
+    if (raw.content_base64.length > 87384) return { error: "transfer_artifact_page_overflow" };
+    const binary = atob(raw.content_base64);
+    page = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+    if (btoa(binary) !== raw.content_base64) return { error: "transfer_artifact_base64_noncanonical" };
+  } catch { return { error: "transfer_artifact_base64_invalid" }; }
+  if (page.byteLength !== raw.bytes || await sha256Hex(page) !== raw.page_sha256) return { error: "transfer_artifact_page_hash_mismatch" };
+  const next = raw.next_offset;
+  if (raw.truncated) {
+    // A nonterminal empty page would create a non-progressing public cursor.
+    if (raw.bytes < 1 || typeof next !== "number" || !Number.isSafeInteger(next) || next !== expectedOffset + raw.bytes || next >= raw.total_bytes) return { error: "transfer_artifact_cursor_invalid" };
+  } else if (next !== null || expectedOffset + raw.bytes !== raw.total_bytes) return { error: "transfer_artifact_terminal_cursor_invalid" };
+  return { data: { plan_id: raw.plan_id, offset: raw.offset, bytes: raw.bytes, total_bytes: raw.total_bytes, next_offset: raw.next_offset, truncated: raw.truncated, encoding: raw.encoding, content_base64: raw.content_base64, page_sha256: raw.page_sha256, sha256: raw.sha256 } };
+}
+
+/** transfer.start is another bearer boundary.  Persist only a small exact
+ * admission/completion receipt; never allow the generic result column to turn
+ * into a ticket, key, ciphertext, or chunk storage channel. */
+function sanitizeTransferStartResult(
+  op: McpOperationRecord,
+  payload: Record<string, unknown>,
+): { data: Record<string, unknown> } | { error: string } {
+  const result = payload.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return { error: "transfer_start_result_invalid" };
+  const raw = result as Record<string, unknown>;
+  const allowed = ["transfer_id", "plan_id", "role", "plan_sha256", "epoch", "fence", "admitted", "completed", "published", "artifact_sha256"];
+  if (Object.keys(raw).some((key) => !allowed.includes(key))) return { error: "transfer_start_result_unknown_field" };
+  const facts = op.action?.facts;
+  const fact = facts && typeof facts === "object" && !Array.isArray(facts) ? facts as Record<string, unknown> : {};
+  const role = op.tool === "__transfer_start_source" ? "source" : op.tool === "__transfer_start_destination" ? "destination" : "";
+  if (!role || raw.role !== role || typeof raw.transfer_id !== "string" || raw.transfer_id !== fact.transfer_id
+    || typeof raw.plan_id !== "string" || raw.plan_id.length === 0 || raw.plan_id.length > 256
+    || typeof raw.plan_sha256 !== "string" || raw.plan_sha256 !== fact.plan_sha256 || !/^[a-f0-9]{64}$/.test(raw.plan_sha256)
+    || raw.epoch !== fact.epoch || raw.fence !== fact.fence || typeof raw.admitted !== "boolean"
+    || (raw.completed !== undefined && typeof raw.completed !== "boolean")
+    || (raw.published !== undefined && (typeof raw.published !== "boolean" || role !== "destination"))
+    || (raw.artifact_sha256 !== undefined && (typeof raw.artifact_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.artifact_sha256)))
+    || (raw.published === true && (raw.completed !== true || raw.artifact_sha256 === undefined))) return { error: "transfer_start_result_binding_mismatch" };
+  return { data: { transfer_id: raw.transfer_id, plan_id: raw.plan_id, role: raw.role, plan_sha256: raw.plan_sha256, epoch: raw.epoch, fence: raw.fence, admitted: raw.admitted, ...(raw.completed !== undefined ? { completed: raw.completed } : {}), ...(raw.published !== undefined ? { published: raw.published } : {}), ...(raw.artifact_sha256 !== undefined ? { artifact_sha256: raw.artifact_sha256 } : {}) } };
+}
+
 /**
  * Map a device-originated operation.result onto authoritative mcp_operations state.
  * Single runtime helper (DeviceRoom DO); mcp.ts must not duplicate this.
@@ -2871,6 +2939,25 @@ export async function applyMcpOperationResult(
     // chunk bytes) into the durable operation row.
     if (status === "completed") {
       const sanitized = sanitizeTransferPreflightResult(op, payload);
+      if ("error" in sanitized) return { ok: false, error: sanitized.error };
+      data = sanitized.data;
+    } else {
+      data = {};
+    }
+  }
+  if (op.tool === "__transfer_artifact_get") {
+    if (status === "completed") {
+      const sanitized = await sanitizeTransferArtifactResult(op, payload);
+      if ("error" in sanitized) return { ok: false, error: sanitized.error };
+      data = sanitized.data;
+    } else {
+      // Errors remain the normal bounded error envelope, never a byte channel.
+      data = {};
+    }
+  }
+  if (op.tool === "__transfer_start_source" || op.tool === "__transfer_start_destination") {
+    if (status === "completed") {
+      const sanitized = sanitizeTransferStartResult(op, payload);
       if ("error" in sanitized) return { ok: false, error: sanitized.error };
       data = sanitized.data;
     } else {

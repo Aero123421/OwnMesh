@@ -1185,6 +1185,45 @@ test("transfer preflight results are exact-correlated metadata only", async () =
   });
 });
 
+test("transfer artifact results are bounded, hash-checked, and exact-plan bound", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_artifact_destination_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const correlationId = randomId("cor_");
+  await store.putMcpOperation({
+    operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
+    tool: "__transfer_artifact_get", status: "pending", summary: "artifact", data: { transfer_id: "xfer_1", offset: 0, max_bytes: 65536 },
+    truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: correlationId,
+    workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  const bytes = new TextEncoder().encode("abc"); const content_base64 = btoa("abc");
+  const page_sha256 = await sha256Hex(bytes);
+  const base = { plan_id: "plan_destination", offset: 0, bytes: 3, total_bytes: 3, next_offset: null, truncated: false, encoding: "base64", content_base64, page_sha256, sha256: "c".repeat(64) };
+  const tampered = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...base, page_sha256: "d".repeat(64) } } });
+  assert.deepEqual(tampered, { ok: false, error: "transfer_artifact_page_hash_mismatch" });
+  assert.equal((await store.getMcpOperation(opId))?.status, "pending");
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: base } });
+  assert.equal(accepted.ok, true); assert.equal((await store.getMcpOperation(opId))?.data.content_base64, content_base64);
+
+  const overflowId = randomId("op_");
+  await store.putMcpOperation({ operation_id: overflowId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact overflow", data: { offset: 0, max_bytes: 65536 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: overflowId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const tooMany = new Uint8Array(65537); const overflow = await applyMcpOperationResult(store, { operationId: overflowId, correlationId: overflowId, deviceId, payload: { operation_id: overflowId, status: "completed", result: { ...base, bytes: 65537, total_bytes: 65537, content_base64: btoa(String.fromCharCode(...tooMany)), page_sha256: "e".repeat(64) } } });
+  assert.deepEqual(overflow, { ok: false, error: "transfer_artifact_result_binding_mismatch" });
+});
+
+test("transfer start receipts reject bearer/byte fields and require exact immutable bindings", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_start_destination_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const correlationId = randomId("cor_");
+  const facts = { transfer_id: "xfer_start_1", plan_sha256: "a".repeat(64), epoch: 2, fence: 3 };
+  await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_destination", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: correlationId, workspace_id: "ws_destination", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const receipt = { transfer_id: facts.transfer_id, plan_id: "plan_destination", role: "destination", plan_sha256: facts.plan_sha256, epoch: 2, fence: 3, admitted: true };
+  const rejected = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, ticket: "must-not-store" } } });
+  assert.deepEqual(rejected, { ok: false, error: "transfer_start_result_unknown_field" });
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: receipt } });
+  assert.equal(accepted.ok, true); assert.deepEqual((await store.getMcpOperation(opId))?.data, receipt);
+});
+
 test("operation.result store write failure fails closed without forward", async () => {
   const deviceId = "dev_result_store_fail";
   const { adapter, store } = openSqliteAdapter();
