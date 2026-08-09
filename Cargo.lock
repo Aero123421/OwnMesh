@@ -1872,6 +1872,7 @@ dependencies = [
  "ownmesh-broker-client",
  "ownmesh-domain",
  "ownmesh-exec",
+ "ownmesh-ipc",
  "rustix 1.1.4",
  "serde",
  "serde_json",

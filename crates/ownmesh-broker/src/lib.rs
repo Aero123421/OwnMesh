@@ -35,6 +35,8 @@ mod install;
 mod ledger;
 pub mod peer;
 mod serve;
+#[cfg(windows)]
+mod windows;
 
 pub use install::load_linux_run_config;
 pub use install::{
@@ -56,6 +58,10 @@ pub use serve::{
     validate_signing_key_custody, validate_socket_custody_metadata, validate_verify_key_custody,
     validate_verify_key_custody_metadata, BrokerServeConfig, BrokerState, CustodyMetadata,
     SocketCustodyMetadata, UnixSocketSecurity, CAPABILITY_SIGNING_FILE, CAPABILITY_VERIFY_FILE,
+};
+#[cfg(windows)]
+pub use windows::{
+    load_windows_daemon_trust_record, WindowsDaemonTrustRecord, WindowsTrustedDaemon,
 };
 
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;

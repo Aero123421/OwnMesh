@@ -21,6 +21,7 @@ path = "src/main.rs"
 ownmesh-broker-client = { path = "../ownmesh-broker-client" }
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-exec = { path = "../ownmesh-exec" }
+ownmesh-ipc = { path = "../ownmesh-ipc" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
