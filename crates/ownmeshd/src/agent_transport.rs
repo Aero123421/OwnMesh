@@ -63,6 +63,8 @@ const MAX_PENDING_RAW_BYTES: usize = MAX_PAYLOAD_BYTES.saturating_add(64 * 1024)
 /// Transfer data is a distinct, bounded WSS connection. It never shares the
 /// control Agent socket or its persisted operation queue.
 const MAX_TRANSFER_SOCKET_BYTES: usize = 96 * 1024;
+/// Opaque Worker-signed transfer bearer accepted on the live-only start path.
+const MAX_TRANSFER_TICKET_WIRE_BYTES: usize = 16 * 1024;
 
 type AgentSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -104,7 +106,7 @@ fn parse_transfer_ticket_wire(raw: &str) -> Result<AgentTransferTicket, String> 
         },
         None => return Err("invalid transfer ticket segments".into()),
     };
-    if body.is_empty() || signature.is_empty() || raw.len() > 16 * 1024 {
+    if body.is_empty() || signature.is_empty() || raw.len() > MAX_TRANSFER_TICKET_WIRE_BYTES {
         return Err("invalid transfer ticket wire".into());
     }
     let bytes = base64url_decode(body)?;
@@ -2248,7 +2250,21 @@ fn verify_exact_action_binding(
     }
 
     // Recompute action facts from the live arguments and require exact match.
-    let args = args_object(request);
+    let mut args = args_object(request);
+    if request.capability == "transfer.start" {
+        // The opaque bearer is intentionally absent from bound/audited facts.
+        // Fail closed on its wire shape here, then remove only this field for
+        // exact-facts comparison. The signed ticket and every embedded plan,
+        // role, device, workspace, epoch and fence are independently checked
+        // twice below before the Room socket or ephemeral private key is used.
+        let ticket = args
+            .get("ticket")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= MAX_TRANSFER_TICKET_WIRE_BYTES)
+            .ok_or("transfer.start requires a bounded string ticket")?;
+        let _ = ticket;
+        args.remove("ticket");
+    }
     let live_facts = recompute_action_facts(&args)?;
     let bound_facts = bound_obj
         .get("facts")
@@ -4197,6 +4213,96 @@ mod tests {
         };
         let err = verify_exact_action_binding(&device, &request, None).unwrap_err();
         assert!(err.contains("authorization"), "{err}");
+    }
+
+    #[test]
+    fn transfer_start_exact_binding_excludes_only_a_bounded_opaque_ticket() {
+        let device = DeviceId::parse("dev_ticket_destination").unwrap();
+        let expires = Timestamp::now()
+            .checked_add(Duration::from_secs(300))
+            .unwrap()
+            .to_rfc3339();
+        let arguments = json!({
+            "action": "transfer.start",
+            "ticket": "e30.signature",
+            "transfer_id": "xfer_ticket_exact",
+            "role": "destination",
+            "plan_sha256": "a".repeat(64),
+            "content_sha256": "b".repeat(64),
+            "size_bytes": 7,
+            "source_path": "source.bin",
+            "destination_path": "destination.bin",
+            "source_device_id": "dev_ticket_source",
+            "destination_device_id": device.as_str(),
+            "source_workspace_id": "ws_source",
+            "destination_workspace_id": "ws_destination",
+            "source_workspace_version": 1,
+            "destination_workspace_version": 1,
+            "workspace_id": "ws_destination",
+            "workspace_version": 1,
+            "epoch": 1,
+            "fence": 1,
+            "grant_id": "xfer_ticket_exact",
+            "grant_operation_id": "xfer_ticket_exact",
+            "grant_payload_sha256": "c".repeat(64),
+            "grant_expires_at_unix": 4_102_444_800_u64,
+        });
+        let mut fact_args = arguments.as_object().unwrap().clone();
+        fact_args.remove("ticket");
+        let facts = recompute_action_facts(&fact_args).unwrap();
+        let bound = json!({
+            "capability": "transfer.start",
+            "action": "transfer.start",
+            "tool": "__transfer_start",
+            "device_id": device.as_str(),
+            "principal_id": "prin_ticket",
+            "tenant_id": "ten_ticket",
+            "workspace_id": "ws_destination",
+            "claim_version": 1,
+            "operation_id": "op_ticket_exact",
+            "expires_at": expires,
+            "facts": facts,
+        });
+        let mut request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_ticket_exact").unwrap(),
+            capability: "transfer.start".into(),
+            workspace_id: Some(ownmesh_domain::WorkspaceId::parse("ws_destination").unwrap()),
+            idempotency_key: "idem_ticket_exact".into(),
+            payload_hash: Some(sha256_hex_str(&stable_stringify(&bound))),
+            authorization: Some(ownmesh_protocol::OperationAuthorizationBinding {
+                bound_action: bound,
+            }),
+            arguments,
+        };
+
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+
+        request.arguments.as_object_mut().unwrap().remove("ticket");
+        assert!(
+            verify_exact_action_binding(&device, &request, Some(&expires))
+                .unwrap_err()
+                .contains("bounded string ticket")
+        );
+        request.arguments["ticket"] = json!(7);
+        assert!(
+            verify_exact_action_binding(&device, &request, Some(&expires))
+                .unwrap_err()
+                .contains("bounded string ticket")
+        );
+        request.arguments["ticket"] = json!("x".repeat(MAX_TRANSFER_TICKET_WIRE_BYTES + 1));
+        assert!(
+            verify_exact_action_binding(&device, &request, Some(&expires))
+                .unwrap_err()
+                .contains("bounded string ticket")
+        );
+
+        // The bearer may change without entering durable/audited facts, but
+        // the immediate ticket parser/admission layer still rejects it before
+        // runtime admission or ephemeral-key consumption.
+        request.arguments["ticket"] = json!("substituted.invalid");
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+        assert!(parse_transfer_ticket_wire("substituted.invalid").is_err());
     }
 
     fn sample_bound_cancel(
