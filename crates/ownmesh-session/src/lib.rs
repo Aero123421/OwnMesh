@@ -558,7 +558,11 @@ impl SessionManager {
         }
         let principal = principal.into();
         if let Some(cur) = &s.info.controller {
-            if cur.principal_id != principal && cur.is_active(now_unix) {
+            // Claim is only a recovery path for an unseated/expired session.
+            // Even the same principal must not rotate a live seat without its
+            // exact lease token: an older Chat connection could otherwise
+            // invalidate a newer connection's controller generation.
+            if cur.is_active(now_unix) {
                 return Err(SessionError::LeaseHeld(cur.principal_id.clone()));
             }
         }

@@ -2918,10 +2918,12 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             },
         };
         let now = self.prepare_session_access()?;
-        // A session attachment is not a discovery/invitation primitive. The
-        // authenticated caller must already be a reader (via open, handoff, or
-        // prior authenticated attachment) before it can reattach/claim.
-        self.require_reader(&p.id, &client.client_name, now)?;
+        // Local IPC has no cloud workspace grant proof, so it must already be
+        // a reader. Remote requests reached this point only after the Worker
+        // bound its tenant/principal/workspace grant into the exact operation.
+        if !is_remote_runtime_principal(&client.client_name) {
+            self.require_reader(&p.id, &client.client_name, now)?;
+        }
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
@@ -3011,6 +3013,12 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        if is_remote_runtime_principal(&client.client_name) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.release is not available over remote MCP; use exact lease-bound session.detach".into(),
+            });
+        }
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
@@ -3115,6 +3123,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             from: Option<String>,
             #[serde(default)]
             workspace_id: Option<String>,
+            #[serde(default)]
+            lease_id: Option<String>,
+            #[serde(default)]
+            controller_epoch: Option<u64>,
         }
         let p: P = parse_params(params)?;
         // give requires from == authenticated identity (spoofed from is rejected).
@@ -3132,6 +3144,23 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let from = client.client_name.clone();
+        if is_remote_runtime_principal(&from) {
+            let lease_id = p
+                .lease_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "session.give requires lease_id for remote principals".into(),
+                })?;
+            let epoch = p.controller_epoch.ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.give requires controller_epoch for remote principals".into(),
+            })?;
+            self.sessions
+                .authorize_controller_lease(&p.id, &from, lease_id, epoch, now)
+                .map_err(session_err)?;
+        }
         // Normalize bare principal ids into the remote runtime form when the
         // controller is a remote MCP principal (same tenant namespace).
         let to = normalize_handoff_target(&from, &p.to)?;

@@ -1650,6 +1650,8 @@ def main() -> int:
                         "session_id": seq_ses_id,
                         "workspace_id": "ws_default",
                         "to": "prin_other",
+                        "lease_id": seq_lease_id,
+                        "controller_epoch": seq_controller_epoch,
                         "async": True,
                         "idempotency_key": f"idem_ses_give_{marker}",
                     },
@@ -1729,6 +1731,217 @@ def main() -> int:
             if str(other_ctrl_done.get("status")) != "completed":
                 raise RuntimeError(
                     f"handoff recipient must write with next input_seq: {other_ctrl_done}"
+                )
+
+            # E5 stale-connection regression: the old principal/seat cannot
+            # claim, attach-as-controller, legacy-release, or hand off the
+            # successor seat. Each call still traverses public MCP/Worker/DO.
+            stale_calls = [
+                ("ownmesh_session_claim", {"session_id": seq_ses_id}),
+                ("ownmesh_session_attach", {"session_id": seq_ses_id, "role": "controller"}),
+                ("ownmesh_session_release", {"session_id": seq_ses_id}),
+                (
+                    "ownmesh_session_give",
+                    {
+                        "session_id": seq_ses_id,
+                        "to": "prin_other",
+                        "lease_id": seq_lease_id,
+                        "controller_epoch": seq_controller_epoch,
+                    },
+                ),
+            ]
+            for stale_i, (stale_tool, stale_args) in enumerate(stale_calls, start=71):
+                stale_args = {
+                    "device_id": device_id,
+                    "workspace_id": "ws_default",
+                    "async": True,
+                    "idempotency_key": f"idem_ses_stale_{stale_tool}_{marker}",
+                    **stale_args,
+                }
+                stale_sc = structured(
+                    mcp_call(issuer, access_token, stale_tool, stale_args, rpc_id=stale_i)
+                )
+                stale_done = wait_operation(
+                    issuer,
+                    access_token,
+                    str(stale_sc.get("operation_id") or ""),
+                    want={"failed", "denied"},
+                    timeout_s=20,
+                )
+                if str(stale_done.get("status")) not in {"failed", "denied"}:
+                    raise RuntimeError(
+                        f"stale same-principal {stale_tool} must fail closed: {stale_done}"
+                    )
+
+            # Exact detach retains the PTY while clearing the seat. The prior
+            # token must not mutate, renew, or detach after the transition.
+            detach_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token_other,
+                    "ownmesh_session_detach",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "lease_id": other_lease_id,
+                        "controller_epoch": other_controller_epoch,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_detach_{marker}",
+                    },
+                    rpc_id=75,
+                )
+            )
+            detach_done = wait_operation(
+                issuer, access_token_other, str(detach_sc.get("operation_id") or ""), want={"completed"}
+            )
+            if str(detach_done.get("status")) != "completed":
+                raise RuntimeError(f"exact session.detach must complete: {detach_done}")
+
+            for stale_i, stale_tool, stale_args in [
+                (76, "ownmesh_session_write", {"data": "old\n", "input_seq": 4}),
+                (77, "ownmesh_session_resize", {"cols": 101, "rows": 31, "resize_seq": 2}),
+                (78, "ownmesh_session_renew", {"ttl_secs": 60}),
+                (79, "ownmesh_session_detach", {}),
+            ]:
+                stale_sc = structured(
+                    mcp_call(
+                        issuer,
+                        access_token_other,
+                        stale_tool,
+                        {
+                            "device_id": device_id,
+                            "session_id": seq_ses_id,
+                            "workspace_id": "ws_default",
+                            "lease_id": other_lease_id,
+                            "controller_epoch": other_controller_epoch,
+                            "async": True,
+                            "idempotency_key": f"idem_ses_old_{stale_tool}_{marker}",
+                            **stale_args,
+                        },
+                        rpc_id=stale_i,
+                    )
+                )
+                stale_done = wait_operation(
+                    issuer,
+                    access_token_other,
+                    str(stale_sc.get("operation_id") or ""),
+                    want={"failed", "denied"},
+                    timeout_s=20,
+                )
+                if str(stale_done.get("status")) not in {"failed", "denied"}:
+                    raise RuntimeError(
+                        f"old lease {stale_tool} must fail closed after detach: {stale_done}"
+                    )
+
+            reclaim_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_claim",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_reclaim_{marker}",
+                    },
+                    rpc_id=80,
+                )
+            )
+            reclaim_done = wait_operation(
+                issuer, access_token, str(reclaim_sc.get("operation_id") or ""), want={"completed"}
+            )
+            reclaim_dump = json.dumps(reclaim_done)
+            reclaim_lease_m = _re2.search(r"lease_[0-9a-fA-F]+", reclaim_dump)
+            reclaim_epoch_m = _re2.search(r'"epoch"\s*:\s*(\d+)', reclaim_dump)
+            if (
+                not reclaim_lease_m
+                or not reclaim_epoch_m
+                or int(reclaim_epoch_m.group(1)) <= other_controller_epoch
+            ):
+                raise RuntimeError(f"detach reclaim must increment controller epoch: {reclaim_done}")
+            reclaim_lease_id = reclaim_lease_m.group(0)
+            reclaim_epoch = int(reclaim_epoch_m.group(1))
+
+            # Natural lease expiry is a second recovery path: a one-second
+            # renewal expires without a disconnect, its old exact token cannot
+            # renew, and the retained reader can reclaim a newer epoch.
+            short_renew_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_renew",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "lease_id": reclaim_lease_id,
+                        "controller_epoch": reclaim_epoch,
+                        "ttl_secs": 1,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_short_renew_{marker}",
+                    },
+                    rpc_id=81,
+                )
+            )
+            short_renew_done = wait_operation(
+                issuer, access_token, str(short_renew_sc.get("operation_id") or ""), want={"completed"}
+            )
+            if str(short_renew_done.get("status")) != "completed":
+                raise RuntimeError(f"short session.renew must complete: {short_renew_done}")
+            time.sleep(2.1)
+
+            expired_renew_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_renew",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "lease_id": reclaim_lease_id,
+                        "controller_epoch": reclaim_epoch,
+                        "ttl_secs": 60,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_expired_renew_{marker}",
+                    },
+                    rpc_id=82,
+                )
+            )
+            expired_renew_done = wait_operation(
+                issuer,
+                access_token,
+                str(expired_renew_sc.get("operation_id") or ""),
+                want={"failed", "denied"},
+                timeout_s=20,
+            )
+            if str(expired_renew_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(f"expired lease renewal must fail closed: {expired_renew_done}")
+
+            natural_reclaim_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token,
+                    "ownmesh_session_claim",
+                    {
+                        "device_id": device_id,
+                        "session_id": seq_ses_id,
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_natural_reclaim_{marker}",
+                    },
+                    rpc_id=83,
+                )
+            )
+            natural_reclaim_done = wait_operation(
+                issuer, access_token, str(natural_reclaim_sc.get("operation_id") or ""), want={"completed"}
+            )
+            natural_epoch_m = _re2.search(r'"epoch"\s*:\s*(\d+)', json.dumps(natural_reclaim_done))
+            if not natural_epoch_m or int(natural_epoch_m.group(1)) <= reclaim_epoch:
+                raise RuntimeError(
+                    f"natural expiry reclaim must increment controller epoch: {natural_reclaim_done}"
                 )
 
             # E3/E4/E5: session scope must NOT bypass command policy in Recommended.

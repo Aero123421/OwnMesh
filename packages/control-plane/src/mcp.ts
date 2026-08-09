@@ -847,7 +847,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_session_release",
-    description: "Release the controller lease on a device session",
+    description: "Deprecated for remote sessions; use ownmesh_session_detach with the exact lease token",
     inputSchema: {
       type: "object",
       properties: {
@@ -879,13 +879,15 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         session_id: str,
         to: str,
+        lease_id: str,
+        controller_epoch: { type: "integer", minimum: 1 },
         workspace_id: str,
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once handoff",
         },
       },
-      required: ["device_id", "session_id", "to", "workspace_id", "idempotency_key"],
+      required: ["device_id", "session_id", "to", "lease_id", "controller_epoch", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,

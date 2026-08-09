@@ -533,12 +533,14 @@ test("session renew and detach expose exact lease-bound idempotent tools", () =>
     assert.equal(tool.scope, "ownmesh.session");
     assert.equal(tool.risk, "session");
     assert.equal(tool.annotations.idempotentHint, true);
-    assert.ok(tool.inputSchema.required?.includes("lease_id"));
-    assert.ok(tool.inputSchema.required?.includes("controller_epoch"));
-    assert.ok(tool.inputSchema.required?.includes("idempotency_key"));
+    const required = Array.isArray(tool.inputSchema.required) ? tool.inputSchema.required : [];
+    assert.ok(required.includes("lease_id"));
+    assert.ok(required.includes("controller_epoch"));
+    assert.ok(required.includes("idempotency_key"));
   }
   const renew = MCP_TOOLS.find((candidate) => candidate.name === "ownmesh_session_renew")!;
-  assert.ok(renew.inputSchema.required?.includes("ttl_secs"));
+  const renewRequired = Array.isArray(renew.inputSchema.required) ? renew.inputSchema.required : [];
+  assert.ok(renewRequired.includes("ttl_secs"));
 });
 
 // ---------------------------------------------------------------------------
