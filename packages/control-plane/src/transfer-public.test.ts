@@ -47,7 +47,9 @@ test("send dispatches only source authenticated preflight and cancel fences stat
   const sent = await invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "send-1" });
   assert.equal(f.routed.length, 1);
   assert.equal(f.routed[0].deviceId, "dev_source");
-  assert.equal(((f.routed[0].operation.payload as Record<string, unknown>).capability), "transfer.preflight_source");
+  const payload = f.routed[0].operation.payload as Record<string, unknown>;
+  assert.equal(payload.capability, "transfer.preflight_source");
+  assert.equal((payload.arguments as Record<string, unknown>).session_nonce, `nonce_${transferId}`);
   assert.equal(JSON.stringify(sent.result!.structuredContent!.data).includes("ticket"), false);
   const cancelled = await invoke(f, "ownmesh_transfer_cancel", { transfer_id: transferId, idempotency_key: "cancel-1" });
   const transfer = cancelled.result!.structuredContent!.data.transfer as Record<string, unknown>;

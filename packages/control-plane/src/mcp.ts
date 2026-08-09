@@ -2899,7 +2899,10 @@ async function buildTransferPreflightOperation(opts: {
     source_device_id: m.source_device_id, destination_device_id: m.destination_device_id,
     source_workspace_id: m.source_workspace_id, destination_workspace_id: m.destination_workspace_id,
     workspace_id: workspaceId, epoch: m.epoch, fence: m.fence,
-    session_nonce: `nonce_${opts.operationId}`, expires_at: Date.parse(m.expires_at),
+    // Both final Agent proofs must sign the same session nonce because the
+    // resulting ticket pair describes one end-to-end transfer session.  The
+    // coordinator operation id remains a separate reply-correlation field.
+    session_nonce: `nonce_${m.transfer_id}`, expires_at: Date.parse(m.expires_at),
     coordinator_request_id: opts.operationId, workspace_version: workspaceVersion,
   };
   if (!source) args.plan_sha256 = m.plan_sha256;
@@ -3330,7 +3333,7 @@ export async function handleMcp(
         if (!router) return mcpError(id, -32009, "device room unavailable");
         const preflightId = randomId("op_");
         const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: preflightId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
-        const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: "", epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${preflightId}`, coordinator_request_id: preflightId, workspace_version: meta.source_workspace_version };
+        const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: "", epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${meta.transfer_id}`, coordinator_request_id: preflightId, workspace_version: meta.source_workspace_version };
         await store.putMcpOperation({ operation_id: preflightId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.source_device_id, tool: "__transfer_preflight_source", status: "pending", summary: "transfer source preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: preflightId, payload_hash: deviceOp.payload_hash, idempotency_key: preflightId, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
         if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source preflight dispatch failed");
@@ -3369,7 +3372,7 @@ export async function handleMcp(
         const bound: TransferPlanMeta = { ...preliminary, plan_sha256: finalPlanSha256 };
         const finalSourceId = randomId("op_");
         const deviceOp = await buildTransferPreflightOperation({ transfer: bound, role: "source", operationId: finalSourceId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
-        const expectation = { role: "source", transfer_id: bound.transfer_id, tenant_id: bound.tenant_id, plan_sha256: finalPlanSha256, epoch: bound.epoch, fence: bound.fence, expires_at: Date.parse(bound.expires_at), device_id: bound.source_device_id, workspace_id: bound.source_workspace_id, session_nonce: `nonce_${finalSourceId}`, coordinator_request_id: finalSourceId, workspace_version: bound.source_workspace_version };
+        const expectation = { role: "source", transfer_id: bound.transfer_id, tenant_id: bound.tenant_id, plan_sha256: finalPlanSha256, epoch: bound.epoch, fence: bound.fence, expires_at: Date.parse(bound.expires_at), device_id: bound.source_device_id, workspace_id: bound.source_workspace_id, session_nonce: `nonce_${bound.transfer_id}`, coordinator_request_id: finalSourceId, workspace_version: bound.source_workspace_version };
         await store.putMcpOperation({ operation_id: finalSourceId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: bound.source_device_id, tool: "__transfer_preflight_source_final", status: "pending", summary: "transfer source final preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: finalSourceId, payload_hash: deviceOp.payload_hash, idempotency_key: finalSourceId, workspace_id: bound.source_workspace_id, expires_at: bound.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(bound.source_device_id, deviceOp);
         if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source final preflight dispatch failed");
@@ -3393,7 +3396,7 @@ export async function handleMcp(
         }
         const destinationId = randomId("op_");
         const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "destination", operationId: destinationId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
-        const expectation = { role: "destination", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.destination_device_id, workspace_id: meta.destination_workspace_id, session_nonce: `nonce_${destinationId}`, coordinator_request_id: destinationId, workspace_version: meta.destination_workspace_version };
+        const expectation = { role: "destination", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.destination_device_id, workspace_id: meta.destination_workspace_id, session_nonce: `nonce_${meta.transfer_id}`, coordinator_request_id: destinationId, workspace_version: meta.destination_workspace_version };
         await store.putMcpOperation({ operation_id: destinationId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_preflight_destination", status: "pending", summary: "transfer destination preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: destinationId, payload_hash: deviceOp.payload_hash, idempotency_key: destinationId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
         if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "destination preflight dispatch failed");
