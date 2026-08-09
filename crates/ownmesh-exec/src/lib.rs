@@ -884,13 +884,13 @@ fn kill_process_tree(pid: u32) {
     }
     #[cfg(unix)]
     {
-        // Negative PID = process group (spawned with process_group(0)).
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // `kill(2)` with a negative PID targets the process group created by
+        // `process_group(0)`.  Do not shell out to a `kill` utility: its
+        // option parsing can treat a negative group id as another signal and
+        // silently leave descendants alive.
+        if let Some(pid) = rustix::process::Pid::from_raw(pid.cast_signed()) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &pid.to_string()])
             .stdin(Stdio::null())

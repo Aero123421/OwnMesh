@@ -1047,7 +1047,20 @@ async fn handle_linux_production_connection(
                 cancel: cancel_tx,
             },
         );
-        let mut response = run_v2_elevated(&internal, &staged.path, Some(cancel_rx)).await;
+        // The Execute connection remains part of the authorization boundary
+        // until its response has been produced.  A separate connection may
+        // carry an exact CancelIntent, but EOF/reset (or any unexpected second
+        // frame) on this one cancels the whole process tree as well.
+        let mut run = Box::pin(run_v2_elevated(&internal, &staged.path, Some(cancel_rx)));
+        let mut disconnect = Box::pin(wait_for_execute_disconnect(stream));
+        let mut response = tokio::select! {
+            response = &mut run => response,
+            () = &mut disconnect => {
+                let _ = state.active.lock().await.get(&internal.nonce)
+                    .map(|active| active.cancel.send(true));
+                run.await
+            }
+        };
         state.active.lock().await.remove(&internal.nonce);
         // The broker owns this exact stage path. Best-effort cleanup is safe
         // only after the running child has been awaited; an uncertain ledger
@@ -1100,6 +1113,25 @@ async fn read_bounded_v2_frame(stream: &mut tokio::net::UnixStream) -> Result<Ve
             return Err("broker request frame exceeds byte limit".into());
         }
         frame.push(byte[0]);
+    }
+}
+
+/// Wait for closure after the one accepted Execute frame.  We intentionally
+/// treat post-frame input as a disconnect-equivalent: an Execute connection
+/// cannot smuggle a second operation while a privileged child is alive.
+#[cfg(target_os = "linux")]
+async fn wait_for_execute_disconnect(stream: &tokio::net::UnixStream) {
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        let mut byte = [0_u8; 1];
+        if !matches!(
+            stream.try_read(&mut byte),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ) {
+            return;
+        }
     }
 }
 
