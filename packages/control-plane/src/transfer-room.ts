@@ -552,9 +552,15 @@ export class TransferRoom {
     }
     const pair = new WebSocketPair(); const client = pair[0]; const server = pair[1];
     const peerId = crypto.randomUUID(); const peer: TransferPeer = { id: peerId, role: ticket.role, device_id: ticket.device_id, send: (raw) => server.send(raw) };
-    if (this.router?.attach(peer) === "reject") return new Response("peer rejected", { status: 403 });
-    server.serializeAttachment({ v: 1, peer_id: peerId, role: ticket.role, device_id: ticket.device_id, transfer_id: ticket.transfer_id, epoch: ticket.epoch, fence: ticket.fence, plan_sha256: ticket.plan_sha256, transfer_expires_at: ticket.transfer_expires_at } satisfies TransferAttachment);
+    // A second-role attach emits `ready` to both peers synchronously. The DO
+    // socket must therefore be accepted before router.attach can call send.
+    // Its bounded attachment is installed before the socket can hibernate.
     this.state.acceptWebSocket(server);
+    server.serializeAttachment({ v: 1, peer_id: peerId, role: ticket.role, device_id: ticket.device_id, transfer_id: ticket.transfer_id, epoch: ticket.epoch, fence: ticket.fence, plan_sha256: ticket.plan_sha256, transfer_expires_at: ticket.transfer_expires_at } satisfies TransferAttachment);
+    if (this.router?.attach(peer) === "reject") {
+      try { server.close(1008, "peer rejected"); } catch { /* already closed */ }
+      return new Response("peer rejected", { status: 403 });
+    }
     return new Response(null, { status: 101, webSocket: client });
   }
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {

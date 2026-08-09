@@ -9,14 +9,14 @@ function encrypted(length: number): string { return btoa("x".repeat(length + 16)
 function ticket(role: "source" | "destination"): TransferTicketClaims { return { v: 1, jti: `jti_${role}`, session_nonce: `nonce_${role}`, transfer_id: "xfer_test", tenant_id: "ten_a", principal_id: "prin_a", device_id: role === "source" ? "dev_source" : "dev_destination", role, source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, epoch: 1, fence: 7, max_bytes: 128 * 1024, ticket_exp: Date.now() + 20_000, transfer_expires_at: Date.now() + 10 * 60_000, source_device_public_key: "01".repeat(32), destination_device_public_key: "02".repeat(32), source_ephemeral_public_key: "03".repeat(32), destination_ephemeral_public_key: "04".repeat(32), source_ephemeral_signature: "05".repeat(64), destination_ephemeral_signature: "06".repeat(64) }; }
 
 type TransferMockSocket = {
-  attachment: unknown; closed: boolean; sent: string[];
+  attachment: unknown; accepted: boolean; closed: boolean; sent: string[];
   send(data: string): void; close(): void;
   serializeAttachment(value: unknown): void; deserializeAttachment(): unknown;
 };
 function transferMockSocket(): TransferMockSocket {
   const socket: TransferMockSocket = {
-    attachment: null, closed: false, sent: [],
-    send(data) { socket.sent.push(data); }, close() { socket.closed = true; },
+    attachment: null, accepted: false, closed: false, sent: [],
+    send(data) { if (!socket.accepted) throw new Error("send before acceptWebSocket"); socket.sent.push(data); }, close() { socket.closed = true; },
     serializeAttachment(value) { socket.attachment = value; },
     deserializeAttachment() { return socket.attachment; },
   };
@@ -38,7 +38,7 @@ function transferState(storage: Map<string, unknown>, sockets: TransferMockSocke
       setAlarm: async () => undefined,
     },
     getWebSockets: () => sockets as unknown as WebSocket[],
-    acceptWebSocket: (socket: WebSocket) => { sockets.push(socket as unknown as TransferMockSocket); },
+    acceptWebSocket: (socket: WebSocket) => { const accepted = socket as unknown as TransferMockSocket; accepted.accepted = true; sockets.push(accepted); },
   } as unknown as DurableObjectState;
 }
 async function transferUpgrade(room: TransferRoom, encoded: string): Promise<number> {
@@ -93,6 +93,21 @@ test("TransferRoom persists only a transfer-bound JTI hash and rejects replay af
     transferUpgrade(new TransferRoom(transferState(invalid), { SESSION_SECRET: secret }), encoded),
     /invalid transfer replay ledger/,
   );
+});
+
+test("TransferRoom accepts both DO sockets before second-role ready sends", async () => {
+  installTransferWebSocketPair();
+  const secret = "accept-before-ready-secret";
+  const storage = new Map<string, unknown>();
+  const sockets: TransferMockSocket[] = [];
+  const room = new TransferRoom(transferState(storage, sockets), { SESSION_SECRET: secret });
+  const source = ticket("source");
+  const destination = { ...ticket("destination"), transfer_expires_at: source.transfer_expires_at };
+  assert.equal(await transferUpgrade(room, await issueTransferTicket(secret, source)), 101);
+  assert.equal(await transferUpgrade(room, await issueTransferTicket(secret, destination)), 101);
+  assert.equal(sockets.length, 2);
+  assert.ok(sockets.every((socket) => socket.accepted));
+  assert.ok(sockets.every((socket) => socket.sent.some((raw) => raw.includes('"type":"ready"'))));
 });
 
 test("ephemeral proof binds the exact key, role, and immutable transfer facts", async () => {
