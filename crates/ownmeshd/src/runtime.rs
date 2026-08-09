@@ -46,7 +46,9 @@ use ownmesh_policy::{
     temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
     ExecutableIdentityBinding, OperationFacts, PolicyDocument, TemporaryGrant,
 };
-use ownmesh_profiles::{official_adapter_spec, parse_adapter_event_page, ProfileRegistry, ProfileStatus};
+use ownmesh_profiles::{
+    official_adapter_spec, parse_adapter_event_page, NativeResume, ProfileRegistry, ProfileStatus,
+};
 use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{
     SessionKind, SessionManager, SidecarHostBinding, StreamKind as SessionStreamKind,
@@ -2990,6 +2992,12 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 message: "adapter_mode requires profile_id; generic program/args are unchanged".into(),
             });
         }
+        if p.native_session_id.is_some() && p.profile_id.is_none() {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "native_session_id requires profile_id; generic program/args are unchanged".into(),
+            });
+        }
         let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
         // Resolve/pin cwd under the selected workspace (custody when enforce is on;
@@ -3030,20 +3038,43 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 code: app_error::INVALID_PARAMS,
                 message: format!("no source-backed adapter contract for profile {profile_id}"),
             })?;
-            let plan = reg
-                // Structured adapters must be allowed to select their declared
-                // stdio/HTTP dialect. PTY is opt-in only; this keeps generic
-                // CLI behavior unchanged while avoiding an accidental terminal
-                // downgrade for an explicit structured profile request.
-                .launch_plan(
-                    profile_id,
-                    p.prompt.as_deref(),
-                    /* force_pty */ adapter_mode == "pty",
-                )
-                .map_err(|e| IpcError::Remote {
-                    code: app_error::INVALID_PARAMS,
-                    message: format!("profile launch plan failed: {e}"),
-                })?;
+            let native_resume = p.native_session_id.as_deref().map(|native_id| match &spec.resume {
+                NativeResume::Argv { .. } => reg.resume_plan(profile_id, native_id).map_err(|e| {
+                    IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: format!("profile native resume plan failed: {e}"),
+                    }
+                }),
+                NativeResume::Negotiated { method } => Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!(
+                        "profile {profile_id} native resume requires negotiated {method}; RPC resume is not available in this session host"
+                    ),
+                }),
+                NativeResume::Degraded => Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!(
+                        "profile {profile_id} has no source-backed native resume; use a new profile session or explicit PTY"
+                    ),
+                }),
+            }).transpose()?;
+            let plan = match native_resume {
+                Some(plan) => plan,
+                None => reg
+                    // Structured adapters must be allowed to select their declared
+                    // stdio/HTTP dialect. PTY is opt-in only; this keeps generic
+                    // CLI behavior unchanged while avoiding an accidental terminal
+                    // downgrade for an explicit structured profile request.
+                    .launch_plan(
+                        profile_id,
+                        p.prompt.as_deref(),
+                        /* force_pty */ adapter_mode == "pty",
+                    )
+                    .map_err(|e| IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: format!("profile launch plan failed: {e}"),
+                    })?,
+            };
             if adapter_mode == "structured" && plan.use_pty {
                 return Err(IpcError::Remote {
                     code: app_error::CONFLICT,
@@ -3062,6 +3093,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 "dialect": spec.dialect,
                 "native_resume": spec.resume,
                 "safe_capabilities": spec.safe_capabilities,
+                "native_resume_requested": p.native_session_id.is_some(),
                 "structured_requested": adapter_mode == "structured" || (adapter_mode == "auto" && !plan.use_pty),
             }));
             let mut argv = vec![plan.program];
