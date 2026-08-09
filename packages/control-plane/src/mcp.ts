@@ -2738,7 +2738,7 @@ async function buildTransferStartOperation(opts: {
   const workspaceId = source ? meta.source_workspace_id : meta.destination_workspace_id;
   const workspaceVersion = source ? meta.source_workspace_version : meta.destination_workspace_version;
   const args = {
-    transfer_id: meta.transfer_id, role: opts.role, ticket: opts.ticket,
+    action: "transfer.start", transfer_id: meta.transfer_id, role: opts.role, ticket: opts.ticket,
     plan_sha256: opts.planSha256, content_sha256: meta.source_sha256,
     size_bytes: meta.source_size_bytes, source_path: meta.source_path, destination_path: meta.destination_path,
     source_device_id: meta.source_device_id, destination_device_id: meta.destination_device_id,
@@ -2771,7 +2771,7 @@ async function buildTransferStartOperation(opts: {
  * signed at the action envelope level, while the live-only bearer is verified
  * independently and must never enter durable/audited facts. */
 export function transferStartAuditedFacts(args: Record<string, unknown>): Record<string, unknown> {
-  return Object.fromEntries(Object.entries(args).filter(([key]) => key !== "ticket" && key !== "workspace_id"));
+  return Object.fromEntries(Object.entries(args).filter(([key]) => key !== "action" && key !== "ticket" && key !== "workspace_id"));
 }
 
 async function transferAuthorities(

@@ -239,7 +239,7 @@ test("durable transfer-start outbox recursively excludes bearer, JTI, and epheme
 
 test("transfer start audited facts exclude live bearer and duplicate workspace routing", () => {
   assert.deepEqual(transferStartAuditedFacts({
-    ticket: "live-only", workspace_id: "ws_destination", transfer_id: "xfer_1",
+    action: "transfer.start", ticket: "live-only", workspace_id: "ws_destination", transfer_id: "xfer_1",
     destination_workspace_id: "ws_destination", epoch: 1, fence: 2,
   }), {
     transfer_id: "xfer_1", destination_workspace_id: "ws_destination", epoch: 1, fence: 2,
