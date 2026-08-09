@@ -219,7 +219,7 @@ impl ReviewResultStore {
         let sha256 = format!("{:x}", Sha256::digest(canonical));
         Ok(ReviewResultPage {
             base_cursor: cursor,
-            next_cursor: end as u64,
+            next_cursor: end,
             total_bytes: total,
             truncated: end < total,
             sha256,
