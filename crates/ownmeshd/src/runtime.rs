@@ -2914,13 +2914,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             },
         };
         let now = self.prepare_session_access()?;
-        // Session IDs are identifiers, not bearer capabilities. Attaching cannot
-        // grant a new principal access; delegation must happen through session.give.
-        self.require_reader(&p.id, &client.client_name, now)?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
         if read_only {
+            // A workspace-granted principal may join as an observer. Session id
+            // alone is not enough: cloud workspace ACL has already been bound
+            // into this Agent request and the local workspace/session binding is
+            // rechecked above. Observer attach never grants controller rights.
             // Exact-action: observer attach must not leave an active controller lease
             // on the same principal (would silently keep write/resize rights).
             if self
@@ -2936,6 +2937,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 .attach_observer(&p.id, principal.clone(), now)
                 .map_err(session_err)?;
         } else {
+            // Controller claim is deliberately stricter: a reader must already
+            // be present (open creator, observer, or explicit give handoff).
+            self.require_reader(&p.id, &principal, now)?;
             let _ = self
                 .sessions
                 .claim_controller(&p.id, principal.clone(), now)

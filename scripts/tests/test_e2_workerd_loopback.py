@@ -1192,6 +1192,54 @@ def main() -> int:
                     f"live PTY session must produce real process output containing {live_marker}"
                 )
 
+            # E5 multi-observer: the explicitly workspace-granted second
+            # principal attaches read-only to the same live process and receives
+            # its bounded replay. It cannot acquire controller implicitly.
+            other_obs_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token_other,
+                    "ownmesh_session_attach",
+                    {
+                        "device_id": device_id,
+                        "session_id": ses_id,
+                        "role": "observer",
+                        "workspace_id": "ws_default",
+                        "async": True,
+                        "idempotency_key": f"idem_ses_other_obs_{marker}",
+                    },
+                    rpc_id=98,
+                )
+            )
+            other_obs_done = wait_operation(
+                issuer, access_token_other, str(other_obs_sc.get("operation_id") or ""), want={"completed"}
+            )
+            if "observer" not in json.dumps(other_obs_done).lower():
+                raise RuntimeError(f"second principal observer attach failed: {other_obs_done}")
+            other_rep_sc = structured(
+                mcp_call(
+                    issuer,
+                    access_token_other,
+                    "ownmesh_session_replay",
+                    {
+                        "device_id": device_id,
+                        "session_id": ses_id,
+                        "workspace_id": "ws_default",
+                        "from_seq": 1,
+                        "max_chunks": 1,
+                        "async": True,
+                        "idempotency_key": f"idem_ses_other_replay_{marker}",
+                    },
+                    rpc_id=99,
+                )
+            )
+            other_rep_done = wait_operation(
+                issuer, access_token_other, str(other_rep_sc.get("operation_id") or ""), want={"completed"}
+            )
+            other_rep_dump = json.dumps(other_rep_done)
+            if live_marker not in other_rep_dump:
+                raise RuntimeError(f"observer replay must expose live process output: {other_rep_done}")
+
             # Second session for observer lease checks (interactive shell).
             lease_sc = structured(
                 mcp_call(
