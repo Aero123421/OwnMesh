@@ -18,14 +18,15 @@
     clippy::too_many_arguments
 )]
 
+use ownmesh_fs::WorkspaceReadHandle;
 use ownmesh_ipc::{
     atomic_write_owner_only, create_owner_only_file_new, open_owner_only_file_append,
-    open_owner_only_file_read, prepare_owner_only_state_dir, publish_owner_only_file_no_replace,
+    open_owner_only_file_append_linkable, open_owner_only_file_read, prepare_owner_only_state_dir,
     read_owner_only_file_bounded, remove_owner_only_file,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -269,10 +270,11 @@ pub struct TransferPlan {
 }
 
 impl TransferPlan {
-    /// Stream-hash a source and create its immutable plan. This never uses
-    /// `read_to_end` or `fs::read`.
-    pub fn for_source(
-        source: &Path,
+    /// Stream-hash an already custody-verified source handle and create its
+    /// immutable plan. This never uses `read_to_end`, `fs::read`, or a path
+    /// reopen after the workspace authority check.
+    pub fn for_workspace_source(
+        source: WorkspaceReadHandle,
         binding: TransferBinding,
         grant: TransferGrant,
         limits: PlanLimits,
@@ -285,8 +287,7 @@ impl TransferPlan {
                 "expired grant or zero quota".into(),
             ));
         }
-        let mut file = open_source_nofollow(source)?;
-        validate_source_handle(&file)?;
+        let mut file = source.into_file();
         let (size_bytes, sha256) = hash_reader(&mut file, limits.max_bytes)?;
         if file.metadata().map_err(io_error)?.len() != size_bytes {
             return Err(TransferError::SourceChanged);
@@ -401,76 +402,11 @@ fn is_reparse_or_symlink(meta: &fs::Metadata) -> bool {
     }
 }
 
-#[cfg(unix)]
-fn nofollow_flag() -> i32 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        0o400_000
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))]
-    {
-        0x100
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    )))]
-    {
-        0
-    }
-}
-
-/// Open the final source component without following a symlink/reparse point.
-/// Callers must retain this handle; a pathname is never reopened for transfer I/O.
-fn open_source_nofollow(source: &Path) -> TransferResult<File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(nofollow_flag())
-            .open(source)
-            .map_err(io_error)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(source)
-            .map_err(io_error)
-    }
-}
-
-fn validate_source_handle(file: &File) -> TransferResult<()> {
+fn validate_retained_file(file: &File) -> TransferResult<()> {
     let meta = file.metadata().map_err(io_error)?;
     if !meta.is_file() || is_reparse_or_symlink(&meta) {
         return Err(TransferError::CustodyUnavailable);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.nlink() != 1 {
-            return Err(TransferError::CustodyUnavailable);
-        }
-    }
-    // Windows reparse/hardlink identity is pinned by the handle-rooted
-    // `ownmesh-fs` integration before it supplies this source path. This core
-    // still rejects a visible symlink/reparse node above, but does not pretend
-    // to replace that stronger custody boundary.
     Ok(())
 }
 
@@ -578,32 +514,14 @@ pub struct TransferSender {
 }
 
 impl TransferSender {
-    pub fn open(plan: TransferPlan, source: &Path) -> TransferResult<Self> {
-        Self::open_at(plan, source, 0, 0)
-    }
-
-    /// Open a no-follow source handle at a receiver-provided cursor. Production
-    /// callers should use [`JournalStore::open_source_sender_at`], which first
-    /// creates an owner-only immutable snapshot; this direct helper remains for
-    /// core-only callers and still never reopens the pathname after admission.
-    pub fn open_at(
-        plan: TransferPlan,
-        source: &Path,
-        sequence: u64,
-        offset: u64,
-    ) -> TransferResult<Self> {
-        let file = open_source_nofollow(source)?;
-        Self::from_verified_file(plan, file, sequence, offset)
-    }
-
-    fn from_verified_file(
+    fn from_retained_file(
         plan: TransferPlan,
         mut file: File,
         sequence: u64,
         offset: u64,
     ) -> TransferResult<Self> {
         plan.validate_at(now_unix())?;
-        validate_source_handle(&file)?;
+        validate_retained_file(&file)?;
         if offset > plan.size_bytes {
             return Err(TransferError::Overflow);
         }
@@ -1042,12 +960,24 @@ impl TransferReceiver {
 pub struct JournalLimits {
     pub max_journals: usize,
     pub max_bytes: usize,
+    /// Maximum number of retained immutable source snapshots.
+    pub max_snapshots: usize,
+    /// Aggregate byte ceiling for retained immutable source snapshots.
+    pub max_snapshot_bytes: u64,
+    /// Maximum number of immutable plan records, including source-only retries.
+    pub max_plans: usize,
+    /// Aggregate byte ceiling for immutable plan records.
+    pub max_plan_bytes: usize,
 }
 impl Default for JournalLimits {
     fn default() -> Self {
         Self {
             max_journals: 1024,
             max_bytes: 16 * 1024,
+            max_snapshots: 64,
+            max_snapshot_bytes: 10 * 1024 * 1024 * 1024,
+            max_plans: 256,
+            max_plan_bytes: 1024 * 1024,
         }
     }
 }
@@ -1074,12 +1004,20 @@ pub struct JournalStore {
 
 impl JournalStore {
     pub fn open(root: impl Into<PathBuf>, limits: JournalLimits) -> TransferResult<Self> {
-        if limits.max_journals == 0 || limits.max_bytes < 512 {
+        if limits.max_journals == 0
+            || limits.max_bytes < 512
+            || limits.max_snapshots == 0
+            || limits.max_snapshot_bytes == 0
+            || limits.max_plans == 0
+            || limits.max_plan_bytes < 512
+        {
             return Err(TransferError::JournalQuotaExceeded);
         }
         let root = root.into();
         prepare_owner_only_state_dir(&root).map_err(|_| TransferError::CustodyUnavailable)?;
-        Ok(Self { root, limits })
+        let store = Self { root, limits };
+        store.cleanup_expired(now_unix())?;
+        Ok(store)
     }
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -1093,6 +1031,70 @@ impl JournalStore {
             return Err(TransferError::InvalidPlan("plan id".into()));
         }
         Ok(self.root.join(format!(".{plan_id}{suffix}")))
+    }
+
+    fn snapshot_usage(&self) -> TransferResult<(usize, u64)> {
+        let mut count = 0_usize;
+        let mut bytes = 0_u64;
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(".xfer_") || !name.ends_with(".source") {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+            if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+                return Err(TransferError::CustodyUnavailable);
+            }
+            count = count.checked_add(1).ok_or(TransferError::Overflow)?;
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or(TransferError::Overflow)?;
+        }
+        Ok((count, bytes))
+    }
+
+    fn ensure_snapshot_capacity(&self, additional_bytes: u64) -> TransferResult<()> {
+        let (count, bytes) = self.snapshot_usage()?;
+        if count >= self.limits.max_snapshots
+            || bytes
+                .checked_add(additional_bytes)
+                .ok_or(TransferError::Overflow)?
+                > self.limits.max_snapshot_bytes
+        {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        Ok(())
+    }
+
+    fn plan_usage(&self) -> TransferResult<(usize, usize)> {
+        let mut count = 0_usize;
+        let mut bytes = 0_usize;
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let entry = entry.map_err(io_error)?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(plan_id) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".plan.json"))
+            else {
+                continue;
+            };
+            if self.path(plan_id, ".plan.json")? != path {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
+            if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+                return Err(TransferError::CustodyUnavailable);
+            }
+            let len = usize::try_from(metadata.len()).map_err(|_| TransferError::Overflow)?;
+            count = count.checked_add(1).ok_or(TransferError::Overflow)?;
+            bytes = bytes.checked_add(len).ok_or(TransferError::Overflow)?;
+        }
+        Ok((count, bytes))
     }
     pub fn acquire(
         &self,
@@ -1163,24 +1165,25 @@ impl JournalStore {
     }
 
     /// Create or reopen the owner-only immutable source snapshot used by the
-    /// live data plane. The caller-provided path is opened once with no-follow
-    /// semantics, copied in bounded chunks, and checked against the immutable
-    /// plan before any network chunk can be emitted. Later reads use only the
-    /// retained owner-only file handle, never that pathname again.
+    /// live data plane. The caller provides a workspace-custody verified
+    /// retained handle; it is copied in bounded chunks and checked against the
+    /// immutable plan before any network chunk can be emitted. Later reads use
+    /// only the retained owner-only file handle, never a pathname reopen.
     pub fn open_source_sender_at(
         &self,
         plan: TransferPlan,
-        source: &Path,
+        source: WorkspaceReadHandle,
         sequence: u64,
         offset: u64,
     ) -> TransferResult<TransferSender> {
         plan.validate_at(now_unix())?;
+        self.cleanup_expired(now_unix())?;
         let snapshot = self.path(plan.id(), ".source")?;
         if snapshot.exists() {
             match open_owner_only_file_read(&snapshot)
                 .map_err(|_| TransferError::CustodyUnavailable)
                 .and_then(|file| {
-                    TransferSender::from_verified_file(plan.clone(), file, sequence, offset)
+                    TransferSender::from_retained_file(plan.clone(), file, sequence, offset)
                 }) {
                 Ok(sender) => return Ok(sender),
                 Err(_) => {
@@ -1193,8 +1196,11 @@ impl JournalStore {
             }
         }
 
-        let mut input = open_source_nofollow(source)?;
-        validate_source_handle(&input)?;
+        // Reserve against the immutable plan size before creating/copying any
+        // snapshot bytes. A repeated fresh generation cannot exhaust state
+        // storage even if it never creates a receiver journal.
+        self.ensure_snapshot_capacity(plan.size_bytes)?;
+        let mut input = source.into_file();
         create_owner_only_file_new(&snapshot, &[])
             .map_err(|_| TransferError::CustodyUnavailable)?;
         let copy_result = (|| -> TransferResult<()> {
@@ -1229,7 +1235,7 @@ impl JournalStore {
         }
         let file =
             open_owner_only_file_read(&snapshot).map_err(|_| TransferError::CustodyUnavailable)?;
-        TransferSender::from_verified_file(plan, file, sequence, offset)
+        TransferSender::from_retained_file(plan, file, sequence, offset)
     }
 
     /// Remove the exact owner-only source snapshot after terminal completion or
@@ -1242,16 +1248,47 @@ impl JournalStore {
         Ok(())
     }
 
+    /// Remove exact source-side terminal state. Destination completion records
+    /// intentionally remain for bounded artifact retrieval and reply-loss
+    /// convergence; source snapshots/plans never need to survive terminal EOF
+    /// or an authenticated source cancellation.
+    pub fn remove_source_terminal_state(&self, plan: &TransferPlan) -> TransferResult<()> {
+        self.remove_source_snapshot(plan)?;
+        let plan_path = self.path(plan.id(), ".plan.json")?;
+        if plan_path.exists() {
+            remove_owner_only_file(&plan_path).map_err(|_| TransferError::CustodyUnavailable)?;
+        }
+        Ok(())
+    }
+
     /// Persist immutable plan metadata separately from progress so a restarted
     /// daemon can reopen only the exact authorized transfer id.
     pub fn save_plan(&self, plan: &TransferPlan) -> TransferResult<()> {
         plan.validate_at(now_unix())?;
+        self.cleanup_expired(now_unix())?;
         let bytes = serde_json::to_vec(plan)
             .map_err(|_| TransferError::InvalidPlan("serialize plan".into()))?;
         if bytes.len() > self.limits.max_bytes {
             return Err(TransferError::JournalQuotaExceeded);
         }
         let path = self.path(plan.id(), ".plan.json")?;
+        let existing_len = if path.exists() {
+            read_owner_only_file_bounded(&path, self.limits.max_bytes)
+                .map_err(|_| TransferError::CustodyUnavailable)?
+                .len()
+        } else {
+            0
+        };
+        let (count, total_bytes) = self.plan_usage()?;
+        if (existing_len == 0 && count >= self.limits.max_plans)
+            || total_bytes
+                .checked_sub(existing_len)
+                .and_then(|used| used.checked_add(bytes.len()))
+                .ok_or(TransferError::Overflow)?
+                > self.limits.max_plan_bytes
+        {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
         atomic_write_owner_only(&path, &bytes).map_err(|_| TransferError::CustodyUnavailable)
     }
 
@@ -1367,7 +1404,7 @@ impl JournalStore {
     pub fn publish_completed_no_replace(
         &self,
         plan: &TransferPlan,
-        destination: &Path,
+        destination_workspace: &ownmesh_fs::WorkspaceRoot,
     ) -> TransferResult<()> {
         plan.validate_at(now_unix())?;
         let journal = self.load(plan)?.ok_or(TransferError::Terminal)?;
@@ -1375,49 +1412,49 @@ impl JournalStore {
             return Err(TransferError::Terminal);
         }
         let part = self.path(plan.id(), ".part")?;
-        let mut file =
-            open_owner_only_file_append(&part).map_err(|_| TransferError::CustodyUnavailable)?;
+        let mut file = open_owner_only_file_append_linkable(&part)
+            .map_err(|_| TransferError::CustodyUnavailable)?;
         file.seek(SeekFrom::Start(0)).map_err(io_error)?;
         let (size, digest) = hash_reader(&mut file, plan.size_bytes)?;
         if size != plan.size_bytes || digest != plan.sha256 {
             return Err(TransferError::HashMismatch);
         }
-        publish_owner_only_file_no_replace(&file, &part, destination).map_err(|error| {
-            if matches!(&error, ownmesh_ipc::IpcError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists) {
-                TransferError::DestinationExists
-            } else {
-                TransferError::CustodyUnavailable
-            }
-        })
+        destination_workspace
+            .publish_retained_transfer_file_no_replace(
+                Path::new(&plan.binding().destination_relative_path),
+                &file,
+            )
+            .map_err(|error| match error {
+                ownmesh_fs::FsError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    TransferError::DestinationExists
+                }
+                _ => TransferError::CustodyUnavailable,
+            })
     }
 
-    /// Verify that the immutable destination path currently contains exactly
-    /// the artifact authorized by `plan`. This deliberately follows neither
-    /// symlinks nor a caller-supplied path: the runtime supplies the already
-    /// pinned workspace resolution from the immutable plan binding.
-    pub fn verify_published_destination(
+    /// Verify that an already custody-verified retained destination handle
+    /// contains exactly the artifact authorized by `plan`. The runtime must
+    /// pass the same handle onward for paging, never reopen its pathname.
+    pub fn verify_published_destination_handle(
         &self,
         plan: &TransferPlan,
-        destination: &Path,
+        file: &mut File,
     ) -> TransferResult<()> {
         plan.validate_at(now_unix())?;
-        let metadata = fs::symlink_metadata(destination).map_err(io_error)?;
+        let metadata = file.metadata().map_err(io_error)?;
         if !metadata.is_file()
-            || metadata.file_type().is_symlink()
+            || is_reparse_or_symlink(&metadata)
             || metadata.len() != plan.size_bytes
         {
             return Err(TransferError::DestinationExists);
         }
-        // Destination is a caller-pinned workspace artifact, not an
-        // owner-only state file; its parent intentionally does not satisfy
-        // the state-directory ownership predicate used for journals/parts.
-        // Reject a link before opening, then verify the opened handle's size
-        // and immutable digest below.
-        let mut file = File::open(destination).map_err(io_error)?;
-        let (size, digest) = hash_reader(&mut file, plan.size_bytes)?;
+        let (size, digest) = hash_reader(file, plan.size_bytes)?;
         if size != plan.size_bytes || digest != plan.sha256 {
             return Err(TransferError::DestinationExists);
         }
+        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
         Ok(())
     }
 
@@ -1480,6 +1517,62 @@ impl JournalStore {
             }
             removed += 1;
         }
+        // Source-side transfers do not create a receiver journal. Sweep their
+        // owner-only plan/snapshot pair on expiry, and remove a `.source` whose
+        // matching plan is absent. Names are strictly generated plan IDs and
+        // every delete revalidates owner-only/reparse-safe custody.
+        let mut live_plan_ids = std::collections::HashSet::new();
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(plan_id) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".plan.json"))
+            else {
+                continue;
+            };
+            let expected = self.path(plan_id, ".plan.json")?;
+            if expected != path {
+                continue;
+            }
+            let bytes = read_owner_only_file_bounded(&path, self.limits.max_bytes)
+                .map_err(|_| TransferError::CorruptJournal)?;
+            let plan: TransferPlan =
+                serde_json::from_slice(&bytes).map_err(|_| TransferError::CorruptJournal)?;
+            if plan.id() != plan_id {
+                return Err(TransferError::CorruptJournal);
+            }
+            if plan.grant().expires_at_unix <= now_unix {
+                let source = self.path(plan_id, ".source")?;
+                if source.exists() {
+                    remove_owner_only_file(&source)
+                        .map_err(|_| TransferError::CustodyUnavailable)?;
+                }
+                remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+                removed += 1;
+            } else {
+                live_plan_ids.insert(plan_id.to_owned());
+            }
+        }
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(plan_id) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".source"))
+            else {
+                continue;
+            };
+            if self.path(plan_id, ".source")? != path || live_plan_ids.contains(plan_id) {
+                continue;
+            }
+            remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+            removed += 1;
+        }
         Ok(removed)
     }
 }
@@ -1529,24 +1622,6 @@ impl PartFileSink {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Publish only after this sink has streamed and verified the complete part.
-    pub fn publish_no_replace(&mut self, destination: &Path) -> TransferResult<()> {
-        if self.expires_at_unix <= now_unix() {
-            return Err(TransferError::InvalidPlan("expired transfer grant".into()));
-        }
-        if !self.verified {
-            return Err(TransferError::HashMismatch);
-        }
-        let file = self.file.as_ref().ok_or(TransferError::Terminal)?;
-        publish_owner_only_file_no_replace(file, &self.path, destination).map_err(|error| {
-            if matches!(&error, ownmesh_ipc::IpcError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists) {
-                TransferError::DestinationExists
-            } else {
-                TransferError::CustodyUnavailable
-            }
-        })
     }
 }
 impl ChunkSink for PartFileSink {

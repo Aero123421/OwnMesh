@@ -24,7 +24,7 @@ pub use git::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
@@ -89,6 +89,37 @@ pub struct WorkspaceRoot {
     root: PathBuf,
     /// When true, restricted-mode handle-rooted custody is enforced.
     pub(crate) enforce: bool,
+}
+
+/// A regular file opened and verified beneath a [`WorkspaceRoot`].
+///
+/// The retained handle, rather than its original pathname, is the authority
+/// for subsequent reads.  In restricted workspaces it has passed the full
+/// no-follow, final-handle, mount, and hardlink custody checks.
+pub struct WorkspaceReadHandle {
+    file: File,
+    final_path: PathBuf,
+    size_bytes: u64,
+}
+
+impl WorkspaceReadHandle {
+    /// Consume this custody proof and return the already verified handle.
+    #[must_use]
+    pub fn into_file(self) -> File {
+        self.file
+    }
+
+    /// Final path observed from the retained operating-system handle.
+    #[must_use]
+    pub fn final_path(&self) -> &Path {
+        &self.final_path
+    }
+
+    /// Size observed from the retained operating-system handle.
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
 }
 
 impl WorkspaceRoot {
@@ -184,6 +215,92 @@ impl WorkspaceRoot {
             return Err(FsError::EscapesWorkspace(resolved));
         }
         Ok(resolved)
+    }
+
+    /// Open a regular file once and retain the verified OS handle for reading.
+    ///
+    /// In restricted mode callers must use this instead of `resolve` followed
+    /// by `File::open`, which would reintroduce a pathname TOCTOU boundary.
+    pub fn open_verified_read(&self, rel: impl AsRef<Path>) -> FsResult<WorkspaceReadHandle> {
+        let (file, final_path) = if self.enforce {
+            custody::open_regular_file_read(self, rel.as_ref())?
+        } else {
+            let path = self.resolve(rel)?;
+            let file = File::open(&path).map_err(|source| FsError::Io {
+                path: Some(path.clone()),
+                source,
+            })?;
+            (file, path)
+        };
+        let meta = file.metadata().map_err(|source| FsError::Io {
+            path: Some(final_path.clone()),
+            source,
+        })?;
+        if !meta.is_file() {
+            return Err(FsError::NotAFile(final_path));
+        }
+        Ok(WorkspaceReadHandle {
+            file,
+            final_path,
+            size_bytes: meta.len(),
+        })
+    }
+
+    /// Open a retained handle for an authenticated immutable transfer artifact.
+    ///
+    /// This is deliberately not a general-purpose read API: transfer
+    /// publication uses a no-replace hardlink, so the normal anti-alias policy
+    /// would reject it. Callers must still verify the immutable transfer plan
+    /// against this exact retained handle before returning any bytes.
+    pub fn open_verified_transfer_artifact_read(
+        &self,
+        rel: impl AsRef<Path>,
+    ) -> FsResult<WorkspaceReadHandle> {
+        let (file, final_path) = if self.enforce {
+            custody::open_regular_file_read_allow_hardlinks(self, rel.as_ref())?
+        } else {
+            let path = self.resolve(rel)?;
+            let file = File::open(&path).map_err(|source| FsError::Io {
+                path: Some(path.clone()),
+                source,
+            })?;
+            (file, path)
+        };
+        let meta = file.metadata().map_err(|source| FsError::Io {
+            path: Some(final_path.clone()),
+            source,
+        })?;
+        if !meta.is_file() {
+            return Err(FsError::NotAFile(final_path));
+        }
+        Ok(WorkspaceReadHandle {
+            file,
+            final_path,
+            size_bytes: meta.len(),
+        })
+    }
+
+    /// Publish an already verified private transfer file into this restricted
+    /// workspace without replacing an existing destination. The destination is
+    /// resolved relative to a retained no-follow parent handle, not reopened by
+    /// pathname after custody validation.
+    pub fn publish_retained_transfer_file_no_replace(
+        &self,
+        rel: impl AsRef<Path>,
+        source: &File,
+    ) -> FsResult<()> {
+        if self.enforce {
+            return custody::publish_retained_file_no_replace(self, rel.as_ref(), source);
+        }
+        let destination = self.resolve(rel)?;
+        let source_path = custody::final_path_of_handle(source).map_err(|source| FsError::Io {
+            path: Some(destination.clone()),
+            source,
+        })?;
+        fs::hard_link(source_path, &destination).map_err(|source| FsError::Io {
+            path: Some(destination),
+            source,
+        })
     }
 
     #[must_use]

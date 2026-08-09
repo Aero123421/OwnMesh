@@ -1,10 +1,12 @@
+use ownmesh_fs::WorkspaceRoot;
 use ownmesh_transfer::{
     ChunkSink, JournalLimits, JournalState, JournalStore, PartFileSink, PlanLimits,
     TransferBinding, TransferChunk, TransferError, TransferGrant, TransferPlan, TransferReceiver,
-    TransferSender, MAX_CHUNK_BYTES,
+    MAX_CHUNK_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 fn digest(bytes: &[u8]) -> String {
@@ -38,6 +40,10 @@ fn make_plan(bytes: &[u8]) -> TransferPlan {
     TransferPlan::from_verified(binding(), grant(), bytes.len() as u64, digest(bytes)).unwrap()
 }
 
+fn workspace(dir: &std::path::Path) -> WorkspaceRoot {
+    WorkspaceRoot::new(dir, true).unwrap()
+}
+
 #[derive(Default)]
 struct TestSink(Vec<u8>);
 impl ChunkSink for TestSink {
@@ -65,9 +71,24 @@ fn binary_three_chunk_stream_round_trips_with_bounded_frames() {
         .map(|i| u8::try_from(i % 251).expect("modulo is below u8 maximum"))
         .collect();
     std::fs::write(&source, &bytes).unwrap();
-    let plan =
-        TransferPlan::for_source(&source, binding(), grant(), PlanLimits::default(), 1).unwrap();
-    let mut sender = TransferSender::open(plan.clone(), &source).unwrap();
+    let ws = workspace(dir.path());
+    let plan = TransferPlan::for_workspace_source(
+        ws.open_verified_read("source.bin").unwrap(),
+        binding(),
+        grant(),
+        PlanLimits::default(),
+        1,
+    )
+    .unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let mut sender = store
+        .open_source_sender_at(
+            plan.clone(),
+            ws.open_verified_read("source.bin").unwrap(),
+            0,
+            0,
+        )
+        .unwrap();
     let mut receiver = TransferReceiver::new(plan, "owner-a", 1, 1, 9_000).unwrap();
     let mut sink = TestSink::default();
     let mut count = 0;
@@ -170,14 +191,24 @@ fn part_cancel_only_deletes_its_own_private_part_and_publish_refuses_overwrite()
     assert!(!part.exists());
 
     let mut publish_sink = PartFileSink::create(&store, &plan, 2, 0).unwrap();
-    publish_sink.write_chunk(0, b"hello").unwrap();
-    publish_sink.finalize().unwrap();
-    let destination = dir.path().join("existing.bin");
+    let mut publish_receiver =
+        TransferReceiver::new(plan.clone(), "owner-a", 2, 1, u64::MAX).unwrap();
+    publish_receiver
+        .receive(
+            &mut publish_sink,
+            TransferChunk::new(0, 0, b"hello".to_vec()).unwrap(),
+        )
+        .unwrap();
+    drop(publish_sink);
+    let journal = publish_receiver.journal_snapshot();
+    let lease = store.acquire(&plan, 1, u64::MAX).unwrap();
+    store.save(&lease, &journal).unwrap();
+    let destination = dir.path().join("output.bin");
     std::fs::write(&destination, b"do not replace").unwrap();
-    assert_eq!(
-        publish_sink.publish_no_replace(&destination).unwrap_err(),
-        TransferError::DestinationExists
-    );
+    let publish_error = store
+        .publish_completed_no_replace(&plan, &workspace(dir.path()))
+        .unwrap_err();
+    assert_eq!(publish_error, TransferError::DestinationExists);
     assert_eq!(std::fs::read(&destination).unwrap(), b"do not replace");
 }
 
@@ -190,6 +221,10 @@ fn durable_journal_fences_corruption_and_quota_fail_closed() {
         JournalLimits {
             max_journals: 1,
             max_bytes: 1024,
+            max_snapshots: 1,
+            max_snapshot_bytes: 1024,
+            max_plans: 1,
+            max_plan_bytes: 1024,
         },
     )
     .unwrap();
@@ -249,15 +284,123 @@ fn private_plan_round_trips_and_rechecks_its_grant() {
 }
 
 #[test]
+fn source_only_plan_and_snapshot_retries_are_aggregate_quota_bounded() {
+    let dir = tempdir().unwrap();
+    let store = JournalStore::open(
+        dir.path().join("state"),
+        JournalLimits {
+            max_journals: 4,
+            max_bytes: 4096,
+            max_snapshots: 1,
+            max_snapshot_bytes: 8,
+            max_plans: 2,
+            max_plan_bytes: 4096,
+        },
+    )
+    .unwrap();
+    let first = make_plan(b"one");
+    let second = make_plan(b"two");
+    let third = make_plan(b"three");
+    store.save_plan(&first).unwrap();
+    store.save_plan(&second).unwrap();
+    assert_eq!(
+        store.save_plan(&third).unwrap_err(),
+        TransferError::JournalQuotaExceeded,
+        "fresh source preflights cannot accumulate plan records without a journal",
+    );
+
+    let source = dir.path().join("input.bin");
+    std::fs::write(&source, b"one").unwrap();
+    let ws = workspace(dir.path());
+    let _sender = store
+        .open_source_sender_at(
+            first.clone(),
+            ws.open_verified_read("input.bin").unwrap(),
+            0,
+            0,
+        )
+        .unwrap();
+    std::fs::write(&source, b"two").unwrap();
+    assert!(matches!(
+        store.open_source_sender_at(second, ws.open_verified_read("input.bin").unwrap(), 0, 0),
+        Err(TransferError::JournalQuotaExceeded)
+    ));
+}
+
+#[test]
+fn startup_cleanup_removes_expired_source_only_plan_snapshot_pair() {
+    let dir = tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut short_grant = grant();
+    short_grant.expires_at_unix = now + 60;
+    let plan = TransferPlan::from_verified(binding(), short_grant, 3, digest(b"one")).unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    std::fs::write(dir.path().join("input.bin"), b"one").unwrap();
+    let ws = workspace(dir.path());
+    let sender = store
+        .open_source_sender_at(
+            plan.clone(),
+            ws.open_verified_read("input.bin").unwrap(),
+            0,
+            0,
+        )
+        .unwrap();
+    drop(sender);
+    let source = store.root().join(format!(".{}.source", plan.id()));
+    let plan_path = store.root().join(format!(".{}.plan.json", plan.id()));
+    assert!(source.exists() && plan_path.exists());
+    assert_eq!(store.cleanup_expired(now + 61).unwrap(), 1);
+    assert!(!source.exists() && !plan_path.exists());
+}
+
+#[test]
+fn source_terminal_cleanup_removes_its_plan_and_snapshot() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"terminal-source");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    std::fs::write(dir.path().join("input.bin"), b"terminal-source").unwrap();
+    let ws = workspace(dir.path());
+    drop(
+        store
+            .open_source_sender_at(
+                plan.clone(),
+                ws.open_verified_read("input.bin").unwrap(),
+                0,
+                0,
+            )
+            .unwrap(),
+    );
+    let source = store.root().join(format!(".{}.source", plan.id()));
+    let plan_path = store.root().join(format!(".{}.plan.json", plan.id()));
+    assert!(source.exists() && plan_path.exists());
+
+    store.remove_source_terminal_state(&plan).unwrap();
+    assert!(!source.exists() && !plan_path.exists());
+}
+
+#[test]
 fn source_mutation_is_detected_before_streaming() {
     let dir = tempdir().unwrap();
     let source = dir.path().join("source.bin");
     std::fs::write(&source, b"first").unwrap();
-    let plan =
-        TransferPlan::for_source(&source, binding(), grant(), PlanLimits::default(), 1).unwrap();
+    let ws = workspace(dir.path());
+    let plan = TransferPlan::for_workspace_source(
+        ws.open_verified_read("source.bin").unwrap(),
+        binding(),
+        grant(),
+        PlanLimits::default(),
+        1,
+    )
+    .unwrap();
     std::fs::write(&source, b"other").unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
     assert!(matches!(
-        TransferSender::open(plan, &source),
+        store.open_source_sender_at(plan, ws.open_verified_read("source.bin").unwrap(), 0, 0),
         Err(TransferError::SourceChanged)
     ));
 }
@@ -268,11 +411,23 @@ fn source_snapshot_retains_the_verified_file_across_path_replacement() {
     let source = dir.path().join("source.bin");
     let original = b"verified source".to_vec();
     std::fs::write(&source, &original).unwrap();
-    let plan =
-        TransferPlan::for_source(&source, binding(), grant(), PlanLimits::default(), 1).unwrap();
+    let ws = workspace(dir.path());
+    let plan = TransferPlan::for_workspace_source(
+        ws.open_verified_read("source.bin").unwrap(),
+        binding(),
+        grant(),
+        PlanLimits::default(),
+        1,
+    )
+    .unwrap();
     let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
     let mut sender = store
-        .open_source_sender_at(plan.clone(), &source, 0, 0)
+        .open_source_sender_at(
+            plan.clone(),
+            ws.open_verified_read("source.bin").unwrap(),
+            0,
+            0,
+        )
         .unwrap();
 
     // Simulate a rename/replacement race after admission. Every emitted byte
@@ -298,11 +453,8 @@ fn source_symlink_is_rejected_without_following_it() {
     let link = dir.path().join("source.bin");
     std::fs::write(&target, b"private target").unwrap();
     symlink(&target, &link).unwrap();
-    let plan = make_plan(b"private target");
-    assert!(matches!(
-        TransferSender::open(plan, &link),
-        Err(TransferError::Io(_)) | Err(TransferError::CustodyUnavailable)
-    ));
+    let ws = workspace(dir.path());
+    assert!(matches!(ws.open_verified_read("source.bin"), Err(_)));
 }
 
 #[test]
@@ -330,9 +482,17 @@ fn expired_grants_are_rejected_at_every_live_side_effect_boundary() {
     std::fs::write(&source, b"x").unwrap();
     let mut expired_grant = grant();
     expired_grant.expires_at_unix = 1;
-    let expired = TransferPlan::from_verified(binding(), expired_grant, 1, digest(b"x")).unwrap();
+    let expired =
+        TransferPlan::from_verified(binding(), expired_grant.clone(), 1, digest(b"x")).unwrap();
+    let ws = workspace(dir.path());
     assert!(matches!(
-        TransferSender::open(expired.clone(), &source),
+        TransferPlan::for_workspace_source(
+            ws.open_verified_read("source.bin").unwrap(),
+            binding(),
+            expired_grant,
+            PlanLimits::default(),
+            1
+        ),
         Err(TransferError::InvalidPlan(_))
     ));
     assert!(matches!(

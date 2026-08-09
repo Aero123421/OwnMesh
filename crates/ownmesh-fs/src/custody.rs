@@ -492,6 +492,220 @@ fn volume_serial_of_handle(file: &File) -> std::io::Result<u32> {
 
 /// Open an existing regular file under the workspace for reading.
 pub(crate) fn open_regular_file_read(ws: &WorkspaceRoot, rel: &Path) -> FsResult<(File, PathBuf)> {
+    open_regular_file_read_with_alias_policy(ws, rel, false)
+}
+
+/// Publish a retained source file into a verified workspace parent without
+/// replacing an existing child. Linux uses `linkat` relative to the held parent
+/// directory handle, so a parent symlink swap cannot redirect the side effect.
+pub(crate) fn publish_retained_file_no_replace(
+    ws: &WorkspaceRoot,
+    rel: &Path,
+    source: &File,
+) -> FsResult<()> {
+    let components = relative_components(rel)?;
+    let (leaf, parents) = components
+        .split_last()
+        .ok_or_else(|| FsError::InvalidPath("empty transfer destination".into()))?;
+    let mut parent_rel = PathBuf::new();
+    for component in parents {
+        parent_rel.push(component);
+    }
+    let parent_path = join_enforced_path(ws, &parent_rel)?;
+    let parent = open_dir_nofollow(&parent_path).map_err(|source| FsError::Io {
+        path: Some(parent_path.clone()),
+        source,
+    })?;
+    ensure_not_reparse_handle(&parent, &parent_path)?;
+    let parent_final = ensure_handle_under_workspace(&parent, ws)?;
+    let parent_meta = parent.metadata().map_err(|source| FsError::Io {
+        path: Some(parent_final.clone()),
+        source,
+    })?;
+    if !parent_meta.is_dir() {
+        return Err(FsError::NotADirectory(parent_final));
+    }
+
+    publish_retained_file_to_parent_no_replace(&parent, &parent_final, leaf, source)
+}
+
+/// Commit through an already-attested parent directory handle. Kept separate
+/// from path admission so adversarial tests can rename the lexical parent
+/// after the handle is retained and prove the side effect remains pinned.
+fn publish_retained_file_to_parent_no_replace(
+    parent: &File,
+    parent_final: &Path,
+    leaf: &std::ffi::OsString,
+    source: &File,
+) -> FsResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        let empty = CString::new("").map_err(|_| FsError::InvalidPath("invalid source".into()))?;
+        let leaf_c = CString::new(leaf.as_os_str().as_bytes())
+            .map_err(|_| FsError::InvalidPath("destination contains NUL".into()))?;
+        let result = unsafe {
+            libc::linkat(
+                source.as_raw_fd(),
+                empty.as_ptr(),
+                parent.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result != 0 {
+            return Err(FsError::Io {
+                path: Some(parent_final.join(leaf)),
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Wdk::Storage::FileSystem::{FileLinkInformation, NtSetInformationFile};
+        use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, HANDLE};
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+        // FILE_LINK_INFORMATION is deliberately represented locally: the WDK
+        // binding exposes `NtSetInformationFile(FileLinkInformation)` but not
+        // the variable-length buffer. `SetFileInformationByHandle` cannot be
+        // used here: its class 11 is `FileIdBothDirectoryRestartInfo`, not the
+        // NT `FileLinkInformation` class. RootDirectory keeps the side effect
+        // pinned to this retained parent; ReplaceIfExists=FALSE preserves
+        // no-replace semantics after a rename/junction swap.
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct FileLinkInfoHeader {
+            replace_if_exists: u8,
+            root_directory: HANDLE,
+            file_name_length: u32,
+        }
+        let name: Vec<u16> = leaf.as_os_str().encode_wide().collect();
+        if name.is_empty() {
+            return Err(FsError::InvalidPath("empty transfer destination".into()));
+        }
+        let name_bytes = name
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .ok_or_else(|| FsError::InvalidPath("transfer destination too long".into()))?;
+        let name_offset = std::mem::offset_of!(FileLinkInfoHeader, file_name_length)
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| FsError::InvalidPath("transfer destination too long".into()))?;
+        // C `sizeof(FILE_LINK_INFORMATION)` includes the declared `WCHAR[1]`
+        // and x64 tail padding. The native API requires exactly that baseline
+        // plus every extra filename wchar beyond the first.
+        let total = std::mem::size_of::<FileLinkInfoHeader>()
+            .checked_add(name_bytes)
+            .and_then(|value| value.checked_sub(std::mem::size_of::<u16>()))
+            .ok_or_else(|| FsError::InvalidPath("transfer destination too long".into()))?;
+        let entries = total
+            .checked_add(std::mem::size_of::<FileLinkInfoHeader>() - 1)
+            .ok_or_else(|| FsError::InvalidPath("transfer destination too long".into()))?
+            / std::mem::size_of::<FileLinkInfoHeader>();
+        let mut buffer = vec![
+            FileLinkInfoHeader {
+                replace_if_exists: 0,
+                root_directory: std::ptr::null_mut(),
+                file_name_length: 0,
+            };
+            entries
+        ];
+        let header = buffer.as_mut_ptr();
+        unsafe {
+            std::ptr::write(
+                header,
+                FileLinkInfoHeader {
+                    replace_if_exists: 0,
+                    root_directory: parent.as_raw_handle() as HANDLE,
+                    file_name_length: u32::try_from(name_bytes).map_err(|_| {
+                        FsError::InvalidPath("transfer destination too long".into())
+                    })?,
+                },
+            );
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                header
+                    .cast::<u16>()
+                    .add(name_offset / std::mem::size_of::<u16>()),
+                name.len(),
+            );
+            let mut io_status: IO_STATUS_BLOCK = std::mem::zeroed();
+            let status = NtSetInformationFile(
+                source.as_raw_handle() as HANDLE,
+                &raw mut io_status,
+                header.cast(),
+                u32::try_from(total)
+                    .map_err(|_| FsError::InvalidPath("transfer destination too long".into()))?,
+                FileLinkInformation,
+            );
+            if status < 0 {
+                return Err(FsError::Io {
+                    path: Some(parent_final.join(leaf)),
+                    source: std::io::Error::from_raw_os_error(
+                        i32::try_from(RtlNtStatusToDosError(status)).unwrap_or(i32::MAX),
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = (source, leaf);
+        return Err(FsError::InvalidPath(
+            "restricted handle-relative transfer publish is unsupported on this platform".into(),
+        ));
+    }
+}
+
+fn ensure_same_mount(file: &File, path: &Path, ws: &WorkspaceRoot) -> FsResult<()> {
+    let root_id = root_identity(ws)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata().map_err(|source| FsError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+        if meta.dev() != root_id.dev {
+            return Err(FsError::CrossMount(path.to_path_buf()));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let info = by_handle_file_info(file).map_err(|source| FsError::Io {
+            path: Some(path.to_path_buf()),
+            source,
+        })?;
+        if info.volume_serial != root_id.volume_serial {
+            return Err(FsError::CrossMount(path.to_path_buf()));
+        }
+    }
+    let _ = root_id;
+    Ok(())
+}
+
+/// Internal narrow exception for a transfer artifact that was published from a
+/// verified private part. The retained handle still receives every no-follow,
+/// final-path, and cross-mount check; only the link-count check is deferred to
+/// the authenticated immutable transfer-plan boundary.
+pub(crate) fn open_regular_file_read_allow_hardlinks(
+    ws: &WorkspaceRoot,
+    rel: &Path,
+) -> FsResult<(File, PathBuf)> {
+    open_regular_file_read_with_alias_policy(ws, rel, true)
+}
+
+fn open_regular_file_read_with_alias_policy(
+    ws: &WorkspaceRoot,
+    rel: &Path,
+    allow_hardlinks: bool,
+) -> FsResult<(File, PathBuf)> {
     if !ws.enforce {
         let path = ws.resolve(rel)?;
         let file = File::open(&path).map_err(|source| FsError::Io {
@@ -528,7 +742,11 @@ pub(crate) fn open_regular_file_read(ws: &WorkspaceRoot, rel: &Path) -> FsResult
     }
     let final_path = ensure_handle_under_workspace(&file, ws)?;
     // After pathname custody, reject multi-link hardlinks and cross-mount inodes.
-    ensure_no_cross_boundary_alias(&file, &final_path, ws)?;
+    if allow_hardlinks {
+        ensure_same_mount(&file, &final_path, ws)?;
+    } else {
+        ensure_no_cross_boundary_alias(&file, &final_path, ws)?;
+    }
     Ok((file, final_path))
 }
 
@@ -1661,6 +1879,141 @@ mod tests {
                     "junction parent must fail closed: {err:?}"
                 );
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_parent_publish_is_not_redirected_by_a_later_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let safe = root.path().join("safe");
+        fs::create_dir(&safe).unwrap();
+        let source_path = root.path().join("private.part");
+        fs::write(&source_path, b"verified private bytes").unwrap();
+        let source = File::open(&source_path).unwrap();
+        let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+
+        // Retain an attested parent, then move its lexical name and replace
+        // that name with an attacker-controlled symlink before the link call.
+        let parent = open_dir_nofollow(&safe).unwrap();
+        let parent_final = ensure_handle_under_workspace(&parent, &ws).unwrap();
+        let held = root.path().join("safe-held");
+        fs::rename(&safe, &held).unwrap();
+        symlink(outside.path(), &safe).unwrap();
+
+        publish_retained_file_to_parent_no_replace(
+            &parent,
+            &parent_final,
+            &"artifact.bin".into(),
+            &source,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(held.join("artifact.bin")).unwrap(),
+            b"verified private bytes"
+        );
+        assert!(
+            !outside.path().join("artifact.bin").exists(),
+            "held-parent link must never publish through the swapped symlink"
+        );
+    }
+
+    #[cfg(windows)]
+    fn open_delete_capable_source(path: &Path) -> File {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE | 0x0001_0000, // DELETE
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE, "open DELETE-capable source");
+        unsafe { File::from_raw_handle(handle) }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_parent_publish_windows_filelink_never_follows_junction_swap() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let safe = root.path().join("safe");
+        fs::create_dir(&safe).unwrap();
+        let source_path = root.path().join("private.part");
+        fs::write(&source_path, b"verified private bytes").unwrap();
+        let source = open_delete_capable_source(&source_path);
+        let ws = WorkspaceRoot::new(root.path(), true).unwrap();
+        let parent = open_dir_nofollow(&safe).unwrap();
+        let parent_final = ensure_handle_under_workspace(&parent, &ws).unwrap();
+        let held = root.path().join("safe-held");
+
+        // A held Windows directory often refuses rename because its share mode
+        // omits DELETE: that is a fail-closed result. If the host permits the
+        // rename, replace the lexical name with a junction before FileLinkInfo.
+        let renamed = fs::rename(&safe, &held).is_ok();
+        let junction_created = if renamed {
+            matches!(
+                std::process::Command::new("cmd")
+                    .args([
+                        "/C",
+                        "mklink",
+                        "/J",
+                        &safe.to_string_lossy(),
+                        &outside.path().to_string_lossy(),
+                    ])
+                    .status(),
+                Ok(status) if status.success()
+            )
+        } else {
+            false
+        };
+        if renamed {
+            assert!(
+                junction_created,
+                "host permitted parent rename but could not create the required junction race fixture"
+            );
+        }
+
+        let result = publish_retained_file_to_parent_no_replace(
+            &parent,
+            &parent_final,
+            &"artifact.bin".into(),
+            &source,
+        );
+        assert!(
+            result.is_ok() || renamed,
+            "normal retained-parent FileLinkInfo publish must succeed: {result:?}"
+        );
+        assert!(
+            !outside.path().join("artifact.bin").exists(),
+            "FileLinkInfo RootDirectory must never publish through the junction"
+        );
+        if result.is_ok() {
+            let published_parent = if renamed { &held } else { &safe };
+            assert_eq!(
+                fs::read(published_parent.join("artifact.bin")).unwrap(),
+                b"verified private bytes"
+            );
         }
     }
 

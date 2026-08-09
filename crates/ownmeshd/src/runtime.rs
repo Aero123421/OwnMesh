@@ -2129,8 +2129,8 @@ full_user_access/full_access for arbitrary commands",
         // TransferBinding::validate above still rejects absolute/traversal paths
         // before either value becomes immutable plan metadata.
         let source = self.workspace_for(Some(&source_workspace_id))?;
-        let source_path = source
-            .resolve(Path::new(&binding.source_relative_path))
+        let source_handle = source
+            .open_verified_read(Path::new(&binding.source_relative_path))
             .map_err(fs_err)?;
         let grant = TransferGrant {
             grant_id: format!("grant_{}", authority.operation_id),
@@ -2138,8 +2138,8 @@ full_user_access/full_access for arbitrary commands",
             payload_sha256: authority.payload_sha256.clone(),
             expires_at_unix: authority.expires_at_unix,
         };
-        let plan = TransferPlan::for_source(
-            &source_path,
+        let plan = TransferPlan::for_workspace_source(
+            source_handle,
             binding,
             grant,
             PlanLimits::default(),
@@ -2242,8 +2242,8 @@ full_user_access/full_access for arbitrary commands",
         }
         binding.validate().map_err(Self::transfer_error)?;
         let source = self.workspace_for(Some(&source_workspace_id))?;
-        let source_path = source
-            .resolve(Path::new(&binding.source_relative_path))
+        let source_handle = source
+            .open_verified_read(Path::new(&binding.source_relative_path))
             .map_err(fs_err)?;
         let final_plan = match (
             p.plan_sha256,
@@ -2301,8 +2301,8 @@ full_user_access/full_access for arbitrary commands",
             payload_sha256: authority.payload_sha256.clone(),
             expires_at_unix: authority.expires_at_unix,
         };
-        let observed = TransferPlan::for_source(
-            &source_path,
+        let observed = TransferPlan::for_workspace_source(
+            source_handle,
             binding,
             grant,
             PlanLimits::default(),
@@ -2632,11 +2632,11 @@ full_user_access/full_access for arbitrary commands",
         }
         let workspace = self.workspace_for(Some(&plan.binding().source_workspace_id))?;
         let source = workspace
-            .resolve(Path::new(&plan.binding().source_relative_path))
+            .open_verified_read(Path::new(&plan.binding().source_relative_path))
             .map_err(fs_err)?;
         let sender = self
             .transfer_store
-            .open_source_sender_at(plan.clone(), &source, p.sequence, p.offset)
+            .open_source_sender_at(plan.clone(), source, p.sequence, p.offset)
             .map_err(Self::transfer_error)?;
         self.transfer_senders.insert(plan.id().to_owned(), sender);
         self.transfer_last_chunks.remove(plan.id());
@@ -2679,7 +2679,7 @@ full_user_access/full_access for arbitrary commands",
             self.transfer_senders.remove(plan.id());
             self.transfer_last_chunks.remove(plan.id());
             self.transfer_store
-                .remove_source_snapshot(&plan)
+                .remove_source_terminal_state(&plan)
                 .map_err(Self::transfer_error)?;
             return Ok(json!({ "plan_id": plan.id(), "sequence": p.sequence, "eof": true }));
         };
@@ -2729,8 +2729,14 @@ full_user_access/full_access for arbitrary commands",
             .map_err(Self::transfer_error)?
         {
             if journal.published() {
+                let mut artifact = workspace
+                    .open_verified_transfer_artifact_read(Path::new(
+                        &plan.binding().destination_relative_path,
+                    ))
+                    .map_err(fs_err)?
+                    .into_file();
                 self.transfer_store
-                    .verify_published_destination(&plan, &destination)
+                    .verify_published_destination_handle(&plan, &mut artifact)
                     .map_err(Self::transfer_error)?;
                 return Ok(
                     json!({ "plan_id": plan.id(), "state": journal.state(), "next_sequence": journal.contiguous_ack().map(|v| v + 1).unwrap_or(0), "next_offset": journal.bytes_received(), "epoch": p.epoch, "fence": p.fence, "completed": true, "published": true }),
@@ -2881,13 +2887,16 @@ full_user_access/full_access for arbitrary commands",
                 code: app_error::CONFLICT,
                 message: "transfer is incomplete".into(),
             })?;
-        let destination = self
-            .workspace_for(Some(&p.workspace_id))?
-            .resolve(Path::new(&plan.binding().destination_relative_path))
-            .map_err(fs_err)?;
+        let workspace = self.workspace_for(Some(&p.workspace_id))?;
         if journal.published() {
+            let mut artifact = workspace
+                .open_verified_transfer_artifact_read(Path::new(
+                    &plan.binding().destination_relative_path,
+                ))
+                .map_err(fs_err)?
+                .into_file();
             self.transfer_store
-                .verify_published_destination(&plan, &destination)
+                .verify_published_destination_handle(&plan, &mut artifact)
                 .map_err(Self::transfer_error)?;
             return Ok(
                 json!({ "plan_id": plan.id(), "published": true, "replayed": true, "sha256": plan.sha256(), "size_bytes": plan.size_bytes() }),
@@ -2908,12 +2917,19 @@ full_user_access/full_access for arbitrary commands",
             .map_err(Self::transfer_error)?;
         match self
             .transfer_store
-            .publish_completed_no_replace(&plan, &destination)
+            .publish_completed_no_replace(&plan, &workspace)
         {
-            Ok(()) | Err(ownmesh_transfer::TransferError::DestinationExists) => self
-                .transfer_store
-                .verify_published_destination(&plan, &destination)
-                .map_err(Self::transfer_error)?,
+            Ok(()) | Err(ownmesh_transfer::TransferError::DestinationExists) => {
+                let mut artifact = workspace
+                    .open_verified_transfer_artifact_read(Path::new(
+                        &plan.binding().destination_relative_path,
+                    ))
+                    .map_err(fs_err)?
+                    .into_file();
+                self.transfer_store
+                    .verify_published_destination_handle(&plan, &mut artifact)
+                    .map_err(Self::transfer_error)?;
+            }
             Err(error) => return Err(Self::transfer_error(error)),
         }
         // The destination file is now verified as the exact immutable plan
@@ -3006,7 +3022,7 @@ full_user_access/full_access for arbitrary commands",
             {
                 self.transfer_senders.remove(plan.id());
                 self.transfer_last_chunks.remove(plan.id());
-                let _ = self.transfer_store.remove_source_snapshot(&plan);
+                let _ = self.transfer_store.remove_source_terminal_state(&plan);
                 return Ok(json!({ "plan_id": plan.id(), "cancelled": true, "source_only": true }));
             }
             Err(error) => return Err(Self::transfer_error(error)),
@@ -3092,49 +3108,26 @@ full_user_access/full_access for arbitrary commands",
             });
         }
         let ws = self.workspace_for(Some(&p.workspace_id))?;
-        let artifact_path = ws
-            .resolve(Path::new(&plan.binding().destination_relative_path))
+        let artifact = ws
+            .open_verified_transfer_artifact_read(Path::new(
+                &plan.binding().destination_relative_path,
+            ))
             .map_err(fs_err)?;
-        if journal.published() {
-            self.transfer_store
-                .verify_published_destination(&plan, &artifact_path)
-                .map_err(Self::transfer_error)?;
-        }
         // The completed artifact is deliberately a no-replace hardlink to the
         // private verified part.  `ownmesh-fs` correctly rejects that
         // cross-boundary hardlink for ordinary path-selected reads; this is the
         // narrow exception for an already authenticated immutable plan.  The
         // caller cannot choose this path, and the read remains regular-file,
         // no-symlink, offset/page bounded.
-        let initial =
-            std::fs::symlink_metadata(&artifact_path).map_err(|error| IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: format!("stat transfer artifact: {error}"),
-            })?;
-        if !initial.is_file() || initial.file_type().is_symlink() {
-            return Err(IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: "transfer artifact custody changed after publication".into(),
-            });
-        }
         let want = p
             .max_bytes
             .unwrap_or(64 * 1024)
             .clamp(1, MAX_CHUNK_BYTES as u64);
-        let mut file = std::fs::File::open(&artifact_path).map_err(|error| IpcError::Remote {
-            code: app_error::INTERNAL,
-            message: format!("open transfer artifact: {error}"),
-        })?;
-        let opened = file.metadata().map_err(|error| IpcError::Remote {
-            code: app_error::INTERNAL,
-            message: format!("inspect transfer artifact: {error}"),
-        })?;
-        if !opened.is_file() || opened.len() != initial.len() {
-            return Err(IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: "transfer artifact changed while opening".into(),
-            });
-        }
+        let total = artifact.size_bytes();
+        let mut file = artifact.into_file();
+        self.transfer_store
+            .verify_published_destination_handle(&plan, &mut file)
+            .map_err(Self::transfer_error)?;
         file.seek(SeekFrom::Start(p.offset))
             .map_err(|error| IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
@@ -3146,7 +3139,6 @@ full_user_access/full_access for arbitrary commands",
             message: format!("read transfer artifact: {error}"),
         })?;
         data.truncate(returned);
-        let total = opened.len();
         let truncated = p
             .offset
             .saturating_add(u64::try_from(returned).unwrap_or(u64::MAX))
@@ -8709,7 +8701,7 @@ mod transfer_runtime_tests {
             .transfer_store
             .publish_completed_no_replace(
                 &stored_plan,
-                &temp.path().join("destination").join("received.bin"),
+                &runtime.workspace_for(Some("ws_destination")).unwrap(),
             )
             .unwrap();
         drop(runtime);

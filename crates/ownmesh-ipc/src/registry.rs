@@ -847,13 +847,28 @@ pub fn open_owner_only_file_read(path: &Path) -> IpcResult<fs::File> {
 /// custody-attested handle. This intentionally never creates a file: callers
 /// must use [`create_owner_only_file_new`] for the exclusive creation step.
 pub fn open_owner_only_file_append(path: &Path) -> IpcResult<fs::File> {
+    open_owner_only_file_append_with_link_permission(path, false)
+}
+
+/// Open an owner-only append file with the additional Windows `DELETE` access
+/// required to publish that exact retained handle through `FileLinkInfo`.
+/// This narrow capability is for immutable transfer part files only; ordinary
+/// owner-only state opens intentionally do not request that broader right.
+pub fn open_owner_only_file_append_linkable(path: &Path) -> IpcResult<fs::File> {
+    open_owner_only_file_append_with_link_permission(path, true)
+}
+
+fn open_owner_only_file_append_with_link_permission(
+    path: &Path,
+    linkable: bool,
+) -> IpcResult<fs::File> {
     let parent = path.parent().ok_or_else(|| {
         IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
     })?;
     validate_secure_state_dir(parent)?;
     let _custody = StateCustody::acquire(parent)?;
     ensure_existing_path_is_regular_file(path)?;
-    let file = open_existing_nofollow_append(path)?;
+    let file = open_existing_nofollow_append(path, linkable)?;
     validate_open_regular_owned_file(&file, path, true)?;
     Ok(file)
 }
@@ -986,11 +1001,11 @@ fn open_existing_nofollow_read(path: &Path) -> IpcResult<fs::File> {
     }
     #[cfg(windows)]
     {
-        open_windows_path(path, false, false, true)
+        open_windows_path(path, false, false, true, false)
     }
 }
 
-fn open_existing_nofollow_append(path: &Path) -> IpcResult<fs::File> {
+fn open_existing_nofollow_append(path: &Path, linkable: bool) -> IpcResult<fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -1004,7 +1019,7 @@ fn open_existing_nofollow_append(path: &Path) -> IpcResult<fs::File> {
     }
     #[cfg(windows)]
     {
-        open_windows_path(path, false, false, false)
+        open_windows_path(path, false, false, false, linkable)
     }
 }
 
@@ -1096,7 +1111,7 @@ fn open_owner_only_rw(path: &Path, create: bool) -> IpcResult<fs::File> {
     }
     #[cfg(windows)]
     {
-        open_windows_path(path, create, false, false)
+        open_windows_path(path, create, false, false, false)
     }
 }
 
@@ -1120,16 +1135,18 @@ fn create_owner_only_new(path: &Path) -> IpcResult<fs::File> {
     }
     #[cfg(windows)]
     {
-        open_windows_path(path, true, true, false)
+        open_windows_path(path, true, true, false, false)
     }
 }
 
 #[cfg(windows)]
+#[allow(clippy::fn_params_excessive_bools)]
 fn open_windows_path(
     path: &Path,
     create: bool,
     create_new: bool,
     read_only: bool,
+    linkable: bool,
 ) -> IpcResult<fs::File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
@@ -1153,7 +1170,15 @@ fn open_windows_path(
     let access = if read_only {
         GENERIC_READ
     } else {
-        GENERIC_READ | GENERIC_WRITE
+        let mut access = GENERIC_READ | GENERIC_WRITE;
+        if linkable {
+            // FileLinkInfo creates a hardlink from this retained source handle
+            // and requires DELETE access. Restrict this to immutable transfer
+            // parts so unrelated owner-only state keeps its compatibility.
+            // DELETE is the standard access right (0x0001_0000).
+            access |= 0x0001_0000;
+        }
+        access
     };
     let disposition = if create_new {
         CREATE_NEW
