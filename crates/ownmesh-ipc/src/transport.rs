@@ -407,6 +407,10 @@ pub struct LocalListener {
     endpoint: Endpoint,
     #[cfg(windows)]
     pipe_name: String,
+    /// Present only for the fixed privileged-broker pipe.  The SID is used to
+    /// recreate and attest the same protected DACL for every pipe instance.
+    #[cfg(windows)]
+    secure_broker_daemon_sid: Option<String>,
     #[cfg(windows)]
     pending: TokioMutex<Option<NamedPipeServer>>,
     #[cfg(unix)]
@@ -417,6 +421,12 @@ pub struct LocalListener {
 }
 
 impl LocalListener {
+    /// Fixed, non-configurable endpoint for the privileged Windows broker.
+    /// Keeping this name out of user configuration prevents an attacker from
+    /// redirecting a high-capability client to a lookalike pipe.
+    #[cfg(windows)]
+    pub const SECURE_BROKER_PIPE_NAME: &'static str = r"\\.\pipe\ownmesh-privileged";
+
     /// Configure the process-wide Unix socket privilege boundary used by [`Self::bind`].
     ///
     /// - `mode`: octal bits; default `0o600` when `None`. Modes with "other" bits are refused.
@@ -479,6 +489,7 @@ impl LocalListener {
                     .create(name)?;
                 Ok(Self {
                     pipe_name: name.clone(),
+                    secure_broker_daemon_sid: None,
                     pending: TokioMutex::new(Some(first)),
                     endpoint,
                     allowed_uids: security.allowed_uids,
@@ -506,6 +517,25 @@ impl LocalListener {
         }
     }
 
+    /// Bind the fixed privileged-broker pipe with a protected DACL that grants
+    /// access only to the configured daemon SID, LocalSystem, and Builtin
+    /// Administrators. Remote clients are rejected and first-instance
+    /// substitution is refused.  This is intentionally separate from generic
+    /// [`Self::bind`]: a configurable pipe name must never gain this authority.
+    #[cfg(windows)]
+    pub async fn bind_secure_broker_pipe(daemon_sid: &str) -> IpcResult<Self> {
+        let daemon_sid = validate_windows_sid_text(daemon_sid)?;
+        let pipe_name = Self::SECURE_BROKER_PIPE_NAME.to_owned();
+        let first = create_secure_broker_pipe(&pipe_name, &daemon_sid, true)?;
+        Ok(Self {
+            endpoint: Endpoint::NamedPipe(pipe_name.clone()),
+            pipe_name,
+            secure_broker_daemon_sid: Some(daemon_sid),
+            pending: TokioMutex::new(Some(first)),
+            allowed_uids: Vec::new(),
+        })
+    }
+
     /// Endpoint currently served.
     #[must_use]
     pub fn endpoint(&self) -> &Endpoint {
@@ -525,14 +555,22 @@ impl LocalListener {
             let mut guard = self.pending.lock().await;
             let server = match guard.take() {
                 Some(s) => s,
-                None => ServerOptions::new().create(&self.pipe_name)?,
+                None => match &self.secure_broker_daemon_sid {
+                    Some(daemon_sid) => {
+                        create_secure_broker_pipe(&self.pipe_name, daemon_sid, false)?
+                    }
+                    None => ServerOptions::new()
+                        .reject_remote_clients(true)
+                        .create(&self.pipe_name)?,
+                },
             };
             server.connect().await?;
-            *guard = Some(
-                ServerOptions::new()
+            *guard = Some(match &self.secure_broker_daemon_sid {
+                Some(daemon_sid) => create_secure_broker_pipe(&self.pipe_name, daemon_sid, false)?,
+                None => ServerOptions::new()
                     .reject_remote_clients(true)
                     .create(&self.pipe_name)?,
-            );
+            });
             // SID attribution via pipe impersonation is deferred until after the
             // server reads the first message from this exact pipe instance.
             let pid = unsafe { named_pipe_client_pid(server.as_raw_handle()) }.map_err(|err| {
@@ -1072,6 +1110,243 @@ fn sha256_file(file: &std::fs::File) -> Result<[u8; 32], String> {
     Ok(digest.finalize().into())
 }
 
+/// Validate the textual form before interpolating it into SDDL.  The Win32 SID
+/// parser is the authority; the conservative character check prevents SDDL
+/// grammar injection even if that parser changes its accepted syntax.
+#[cfg(windows)]
+fn validate_windows_sid_text(value: &str) -> IpcResult<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::PSID;
+
+    if !value.starts_with("S-")
+        || value.len() > 184
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'S')
+    {
+        return Err(IpcError::Protocol(
+            "daemon SID must be a canonical Windows S-... SID (fail-closed)".into(),
+        ));
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sid: PSID = ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+        return Err(IpcError::Protocol(format!(
+            "daemon SID is not recognized by Windows (fail-closed): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    unsafe {
+        let _ = LocalFree(sid.cast());
+    }
+    Ok(value.to_owned())
+}
+
+/// Create one protected privileged-broker pipe instance.  The only unsafe call
+/// to Tokio's raw-security API is contained here, after the descriptor has been
+/// constructed and before its lifetime ends; callers receive an ordinary safe
+/// `NamedPipeServer` only after the actual handle DACL is re-attested.
+#[cfg(windows)]
+fn create_secure_broker_pipe(
+    pipe_name: &str,
+    daemon_sid: &str,
+    first_instance: bool,
+) -> IpcResult<NamedPipeServer> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    let sddl_text = format!("D:P(A;;GRGW;;;{daemon_sid})(A;;GA;;;SY)(A;;GA;;;BA)");
+    let sddl: Vec<u16> = sddl_text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+        || descriptor.is_null()
+    {
+        return Err(IpcError::Protocol(format!(
+            "construct protected broker pipe DACL failed (fail-closed): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut attrs = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let result = (|| {
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first_instance)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(
+                    pipe_name,
+                    std::ptr::from_mut(&mut attrs).cast(),
+                )
+        }
+        .map_err(IpcError::Io)?;
+        verify_secure_broker_pipe_dacl(server.as_raw_handle(), daemon_sid)?;
+        Ok(server)
+    })();
+    unsafe {
+        let _ = LocalFree(descriptor);
+    }
+    result
+}
+
+/// Inspect the live pipe handle rather than trusting the requested SDDL.  The
+/// ACL must be protected and contain exactly the three non-inherited allow ACEs
+/// in canonical order: daemon GR|GW, SYSTEM GA, BUILTIN\\Administrators GA.
+#[cfg(windows)]
+fn verify_secure_broker_pipe_dacl(
+    handle: std::os::windows::io::RawHandle,
+    daemon_sid_text: &str,
+) -> IpcResult<()> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, INHERITED_ACE, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+
+    fn sid_from_text(value: &str) -> IpcResult<PSID> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let wide: Vec<u16> = std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sid = ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+            return Err(IpcError::Unauthorized(
+                "cannot parse expected broker DACL SID (fail-closed)".into(),
+            ));
+        }
+        Ok(sid)
+    }
+
+    let daemon_sid = sid_from_text(daemon_sid_text)?;
+    let system_sid = sid_from_text("S-1-5-18")?;
+    let admin_sid = sid_from_text("S-1-5-32-544")?;
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    let result = (|| {
+        if status != 0 || descriptor.is_null() {
+            return Err(IpcError::Unauthorized(format!(
+                "cannot inspect live broker pipe DACL (fail-closed): {}",
+                std::io::Error::from_raw_os_error(status.cast_signed())
+            )));
+        }
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err(IpcError::Unauthorized(
+                "broker pipe DACL is not protected (fail-closed)".into(),
+            ));
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return Err(IpcError::Unauthorized(
+                "broker pipe DACL is absent (fail-closed)".into(),
+            ));
+        }
+        let mut info = unsafe { std::mem::zeroed::<ACL_SIZE_INFORMATION>() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut info).cast(),
+                u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
+                AclSizeInformation,
+            )
+        } == 0
+            || info.AceCount != 3
+        {
+            return Err(IpcError::Unauthorized(
+                "broker pipe DACL has unexpected ACE count (fail-closed)".into(),
+            ));
+        }
+        let expected = [
+            // `CreateNamedPipeW` maps SDDL GR|GW to this pipe-specific access
+            // mask before exposing the live kernel-object DACL.
+            (daemon_sid, 0x0012_019f),
+            // Likewise, GA is mapped by CreateNamedPipeW to the pipe's full
+            // access mask before we inspect the live DACL.
+            (system_sid, 0x001f_01ff),
+            (admin_sid, 0x001f_01ff),
+        ];
+        for (index, (expected_sid, expected_mask)) in expected.into_iter().enumerate() {
+            let mut ace = ptr::null_mut();
+            if unsafe { GetAce(dacl, u32::try_from(index).unwrap_or(u32::MAX), &mut ace) } == 0
+                || ace.is_null()
+            {
+                return Err(IpcError::Unauthorized(
+                    "broker pipe DACL ACE retrieval failed (fail-closed)".into(),
+                ));
+            }
+            let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid: PSID = (&raw const ace.SidStart).cast_mut().cast();
+            if ace.Header.AceType != 0
+                || u32::from(ace.Header.AceFlags) & INHERITED_ACE != 0
+                || ace.Mask != expected_mask
+                || unsafe { EqualSid(sid, expected_sid) } == 0
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "broker pipe DACL is not the required canonical policy at ACE {index}: type={} flags={} mask={:#x} expected_mask={expected_mask:#x} sid_match={} (fail-closed)",
+                    ace.Header.AceType,
+                    ace.Header.AceFlags,
+                    ace.Mask,
+                    unsafe { EqualSid(sid, expected_sid) },
+                )));
+            }
+        }
+        Ok(())
+    })();
+    unsafe {
+        let _ = LocalFree(daemon_sid.cast());
+        let _ = LocalFree(system_sid.cast());
+        let _ = LocalFree(admin_sid.cast());
+        if !descriptor.is_null() {
+            let _ = LocalFree(descriptor);
+        }
+    }
+    result
+}
+
 /// Server-attested Windows user SID bound to this named-pipe connection.
 ///
 /// # Safety
@@ -1360,5 +1635,32 @@ mod windows_tests {
         facts.revalidate_process_birth().unwrap();
         facts.revalidate_image().unwrap();
         client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn secure_broker_pipe_rejects_sid_injection_and_attests_live_dacl() {
+        let Err(error) = LocalListener::bind_secure_broker_pipe("S-1-5-18)(A;;GA;;;WD").await
+        else {
+            panic!("SDDL injection must not reach pipe creation");
+        };
+        assert!(error.to_string().contains("SID"), "{error}");
+
+        // This process is not LocalSystem, so it cannot connect.  Successful
+        // bind proves that the live handle, not just requested SDDL text,
+        // passed the exact protected-DACL attestation.
+        let listener = LocalListener::bind_secure_broker_pipe("S-1-5-18")
+            .await
+            .expect("secure broker pipe DACL must be accepted");
+        assert_eq!(
+            listener.endpoint(),
+            &Endpoint::NamedPipe(LocalListener::SECURE_BROKER_PIPE_NAME.into())
+        );
+        let Err(error) = connect(listener.endpoint()).await else {
+            panic!("medium-integrity non-SYSTEM client must not open the broker pipe");
+        };
+        assert!(
+            error.to_string().contains("failed to open named pipe"),
+            "{error}"
+        );
     }
 }
