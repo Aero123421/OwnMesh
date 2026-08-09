@@ -37,6 +37,8 @@ mod registry;
 mod rpc;
 mod server;
 mod transport;
+#[cfg(windows)]
+mod windows_job;
 
 pub use auth::{
     canonicalize_principal_key, constant_time_eq, current_os_user_id, generate_token,
@@ -67,6 +69,8 @@ pub use transport::{
     windows_process_facts, windows_running_service_facts, WindowsPipePeerFacts,
     WindowsProcessFacts, WindowsServiceFacts,
 };
+#[cfg(windows)]
+pub use windows_job::{spawn_suspended_windows_job, WindowsJobProcess};
 
 /// Stable crate name used by diagnostics and tests.
 #[must_use]

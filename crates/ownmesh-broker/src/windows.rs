@@ -95,6 +95,13 @@ impl WindowsReplayLedger for crate::ReplayLedger {
 /// means this handler has no accidental `Command`/shell fallback.
 pub trait WindowsBrokerRunner: Send + Sync {
     fn run(&self, request: &BrokerRequestV2) -> BrokerResponseV2;
+
+    /// Signal a matching in-flight request. Implementations must bind both
+    /// identifiers; a cancellation for another operation must never tear down
+    /// the wrong elevated tree.
+    fn cancel(&self, _request_id: &str, _nonce: &str) -> bool {
+        false
+    }
 }
 
 /// Dedicated Windows v2 data-plane handler. It is intentionally not reachable
@@ -230,6 +237,9 @@ where
                         .lock()
                         .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
                         .complete(&request.nonce, &digest)?;
+                    let cancelled = self
+                        .runner
+                        .cancel(&cancel.target_request_id, &cancel.target_nonce);
                     Ok(BrokerResponseV2 {
                         request_id: cancel.request_id,
                         ok: true,
@@ -238,7 +248,7 @@ where
                         stderr: String::new(),
                         error: None,
                         timed_out: false,
-                        cancelled: true,
+                        cancelled,
                         truncated: false,
                         duration_ms: 0,
                     })

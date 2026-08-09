@@ -1,0 +1,410 @@
+//! Windows broker runner built entirely on the audited IPC Job Object façade.
+//!
+//! This module contains no Win32 FFI and no `Command` fallback. A production
+//! service can instantiate it only after its installer has custody-validated
+//! `staging_dir`; it is deliberately not wired into `run_broker` until that
+//! service lifecycle proof exists.
+
+use crate::windows::WindowsBrokerRunner;
+use ownmesh_broker_client::{BrokerRequestV2, BrokerResponseV2, MAX_BROKER_OUTPUT_BYTES};
+use ownmesh_ipc::spawn_suspended_windows_job;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const MAX_STAGE_BYTES: u64 = 64 * 1024 * 1024;
+const KILL_WAIT: Duration = Duration::from_secs(2);
+const POLL_WAIT: Duration = Duration::from_millis(20);
+
+/// Explicit owner for the current Windows broker process tree.  Cancellation
+/// is a fail-closed fence: it kills the active private Job and is reset only at
+/// the beginning of a new execution.
+#[derive(Clone)]
+pub struct WindowsJobRunner {
+    staging_dir: PathBuf,
+    active: Arc<Mutex<BTreeMap<String, ActiveExecution>>>,
+}
+
+struct ActiveExecution {
+    request_id: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl WindowsJobRunner {
+    /// `staging_dir` must be an Administrator-custodied, non-reparse private
+    /// directory created and ACL-verified by the future elevated installer.
+    /// This constructor only does structural checks; it never claims lifecycle
+    /// custody and therefore cannot promote Windows to supported by itself.
+    pub fn new(staging_dir: PathBuf) -> Result<Self, String> {
+        let metadata = std::fs::symlink_metadata(&staging_dir).map_err(|error| {
+            format!(
+                "Windows broker staging directory {} is unavailable: {error}",
+                staging_dir.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err("Windows broker staging directory must be a non-reparse directory".into());
+        }
+        let canonical = std::fs::canonicalize(&staging_dir)
+            .map_err(|error| format!("canonicalize Windows broker staging directory: {error}"))?;
+        Ok(Self {
+            staging_dir: canonical,
+            active: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+}
+
+impl WindowsBrokerRunner for WindowsJobRunner {
+    fn run(&self, request: &BrokerRequestV2) -> BrokerResponseV2 {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let registered = self.active.lock().map(|mut active| {
+            active.insert(
+                request.nonce.clone(),
+                ActiveExecution {
+                    request_id: request.request_id.clone(),
+                    cancelled: Arc::clone(&cancellation),
+                },
+            );
+        });
+        if registered.is_err() {
+            return response_error(
+                &request.request_id,
+                "Windows active execution lock poisoned".into(),
+            );
+        }
+        let result = self.run_checked(request, &cancellation);
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&request.nonce);
+        }
+        match result {
+            Ok(response) => response,
+            Err(error) => response_error(&request.request_id, error),
+        }
+    }
+
+    fn cancel(&self, request_id: &str, nonce: &str) -> bool {
+        let Ok(active) = self.active.lock() else {
+            return false;
+        };
+        let Some(execution) = active.get(nonce) else {
+            return false;
+        };
+        if execution.request_id != request_id {
+            return false;
+        }
+        execution.cancelled.store(true, Ordering::Release);
+        true
+    }
+}
+
+impl WindowsJobRunner {
+    fn run_checked(
+        &self,
+        request: &BrokerRequestV2,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<BrokerResponseV2, String> {
+        let facts = &request.facts;
+        if facts.canonical_cwd.is_some() || !facts.sanitized_env.is_empty() || facts.argv.is_empty()
+        {
+            return Err("Windows runner rejects caller cwd, environment, or empty argv".into());
+        }
+        reject_shell(&facts.argv[0])?;
+        if facts.max_output_bytes == 0 || facts.max_output_bytes > MAX_BROKER_OUTPUT_BYTES {
+            return Err("Windows runner output bound is invalid".into());
+        }
+        let staged = stage_pinned_executable(request, &self.staging_dir)?;
+        let staged_path = staged.path.clone();
+        let result = self.run_staged(request, &staged, cancellation);
+        // The broker created this exact unique path. Best-effort cleanup occurs
+        // after the retained stage handle and Job have been dropped.
+        drop(staged);
+        if let Err(error) = std::fs::remove_file(staged_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("remove Windows staged executable: {error}"));
+            }
+        }
+        result
+    }
+
+    fn run_staged(
+        &self,
+        request: &BrokerRequestV2,
+        staged: &StagedWindowsExecutable,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<BrokerResponseV2, String> {
+        let facts = &request.facts;
+        recheck_retained_stage(
+            staged,
+            &facts.executable.image_sha256,
+            facts.executable.image_len,
+        )?;
+        let mut process =
+            spawn_suspended_windows_job(&staged.path, &facts.argv[1..], &self.staging_dir)
+                .map_err(|error| format!("CreateProcessW/Job Object setup: {error}"))?;
+        let output_limit = facts.max_output_bytes;
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let stdout = process
+            .take_stdout()
+            .ok_or("Windows Job stdout pipe unexpectedly absent")?;
+        let stderr = process
+            .take_stderr()
+            .ok_or("Windows Job stderr pipe unexpectedly absent")?;
+        let stdout_signal = Arc::clone(&exceeded);
+        let stderr_signal = Arc::clone(&exceeded);
+        let stdout_reader =
+            std::thread::spawn(move || drain_pipe_bounded(stdout, output_limit, stdout_signal));
+        let stderr_reader =
+            std::thread::spawn(move || drain_pipe_bounded(stderr, output_limit, stderr_signal));
+        process
+            .resume()
+            .map_err(|error| format!("resume contained Windows child: {error}"))?;
+
+        let started = Instant::now();
+        let mut timed_out = false;
+        let mut cancelled = false;
+        loop {
+            if process
+                .wait_timeout(POLL_WAIT)
+                .map_err(|error| format!("wait Windows Job child: {error}"))?
+            {
+                break;
+            }
+            if cancellation.load(Ordering::Acquire) {
+                cancelled = true;
+                break;
+            }
+            if exceeded.load(Ordering::Acquire) {
+                break;
+            }
+            if started.elapsed() >= Duration::from_millis(facts.timeout_ms) {
+                timed_out = true;
+                break;
+            }
+        }
+        let truncated = exceeded.load(Ordering::Acquire);
+        if timed_out || cancelled || truncated {
+            process
+                .terminate_and_wait(KILL_WAIT)
+                .map_err(|error| format!("terminate contained Windows Job: {error}"))?;
+        }
+        let exit_code = if timed_out || cancelled || truncated {
+            None
+        } else {
+            Some(
+                process
+                    .exit_code()
+                    .map_err(|error| format!("read Windows child exit code: {error}"))?,
+            )
+        };
+        drop(process); // closes the private Job: final descendant-kill fence.
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| "Windows stdout drain thread panicked")?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| "Windows stderr drain thread panicked")?;
+        let truncated = truncated || stdout.truncated || stderr.truncated;
+        let error = if timed_out {
+            Some("broker execution timed out; Windows Job process tree killed".into())
+        } else if cancelled {
+            Some("broker execution cancelled; Windows Job process tree killed".into())
+        } else if truncated {
+            Some("broker execution output limit reached; Windows Job process tree killed".into())
+        } else {
+            None
+        };
+        Ok(BrokerResponseV2 {
+            request_id: request.request_id.clone(),
+            ok: exit_code == Some(0) && error.is_none(),
+            exit_code,
+            stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+            error,
+            timed_out,
+            cancelled,
+            truncated,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+}
+
+struct StagedWindowsExecutable {
+    path: PathBuf,
+    // Holding this open keeps the exact staged file identity stable through the
+    // second hash check and CreateProcessW. The private installer-owned parent
+    // ACL prevents replacement through the pathname used by CreateProcessW.
+    retained: File,
+}
+
+fn stage_pinned_executable(
+    request: &BrokerRequestV2,
+    staging_dir: &Path,
+) -> Result<StagedWindowsExecutable, String> {
+    let facts = &request.facts;
+    let source = Path::new(&facts.executable.canonical_path);
+    if !source.is_absolute() {
+        return Err("Windows source executable must be absolute".into());
+    }
+    let source = std::fs::canonicalize(source)
+        .map_err(|error| format!("canonicalize Windows source executable: {error}"))?;
+    let before = std::fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+    if !before.file_type().is_file()
+        || before.file_type().is_symlink()
+        || before.len() != facts.executable.image_len
+        || before.len() > MAX_STAGE_BYTES
+    {
+        return Err("Windows source executable type or length changed".into());
+    }
+    let path = staging_dir.join(format!("exec-{}.exe", uuid::Uuid::new_v4().simple()));
+    let mut source_file = File::open(&source).map_err(|error| error.to_string())?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("create Windows private stage: {error}"))?;
+    let copied = (|| -> Result<(), String> {
+        let mut hash = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = source_file
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(u64::try_from(read).unwrap())
+                .ok_or("Windows staged executable length overflow")?;
+            if total > MAX_STAGE_BYTES {
+                return Err("Windows source executable exceeds staging bound".into());
+            }
+            hash.update(&buffer[..read]);
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| error.to_string())?;
+        }
+        output.sync_all().map_err(|error| error.to_string())?;
+        let after = std::fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+        if !after.file_type().is_file()
+            || after.file_type().is_symlink()
+            || after.len() != before.len()
+            || total != facts.executable.image_len
+            || hex::encode(hash.finalize()) != facts.executable.image_sha256
+        {
+            return Err("Windows pinned source executable identity/hash mismatch".into());
+        }
+        Ok(())
+    })();
+    drop(output);
+    drop(source_file);
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    let retained = File::open(&path).map_err(|error| {
+        let _ = std::fs::remove_file(&path);
+        format!("open retained Windows stage: {error}")
+    })?;
+    Ok(StagedWindowsExecutable { path, retained })
+}
+
+fn recheck_retained_stage(
+    staged: &StagedWindowsExecutable,
+    expected_hash: &str,
+    expected_len: u64,
+) -> Result<(), String> {
+    let metadata = staged
+        .retained
+        .metadata()
+        .map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() != expected_len || expected_len > MAX_STAGE_BYTES {
+        return Err("retained Windows stage type or length changed".into());
+    }
+    let mut file = staged
+        .retained
+        .try_clone()
+        .map_err(|error| error.to_string())?;
+    let mut hash = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        total += u64::try_from(read).unwrap();
+        if total > MAX_STAGE_BYTES {
+            return Err("retained Windows stage exceeds size bound".into());
+        }
+        hash.update(&buffer[..read]);
+    }
+    if total != expected_len || hex::encode(hash.finalize()) != expected_hash {
+        return Err("retained Windows stage hash mismatch".into());
+    }
+    Ok(())
+}
+
+fn reject_shell(argv0: &str) -> Result<(), String> {
+    let base = argv0.rsplit(['\\', '/']).next().unwrap_or(argv0);
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    if ["cmd", "powershell", "pwsh", "sh", "bash"]
+        .iter()
+        .any(|shell| base.eq_ignore_ascii_case(shell))
+    {
+        return Err("Windows broker runner rejects shell execution".into());
+    }
+    Ok(())
+}
+
+struct CapturedPipe {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn drain_pipe_bounded(mut pipe: File, maximum: usize, exceeded: Arc<AtomicBool>) -> CapturedPipe {
+    let mut bytes = Vec::with_capacity(maximum.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let room = maximum.saturating_sub(bytes.len());
+                let kept = room.min(read);
+                bytes.extend_from_slice(&buffer[..kept]);
+                if kept != read {
+                    truncated = true;
+                    exceeded.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            Err(_) => {
+                truncated = true;
+                exceeded.store(true, Ordering::Release);
+                break;
+            }
+        }
+    }
+    CapturedPipe { bytes, truncated }
+}
+
+fn response_error(request_id: &str, error: String) -> BrokerResponseV2 {
+    BrokerResponseV2 {
+        request_id: request_id.into(),
+        ok: false,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: Some(error),
+        timed_out: false,
+        cancelled: false,
+        truncated: false,
+        duration_ms: 0,
+    }
+}
