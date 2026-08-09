@@ -1550,6 +1550,71 @@ test("transfer cancel controls persist only target-bound cleanup proof", async (
   assert.deepEqual((await store.getMcpOperation(opId))?.data, { target_operation_id: target, cancelled: false, signal_delivered: false });
 });
 
+test("internal transfer errors and approvals never persist Agent diagnostics", async () => {
+  const { db, store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_transfer_redaction_01"; await seedActiveDevice(store, deviceId);
+  const tools = [
+    "__transfer_start_source",
+    "__transfer_start_destination",
+    "__transfer_preflight_source",
+    "__transfer_preflight_source_final",
+    "__transfer_preflight_destination",
+    "__transfer_artifact_get",
+    "__transfer_cancel_control",
+  ];
+  const modes = [
+    { name: "approval", status: "failed", approval: true },
+    // The wire protocol normally uses failed, but a malformed literal error
+    // must not turn this durable row into a diagnostics sink either.
+    { name: "error", status: "error", approval: false },
+  ];
+  const secrets: string[] = [];
+  for (const tool of tools) {
+    for (const mode of modes) {
+      const operationId = randomId("op_");
+      const marker = `distinctive-${tool.slice(11)}-${mode.name}-${operationId}`;
+      secrets.push(marker);
+      await store.putMcpOperation({
+        operation_id: operationId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
+        tool, status: "pending", summary: "internal transfer", data: { safe: true },
+        truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId,
+        workspace_id: "ws_destination", policy_authority: "ownmesh_device",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      });
+      const applied = await applyMcpOperationResult(store, {
+        operationId, correlationId: operationId, deviceId,
+        payload: {
+          operation_id: operationId, status: mode.status, approval_required: mode.approval,
+          summary: `${marker}-summary`, reason: `${marker}-reason`, approval_id: `${marker}-approval-id`,
+          session_id: `${marker}-session`,
+          result: { ticket: `${marker}-ticket`, path: `${marker}-path`, bytes: `${marker}-bytes` },
+          error: {
+            code: mode.approval ? "OWNMESH_E_APPROVAL_REQUIRED" : "OWNMESH_E_TRANSFER_UNSAFE",
+            message: `${marker}-message`,
+            details: {
+              approval_required: mode.approval, approval_id: `${marker}-details-approval-id`,
+              reason: `${marker}-details-reason`, ticket: `${marker}-details-ticket`,
+              path: `${marker}-details-path`, bytes: `${marker}-details-bytes`, ciphertext: `${marker}-details-ciphertext`,
+            },
+          },
+        },
+      });
+      assert.equal(applied.ok, true);
+      const stored = await store.getMcpOperation(operationId);
+      assert.ok(stored);
+      assert.equal(stored.approval_id ?? null, null);
+      assert.equal(stored.session_id ?? null, null);
+      assert.equal(stored.summary.includes(marker), false);
+      assert.equal(JSON.stringify(stored).includes(marker), false);
+    }
+  }
+  // Check the actual SQLite representation, rather than only the decoded
+  // record, so a future serialization path cannot hide a re-persisted field.
+  const raw = db.prepare("SELECT summary, data_json, approval_id, session_id FROM mcp_operations").all() as Record<string, unknown>[];
+  const serialized = JSON.stringify(raw);
+  for (const marker of secrets) assert.equal(serialized.includes(marker), false, marker);
+});
+
 test("operation.result store write failure fails closed without forward", async () => {
   const deviceId = "dev_result_store_fail";
   const { adapter, store } = openSqliteAdapter();

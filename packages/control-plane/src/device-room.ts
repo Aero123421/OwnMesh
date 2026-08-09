@@ -3005,6 +3005,33 @@ function sanitizeTransferCancelControlResult(
   return { data: { target_operation_id: expectedTarget, cancelled: raw.cancelled, signal_delivered: raw.signal_delivered } };
 }
 
+/** Internal transfer coordination is not a diagnostic channel.  The device can
+ * report an ordinary completion only through the tool-specific validators
+ * above; every other outcome uses these fixed summaries and bounded data. */
+function isInternalTransferTool(tool: string): boolean {
+  return tool === "__transfer_start_source"
+    || tool === "__transfer_start_destination"
+    || tool === "__transfer_preflight_source"
+    || tool === "__transfer_preflight_source_final"
+    || tool === "__transfer_preflight_destination"
+    || tool === "__transfer_artifact_get"
+    || tool === "__transfer_cancel_control";
+}
+
+function internalTransferFailureSummary(tool: string, status: string): string {
+  const needsApproval = status === "approval_required";
+  if (tool === "__transfer_preflight_source" || tool === "__transfer_preflight_source_final" || tool === "__transfer_preflight_destination") {
+    return needsApproval ? "transfer preflight requires approval" : "transfer preflight failed";
+  }
+  if (tool === "__transfer_artifact_get") {
+    return needsApproval ? "transfer artifact request requires approval" : "transfer artifact request failed";
+  }
+  if (tool === "__transfer_cancel_control") {
+    return needsApproval ? "transfer cancellation control requires approval" : "transfer cancellation control failed";
+  }
+  return needsApproval ? "transfer start requires approval" : "transfer start failed";
+}
+
 /**
  * Map a device-originated operation.result onto authoritative mcp_operations state.
  * Single runtime helper (DeviceRoom DO); mcp.ts must not duplicate this.
@@ -3201,6 +3228,7 @@ export async function applyMcpOperationResult(
   }
 
   let safeSummary: string | undefined;
+  const internalTransferTool = isInternalTransferTool(op.tool);
   let data =
     payload.result && typeof payload.result === "object"
       ? (payload.result as Record<string, unknown>)
@@ -3216,7 +3244,7 @@ export async function applyMcpOperationResult(
       data = sanitized.data;
     } else {
       data = {};
-      safeSummary = "transfer preflight failed";
+      safeSummary = internalTransferFailureSummary(op.tool, status);
     }
   }
   if (op.tool === "__transfer_artifact_get") {
@@ -3227,7 +3255,7 @@ export async function applyMcpOperationResult(
     } else {
       // Errors remain the normal bounded error envelope, never a byte channel.
       data = {};
-      safeSummary = "transfer artifact request failed";
+      safeSummary = internalTransferFailureSummary(op.tool, status);
     }
   }
   if (op.tool === "__transfer_start_source" || op.tool === "__transfer_start_destination") {
@@ -3241,8 +3269,12 @@ export async function applyMcpOperationResult(
       // message, details, ticket, keys, paths, or byte-shaped diagnostics.
       const code = errCode === "OWNMESH_E_TRANSFER_RECONNECT"
         || errCode === "OWNMESH_E_TRANSFER_SESSION_LOST" ? errCode : "";
-      data = code ? { error: { code } } : {};
-      safeSummary = code ? "transfer start requires a fresh connection proof" : "transfer start failed";
+      // An approval must not retain the Agent-provided approval payload. It is
+      // a terminal coordinator state; the durable status bit is sufficient.
+      data = status !== "approval_required" && code ? { error: { code } } : {};
+      safeSummary = code && status !== "approval_required"
+        ? "transfer start requires a fresh connection proof"
+        : internalTransferFailureSummary(op.tool, status);
     }
   }
   if (op.tool === "__transfer_cancel_control") {
@@ -3252,10 +3284,10 @@ export async function applyMcpOperationResult(
       data = sanitized.data;
     } else {
       data = {};
-      safeSummary = "transfer cancellation control failed";
+      safeSummary = internalTransferFailureSummary(op.tool, status);
     }
   }
-  if (status === "approval_required" && errDetails) {
+  if (status === "approval_required" && errDetails && !internalTransferTool) {
     Object.assign(data, {
       approval_required: true,
       approval_id: errDetails.approval_id ?? payload.approval_id,
@@ -3264,10 +3296,14 @@ export async function applyMcpOperationResult(
     });
   }
 
-  const approvalId =
-    (errDetails?.approval_id != null ? String(errDetails.approval_id) : undefined) ||
-    (payload.approval_id ? String(payload.approval_id) : undefined) ||
-    op.approval_id;
+  // Internal transfer tools may not make a durable row into a bearer or
+  // diagnostics channel through an approval id or session id either. Preserve
+  // only a pre-existing authoritative value; never copy Agent input.
+  const approvalId = internalTransferTool
+    ? op.approval_id
+    : (errDetails?.approval_id != null ? String(errDetails.approval_id) : undefined) ||
+      (payload.approval_id ? String(payload.approval_id) : undefined) ||
+      op.approval_id;
 
   // Preserve continuation cursors on the durable row so clients can page after a
   // large result is bounded by the store (never silently drop next_offset).
@@ -3304,7 +3340,9 @@ export async function applyMcpOperationResult(
       next_cursor: nextCursor,
       approval_required: status === "approval_required",
       approval_id: approvalId,
-      session_id: payload.session_id != null ? String(payload.session_id) : op.session_id,
+      session_id: internalTransferTool
+        ? op.session_id
+        : payload.session_id != null ? String(payload.session_id) : op.session_id,
     },
     fromStatuses,
   );
