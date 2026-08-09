@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TransferRoomRouter, TRANSFER_PROTOCOL, type TransferMetadata } from "./transfer-room.ts";
+import { issueTransferTicket, TransferRoomRouter, TRANSFER_PROTOCOL, verifyTransferTicket, type TransferMetadata, type TransferTicketClaims } from "./transfer-room.ts";
 
 const digest = "a".repeat(64);
 function meta(): TransferMetadata { return { version: 1, transfer_id: "xfer_test", tenant_id: "ten_a", source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, expires_at: Date.now() + 60_000, max_bytes: 128 * 1024, epoch: 1, fence: 7, state: "prepared", contiguous_ack_sequence: null, contiguous_ack_offset: 0 }; }
 function frame(type: string, fields: Record<string, unknown> = {}) { return JSON.stringify({ protocol: TRANSFER_PROTOCOL, type, transfer_id: "xfer_test", epoch: 1, fence: 7, plan_sha256: digest, ...fields }); }
 function encrypted(length: number): string { return btoa("x".repeat(length + 16)); }
+function ticket(role: "source" | "destination"): TransferTicketClaims { return { v: 1, jti: `jti_${role}`, session_nonce: `nonce_${role}`, transfer_id: "xfer_test", tenant_id: "ten_a", principal_id: "prin_a", device_id: role === "source" ? "dev_source" : "dev_destination", role, source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, epoch: 1, fence: 7, max_bytes: 128 * 1024, exp: Date.now() + 20_000 }; }
+
+test("transfer tickets are short lived and bind role, device, tenant, plan and session nonce", async () => {
+  const secret = "test-secret"; const source = ticket("source");
+  const encoded = await issueTransferTicket(secret, source);
+  assert.deepEqual(await verifyTransferTicket(secret, encoded), source);
+  assert.equal(await verifyTransferTicket("wrong", encoded), null);
+  await assert.rejects(issueTransferTicket(secret, { ...source, role: "source", device_id: "dev_destination" }));
+  await assert.rejects(issueTransferTicket(secret, { ...source, exp: Date.now() - 1 }));
+});
 
 test("TransferRoom forwards one opaque chunk and persists only contiguous ACK metadata", async () => {
   const saved: TransferMetadata[] = []; const destination: string[] = []; const source: string[] = [];

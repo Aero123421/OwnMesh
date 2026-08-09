@@ -33,6 +33,10 @@
       {
         "name": "DEVICE_ROOM",
         "class_name": "DeviceRoom"
+      },
+      {
+        "name": "TRANSFER_ROOM",
+        "class_name": "TransferRoom"
       }
     ]
   },
@@ -42,6 +46,10 @@
       // https://developers.cloudflare.com/durable-objects/best-practices/websockets/
       "tag": "v1",
       "new_sqlite_classes": ["DeviceRoom"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["TransferRoom"]
     }
   ]
 }

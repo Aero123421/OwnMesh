@@ -30,6 +30,7 @@ import {
 } from "./oauth.ts";
 import { handleApprove, handleMcp, MCP_TOOLS } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
+import { TransferRoom, verifyTransferTicket } from "./transfer-room.ts";
 import {
   internalContextHeaderName,
   internalDoHeaders,
@@ -44,6 +45,7 @@ import {
 export interface Env {
   DB?: D1Database;
   DEVICE_ROOM?: DurableObjectNamespace;
+  TRANSFER_ROOM?: DurableObjectNamespace;
   OAUTH_ISSUER?: string;
   SESSION_SECRET?: string;
   AUTH_PROVIDER?: Fetcher;
@@ -53,7 +55,7 @@ export interface Env {
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
 }
 
-export { DeviceRoom, MCP_TOOLS };
+export { DeviceRoom, TransferRoom, MCP_TOOLS };
 export type { ControlPlaneStore };
 
 /** Optional injected store for unit tests (avoids global mutable singleton). */
@@ -487,6 +489,25 @@ export default {
         },
         { issuer },
       );
+    }
+
+    // Transfer data plane: a short-lived ticket is the sole transfer authority.
+    // Query strings and client-selected role/device values are rejected; the
+    // agent credential and ticket must agree with the live D1 device record.
+    if (url.pathname === "/transfer/connect") {
+      if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return json({ error: "expected_websocket" }, { status: 426 });
+      if (url.search) return json({ error: "query_authority_forbidden" }, { status: 400 });
+      if (!originAllowed(request, env, issuer)) return json({ error: "origin_not_allowed" }, { status: 403 });
+      if (!env.TRANSFER_ROOM || !env.SESSION_SECRET) return json({ error: "transfer_room_unavailable" }, { status: 503 });
+      const ticket = await verifyTransferTicket(env.SESSION_SECRET, request.headers.get("x-ownmesh-transfer-ticket"));
+      const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+      const credential = bearerToken ? await store.getDeviceCredential(bearerToken) : null;
+      if (!ticket || !credential || ticket.exp <= Date.now() || credential.device_id !== ticket.device_id || credential.tenant_id !== ticket.tenant_id || credential.principal_id !== ticket.principal_id) return json({ error: "invalid_transfer_identity" }, { status: 401 });
+      const device = await store.getDevice(ticket.device_id);
+      if (!device || device.revoked || device.status !== "active" || device.tenant_id !== ticket.tenant_id) return json({ error: "device_not_active" }, { status: 403 });
+      if (!(await store.canOperateDevice(ticket.source_device_id, ticket.principal_id, ticket.tenant_id)) || !(await store.canOperateDevice(ticket.destination_device_id, ticket.principal_id, ticket.tenant_id))) return json({ error: "transfer_member_denied" }, { status: 403 });
+      const stub = env.TRANSFER_ROOM.get(env.TRANSFER_ROOM.idFromName(ticket.transfer_id));
+      return stub.fetch(new Request("https://transfer-room/ws", { method: "GET", headers: request.headers }));
     }
 
     // Agent / client WebSocket connect → DeviceRoom DO
