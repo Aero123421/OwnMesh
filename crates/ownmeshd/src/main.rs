@@ -26,9 +26,10 @@
     clippy::unused_self
 )]
 
-mod agent_transport;
+pub mod agent_transport;
 mod daemon;
 mod runtime;
+pub mod transfer_crypto;
 
 use clap::{Parser, Subcommand};
 use ownmesh_domain::ExitCode;

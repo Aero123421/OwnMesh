@@ -34,6 +34,7 @@ ownmesh-protocol = { path = "../ownmesh-protocol" }
 ownmesh-session = { path = "../ownmesh-session" }
 ownmesh-session-host = { path = "../ownmesh-session-host" }
 ownmesh-transfer = { path = "../ownmesh-transfer" }
+ring = "0.17.14"
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"

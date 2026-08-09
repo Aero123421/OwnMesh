@@ -30,7 +30,11 @@ import {
 } from "./oauth.ts";
 import { handleApprove, handleMcp, MCP_TOOLS } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
-import { TransferRoom, verifyTransferTicket } from "./transfer-room.ts";
+import {
+  TransferRoom,
+  verifyTransferEphemeralProof,
+  verifyTransferTicket,
+} from "./transfer-room.ts";
 import {
   internalContextHeaderName,
   internalDoHeaders,
@@ -504,7 +508,10 @@ export default {
       const credential = bearerToken ? await store.getDeviceCredential(bearerToken) : null;
       if (!ticket || !credential || ticket.exp <= Date.now() || credential.device_id !== ticket.device_id || credential.tenant_id !== ticket.tenant_id || credential.principal_id !== ticket.principal_id) return json({ error: "invalid_transfer_identity" }, { status: 401 });
       const device = await store.getDevice(ticket.device_id);
-      if (!device || device.revoked || device.status !== "active" || device.tenant_id !== ticket.tenant_id) return json({ error: "device_not_active" }, { status: 403 });
+      const sourceDevice = await store.getDevice(ticket.source_device_id);
+      const destinationDevice = await store.getDevice(ticket.destination_device_id);
+      if (!device || !sourceDevice || !destinationDevice || device.revoked || sourceDevice.revoked || destinationDevice.revoked || device.status !== "active" || sourceDevice.status !== "active" || destinationDevice.status !== "active" || device.tenant_id !== ticket.tenant_id || sourceDevice.tenant_id !== ticket.tenant_id || destinationDevice.tenant_id !== ticket.tenant_id) return json({ error: "device_not_active" }, { status: 403 });
+      if (ticket.source_device_public_key !== sourceDevice.public_key || ticket.destination_device_public_key !== destinationDevice.public_key || !(await verifyTransferEphemeralProof(ticket, "source", sourceDevice.public_key)) || !(await verifyTransferEphemeralProof(ticket, "destination", destinationDevice.public_key))) return json({ error: "invalid_transfer_key_proof" }, { status: 403 });
       if (!(await store.canOperateDevice(ticket.source_device_id, ticket.principal_id, ticket.tenant_id)) || !(await store.canOperateDevice(ticket.destination_device_id, ticket.principal_id, ticket.tenant_id))) return json({ error: "transfer_member_denied" }, { status: 403 });
       const stub = env.TRANSFER_ROOM.get(env.TRANSFER_ROOM.idFromName(ticket.transfer_id));
       return stub.fetch(new Request("https://transfer-room/ws", { method: "GET", headers: request.headers }));

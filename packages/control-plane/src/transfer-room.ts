@@ -60,6 +60,15 @@ export type TransferTicketClaims = {
   fence: number;
   max_bytes: number;
   exp: number;
+  /** X25519 public keys are ticket-bound and signed by the persistent device
+   * Ed25519 identities. These are public session material, never long-lived
+   * private keys or plaintext transfer data. */
+  source_device_public_key: string;
+  destination_device_public_key: string;
+  source_ephemeral_public_key: string;
+  destination_ephemeral_public_key: string;
+  source_ephemeral_signature: string;
+  destination_ephemeral_signature: string;
 };
 
 const TICKET_MAX_MS = 60_000;
@@ -77,8 +86,55 @@ function fromBase64Url(value: string): Uint8Array | null {
 }
 async function ticketKey(secret: string): Promise<CryptoKey> { return crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]); }
 
+function hex(value: unknown, bytes: number): value is string {
+  return typeof value === "string" && new RegExp(`^[a-f0-9]{${bytes * 2}}$`).test(value);
+}
+
+/** The device-signed, deliberately non-JSON representation of one ephemeral
+ * key binding. It must match the Rust Agent implementation byte-for-byte. */
+export function canonicalTransferEphemeralProof(claims: TransferTicketClaims, role: TransferRole): string {
+  const device = role === "source" ? claims.source_device_id : claims.destination_device_id;
+  const workspace = role === "source" ? claims.source_workspace_id : claims.destination_workspace_id;
+  const ephemeral = role === "source" ? claims.source_ephemeral_public_key : claims.destination_ephemeral_public_key;
+  return [
+    "ownmesh-transfer-ephemeral-v1",
+    `transfer=${claims.transfer_id}`,
+    `tenant=${claims.tenant_id}`,
+    `role=${role}`,
+    `device=${device}`,
+    `workspace=${workspace}`,
+    `plan=${claims.plan_sha256}`,
+    `epoch=${claims.epoch}`,
+    `fence=${claims.fence}`,
+    `session_nonce=${claims.session_nonce}`,
+    `ephemeral_pub=${ephemeral}`,
+    `expires=${claims.exp}`,
+  ].join("|");
+}
+
+/** Verify a device identity signature over its one-time X25519 public key. */
+export async function verifyTransferEphemeralProof(
+  claims: TransferTicketClaims,
+  role: TransferRole,
+  devicePublicKey: string,
+): Promise<boolean> {
+  const signature = role === "source" ? claims.source_ephemeral_signature : claims.destination_ephemeral_signature;
+  if (!hex(devicePublicKey, 32) || !hex(signature, 64)) return false;
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw", Uint8Array.from(devicePublicKey.match(/../g)!, (pair) => Number.parseInt(pair, 16)),
+      { name: "Ed25519" }, false, ["verify"],
+    );
+    return crypto.subtle.verify(
+      "Ed25519", key,
+      Uint8Array.from(signature.match(/../g)!, (pair) => Number.parseInt(pair, 16)),
+      new TextEncoder().encode(canonicalTransferEphemeralProof(claims, role)),
+    );
+  } catch { return false; }
+}
+
 export async function issueTransferTicket(secret: string, claims: TransferTicketClaims): Promise<string> {
-  if (!secret || claims.v !== 1 || !id(claims.jti) || !id(claims.session_nonce) || !id(claims.transfer_id) || !id(claims.tenant_id) || !id(claims.principal_id) || !id(claims.device_id) || !id(claims.source_device_id) || !id(claims.destination_device_id) || !id(claims.source_workspace_id) || !id(claims.destination_workspace_id) || !hash(claims.plan_sha256) || (claims.role !== "source" && claims.role !== "destination") || claims.device_id !== (claims.role === "source" ? claims.source_device_id : claims.destination_device_id) || claims.exp <= Date.now() || claims.exp > Date.now() + TICKET_MAX_MS || !Number.isSafeInteger(claims.epoch) || claims.epoch < 1 || !Number.isSafeInteger(claims.fence) || claims.fence < 1 || !Number.isSafeInteger(claims.max_bytes) || claims.max_bytes < 1) throw new Error("invalid_transfer_ticket_claims");
+  if (!secret || claims.v !== 1 || !id(claims.jti) || !id(claims.session_nonce) || !id(claims.transfer_id) || !id(claims.tenant_id) || !id(claims.principal_id) || !id(claims.device_id) || !id(claims.source_device_id) || !id(claims.destination_device_id) || !id(claims.source_workspace_id) || !id(claims.destination_workspace_id) || !hash(claims.plan_sha256) || !hex(claims.source_device_public_key, 32) || !hex(claims.destination_device_public_key, 32) || !hex(claims.source_ephemeral_public_key, 32) || !hex(claims.destination_ephemeral_public_key, 32) || !hex(claims.source_ephemeral_signature, 64) || !hex(claims.destination_ephemeral_signature, 64) || (claims.role !== "source" && claims.role !== "destination") || claims.device_id !== (claims.role === "source" ? claims.source_device_id : claims.destination_device_id) || claims.exp <= Date.now() || claims.exp > Date.now() + TICKET_MAX_MS || !Number.isSafeInteger(claims.epoch) || claims.epoch < 1 || !Number.isSafeInteger(claims.fence) || claims.fence < 1 || !Number.isSafeInteger(claims.max_bytes) || claims.max_bytes < 1) throw new Error("invalid_transfer_ticket_claims");
   const body = base64Url(new TextEncoder().encode(JSON.stringify(claims)));
   const signature = new Uint8Array(await crypto.subtle.sign("HMAC", await ticketKey(secret), new TextEncoder().encode(body)));
   return `${body}.${base64Url(signature)}`;

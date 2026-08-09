@@ -5,6 +5,7 @@
 //! fail-closed (`remote_routing_enabled: false`).
 
 use crate::runtime::DaemonRuntime;
+use crate::transfer_crypto::AgentTransferTicket;
 use futures_util::{SinkExt, StreamExt};
 use ownmesh_config::{atomic_write, OwnMeshConfig, OwnMeshPaths};
 use ownmesh_domain::{DeviceId, MessageId, Timestamp};
@@ -58,6 +59,9 @@ const MAX_IN_FLIGHT_REMOTE_OPS: usize = 32;
 const MAX_PENDING_DISPATCHES: usize = 64;
 /// Bound raw envelope retention so the transport state file stays inside budget.
 const MAX_PENDING_RAW_BYTES: usize = MAX_PAYLOAD_BYTES.saturating_add(64 * 1024);
+/// Transfer data is a distinct, bounded WSS connection. It never shares the
+/// control Agent socket or its persisted operation queue.
+const MAX_TRANSFER_SOCKET_BYTES: usize = 96 * 1024;
 
 type AgentSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -173,6 +177,77 @@ fn agent_connect_url(issuer: &str, device_id: &str) -> Result<Url, String> {
         .append_pair("role", "agent");
     url.set_fragment(None);
     Ok(url)
+}
+
+fn transfer_connect_url(issuer: &str) -> Result<Url, String> {
+    let raw = format!("{}/transfer/connect", issuer.trim_end_matches('/'));
+    let mut url =
+        Url::parse(&raw).map_err(|error| format!("build transfer connect URL: {error}"))?;
+    let websocket_scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => return Err("control-plane URL must use https or loopback http".into()),
+    };
+    url.set_scheme(websocket_scheme)
+        .map_err(|()| "failed to set transfer WebSocket URL scheme".to_owned())?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+/// Open the short-lived transfer WebSocket using the already enrolled device
+/// credential. Ticket authority is carried only in a header, never a URL.
+/// The caller supplies the ticket decoded from the exact signed Worker value;
+/// this method checks its device/role/expiry/key proofs before the upgrade.
+pub async fn connect_transfer_socket(
+    config: &AgentTransportConfig,
+    ticket_wire: &str,
+    ticket: &AgentTransferTicket,
+) -> Result<AgentSocket, String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system time is before UNIX epoch")?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "system time exceeds transfer ticket range")?;
+    ticket.validate_for(config.device_id.as_str(), &ticket.role, now_ms)?;
+    if ticket_wire.is_empty()
+        || ticket_wire.len() > 16 * 1024
+        || ticket_wire.chars().any(char::is_whitespace)
+    {
+        return Err("invalid transfer ticket wire value".into());
+    }
+    let mut request = transfer_connect_url(&config.issuer)?
+        .as_str()
+        .into_client_request()
+        .map_err(|error| format!("build transfer WebSocket request: {error}"))?;
+    let bearer = format!("Bearer {}", config.credential.expose());
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        bearer
+            .parse()
+            .map_err(|_| "device credential cannot be encoded as an HTTP header")?,
+    );
+    request.headers_mut().insert(
+        ORIGIN,
+        config
+            .origin
+            .parse()
+            .map_err(|_| "control-plane origin cannot be encoded as an HTTP header")?,
+    );
+    request.headers_mut().insert(
+        "x-ownmesh-transfer-ticket",
+        ticket_wire
+            .parse()
+            .map_err(|_| "transfer ticket cannot be encoded as an HTTP header")?,
+    );
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_TRANSFER_SOCKET_BYTES))
+        .max_frame_size(Some(MAX_TRANSFER_SOCKET_BYTES));
+    let (socket, _) = connect_async_with_config(request, Some(ws_config), true)
+        .await
+        .map_err(|error| format!("transfer WebSocket connect failed: {error}"))?;
+    Ok(socket)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
