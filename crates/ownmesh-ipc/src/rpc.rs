@@ -34,6 +34,10 @@ pub mod methods {
 
     /// Authenticated bounded transfer state-machine operations.
     pub const TRANSFER_PLAN: &str = "transfer.plan";
+    /// Internal Agent-only source custody/hash preflight. Never an IPC client surface.
+    pub const TRANSFER_PREFLIGHT_SOURCE: &str = "transfer.preflight_source";
+    /// Internal Agent-only destination no-replace/custody preflight.
+    pub const TRANSFER_PREFLIGHT_DESTINATION: &str = "transfer.preflight_destination";
     pub const TRANSFER_SOURCE_OPEN: &str = "transfer.source_open";
     pub const TRANSFER_SOURCE_CHUNK: &str = "transfer.source_chunk";
     pub const TRANSFER_DESTINATION_PREPARE: &str = "transfer.destination_prepare";

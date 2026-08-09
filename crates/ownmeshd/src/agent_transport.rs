@@ -5,7 +5,7 @@
 //! fail-closed (`remote_routing_enabled: false`).
 
 use crate::runtime::DaemonRuntime;
-use crate::transfer_crypto::AgentTransferTicket;
+use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
 use futures_util::{SinkExt, StreamExt};
 use ownmesh_config::{atomic_write, OwnMeshConfig, OwnMeshPaths};
 use ownmesh_domain::{DeviceId, MessageId, Timestamp};
@@ -23,7 +23,7 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -73,8 +73,21 @@ pub struct AgentTransportConfig {
     origin: String,
     device_id: DeviceId,
     credential: SecretString,
-    key: DeviceKeyPair,
+    key: Arc<DeviceKeyPair>,
+    /// Ephemeral X25519 private halves are scoped to a short-lived transfer
+    /// preflight and deliberately never enter AgentTransportState or logs.
+    preflight_ephemerals: Arc<Mutex<HashMap<String, PreflightEphemeral>>>,
     state_path: PathBuf,
+}
+
+struct PreflightEphemeral {
+    role: String,
+    transfer_id: String,
+    epoch: u32,
+    fence: u64,
+    session_nonce: String,
+    expires_at_ms: u64,
+    key: TransferEphemeral,
 }
 
 /// Resolve the single active instance and its issuer/device-bound credential.
@@ -123,7 +136,8 @@ pub fn configured_transport(
         origin,
         device_id,
         credential: envelope.credential().clone(),
-        key,
+        key: Arc::new(key),
+        preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
         state_path: paths.state_dir.join(TRANSPORT_STATE_FILE),
     }))
 }
@@ -1241,6 +1255,8 @@ async fn handle_live_frame(
             let finish_tx = finish_tx.clone();
             let active_dispatches = Arc::clone(active_dispatches);
             let device_id = config.device_id.clone();
+            let device_key = Arc::clone(&config.key);
+            let preflight_ephemerals = Arc::clone(&config.preflight_ephemerals);
             let envelope_expires_at = operation
                 .envelope
                 .expires_at
@@ -1251,6 +1267,8 @@ async fn handle_live_frame(
                 let payload = dispatch_remote_operation(
                     &runtime,
                     &device_id,
+                    &device_key,
+                    &preflight_ephemerals,
                     &request,
                     envelope_expires_at.as_deref(),
                     &cancel_registry,
@@ -1683,7 +1701,16 @@ fn map_request_to_method(
 ) -> Result<(&'static str, Value), String> {
     let action = action_of(request);
     let mut args = args_object(request);
-    if request.capability.starts_with("transfer.") || action.starts_with("transfer.") {
+    // Only the private preflight operations receive server-derived peer facts.
+    // They are still covered by the exact operation authorization binding before
+    // this mapper runs; public MCP requests never route these capabilities.
+    let internal_preflight = matches!(
+        request.capability.as_str(),
+        "transfer.preflight_source" | "transfer.preflight_destination"
+    );
+    if (request.capability.starts_with("transfer.") || action.starts_with("transfer."))
+        && !internal_preflight
+    {
         for forbidden in [
             "tenant_id",
             "principal_id",
@@ -1937,6 +1964,13 @@ fn map_request_to_method(
         ("fs.read", _) => methods::OPS_FS_READ,
         ("fs.write", _) => methods::OPS_FS_WRITE,
         ("fs.list", _) => methods::OPS_FS_LIST,
+        ("transfer.preflight_source", "transfer.preflight_source" | "preflight_source") => {
+            methods::TRANSFER_PREFLIGHT_SOURCE
+        }
+        (
+            "transfer.preflight_destination",
+            "transfer.preflight_destination" | "preflight_destination",
+        ) => methods::TRANSFER_PREFLIGHT_DESTINATION,
         ("transfer.plan", "transfer.plan" | "plan") => methods::TRANSFER_PLAN,
         ("transfer.source_open", "transfer.source_open" | "source_open") => {
             methods::TRANSFER_SOURCE_OPEN
@@ -2061,9 +2095,151 @@ fn bound_result_object(value: Value) -> Value {
     Value::Object(preserved)
 }
 
+fn preflight_cache_key(fields: &[&str]) -> String {
+    let mut key = String::new();
+    for field in fields {
+        key.push_str(&field.len().to_string());
+        key.push(':');
+        key.push_str(field);
+        key.push('|');
+    }
+    key
+}
+
+fn preflight_text<'a>(body: &'a Value, name: &str) -> Result<&'a str, String> {
+    body.get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .ok_or_else(|| format!("transfer preflight result missing {name}"))
+}
+
+fn preflight_u64(body: &Value, name: &str) -> Result<u64, String> {
+    body.get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("transfer preflight result missing {name}"))
+}
+
+/// Convert the local runtime's metadata-only preflight into the exact proof
+/// envelope consumed by DeviceRoom. The X25519 private half remains only in
+/// this in-memory cache for a subsequent ticket-bound start operation.
+async fn signed_transfer_preflight_result(
+    body: &Value,
+    operation_id: &str,
+    device_key: &DeviceKeyPair,
+    cache: &Arc<Mutex<HashMap<String, PreflightEphemeral>>>,
+) -> Result<Value, String> {
+    let role = preflight_text(body, "role")?;
+    if !matches!(role, "source" | "destination") {
+        return Err("invalid transfer preflight role".into());
+    }
+    let transfer_id = preflight_text(body, "transfer_id")?;
+    let tenant_id = preflight_text(body, "tenant_id")?;
+    let principal_id = preflight_text(body, "principal_id")?;
+    let device_id = preflight_text(body, "device_id")?;
+    let workspace_id = preflight_text(body, "workspace_id")?;
+    let plan_sha256 = preflight_text(body, "plan_sha256")?;
+    let session_nonce = preflight_text(body, "session_nonce")?;
+    let coordinator_request_id = preflight_text(body, "coordinator_request_id")?;
+    let epoch = u32::try_from(preflight_u64(body, "epoch")?)
+        .map_err(|_| "transfer preflight epoch overflow")?;
+    let fence = preflight_u64(body, "fence")?;
+    let expires_at = preflight_u64(body, "expires_at")?;
+    let workspace_version = preflight_u64(body, "workspace_version")?;
+    if epoch == 0 || fence == 0 || workspace_version == 0 || expires_at == 0 {
+        return Err("invalid transfer preflight metadata".into());
+    }
+    let cache_key = preflight_cache_key(&[
+        role,
+        transfer_id,
+        device_id,
+        workspace_id,
+        plan_sha256,
+        session_nonce,
+        &epoch.to_string(),
+        &fence.to_string(),
+        &expires_at.to_string(),
+    ]);
+    let public = {
+        let mut guard = cache.lock().await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock before unix epoch")?
+            .as_millis() as u64;
+        guard.retain(|_, entry| entry.expires_at_ms > now_ms);
+        if let Some(entry) = guard.get(&cache_key) {
+            if entry.role != role
+                || entry.transfer_id != transfer_id
+                || entry.epoch != epoch
+                || entry.fence != fence
+                || entry.session_nonce != session_nonce
+                || entry.expires_at_ms != expires_at
+            {
+                return Err("transfer ephemeral cache binding mismatch".into());
+            }
+            *entry.key.public()
+        } else {
+            if guard.len() >= 32 {
+                return Err("transfer ephemeral cache capacity reached".into());
+            }
+            let key = TransferEphemeral::generate()?;
+            let public = *key.public();
+            guard.insert(
+                cache_key,
+                PreflightEphemeral {
+                    role: role.to_owned(),
+                    transfer_id: transfer_id.to_owned(),
+                    epoch,
+                    fence,
+                    session_nonce: session_nonce.to_owned(),
+                    expires_at_ms: expires_at,
+                    key,
+                },
+            );
+            public
+        }
+    };
+    let public_hex = hex_encode(&public);
+    let proof = canonical_ephemeral_proof(
+        transfer_id,
+        tenant_id,
+        role,
+        device_id,
+        workspace_id,
+        plan_sha256,
+        epoch,
+        fence,
+        session_nonce,
+        &public_hex,
+        expires_at,
+    )?;
+    let signature = hex_encode(device_key.sign(&proof).expose());
+    Ok(json!({
+        "transfer_preflight": {
+            "role": role,
+            "transfer_id": transfer_id,
+            "tenant_id": tenant_id,
+            "device_id": device_id,
+            "workspace_id": workspace_id,
+            "plan_sha256": plan_sha256,
+            "epoch": epoch,
+            "fence": fence,
+            "session_nonce": session_nonce,
+            "expires_at": expires_at,
+            "ephemeral_public_key": public_hex,
+            "ephemeral_signature": signature,
+        },
+        "operation_id": operation_id,
+        "coordinator_request_id": coordinator_request_id,
+        "principal_id": principal_id,
+        "workspace_version": workspace_version,
+    }))
+}
+
 async fn dispatch_remote_operation(
     runtime: &Arc<Mutex<DaemonRuntime>>,
     device_id: &DeviceId,
+    device_key: &DeviceKeyPair,
+    preflight_ephemerals: &Arc<Mutex<HashMap<String, PreflightEphemeral>>>,
     request: &OperationRequestPayload,
     envelope_expires_at: Option<&str>,
     cancel_registry: &CancelRegistry,
@@ -2256,7 +2432,35 @@ async fn dispatch_remote_operation(
                     }
                 });
             }
-            let result = body.get("result").cloned().unwrap_or(body);
+            let result = if matches!(
+                request.capability.as_str(),
+                "transfer.preflight_source" | "transfer.preflight_destination"
+            ) {
+                match signed_transfer_preflight_result(
+                    &body,
+                    &operation_id,
+                    device_key,
+                    preflight_ephemerals,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(message) => {
+                        return json!({
+                            "operation_contract": OPERATION_CONTRACT_V1,
+                            "operation_id": operation_id,
+                            "status": "failed",
+                            "error": {
+                                "code": "OWNMESH_E_TRANSFER_PREFLIGHT",
+                                "message": message,
+                                "retryable": false
+                            }
+                        });
+                    }
+                }
+            } else {
+                body.get("result").cloned().unwrap_or(body)
+            };
             json!({
                 "operation_contract": OPERATION_CONTRACT_V1,
                 "operation_id": operation_id,
@@ -2441,7 +2645,8 @@ mod tests {
             origin: "http://127.0.0.1:1".into(),
             device_id: device.clone(),
             credential: SecretString::new("redacted-test-credential"),
-            key: DeviceKeyPair::generate(),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -2481,7 +2686,8 @@ mod tests {
             origin: "http://127.0.0.1:1".into(),
             device_id: device.clone(),
             credential: SecretString::new("redacted-test-credential"),
-            key: DeviceKeyPair::generate(),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -2594,7 +2800,8 @@ mod tests {
             origin: issuer.clone(),
             device_id: device.clone(),
             credential: SecretString::new(credential),
-            key,
+            key: Arc::new(key),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             state_path: dir.path().join("transport.json"),
         };
 
@@ -3336,5 +3543,93 @@ mod tests {
             assert_eq!(args.get("lease_id"), Some(&json!("lease_exact")));
             assert_eq!(args.get("controller_epoch"), Some(&json!(2)));
         }
+    }
+
+    #[test]
+    fn internal_transfer_preflight_maps_but_normal_transfer_peer_authority_is_rejected() {
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_preflight_1").unwrap(),
+            capability: "transfer.preflight_source".into(),
+            workspace_id: Some(ownmesh_domain::WorkspaceId::parse("ws_source").unwrap()),
+            idempotency_key: "idem_preflight_1".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({
+                "action": "preflight_source",
+                "tenant_id": "ten_1",
+                "source_device_id": "dev_source",
+                "destination_device_id": "dev_destination"
+            }),
+        };
+        let (method, args) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, methods::TRANSFER_PREFLIGHT_SOURCE);
+        assert_eq!(args["destination_device_id"], json!("dev_destination"));
+
+        let mut normal = request;
+        normal.capability = "transfer.plan".into();
+        normal.arguments["action"] = json!("plan");
+        let error = map_request_to_method(&normal).unwrap_err();
+        assert!(
+            error.contains("tenant_id") || error.contains("destination_device_id"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_proof_is_stable_for_retry_and_private_key_stays_memory_only() {
+        let key = DeviceKeyPair::generate();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let body = json!({
+            "role": "source",
+            "transfer_id": "xfer_preflight",
+            "tenant_id": "ten_1",
+            "principal_id": "prin_1",
+            "device_id": "dev_source",
+            "workspace_id": "ws_source",
+            "plan_sha256": "a".repeat(64),
+            "epoch": 1,
+            "fence": 1,
+            "session_nonce": "nonce_1",
+            "expires_at": (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64) + 30_000,
+            "coordinator_request_id": "coord_1",
+            "workspace_version": 1,
+        });
+        let first = signed_transfer_preflight_result(&body, "op_preflight", &key, &cache)
+            .await
+            .unwrap();
+        let second = signed_transfer_preflight_result(&body, "op_preflight", &key, &cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            first["transfer_preflight"]["ephemeral_public_key"],
+            second["transfer_preflight"]["ephemeral_public_key"]
+        );
+        assert_eq!(cache.lock().await.len(), 1);
+        let proof = canonical_ephemeral_proof(
+            "xfer_preflight",
+            "ten_1",
+            "source",
+            "dev_source",
+            "ws_source",
+            &"a".repeat(64),
+            1,
+            1,
+            "nonce_1",
+            first["transfer_preflight"]["ephemeral_public_key"]
+                .as_str()
+                .unwrap(),
+            first["transfer_preflight"]["expires_at"].as_u64().unwrap(),
+        )
+        .unwrap();
+        ownmesh_identity::verify_from_public_key_hex(
+            &key.public_identity().public_key_hex,
+            &proof,
+            first["transfer_preflight"]["ephemeral_signature"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!serde_json::to_string(&first).unwrap().contains("private"));
     }
 }

@@ -1914,6 +1914,234 @@ full_user_access/full_access for arbitrary commands",
         }))
     }
 
+    /// Internal source-side preflight used only by the authenticated Agent
+    /// transport.  It hashes from a pinned source custody path and creates the
+    /// immutable local source plan, but deliberately does not inspect a
+    /// destination filesystem: that custody boundary belongs to the other
+    /// device's `transfer.preflight_destination` operation.
+    async fn handle_transfer_preflight_source(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            transfer_id: String,
+            source_path: String,
+            destination_path: String,
+            source_principal_id: String,
+            destination_principal_id: String,
+            source_device_id: String,
+            destination_device_id: String,
+            destination_workspace_id: String,
+            epoch: u32,
+            fence: u64,
+            session_nonce: String,
+            expires_at: u64,
+            coordinator_request_id: String,
+            workspace_version: u64,
+            #[serde(default)]
+            workspace_id: Option<String>,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let source_workspace_id = p.workspace_id.unwrap_or_else(|| "ws_default".into());
+        let binding = TransferBinding {
+            tenant_id: authority.tenant_id.clone(),
+            source_principal_id: p.source_principal_id,
+            destination_principal_id: p.destination_principal_id,
+            source_device_id: p.source_device_id,
+            destination_device_id: p.destination_device_id,
+            source_workspace_id: source_workspace_id.clone(),
+            destination_workspace_id: p.destination_workspace_id,
+            source_relative_path: p.source_path,
+            destination_relative_path: p.destination_path,
+        };
+        if p.transfer_id.is_empty()
+            || p.transfer_id.len() > 256
+            || p.transfer_id.bytes().any(|byte| byte.is_ascii_control())
+            || p.epoch == 0
+            || p.fence == 0
+            || p.session_nonce.is_empty()
+            || p.session_nonce.len() > 256
+            || p.session_nonce.bytes().any(|byte| byte.is_ascii_control())
+            || p.expires_at <= (Self::now() as u64).saturating_mul(1000)
+            || p.coordinator_request_id.is_empty()
+            || p.coordinator_request_id.len() > 256
+            || p.coordinator_request_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || p.workspace_version == 0
+            || binding.source_principal_id != authority.principal_id
+            || binding.source_device_id != authority.device_id
+        {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "source preflight is not bound to the authenticated Agent identity".into(),
+            });
+        }
+        binding.validate().map_err(Self::transfer_error)?;
+        let source = self.workspace_for(Some(&source_workspace_id))?;
+        let source_path = source
+            .resolve(Path::new(&binding.source_relative_path))
+            .map_err(fs_err)?;
+        let grant = TransferGrant {
+            grant_id: format!("grant_{}", authority.operation_id),
+            operation_id: authority.operation_id.clone(),
+            payload_sha256: authority.payload_sha256.clone(),
+            expires_at_unix: authority.expires_at_unix,
+        };
+        let plan = TransferPlan::for_source(
+            &source_path,
+            binding,
+            grant,
+            PlanLimits::default(),
+            Self::now() as u64,
+        )
+        .map_err(Self::transfer_error)?;
+        self.transfer_store
+            .save_plan(&plan)
+            .map_err(Self::transfer_error)?;
+        Ok(json!({
+            "transfer_id": p.transfer_id,
+            "role": "source",
+            "tenant_id": authority.tenant_id,
+            "principal_id": authority.principal_id,
+            "device_id": authority.device_id,
+            "workspace_id": plan.binding().source_workspace_id,
+            "plan_id": plan.id(),
+            "size_bytes": plan.size_bytes(),
+            "sha256": plan.sha256(),
+            "plan_sha256": plan.plan_sha256(),
+            "source_workspace_id": plan.binding().source_workspace_id,
+            "destination_workspace_id": plan.binding().destination_workspace_id,
+            "epoch": p.epoch,
+            "fence": p.fence,
+            "session_nonce": p.session_nonce,
+            "expires_at": p.expires_at,
+            "coordinator_request_id": p.coordinator_request_id,
+            "workspace_version": p.workspace_version,
+            "expires_at_unix": authority.expires_at_unix,
+        }))
+    }
+
+    /// Internal destination-side preflight.  It is intentionally read-only:
+    /// reserve/part-file creation happens later in `destination_prepare`, after
+    /// both authenticated Agent replies have been correlated by the coordinator.
+    async fn handle_transfer_preflight_destination(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            transfer_id: String,
+            source_path: String,
+            destination_path: String,
+            source_principal_id: String,
+            destination_principal_id: String,
+            source_device_id: String,
+            destination_device_id: String,
+            source_workspace_id: String,
+            workspace_id: String,
+            plan_sha256: String,
+            epoch: u32,
+            fence: u64,
+            session_nonce: String,
+            expires_at: u64,
+            coordinator_request_id: String,
+            workspace_version: u64,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let binding = TransferBinding {
+            tenant_id: authority.tenant_id.clone(),
+            source_principal_id: p.source_principal_id,
+            destination_principal_id: p.destination_principal_id,
+            source_device_id: p.source_device_id,
+            destination_device_id: p.destination_device_id,
+            source_workspace_id: p.source_workspace_id,
+            destination_workspace_id: p.workspace_id.clone(),
+            source_relative_path: p.source_path,
+            destination_relative_path: p.destination_path,
+        };
+        if p.transfer_id.is_empty()
+            || p.transfer_id.len() > 256
+            || p.transfer_id.bytes().any(|byte| byte.is_ascii_control())
+            || p.epoch == 0
+            || p.fence == 0
+            || p.session_nonce.is_empty()
+            || p.session_nonce.len() > 256
+            || p.session_nonce.bytes().any(|byte| byte.is_ascii_control())
+            || p.expires_at <= (Self::now() as u64).saturating_mul(1000)
+            || p.coordinator_request_id.is_empty()
+            || p.coordinator_request_id.len() > 256
+            || p.coordinator_request_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control())
+            || p.workspace_version == 0
+            || !p
+                .plan_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            || p.plan_sha256.len() != 64
+            || binding.destination_principal_id != authority.principal_id
+            || binding.destination_device_id != authority.device_id
+        {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "destination preflight is not bound to the authenticated Agent identity"
+                    .into(),
+            });
+        }
+        binding.validate().map_err(Self::transfer_error)?;
+        let workspace = self.workspace_for(Some(&binding.destination_workspace_id))?;
+        let destination = workspace
+            .resolve(Path::new(&binding.destination_relative_path))
+            .map_err(fs_err)?;
+        if destination.exists() {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "destination already exists; overwrite is forbidden".into(),
+            });
+        }
+        let parent = destination.parent().ok_or_else(|| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: "destination parent is missing".into(),
+        })?;
+        let parent_meta = std::fs::symlink_metadata(parent).map_err(|error| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: format!("inspect destination parent: {error}"),
+        })?;
+        if !parent_meta.is_dir() || parent_meta.file_type().is_symlink() {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "destination parent is not a pinned workspace directory".into(),
+            });
+        }
+        Ok(json!({
+            "transfer_id": p.transfer_id,
+            "role": "destination",
+            "tenant_id": authority.tenant_id,
+            "principal_id": authority.principal_id,
+            "device_id": authority.device_id,
+            "workspace_id": binding.destination_workspace_id,
+            "plan_sha256": p.plan_sha256,
+            "destination_workspace_id": binding.destination_workspace_id,
+            "destination_path": binding.destination_relative_path,
+            "epoch": p.epoch,
+            "fence": p.fence,
+            "session_nonce": p.session_nonce,
+            "expires_at": p.expires_at,
+            "coordinator_request_id": p.coordinator_request_id,
+            "workspace_version": p.workspace_version,
+            "available": true,
+            "expires_at_unix": authority.expires_at_unix,
+        }))
+    }
+
     fn transfer_plan_for(
         &self,
         plan_id: &str,
@@ -3933,6 +4161,13 @@ full_user_access/full_access for arbitrary commands",
             methods::OPS_FS_DELETE => self.handle_fs_delete(params, client).await,
             methods::OPS_LOGS_QUERY => self.handle_logs_query(params, client).await,
             methods::TRANSFER_PLAN => self.handle_transfer_plan(params, client).await,
+            methods::TRANSFER_PREFLIGHT_SOURCE => {
+                self.handle_transfer_preflight_source(params, client).await
+            }
+            methods::TRANSFER_PREFLIGHT_DESTINATION => {
+                self.handle_transfer_preflight_destination(params, client)
+                    .await
+            }
             methods::TRANSFER_SOURCE_OPEN => self.handle_transfer_source_open(params, client).await,
             methods::TRANSFER_SOURCE_CHUNK => {
                 self.handle_transfer_source_chunk(params, client).await
@@ -7530,6 +7765,90 @@ mod transfer_runtime_tests {
             plan["destination_workspace_id"],
             json!("ws_remote_destination")
         );
+    }
+
+    #[tokio::test]
+    async fn transfer_preflight_splits_source_hash_from_destination_no_replace_custody() {
+        let source_temp = tempdir().unwrap();
+        let source_paths = OwnMeshPaths::for_base(source_temp.path());
+        let mut source_runtime = DaemonRuntime::open(&source_paths).unwrap();
+        std::fs::write(
+            source_paths.state_dir.join("workspace").join("source.bin"),
+            b"preflight source bytes",
+        )
+        .unwrap();
+        bind_remote_transfer(&mut source_runtime);
+        let source = source_runtime
+            .handle_transfer_preflight_source(
+                Some(json!({
+                    "transfer_id": "xfer_preflight_split",
+                    "source_path": "source.bin",
+                    "destination_path": "received.bin",
+                    "source_principal_id": "principal_a",
+                    "destination_principal_id": "principal_a",
+                    "source_device_id": "dev_transfer_test",
+                    "destination_device_id": "dev_destination",
+                    "destination_workspace_id": "ws_destination",
+                    "epoch": 1,
+                    "fence": 1,
+                    "session_nonce": "nonce_split",
+                    "expires_at": (DaemonRuntime::now() as u64 + 120) * 1000,
+                    "coordinator_request_id": "coord_split",
+                    "workspace_version": 1,
+                    "workspace_id": "ws_default"
+                })),
+                &remote_client(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(source["role"], json!("source"));
+        assert!(source["size_bytes"].as_u64().unwrap() > 0);
+
+        let destination_temp = tempdir().unwrap();
+        let destination_paths = OwnMeshPaths::for_base(destination_temp.path());
+        let mut destination_runtime = DaemonRuntime::open(&destination_paths).unwrap();
+        let destination_root = destination_temp.path().join("destination");
+        std::fs::create_dir_all(&destination_root).unwrap();
+        destination_runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_destination".into(),
+                root: destination_root.clone(),
+                label: None,
+            })
+            .unwrap();
+        bind_remote_transfer(&mut destination_runtime);
+        destination_runtime.active_remote_device_id = Some("dev_destination".into());
+        let destination_request = json!({
+            "transfer_id": "xfer_preflight_split",
+            "source_path": "source.bin",
+            "destination_path": "received.bin",
+            "source_principal_id": "principal_a",
+            "destination_principal_id": "principal_a",
+            "source_device_id": "dev_transfer_test",
+            "destination_device_id": "dev_destination",
+            "source_workspace_id": "ws_default",
+            "workspace_id": "ws_destination",
+            "plan_sha256": source["plan_sha256"],
+            "epoch": 1,
+            "fence": 1,
+            "session_nonce": "nonce_split",
+            "expires_at": (DaemonRuntime::now() as u64 + 120) * 1000,
+            "coordinator_request_id": "coord_split",
+            "workspace_version": 1,
+        });
+        let destination = destination_runtime
+            .handle_transfer_preflight_destination(
+                Some(destination_request.clone()),
+                &remote_client(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(destination["available"], json!(true));
+        std::fs::write(destination_root.join("received.bin"), b"untouched").unwrap();
+        assert!(destination_runtime
+            .handle_transfer_preflight_destination(Some(destination_request), &remote_client())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

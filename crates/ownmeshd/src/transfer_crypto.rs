@@ -138,26 +138,63 @@ impl AgentTransferTicket {
             ),
             _ => return Err("invalid transfer role".into()),
         };
-        let plan = decode_hex(&self.plan_sha256)?;
-        let ephemeral = decode_hex(ephemeral)?;
-        if plan.len() != 32 || ephemeral.len() != 32 {
-            return Err("invalid transfer proof key material".into());
-        }
-        let mut out = Vec::new();
-        push_proof_string(&mut out, EPHEMERAL_PROOF_DOMAIN)?;
-        push_proof_string(&mut out, &self.transfer_id)?;
-        push_proof_string(&mut out, &self.tenant_id)?;
-        out.push(if role == "source" { 1 } else { 2 });
-        push_proof_string(&mut out, device)?;
-        push_proof_string(&mut out, workspace)?;
-        out.extend_from_slice(&plan);
-        out.extend_from_slice(&self.epoch.to_be_bytes());
-        out.extend_from_slice(&self.fence.to_be_bytes());
-        push_proof_string(&mut out, &self.session_nonce)?;
-        out.extend_from_slice(&ephemeral);
-        out.extend_from_slice(&self.exp.to_be_bytes());
-        Ok(out)
+        canonical_ephemeral_proof(
+            &self.transfer_id,
+            &self.tenant_id,
+            role,
+            device,
+            workspace,
+            &self.plan_sha256,
+            self.epoch,
+            self.fence,
+            &self.session_nonce,
+            ephemeral,
+            self.exp,
+        )
     }
+}
+
+/// Canonical bytes signed by the device key before a transfer ticket exists.
+/// This is shared by the Agent preflight and ticket verification paths so an
+/// implementation cannot accidentally sign an ambiguous delimiter string.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_ephemeral_proof(
+    transfer_id: &str,
+    tenant_id: &str,
+    role: &str,
+    device_id: &str,
+    workspace_id: &str,
+    plan_sha256: &str,
+    epoch: u32,
+    fence: u64,
+    session_nonce: &str,
+    ephemeral_public_key: &str,
+    expires_at_ms: u64,
+) -> Result<Vec<u8>, String> {
+    let plan = decode_hex(plan_sha256)?;
+    let ephemeral = decode_hex(ephemeral_public_key)?;
+    if plan.len() != 32 || ephemeral.len() != 32 || epoch == 0 || fence == 0 {
+        return Err("invalid transfer proof key material".into());
+    }
+    let role_byte = match role {
+        "source" => 1,
+        "destination" => 2,
+        _ => return Err("invalid transfer proof role".into()),
+    };
+    let mut out = Vec::new();
+    push_proof_string(&mut out, EPHEMERAL_PROOF_DOMAIN)?;
+    push_proof_string(&mut out, transfer_id)?;
+    push_proof_string(&mut out, tenant_id)?;
+    out.push(role_byte);
+    push_proof_string(&mut out, device_id)?;
+    push_proof_string(&mut out, workspace_id)?;
+    out.extend_from_slice(&plan);
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&fence.to_be_bytes());
+    push_proof_string(&mut out, session_nonce)?;
+    out.extend_from_slice(&ephemeral);
+    out.extend_from_slice(&expires_at_ms.to_be_bytes());
+    Ok(out)
 }
 
 fn push_proof_string(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
