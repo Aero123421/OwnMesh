@@ -491,7 +491,7 @@ export default {
               ? { principal_id: mcpAccess.principal, tenant_id: mcpAccess.tenant_id }
               : undefined),
         },
-        { issuer },
+        { issuer, transferTicketSecret: env.SESSION_SECRET },
       );
     }
 

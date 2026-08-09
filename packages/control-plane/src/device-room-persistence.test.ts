@@ -1168,6 +1168,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
         coordinator_request_id: expected.coordinator_request_id,
         principal_id: "prin_dev",
         workspace_version: expected.workspace_version,
+        source_plan: { plan_id: "xfer_local_1", sha256: "b".repeat(64), size_bytes: 1 },
       },
     },
   });
@@ -1180,6 +1181,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
     coordinator_request_id: expected.coordinator_request_id,
     principal_id: "prin_dev",
     workspace_version: expected.workspace_version,
+    source_plan: { plan_id: "xfer_local_1", sha256: "b".repeat(64), size_bytes: 1 },
   });
 });
 

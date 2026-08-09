@@ -2610,7 +2610,10 @@ function transferPreflightExpectation(op: McpOperationRecord): TransferPreflight
   if (!role || expected.device_id !== op.device_id || expected.tenant_id !== op.tenant_id
     || expected.workspace_id !== op.workspace_id || expected.workspace_version < 1
     || expected.epoch < 1 || expected.fence < 1 || expected.expires_at <= Date.now()
-    || !/^[a-f0-9]{64}$/.test(expected.plan_sha256)) return null;
+    // The source Agent is the authority that hashes the pinned source file.
+    // Its preflight starts with no server-known plan hash; every other path
+    // requires the already CAS-bound hash.
+    || !((expected.role === "source" && expected.plan_sha256 === "") || /^[a-f0-9]{64}$/.test(expected.plan_sha256))) return null;
   return expected;
 }
 
@@ -2625,7 +2628,7 @@ function sanitizeTransferPreflightResult(
     return { error: "transfer_preflight_result_invalid" };
   }
   const raw = result as Record<string, unknown>;
-  const allowed = ["transfer_preflight", "operation_id", "coordinator_request_id", "principal_id", "workspace_version"];
+  const allowed = ["transfer_preflight", "operation_id", "coordinator_request_id", "principal_id", "workspace_version", "source_plan"];
   if (Object.keys(raw).some((key) => !allowed.includes(key))) return { error: "transfer_preflight_result_unknown_field" };
   if (raw.operation_id !== op.operation_id || raw.coordinator_request_id !== expected.coordinator_request_id
     || raw.principal_id !== op.principal_id || raw.workspace_version !== expected.workspace_version) {
@@ -2633,6 +2636,21 @@ function sanitizeTransferPreflightResult(
   }
   const reply = parseTransferPreflightResult(raw.transfer_preflight, expected);
   if (!reply) return { error: "transfer_preflight_proof_mismatch" };
+  let sourcePlan: Record<string, unknown> | undefined;
+  if (expected.role === "source") {
+    const plan = raw.source_plan;
+    if (!plan || typeof plan !== "object" || Array.isArray(plan)) return { error: "transfer_preflight_source_plan_missing" };
+    const p = plan as Record<string, unknown>;
+    if (Object.keys(p).some((key) => !["plan_id", "sha256", "size_bytes"].includes(key))
+      || typeof p.plan_id !== "string" || p.plan_id.length === 0 || p.plan_id.length > 256
+      || typeof p.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(p.sha256)
+      || typeof p.size_bytes !== "number" || !Number.isSafeInteger(p.size_bytes) || p.size_bytes < 1) {
+      return { error: "transfer_preflight_source_plan_invalid" };
+    }
+    sourcePlan = { plan_id: p.plan_id, sha256: p.sha256, size_bytes: p.size_bytes };
+  } else if (raw.source_plan !== undefined) {
+    return { error: "transfer_preflight_destination_source_plan_forbidden" };
+  }
   // Store only the bounded proof metadata.  This deliberately excludes the
   // raw operation payload and gives the ticket coordinator no byte channel.
   return {
@@ -2642,6 +2660,7 @@ function sanitizeTransferPreflightResult(
       coordinator_request_id: expected.coordinator_request_id,
       principal_id: op.principal_id,
       workspace_version: expected.workspace_version,
+      ...(sourcePlan ? { source_plan: sourcePlan } : {}),
     },
   };
 }

@@ -1942,6 +1942,20 @@ full_user_access/full_access for arbitrary commands",
             coordinator_request_id: String,
             workspace_version: u64,
             #[serde(default)]
+            plan_sha256: Option<String>,
+            #[serde(default)]
+            content_sha256: Option<String>,
+            #[serde(default)]
+            size_bytes: Option<u64>,
+            #[serde(default)]
+            grant_id: Option<String>,
+            #[serde(default)]
+            grant_operation_id: Option<String>,
+            #[serde(default)]
+            grant_payload_sha256: Option<String>,
+            #[serde(default)]
+            grant_expires_at_unix: Option<u64>,
+            #[serde(default)]
             workspace_id: Option<String>,
         }
         let p: Params = parse_params(params)?;
@@ -1986,13 +2000,63 @@ full_user_access/full_access for arbitrary commands",
         let source_path = source
             .resolve(Path::new(&binding.source_relative_path))
             .map_err(fs_err)?;
+        let final_plan = match (
+            p.plan_sha256,
+            p.content_sha256,
+            p.size_bytes,
+            p.grant_id,
+            p.grant_operation_id,
+            p.grant_payload_sha256,
+            p.grant_expires_at_unix,
+        ) {
+            (None, None, None, None, None, None, None) => None,
+            (
+                Some(plan_sha256),
+                Some(content_sha256),
+                Some(size_bytes),
+                Some(grant_id),
+                Some(operation_id),
+                Some(payload_sha256),
+                Some(expires_at_unix),
+            ) => {
+                if expires_at_unix != authority.expires_at_unix {
+                    return Err(IpcError::Remote {
+                        code: app_error::UNAUTHORIZED,
+                        message: "final transfer grant expiry differs from authenticated operation"
+                            .into(),
+                    });
+                }
+                let grant = TransferGrant {
+                    grant_id,
+                    operation_id,
+                    payload_sha256,
+                    expires_at_unix,
+                };
+                let verified =
+                    TransferPlan::from_verified(binding.clone(), grant, size_bytes, content_sha256)
+                        .map_err(Self::transfer_error)?;
+                if verified.plan_sha256() != plan_sha256 {
+                    return Err(IpcError::Remote {
+                        code: app_error::UNAUTHORIZED,
+                        message: "final transfer plan digest is not canonical".into(),
+                    });
+                }
+                Some(verified)
+            }
+            _ => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "final transfer preflight fields must be supplied together".into(),
+                })
+            }
+        };
         let grant = TransferGrant {
             grant_id: format!("grant_{}", authority.operation_id),
             operation_id: authority.operation_id.clone(),
             payload_sha256: authority.payload_sha256.clone(),
             expires_at_unix: authority.expires_at_unix,
         };
-        let plan = TransferPlan::for_source(
+        let observed = TransferPlan::for_source(
             &source_path,
             binding,
             grant,
@@ -2000,6 +2064,19 @@ full_user_access/full_access for arbitrary commands",
             Self::now() as u64,
         )
         .map_err(Self::transfer_error)?;
+        let plan = if let Some(final_plan) = final_plan {
+            if observed.size_bytes() != final_plan.size_bytes()
+                || observed.sha256() != final_plan.sha256()
+            {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: "source changed after preflight evidence".into(),
+                });
+            }
+            final_plan
+        } else {
+            observed
+        };
         self.transfer_store
             .save_plan(&plan)
             .map_err(Self::transfer_error)?;
@@ -2140,6 +2217,98 @@ full_user_access/full_access for arbitrary commands",
             "available": true,
             "expires_at_unix": authority.expires_at_unix,
         }))
+    }
+
+    /// Strict Agent-only admission for a ticket-bound transfer session.  The
+    /// bearer remains opaque and is never persisted or returned from runtime.
+    async fn handle_transfer_start(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            transfer_id: String,
+            role: String,
+            ticket: String,
+            plan_sha256: String,
+            content_sha256: String,
+            size_bytes: u64,
+            source_path: String,
+            destination_path: String,
+            source_device_id: String,
+            destination_device_id: String,
+            source_workspace_id: String,
+            destination_workspace_id: String,
+            source_workspace_version: u64,
+            destination_workspace_version: u64,
+            workspace_id: String,
+            workspace_version: u64,
+            epoch: u32,
+            fence: u64,
+            grant_id: String,
+            grant_operation_id: String,
+            grant_payload_sha256: String,
+            grant_expires_at_unix: u64,
+        }
+        let p: Params = parse_params(params)?;
+        let authority = self.transfer_authority(client)?;
+        let hex =
+            |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let local_device = if p.role == "source" {
+            &p.source_device_id
+        } else {
+            &p.destination_device_id
+        };
+        let local_workspace = if p.role == "source" {
+            &p.source_workspace_id
+        } else {
+            &p.destination_workspace_id
+        };
+        if !matches!(p.role.as_str(), "source" | "destination")
+            || p.transfer_id.is_empty()
+            || p.transfer_id.len() > 256
+            || p.source_path.is_empty()
+            || p.destination_path.is_empty()
+            || p.source_path.len() > 4096
+            || p.destination_path.len() > 4096
+            || p.source_path.contains('\\')
+            || p.destination_path.contains('\\')
+            || p.source_path
+                .split('/')
+                .any(|part| part == "." || part == ".." || part.is_empty())
+            || p.destination_path
+                .split('/')
+                .any(|part| part == "." || part == ".." || part.is_empty())
+            || p.transfer_id != p.grant_id
+            || p.grant_operation_id != p.transfer_id
+            || p.grant_expires_at_unix != authority.expires_at_unix
+            || authority.device_id != *local_device
+            || p.workspace_id != *local_workspace
+            || p.epoch == 0
+            || p.fence == 0
+            || p.size_bytes == 0
+            || p.workspace_version == 0
+            || p.source_workspace_version == 0
+            || p.destination_workspace_version == 0
+            || !hex(&p.plan_sha256)
+            || !hex(&p.content_sha256)
+            || !hex(&p.grant_payload_sha256)
+            || p.ticket.is_empty()
+            || p.ticket.len() > 16 * 1024
+            || p.ticket.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "invalid ticket-bound transfer start".into(),
+            });
+        }
+        // `ticket` is passed straight to connect_transfer_socket by the Agent
+        // transport.  This receipt intentionally omits the bearer and paths.
+        Ok(
+            json!({ "transfer_id": p.transfer_id, "role": p.role, "plan_sha256": p.plan_sha256, "epoch": p.epoch, "fence": p.fence, "admitted": true }),
+        )
     }
 
     fn transfer_plan_for(
@@ -4168,6 +4337,7 @@ full_user_access/full_access for arbitrary commands",
                 self.handle_transfer_preflight_destination(params, client)
                     .await
             }
+            "transfer.start" => self.handle_transfer_start(params, client).await,
             methods::TRANSFER_SOURCE_OPEN => self.handle_transfer_source_open(params, client).await,
             methods::TRANSFER_SOURCE_CHUNK => {
                 self.handle_transfer_source_chunk(params, client).await

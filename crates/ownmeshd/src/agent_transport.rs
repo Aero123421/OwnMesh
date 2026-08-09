@@ -1971,6 +1971,7 @@ fn map_request_to_method(
             "transfer.preflight_destination",
             "transfer.preflight_destination" | "preflight_destination",
         ) => methods::TRANSFER_PREFLIGHT_DESTINATION,
+        ("transfer.start", "transfer.start" | "start") => "transfer.start",
         ("transfer.plan", "transfer.plan" | "plan") => methods::TRANSFER_PLAN,
         ("transfer.source_open", "transfer.source_open" | "source_open") => {
             methods::TRANSFER_SOURCE_OPEN
@@ -2213,7 +2214,21 @@ async fn signed_transfer_preflight_result(
         expires_at,
     )?;
     let signature = hex_encode(device_key.sign(&proof).expose());
-    Ok(json!({
+    // Source-side plan identity/size/content digest are immutable metadata, not
+    // transfer data. They are retained only for the same Agent's later
+    // ticket-bound start; no chunk, ciphertext, or key is put on this path.
+    let source_plan = if role == "source" {
+        let plan_id = preflight_text(body, "plan_id")?;
+        let sha256 = preflight_text(body, "sha256")?;
+        let size_bytes = preflight_u64(body, "size_bytes")?;
+        if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("invalid source transfer plan digest".into());
+        }
+        Some(json!({ "plan_id": plan_id, "sha256": sha256, "size_bytes": size_bytes }))
+    } else {
+        None
+    };
+    let mut result = json!({
         "transfer_preflight": {
             "role": role,
             "transfer_id": transfer_id,
@@ -2232,7 +2247,11 @@ async fn signed_transfer_preflight_result(
         "coordinator_request_id": coordinator_request_id,
         "principal_id": principal_id,
         "workspace_version": workspace_version,
-    }))
+    });
+    if let Some(source_plan) = source_plan {
+        result["source_plan"] = source_plan;
+    }
+    Ok(result)
 }
 
 async fn dispatch_remote_operation(
@@ -3594,6 +3613,9 @@ mod tests {
             "expires_at": (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64) + 30_000,
             "coordinator_request_id": "coord_1",
             "workspace_version": 1,
+            "plan_id": "xfer_local_preflight",
+            "sha256": "b".repeat(64),
+            "size_bytes": 1,
         });
         let first = signed_transfer_preflight_result(&body, "op_preflight", &key, &cache)
             .await

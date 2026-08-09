@@ -69,7 +69,12 @@ export function parseTransferPreflightResult(
   };
   return reply.role === expected.role && reply.transfer_id === expected.transfer_id && reply.tenant_id === expected.tenant_id
     && reply.device_id === expected.device_id && reply.workspace_id === expected.workspace_id
-    && reply.plan_sha256 === expected.plan_sha256 && reply.epoch === expected.epoch && reply.fence === expected.fence
+    // Source planning is the one place where the server cannot know the
+    // immutable content hash yet. An empty expected hash is therefore allowed
+    // only for the source preflight; the coordinator CAS-binds the returned
+    // lower-case SHA-256 before it can dispatch destination preflight/start.
+    && (expected.plan_sha256 === "" && expected.role === "source" ? hash(reply.plan_sha256) : reply.plan_sha256 === expected.plan_sha256)
+    && reply.epoch === expected.epoch && reply.fence === expected.fence
     && reply.session_nonce === expected.session_nonce && reply.expires_at === expected.expires_at
     && key(reply.ephemeral_public_key, 32) && key(reply.ephemeral_signature, 64) ? reply : null;
 }
