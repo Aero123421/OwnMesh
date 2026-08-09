@@ -375,7 +375,8 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
                 })
             }
         };
-        let active = systemctl_status("is-active", "ownmesh-broker.service").unwrap_or(false);
+        let active = systemctl_status("is-active", "ownmesh-broker.service").unwrap_or(false)
+            && active_pid_matches(Path::new(&rec.broker_binary)).unwrap_or(false);
         let socket_ok = endpoint_socket_valid(
             Path::new(&rec.endpoint),
             UnixSocketSecurity {
@@ -517,6 +518,7 @@ fn systemctl_status(command: &str, unit: &str) -> Result<bool, String> {
 fn wait_active(record: &InstallRecord) -> Result<(), String> {
     for _ in 0..30 {
         if systemctl_status("is-active", "ownmesh-broker.service")?
+            && active_pid_matches(Path::new(&record.broker_binary))?
             && endpoint_socket_valid(
                 Path::new(&record.endpoint),
                 UnixSocketSecurity {
@@ -531,6 +533,40 @@ fn wait_active(record: &InstallRecord) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Err("ownmesh-broker did not become active with a custody-valid Unix socket".into())
+}
+
+/// `systemctl is-active` alone is not enough: prove that systemd's main PID
+/// is still executing the immutable image recorded by this installation.
+#[cfg(target_os = "linux")]
+fn active_pid_matches(expected: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let output = std::process::Command::new("systemctl")
+        .args([
+            "show",
+            "--property=MainPID",
+            "--value",
+            "ownmesh-broker.service",
+        ])
+        .output()
+        .map_err(|e| format!("read broker MainPID: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "read broker MainPID: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let pid = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "broker systemd MainPID is missing".to_string())?;
+    if pid == 0 {
+        return Ok(false);
+    }
+    let process = std::fs::metadata(format!("/proc/{pid}/exe"))
+        .map_err(|e| format!("inspect broker process executable: {e}"))?;
+    let installed = std::fs::metadata(expected)
+        .map_err(|e| format!("inspect installed broker executable: {e}"))?;
+    Ok(process.dev() == installed.dev() && process.ino() == installed.ino())
 }
 #[cfg(target_os = "linux")]
 fn ensure_dir(path: &Path, mode: u32) -> Result<(), String> {

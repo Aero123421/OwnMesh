@@ -25,6 +25,10 @@ fi
 "$broker" uninstall || true
 "$broker" install --trusted-executable "$trusted"
 "$broker" status | grep -q 'status=installed support=supported network=disabled'
+if command -v ss >/dev/null 2>&1 && ss -ltnp 2>/dev/null | grep -q ownmesh-broker; then
+  echo "broker unexpectedly owns a TCP listener" >&2
+  exit 1
+fi
 systemctl stop ownmesh-broker.service
 test "$(systemctl is-active ownmesh-broker.service)" = inactive
 systemctl start ownmesh-broker.service
