@@ -7,12 +7,12 @@ use ownmesh_session::{PtyBackend, PtyCommand, PtySize, SessionHostHandle};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize as PortableSize};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use std::process::{Child, ChildStdin, Command, Stdio};
 
 /// Aggregate byte budget for one live host's unread output ring.
 pub const LIVE_OUTPUT_RING_BYTES: usize = 1024 * 1024;
@@ -25,7 +25,11 @@ pub const PIPE_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Host I/O contract selected by the supervisor spawn request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HostIoMode { #[default] Pty, StructuredPipes }
+pub enum HostIoMode {
+    #[default]
+    Pty,
+    StructuredPipes,
+}
 
 /// Live PTY session used by the standalone CLI (or pipe fallback).
 pub struct PtySession {
@@ -114,12 +118,25 @@ pub struct StructuredProcessHost {
 impl StructuredProcessHost {
     pub fn spawn(cmd: &PtyCommand, size: PtySize) -> Result<Self, String> {
         let mut command = Command::new(&cmd.program);
-        command.args(&cmd.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if let Some(cwd) = &cmd.cwd { command.current_dir(cwd); }
-        for (key, value) in &cmd.env { command.env(key, value); }
+        command
+            .args(&cmd.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(cwd) = &cmd.cwd {
+            command.current_dir(cwd);
+        }
+        for (key, value) in &cmd.env {
+            command.env(key, value);
+        }
         #[cfg(unix)]
-        { use std::os::unix::process::CommandExt; command.process_group(0); }
-        let mut child = command.spawn().map_err(|e| format!("structured spawn: {e}"))?;
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("structured spawn: {e}"))?;
         let pid = child.id();
         let stdin = child.stdin.take().ok_or("structured stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("structured stdout unavailable")?;
@@ -129,34 +146,97 @@ impl StructuredProcessHost {
         let err_ring = Arc::new(Mutex::new(ByteRing::new()));
         let out_reader = spawn_pipe_ring_reader(stdout, Arc::clone(&out_ring), Arc::clone(&stop));
         let err_reader = spawn_pipe_ring_reader(stderr, Arc::clone(&err_ring), Arc::clone(&stop));
-        Ok(Self { handle: SessionHostHandle { session_id: format!("proc_{pid}"), backend: PtyBackend::PipeFallback, pid: Some(pid), cols: size.cols, rows: size.rows }, stdin: Mutex::new(Some(stdin)), child: Mutex::new(child), stdout: out_ring, stderr: err_ring, stop, readers: vec![out_reader, err_reader] })
+        Ok(Self {
+            handle: SessionHostHandle {
+                session_id: format!("proc_{pid}"),
+                backend: PtyBackend::PipeFallback,
+                pid: Some(pid),
+                cols: size.cols,
+                rows: size.rows,
+            },
+            stdin: Mutex::new(Some(stdin)),
+            child: Mutex::new(child),
+            stdout: out_ring,
+            stderr: err_ring,
+            stop,
+            readers: vec![out_reader, err_reader],
+        })
     }
 
     pub fn write_frame(&self, frame: &[u8]) -> Result<(), String> {
-        if frame.is_empty() || frame.len() > 64 * 1024 || !frame.ends_with(b"\n") { return Err("structured frame must be LF terminated and <= 64KiB".into()); }
+        if frame.is_empty() || frame.len() > 64 * 1024 || !frame.ends_with(b"\n") {
+            return Err("structured frame must be LF terminated and <= 64KiB".into());
+        }
         let mut stdin = self.stdin.lock().map_err(|e| e.to_string())?;
         let writer = stdin.as_mut().ok_or("structured stdin closed")?;
-        writer.write_all(frame).and_then(|()| writer.flush()).map_err(|e| e.to_string())
+        writer
+            .write_all(frame)
+            .and_then(|()| writer.flush())
+            .map_err(|e| e.to_string())
     }
 
-    pub fn drain_stdout(&self, max: usize) -> Result<RawDrainOutput, String> { drain_ring(&self.stdout, max) }
-    pub fn drain_stderr(&self, max: usize) -> Result<RawDrainOutput, String> { drain_ring(&self.stderr, max) }
-    pub fn pending_output_bytes(&self) -> usize { self.stdout.lock().map(|r| r.remaining()).unwrap_or(0).saturating_add(self.stderr.lock().map(|r| r.remaining()).unwrap_or(0)) }
+    pub fn drain_stdout(&self, max: usize) -> Result<RawDrainOutput, String> {
+        drain_ring(&self.stdout, max)
+    }
+    pub fn drain_stderr(&self, max: usize) -> Result<RawDrainOutput, String> {
+        drain_ring(&self.stderr, max)
+    }
+    pub fn pending_stdout_bytes(&self) -> usize {
+        self.stdout.lock().map(|r| r.remaining()).unwrap_or(0)
+    }
+    pub fn pending_stderr_bytes(&self) -> usize {
+        self.stderr.lock().map(|r| r.remaining()).unwrap_or(0)
+    }
+    pub fn pending_output_bytes(&self) -> usize {
+        self.pending_stdout_bytes()
+            .saturating_add(self.pending_stderr_bytes())
+    }
+    pub fn is_exited(&self) -> bool {
+        self.stdout.lock().map(|r| r.exited).unwrap_or(true)
+            && self.stderr.lock().map(|r| r.exited).unwrap_or(true)
+    }
 
     pub fn terminate(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut stdin) = self.stdin.lock() { *stdin = None; }
+        if let Ok(mut stdin) = self.stdin.lock() {
+            *stdin = None;
+        }
         let mut child = self.child.lock().map_err(|e| e.to_string())?;
         let result = terminate_std_child_tree(&mut child);
-        for reader in self.readers.drain(..) { let _ = std::thread::Builder::new().spawn(move || { let _ = reader.join(); }); }
+        for reader in self.readers.drain(..) {
+            let _ = std::thread::Builder::new().spawn(move || {
+                let _ = reader.join();
+            });
+        }
         result
     }
 }
 
-impl Drop for StructuredProcessHost { fn drop(&mut self) { let _ = self.terminate(); } }
+impl Drop for StructuredProcessHost {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
 
-fn spawn_pipe_ring_reader<R: Read + Send + 'static>(mut reader: R, ring: Arc<Mutex<ByteRing>>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
-    std::thread::spawn(move || { let mut buf = [0_u8; 8192]; while !stop.load(Ordering::SeqCst) { match reader.read(&mut buf) { Ok(0) => break, Ok(n) => if let Ok(mut r) = ring.lock() { r.push(&buf[..n]); }, Err(_) => break } } })
+fn spawn_pipe_ring_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    ring: Arc<Mutex<ByteRing>>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 8192];
+        while !stop.load(Ordering::SeqCst) {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(mut r) = ring.lock() {
+                        r.push(&buf[..n]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
 }
 
 fn drain_ring(ring: &Arc<Mutex<ByteRing>>, max: usize) -> Result<RawDrainOutput, String> {
@@ -166,12 +246,28 @@ fn drain_ring(ring: &Arc<Mutex<ByteRing>>, max: usize) -> Result<RawDrainOutput,
 }
 
 fn terminate_std_child_tree(child: &mut Child) -> Result<(), String> {
-    if child.try_wait().map_err(|e| e.to_string())?.is_some() { return Ok(()); }
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(());
+    }
     #[cfg(windows)]
-    { let status = Command::new("taskkill").args(["/PID", &child.id().to_string(), "/T", "/F"]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("taskkill failed".into()); } }
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("taskkill failed".into());
+        }
+    }
     #[cfg(unix)]
-    { let _ = Command::new("kill").args(["-TERM", &format!("-{}", child.id())]).status(); let _ = child.kill(); }
-    let _ = child.wait(); Ok(())
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{}", child.id())])
+            .status();
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    Ok(())
 }
 
 struct ByteRing {
@@ -1141,9 +1237,19 @@ mod tests {
     #[test]
     fn structured_pipes_keep_stdout_and_stderr_separate_and_bound_frames() {
         let cmd = if cfg!(windows) {
-            PtyCommand { program: "cmd.exe".into(), args: vec!["/C".into(), "echo out & echo err 1>&2".into()], cwd: None, env: vec![] }
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "echo out & echo err 1>&2".into()],
+                cwd: None,
+                env: vec![],
+            }
         } else {
-            PtyCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "printf out; printf err >&2".into()], cwd: None, env: vec![] }
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf out; printf err >&2".into()],
+                cwd: None,
+                env: vec![],
+            }
         };
         let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
         std::thread::sleep(Duration::from_millis(100));

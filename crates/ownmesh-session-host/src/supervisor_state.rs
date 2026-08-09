@@ -1,7 +1,7 @@
 //! In-process state behind the persistent local session-supervisor IPC service.
 
-use crate::{HostIoMode, HostManifest, LiveHost, OwnerSpool, SpoolPage, StructuredProcessHost};
 use crate::pty_host::RawDrainOutput;
+use crate::{HostIoMode, HostManifest, LiveHost, OwnerSpool, SpoolPage, StructuredProcessHost};
 use ownmesh_session::{PtyCommand, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -38,7 +38,11 @@ impl SupervisorBinding {
 #[serde(deny_unknown_fields)]
 pub struct SupervisorStatus {
     pub pid: Option<u32>,
+    /// Compatibility aggregate; structured hosts expose the two bounded
+    /// streams below so callers never mistake stderr for stdout replay.
     pub pending_output_bytes: usize,
+    pub pending_stdout_bytes: usize,
+    pub pending_stderr_bytes: usize,
     pub exited: bool,
 }
 
@@ -49,14 +53,50 @@ struct Hosted {
     host: HostedHost,
 }
 
-enum HostedHost { Pty(LiveHost), Structured(StructuredProcessHost) }
+enum HostedHost {
+    Pty(LiveHost),
+    Structured(StructuredProcessHost),
+}
 
 impl HostedHost {
-    fn write(&self, bytes: &[u8]) -> Result<(), String> { match self { Self::Pty(h) => h.write_stdin(bytes), Self::Structured(h) => h.write_frame(bytes) } }
-    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> { match self { Self::Pty(h) => h.resize(cols, rows), Self::Structured(_) => Err("structured pipe hosts cannot resize".into()) } }
-    fn drain(&self, stderr: bool, max: usize) -> Result<RawDrainOutput, String> { match self { Self::Pty(h) if stderr => Ok((Vec::new(), false, h.is_exited(), None, 0)), Self::Pty(h) => h.drain_output_bytes(max), Self::Structured(h) if stderr => h.drain_stderr(max), Self::Structured(h) => h.drain_stdout(max) } }
-    fn terminate(&mut self) -> Result<(), String> { match self { Self::Pty(h) => h.terminate(), Self::Structured(h) => h.terminate() } }
-    fn status(&self) -> SupervisorStatus { match self { Self::Pty(h) => status(h), Self::Structured(h) => SupervisorStatus { pid: h.handle.pid, pending_output_bytes: h.pending_output_bytes(), exited: false } } }
+    fn write(&self, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Pty(h) => h.write_stdin(bytes),
+            Self::Structured(h) => h.write_frame(bytes),
+        }
+    }
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        match self {
+            Self::Pty(h) => h.resize(cols, rows),
+            Self::Structured(_) => Err("structured pipe hosts cannot resize".into()),
+        }
+    }
+    fn drain(&self, stderr: bool, max: usize) -> Result<RawDrainOutput, String> {
+        match self {
+            Self::Pty(h) if stderr => Ok((Vec::new(), false, h.is_exited(), None, 0)),
+            Self::Pty(h) => h.drain_output_bytes(max),
+            Self::Structured(h) if stderr => h.drain_stderr(max),
+            Self::Structured(h) => h.drain_stdout(max),
+        }
+    }
+    fn terminate(&mut self) -> Result<(), String> {
+        match self {
+            Self::Pty(h) => h.terminate(),
+            Self::Structured(h) => h.terminate(),
+        }
+    }
+    fn status(&self) -> SupervisorStatus {
+        match self {
+            Self::Pty(h) => status(h),
+            Self::Structured(h) => SupervisorStatus {
+                pid: h.handle.pid,
+                pending_output_bytes: h.pending_output_bytes(),
+                pending_stdout_bytes: h.pending_stdout_bytes(),
+                pending_stderr_bytes: h.pending_stderr_bytes(),
+                exited: h.is_exited(),
+            },
+        }
+    }
 }
 
 /// Bounded supervisor host map. A disconnected daemon client leaves this
@@ -80,7 +120,10 @@ impl SupervisorState {
         manifest: HostManifest,
         command: PtyCommand,
         size: PtySize,
-    ) -> Result<SupervisorBinding, String> { self.spawn_with_io(manifest, command, size, HostIoMode::Pty).await }
+    ) -> Result<SupervisorBinding, String> {
+        self.spawn_with_io(manifest, command, size, HostIoMode::Pty)
+            .await
+    }
 
     pub async fn spawn_with_io(
         &self,
@@ -98,11 +141,18 @@ impl SupervisorState {
         if hosts.contains_key(&manifest.session_id) {
             return Err("supervisor host already live".into());
         }
-        let host = match io_mode { HostIoMode::Pty => HostedHost::Pty(LiveHost::spawn(&command, size)?), HostIoMode::StructuredPipes => HostedHost::Structured(StructuredProcessHost::spawn(&command, size)?) };
+        let host = match io_mode {
+            HostIoMode::Pty => HostedHost::Pty(LiveHost::spawn(&command, size)?),
+            HostIoMode::StructuredPipes => {
+                HostedHost::Structured(StructuredProcessHost::spawn(&command, size)?)
+            }
+        };
         // Do not reserve durable identity until a PTY exists. If custody/spool
         // creation fails, dropping this newly spawned host cleans its tree.
         let spool = OwnerSpool::create(&self.root, manifest.clone())?;
-        let stderr_spool = matches!(io_mode, HostIoMode::StructuredPipes).then(|| OwnerSpool::create_stderr(&self.root, &manifest.session_id)).transpose()?;
+        let stderr_spool = matches!(io_mode, HostIoMode::StructuredPipes)
+            .then(|| OwnerSpool::create_stderr(&self.root, &manifest.session_id))
+            .transpose()?;
         let binding = binding_of(&manifest);
         hosts.insert(
             manifest.session_id.clone(),
@@ -167,7 +217,14 @@ impl SupervisorState {
             .ok_or("supervisor host unavailable")?;
         exact(binding, &hosted.manifest)?;
         let (bytes, truncated, _, _, _) = hosted.host.drain(stderr, max_bytes)?;
-        let spool = if stderr { hosted.stderr_spool.as_mut().ok_or("stderr stream unavailable")? } else { &mut hosted.spool };
+        let spool = if stderr {
+            hosted
+                .stderr_spool
+                .as_mut()
+                .ok_or("stderr stream unavailable")?
+        } else {
+            &mut hosted.spool
+        };
         if !bytes.is_empty() {
             spool.append(&bytes)?;
         }
@@ -193,14 +250,10 @@ impl SupervisorState {
             .ok_or("supervisor host unavailable")?;
         exact(previous, &hosted.manifest)?;
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let next = hosted.manifest.successor(
             next_owner_principal,
             next_epoch,
             next_binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         hosted.spool.rotate_manifest(next.clone())?;
@@ -232,14 +285,10 @@ impl SupervisorState {
         }
         exact(previous, &hosted.manifest)?;
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let mut next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let mut next = hosted.manifest.successor(
             next_owner_principal,
             next_epoch,
             next_binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         next.record_transition(transition_id, payload_digest)?;
@@ -269,14 +318,10 @@ impl SupervisorState {
             return Err("supervisor binding has not expired".into());
         }
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let next = hosted.manifest.successor(
             next_owner_principal,
             next_epoch,
             next_binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         hosted.spool.rotate_manifest(next.clone())?;
@@ -298,14 +343,10 @@ impl SupervisorState {
             .ok_or("supervisor host unavailable")?;
         exact(previous, &hosted.manifest)?;
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let mut next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let mut next = hosted.manifest.successor(
             hosted.manifest.owner_principal.clone(),
             next_epoch,
             hosted.manifest.binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.controller_attached = false;
         hosted.spool.rotate_manifest(next.clone())?;
@@ -334,14 +375,10 @@ impl SupervisorState {
         }
         exact(previous, &hosted.manifest)?;
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let mut next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let mut next = hosted.manifest.successor(
             hosted.manifest.owner_principal.clone(),
             next_epoch,
             hosted.manifest.binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.controller_attached = false;
         next.record_transition(transition_id, payload_digest)?;
@@ -368,14 +405,10 @@ impl SupervisorState {
             return Err("supervisor controller is still attached".into());
         }
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let next = hosted.manifest.successor(
             next_owner_principal,
             next_epoch,
             next_binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         hosted.spool.rotate_manifest(next.clone())?;
@@ -408,14 +441,10 @@ impl SupervisorState {
             return Err("supervisor controller is still attached".into());
         }
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let mut next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let mut next = hosted.manifest.successor(
             next_owner_principal,
             next_epoch,
             next_binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         next.record_transition(transition_id, payload_digest)?;
@@ -451,14 +480,10 @@ impl SupervisorState {
             return Err("supervisor binding has not expired".into());
         }
         rotate_epoch(previous.controller_epoch, next_epoch)?;
-        let mut next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let mut next = hosted.manifest.successor(
             next_owner_principal,
             next_epoch,
             next_binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         next.record_transition(transition_id, payload_digest)?;
@@ -487,14 +512,10 @@ impl SupervisorState {
             return Ok(binding_of(&hosted.manifest));
         }
         exact(previous, &hosted.manifest)?;
-        let mut next = HostManifest::new(
-            hosted.manifest.session_id.clone(),
-            hosted.manifest.device_id.clone(),
-            hosted.manifest.workspace_id.clone(),
+        let mut next = hosted.manifest.successor(
             hosted.manifest.owner_principal.clone(),
             hosted.manifest.controller_epoch,
             next_binding_expires_unix,
-            hosted.manifest.host_expires_unix,
         )?;
         next.validate_runtime_lifetimes(unix_now())?;
         next.record_transition(transition_id, payload_digest)?;
@@ -629,6 +650,8 @@ fn status(host: &LiveHost) -> SupervisorStatus {
     SupervisorStatus {
         pid: host.handle.pid,
         pending_output_bytes: host.pending_output_bytes(),
+        pending_stdout_bytes: host.pending_output_bytes(),
+        pending_stderr_bytes: 0,
         exited: host.is_exited(),
     }
 }
@@ -776,6 +799,46 @@ mod tests {
             .await
             .is_err());
         state.terminate(&first).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_transition_preserves_shared_adapter_manifest() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let mut manifest = HostManifest::new(
+            "ses_structured_transition",
+            "dev",
+            "ws",
+            "owner_a",
+            1,
+            unix_now() + 60,
+            unix_now() + 600,
+        )
+        .unwrap();
+        manifest.io_mode = HostIoMode::StructuredPipes;
+        manifest.profile_id = Some("fixture".into());
+        manifest.adapter_dialect = Some("jsonl".into());
+        let binding = state
+            .spawn_with_io(
+                manifest,
+                shell_command(),
+                PtySize::default(),
+                HostIoMode::StructuredPipes,
+            )
+            .await
+            .unwrap();
+        let successor = state
+            .rotate_binding(&binding, "owner_b", 2, unix_now() + 60)
+            .await
+            .unwrap();
+        let primary = OwnerSpool::open(root.path(), "ses_structured_transition").unwrap();
+        let stderr = OwnerSpool::create_stderr(root.path(), "ses_structured_transition").unwrap();
+        assert_eq!(primary.manifest(), stderr.manifest());
+        assert_eq!(primary.manifest().profile_id.as_deref(), Some("fixture"));
+        assert_eq!(primary.manifest().adapter_dialect.as_deref(), Some("jsonl"));
+        // `cmd.exe` may already have exited on Windows; state cleanup remains
+        // best effort for a naturally exited structured child.
+        let _ = state.terminate(&successor).await;
     }
 
     #[tokio::test]

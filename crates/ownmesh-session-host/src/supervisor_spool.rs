@@ -4,11 +4,11 @@
 //! underlying files use the same pinned owner/DACL/no-reparse custody helpers as
 //! the daemon credential registry; this is not a same-user malware boundary.
 
+use crate::HostIoMode;
 use ownmesh_ipc::{
     atomic_write_owner_only, create_owner_only_file_new, prepare_owner_only_state_dir,
     read_owner_only_file_bounded,
 };
-use crate::HostIoMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -131,7 +131,51 @@ impl HostManifest {
         {
             return Err("invalid supervisor epoch or expiry".into());
         }
+        match self.io_mode {
+            HostIoMode::Pty => {
+                if self.profile_id.is_some() || self.adapter_dialect.is_some() {
+                    return Err("PTY supervisor manifest cannot carry adapter facts".into());
+                }
+            }
+            HostIoMode::StructuredPipes => {
+                for (field, value) in [
+                    ("profile_id", self.profile_id.as_deref()),
+                    ("adapter_dialect", self.adapter_dialect.as_deref()),
+                ] {
+                    if !value.is_some_and(valid_component) {
+                        return Err(format!(
+                            "structured supervisor manifest requires valid {field}"
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Make a fresh controller-generation manifest while preserving immutable
+    /// process I/O facts.  A handoff must never silently turn a structured
+    /// adapter process into a generic PTY session (or vice versa).
+    pub fn successor(
+        &self,
+        owner_principal: impl Into<String>,
+        controller_epoch: u64,
+        binding_expires_unix: i64,
+    ) -> Result<Self, String> {
+        let mut next = Self::new(
+            self.session_id.clone(),
+            self.device_id.clone(),
+            self.workspace_id.clone(),
+            owner_principal,
+            controller_epoch,
+            binding_expires_unix,
+            self.host_expires_unix,
+        )?;
+        next.io_mode = self.io_mode;
+        next.profile_id.clone_from(&self.profile_id);
+        next.adapter_dialect.clone_from(&self.adapter_dialect);
+        next.validate()?;
+        Ok(next)
     }
 
     pub fn matches_transition(
@@ -246,7 +290,11 @@ impl OwnerSpool {
         // State (base offset + bytes) is one atomically replaced owner-only file.
         create_owner_only_file_new(&dir.join(SPOOL_FILE), &encode_spool(0, &[]))
             .map_err(|e| format!("create supervisor spool: {e}"))?;
-        Ok(Self { dir, manifest, payload_file: SPOOL_FILE })
+        Ok(Self {
+            dir,
+            manifest,
+            payload_file: SPOOL_FILE,
+        })
     }
 
     pub fn open(root: &Path, session_id: &str) -> Result<Self, String> {
@@ -264,7 +312,11 @@ impl OwnerSpool {
         if manifest.session_id != session_id {
             return Err("supervisor manifest/session path mismatch".into());
         }
-        let spool = Self { dir, manifest, payload_file: SPOOL_FILE };
+        let spool = Self {
+            dir,
+            manifest,
+            payload_file: SPOOL_FILE,
+        };
         let _ = spool.read_state()?;
         Ok(spool)
     }
@@ -274,7 +326,12 @@ impl OwnerSpool {
     pub fn create_stderr(root: &Path, session_id: &str) -> Result<Self, String> {
         let mut spool = Self::open(root, session_id)?;
         let path = spool.dir.join(STDERR_SPOOL_FILE);
-        if !path.exists() { create_owner_only_file_new(&path, &encode_spool(0, &[])).map_err(|e| format!("create stderr spool: {e}"))?; }
+        match create_owner_only_file_new(&path, &encode_spool(0, &[])) {
+            Ok(()) => {}
+            Err(ownmesh_ipc::IpcError::Io(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("create stderr spool: {error}")),
+        }
         spool.payload_file = STDERR_SPOOL_FILE;
         let _ = spool.read_state()?;
         Ok(spool)
@@ -373,6 +430,9 @@ impl OwnerSpool {
         if next.session_id != self.manifest.session_id
             || next.device_id != self.manifest.device_id
             || next.workspace_id != self.manifest.workspace_id
+            || next.io_mode != self.manifest.io_mode
+            || next.profile_id != self.manifest.profile_id
+            || next.adapter_dialect != self.manifest.adapter_dialect
         {
             return Err("supervisor binding identity cannot change".into());
         }
@@ -398,6 +458,9 @@ impl OwnerSpool {
             || next.owner_principal != self.manifest.owner_principal
             || next.controller_epoch != self.manifest.controller_epoch
             || !next.controller_attached
+            || next.io_mode != self.manifest.io_mode
+            || next.profile_id != self.manifest.profile_id
+            || next.adapter_dialect != self.manifest.adapter_dialect
         {
             return Err("supervisor renewal identity cannot change".into());
         }
@@ -426,8 +489,11 @@ impl OwnerSpool {
         let mut next = Vec::with_capacity(retained.len().saturating_sub(drop_count) + bytes.len());
         next.extend_from_slice(&retained[drop_count..]);
         next.extend_from_slice(bytes);
-        atomic_write_owner_only(&self.dir.join(self.payload_file), &encode_spool(next_base, &next))
-            .map_err(|e| format!("write supervisor spool: {e}"))
+        atomic_write_owner_only(
+            &self.dir.join(self.payload_file),
+            &encode_spool(next_base, &next),
+        )
+        .map_err(|e| format!("write supervisor spool: {e}"))
     }
 
     pub fn read_page(&self, offset: u64, max_bytes: usize) -> Result<SpoolPage, String> {
@@ -571,5 +637,42 @@ mod tests {
         fs::rename(temp.path().join("ses_1"), &other).unwrap();
         assert!(OwnerSpool::open(temp.path(), "ses_other").is_err());
         assert_eq!(spool.manifest().session_id, "ses_1");
+    }
+
+    #[test]
+    fn corrupt_secondary_stream_does_not_change_authoritative_identity() {
+        let temp = tempdir().unwrap();
+        let spool = OwnerSpool::create(temp.path(), manifest()).unwrap();
+        let stderr = OwnerSpool::create_stderr(temp.path(), "ses_1").unwrap();
+        fs::write(stderr.dir.join(STDERR_SPOOL_FILE), b"corrupt").unwrap();
+
+        // The single manifest and primary stream remain valid; only the
+        // corrupted stream becomes visibly unavailable rather than changing
+        // a controller transition's identity facts.
+        assert_eq!(
+            OwnerSpool::open(temp.path(), "ses_1").unwrap().manifest(),
+            spool.manifest()
+        );
+        assert!(OwnerSpool::create_stderr(temp.path(), "ses_1").is_err());
+    }
+
+    #[test]
+    fn structured_manifest_requires_and_preserves_exact_adapter_facts() {
+        let mut structured = manifest();
+        structured.io_mode = HostIoMode::StructuredPipes;
+        structured.profile_id = Some("codex".into());
+        structured.adapter_dialect = Some("codex-app-server".into());
+        structured.validate().unwrap();
+        let next = structured.successor("owner_b", 2, 1_800_000_200).unwrap();
+        assert_eq!(next.io_mode, HostIoMode::StructuredPipes);
+        assert_eq!(next.profile_id.as_deref(), Some("codex"));
+        assert_eq!(next.adapter_dialect.as_deref(), Some("codex-app-server"));
+
+        let mut bad = structured.clone();
+        bad.adapter_dialect = None;
+        assert!(bad.validate().is_err());
+        let mut pty = manifest();
+        pty.profile_id = Some("codex".into());
+        assert!(pty.validate().is_err());
     }
 }

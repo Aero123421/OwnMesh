@@ -164,11 +164,29 @@ impl SupervisorClient {
         offset: u64,
         max_bytes: usize,
     ) -> IpcResult<crate::SpoolPage> {
+        self.drain_stream(binding, offset, max_bytes, "stdout")
+            .await
+    }
+
+    /// Drain exactly one durable stream.  `stderr` is separate from the
+    /// structured protocol stream and cannot be folded into its cursor.
+    pub async fn drain_stream(
+        &self,
+        binding: &SupervisorBinding,
+        offset: u64,
+        max_bytes: usize,
+        stream: &str,
+    ) -> IpcResult<crate::SpoolPage> {
+        if !matches!(stream, "stdout" | "stderr") {
+            return Err(ownmesh_ipc::IpcError::Protocol(
+                "invalid supervisor drain stream".into(),
+            ));
+        }
         Ok(serde_json::from_value(
             self.client
                 .call(
                     SupervisorRpcMethods::DRAIN,
-                    Some(json!({"binding":binding,"offset":offset,"max_bytes":max_bytes})),
+                    Some(json!({"binding":binding,"offset":offset,"max_bytes":max_bytes,"stream":stream})),
                 )
                 .await?,
         )?)
@@ -417,8 +435,13 @@ async fn dispatch(
             if params.max_bytes == 0 || params.max_bytes > MAX_DRAIN_BYTES {
                 return Err(invalid("invalid supervisor drain budget"));
             }
+            let stderr = match params.stream.as_deref() {
+                None | Some("stdout") => false,
+                Some("stderr") => true,
+                _ => return Err(invalid("invalid supervisor drain stream")),
+            };
             Ok(json!(state
-                .drain(&params.binding, params.offset, params.max_bytes, params.stream.as_deref() == Some("stderr"))
+                .drain(&params.binding, params.offset, params.max_bytes, stderr)
                 .await
                 .map_err(invalid)?))
         }
@@ -578,7 +601,10 @@ fn validate_spawn(params: &SupervisorSpawnRequest) -> IpcResult<()> {
     }
     if matches!(params.io_mode, HostIoMode::StructuredPipes) {
         require_component(params.profile_id.as_deref().unwrap_or(""), "profile_id")?;
-        require_component(params.adapter_dialect.as_deref().unwrap_or(""), "adapter_dialect")?;
+        require_component(
+            params.adapter_dialect.as_deref().unwrap_or(""),
+            "adapter_dialect",
+        )?;
     }
     Ok(())
 }
