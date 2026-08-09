@@ -71,6 +71,7 @@ const SIGNING_NAME: &str = "broker.cap.signing";
 const STAGING_NAME: &str = "staged";
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
 const MAX_BROKER_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+const BROKER_SECRET_BYTES: usize = 32;
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -678,7 +679,7 @@ fn copy_custodied_new(
     retained: &mut Vec<CustodyHandle>,
 ) -> Result<(), String> {
     let expected = hash_file(source)?;
-    let descriptor = CreationDescriptor::service()?;
+    let descriptor = CreationDescriptor::new(false)?;
     let attributes = descriptor.attributes();
     let name = wide(destination.as_os_str());
     let raw = unsafe {
@@ -1127,7 +1128,7 @@ fn validate_service_config(
 fn set_service_custody(
     service: windows_sys::Win32::System::Services::SC_HANDLE,
 ) -> Result<(), String> {
-    let descriptor = CreationDescriptor::new(false)?;
+    let descriptor = CreationDescriptor::service()?;
     if unsafe {
         SetServiceObjectSecurity(
             service,
@@ -1480,7 +1481,7 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
             if std::fs::read(&secret_path)
                 .map_err(|e| e.to_string())?
                 .len()
-                < 32
+                != BROKER_SECRET_BYTES
             {
                 return Err("existing Windows broker request secret is malformed".into());
             }
@@ -1864,15 +1865,22 @@ async fn run_windows_broker_service() -> Result<(), String> {
     let trusted = load_windows_daemon_trust_record(&cfg.trust_record)?;
     verify_system_admin_custody(&cfg.request_secret)?;
     verify_system_admin_custody(&cfg.signing_key)?;
-    let secret = BrokerSecret::from_bytes(
-        std::fs::read(&cfg.request_secret)
-            .map_err(|e| format!("read Windows broker secret: {e}"))?,
-    );
+    let secret_bytes = std::fs::read(&cfg.request_secret)
+        .map_err(|e| format!("read Windows broker secret: {e}"))?;
+    if secret_bytes.len() != BROKER_SECRET_BYTES
+        || hash_file(&cfg.request_secret)? != cfg.secret_sha256
+    {
+        return Err("Windows broker request secret differs from exact custody record".into());
+    }
+    let secret = BrokerSecret::from_bytes(secret_bytes);
     let signing_key = CapabilitySigningKey::from_bytes(
         &std::fs::read(&cfg.signing_key)
             .map_err(|e| format!("read Windows broker signing key: {e}"))?,
     )
     .map_err(|e| format!("read Windows broker signing key: {e}"))?;
+    if hash_file(&cfg.signing_key)? != cfg.signing_sha256 {
+        return Err("Windows broker signing key differs from exact custody record".into());
+    }
     let ledger = WindowsDurableReplayLedger::open(&cfg.replay_ledger, 16_384)?;
     let runner = WindowsJobRunner::new(&cfg.staging_dir)?;
     let daemon_pipe_sid = trusted.record().daemon_pipe_sid.clone();
