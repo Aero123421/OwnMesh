@@ -2315,6 +2315,30 @@ fn remote_agent_client_from_bound(
     Ok(ClientIdentity::new(key, env!("CARGO_PKG_VERSION")))
 }
 
+/// Read the control-plane credential generation from the already hashed
+/// `bound_action`.  The field is optional for ordinary operations while the
+/// control plane is upgraded, but an elevated broker handoff requires it and
+/// rejects a missing value rather than inventing a surrogate from claim data.
+fn remote_principal_credential_generation_from_bound(
+    request: &OperationRequestPayload,
+) -> Result<Option<u64>, String> {
+    let bound = request
+        .authorization
+        .as_ref()
+        .and_then(|authorization| authorization.bound_action.as_object())
+        .ok_or_else(|| "remote credential generation requires verified bound_action".to_owned())?;
+    let Some(value) = bound.get("principal_credential_generation") else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .filter(|generation| *generation > 0)
+        .map(Some)
+        .ok_or_else(|| {
+            "bound principal_credential_generation must be a positive integer".to_owned()
+        })
+}
+
 fn action_of(request: &OperationRequestPayload) -> String {
     request
         .arguments
@@ -3096,6 +3120,22 @@ async fn dispatch_remote_operation(
             });
         }
     };
+    let remote_principal_credential_generation =
+        match remote_principal_credential_generation_from_bound(request) {
+            Ok(generation) => generation,
+            Err(message) => {
+                return json!({
+                    "operation_contract": OPERATION_CONTRACT_V1,
+                    "operation_id": operation_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "OWNMESH_E_ACTION_BINDING_MISMATCH",
+                        "message": message,
+                        "retryable": false
+                    }
+                });
+            }
+        };
     // Capture remote exact-action expiry/hash onto any deferred ApprovalRecord.
     let remote_expires_unix = envelope_expires_at.and_then(|raw| {
         ownmesh_domain::Timestamp::parse(raw)
@@ -3106,7 +3146,7 @@ async fn dispatch_remote_operation(
     let outcome = {
         let mut guard = runtime.lock().await;
         guard
-            .dispatch_cancellable_bound(
+            .dispatch_cancellable_bound_with_generation(
                 mapped.0,
                 Some(mapped.1),
                 &client,
@@ -3115,6 +3155,7 @@ async fn dispatch_remote_operation(
                 remote_expires_unix,
                 remote_payload_hash.clone(),
                 Some(device_id.as_str().to_owned()),
+                remote_principal_credential_generation,
             )
             .await
     };

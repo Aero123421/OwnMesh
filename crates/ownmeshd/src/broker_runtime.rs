@@ -5,6 +5,8 @@
 //! every caller-configurable endpoint and only accepts the exact root-owned
 //! installation written by the native Linux installer.
 
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret, CapabilityVerifyKey};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -252,7 +254,7 @@ mod tests {
 
     #[test]
     fn malformed_or_authority_substituted_record_is_refused_before_connect() {
-        let paths = LinuxBrokerInstallPaths::production();
+        let _paths = LinuxBrokerInstallPaths::production();
         let record = InstallRecord {
             installed: true,
             endpoint: LINUX_SOCKET.into(),
@@ -281,7 +283,7 @@ mod tests {
         let mut bad = record;
         bad.endpoint = "/tmp/attacker.sock".into();
         #[cfg(target_os = "linux")]
-        assert!(validate_record(&bad, &paths, 1000, 1000).is_err());
+        assert!(validate_record(&bad, &_paths, 1000, 1000).is_err());
     }
 
     #[test]

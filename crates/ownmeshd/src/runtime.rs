@@ -21,13 +21,20 @@
     clippy::unused_self
 )]
 
+#[path = "broker_runtime.rs"]
+mod broker_runtime;
 #[path = "review_manifest.rs"]
 mod review_manifest;
 #[path = "session_transition_journal.rs"]
 mod session_transition_journal;
 #[path = "structured_adapter.rs"]
 mod structured_adapter;
-use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
+use broker_runtime::load_linux_broker_client;
+use ownmesh_broker_client::{
+    compute_execute_intent_mac_v2, connect_and_execute_v2, connect_and_execute_v2_cancellable,
+    BrokerV2ClientError, ExecutablePinV2, ExecuteIntentV2, OperationFactsV2, BROKER_PROTOCOL_V2,
+    DEFAULT_CAPABILITY_TTL_SECS,
+};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
     classify_from_request_in_dir, pin_executable, resolve_executable_path, run_command_cancellable,
@@ -77,7 +84,7 @@ use serde_json::{json, Value};
 use session_transition_journal::{
     SessionTransitionJournal, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -486,8 +493,6 @@ pub struct DaemonRuntime {
     review_manifests: ReviewManifestStore,
     review_results: ReviewResultStore,
     transition_recovery_running: bool,
-    broker_endpoint: Option<BrokerEndpoint>,
-    broker_secret: Option<BrokerSecret>,
     /// Optional cancel signal for the currently executing remote command.
     /// Lives only for the duration of `dispatch_cancellable`.
     active_cancel: Option<watch::Receiver<bool>>,
@@ -501,6 +506,11 @@ pub struct DaemonRuntime {
     /// Verified Agent device identity for the active remote dispatch only.
     /// This is never populated from MCP arguments or local IPC parameters.
     active_remote_device_id: Option<String>,
+    /// Verified remote caller key. Never copied from command parameters.
+    active_remote_principal: Option<String>,
+    /// Server-derived credential generation bound into the exact remote action.
+    /// Missing is intentionally not synthesized or hashed.
+    active_remote_principal_credential_generation: Option<u64>,
     /// Owner-only immutable plans and receiver progress.  The sender itself is
     /// intentionally ephemeral; after a restart the authenticated caller must
     /// reopen it at the durable receiver cursor.
@@ -574,7 +584,6 @@ impl DaemonRuntime {
                 )
             })?;
         }
-        let (broker_endpoint, broker_secret) = load_broker_client(paths);
         let transfer_store =
             JournalStore::open(paths.state_dir.join("transfers"), JournalLimits::default())
                 .map_err(|error| format!("open transfer state: {error}"))?;
@@ -605,13 +614,13 @@ impl DaemonRuntime {
             review_manifests,
             review_results,
             transition_recovery_running: false,
-            broker_endpoint,
-            broker_secret,
             active_cancel: None,
             active_remote_operation_id: None,
             active_remote_expires_at_unix: None,
             active_remote_payload_hash: None,
             active_remote_device_id: None,
+            active_remote_principal: None,
+            active_remote_principal_credential_generation: None,
             transfer_store,
             transfer_senders: HashMap::new(),
             transfer_last_chunks: HashMap::new(),
@@ -1369,10 +1378,9 @@ impl DaemonRuntime {
             .map(|pin| pin.path.clone())
             .unwrap_or_else(|| p.program.clone());
 
-        // elevated=true is production-unsupported until a secure mint authority exists.
-        // Fail closed regardless of broker install/artifacts; never fall back to local exec.
+        // Elevated execution has no local fallback.  Only the custody-attested
+        // Linux v2 broker path below may spawn with privilege.
         if p.elevated {
-            let _ = execution_program;
             return self.try_broker_elevated(p).await;
         }
         // Spawn mode follows the client request shape (argv vs shell-string).
@@ -1425,14 +1433,226 @@ impl DaemonRuntime {
         })
     }
 
-    async fn try_broker_elevated(&self, _p: &ExecParams) -> IpcResult<Value> {
-        // Ignore broker_endpoint/broker_secret presence: production elevated exec is
-        // unsupported until secure mint authority is established. No process spawn.
-        let _ = (&self.broker_endpoint, &self.broker_secret);
-        Err(IpcError::Remote {
+    async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
+        let running_image = std::env::current_exe().map_err(|_| IpcError::Remote {
             code: app_error::INTERNAL,
-            message: "unsupported: elevated execution requires broker; broker unavailable (not configured); secure mint authority not established (fail-closed; no local exec)".into(),
+            message: "elevated execution cannot resolve the running daemon image (fail-closed)"
+                .into(),
+        })?;
+        // Re-read every custody artifact immediately before the authority-bearing
+        // write. Startup state is never sufficient: service/socket/config/key
+        // replacement and daemon image drift must take elevation offline.
+        let broker = load_linux_broker_client(&running_image).map_err(|_| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: "unsupported: elevated execution requires a custody-attested installed Linux broker; broker unavailable or custody validation failed (fail-closed; no local exec)".into(),
+        })?;
+        let execute = self.build_broker_execute_intent(p, &broker.secret)?;
+        let response = if let Some(mut cancel) = self.active_cancel.clone() {
+            connect_and_execute_v2_cancellable(
+                &broker.endpoint,
+                &broker.secret,
+                &execute,
+                &mut cancel,
+            )
+            .await
+        } else {
+            connect_and_execute_v2(&broker.endpoint, &execute).await
+        }
+        .map_err(Self::broker_client_error)?;
+        // The strict client already correlates the request id. Keep the check
+        // here as a second guard before a broker response becomes a completed
+        // outer operation receipt.
+        if response.request_id != execute.request_id {
+            return Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "broker response request-id mismatch; outcome remains uncertain".into(),
+            });
+        }
+        // A response is not committed into the outer operation journal until
+        // the installed record, secret, verify key, socket and daemon image
+        // are attested again. A post-send failure is intentionally uncertain,
+        // so the caller cannot replay a possibly completed privileged command.
+        let reattested = load_linux_broker_client(&running_image).map_err(|_| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: "broker custody changed after execution; outcome is uncertain and must not be retried".into(),
+        })?;
+        if reattested.endpoint != broker.endpoint
+            || reattested.verify_key != broker.verify_key
+            || reattested.trusted_executable != broker.trusted_executable
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "broker trust identity changed after execution; outcome is uncertain and must not be retried".into(),
+            });
+        }
+        Self::broker_response_value(response)
+    }
+
+    fn broker_response_value(
+        response: ownmesh_broker_client::BrokerResponseV2,
+    ) -> IpcResult<Value> {
+        if !response.ok {
+            return Err(IpcError::Remote {
+                code: if response.cancelled || response.timed_out {
+                    app_error::CONFLICT
+                } else {
+                    app_error::INTERNAL
+                },
+                message: format!(
+                    "privileged broker rejected execution: {}",
+                    response
+                        .error
+                        .as_deref()
+                        .unwrap_or("unknown broker failure")
+                ),
+            });
+        }
+        // Keep the normal command result contract for successful privileged
+        // execution. The broker's `ok` is an execution receipt, not a second
+        // policy decision, and a false receipt never becomes a successful
+        // outer operation result.
+        serde_json::to_value(json!({
+            "exit_code": response.exit_code,
+            "stdout": response.stdout,
+            "stderr": response.stderr,
+            "timed_out": response.timed_out,
+            "cancelled": response.cancelled,
+            "duration_ms": response.duration_ms,
+            "truncated": response.truncated,
+            "replayed": false,
+        }))
+        .map_err(|error| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: format!("serialize bounded broker response: {error}"),
         })
+    }
+
+    fn build_broker_execute_intent(
+        &self,
+        p: &ExecParams,
+        secret: &ownmesh_broker_client::BrokerSecret,
+    ) -> IpcResult<ExecuteIntentV2> {
+        let operation_id = self
+            .active_remote_operation_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| broker_binding_error("remote operation id is required"))?;
+        let payload_hash = self
+            .active_remote_payload_hash
+            .as_deref()
+            .filter(|value| is_lower_sha256(value))
+            .ok_or_else(|| broker_binding_error("server exact payload hash is required"))?;
+        let device_id = self
+            .active_remote_device_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| broker_binding_error("verified remote device id is required"))?;
+        let principal = self
+            .active_remote_principal
+            .as_deref()
+            .ok_or_else(|| broker_binding_error("verified remote principal is required"))?;
+        let (tenant_id, principal_id) = split_remote_principal(principal)
+            .ok_or_else(|| broker_binding_error("verified remote principal shape is invalid"))?;
+        let principal_credential_generation = self
+            .active_remote_principal_credential_generation
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| {
+                broker_binding_error(
+                    "server-derived principal credential generation is required for elevation",
+                )
+            })?;
+        let expires_at_unix = self
+            .active_remote_expires_at_unix
+            .filter(|expiry| *expiry > Self::now())
+            .ok_or_else(|| broker_binding_error("unexpired remote operation is required"))?;
+        let executable = p.executable_pin.as_ref().ok_or_else(|| {
+            broker_binding_error("server-pinned structured executable is required for elevation")
+        })?;
+        if executable.policy_kind != CommandKind::Structured.as_str() {
+            return Err(broker_binding_error(
+                "elevated raw-shell execution is unsupported by the secure broker",
+            ));
+        }
+        // The broker intentionally stages a held executable and currently does
+        // not accept a cwd handoff.  A nonempty overlay would reintroduce a
+        // loader/PATH confused deputy, so v2 likewise accepts only empty env.
+        if p.cwd.is_some() {
+            return Err(broker_binding_error(
+                "elevated cwd handoff is unsupported by the secure broker",
+            ));
+        }
+        if !p.env.is_empty() {
+            return Err(broker_binding_error(
+                "elevated environment overlays are unsupported by the secure broker",
+            ));
+        }
+        verify_executable_pin(Path::new(&executable.path), executable).map_err(|error| {
+            broker_binding_error(&format!(
+                "executable identity changed before privileged handoff: {error}"
+            ))
+        })?;
+        let now = Self::now();
+        let issued_at_unix = now;
+        let expires_at_unix = expires_at_unix.min(now.saturating_add(DEFAULT_CAPABILITY_TTL_SECS));
+        if expires_at_unix <= issued_at_unix {
+            return Err(broker_binding_error(
+                "remote operation expires before broker handoff",
+            ));
+        }
+        let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
+        let max_output_bytes = p.max_output_bytes.unwrap_or(128 * 1024).clamp(1, 200_000);
+        let workspace_id = p
+            .workspace_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| broker_binding_error("server-bound workspace id is required"))?;
+        let facts = OperationFactsV2 {
+            operation: operation_id.to_owned(),
+            remote_payload_sha256: payload_hash.to_owned(),
+            principal_id: principal_id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            principal_credential_generation,
+            timeout_ms,
+            max_output_bytes,
+            device_id: device_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            argv: std::iter::once(executable.path.clone())
+                .chain(p.args.iter().cloned())
+                .collect(),
+            canonical_cwd: None,
+            sanitized_env: BTreeMap::new(),
+            executable: ExecutablePinV2 {
+                canonical_path: executable.path.clone(),
+                image_sha256: executable.content_sha256.clone(),
+                image_len: executable.len,
+            },
+        };
+        let mut execute = ExecuteIntentV2 {
+            protocol_version: BROKER_PROTOCOL_V2,
+            request_id: Self::new_id("breq_"),
+            operation_id: operation_id.to_owned(),
+            nonce: Self::new_id("bnonce_"),
+            issued_at_unix,
+            expires_at_unix,
+            facts,
+            mac: String::new(),
+        };
+        execute.mac = compute_execute_intent_mac_v2(secret, &execute);
+        Ok(execute)
+    }
+
+    fn broker_client_error(error: BrokerV2ClientError) -> IpcError {
+        let code = match error {
+            // The Execute frame may have reached the broker. The durable outer
+            // in-progress marker deliberately remains, preventing a retry from
+            // spawning the same privileged action twice.
+            BrokerV2ClientError::ExecutionUncertain(_) => app_error::CONFLICT,
+            _ => app_error::INTERNAL,
+        };
+        IpcError::Remote {
+            code,
+            message: format!("privileged broker execution failed: {error}"),
+        }
     }
 
     fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
@@ -1688,7 +1908,17 @@ full_user_access/full_access for arbitrary commands",
         // Bind optional cwd to the selected workspace root as context when provided.
         if let Some(ws_id) = p.workspace_id.clone() {
             let ws = self.workspace_for(Some(ws_id.as_str()))?;
-            if let Some(cwd) = p.cwd.as_deref() {
+            if p.elevated {
+                // v2 binds the workspace as exact authorization/audit context,
+                // but the current broker safely stages only executables and
+                // deliberately rejects a cwd handoff. Do not silently turn a
+                // selected workspace into a different privileged cwd.
+                if p.cwd.is_some() {
+                    return Err(broker_binding_error(
+                        "elevated cwd handoff is unsupported by the secure broker",
+                    ));
+                }
+            } else if let Some(cwd) = p.cwd.as_deref() {
                 let resolved = ws.resolve(Path::new(cwd)).map_err(fs_err)?;
                 p.cwd = Some(resolved.to_string_lossy().into_owned());
             } else {
@@ -4179,6 +4409,36 @@ full_user_access/full_access for arbitrary commands",
         remote_payload_hash: Option<String>,
         remote_device_id: Option<String>,
     ) -> IpcResult<Value> {
+        self.dispatch_cancellable_bound_with_generation(
+            method,
+            params,
+            client,
+            cancel,
+            remote_operation_id,
+            remote_expires_at_unix,
+            remote_payload_hash,
+            remote_device_id,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`Self::dispatch_cancellable_bound`] but carries a positive,
+    /// control-plane-issued principal credential generation. This separate API
+    /// preserves the stable runtime test/local-IPC call shape while making the
+    /// additional authority fact explicit at the authenticated Agent boundary.
+    pub async fn dispatch_cancellable_bound_with_generation(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        client: &ClientIdentity,
+        cancel: Option<watch::Receiver<bool>>,
+        remote_operation_id: Option<String>,
+        remote_expires_at_unix: Option<i64>,
+        remote_payload_hash: Option<String>,
+        remote_device_id: Option<String>,
+        remote_principal_credential_generation: Option<u64>,
+    ) -> IpcResult<Value> {
         self.active_cancel = cancel;
         self.active_remote_operation_id = remote_operation_id
             .map(|s| s.trim().to_owned())
@@ -4190,12 +4450,18 @@ full_user_access/full_access for arbitrary commands",
         self.active_remote_device_id = remote_device_id
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty());
+        self.active_remote_principal = Some(canonicalize_principal_key(client.principal_key()))
+            .filter(|value| !value.is_empty());
+        self.active_remote_principal_credential_generation =
+            remote_principal_credential_generation.filter(|generation| *generation > 0);
         let outcome = self.dispatch(method, params, client).await;
         self.active_cancel = None;
         self.active_remote_operation_id = None;
         self.active_remote_expires_at_unix = None;
         self.active_remote_payload_hash = None;
         self.active_remote_device_id = None;
+        self.active_remote_principal = None;
+        self.active_remote_principal_credential_generation = None;
         outcome
     }
 
@@ -7898,13 +8164,41 @@ fn principal_journal_key(principal: &str, idempotency_key: &str) -> String {
     )
 }
 
-/// Production elevated broker loading is disabled until a secure mint authority
-/// exists. Ignore all install records and artifacts, including hand-written
-/// `installed=true` / `support=supported` records, and return no broker config.
-pub(crate) fn load_broker_client(
-    _paths: &OwnMeshPaths,
-) -> (Option<BrokerEndpoint>, Option<BrokerSecret>) {
-    (None, None)
+fn broker_binding_error(message: &str) -> IpcError {
+    IpcError::Remote {
+        code: app_error::UNAUTHORIZED,
+        message: format!(
+            "privileged broker binding unavailable: {message} (fail-closed; no local exec)"
+        ),
+    }
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+}
+
+fn split_remote_principal(value: &str) -> Option<(&str, &str)> {
+    let mut fields = value.split(':');
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some("client"), Some("remote"), Some(tenant), Some(principal), None)
+            if !tenant.is_empty()
+                && !principal.is_empty()
+                && tenant.len() <= 128
+                && principal.len() <= 128 =>
+        {
+            Some((tenant, principal))
+        }
+        _ => None,
+    }
 }
 
 fn is_op_journal_in_progress(value: &Value) -> bool {
@@ -8867,4 +9161,172 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     // Use shared atomic_write (Windows: MoveFileExW replace, no delete window).
     ownmesh_config::atomic_write(path, raw.as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+}
+
+#[cfg(test)]
+mod broker_intent_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn bound_runtime() -> (tempfile::TempDir, DaemonRuntime, ExecParams) {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.active_remote_operation_id = Some("op_elevated_exact_1".into());
+        runtime.active_remote_payload_hash = Some("a".repeat(64));
+        runtime.active_remote_device_id = Some("device_elevated_1".into());
+        runtime.active_remote_principal = Some("client:remote:tenant_e8:principal_e8".into());
+        runtime.active_remote_principal_credential_generation = Some(7);
+        runtime.active_remote_expires_at_unix = Some(DaemonRuntime::now() + 300);
+        let executable = std::env::current_exe().unwrap();
+        let pin = pin_executable(&executable, CommandKind::Structured).unwrap();
+        (
+            temp,
+            runtime,
+            ExecParams {
+                kind: Some("structured".into()),
+                policy_kind: Some("structured".into()),
+                program: pin.path.clone(),
+                args: vec!["--version".into()],
+                cwd: None,
+                workspace_id: Some("ws_default".into()),
+                env: HashMap::new(),
+                timeout_ms: Some(2_000),
+                idempotency_key: Some("idempotent_elevated_1".into()),
+                max_output_bytes: Some(4_096),
+                elevated: true,
+                executable_pin: Some(pin),
+            },
+        )
+    }
+
+    #[test]
+    fn elevated_intent_is_exactly_bound_to_remote_authority_and_pinned_argv() {
+        let (_temp, runtime, params) = bound_runtime();
+        let intent = runtime
+            .build_broker_execute_intent(&params, &ownmesh_broker_client::BrokerSecret::generate())
+            .unwrap();
+        assert_eq!(intent.operation_id, "op_elevated_exact_1");
+        assert_eq!(intent.facts.remote_payload_sha256, "a".repeat(64));
+        assert_eq!(intent.facts.tenant_id, "tenant_e8");
+        assert_eq!(intent.facts.principal_id, "principal_e8");
+        assert_eq!(intent.facts.principal_credential_generation, 7);
+        assert_eq!(intent.facts.argv[0], intent.facts.executable.canonical_path);
+        assert_eq!(intent.facts.argv[1], "--version");
+        assert!(intent.facts.sanitized_env.is_empty());
+        assert!(!intent.mac.is_empty());
+    }
+
+    #[test]
+    fn elevated_intent_refuses_missing_generation_and_unsafe_handoff_facts() {
+        let (_temp, mut runtime, mut params) = bound_runtime();
+        runtime.active_remote_principal_credential_generation = None;
+        let err = runtime
+            .build_broker_execute_intent(&params, &ownmesh_broker_client::BrokerSecret::generate())
+            .unwrap_err();
+        assert!(err.to_string().contains("credential generation"));
+
+        runtime.active_remote_principal_credential_generation = Some(7);
+        params.cwd = Some("/untrusted-cwd".into());
+        let err = runtime
+            .build_broker_execute_intent(&params, &ownmesh_broker_client::BrokerSecret::generate())
+            .unwrap_err();
+        assert!(err.to_string().contains("cwd handoff"));
+
+        params.cwd = None;
+        params.env.insert("PATH".into(), "/attacker".into());
+        let err = runtime
+            .build_broker_execute_intent(&params, &ownmesh_broker_client::BrokerSecret::generate())
+            .unwrap_err();
+        assert!(err.to_string().contains("environment overlays"));
+
+        params.env.clear();
+        params.workspace_id = None;
+        let err = runtime
+            .build_broker_execute_intent(&params, &ownmesh_broker_client::BrokerSecret::generate())
+            .unwrap_err();
+        assert!(err.to_string().contains("workspace id"));
+    }
+
+    #[tokio::test]
+    async fn local_elevation_stays_in_the_same_runtime_and_uncertain_marker_blocks_replay() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let program = std::env::current_exe().unwrap().display().to_string();
+        let client = ClientIdentity::new("local-elevation-test", "test");
+        let params = json!({
+            "program": program,
+            "args": [],
+            "kind": "structured",
+            "workspace_id": "ws_default",
+            "elevated": true,
+            "idempotency_key": "local-elevated-never-fallback"
+        });
+        let first = runtime
+            .dispatch(methods::OPS_EXEC, Some(params.clone()), &client)
+            .await
+            .expect_err("local elevation must not fall back to local spawning");
+        assert!(first.to_string().contains("broker") || first.to_string().contains("binding"));
+        let second = runtime
+            .dispatch(methods::OPS_EXEC, Some(params), &client)
+            .await
+            .expect_err("uncertain elevated operation must not rerun");
+        assert!(
+            second.to_string().contains("in-progress") || second.to_string().contains("uncertain")
+        );
+    }
+
+    #[test]
+    fn uncertain_broker_write_is_non_retriable_conflict() {
+        let error = DaemonRuntime::broker_client_error(BrokerV2ClientError::ExecutionUncertain(
+            "lost response".into(),
+        ));
+        assert!(matches!(
+            error,
+            IpcError::Remote {
+                code: app_error::CONFLICT,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn broker_failure_never_becomes_a_successful_exec_result() {
+        let denied =
+            DaemonRuntime::broker_response_value(ownmesh_broker_client::BrokerResponseV2 {
+                request_id: "breq_failed".into(),
+                ok: false,
+                exit_code: Some(1),
+                stdout: "must-not-be-a-result".into(),
+                stderr: "failed".into(),
+                error: Some("broker failed".into()),
+                timed_out: false,
+                cancelled: false,
+                truncated: false,
+                duration_ms: 1,
+            })
+            .unwrap_err();
+        assert!(denied.to_string().contains("broker rejected"));
+
+        let result =
+            DaemonRuntime::broker_response_value(ownmesh_broker_client::BrokerResponseV2 {
+                request_id: "breq_ok".into(),
+                ok: true,
+                exit_code: Some(0),
+                stdout: "ok".into(),
+                stderr: String::new(),
+                error: None,
+                timed_out: false,
+                cancelled: false,
+                truncated: true,
+                duration_ms: 2,
+            })
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["stdout"], "ok");
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["replayed"], false);
+    }
 }
