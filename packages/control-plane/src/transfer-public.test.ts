@@ -274,6 +274,7 @@ test("completed transfer artifact get is destination-bound and page-bounded", as
   assert.equal(f.routed.length, 1); assert.equal(f.routed[0].deviceId, "dev_destination");
   const payload = f.routed[0].operation.payload as Record<string, unknown>;
   assert.equal(payload.capability, "transfer.artifact_get");
+  assert.equal(Object.hasOwn(payload.arguments as Record<string, unknown>, "idempotency_key"), false);
   assert.deepEqual(payload.arguments && { plan_id: (payload.arguments as Record<string, unknown>).plan_id, offset: (payload.arguments as Record<string, unknown>).offset, max_bytes: (payload.arguments as Record<string, unknown>).max_bytes }, { plan_id: "plan_destination", offset: 65536, max_bytes: 65536 });
   const tooLarge = await invoke(f, "ownmesh_transfer_get", { transfer_id: transferId, max_bytes: 65537 });
   assert.equal(tooLarge.error?.message, "invalid artifact page arguments");

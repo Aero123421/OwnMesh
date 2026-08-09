@@ -3300,7 +3300,10 @@ export async function handleMcp(
           principalId: rec.principal, tenantId: rec.tenant_id, expiresAt: meta.expires_at, claimVersion: 1,
           principalCredentialGeneration,
           oauthClientId: rec.client_id, workspaceBinding: { workspace_id: meta.destination_workspace_id, version: meta.destination_workspace_version },
-          args: { plan_id: meta.destination_plan_id, workspace_id: meta.destination_workspace_id, offset, max_bytes: maxBytes, idempotency_key: artifactId },
+          // Transport idempotency is bound by the outer operation envelope.
+          // The Agent runtime contract is intentionally the exact artifact
+          // request and rejects coordinator-only duplicate fields.
+          args: { plan_id: meta.destination_plan_id, workspace_id: meta.destination_workspace_id, offset, max_bytes: maxBytes },
         });
         await store.putMcpOperation({ operation_id: artifactId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_artifact_get", status: "pending", summary: "transfer artifact page requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, offset, max_bytes: maxBytes, expected_sha256: meta.source_sha256, expected_total_bytes: meta.source_size_bytes }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: artifactId, payload_hash: deviceOp.payload_hash, idempotency_key: artifactId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
