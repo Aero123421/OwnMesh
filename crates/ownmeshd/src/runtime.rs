@@ -1831,17 +1831,32 @@ full_user_access/full_access for arbitrary commands",
     fn verify_local_transfer_identity(
         plan: &TransferPlan,
         authority: &TransferAuthority,
+        role: Option<&str>,
     ) -> IpcResult<()> {
         let binding = plan.binding();
         if binding.tenant_id != authority.tenant_id
             || binding.source_principal_id != authority.principal_id
             || binding.destination_principal_id != authority.principal_id
-            || binding.source_device_id != authority.device_id
-            || binding.destination_device_id != authority.device_id
         {
             return Err(IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
                 message: "transfer plan is not bound to this authenticated local device/principal"
+                    .into(),
+            });
+        }
+        let local = match role {
+            Some("source") => binding.source_device_id == authority.device_id,
+            Some("destination") => binding.destination_device_id == authority.device_id,
+            None => {
+                binding.source_device_id == authority.device_id
+                    || binding.destination_device_id == authority.device_id
+            }
+            _ => false,
+        };
+        if !local {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer plan is not bound to this authenticated local device role"
                     .into(),
             });
         }
@@ -2288,7 +2303,6 @@ full_user_access/full_access for arbitrary commands",
             || p.workspace_id != *local_workspace
             || p.epoch == 0
             || p.fence == 0
-            || p.size_bytes == 0
             || p.workspace_version == 0
             || p.source_workspace_version == 0
             || p.destination_workspace_version == 0
@@ -2304,10 +2318,42 @@ full_user_access/full_access for arbitrary commands",
                 message: "invalid ticket-bound transfer start".into(),
             });
         }
+        let binding = TransferBinding {
+            tenant_id: authority.tenant_id.clone(),
+            source_principal_id: authority.principal_id.clone(),
+            destination_principal_id: authority.principal_id.clone(),
+            source_device_id: p.source_device_id,
+            destination_device_id: p.destination_device_id,
+            source_workspace_id: p.source_workspace_id,
+            destination_workspace_id: p.destination_workspace_id,
+            source_relative_path: p.source_path,
+            destination_relative_path: p.destination_path,
+        };
+        let plan = TransferPlan::from_verified(
+            binding,
+            TransferGrant {
+                grant_id: p.grant_id,
+                operation_id: p.grant_operation_id,
+                payload_sha256: p.grant_payload_sha256,
+                expires_at_unix: p.grant_expires_at_unix,
+            },
+            p.size_bytes,
+            p.content_sha256,
+        )
+        .map_err(Self::transfer_error)?;
+        if plan.plan_sha256() != p.plan_sha256 {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "transfer start plan hash mismatch".into(),
+            });
+        }
+        self.transfer_store
+            .save_plan(&plan)
+            .map_err(Self::transfer_error)?;
         // `ticket` is passed straight to connect_transfer_socket by the Agent
         // transport.  This receipt intentionally omits the bearer and paths.
         Ok(
-            json!({ "transfer_id": p.transfer_id, "role": p.role, "plan_sha256": p.plan_sha256, "epoch": p.epoch, "fence": p.fence, "admitted": true }),
+            json!({ "transfer_id": p.transfer_id, "plan_id": plan.id(), "role": p.role, "plan_sha256": p.plan_sha256, "epoch": p.epoch, "fence": p.fence, "admitted": true }),
         )
     }
 
@@ -2315,6 +2361,7 @@ full_user_access/full_access for arbitrary commands",
         &self,
         plan_id: &str,
         authority: &TransferAuthority,
+        role: Option<&str>,
     ) -> IpcResult<TransferPlan> {
         let plan = self
             .transfer_store
@@ -2324,7 +2371,7 @@ full_user_access/full_access for arbitrary commands",
                 code: app_error::INVALID_PARAMS,
                 message: "transfer plan was not found".into(),
             })?;
-        Self::verify_local_transfer_identity(&plan, authority)?;
+        Self::verify_local_transfer_identity(&plan, authority, role)?;
         Ok(plan)
     }
 
@@ -2346,7 +2393,7 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, Some("source"))?;
         if p.workspace_id.as_deref().unwrap_or("ws_default") != plan.binding().source_workspace_id {
             return Err(IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
@@ -2379,7 +2426,7 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, Some("source"))?;
         if let Some((sequence, frame)) = self.transfer_last_chunks.get(plan.id()) {
             if *sequence == p.sequence {
                 return Ok(
@@ -2394,13 +2441,9 @@ full_user_access/full_access for arbitrary commands",
                 code: app_error::CONFLICT,
                 message: "source is not open; reopen at the durable receiver cursor".into(),
             })?;
-        let chunk = sender
-            .next_chunk()
-            .map_err(Self::transfer_error)?
-            .ok_or_else(|| IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: "source reached end of plan".into(),
-            })?;
+        let Some(chunk) = sender.next_chunk().map_err(Self::transfer_error)? else {
+            return Ok(json!({ "plan_id": plan.id(), "sequence": p.sequence, "eof": true }));
+        };
         if chunk.sequence != p.sequence {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -2430,7 +2473,7 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, Some("destination"))?;
         if p.workspace_id != plan.binding().destination_workspace_id {
             return Err(IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
@@ -2441,6 +2484,20 @@ full_user_access/full_access for arbitrary commands",
         let destination = workspace
             .resolve(Path::new(&plan.binding().destination_relative_path))
             .map_err(fs_err)?;
+        if let Some(journal) = self
+            .transfer_store
+            .load(&plan)
+            .map_err(Self::transfer_error)?
+        {
+            if journal.published() {
+                self.transfer_store
+                    .verify_published_destination(&plan, &destination)
+                    .map_err(Self::transfer_error)?;
+                return Ok(
+                    json!({ "plan_id": plan.id(), "state": journal.state(), "next_sequence": journal.contiguous_ack().map(|v| v + 1).unwrap_or(0), "next_offset": journal.bytes_received(), "epoch": p.epoch, "fence": p.fence, "completed": true, "published": true }),
+                );
+            }
+        }
         if destination.exists() {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -2464,13 +2521,28 @@ full_user_access/full_access for arbitrary commands",
                 authority.expires_at_unix,
             )
             .map_err(Self::transfer_error)?;
-        let _sink = PartFileSink::create(
+        let mut sink = PartFileSink::create(
             &self.transfer_store,
             &plan,
             p.epoch,
             journal.bytes_received(),
         )
         .map_err(Self::transfer_error)?;
+        if plan.size_bytes() == 0 {
+            let mut receiver =
+                TransferReceiver::resume_from_part(plan.clone(), journal, sink.path())
+                    .map_err(Self::transfer_error)?;
+            receiver
+                .complete_empty(&mut sink)
+                .map_err(Self::transfer_error)?;
+            let updated = receiver.journal_snapshot();
+            self.transfer_store
+                .save(&lease, &updated)
+                .map_err(Self::transfer_error)?;
+            return Ok(
+                json!({ "plan_id": plan.id(), "state": updated.state(), "next_sequence": 0, "next_offset": 0, "epoch": updated.epoch(), "fence": updated.fence(), "completed": true }),
+            );
+        }
         Ok(
             json!({ "plan_id": plan.id(), "state": journal.state(), "next_sequence": journal.contiguous_ack().map(|v| v + 1).unwrap_or(0), "next_offset": journal.bytes_received(), "epoch": journal.epoch(), "fence": journal.fence() }),
         )
@@ -2498,7 +2570,7 @@ full_user_access/full_access for arbitrary commands",
             });
         }
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, Some("destination"))?;
         if p.workspace_id != plan.binding().destination_workspace_id {
             return Err(IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
@@ -2555,7 +2627,7 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, Some("destination"))?;
         if p.workspace_id != plan.binding().destination_workspace_id {
             return Err(IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
@@ -2564,23 +2636,62 @@ full_user_access/full_access for arbitrary commands",
         }
         let journal = self
             .transfer_store
-            .load_for_fence(&plan, p.epoch, p.fence)
-            .map_err(Self::transfer_error)?;
-        if journal.state() != JournalState::Completed {
+            .load(&plan)
+            .map_err(Self::transfer_error)?
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "transfer is incomplete".into(),
+            })?;
+        let destination = self
+            .workspace_for(Some(&p.workspace_id))?
+            .resolve(Path::new(&plan.binding().destination_relative_path))
+            .map_err(fs_err)?;
+        if journal.published() {
+            self.transfer_store
+                .verify_published_destination(&plan, &destination)
+                .map_err(Self::transfer_error)?;
+            return Ok(
+                json!({ "plan_id": plan.id(), "published": true, "replayed": true, "sha256": plan.sha256(), "size_bytes": plan.size_bytes() }),
+            );
+        }
+        if journal.epoch() != p.epoch
+            || journal.fence() != p.fence
+            || journal.state() != JournalState::Completed
+        {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "transfer is incomplete".into(),
             });
         }
-        let destination = self
-            .workspace_for(Some(&p.workspace_id))?
-            .resolve(Path::new(&plan.binding().destination_relative_path))
-            .map_err(fs_err)?;
-        self.transfer_store
+        let lease = self
+            .transfer_store
+            .acquire(&plan, Self::now() as u64, authority.expires_at_unix)
+            .map_err(Self::transfer_error)?;
+        match self
+            .transfer_store
             .publish_completed_no_replace(&plan, &destination)
+        {
+            Ok(()) | Err(ownmesh_transfer::TransferError::DestinationExists) => self
+                .transfer_store
+                .verify_published_destination(&plan, &destination)
+                .map_err(Self::transfer_error)?,
+            Err(error) => return Err(Self::transfer_error(error)),
+        }
+        // The destination file is now verified as the exact immutable plan
+        // artifact. Persist this receipt before returning so a crash after the
+        // no-replace publish is replay-safe rather than a false conflict.
+        let mut receipt = self
+            .transfer_store
+            .load_for_fence(&plan, p.epoch, p.fence)
+            .map_err(Self::transfer_error)?;
+        receipt
+            .mark_published(&plan)
+            .map_err(Self::transfer_error)?;
+        self.transfer_store
+            .save(&lease, &receipt)
             .map_err(Self::transfer_error)?;
         Ok(
-            json!({ "plan_id": plan.id(), "published": true, "sha256": plan.sha256(), "size_bytes": plan.size_bytes() }),
+            json!({ "plan_id": plan.id(), "published": true, "replayed": false, "sha256": plan.sha256(), "size_bytes": plan.size_bytes() }),
         )
     }
 
@@ -2596,7 +2707,7 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, None)?;
         let journal = self
             .transfer_store
             .load(&plan)
@@ -2618,7 +2729,7 @@ full_user_access/full_access for arbitrary commands",
             .map_err(Self::transfer_error)?;
         let mut entries = Vec::new();
         for plan in plans {
-            if Self::verify_local_transfer_identity(&plan, &authority).is_ok() {
+            if Self::verify_local_transfer_identity(&plan, &authority, None).is_ok() {
                 let journal = self
                     .transfer_store
                     .load(&plan)
@@ -2643,11 +2754,23 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
-        let journal = self
-            .transfer_store
-            .load_for_fence(&plan, p.epoch, p.fence)
-            .map_err(Self::transfer_error)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, None)?;
+        let journal = match self.transfer_store.load_for_fence(&plan, p.epoch, p.fence) {
+            Ok(journal) => journal,
+            // A source Agent has no receiver journal or part file to cancel.
+            // It still owns an in-memory sender cache which must be dropped on
+            // an authenticated transfer cancellation; do not manufacture a
+            // destination journal on the source device.
+            Err(ownmesh_transfer::TransferError::Terminal)
+                if plan.binding().source_device_id == authority.device_id
+                    && plan.binding().destination_device_id != authority.device_id =>
+            {
+                self.transfer_senders.remove(plan.id());
+                self.transfer_last_chunks.remove(plan.id());
+                return Ok(json!({ "plan_id": plan.id(), "cancelled": true, "source_only": true }));
+            }
+            Err(error) => return Err(Self::transfer_error(error)),
+        };
         if journal.state() == JournalState::Cancelled {
             return Ok(
                 json!({ "plan_id": plan.id(), "cancelled": true, "state": journal.state(), "replayed": true }),
@@ -2655,7 +2778,7 @@ full_user_access/full_access for arbitrary commands",
         }
         if matches!(
             journal.state(),
-            JournalState::Completed | JournalState::Failed
+            JournalState::Completed | JournalState::Published | JournalState::Failed
         ) {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -2703,7 +2826,7 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
-        let plan = self.transfer_plan_for(&p.plan_id, &authority)?;
+        let plan = self.transfer_plan_for(&p.plan_id, &authority, Some("destination"))?;
         if p.workspace_id != plan.binding().destination_workspace_id {
             return Err(IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
@@ -2718,7 +2841,10 @@ full_user_access/full_access for arbitrary commands",
                 code: app_error::CONFLICT,
                 message: "artifact is not prepared".into(),
             })?;
-        if journal.state() != JournalState::Completed {
+        if !matches!(
+            journal.state(),
+            JournalState::Completed | JournalState::Published
+        ) {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "artifact is incomplete".into(),
@@ -2728,6 +2854,11 @@ full_user_access/full_access for arbitrary commands",
         let artifact_path = ws
             .resolve(Path::new(&plan.binding().destination_relative_path))
             .map_err(fs_err)?;
+        if journal.published() {
+            self.transfer_store
+                .verify_published_destination(&plan, &artifact_path)
+                .map_err(Self::transfer_error)?;
+        }
         // The completed artifact is deliberately a no-replace hardlink to the
         // private verified part.  `ownmesh-fs` correctly rejects that
         // cross-boundary hardlink for ordinary path-selected reads; this is the
@@ -8044,6 +8175,120 @@ mod transfer_runtime_tests {
     }
 
     #[tokio::test]
+    async fn cross_device_start_binds_each_runtime_to_its_own_transfer_role() {
+        let source_temp = tempdir().unwrap();
+        let source_paths = OwnMeshPaths::for_base(source_temp.path());
+        let mut source = DaemonRuntime::open(&source_paths).unwrap();
+        let content = b"cross-device source custody";
+        std::fs::write(
+            source_paths.state_dir.join("workspace").join("source.bin"),
+            content,
+        )
+        .unwrap();
+        bind_remote_transfer(&mut source);
+        source.active_remote_device_id = Some("dev_source".into());
+
+        let destination_temp = tempdir().unwrap();
+        let destination_paths = OwnMeshPaths::for_base(destination_temp.path());
+        let mut destination = DaemonRuntime::open(&destination_paths).unwrap();
+        let destination_root = destination_temp.path().join("destination");
+        destination
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_destination".into(),
+                root: destination_root,
+                label: None,
+            })
+            .unwrap();
+        bind_remote_transfer(&mut destination);
+        destination.active_remote_device_id = Some("dev_destination".into());
+
+        let expires_at = u64::try_from(source.active_remote_expires_at_unix.unwrap()).unwrap();
+        assert_eq!(
+            destination.active_remote_expires_at_unix,
+            Some(expires_at as i64)
+        );
+        let binding = TransferBinding {
+            tenant_id: "tenant_a".into(),
+            source_principal_id: "principal_a".into(),
+            destination_principal_id: "principal_a".into(),
+            source_device_id: "dev_source".into(),
+            destination_device_id: "dev_destination".into(),
+            source_workspace_id: "ws_default".into(),
+            destination_workspace_id: "ws_destination".into(),
+            source_relative_path: "source.bin".into(),
+            destination_relative_path: "received.bin".into(),
+        };
+        let transfer_id = "xfer_cross_device";
+        let plan = TransferPlan::from_verified(
+            binding,
+            TransferGrant {
+                grant_id: transfer_id.into(),
+                operation_id: transfer_id.into(),
+                payload_sha256: "a".repeat(64),
+                expires_at_unix: expires_at,
+            },
+            content.len() as u64,
+            sha256_hex(content),
+        )
+        .unwrap();
+        let start = |workspace_id: &str| {
+            json!({
+                "transfer_id": transfer_id,
+                "role": if workspace_id == "ws_default" { "source" } else { "destination" },
+                "ticket": "opaque.ticket",
+                "plan_sha256": plan.plan_sha256(),
+                "content_sha256": plan.sha256(),
+                "size_bytes": plan.size_bytes(),
+                "source_path": "source.bin",
+                "destination_path": "received.bin",
+                "source_device_id": "dev_source",
+                "destination_device_id": "dev_destination",
+                "source_workspace_id": "ws_default",
+                "destination_workspace_id": "ws_destination",
+                "source_workspace_version": 1,
+                "destination_workspace_version": 1,
+                "workspace_id": workspace_id,
+                "workspace_version": 1,
+                "epoch": 1,
+                "fence": 1,
+                "grant_id": transfer_id,
+                "grant_operation_id": transfer_id,
+                "grant_payload_sha256": "a".repeat(64),
+                "grant_expires_at_unix": expires_at
+            })
+        };
+        let client = remote_client();
+        let source_started = source
+            .handle_transfer_start(Some(start("ws_default")), &client)
+            .await
+            .unwrap();
+        let destination_started = destination
+            .handle_transfer_start(Some(start("ws_destination")), &client)
+            .await
+            .unwrap();
+        assert_eq!(source_started["plan_id"], destination_started["plan_id"]);
+        let plan_id = source_started["plan_id"].as_str().unwrap();
+        source
+            .handle_transfer_source_open(
+                Some(
+                    json!({"plan_id":plan_id,"sequence":0,"offset":0,"workspace_id":"ws_default"}),
+                ),
+                &client,
+            )
+            .await
+            .unwrap();
+        destination
+            .handle_transfer_destination_prepare(
+                Some(
+                    json!({"plan_id":plan_id,"epoch":1,"fence":1,"workspace_id":"ws_destination"}),
+                ),
+                &client,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn transfer_streams_binary_resumes_after_restart_and_pages_artifact() {
         let temp = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(temp.path());
@@ -8148,13 +8393,31 @@ mod transfer_runtime_tests {
                 .await
                 .unwrap();
         }
+        // Simulate a process crash exactly after the no-replace publish and
+        // before the runtime can durably record/send its terminal reply.
+        let stored_plan = runtime
+            .transfer_store
+            .load_plan(&plan_id, DaemonRuntime::now() as u64)
+            .unwrap()
+            .unwrap();
         runtime
+            .transfer_store
+            .publish_completed_no_replace(
+                &stored_plan,
+                &temp.path().join("destination").join("received.bin"),
+            )
+            .unwrap();
+        drop(runtime);
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        bind_remote_transfer(&mut runtime);
+        let recovered = runtime
             .handle_transfer_finalize(
                 Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination" })),
                 &client,
             )
             .await
             .unwrap();
+        assert_eq!(recovered["replayed"], json!(false));
         let mut reconstructed = Vec::new();
         let mut offset = 0_u64;
         loop {
@@ -8173,6 +8436,30 @@ mod transfer_runtime_tests {
             offset = page["next_offset"].as_u64().unwrap();
         }
         assert_eq!(reconstructed, bytes);
+        // A lost terminal reply is idempotent: the durable publication receipt
+        // verifies the pinned artifact instead of treating its own no-replace
+        // destination as a foreign conflict. A later substitution is never
+        // accepted as that receipt.
+        let replay = runtime
+            .handle_transfer_finalize(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay["replayed"], json!(true));
+        std::fs::write(
+            temp.path().join("destination").join("received.bin"),
+            b"substituted",
+        )
+        .unwrap();
+        assert!(runtime
+            .handle_transfer_finalize(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .is_err());
     }
 }
 

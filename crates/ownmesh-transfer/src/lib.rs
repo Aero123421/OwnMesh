@@ -635,11 +635,17 @@ pub enum JournalState {
     Cancelled,
     Failed,
     Completed,
+    /// The destination was published no-replace and its exact immutable plan
+    /// digest was durably receipted. This makes a reply-loss retry idempotent.
+    Published,
 }
 
 impl JournalState {
     fn terminal(self) -> bool {
-        matches!(self, Self::Cancelled | Self::Failed | Self::Completed)
+        matches!(
+            self,
+            Self::Cancelled | Self::Failed | Self::Completed | Self::Published
+        )
     }
 }
 
@@ -658,6 +664,10 @@ pub struct TransferJournal {
     contiguous_ack: Option<u64>,
     bytes_received: u64,
     expires_at_unix: u64,
+    #[serde(default)]
+    published_size: Option<u64>,
+    #[serde(default)]
+    published_sha256: Option<String>,
 }
 
 impl TransferJournal {
@@ -683,6 +693,8 @@ impl TransferJournal {
             contiguous_ack: None,
             bytes_received: 0,
             expires_at_unix,
+            published_size: None,
+            published_sha256: None,
         })
     }
     fn validate_for(&self, plan: &TransferPlan) -> TransferResult<()> {
@@ -693,6 +705,16 @@ impl TransferJournal {
             || self.fence == 0
         {
             return Err(TransferError::CorruptJournal);
+        }
+        match self.state {
+            JournalState::Published
+                if self.published_size == Some(plan.size_bytes)
+                    && self.published_sha256.as_deref() == Some(plan.sha256.as_str()) => {}
+            JournalState::Published => return Err(TransferError::CorruptJournal),
+            _ if self.published_size.is_some() || self.published_sha256.is_some() => {
+                return Err(TransferError::CorruptJournal)
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -715,6 +737,23 @@ impl TransferJournal {
     #[must_use]
     pub const fn fence(&self) -> u64 {
         self.fence
+    }
+
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        matches!(self.state, JournalState::Published)
+    }
+
+    /// Convert a completed receiver journal into the durable publication
+    /// receipt. The caller must first verify the pinned destination artifact.
+    pub fn mark_published(&mut self, plan: &TransferPlan) -> TransferResult<()> {
+        if self.state != JournalState::Completed || self.bytes_received != plan.size_bytes {
+            return Err(TransferError::Terminal);
+        }
+        self.state = JournalState::Published;
+        self.published_size = Some(plan.size_bytes);
+        self.published_sha256 = Some(plan.sha256.clone());
+        self.validate_for(plan)
     }
 }
 
@@ -891,6 +930,32 @@ impl TransferReceiver {
             }
             self.journal.state = JournalState::Completed;
         }
+        Ok(())
+    }
+
+    /// Complete a verified empty artifact without manufacturing a zero-length
+    /// chunk. The private sink is finalized before the completed journal can
+    /// be persisted by the caller.
+    pub fn complete_empty(&mut self, sink: &mut impl ChunkSink) -> TransferResult<()> {
+        self.plan.validate_at(now_unix())?;
+        if self.plan.size_bytes != 0
+            || self.journal.state.terminal()
+            || self.journal.bytes_received != 0
+        {
+            return Err(TransferError::InvalidPlan(
+                "empty completion binding".into(),
+            ));
+        }
+        if hex::encode(self.hasher.clone().finalize()) != self.plan.sha256 {
+            self.journal.state = JournalState::Failed;
+            return Err(TransferError::HashMismatch);
+        }
+        if let Err(error) = sink.finalize() {
+            let _ = sink.cancel();
+            self.journal.state = JournalState::Failed;
+            return Err(TransferError::Sink(error));
+        }
+        self.journal.state = JournalState::Completed;
         Ok(())
     }
 
@@ -1188,6 +1253,36 @@ impl JournalStore {
                 TransferError::CustodyUnavailable
             }
         })
+    }
+
+    /// Verify that the immutable destination path currently contains exactly
+    /// the artifact authorized by `plan`. This deliberately follows neither
+    /// symlinks nor a caller-supplied path: the runtime supplies the already
+    /// pinned workspace resolution from the immutable plan binding.
+    pub fn verify_published_destination(
+        &self,
+        plan: &TransferPlan,
+        destination: &Path,
+    ) -> TransferResult<()> {
+        plan.validate_at(now_unix())?;
+        let metadata = fs::symlink_metadata(destination).map_err(io_error)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != plan.size_bytes
+        {
+            return Err(TransferError::DestinationExists);
+        }
+        // Destination is a caller-pinned workspace artifact, not an
+        // owner-only state file; its parent intentionally does not satisfy
+        // the state-directory ownership predicate used for journals/parts.
+        // Reject a link before opening, then verify the opened handle's size
+        // and immutable digest below.
+        let mut file = File::open(destination).map_err(io_error)?;
+        let (size, digest) = hash_reader(&mut file, plan.size_bytes)?;
+        if size != plan.size_bytes || digest != plan.sha256 {
+            return Err(TransferError::DestinationExists);
+        }
+        Ok(())
     }
 
     /// Startup/TTL cleanup. It first validates every journal within the bounded

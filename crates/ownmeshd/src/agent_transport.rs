@@ -18,6 +18,7 @@ use ownmesh_protocol::{
     Envelope, OperationEnvelope, OperationPayload, OperationRequestPayload, OPERATION_CONTRACT_V1,
     PROTOCOL_DEVICE_V1,
 };
+use ownmesh_transfer::TransferChunk;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -67,6 +68,7 @@ type AgentSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Fully bound transport inputs. Secret-bearing fields intentionally have no
 /// `Debug` implementation.
+#[derive(Clone)]
 pub struct AgentTransportConfig {
     issuer: String,
     ws_url: Url,
@@ -88,6 +90,468 @@ struct PreflightEphemeral {
     session_nonce: String,
     expires_at_ms: u64,
     key: TransferEphemeral,
+}
+
+/// Parse only the signed-ticket body.  HMAC validation happens at the Worker
+/// upgrade boundary; the Agent independently validates role/device/expiry and
+/// both Ed25519 ephemeral proofs before deriving a cipher.  The wire bearer is
+/// never retained in transport state or an operation result.
+fn parse_transfer_ticket_wire(raw: &str) -> Result<AgentTransferTicket, String> {
+    let (body, signature) = match raw.split_once('.') {
+        Some((body, rest)) => match rest.split_once('.') {
+            Some((_, _)) => return Err("invalid transfer ticket segments".into()),
+            None => (body, rest),
+        },
+        None => return Err("invalid transfer ticket segments".into()),
+    };
+    if body.is_empty() || signature.is_empty() || raw.len() > 16 * 1024 {
+        return Err("invalid transfer ticket wire".into());
+    }
+    let bytes = base64url_decode(body)?;
+    serde_json::from_slice(&bytes).map_err(|_| "invalid transfer ticket body".into())
+}
+
+fn base64url_decode(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() || value.len() % 4 == 1 {
+        return Err("invalid base64url".into());
+    }
+    let decode = |byte: u8| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    };
+    let mut bits = 0_u32;
+    let mut count = 0_u8;
+    let mut out = Vec::with_capacity(value.len() * 3 / 4);
+    for byte in value.bytes() {
+        let sextet = u32::from(decode(byte).ok_or("invalid base64url")?);
+        bits = (bits << 6) | sextet;
+        count += 6;
+        while count >= 8 {
+            count -= 8;
+            out.push(((bits >> count) & 0xff) as u8);
+        }
+    }
+    if count > 0 && (bits & ((1_u32 << count) - 1)) != 0 {
+        return Err("non-canonical base64url".into());
+    }
+    Ok(out)
+}
+
+async fn consume_preflight_cipher(
+    cache: &Arc<Mutex<HashMap<String, PreflightEphemeral>>>,
+    device_id: &str,
+    ticket: &AgentTransferTicket,
+) -> Result<crate::transfer_crypto::TransferCipher, String> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock before unix epoch")?
+        .as_millis() as u64;
+    ticket.validate_for(device_id, &ticket.role, now_ms)?;
+    let workspace = if ticket.role == "source" {
+        &ticket.source_workspace_id
+    } else {
+        &ticket.destination_workspace_id
+    };
+    let key = preflight_cache_key(&[
+        &ticket.role,
+        &ticket.transfer_id,
+        device_id,
+        workspace,
+        &ticket.plan_sha256,
+        &ticket.session_nonce,
+        &ticket.epoch.to_string(),
+        &ticket.fence.to_string(),
+        &ticket.transfer_expires_at.to_string(),
+    ]);
+    let entry = {
+        let mut guard = cache.lock().await;
+        guard.retain(|_, item| item.expires_at_ms > now_ms);
+        guard
+            .remove(&key)
+            .ok_or("transfer ephemeral key is unavailable or already consumed")?
+    };
+    if entry.role != ticket.role
+        || entry.transfer_id != ticket.transfer_id
+        || entry.epoch != ticket.epoch
+        || entry.fence != ticket.fence
+        || entry.session_nonce != ticket.session_nonce
+        || entry.expires_at_ms != ticket.transfer_expires_at
+    {
+        return Err("transfer ephemeral cache binding mismatch".into());
+    }
+    entry.key.derive(
+        &ticket.peer_ephemeral_public_key(&ticket.role)?,
+        &ticket.binding(),
+    )
+}
+
+#[derive(Clone)]
+struct TransferSessionAuthority {
+    client: ClientIdentity,
+    operation_id: String,
+    expires_at_unix: i64,
+    payload_hash: String,
+    device_id: String,
+}
+
+async fn transfer_runtime_call(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    authority: &TransferSessionAuthority,
+    method: &str,
+    params: Value,
+    cancel: Option<watch::Receiver<bool>>,
+) -> Result<Value, String> {
+    let mut guard = runtime.lock().await;
+    guard
+        .dispatch_cancellable_bound(
+            method,
+            Some(params),
+            &authority.client,
+            cancel,
+            Some(authority.operation_id.clone()),
+            Some(authority.expires_at_unix),
+            Some(authority.payload_hash.clone()),
+            Some(authority.device_id.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn b64_standard_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for raw in bytes.chunks(3) {
+        let a = raw[0];
+        let b = *raw.get(1).unwrap_or(&0);
+        let c = *raw.get(2).unwrap_or(&0);
+        out.push(TABLE[(a >> 2) as usize] as char);
+        out.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+        out.push(if raw.len() > 1 {
+            TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if raw.len() > 2 {
+            TABLE[(c & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn b64_standard_decode(value: &str) -> Result<Vec<u8>, String> {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
+        return Err("invalid base64".into());
+    }
+    let pad = value.bytes().rev().take_while(|byte| *byte == b'=').count();
+    if pad > 2 || value[..value.len() - pad].contains('=') {
+        return Err("invalid base64".into());
+    }
+    let decode = |byte| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(value.len() / 4 * 3 - pad);
+    for (index, raw) in value.as_bytes().chunks_exact(4).enumerate() {
+        let last = index + 1 == value.len() / 4;
+        let a = decode(raw[0]).ok_or("invalid base64")?;
+        let b = decode(raw[1]).ok_or("invalid base64")?;
+        let c = if raw[2] == b'=' {
+            0
+        } else {
+            decode(raw[2]).ok_or("invalid base64")?
+        };
+        let d = if raw[3] == b'=' {
+            0
+        } else {
+            decode(raw[3]).ok_or("invalid base64")?
+        };
+        if (raw[3] == b'=' || raw[2] == b'=') && (raw[3] != b'=' || !last) {
+            return Err("invalid base64".into());
+        }
+        out.push((a << 2) | (b >> 4));
+        if raw[2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if raw[3] != b'=' {
+            out.push((c << 6) | d);
+        }
+    }
+    Ok(out)
+}
+
+fn transfer_frame_binding(
+    value: &serde_json::Map<String, Value>,
+    ticket: &AgentTransferTicket,
+) -> bool {
+    value.get("protocol").and_then(Value::as_str) == Some("ownmesh.transfer/1.0")
+        && value.get("transfer_id").and_then(Value::as_str) == Some(ticket.transfer_id.as_str())
+        && value.get("epoch").and_then(Value::as_u64) == Some(u64::from(ticket.epoch))
+        && value.get("fence").and_then(Value::as_u64) == Some(ticket.fence)
+        && value.get("plan_sha256").and_then(Value::as_str) == Some(ticket.plan_sha256.as_str())
+}
+
+async fn transfer_next_text(
+    socket: &mut AgentSocket,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<String, String> {
+    tokio::select! {
+        changed = cancel.changed() => {
+            if changed.is_ok() && *cancel.borrow() { Err("transfer cancelled".into()) } else { Err("transfer cancellation channel closed".into()) }
+        }
+        frame = tokio::time::timeout(Duration::from_secs(30), socket.next()) => match frame {
+            Ok(Some(Ok(Message::Text(text)))) => Ok(text.to_string()),
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => Err("transfer socket closed; fresh ticket required for reconnect".into()),
+            Ok(Some(Ok(_))) => Err("transfer socket binary/control frame rejected".into()),
+            Ok(Some(Err(_))) => Err("transfer socket failed; fresh ticket required for reconnect".into()),
+            Err(_) => Err("transfer socket ACK timeout".into()),
+        }
+    }
+}
+
+/// Only transport loss is safe for the coordinator to resume. Integrity,
+/// custody and binding failures deliberately remain terminal and never cause
+/// an automatic re-key/re-ticket attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferSessionFailure {
+    Reconnect,
+    Cancelled,
+    Terminal,
+}
+
+fn classify_transfer_failure(error: &str) -> TransferSessionFailure {
+    match error {
+        "transfer cancelled" => TransferSessionFailure::Cancelled,
+        "transfer socket closed; fresh ticket required for reconnect"
+        | "transfer socket failed; fresh ticket required for reconnect"
+        | "transfer socket ACK timeout"
+        | "transfer send failed"
+        | "transfer ACK send failed"
+        | "transfer finish send failed"
+        | "transfer finish acknowledgement send failed" => TransferSessionFailure::Reconnect,
+        _ => TransferSessionFailure::Terminal,
+    }
+}
+
+async fn transfer_ready_cursor(
+    socket: &mut AgentSocket,
+    ticket: &AgentTransferTicket,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(u64, u64), String> {
+    let raw = transfer_next_text(socket, cancel).await?;
+    let frame: Value = serde_json::from_str(&raw).map_err(|_| "invalid transfer ready frame")?;
+    let object = frame.as_object().ok_or("invalid transfer ready frame")?;
+    if object.get("type").and_then(Value::as_str) != Some("ready")
+        || !transfer_frame_binding(object, ticket)
+    {
+        return Err("transfer ready binding mismatch".into());
+    }
+    let sequence = object
+        .get("next_sequence")
+        .and_then(Value::as_u64)
+        .ok_or("transfer ready cursor missing")?;
+    let offset = object
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .ok_or("transfer ready cursor missing")?;
+    if offset > ticket.max_bytes {
+        return Err("transfer ready cursor exceeds plan".into());
+    }
+    Ok((sequence, offset))
+}
+
+async fn run_source_transfer_pump(
+    socket: &mut AgentSocket,
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    authority: &TransferSessionAuthority,
+    ticket: &AgentTransferTicket,
+    cipher: crate::transfer_crypto::TransferCipher,
+    plan_id: &str,
+    cursor: (u64, u64),
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Value, String> {
+    let opened = transfer_runtime_call(runtime, authority, methods::TRANSFER_SOURCE_OPEN,
+        json!({"plan_id":plan_id,"sequence":cursor.0,"offset":cursor.1,"workspace_id":ticket.source_workspace_id}), None).await?;
+    let mut sequence = opened
+        .get("next_sequence")
+        .and_then(Value::as_u64)
+        .ok_or("source cursor missing")?;
+    let mut offset = opened
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .ok_or("source cursor missing")?;
+    if (sequence, offset) != cursor {
+        return Err("source durable cursor differs from transfer room".into());
+    }
+    loop {
+        let next = transfer_runtime_call(
+            runtime,
+            authority,
+            methods::TRANSFER_SOURCE_CHUNK,
+            json!({"plan_id":plan_id,"sequence":sequence}),
+            None,
+        )
+        .await;
+        let chunk_reply = next?;
+        if chunk_reply.get("eof") == Some(&Value::Bool(true)) {
+            if offset != ticket.max_bytes {
+                return Err("source ended before immutable transfer size".into());
+            }
+            socket
+                .send(Message::Text(
+                    json!({"protocol":"ownmesh.transfer/1.0","type":"finish","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .map_err(|_| "transfer finish send failed")?;
+            let finish = transfer_next_text(socket, cancel).await?;
+            let finish: Value = serde_json::from_str(&finish)
+                .map_err(|_| "invalid transfer finish acknowledgement")?;
+            let finish = finish
+                .as_object()
+                .ok_or("invalid transfer finish acknowledgement")?;
+            if finish.get("type").and_then(Value::as_str) != Some("finish_ack")
+                || !transfer_frame_binding(finish, ticket)
+            {
+                return Err("transfer finish acknowledgement binding mismatch".into());
+            }
+            return Ok(
+                json!({"transfer_id":ticket.transfer_id,"state":"source_finished","plan_sha256":ticket.plan_sha256}),
+            );
+        }
+        let raw = chunk_reply
+            .get("frame_base64")
+            .and_then(Value::as_str)
+            .ok_or("source chunk frame missing")?;
+        let chunk =
+            TransferChunk::decode(&b64_standard_decode(raw)?).map_err(|error| error.to_string())?;
+        if chunk.sequence != sequence || chunk.offset != offset {
+            return Err("source emitted non-contiguous chunk".into());
+        }
+        let ciphertext = cipher.seal(chunk.sequence, chunk.offset, &chunk.sha256, &chunk.bytes)?;
+        let frame = json!({"protocol":"ownmesh.transfer/1.0","type":"chunk","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256,"sequence":chunk.sequence,"offset":chunk.offset,"length":chunk.bytes.len(),"ciphertext_base64":b64_standard_encode(&ciphertext),"chunk_sha256":chunk.sha256});
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .map_err(|_| "transfer send failed")?;
+        let raw_ack = transfer_next_text(socket, cancel).await?;
+        let ack: Value = serde_json::from_str(&raw_ack).map_err(|_| "invalid transfer ACK")?;
+        let object = ack.as_object().ok_or("invalid transfer ACK")?;
+        if object.get("type").and_then(Value::as_str) != Some("ack")
+            || !transfer_frame_binding(object, ticket)
+            || object.get("sequence").and_then(Value::as_u64) != Some(sequence)
+            || object.get("next_offset").and_then(Value::as_u64)
+                != Some(offset + chunk.bytes.len() as u64)
+        {
+            return Err("transfer ACK binding mismatch".into());
+        }
+        sequence += 1;
+        offset += chunk.bytes.len() as u64;
+    }
+}
+
+async fn run_destination_transfer_pump(
+    socket: &mut AgentSocket,
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    authority: &TransferSessionAuthority,
+    ticket: &AgentTransferTicket,
+    cipher: crate::transfer_crypto::TransferCipher,
+    plan_id: &str,
+    cursor: (u64, u64),
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<Value, String> {
+    let prepared = transfer_runtime_call(runtime, authority, methods::TRANSFER_DESTINATION_PREPARE,
+        json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"workspace_id":ticket.destination_workspace_id}), None).await?;
+    let mut expected_sequence = prepared
+        .get("next_sequence")
+        .and_then(Value::as_u64)
+        .ok_or("destination cursor missing")?;
+    let mut expected_offset = prepared
+        .get("next_offset")
+        .and_then(Value::as_u64)
+        .ok_or("destination cursor missing")?;
+    if (expected_sequence, expected_offset) != cursor {
+        return Err("destination durable cursor differs from transfer room".into());
+    }
+    loop {
+        let raw = transfer_next_text(socket, cancel).await?;
+        let frame: Value = serde_json::from_str(&raw).map_err(|_| "invalid transfer frame")?;
+        let object = frame.as_object().ok_or("invalid transfer frame")?;
+        if object.get("type").and_then(Value::as_str) == Some("cancel") {
+            if transfer_frame_binding(object, ticket) {
+                return Err("transfer cancelled".into());
+            }
+            return Err("transfer cancel binding mismatch".into());
+        }
+        if object.get("type").and_then(Value::as_str) == Some("finish") {
+            if !transfer_frame_binding(object, ticket) {
+                return Err("transfer finish binding mismatch".into());
+            }
+            if expected_offset != ticket.max_bytes {
+                return Err("transfer finish before durable destination completion".into());
+            }
+            transfer_runtime_call(runtime, authority, methods::TRANSFER_FINALIZE, json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"workspace_id":ticket.destination_workspace_id}), None).await?;
+            socket.send(Message::Text(json!({"protocol":"ownmesh.transfer/1.0","type":"finish_ack","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256}).to_string().into())).await.map_err(|_| "transfer finish acknowledgement send failed")?;
+            return Ok(
+                json!({"transfer_id":ticket.transfer_id,"state":"completed","plan_sha256":ticket.plan_sha256}),
+            );
+        }
+        if object.get("type").and_then(Value::as_str) != Some("chunk")
+            || !transfer_frame_binding(object, ticket)
+        {
+            return Err("transfer frame binding mismatch".into());
+        }
+        let sequence = object
+            .get("sequence")
+            .and_then(Value::as_u64)
+            .ok_or("chunk sequence missing")?;
+        let offset = object
+            .get("offset")
+            .and_then(Value::as_u64)
+            .ok_or("chunk offset missing")?;
+        let length = object
+            .get("length")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0 && *n <= 64 * 1024)
+            .ok_or("chunk length invalid")?;
+        let sha = object
+            .get("chunk_sha256")
+            .and_then(Value::as_str)
+            .ok_or("chunk hash missing")?;
+        let mut encrypted = b64_standard_decode(
+            object
+                .get("ciphertext_base64")
+                .and_then(Value::as_str)
+                .ok_or("ciphertext missing")?,
+        )?;
+        if sequence != expected_sequence || offset != expected_offset {
+            return Err("destination chunk is not contiguous".into());
+        }
+        let plaintext = cipher.open(sequence, offset, length, sha, &mut encrypted)?;
+        let chunk =
+            TransferChunk::new(sequence, offset, plaintext).map_err(|error| error.to_string())?;
+        let saved = transfer_runtime_call(runtime, authority, methods::TRANSFER_DESTINATION_CHUNK,
+            json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"workspace_id":ticket.destination_workspace_id,"frame_base64":b64_standard_encode(&chunk.encode().map_err(|error| error.to_string())?)}), None).await?;
+        // Durable destination_chunk completed before this ACK is emitted.
+        let next_offset = offset + length as u64;
+        socket.send(Message::Text(json!({"protocol":"ownmesh.transfer/1.0","type":"ack","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256,"sequence":sequence,"next_offset":next_offset}).to_string().into())).await.map_err(|_| "transfer ACK send failed")?;
+        if saved.get("completed") == Some(&Value::Bool(true)) && next_offset != ticket.max_bytes {
+            return Err("destination reported completed before immutable transfer size".into());
+        }
+        expected_sequence += 1;
+        expected_offset = next_offset;
+    }
 }
 
 /// Resolve the single active instance and its issuer/device-bound credential.
@@ -281,6 +745,14 @@ struct PendingDispatch {
     operation_id: String,
     raw: String,
     accepted_at: String,
+    /// transfer.start tickets and ephemeral proof material are single-use and
+    /// must never enter the device crash outbox. These receipts deliberately
+    /// cannot be redelivered after a restart; the coordinator must mint a
+    /// fresh epoch/fence/ticket after new preflight evidence.
+    #[serde(default)]
+    transfer_session_lost: bool,
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -812,6 +1284,19 @@ struct FinishedRemoteOp {
     completed: CompletedReply,
 }
 
+fn transfer_session_lost_reply(operation_id: &str) -> Value {
+    json!({
+        "operation_contract": OPERATION_CONTRACT_V1,
+        "operation_id": operation_id,
+        "status": "failed",
+        "error": {
+            "code": "OWNMESH_E_TRANSFER_SESSION_LOST",
+            "message": "transfer session was interrupted; obtain fresh preflight and ticket",
+            "retryable": true
+        }
+    })
+}
+
 async fn live_loop(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
@@ -835,6 +1320,17 @@ async fn live_loop(
     for pending in pending_resume {
         if state.completed(&pending.correlation_id).is_some() {
             state.clear_pending_by_correlation(&pending.correlation_id);
+            continue;
+        }
+        if pending.transfer_session_lost {
+            let completed = CompletedReply {
+                correlation_id: pending.correlation_id.clone(),
+                operation_id: pending.operation_id.clone(),
+                payload: transfer_session_lost_reply(&pending.operation_id),
+            };
+            state.remember_completed(completed.clone());
+            state.save(&config.state_path)?;
+            send_cached_result(socket, config, state, &completed).await?;
             continue;
         }
         let Ok(envelope) = Envelope::parse_str(&pending.raw) else {
@@ -1038,12 +1534,20 @@ fn parse_and_record_inbound(
             .to_owned();
         // Skip outbox when a terminal result already exists (replay after complete).
         if state.completed(&correlation_id).is_none() {
+            let transfer_session_lost = envelope.payload.get("capability").and_then(Value::as_str)
+                == Some("transfer.start");
             state.remember_pending(PendingDispatch {
                 message_id: message_id.to_owned(),
                 correlation_id,
                 operation_id,
-                raw: raw.to_owned(),
+                raw: if transfer_session_lost {
+                    String::new()
+                } else {
+                    raw.to_owned()
+                },
                 accepted_at: Timestamp::now().to_rfc3339(),
+                transfer_session_lost,
+                expires_at: envelope.expires_at.as_ref().map(ToString::to_string),
             })?;
         }
     }
@@ -1094,6 +1598,16 @@ async fn handle_live_frame(
             let raw = match raw {
                 Some(raw) => raw,
                 None => match state.pending_by_correlation(correlation) {
+                    Some(pending) if pending.transfer_session_lost => {
+                        let completed = CompletedReply {
+                            correlation_id: correlation.to_owned(),
+                            operation_id: pending.operation_id.clone(),
+                            payload: transfer_session_lost_reply(&pending.operation_id),
+                        };
+                        state.remember_completed(completed.clone());
+                        state.save(&config.state_path)?;
+                        return send_cached_result(socket, config, state, &completed).await;
+                    }
                     Some(pending) => pending.raw.clone(),
                     None => {
                         // Seen without pending or completion: fail closed so D1 cannot
@@ -1257,6 +1771,10 @@ async fn handle_live_frame(
             let device_id = config.device_id.clone();
             let device_key = Arc::clone(&config.key);
             let preflight_ephemerals = Arc::clone(&config.preflight_ephemerals);
+            // Transfer sessions outlive the control-socket dispatch turn.  They
+            // own a cloned, non-persisted connection configuration so no
+            // network wait ever holds the daemon runtime mutex.
+            let transfer_config = config.clone();
             let envelope_expires_at = operation
                 .envelope
                 .expires_at
@@ -1269,6 +1787,7 @@ async fn handle_live_frame(
                     &device_id,
                     &device_key,
                     &preflight_ephemerals,
+                    &transfer_config,
                     &request,
                     envelope_expires_at.as_deref(),
                     &cancel_registry,
@@ -2259,6 +2778,7 @@ async fn dispatch_remote_operation(
     device_id: &DeviceId,
     device_key: &DeviceKeyPair,
     preflight_ephemerals: &Arc<Mutex<HashMap<String, PreflightEphemeral>>>,
+    transfer_config: &AgentTransportConfig,
     request: &OperationRequestPayload,
     envelope_expires_at: Option<&str>,
     cancel_registry: &CancelRegistry,
@@ -2296,6 +2816,33 @@ async fn dispatch_remote_operation(
             });
         }
     };
+    let transfer_start_args = (request.capability == "transfer.start").then(|| mapped.1.clone());
+    let session_cancel = cancel_rx.clone();
+
+    // Reject a malformed/foreign ticket before policy or runtime admission.
+    // The private ephemeral is intentionally consumed only by the actual pump
+    // after this admission succeeds, so a malformed retry cannot burn it.
+    if request.capability == "transfer.start" {
+        let ticket_wire = mapped
+            .1
+            .get("ticket")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing transfer ticket".to_owned())
+            .and_then(parse_transfer_ticket_wire);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "clock before unix epoch")
+            .map(|duration| duration.as_millis() as u64);
+        match (ticket_wire, now_ms) {
+            (Ok(ticket), Ok(now_ms))
+                if ticket
+                    .validate_for(device_id.as_str(), &ticket.role, now_ms)
+                    .is_ok() => {}
+            _ => {
+                return json!({ "operation_contract": OPERATION_CONTRACT_V1, "operation_id": operation_id, "status": "failed", "error": { "code": "OWNMESH_E_TRANSFER_TICKET", "message": "invalid transfer ticket", "retryable": false } })
+            }
+        }
+    }
 
     if mapped.0 == "__cancel__" {
         // Cancel is handled on the live loop; this branch is defensive only.
@@ -2421,7 +2968,7 @@ async fn dispatch_remote_operation(
                 cancel_rx,
                 Some(operation_id.clone()),
                 remote_expires_unix,
-                remote_payload_hash,
+                remote_payload_hash.clone(),
                 Some(device_id.as_str().to_owned()),
             )
             .await
@@ -2429,6 +2976,106 @@ async fn dispatch_remote_operation(
 
     match outcome {
         Ok(body) => {
+            if let Some(args) = transfer_start_args {
+                let session = async {
+                    let ticket_wire = args
+                        .get("ticket")
+                        .and_then(Value::as_str)
+                        .ok_or("missing transfer ticket")?;
+                    let ticket = parse_transfer_ticket_wire(ticket_wire)?;
+                    let cipher =
+                        consume_preflight_cipher(preflight_ephemerals, device_id.as_str(), &ticket)
+                            .await?;
+                    let plan_id = body
+                        .get("plan_id")
+                        .and_then(Value::as_str)
+                        .ok_or("transfer start plan id missing")?;
+                    let authority = TransferSessionAuthority {
+                        client: client.clone(),
+                        operation_id: operation_id.clone(),
+                        expires_at_unix: remote_expires_unix
+                            .ok_or("transfer authority expiry missing")?,
+                        payload_hash: remote_payload_hash
+                            .clone()
+                            .ok_or("transfer authority hash missing")?,
+                        device_id: device_id.as_str().to_owned(),
+                    };
+                    let mut socket =
+                        connect_transfer_socket(transfer_config, ticket_wire, &ticket).await?;
+                    let mut cancel =
+                        session_cancel.ok_or("transfer cancellation channel missing")?;
+                    let cursor = transfer_ready_cursor(&mut socket, &ticket, &mut cancel).await?;
+                    let pumped = if ticket.role == "source" {
+                        run_source_transfer_pump(
+                            &mut socket,
+                            runtime,
+                            &authority,
+                            &ticket,
+                            cipher,
+                            plan_id,
+                            cursor,
+                            &mut cancel,
+                        )
+                        .await
+                    } else {
+                        run_destination_transfer_pump(
+                            &mut socket,
+                            runtime,
+                            &authority,
+                            &ticket,
+                            cipher,
+                            plan_id,
+                            cursor,
+                            &mut cancel,
+                        )
+                        .await
+                    };
+                    // A controller-side cancellation must become a durable room
+                    // transition and remove the local receiver part file.  The
+                    // cancel frame is best-effort only: local cleanup is still
+                    // attempted if the peer has already disconnected.
+                    let peer_cancelled = pumped
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| {
+                            classify_transfer_failure(error) == TransferSessionFailure::Cancelled
+                        });
+                    if *cancel.borrow() || peer_cancelled {
+                        if *cancel.borrow() {
+                            let _ = socket
+                                .send(Message::Text(
+                                    json!({"protocol":"ownmesh.transfer/1.0","type":"cancel","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
+                        }
+                        let _ = transfer_runtime_call(
+                            runtime,
+                            &authority,
+                            methods::TRANSFER_CANCEL,
+                            json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence}),
+                            None,
+                        )
+                        .await;
+                    }
+                    pumped
+                }
+                .await;
+                return match session {
+                    Ok(result) => {
+                        json!({"operation_contract":OPERATION_CONTRACT_V1,"operation_id":operation_id,"status":"completed","result":result})
+                    }
+                    Err(error) => {
+                        let (code, message, retryable) = match classify_transfer_failure(&error) {
+                            TransferSessionFailure::Reconnect => ("OWNMESH_E_TRANSFER_RECONNECT", "transfer connection interrupted; obtain a fresh ticket to reconnect", true),
+                            TransferSessionFailure::Cancelled => ("OWNMESH_E_TRANSFER_CANCELLED", "transfer cancelled", false),
+                            TransferSessionFailure::Terminal => ("OWNMESH_E_TRANSFER_SESSION", "transfer session failed", false),
+                        };
+                        json!({"operation_contract":OPERATION_CONTRACT_V1,"operation_id":operation_id,"status":"failed","error":{"code":code,"message":message,"retryable":retryable}})
+                    }
+                };
+            }
             // Runtime may surface policy ask without executing.
             if body.get("approval_required") == Some(&Value::Bool(true)) {
                 // Always echo the remote MCP operation id (never a local mint) so
@@ -2772,6 +3419,70 @@ mod tests {
     }
 
     #[test]
+    fn transfer_start_crash_receipt_excludes_bearer_and_requires_fresh_session() {
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_transfer_receipt").unwrap();
+        let config = AgentTransportConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            ws_url: agent_connect_url("http://127.0.0.1:1", device.as_str()).unwrap(),
+            origin: "http://127.0.0.1:1".into(),
+            device_id: device.clone(),
+            credential: SecretString::new("redacted-test-credential"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        let sent_at = Timestamp::now();
+        let expires_at = sent_at.checked_add(Duration::from_secs(60)).unwrap();
+        let raw = json!({
+            "protocol": PROTOCOL_DEVICE_V1,
+            "message_id": "msg_transfer_receipt",
+            "type": "operation.request",
+            "device_id": device.as_str(),
+            "correlation_id": "op_transfer_receipt",
+            "seq": 1,
+            "sent_at": sent_at,
+            "expires_at": expires_at,
+            "payload": {
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": "op_transfer_receipt",
+                "capability": "transfer.start",
+                "arguments": {
+                    "ticket": "ticket-secret-must-not-persist",
+                    "jti": "jti-secret-must-not-persist",
+                    "ephemeral_private_key": "key-secret-must-not-persist"
+                }
+            }
+        })
+        .to_string();
+        parse_and_record_inbound(&raw, &config, &mut state).unwrap();
+        let saved = std::fs::read_to_string(&config.state_path).unwrap();
+        for forbidden in [
+            "ticket-secret-must-not-persist",
+            "jti-secret-must-not-persist",
+            "key-secret-must-not-persist",
+            "ticket\"",
+            "ephemeral",
+        ] {
+            assert!(!saved.contains(forbidden), "state leaked {forbidden}");
+        }
+        let reloaded =
+            AgentTransportState::load(&config.state_path, &config.issuer, &device).unwrap();
+        let pending = reloaded
+            .pending_by_correlation("op_transfer_receipt")
+            .unwrap();
+        assert!(pending.transfer_session_lost);
+        assert!(pending.raw.is_empty());
+        let recovery = transfer_session_lost_reply(&pending.operation_id);
+        assert_eq!(recovery["error"]["code"], "OWNMESH_E_TRANSFER_SESSION_LOST");
+        assert_eq!(recovery["error"]["retryable"], true);
+        assert!(!recovery
+            .to_string()
+            .contains("ticket-secret-must-not-persist"));
+    }
+
+    #[test]
     fn pending_outbox_capacity_rejects_without_live_eviction() {
         let device = DeviceId::parse("dev_cap").unwrap();
         let mut state = AgentTransportState::fresh("http://127.0.0.1:1", &device);
@@ -2783,6 +3494,8 @@ mod tests {
                     operation_id: format!("op_cap_{i}"),
                     raw: format!(r#"{{"i":{i}}}"#),
                     accepted_at: Timestamp::now().to_rfc3339(),
+                    transfer_session_lost: false,
+                    expires_at: None,
                 })
                 .unwrap();
         }
@@ -2793,6 +3506,8 @@ mod tests {
                 operation_id: "op_overflow".into(),
                 raw: r#"{"i":999}"#.into(),
                 accepted_at: Timestamp::now().to_rfc3339(),
+                transfer_session_lost: false,
+                expires_at: None,
             })
             .expect_err("must reject when full");
         assert!(
@@ -3653,5 +4368,31 @@ mod tests {
         )
         .unwrap();
         assert!(!serde_json::to_string(&first).unwrap().contains("private"));
+    }
+}
+#[test]
+fn transfer_failure_classification_only_retries_connection_loss() {
+    assert_eq!(
+        classify_transfer_failure("transfer socket closed; fresh ticket required for reconnect"),
+        TransferSessionFailure::Reconnect
+    );
+    assert_eq!(
+        classify_transfer_failure("transfer socket ACK timeout"),
+        TransferSessionFailure::Reconnect
+    );
+    assert_eq!(
+        classify_transfer_failure("transfer cancelled"),
+        TransferSessionFailure::Cancelled
+    );
+    for terminal in [
+        "transfer frame binding mismatch",
+        "chunk hash mismatch",
+        "destination durable cursor differs from transfer room",
+        "source ended before immutable transfer size",
+    ] {
+        assert_eq!(
+            classify_transfer_failure(terminal),
+            TransferSessionFailure::Terminal
+        );
     }
 }

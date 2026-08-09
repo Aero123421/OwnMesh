@@ -31,7 +31,8 @@ pub struct AgentTransferTicket {
     pub epoch: u32,
     pub fence: u64,
     pub max_bytes: u64,
-    pub exp: u64,
+    pub ticket_exp: u64,
+    pub transfer_expires_at: u64,
     pub source_device_public_key: String,
     pub destination_device_public_key: String,
     pub source_ephemeral_public_key: String,
@@ -57,8 +58,9 @@ impl AgentTransferTicket {
             || !valid_hex(&self.plan_sha256, 32)
             || role != self.role
             || device_id != self.device_id
-            || self.exp <= now_ms
-            || self.max_bytes == 0
+            || self.ticket_exp <= now_ms
+            || self.transfer_expires_at <= now_ms
+            || self.transfer_expires_at < self.ticket_exp
             || self.epoch == 0
             || self.fence == 0
             || !matches!(role, "source" | "destination")
@@ -149,7 +151,7 @@ impl AgentTransferTicket {
             self.fence,
             &self.session_nonce,
             ephemeral,
-            self.exp,
+            self.transfer_expires_at,
         )
     }
 }
@@ -502,7 +504,8 @@ mod tests {
             epoch: 1,
             fence: 1,
             max_bytes: 64 * 1024,
-            exp: u64::MAX,
+            ticket_exp: u64::MAX,
+            transfer_expires_at: u64::MAX,
             source_device_public_key: source.public_identity().public_key_hex,
             destination_device_public_key: destination.public_identity().public_key_hex,
             source_ephemeral_public_key: hex(source_ephemeral.public()),
@@ -548,7 +551,7 @@ mod tests {
         ticket.epoch = 0x0102_0304;
         ticket.fence = 0x0102_0304_0506;
         ticket.session_nonce = "n|=".into();
-        ticket.exp = 1_700_000_000_000;
+        ticket.transfer_expires_at = 1_700_000_000_000;
         let proof = ticket.ephemeral_proof("source").unwrap();
         let mut different = ticket;
         different.transfer_id = "x".into();
