@@ -7,7 +7,7 @@ use crate::{ReplayLedger, ReplayLedgerError};
 #[cfg(target_os = "linux")]
 use ownmesh_broker_client::{
     operation_facts_digest, parse_broker_wire_intent_v2, verify_cancel_intent_v2_message_auth,
-    verify_capability_v2, verify_execute_intent_v2_message_auth, BrokerRequestV2,
+    verify_capability_v2, verify_execute_intent_v2_message_auth, BrokerRequestV2, BrokerResponseV2,
     BrokerWireIntentV2, CapabilityTokenV2, MAX_BROKER_REQUEST_BYTES,
 };
 use ownmesh_broker_client::{
@@ -253,8 +253,8 @@ pub fn validate_signing_custody_metadata(
 /// Load or create the broker-only capability signing key.
 ///
 /// On Unix this operation requires effective UID 0. The immediate parent is
-/// root-owned mode 0711 (lookup permits identity checks, never key reads); the
-/// key itself remains root-owned mode 0600.
+/// root-owned mode 0700: the unprivileged daemon never needs to look up the
+/// broker-only signing key, ledger, or staging area.
 pub fn load_or_create_capability_keys(
     signing_path: &Path,
 ) -> Result<(CapabilitySigningKey, CapabilityVerifyKey), String> {
@@ -374,7 +374,7 @@ fn prepare_signing_parent(signing_path: &Path) -> Result<(), String> {
     }
     std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     set_root_owner(parent)?;
-    set_mode(parent, 0o711)?;
+    set_mode(parent, 0o700)?;
     validate_signing_parent_custody(parent)
 }
 
@@ -455,7 +455,11 @@ pub fn validate_verify_key_custody(path: &Path) -> Result<(), String> {
 
 /// Load/create the request-MAC secret with physical DAC custody by one daemon UID.
 /// Existing files are never repaired in place: unexpected type/owner/mode is rejected.
-pub fn load_or_create_request_secret(path: &Path, daemon_uid: u32) -> Result<BrokerSecret, String> {
+pub fn load_or_create_request_secret(
+    path: &Path,
+    daemon_uid: u32,
+    daemon_group_gid: u32,
+) -> Result<BrokerSecret, String> {
     #[cfg(unix)]
     {
         use std::io::ErrorKind;
@@ -476,11 +480,16 @@ pub fn load_or_create_request_secret(path: &Path, daemon_uid: u32) -> Result<Bro
                     },
                     daemon_uid,
                 )?;
+                if md.gid() != daemon_group_gid {
+                    return Err(format!(
+                        "request-MAC secret must be owned by daemon GID {daemon_group_gid} (fail-closed)"
+                    ));
+                }
             }
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 let secret = BrokerSecret::generate();
                 write_new_private_file(path, secret.as_bytes(), 0o600)?;
-                set_owner(path, daemon_uid, 0)?;
+                set_owner(path, daemon_uid, daemon_group_gid)?;
                 set_mode(path, 0o600)?;
             }
             Err(err) => {
@@ -499,6 +508,11 @@ pub fn load_or_create_request_secret(path: &Path, daemon_uid: u32) -> Result<Bro
             },
             daemon_uid,
         )?;
+        if md.gid() != daemon_group_gid {
+            return Err(format!(
+                "request-MAC secret must be owned by daemon GID {daemon_group_gid} (fail-closed)"
+            ));
+        }
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         if bytes.len() < 32 {
             return Err("secret file too short".into());
@@ -507,7 +521,7 @@ pub fn load_or_create_request_secret(path: &Path, daemon_uid: u32) -> Result<Bro
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, daemon_uid);
+        let _ = (path, daemon_uid, daemon_group_gid);
         Err("request-MAC secret DAC custody is unsupported on this OS".into())
     }
 }
@@ -861,7 +875,8 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
     ensure_broker_key_separation(&cfg.secret_file, &cfg.signing_key_file)?;
     let policy = peer::load_trusted_peer_policy(&cfg.trusted_executable, cfg.allowed_uids.clone())?;
     prepare_linux_socket_path(&socket_path, cfg.socket_security)?;
-    let secret = load_or_create_request_secret(&cfg.secret_file, daemon_uid)?;
+    let secret =
+        load_or_create_request_secret(&cfg.secret_file, daemon_uid, cfg.socket_security.group_gid)?;
     let (signing_key, verify_key) = load_or_create_capability_keys(&cfg.signing_key_file)?;
     let broker_key_id = hex::encode(Sha256::digest(verify_key.to_bytes()));
     let broker_instance_id = hex::encode(Sha256::digest(
@@ -894,15 +909,19 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
         let Ok(permit) = Arc::clone(&concurrency).try_acquire_owned() else {
-            let _ = write_resp(
+            let _ = write_v2_resp(
                 &mut stream,
-                &BrokerResponse {
+                &BrokerResponseV2 {
                     request_id: "unknown".into(),
                     ok: false,
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
                     error: Some("broker busy; bounded concurrency limit reached".into()),
+                    timed_out: false,
+                    cancelled: false,
+                    truncated: false,
+                    duration_ms: 0,
                 },
             )
             .await;
@@ -913,7 +932,7 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
         tokio::spawn(async move {
             let _permit = permit;
             let response = handle_linux_production_connection(&mut stream, &policy, state).await;
-            let _ = write_resp(&mut stream, &response).await;
+            let _ = write_v2_resp(&mut stream, &response).await;
         });
     }
 }
@@ -923,9 +942,10 @@ async fn handle_linux_production_connection(
     stream: &mut tokio::net::UnixStream,
     policy: &crate::peer::TrustedPeerPolicy,
     state: Arc<ProductionState>,
-) -> BrokerResponse {
+) -> BrokerResponseV2 {
     let request_id = "unknown".to_string();
-    let result: Result<BrokerResponse, String> = async {
+    let started = std::time::Instant::now();
+    let result: Result<BrokerResponseV2, String> = async {
         let accepted = peer::authorize_unix_peer(stream, policy)?;
         let bytes = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -985,13 +1005,17 @@ async fn handle_linux_production_connection(
                 .map_err(|_| "replay ledger lock poisoned".to_string())?
                 .mark_completed(&cancel.nonce, &cancel_digest)
                 .map_err(|error| replay_error(&error))?;
-            return Ok(BrokerResponse {
+            return Ok(BrokerResponseV2 {
                 request_id: cancel.request_id,
                 ok: true,
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
                 error: None,
+                timed_out: false,
+                cancelled: false,
+                truncated: false,
+                duration_ms: elapsed_ms(started),
             });
         }
         let BrokerWireIntentV2::Execute(execute) = intent else {
@@ -1078,13 +1102,17 @@ async fn handle_linux_production_connection(
         Ok(response)
     }
     .await;
-    result.unwrap_or_else(|error| BrokerResponse {
+    result.unwrap_or_else(|error| BrokerResponseV2 {
         request_id,
         ok: false,
         exit_code: None,
         stdout: String::new(),
         stderr: String::new(),
         error: Some(error),
+        timed_out: false,
+        cancelled: false,
+        truncated: false,
+        duration_ms: elapsed_ms(started),
     })
 }
 
@@ -1114,6 +1142,11 @@ async fn read_bounded_v2_frame(stream: &mut tokio::net::UnixStream) -> Result<Ve
         }
         frame.push(byte[0]);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Wait for closure after the one accepted Execute frame.  We intentionally
@@ -1329,16 +1362,20 @@ async fn run_v2_elevated(
     request: &BrokerRequestV2,
     staged_program: &Path,
     cancel: Option<watch::Receiver<bool>>,
-) -> BrokerResponse {
+) -> BrokerResponseV2 {
     let facts = &request.facts;
     if facts.canonical_cwd.is_some() {
-        return BrokerResponse {
+        return BrokerResponseV2 {
             request_id: request.request_id.clone(),
             ok: false,
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
             error: Some("non-None cwd is unsupported for privileged broker execution".into()),
+            timed_out: false,
+            cancelled: false,
+            truncated: false,
+            duration_ms: 0,
         };
     }
     let cwd = None;
@@ -1349,13 +1386,17 @@ async fn run_v2_elevated(
         cwd.as_deref(),
     ) != CommandKind::Structured
     {
-        return BrokerResponse {
+        return BrokerResponseV2 {
             request_id: request.request_id.clone(),
             ok: false,
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
             error: Some("shell-classified executable is forbidden in broker v2".into()),
+            timed_out: false,
+            cancelled: false,
+            truncated: false,
+            duration_ms: 0,
         };
     }
     let result = ownmesh_exec::run_command_cancellable(
@@ -1375,7 +1416,7 @@ async fn run_v2_elevated(
     )
     .await;
     match result {
-        Ok(result) => BrokerResponse {
+        Ok(result) => BrokerResponseV2 {
             request_id: request.request_id.clone(),
             ok: result.exit_code == Some(0) && !result.timed_out,
             exit_code: result.exit_code,
@@ -1388,8 +1429,12 @@ async fn run_v2_elevated(
             } else {
                 None
             },
+            timed_out: result.timed_out,
+            cancelled: false,
+            truncated: result.truncated,
+            duration_ms: result.duration_ms,
         },
-        Err(error) => BrokerResponse {
+        Err(error) => BrokerResponseV2 {
             request_id: request.request_id.clone(),
             ok: false,
             exit_code: None,
@@ -1400,6 +1445,10 @@ async fn run_v2_elevated(
             } else {
                 error.to_string()
             }),
+            timed_out: false,
+            cancelled: matches!(error, ownmesh_exec::ExecError::Cancelled),
+            truncated: false,
+            duration_ms: 0,
         },
     }
 }
@@ -1480,6 +1529,23 @@ async fn write_resp<W: AsyncWriteExt + Unpin>(
     resp: &BrokerResponse,
 ) -> Result<(), String> {
     let mut out = serde_json::to_string(resp).map_err(|e| e.to_string())?;
+    out.push('\n');
+    writer
+        .write_all(out.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Production Unix-socket v2 response writer. Kept separate from the legacy
+/// test-only response shape so a client cannot silently accept a downgraded
+/// wire response.
+#[cfg(target_os = "linux")]
+async fn write_v2_resp<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    response: &BrokerResponseV2,
+) -> Result<(), String> {
+    let mut out = serde_json::to_string(response).map_err(|e| e.to_string())?;
     out.push('\n');
     writer
         .write_all(out.as_bytes())

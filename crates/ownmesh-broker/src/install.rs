@@ -39,6 +39,9 @@ pub struct BrokerInstallConfig {
     /// Source ownmeshd image.  It is copied into the same root-controlled
     /// directory as the broker so the peer policy can pin an executable inode.
     pub trusted_executable: PathBuf,
+    /// Exact non-root identity of the unprivileged ownmeshd peer.
+    pub daemon_uid: u32,
+    pub daemon_gid: u32,
     pub socket_security: UnixSocketSecurity,
     pub allowed_uids: Vec<u32>,
 }
@@ -66,6 +69,10 @@ pub struct InstallRecord {
     pub socket_mode: u32,
     #[serde(default)]
     pub allowed_uids: Vec<u32>,
+    #[serde(default)]
+    pub daemon_uid: u32,
+    #[serde(default)]
+    pub daemon_gid: u32,
     #[serde(default)]
     pub broker_binary: String,
     #[serde(default)]
@@ -109,6 +116,8 @@ struct LinuxRunConfig {
     socket_group_gid: u32,
     socket_mode: u32,
     allowed_uids: Vec<u32>,
+    daemon_uid: u32,
+    daemon_gid: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -135,9 +144,11 @@ pub fn install_broker(
         return install_linux(
             base,
             &broker,
-            BrokerInstallConfig {
+            &BrokerInstallConfig {
                 endpoint: endpoint_override,
                 trusted_executable: daemon,
+                daemon_uid: 0,
+                daemon_gid: 0,
                 socket_security: UnixSocketSecurity {
                     owner_uid: 0,
                     group_gid: 0,
@@ -157,6 +168,7 @@ pub fn install_broker(
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub fn install_broker_with_config(
     base: &Path,
     config: BrokerInstallConfig,
@@ -165,7 +177,7 @@ pub fn install_broker_with_config(
     {
         let broker =
             std::env::current_exe().map_err(|e| format!("resolve broker executable: {e}"))?;
-        return install_linux(base, &broker, config);
+        return install_linux(base, &broker, &config);
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -181,44 +193,49 @@ pub fn install_broker_with_config(
 fn install_linux(
     base: &Path,
     broker_source: &Path,
-    config: BrokerInstallConfig,
+    config: &BrokerInstallConfig,
 ) -> Result<InstallRecord, String> {
     require_root()?;
     if !base.as_os_str().is_empty() && base != Path::new(".") {
         // State no longer follows a caller-controlled directory.  Keeping the
         // argument accepts old clients without letting them redirect root data.
     }
-    let endpoint = match config.endpoint {
+    let endpoint = match config.endpoint.as_ref() {
         None => PathBuf::from(LINUX_SOCKET),
-        Some(BrokerEndpoint::UnixSocket(path)) if path == Path::new(LINUX_SOCKET) => path,
+        Some(BrokerEndpoint::UnixSocket(path)) if path == Path::new(LINUX_SOCKET) => path.clone(),
         Some(_) => {
             return Err(format!(
                 "broker endpoint is fixed at {LINUX_SOCKET}; refusing caller-controlled endpoint"
             ))
         }
     };
-    if config.socket_security
-        != (UnixSocketSecurity {
-            owner_uid: 0,
-            group_gid: 0,
-            mode: 0o600,
-        })
-        || config.allowed_uids != [0]
+    if config.daemon_uid == 0
+        || config.daemon_gid == 0
+        || config.socket_security
+            != (UnixSocketSecurity {
+                owner_uid: config.daemon_uid,
+                group_gid: config.daemon_gid,
+                mode: 0o600,
+            })
+        || config.allowed_uids != [config.daemon_uid]
     {
-        return Err("Linux native service requires root ownmeshd, socket owner root:root mode 0600, and allowed UID [0]".into());
+        return Err("Linux native service requires one explicit non-root ownmeshd UID/GID; socket owner and allowed UID must exactly match it".into());
     }
     verify_source(broker_source)?;
     verify_source(&config.trusted_executable)?;
     ensure_dir(Path::new("/etc/ownmesh"), 0o700)?;
     ensure_dir(Path::new(LINUX_LIB_DIR), 0o755)?;
-    ensure_dir(Path::new("/var/lib/ownmesh"), 0o700)?;
-    ensure_dir(Path::new(LINUX_STATE), 0o700)?;
-    ensure_dir(Path::new(LINUX_RUNTIME), 0o700)?;
+    // These root-owned lookup-only parents let precisely the daemon UID reach
+    // its 0600 socket and secret; broker keys/ledger/staging stay in private/.
+    ensure_dir(Path::new("/var/lib/ownmesh"), 0o711)?;
+    ensure_dir(Path::new(LINUX_STATE), 0o711)?;
+    ensure_dir(Path::new(LINUX_RUNTIME), 0o711)?;
 
     let record_path = install_path(base);
     if record_path.exists() {
         let record = read_record(&record_path)?;
         validate_record(&record)?;
+        validate_requested_matches_record(&record, broker_source, config)?;
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", "ownmesh-broker.service"])?;
         wait_active(&record)?;
@@ -249,10 +266,12 @@ fn install_linux(
             secret_file: format!("{LINUX_STATE}/broker.secret"),
             signing_key_file: format!("{LINUX_STATE}/private/{CAPABILITY_SIGNING_FILE}"),
             trusted_executable: LINUX_DAEMON.into(),
-            socket_owner_uid: 0,
-            socket_group_gid: 0,
+            socket_owner_uid: config.daemon_uid,
+            socket_group_gid: config.daemon_gid,
             socket_mode: 0o600,
-            allowed_uids: vec![0],
+            allowed_uids: vec![config.daemon_uid],
+            daemon_uid: config.daemon_uid,
+            daemon_gid: config.daemon_gid,
         };
         let config_bytes = serde_json::to_vec_pretty(&run)
             .map_err(|e| format!("serialize service config: {e}"))?;
@@ -271,10 +290,12 @@ fn install_linux(
             signing_key_file: run.signing_key_file,
             verify_key_file: format!("{LINUX_STATE}/{CAPABILITY_VERIFY_FILE}"),
             trusted_executable: LINUX_DAEMON.into(),
-            socket_owner_uid: 0,
-            socket_group_gid: 0,
+            socket_owner_uid: config.daemon_uid,
+            socket_group_gid: config.daemon_gid,
             socket_mode: 0o600,
-            allowed_uids: vec![0],
+            allowed_uids: vec![config.daemon_uid],
+            daemon_uid: config.daemon_uid,
+            daemon_gid: config.daemon_gid,
             broker_binary: LINUX_BROKER.into(),
             config_path: LINUX_CONFIG.into(),
             broker_sha256: sha256_file(Path::new(LINUX_BROKER))?,
@@ -301,6 +322,28 @@ fn install_linux(
         let _ = systemctl(&["daemon-reload"]);
     }
     outcome
+}
+
+#[cfg(target_os = "linux")]
+fn validate_requested_matches_record(
+    record: &InstallRecord,
+    broker_source: &Path,
+    requested: &BrokerInstallConfig,
+) -> Result<(), String> {
+    if requested.daemon_uid != record.daemon_uid
+        || requested.daemon_gid != record.daemon_gid
+        || requested.socket_security.owner_uid != record.socket_owner_uid
+        || requested.socket_security.group_gid != record.socket_group_gid
+        || requested.socket_security.mode != record.socket_mode
+        || requested.allowed_uids != record.allowed_uids
+        || sha256_file(broker_source)? != record.broker_sha256
+        || sha256_file(&requested.trusted_executable)? != record.trusted_executable_sha256
+    {
+        return Err(
+            "idempotent reinstall identity/configuration mismatch; refusing overwrite".into(),
+        );
+    }
+    Ok(())
 }
 
 pub fn uninstall_broker(base: &Path) -> Result<(), String> {
@@ -380,8 +423,8 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
         let socket_ok = endpoint_socket_valid(
             Path::new(&rec.endpoint),
             UnixSocketSecurity {
-                owner_uid: 0,
-                group_gid: 0,
+                owner_uid: rec.daemon_uid,
+                group_gid: rec.daemon_gid,
                 mode: 0o600,
             },
         );
@@ -391,7 +434,11 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
             network: "disabled",
             endpoint: Some(rec.endpoint),
             endpoint_kind: rec.endpoint_kind,
-            secret_present: Path::new(&rec.secret_file).is_file(),
+            secret_present: regular_file_owned_mode(
+                Path::new(&rec.secret_file),
+                rec.daemon_uid,
+                0o600,
+            ),
             signing_key_present: Path::new(&rec.signing_key_file).is_file(),
             verify_key_present: Path::new(&rec.verify_key_file).is_file(),
             unit_path: rec.unit_path,
@@ -447,10 +494,12 @@ pub fn load_linux_run_config(path: &Path) -> Result<crate::serve::BrokerServeCon
         || cfg.secret_file != format!("{LINUX_STATE}/broker.secret")
         || cfg.signing_key_file != format!("{LINUX_STATE}/private/{CAPABILITY_SIGNING_FILE}")
         || cfg.trusted_executable != LINUX_DAEMON
-        || cfg.socket_owner_uid != 0
-        || cfg.socket_group_gid != 0
+        || cfg.daemon_uid == 0
+        || cfg.daemon_gid == 0
+        || cfg.socket_owner_uid != cfg.daemon_uid
+        || cfg.socket_group_gid != cfg.daemon_gid
         || cfg.socket_mode != 0o600
-        || cfg.allowed_uids != [0]
+        || cfg.allowed_uids != [cfg.daemon_uid]
     {
         return Err("broker config differs from strict native Linux policy".into());
     }
@@ -461,8 +510,8 @@ pub fn load_linux_run_config(path: &Path) -> Result<crate::serve::BrokerServeCon
         trusted_executable: PathBuf::from(cfg.trusted_executable),
         allowed_uids: cfg.allowed_uids,
         socket_security: UnixSocketSecurity {
-            owner_uid: 0,
-            group_gid: 0,
+            owner_uid: cfg.daemon_uid,
+            group_gid: cfg.daemon_gid,
             mode: 0o600,
         },
         addr_file: None,
@@ -522,8 +571,8 @@ fn wait_active(record: &InstallRecord) -> Result<(), String> {
             && endpoint_socket_valid(
                 Path::new(&record.endpoint),
                 UnixSocketSecurity {
-                    owner_uid: 0,
-                    group_gid: 0,
+                    owner_uid: record.daemon_uid,
+                    group_gid: record.daemon_gid,
                     mode: 0o600,
                 },
             )
@@ -677,6 +726,18 @@ fn verify_regular_root(path: &Path, mode: u32) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn regular_file_owned_mode(path: &Path, uid: u32, mode: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().is_some_and(|md| {
+        md.file_type().is_file()
+            && !md.file_type().is_symlink()
+            && md.uid() == uid
+            && md.mode() & 0o777 == mode
+            && ensure_no_extended_acl(path).is_ok()
+    })
+}
+
 /// POSIX ACLs can grant access that the mode bits do not show.  `getfacl` is
 /// the portable operator-facing reader available on supported Linux hosts; if
 /// it is installed, any named/default ACL is a custody violation.  Minimal
@@ -755,9 +816,11 @@ fn validate_record(rec: &InstallRecord) -> Result<(), String> {
         || rec.broker_binary != LINUX_BROKER
         || rec.config_path != LINUX_CONFIG
         || rec.trusted_executable != LINUX_DAEMON
-        || rec.allowed_uids != [0]
-        || rec.socket_owner_uid != 0
-        || rec.socket_group_gid != 0
+        || rec.daemon_uid == 0
+        || rec.daemon_gid == 0
+        || rec.allowed_uids != [rec.daemon_uid]
+        || rec.socket_owner_uid != rec.daemon_uid
+        || rec.socket_group_gid != rec.daemon_gid
         || rec.socket_mode != 0o600
     {
         return Err("install record is not an exact Linux native service record".into());

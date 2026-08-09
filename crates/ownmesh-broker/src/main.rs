@@ -64,16 +64,23 @@ enum Commands {
         /// Source ownmeshd image to install beside the broker.
         #[arg(long)]
         trusted_executable: Option<PathBuf>,
-        /// Must be 0 on the Linux native service.
+        /// Unprivileged ownmeshd UID. Required for direct root invocation;
+        /// defaults only from a validated sudo caller identity.
+        #[arg(long)]
+        daemon_uid: Option<u32>,
+        /// Unprivileged ownmeshd primary GID. Required with --daemon-uid.
+        #[arg(long)]
+        daemon_gid: Option<u32>,
+        /// Must equal --daemon-uid when supplied.
         #[arg(long)]
         socket_owner_uid: Option<u32>,
-        /// Must be 0 on the Linux native service.
+        /// Must equal --daemon-gid when supplied.
         #[arg(long)]
         socket_group_gid: Option<u32>,
         /// Must be 0600 on the Linux native service.
         #[arg(long, value_parser = parse_octal_mode)]
         socket_mode: Option<u32>,
-        /// Must contain exactly UID 0 on the Linux native service.
+        /// Must contain exactly --daemon-uid on the Linux native service.
         #[arg(long = "allowed-uid")]
         allowed_uids: Vec<u32>,
     },
@@ -152,14 +159,15 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             if st.installed { Ok(()) } else { Err(st.notes.first().cloned().unwrap_or_else(|| "broker is not installed".into())) }
         }
-        Commands::Install { state_dir, endpoint, trusted_executable, socket_owner_uid, socket_group_gid, socket_mode, allowed_uids } => {
+        Commands::Install { state_dir, endpoint, trusted_executable, daemon_uid, daemon_gid, socket_owner_uid, socket_group_gid, socket_mode, allowed_uids } => {
             let endpoint = endpoint.map(|raw| raw.strip_prefix("unix:").map(PathBuf::from).map(BrokerEndpoint::UnixSocket).ok_or_else(|| "install endpoint must use unix:/run/ownmesh/broker.sock".to_string())).transpose()?;
             let broker = std::env::current_exe().map_err(|e| format!("resolve broker executable: {e}"))?;
             let trusted = trusted_executable.unwrap_or_else(|| broker.with_file_name("ownmeshd"));
+            let (daemon_uid, daemon_group_gid) = resolve_daemon_identity(daemon_uid, daemon_gid)?;
             let rec = install_broker_with_config(state_dir.as_deref().unwrap_or_else(|| Path::new(".")), BrokerInstallConfig {
-                endpoint, trusted_executable: trusted,
-                socket_security: UnixSocketSecurity { owner_uid: socket_owner_uid.unwrap_or(0), group_gid: socket_group_gid.unwrap_or(0), mode: socket_mode.unwrap_or(0o600) },
-                allowed_uids: if allowed_uids.is_empty() { vec![0] } else { allowed_uids },
+                endpoint, trusted_executable: trusted, daemon_uid, daemon_gid: daemon_group_gid,
+                socket_security: UnixSocketSecurity { owner_uid: socket_owner_uid.unwrap_or(daemon_uid), group_gid: socket_group_gid.unwrap_or(daemon_group_gid), mode: socket_mode.unwrap_or(0o600) },
+                allowed_uids: if allowed_uids.is_empty() { vec![daemon_uid] } else { allowed_uids },
             })?;
             println!("installed=true support={} endpoint={}", rec.support, rec.endpoint); Ok(())
         }
@@ -178,6 +186,29 @@ async fn run(cli: Cli) -> Result<(), String> {
             "unsupported: elevated broker exec CLI is disabled until a secure mint authority is established (fail-closed; no process spawn)"
         )),
     }
+}
+
+fn resolve_daemon_identity(uid: Option<u32>, gid: Option<u32>) -> Result<(u32, u32), String> {
+    let (uid, gid) = match (uid, gid) {
+        (Some(uid), Some(gid)) => (uid, gid),
+        (None, None) => {
+            let uid = std::env::var("SUDO_UID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            let gid = std::env::var("SUDO_GID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            match (uid, gid) {
+                (Some(uid), Some(gid)) => (uid, gid),
+                _ => return Err("direct root install requires --daemon-uid <nonzero> --daemon-gid <nonzero>; sudo defaults require both SUDO_UID and SUDO_GID".into()),
+            }
+        }
+        _ => return Err("--daemon-uid and --daemon-gid must be supplied together".into()),
+    };
+    if uid == 0 || gid == 0 {
+        return Err("Linux native broker refuses root ownmeshd identity; choose an explicit non-root daemon UID/GID".into());
+    }
+    Ok((uid, gid))
 }
 
 #[cfg(test)]

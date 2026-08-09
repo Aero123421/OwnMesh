@@ -2,10 +2,13 @@
 
 Networkless privileged broker for elevated operations.
 
-On Linux, `ownmesh-broker install --trusted-executable <root-owned-ownmeshd>`
-creates a root-only native systemd service. It copies immutable images to
-`/usr/lib/ownmesh`, uses `/run/ownmesh/broker.sock` with mode `0600`, and only
-accepts the strict root-owned configuration at `/etc/ownmesh/ownmesh-broker.json`.
+On Linux, `ownmesh-broker install --trusted-executable <root-owned-ownmeshd>
+--daemon-uid <uid> --daemon-gid <gid>` creates a root-only native systemd
+service while `ownmeshd` remains an explicit non-root peer identity. It copies
+immutable images to `/usr/lib/ownmesh`, gives that daemon-owned UDS and request
+secret mode `0600`, and only accepts the strict root-owned configuration at
+`/etc/ownmesh/ownmesh-broker.json`. When invoked through sudo, both UID/GID may
+be read from `SUDO_UID`/`SUDO_GID`; direct root invocations must supply them.
 Windows and macOS lifecycle commands remain unsupported.
 
 ## Production status: **UNSUPPORTED**

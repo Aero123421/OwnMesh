@@ -294,6 +294,8 @@ mod tests {
             BrokerInstallConfig {
                 endpoint: Some(BrokerEndpoint::NamedPipe("ignored".into())),
                 trusted_executable: PathBuf::from("ignored"),
+                daemon_uid: 1000,
+                daemon_gid: 1000,
                 socket_security: UnixSocketSecurity {
                     owner_uid: 0,
                     group_gid: 0,
