@@ -23,11 +23,9 @@ pub const PIPE_FALLBACK_MAX_BYTES: usize = 256 * 1024;
 pub const PIPE_FALLBACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Host I/O contract selected by the supervisor spawn request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HostIoMode { Pty, StructuredPipes }
-
-impl Default for HostIoMode { fn default() -> Self { Self::Pty } }
+pub enum HostIoMode { #[default] Pty, StructuredPipes }
 
 /// Live PTY session used by the standalone CLI (or pipe fallback).
 pub struct PtySession {
@@ -138,7 +136,7 @@ impl StructuredProcessHost {
         if frame.is_empty() || frame.len() > 64 * 1024 || !frame.ends_with(b"\n") { return Err("structured frame must be LF terminated and <= 64KiB".into()); }
         let mut stdin = self.stdin.lock().map_err(|e| e.to_string())?;
         let writer = stdin.as_mut().ok_or("structured stdin closed")?;
-        writer.write_all(frame).and_then(|_| writer.flush()).map_err(|e| e.to_string())
+        writer.write_all(frame).and_then(|()| writer.flush()).map_err(|e| e.to_string())
     }
 
     pub fn drain_stdout(&self, max: usize) -> Result<RawDrainOutput, String> { drain_ring(&self.stdout, max) }
@@ -167,6 +165,7 @@ fn drain_ring(ring: &Arc<Mutex<ByteRing>>, max: usize) -> Result<RawDrainOutput,
 }
 
 fn terminate_std_child_tree(child: &mut Child) -> Result<(), String> {
+    if child.try_wait().map_err(|e| e.to_string())?.is_some() { return Ok(()); }
     #[cfg(windows)]
     { let status = Command::new("taskkill").args(["/PID", &child.id().to_string(), "/T", "/F"]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("taskkill failed".into()); } }
     #[cfg(unix)]
