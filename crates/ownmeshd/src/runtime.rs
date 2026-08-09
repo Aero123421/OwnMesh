@@ -21,6 +21,8 @@
     clippy::unused_self
 )]
 
+#[path = "session_transition_journal.rs"]
+mod session_transition_journal;
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
@@ -55,6 +57,7 @@ use ownmesh_session_host::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use session_transition_journal::{SessionTransitionJournal, TransitionPhase};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -344,6 +347,7 @@ struct WorkspaceRegistryFile {
 }
 
 /// Shared daemon operation state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct DaemonRuntime {
     paths: OwnMeshPaths,
     policy: PolicyDocument,
@@ -376,6 +380,8 @@ pub struct DaemonRuntime {
     /// Dedicated local-only proxy for remote/cloud PTY sessions. Local CLI
     /// compatibility keeps the legacy embedded host path until fully migrated.
     supervisor: Option<SupervisorClient>,
+    transition_journal: SessionTransitionJournal,
+    transition_recovery_running: bool,
     broker_endpoint: Option<BrokerEndpoint>,
     broker_secret: Option<BrokerSecret>,
     /// Optional cancel signal for the currently executing remote command.
@@ -432,6 +438,8 @@ impl DaemonRuntime {
             &paths.state_dir.join("revoked-clients.json"),
         )?));
         let sessions_path = paths.state_dir.join("sessions").join("sessions.json");
+        let transition_journal =
+            SessionTransitionJournal::open(paths.state_dir.join("session-transitions"))?;
         let mut sessions = SessionManager::load_from_path(&sessions_path).map_err(|e| {
             format!(
                 "failed to load sessions from {}: {e}",
@@ -469,6 +477,8 @@ impl DaemonRuntime {
             sessions_path,
             live_hosts: HashMap::new(),
             supervisor: None,
+            transition_journal,
+            transition_recovery_running: false,
             broker_endpoint,
             broker_secret,
             active_cancel: None,
@@ -2570,10 +2580,68 @@ full_user_access/full_access for arbitrary commands",
                 });
             }
         }
+        self.recover_sidecar_transitions()?;
         self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
             code: app_error::INTERNAL,
             message: "persistent session sidecar state unavailable".into(),
         })
+    }
+
+    fn recover_sidecar_transitions(&mut self) -> IpcResult<()> {
+        if self.transition_recovery_running {
+            return Ok(());
+        }
+        self.transition_recovery_running = true;
+        let result = (|| {
+            for record in self.transition_journal.pending() {
+                if record.expires_unix <= Self::now() {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "expired sidecar transition journal record {}",
+                            record.transition_id
+                        ),
+                    });
+                }
+                if record.phase == TransitionPhase::Intent {
+                    // An intent does not prove that the sidecar mutation ran.
+                    // Keep it durable and fail closed until the transition RPC
+                    // is replayed with its exact id/facts by the owning handler.
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "unapplied sidecar transition requires exact recovery: {}",
+                            record.transition_id
+                        ),
+                    });
+                }
+                let binding = record.new_binding.clone().ok_or_else(|| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: "applied sidecar transition missing binding".into(),
+                })?;
+                let current = self.sessions.get(&record.session_id).map_err(session_err)?;
+                if current.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: "sidecar transition workspace mismatch during recovery".into(),
+                    });
+                }
+                let snapshot = self.sessions.clone();
+                self.sessions
+                    .set_sidecar_host_binding(&record.session_id, Some(binding))
+                    .map_err(session_err)?;
+                self.commit_sessions(snapshot)?;
+                self.transition_journal
+                    .clear(&record.transition_id)
+                    .map_err(|e| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: format!("clear recovered transition journal: {e}"),
+                    })?;
+            }
+            Ok(())
+        })();
+        self.transition_recovery_running = false;
+        result
     }
 
     async fn handle_session_open(
