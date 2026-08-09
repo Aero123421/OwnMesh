@@ -38,6 +38,8 @@ mod serve;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+mod windows_ledger;
+#[cfg(windows)]
 mod windows_runner;
 
 pub use install::load_linux_run_config;
@@ -67,6 +69,8 @@ pub use windows::{
     WindowsPeerAuthorizer, WindowsProductionBrokerServer, WindowsReplayLedger,
     WindowsTrustedDaemon,
 };
+#[cfg(windows)]
+pub use windows_ledger::WindowsDurableReplayLedger;
 #[cfg(windows)]
 pub use windows_runner::WindowsJobRunner;
 
