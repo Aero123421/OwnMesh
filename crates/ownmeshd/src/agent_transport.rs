@@ -2383,6 +2383,7 @@ fn map_request_to_method(
 ) -> Result<(&'static str, Value), String> {
     let action = action_of(request);
     let mut args = args_object(request);
+    bind_envelope_workspace(request, &mut args)?;
     // Only private exact-bound transfer operations receive server-derived peer
     // facts. `transfer.start` needs the complete signed plan so its local
     // runtime can reconstruct exactly what the Room ticket authorizes; it is
@@ -2690,23 +2691,53 @@ fn map_request_to_method(
         }
     };
 
-    // Bind server-side idempotency to the operation contract key when the caller
-    // did not supply one inside arguments.
-    if !args.contains_key("idempotency_key") {
-        args.insert(
-            "idempotency_key".into(),
-            Value::String(request.idempotency_key.clone()),
-        );
-    }
-    // Propagate envelope workspace_id into method args so the runtime selects
-    // the registered root at the side-effect boundary (not audit-only).
-    if let Some(ws) = request.workspace_id.as_ref() {
-        let ws_str = ws.to_string();
-        if !ws_str.trim().is_empty() && !args.contains_key("workspace_id") {
-            args.insert("workspace_id".into(), Value::String(ws_str));
+    // The operation contract key is the sole remote idempotency authority.
+    // A different arguments-side key could otherwise retrieve a prior
+    // same-principal journal result under a new signed operation.
+    if let Some(candidate) = args.get("idempotency_key") {
+        if candidate.as_str() != Some(request.idempotency_key.as_str()) {
+            return Err("arguments idempotency_key differs from operation contract".into());
         }
     }
+    args.insert(
+        "idempotency_key".into(),
+        Value::String(request.idempotency_key.clone()),
+    );
     Ok((method, Value::Object(args)))
+}
+
+/// The envelope workspace is part of the authenticated exact action.  It is
+/// deliberately excluded from generic `facts` because it is a top-level
+/// routing/ownership boundary, so preserve it separately and never let an
+/// arguments-side value nominate a different runtime workspace.
+fn bind_envelope_workspace(
+    request: &OperationRequestPayload,
+    args: &mut Map<String, Value>,
+) -> Result<(), String> {
+    match request.workspace_id.as_ref() {
+        Some(workspace) => {
+            let expected = workspace.as_str();
+            if expected.trim().is_empty() {
+                return Err("envelope workspace_id is empty".into());
+            }
+            if let Some(candidate) = args.get("workspace_id") {
+                if candidate.as_str() != Some(expected) {
+                    return Err(
+                        "arguments workspace_id differs from verified envelope workspace".into(),
+                    );
+                }
+            }
+            args.insert("workspace_id".into(), Value::String(expected.to_owned()));
+            Ok(())
+        }
+        None => {
+            if args.contains_key("workspace_id") {
+                Err("arguments workspace_id is forbidden when envelope has no workspace".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 fn bound_result_object(value: Value) -> Value {
@@ -4030,6 +4061,95 @@ mod tests {
         let device = DeviceId::parse("dev_bind_ok").unwrap();
         let (request, expires) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
         assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+    }
+
+    fn refresh_bound_hash(request: &mut OperationRequestPayload) {
+        let bound = request
+            .authorization
+            .as_ref()
+            .expect("bound action")
+            .bound_action
+            .clone();
+        request.payload_hash = Some(sha256_hex_str(&stable_stringify(&bound)));
+    }
+
+    #[test]
+    fn verified_envelope_workspace_cannot_be_substituted_for_fs_or_elevated_command() {
+        let device = DeviceId::parse("dev_workspace_bound").unwrap();
+        let (mut fs_request, expires) =
+            sample_bound_request(device.as_str(), "workspace.txt", Some("hello"));
+        fs_request.workspace_id = Some(ownmesh_domain::WorkspaceId::parse("ws_verified").unwrap());
+        fs_request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_id".into(), json!("ws_verified"));
+        fs_request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_id".into(), json!("ws_attacker"));
+        refresh_bound_hash(&mut fs_request);
+        assert!(verify_exact_action_binding(&device, &fs_request, Some(&expires)).is_ok());
+        assert!(map_request_to_method(&fs_request).is_err());
+
+        let mut command_request = fs_request.clone();
+        command_request.capability = "command.run".into();
+        command_request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("action".into(), json!("command.run"));
+        let bound = command_request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap();
+        bound.insert("capability".into(), json!("command.run"));
+        bound.insert("action".into(), json!("command.run"));
+        refresh_bound_hash(&mut command_request);
+        assert!(verify_exact_action_binding(&device, &command_request, Some(&expires)).is_ok());
+        assert!(map_request_to_method(&command_request).is_err());
+
+        command_request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_id".into(), json!("ws_verified"));
+        let (_, mapped) = map_request_to_method(&command_request).unwrap();
+        assert_eq!(mapped["workspace_id"], "ws_verified");
+
+        let (mut unscoped, _) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
+        unscoped
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_id".into(), json!("ws_attacker"));
+        assert!(map_request_to_method(&unscoped).is_err());
+    }
+
+    #[test]
+    fn contract_idempotency_cannot_be_replaced_with_an_old_journal_key() {
+        let device = DeviceId::parse("dev_idempotency_bound").unwrap();
+        let (mut request, _expires) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
+        request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("idempotency_key".into(), json!("old-operation-journal-key"));
+        assert!(map_request_to_method(&request).is_err());
+
+        request.arguments.as_object_mut().unwrap().insert(
+            "idempotency_key".into(),
+            json!(request.idempotency_key.clone()),
+        );
+        let (_, mapped) = map_request_to_method(&request).unwrap();
+        assert_eq!(mapped["idempotency_key"], request.idempotency_key);
     }
 
     #[test]
