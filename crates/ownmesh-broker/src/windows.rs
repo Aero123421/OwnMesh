@@ -293,7 +293,15 @@ where
                         .lock()
                         .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
                         .reserve(&internal, now)?;
-                    let mut response = self.runner.run(&internal);
+                    // A pipe connection is part of the authority boundary: the
+                    // daemon must keep the exact, SCM-attested connection alive
+                    // for the whole side effect.  Do not let a lost client leave
+                    // a privileged Job running in the background.  The runner is
+                    // invoked on the blocking pool because it owns synchronous
+                    // Job Object handles while this task continues to observe EOF.
+                    let mut response = self
+                        .run_with_disconnect_cancellation(connection, internal.clone())
+                        .await?;
                     if let Err(error) = self
                         .ledger
                         .lock()
@@ -322,6 +330,38 @@ where
             truncated: false,
             duration_ms: 0,
         })
+    }
+
+    async fn run_with_disconnect_cancellation(
+        &self,
+        connection: &mut ownmesh_ipc::ServerConnection,
+        request: BrokerRequestV2,
+    ) -> Result<BrokerResponseV2, String> {
+        let runner = Arc::clone(&self.runner);
+        let request_for_runner = request.clone();
+        let mut execution = tokio::task::spawn_blocking(move || runner.run(&request_for_runner));
+        let mut probe = [0_u8; 1];
+        tokio::select! {
+            result = &mut execution => result.map_err(|error| format!("Windows Job execution task failed: {error}")),
+            read = connection.read(&mut probe) => {
+                let read = read.map_err(|error| format!("observe Windows broker peer disconnect: {error}"))?;
+                // A v2 connection is single-frame.  EOF is the normal loss of
+                // custody signal; a second byte is an equally invalid protocol
+                // transition and is fenced in exactly the same way.
+                let cancelled = self.runner.cancel(&request.request_id, &request.nonce);
+                if !cancelled {
+                    return Err("Windows broker peer changed connection but no matching active Job was cancellable".into());
+                }
+                let response = execution
+                    .await
+                    .map_err(|error| format!("Windows Job cancellation task failed: {error}"))?;
+                // Return the runner receipt so the durable replay ledger is
+                // finalized even though the caller can no longer receive it.
+                // A subsequent same-nonce frame remains fenced by that ledger.
+                let _ = read;
+                Ok(response)
+            }
+        }
     }
 }
 
