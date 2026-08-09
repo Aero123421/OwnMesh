@@ -121,6 +121,7 @@ Annotations are **UX hints only**. They do not authorize.
 | Device preset / decision | MCP tool result (`structuredContent`) |
 |---|---|
 | `allow` | `status: "completed"` (or `pending`/`running` if async) |
+| `ask` with local `delegate_remote_mcp = true` and a valid exact-bound MCP action | `status: "completed"`; no OwnMesh approval page is required |
 | `ask` | `status: "approval_required"`, `approval_required: true`, `operation_id`, `approval_url`, optional `approval_id` |
 | `deny` | `status: "denied"` with `OWNMESH_E_POLICY_DENIED` |
 | Device offline | `status: "device_offline"` with `OWNMESH_E_DEVICE_OFFLINE` |
@@ -143,12 +144,26 @@ Then poll `ownmesh_get_operation` with the same `operation_id`.
 ChatGPT’s confirmation card **must not** be treated as OwnMesh local approval or
 as a cryptographic attestation OwnMesh can verify.
 
+For ChatGPT-primary operation, the device owner may explicitly enable the local
+policy-file setting below during setup. This treats the authenticated MCP
+invocation with a verified operation ID, payload hash, and unexpired binding as
+the requested action; it does not accept a client `approved` flag or claim a
+ChatGPT attestation. `deny`, lockdown, OAuth/device checks, exact-action
+matching, expiry, and idempotency still fail closed. Omitting the setting (the
+default) retains the recovery approval flow above.
+
+```toml
+# policy.toml
+preset = "recommended"
+delegate_remote_mcp = true
+```
+
 ### Recommended matrix for first-time setup
 
 | Phase | ChatGPT | OwnMesh preset | Expectation |
 |---|---|---|---|
 | Day-0 read-only | Grant read scopes only | `workspace_only` or `recommended` | List/read works; write/exec fail scope or ask |
-| Trusted write | Add write/exec scopes | `recommended` | Writes return `approval_required` until TUI/CLI approve |
+| Trusted write | Add write/exec scopes | `recommended` + `delegate_remote_mcp = true` | Exact-bound MCP writes complete in ChatGPT; no OwnMesh approval UI |
 | Power user | Full scopes | `full_user_access` | Broader allow inside user home; still no silent privilege escape |
 | Lab only | Full scopes | `full_access` | Policy allow-all **without hidden denies**; still no broker integrity bypass |
 

@@ -1257,6 +1257,7 @@ fn production_daemon_start_recovers_config_written_journal_before_policy_use() {
     let old_policy = PolicyFile {
         schema_version: 1,
         preset: Some("full_access".into()),
+        delegate_remote_mcp: false,
     };
     save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -1272,6 +1273,7 @@ fn production_daemon_start_recovers_config_written_journal_before_policy_use() {
     let new_policy = PolicyFile {
         schema_version: 1,
         preset: Some("workspace_only".into()),
+        delegate_remote_mcp: false,
     };
     // Render via a successful transactional write to a sibling layout, then copy bytes.
     let render_dir = tempdir().unwrap();

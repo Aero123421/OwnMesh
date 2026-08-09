@@ -462,6 +462,11 @@ pub struct PolicyFile {
     /// Selected preset name when using a built-in preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// When deliberately enabled during local setup, an authenticated and
+    /// exact-bound remote MCP invocation is the user's requested action.  This
+    /// is not (and must never be represented as) a ChatGPT attestation.
+    #[serde(default)]
+    pub delegate_remote_mcp: bool,
 }
 
 impl Default for PolicyFile {
@@ -469,6 +474,7 @@ impl Default for PolicyFile {
         Self {
             schema_version: 1,
             preset: Some("recommended".into()),
+            delegate_remote_mcp: false,
         }
     }
 }

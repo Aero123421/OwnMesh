@@ -374,6 +374,7 @@ pub fn apply_setup(
     let policy = PolicyFile {
         schema_version: 1,
         preset: Some(preset_slug(preset).to_string()),
+        delegate_remote_mcp: false,
     };
     policy
         .validate()

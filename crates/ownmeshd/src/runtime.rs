@@ -338,6 +338,9 @@ struct WorkspaceRegistryFile {
 pub struct DaemonRuntime {
     paths: OwnMeshPaths,
     policy: PolicyDocument,
+    /// Explicit local setup choice: authenticated, exact-bound remote MCP
+    /// invocation may satisfy a policy Ask. Defaults fail-closed to false.
+    delegate_remote_mcp: bool,
     grants: Vec<TemporaryGrant>,
     approvals: HashMap<String, ApprovalRecord>,
     /// Completed operation results keyed by client idempotency key.
@@ -393,6 +396,7 @@ impl DaemonRuntime {
             format!("policy load failed (refusing startup; config+policy journal preserved on recovery failure): {e}")
         })?;
         let policy = policy_from_file(&policy_file);
+        let delegate_remote_mcp = policy_file.delegate_remote_mcp;
         let enforce_workspace = matches!(
             policy.preset,
             AccessPreset::WorkspaceOnly | AccessPreset::Recommended
@@ -436,6 +440,7 @@ impl DaemonRuntime {
         Ok(Self {
             paths: paths.clone(),
             policy,
+            delegate_remote_mcp,
             grants,
             approvals,
             op_journal,
@@ -932,7 +937,22 @@ impl DaemonRuntime {
             return Ok(replayed);
         }
 
-        let verdict = self.evaluate(&facts, &requester_principal);
+        let mut verdict = self.evaluate(&facts, &requester_principal);
+        // ChatGPT does not provide a cryptographic confirmation attestation.
+        // A user may nevertheless configure the local device to treat the
+        // authenticated, canonical-payload-bound MCP invocation itself as the
+        // confirmation UI. This narrowly converts only a policy Ask; it cannot
+        // bypass Deny, local lockdown, binding/expiry verification or custody.
+        let delegated_remote = self.delegate_remote_mcp
+            && self.active_remote_operation_id.is_some()
+            && self.active_remote_payload_hash.is_some()
+            && self
+                .active_remote_expires_at_unix
+                .is_some_and(|expiry| expiry >= Self::now());
+        if delegated_remote && verdict.decision == Decision::Ask {
+            verdict.decision = Decision::Allow;
+            verdict.reason = format!("{}; remote MCP delegation configured", verdict.reason);
+        }
         // Prefer the control-plane operation id when present so Ask/Allow results
         // keep DeviceRoom correlation/operation_id binding. Local IPC keeps a
         // freshly minted id.
@@ -1900,6 +1920,7 @@ full_user_access/full_access for arbitrary commands",
             "note": self.policy.note,
             "rules": self.policy.rules,
             "lockdown": self.lockdown,
+            "delegate_remote_mcp": self.delegate_remote_mcp,
             "grants": self.grants,
             "full_access_conformance": full_access_has_no_hidden_restrictive_rules(&self.policy)
                 || self.policy.preset != AccessPreset::FullAccess,
@@ -1915,6 +1936,8 @@ full_user_access/full_access for arbitrary commands",
         #[derive(Deserialize)]
         struct P {
             name: String,
+            #[serde(default)]
+            delegate_remote_mcp: Option<bool>,
         }
         let p: P = parse_params(params)?;
         let preset = parse_preset(&p.name).ok_or_else(|| IpcError::Remote {
@@ -1929,12 +1952,14 @@ full_user_access/full_access for arbitrary commands",
         let file = PolicyFile {
             schema_version: 1,
             preset: Some(preset_name(preset).into()),
+            delegate_remote_mcp: p.delegate_remote_mcp.unwrap_or(self.delegate_remote_mcp),
         };
         save_policy(&self.paths, &file).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
         })?;
         self.policy = policy;
+        self.delegate_remote_mcp = file.delegate_remote_mcp;
         self.enforce_workspace = enforce_workspace;
         self.append_audit(
             "policy.preset",

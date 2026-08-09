@@ -26,7 +26,7 @@
 #[path = "../src/runtime.rs"]
 mod runtime;
 
-use ownmesh_config::OwnMeshPaths;
+use ownmesh_config::{save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_ipc::{app_error, methods, ClientIdentity, IpcError};
 use ownmesh_policy::{preset_document, AccessPreset};
 use runtime::{session_methods, DaemonRuntime};
@@ -112,6 +112,59 @@ async fn enqueue_write(rt: &mut DaemonRuntime, key: Option<&str>) -> String {
         .expect("enqueue approval");
     assert_eq!(queued["approval_required"], true);
     queued["approval_id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn delegated_remote_mcp_executes_exact_bound_ask_without_local_approval() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    save_policy(
+        &paths,
+        &PolicyFile {
+            schema_version: 1,
+            preset: Some("recommended".into()),
+            delegate_remote_mcp: true,
+        },
+    )
+    .unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let remote = ClientIdentity::new("client:remote:oauth-principal", "1.0");
+
+    let allowed = rt
+        .dispatch_cancellable_bound(
+            methods::OPS_FS_WRITE,
+            Some(json!({
+                "path": "delegated.txt",
+                "content": "exact-bound",
+                "idempotency_key": "delegated-write-1",
+            })),
+            &remote,
+            None,
+            Some("op_delegated_1".into()),
+            Some(i64::MAX),
+            Some("a".repeat(64)),
+        )
+        .await
+        .expect("delegated exact-bound write executes");
+    assert_eq!(allowed["approval_required"], false);
+    assert_eq!(
+        fs::read_to_string(paths.state_dir.join("workspace").join("delegated.txt")).unwrap(),
+        "exact-bound"
+    );
+
+    let unbound = rt
+        .dispatch_cancellable_bound(
+            methods::OPS_FS_WRITE,
+            Some(json!({ "path": "unbound.txt", "content": "must-ask" })),
+            &remote,
+            None,
+            Some("op_delegated_2".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("unbound write is queued instead of delegated");
+    assert_eq!(unbound["approval_required"], true);
 }
 
 async fn open_session(rt: &mut DaemonRuntime, who: &str, title: &str) -> String {

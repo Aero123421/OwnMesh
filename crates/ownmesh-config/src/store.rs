@@ -915,6 +915,7 @@ mod tests {
         let policy = PolicyFile {
             schema_version: 1,
             preset: Some("recommended".into()),
+            delegate_remote_mcp: false,
         };
         save_config_and_policy_transactional(&paths, &cfg, &policy).unwrap();
         assert!(!transaction_path(&paths).exists());
@@ -940,6 +941,7 @@ mod tests {
         let old_policy = PolicyFile {
             schema_version: 1,
             preset: Some("full_access".into()),
+            delegate_remote_mcp: false,
         };
         save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -955,6 +957,7 @@ mod tests {
         let new_policy = PolicyFile {
             schema_version: 1,
             preset: Some("workspace_only".into()),
+            delegate_remote_mcp: false,
         };
 
         // Simulate crash after config stage: journal left in config_written with new config
@@ -1003,6 +1006,7 @@ mod tests {
         let old_policy = PolicyFile {
             schema_version: 1,
             preset: Some("full_access".into()),
+            delegate_remote_mcp: false,
         };
         save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -1018,6 +1022,7 @@ mod tests {
         let new_policy = PolicyFile {
             schema_version: 1,
             preset: Some("workspace_only".into()),
+            delegate_remote_mcp: false,
         };
         let new_config = toml::to_string_pretty(&new_cfg).unwrap();
         let new_policy_text = toml::to_string_pretty(&new_policy).unwrap();
@@ -1117,6 +1122,7 @@ mod tests {
         let policy = PolicyFile {
             schema_version: 1,
             preset: Some("recommended".into()),
+            delegate_remote_mcp: false,
         };
         save_config_and_policy_transactional(&paths, &initial, &policy).unwrap();
 
@@ -1144,6 +1150,7 @@ mod tests {
                     } else {
                         "workspace_only".into()
                     }),
+                    delegate_remote_mcp: false,
                 };
                 barrier.wait();
                 save_config_and_policy_transactional(&paths, &cfg, &pol).expect("serialized setup");
@@ -1178,6 +1185,7 @@ mod tests {
         let old_policy = PolicyFile {
             schema_version: 1,
             preset: Some("recommended".into()),
+            delegate_remote_mcp: false,
         };
         save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -1193,6 +1201,7 @@ mod tests {
         let new_policy = PolicyFile {
             schema_version: 1,
             preset: Some("workspace_only".into()),
+            delegate_remote_mcp: false,
         };
 
         // Fault-inject policy destination as a non-empty directory so atomic_write fails.
