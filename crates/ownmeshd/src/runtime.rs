@@ -2868,7 +2868,13 @@ full_user_access/full_access for arbitrary commands",
         let now = Self::now() as u64;
         let lease = self
             .transfer_store
-            .acquire(&plan, now, authority.expires_at_unix)
+            .acquire_for_fence(
+                &plan,
+                now,
+                authority.expires_at_unix,
+                u64::from(p.epoch),
+                p.fence,
+            )
             .map_err(Self::transfer_error)?;
         let journal = self
             .transfer_store

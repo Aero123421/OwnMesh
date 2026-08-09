@@ -278,6 +278,34 @@ fn stale_lease_drop_cannot_remove_a_fresh_cross_process_unique_lease() {
 }
 
 #[test]
+fn newer_fence_reclaims_crash_orphan_and_retired_holder_cannot_save() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"resume");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let retired = store.acquire_for_fence(&plan, 1, 9_000, 1, 1).unwrap();
+    let old = store
+        .claim(&retired, &plan, "owner-a", 1, 1, 1, 9_000)
+        .unwrap();
+
+    // Model a coordinator fence advance while the previous process/operation
+    // never got to release its durable lease record.
+    let current = store.acquire_for_fence(&plan, 2, 9_000, 2, 2).unwrap();
+    let resumed = store
+        .claim(&current, &plan, "owner-a", 2, 2, 2, 9_000)
+        .unwrap();
+    assert_eq!(resumed.epoch(), 2);
+    assert_eq!(resumed.fence(), 2);
+    assert_eq!(store.save(&retired, &old), Err(TransferError::StaleFence));
+    drop(retired);
+    assert!(matches!(
+        store.acquire(&plan, 2, 9_000),
+        Err(TransferError::LeaseBusy)
+    ));
+    drop(current);
+    assert!(store.acquire(&plan, 2, 9_000).is_ok());
+}
+
+#[test]
 fn startup_cleanup_removes_only_expired_owned_part() {
     let dir = tempdir().unwrap();
     let plan = make_plan(b"hello");

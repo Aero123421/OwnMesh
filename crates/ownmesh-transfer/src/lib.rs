@@ -1274,6 +1274,35 @@ impl JournalStore {
         now_unix: u64,
         expires_at_unix: u64,
     ) -> TransferResult<JournalLease> {
+        self.acquire_inner(plan, now_unix, expires_at_unix, None)
+    }
+
+    /// Acquire a destination mutation lease for an exact transfer fence.
+    /// A strictly newer epoch/fence may retire a crash-or-disconnect orphaned
+    /// lease even while the immutable transfer grant is still live. Every
+    /// subsequent save verifies the lease nonce, so the retired holder cannot
+    /// overwrite the newly claimed journal if it resumes late.
+    pub fn acquire_for_fence(
+        &self,
+        plan: &TransferPlan,
+        now_unix: u64,
+        expires_at_unix: u64,
+        epoch: u64,
+        fence: u64,
+    ) -> TransferResult<JournalLease> {
+        if epoch == 0 || fence == 0 {
+            return Err(TransferError::StaleFence);
+        }
+        self.acquire_inner(plan, now_unix, expires_at_unix, Some((epoch, fence)))
+    }
+
+    fn acquire_inner(
+        &self,
+        plan: &TransferPlan,
+        now_unix: u64,
+        expires_at_unix: u64,
+        requested_fence: Option<(u64, u64)>,
+    ) -> TransferResult<JournalLease> {
         let _store_lock = self.lock_store()?;
         plan.validate_at(now_unix)?;
         if expires_at_unix <= now_unix {
@@ -1291,9 +1320,18 @@ impl JournalStore {
         } else {
             let existing =
                 read_owner_only_file_bounded(&path, 512).map_err(|_| TransferError::LeaseBusy)?;
-            let stale =
+            let expired =
                 parse_lease_expiry(&existing, plan.id()).is_some_and(|expiry| expiry <= now_unix);
-            if !stale {
+            let fenced_reclaim = requested_fence.is_some_and(|(epoch, fence)| {
+                match self.load(plan) {
+                    Ok(Some(journal)) => epoch > journal.epoch && fence > journal.fence,
+                    // No journal means the old process died before its first
+                    // durable claim. Only a post-initial generation may retire it.
+                    Ok(None) => epoch > 1 && fence > 1,
+                    Err(_) => false,
+                }
+            });
+            if !expired && !fenced_reclaim {
                 return Err(TransferError::LeaseBusy);
             }
             remove_owner_only_file(&path).map_err(|_| TransferError::LeaseBusy)?;
@@ -1606,6 +1644,11 @@ impl JournalStore {
 
     fn save_unlocked(&self, lease: &JournalLease, journal: &TransferJournal) -> TransferResult<()> {
         if lease.plan_id != journal.plan_id {
+            return Err(TransferError::StaleFence);
+        }
+        let current = read_owner_only_file_bounded(&lease.path, 512)
+            .map_err(|_| TransferError::StaleFence)?;
+        if current != lease.body {
             return Err(TransferError::StaleFence);
         }
         let bytes = serde_json::to_vec(journal).map_err(|_| TransferError::CorruptJournal)?;
