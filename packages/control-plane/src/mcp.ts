@@ -2757,7 +2757,7 @@ async function reconcileTransferStart(
   // destination publication receipt: source may have lost its finish ACK only
   // after the receiver atomically published.  The transfer is already terminal
   // in the Room, so minting an epoch+1 pair would be both useless and unsafe.
-  else if (destination?.status === "completed" && destinationPublishedReceipt(destination)
+  else if (destination?.status === "completed" && destinationPublishedReceipt(destination, meta)
     && source?.status === "failed" && retryableTransferStartFailure(source)) {
     nextState = "completed"; status = "completed"; summary = "destination publication confirmed after source reply loss";
   }
@@ -2784,11 +2784,11 @@ function retryableTransferStartFailure(op: McpOperationRecord | null): boolean {
   return code === "OWNMESH_E_TRANSFER_RECONNECT" || code === "OWNMESH_E_TRANSFER_SESSION_LOST";
 }
 
-function destinationPublishedReceipt(op: McpOperationRecord): boolean {
+function destinationPublishedReceipt(op: McpOperationRecord, meta: TransferPlanMeta): boolean {
   const receipt = op.data;
   return receipt.role === "destination" && receipt.published === true
     && transferText(receipt.plan_id) !== null
-    && typeof receipt.artifact_sha256 === "string" && /^[a-f0-9]{64}$/.test(receipt.artifact_sha256);
+    && receipt.artifact_sha256 === meta.source_sha256;
 }
 
 async function reconcileTransferCancellation(
@@ -2804,6 +2804,27 @@ async function reconcileTransferCancellation(
     return updated ? { plan: updated, meta: failed } : { plan, meta };
   }
   if (!controls.every((op) => op?.status === "completed" || op?.status === "cancelled")) return { plan, meta };
+  const expectedTargets = [meta.source_start_operation_id, meta.destination_start_operation_id]
+    .filter((id): id is string => Boolean(id));
+  const cleanupProven = controls.length === expectedTargets.length && controls.every((op, index) =>
+    op?.data?.target_operation_id === expectedTargets[index]
+    && op.data.cancelled === true && op.data.signal_delivered === true,
+  );
+  if (!cleanupProven) {
+    // A generic cancel can truthfully report that no live task was found after
+    // an Agent restart.  That does not prove its durable transfer part was
+    // cleaned.  If both original starts are already terminal, let their exact
+    // receipts win; otherwise retain `cancelling` and never manufacture a
+    // successful cleanup result.
+    const startIds = [meta.source_start_operation_id, meta.destination_start_operation_id]
+      .filter((id): id is string => Boolean(id));
+    const starts = await Promise.all(startIds.map((operationId) => store.getMcpOperation(operationId)));
+    if (starts.length === 2 && starts.every((op) => op && ["completed", "failed", "denied", "cancelled", "device_offline"].includes(op.status))) {
+      const settled = await reconcileTransferStart(store, tracker, plan, { ...meta, state: "sending" });
+      if (settled.meta.state !== "sending") return settled;
+    }
+    return { plan, meta };
+  }
   const cancelled = { ...meta, state: "cancelled" as const };
   const updated = await patchOp(store, tracker, plan.operation_id, { status: "cancelled", summary: "transfer cancellation confirmed by both Agents", data: { [TRANSFER_META_KEY]: cancelled } }, ["cancel_requested", "running", "pending"]);
   return updated ? { plan: updated, meta: cancelled } : { plan, meta };
@@ -3152,6 +3173,12 @@ export async function handleMcp(
       let plan = await loadOp(store, tracker, transferId);
       let meta = plan && plan.tool === "ownmesh_transfer_plan" ? transferMeta(plan.data) : null;
       if (!plan || !meta) return mcpError(id, -32004, "transfer_not_available");
+      // Ownership is the first transfer boundary.  In particular, status is
+      // metadata-only, not public-by-opaque-id: never let a foreign caller
+      // observe a plan or trigger its reconciliation CAS.
+      if (meta.tenant_id !== rec.tenant_id || meta.principal_id !== rec.principal) {
+        return mcpError(id, -32004, "transfer_not_available");
+      }
       ({ plan, meta } = await reconcileTransferStart(store, tracker, plan, meta));
       ({ plan, meta } = await reconcileTransferCancellation(store, tracker, plan, meta));
       const authority = await transferAuthorities(store, meta, rec.principal, rec.tenant_id);
@@ -3163,7 +3190,10 @@ export async function handleMcp(
         if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 65536) return mcpError(id, -32602, "invalid artifact page arguments");
         // No fallback to fs.read is allowed: this is an immutable transfer-plan
         // artifact read with destination workspace/version custody rechecked.
-        if (meta.state !== "completed" || !meta.destination_plan_id || !router) return mcpError(id, -32009, "transfer artifact is not available", { transfer: publicTransferMeta(meta), max_bytes: 65536 });
+        if (meta.state !== "completed" || !meta.destination_plan_id || !meta.source_sha256
+          || meta.source_size_bytes === undefined || !router) {
+          return mcpError(id, -32009, "transfer artifact is not available", { transfer: publicTransferMeta(meta), max_bytes: 65536 });
+        }
         const artifactId = randomId("op_");
         const deviceOp = await buildDeviceOperation({
           toolName: "__transfer_artifact_get", operationId: artifactId, deviceId: meta.destination_device_id,
@@ -3171,7 +3201,7 @@ export async function handleMcp(
           oauthClientId: rec.client_id, workspaceBinding: { workspace_id: meta.destination_workspace_id, version: meta.destination_workspace_version },
           args: { plan_id: meta.destination_plan_id, workspace_id: meta.destination_workspace_id, offset, max_bytes: maxBytes, idempotency_key: artifactId },
         });
-        await store.putMcpOperation({ operation_id: artifactId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_artifact_get", status: "pending", summary: "transfer artifact page requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, offset, max_bytes: maxBytes }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: artifactId, payload_hash: deviceOp.payload_hash, idempotency_key: artifactId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
+        await store.putMcpOperation({ operation_id: artifactId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_artifact_get", status: "pending", summary: "transfer artifact page requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, offset, max_bytes: maxBytes, expected_sha256: meta.source_sha256, expected_total_bytes: meta.source_size_bytes }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: artifactId, payload_hash: deviceOp.payload_hash, idempotency_key: artifactId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
         const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
         if (!["routed_to_device", "pending", "dispatch_uncertain"].includes(routed.status)) return mcpError(id, -32009, "artifact route failed");
         const artifact = await loadOp(store, tracker, artifactId);

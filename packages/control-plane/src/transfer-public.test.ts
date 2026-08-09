@@ -10,16 +10,17 @@ function request(token: string, name: string, args: Record<string, unknown>): Re
 async function fixture() {
   const store = new MemoryStore(); await store.ensureBootstrap();
   const token = await store.issueTokens("client_transfer", "prin_dev", "ownmesh.read ownmesh.write");
+  const foreign = await store.issueTokens("client_transfer_foreign", "prin_foreign", "ownmesh.read ownmesh.write");
   for (const id of ["dev_source", "dev_destination"]) await store.putDevice({ id, tenant_id: "ten_default", principal_id: "prin_dev", name: id, hostname: id, os: "test", arch: "test", agent_version: "test", protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false, created_at: new Date().toISOString(), status: "active" });
   await store.putWorkspace({ workspace_id: "ws_source", tenant_id: "ten_default", device_id: "dev_source", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   await store.putWorkspace({ workspace_id: "ws_destination", tenant_id: "ten_default", device_id: "dev_destination", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const routed: Array<{ deviceId: string; operation: Record<string, unknown> }> = [];
   const router: OperationRouter = { async routeToDevice(deviceId, operation) { routed.push({ deviceId, operation: operation as unknown as Record<string, unknown> }); return { status: "routed_to_device" }; } };
-  return { store, token: token.access_token, router, routed };
+  return { store, token: token.access_token, foreignToken: foreign.access_token, router, routed };
 }
 
-async function invoke(f: Awaited<ReturnType<typeof fixture>>, name: string, args: Record<string, unknown>) {
-  const response = await handleMcp(request(f.token, name, args), f.store, new URL("https://cp.test/mcp"), f.router, { tracker: new OperationTracker() });
+async function invoke(f: Awaited<ReturnType<typeof fixture>>, name: string, args: Record<string, unknown>, token = f.token) {
+  const response = await handleMcp(request(token, name, args), f.store, new URL("https://cp.test/mcp"), f.router, { tracker: new OperationTracker() });
   return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown> } }; error?: { message: string } };
 }
 
@@ -66,6 +67,9 @@ test("status CAS-reconciles both durable transfer.start results", async () => {
   for (const [operation_id, device_id] of [[sourceId, "dev_source"], [destinationId, "dev_destination"]] as const) {
     await f.store.putMcpOperation({ ...parent, operation_id, correlation_id: operation_id, device_id, tool: "__transfer_start", status: "completed", summary: "finished", data: device_id === "dev_destination" ? { plan_id: "plan_destination" } : { plan_id: "plan_source" }, idempotency_key: operation_id, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   }
+  const foreign = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId }, f.foreignToken);
+  assert.equal(foreign.error?.message, "transfer_not_available");
+  assert.equal((await f.store.getMcpOperation(transferId))?.status, "running", "foreign status must not reconcile another principal's transfer");
   const status = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
   assert.equal((status.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "completed");
   const listed = await invoke(f, "ownmesh_transfer_list", {});
@@ -121,7 +125,7 @@ test("source reply loss after authenticated destination publication converges wi
   const transferId = created.result!.structuredContent!.operation_id;
   const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
   const meta = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
-  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: { ...meta, state: "sending", source_start_operation_id: "op_lost_source", destination_start_operation_id: "op_published_destination", source_start_routed: true, destination_start_routed: true } } });
+  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: { ...meta, state: "sending", source_sha256: "d".repeat(64), source_size_bytes: 7, source_start_operation_id: "op_lost_source", destination_start_operation_id: "op_published_destination", source_start_routed: true, destination_start_routed: true } } });
   await f.store.putMcpOperation({ ...parent, operation_id: "op_lost_source", correlation_id: "op_lost_source", device_id: "dev_source", tool: "__transfer_start_source", status: "failed", summary: "finish ack lost", data: { error: { code: "OWNMESH_E_TRANSFER_SESSION_LOST" } }, idempotency_key: "op_lost_source", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   await f.store.putMcpOperation({ ...parent, operation_id: "op_published_destination", correlation_id: "op_published_destination", device_id: "dev_destination", tool: "__transfer_start_destination", status: "completed", summary: "published", data: { transfer_id: transferId, plan_id: "plan_destination", role: "destination", published: true, completed: true, artifact_sha256: "d".repeat(64) }, idempotency_key: "op_published_destination", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const status = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
@@ -143,13 +147,31 @@ test("cancel fans out exact generic cancel controls and never retries them as a 
   assert.deepEqual(f.routed.map((entry) => ((entry.operation.payload as Record<string, unknown>).arguments as Record<string, unknown>).target_operation_id).sort(), ["op_cancel_destination", "op_cancel_source"]);
   const cancelling = await f.store.getMcpOperation(transferId); assert.ok(cancelling);
   const cancelMeta = cancelling.data.__ownmesh_transfer_plan as Record<string, unknown>;
-  for (const controlId of [cancelMeta.source_cancel_operation_id, cancelMeta.destination_cancel_operation_id]) {
-    assert.equal(typeof controlId, "string"); await f.store.updateMcpOperation(controlId as string, { status: "completed", summary: "cancelled receipt" }, ["pending"]);
+  for (const [controlId, target] of [[cancelMeta.source_cancel_operation_id, "op_cancel_source"], [cancelMeta.destination_cancel_operation_id, "op_cancel_destination"]]) {
+    assert.equal(typeof controlId, "string"); await f.store.updateMcpOperation(controlId as string, { status: "completed", summary: "cancelled receipt", data: { target_operation_id: target, cancelled: true, signal_delivered: true } }, ["pending"]);
   }
   const settled = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
   assert.equal((settled.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelled");
   const repeat = await invoke(f, "ownmesh_transfer_cancel", { transfer_id: transferId, idempotency_key: "cancel-key" });
   assert.equal((repeat.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelled"); assert.equal(f.routed.length, 2, "cancel receipt polling must not route controls again");
+});
+
+test("cancel remains unresolved when a restarted Agent cannot prove durable cleanup", async () => {
+  const f = await fixture();
+  const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "cancel-uncertain-plan" });
+  const transferId = created.result!.structuredContent!.operation_id;
+  const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
+  const meta = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
+  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: { ...meta, state: "sending", source_start_operation_id: "op_restarted_source", destination_start_operation_id: "op_restarted_destination", source_start_routed: true, destination_start_routed: true } } });
+  const result = await invoke(f, "ownmesh_transfer_cancel", { transfer_id: transferId, idempotency_key: "cancel-uncertain-key" });
+  assert.equal((result.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelling");
+  const cancelling = await f.store.getMcpOperation(transferId); assert.ok(cancelling);
+  const cancelMeta = cancelling.data.__ownmesh_transfer_plan as Record<string, unknown>;
+  for (const [controlId, target] of [[cancelMeta.source_cancel_operation_id, "op_restarted_source"], [cancelMeta.destination_cancel_operation_id, "op_restarted_destination"]]) {
+    await f.store.updateMcpOperation(controlId as string, { status: "completed", data: { target_operation_id: target, cancelled: false, signal_delivered: false } }, ["pending"]);
+  }
+  const status = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+  assert.equal((status.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "cancelling");
 });
 
 test("completed transfer artifact get is destination-bound and page-bounded", async () => {
@@ -158,7 +180,7 @@ test("completed transfer artifact get is destination-bound and page-bounded", as
   const transferId = created.result!.structuredContent!.operation_id;
   const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
   const meta = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
-  await f.store.updateMcpOperation(transferId, { status: "completed", data: { __ownmesh_transfer_plan: { ...meta, state: "completed", destination_plan_id: "plan_destination" } } });
+  await f.store.updateMcpOperation(transferId, { status: "completed", data: { __ownmesh_transfer_plan: { ...meta, state: "completed", destination_plan_id: "plan_destination", source_sha256: "a".repeat(64), source_size_bytes: 131072 } } });
   const get = await invoke(f, "ownmesh_transfer_get", { transfer_id: transferId, offset: 65536, max_bytes: 65536 });
   assert.match(get.result!.structuredContent!.operation_id, /^op_/);
   assert.equal(f.routed.length, 1); assert.equal(f.routed[0].deviceId, "dev_destination");

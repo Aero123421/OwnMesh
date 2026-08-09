@@ -1191,7 +1191,7 @@ test("transfer artifact results are bounded, hash-checked, and exact-plan bound"
   const opId = randomId("op_"); const correlationId = randomId("cor_");
   await store.putMcpOperation({
     operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
-    tool: "__transfer_artifact_get", status: "pending", summary: "artifact", data: { transfer_id: "xfer_1", offset: 0, max_bytes: 65536 },
+    tool: "__transfer_artifact_get", status: "pending", summary: "artifact", data: { transfer_id: "xfer_1", offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 3 },
     truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: correlationId,
     workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device",
     created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
@@ -1205,8 +1205,13 @@ test("transfer artifact results are bounded, hash-checked, and exact-plan bound"
   const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: base } });
   assert.equal(accepted.ok, true); assert.equal((await store.getMcpOperation(opId))?.data.content_base64, content_base64);
 
+  const mismatchId = randomId("op_");
+  await store.putMcpOperation({ operation_id: mismatchId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact mismatch", data: { offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 3 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: mismatchId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const mismatchedDigest = await applyMcpOperationResult(store, { operationId: mismatchId, correlationId: mismatchId, deviceId, payload: { operation_id: mismatchId, status: "completed", result: { ...base, sha256: "d".repeat(64) } } });
+  assert.deepEqual(mismatchedDigest, { ok: false, error: "transfer_artifact_result_binding_mismatch" });
+
   const overflowId = randomId("op_");
-  await store.putMcpOperation({ operation_id: overflowId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact overflow", data: { offset: 0, max_bytes: 65536 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: overflowId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  await store.putMcpOperation({ operation_id: overflowId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact overflow", data: { offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 65537 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: overflowId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const tooMany = new Uint8Array(65537); const overflow = await applyMcpOperationResult(store, { operationId: overflowId, correlationId: overflowId, deviceId, payload: { operation_id: overflowId, status: "completed", result: { ...base, bytes: 65537, total_bytes: 65537, content_base64: btoa(String.fromCharCode(...tooMany)), page_sha256: "e".repeat(64) } } });
   assert.deepEqual(overflow, { ok: false, error: "transfer_artifact_result_binding_mismatch" });
 });
@@ -1215,13 +1220,27 @@ test("transfer start receipts reject bearer/byte fields and require exact immuta
   const { store } = openSqliteAdapter(); await store.ensureBootstrap();
   const deviceId = "dev_start_destination_01"; await seedActiveDevice(store, deviceId);
   const opId = randomId("op_"); const correlationId = randomId("cor_");
-  const facts = { transfer_id: "xfer_start_1", plan_sha256: "a".repeat(64), epoch: 2, fence: 3 };
+  const facts = { transfer_id: "xfer_start_1", plan_sha256: "a".repeat(64), content_sha256: "b".repeat(64), epoch: 2, fence: 3 };
   await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_destination", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: correlationId, workspace_id: "ws_destination", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const receipt = { transfer_id: facts.transfer_id, plan_id: "plan_destination", role: "destination", plan_sha256: facts.plan_sha256, epoch: 2, fence: 3, admitted: true };
+  const receipt = { transfer_id: facts.transfer_id, plan_id: "plan_destination", role: "destination", plan_sha256: facts.plan_sha256, epoch: 2, fence: 3, admitted: true, completed: true, published: true, artifact_sha256: facts.content_sha256 };
   const rejected = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, ticket: "must-not-store" } } });
   assert.deepEqual(rejected, { ok: false, error: "transfer_start_result_unknown_field" });
+  const wrongArtifact = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, artifact_sha256: "c".repeat(64) } } });
+  assert.deepEqual(wrongArtifact, { ok: false, error: "transfer_start_result_binding_mismatch" });
   const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: receipt } });
   assert.equal(accepted.ok, true); assert.deepEqual((await store.getMcpOperation(opId))?.data, receipt);
+});
+
+test("transfer cancel controls persist only target-bound cleanup proof", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_cancel_destination_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const target = "op_transfer_destination";
+  await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_cancel_control", status: "pending", summary: "cancel", data: { target_operation_id: target }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: opId, workspace_id: "ws_destination", policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const substituted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: "op_other", cancelled: true, signal_delivered: true } } });
+  assert.deepEqual(substituted, { ok: false, error: "transfer_cancel_result_binding_mismatch" });
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: target, cancelled: false, signal_delivered: false, note: "Agent restarted" } } });
+  assert.equal(accepted.ok, true);
+  assert.deepEqual((await store.getMcpOperation(opId))?.data, { target_operation_id: target, cancelled: false, signal_delivered: false });
 });
 
 test("operation.result store write failure fails closed without forward", async () => {

@@ -2683,12 +2683,16 @@ async function sanitizeTransferArtifactResult(
     : undefined;
   const expectedOffset = op.data.offset;
   const expectedMax = op.data.max_bytes;
+  const expectedSha256 = op.data.expected_sha256;
+  const expectedTotalBytes = op.data.expected_total_bytes;
   if (typeof expectedPlan !== "string" || typeof expectedOffset !== "number" || typeof expectedMax !== "number"
+    || typeof expectedSha256 !== "string" || !/^[a-f0-9]{64}$/.test(expectedSha256)
+    || typeof expectedTotalBytes !== "number" || !Number.isSafeInteger(expectedTotalBytes) || expectedTotalBytes < 0
     || raw.plan_id !== expectedPlan || raw.offset !== expectedOffset || raw.encoding !== "base64"
     || typeof raw.content_base64 !== "string" || typeof raw.page_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.page_sha256)
-    || typeof raw.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.sha256)
+    || raw.sha256 !== expectedSha256
     || typeof raw.bytes !== "number" || !Number.isSafeInteger(raw.bytes) || raw.bytes < 0 || raw.bytes > 65536 || raw.bytes > expectedMax
-    || typeof raw.total_bytes !== "number" || !Number.isSafeInteger(raw.total_bytes) || raw.total_bytes < raw.bytes
+    || raw.total_bytes !== expectedTotalBytes || raw.total_bytes < raw.bytes
     || typeof raw.truncated !== "boolean") return { error: "transfer_artifact_result_binding_mismatch" };
   let page: Uint8Array;
   try {
@@ -2729,8 +2733,26 @@ function sanitizeTransferStartResult(
     || (raw.completed !== undefined && typeof raw.completed !== "boolean")
     || (raw.published !== undefined && (typeof raw.published !== "boolean" || role !== "destination"))
     || (raw.artifact_sha256 !== undefined && (typeof raw.artifact_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.artifact_sha256)))
-    || (raw.published === true && (raw.completed !== true || raw.artifact_sha256 === undefined))) return { error: "transfer_start_result_binding_mismatch" };
+    || (raw.published === true && (raw.completed !== true || raw.artifact_sha256 !== fact.content_sha256))) return { error: "transfer_start_result_binding_mismatch" };
   return { data: { transfer_id: raw.transfer_id, plan_id: raw.plan_id, role: raw.role, plan_sha256: raw.plan_sha256, epoch: raw.epoch, fence: raw.fence, admitted: raw.admitted, ...(raw.completed !== undefined ? { completed: raw.completed } : {}), ...(raw.published !== undefined ? { published: raw.published } : {}), ...(raw.artifact_sha256 !== undefined ? { artifact_sha256: raw.artifact_sha256 } : {}) } };
+}
+
+/** A generic cancel acknowledgement is not by itself proof that an in-flight
+ * transfer was stopped.  Keep only the target-bound booleans needed by the
+ * transfer coordinator and drop any unbounded diagnostic payload. */
+function sanitizeTransferCancelControlResult(
+  op: McpOperationRecord,
+  payload: Record<string, unknown>,
+): { data: Record<string, unknown> } | { error: string } {
+  const result = payload.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return { error: "transfer_cancel_result_invalid" };
+  const raw = result as Record<string, unknown>;
+  const expectedTarget = op.data.target_operation_id;
+  if (typeof expectedTarget !== "string" || expectedTarget.length === 0
+    || raw.target_operation_id !== expectedTarget
+    || typeof raw.cancelled !== "boolean"
+    || typeof raw.signal_delivered !== "boolean") return { error: "transfer_cancel_result_binding_mismatch" };
+  return { data: { target_operation_id: expectedTarget, cancelled: raw.cancelled, signal_delivered: raw.signal_delivered } };
 }
 
 /**
@@ -2958,6 +2980,15 @@ export async function applyMcpOperationResult(
   if (op.tool === "__transfer_start_source" || op.tool === "__transfer_start_destination") {
     if (status === "completed") {
       const sanitized = sanitizeTransferStartResult(op, payload);
+      if ("error" in sanitized) return { ok: false, error: sanitized.error };
+      data = sanitized.data;
+    } else {
+      data = {};
+    }
+  }
+  if (op.tool === "__transfer_cancel_control") {
+    if (status === "completed") {
+      const sanitized = sanitizeTransferCancelControlResult(op, payload);
       if ("error" in sanitized) return { ok: false, error: sanitized.error };
       data = sanitized.data;
     } else {
