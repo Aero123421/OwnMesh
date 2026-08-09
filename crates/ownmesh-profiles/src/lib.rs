@@ -75,6 +75,219 @@ impl InterfacePreference {
     }
 }
 
+/// The child-process transport selected by an official adapter.
+///
+/// These values are deliberately narrower than a general network transport.
+/// An adapter never creates an inbound listener; `LocalHttp` means that the
+/// vendor's documented child server is contacted only by the local host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterTransport {
+    StdioJsonl,
+    StdioJsonRpc,
+    LocalHttp,
+    Pty,
+}
+
+/// Vendor dialect carried over an [`AdapterTransport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterDialect {
+    CodexAppServer,
+    ClaudeStreamJson,
+    KimiAcp,
+    OpenCodeServer,
+    PiRpc,
+    AgyStreamJson,
+    QwenAcp,
+    HermesAcp,
+    QoderAcp,
+}
+
+/// Native-session continuation surface exposed by an adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum NativeResume {
+    /// A native argv resume operation. `{{native_id}}` is a single argv item.
+    Argv { args: Vec<String> },
+    /// The native protocol negotiates load/resume support at runtime.
+    Negotiated { method: String },
+    /// The vendor documents no safe native resume operation for this adapter.
+    Degraded,
+}
+
+/// Read-only profile authentication probe declaration.
+///
+/// An absent probe is intentional: OwnMesh reports `unknown` rather than
+/// reading credential files or guessing a vendor CLI command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthProbe {
+    pub args: Vec<String>,
+    /// Successful process exit codes. Output is capped and redacted by the
+    /// executor; it is never included in an audit record.
+    pub success_exit_codes: Vec<i32>,
+}
+
+/// Explicit, source-backed contract for one official CLI adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterSpec {
+    pub profile_id: String,
+    pub transport: AdapterTransport,
+    pub dialect: AdapterDialect,
+    /// Start argv, excluding the executable.  Prompt/session placeholders are
+    /// expanded only as one complete argument.
+    pub start_args: Vec<String>,
+    pub resume: NativeResume,
+    pub auth_probe: Option<AuthProbe>,
+    /// Structured mode permits event normalization and avoids a PTY.
+    pub structured_events: bool,
+    /// Profile safe capabilities; this is not a permission escalation surface.
+    pub safe_capabilities: Vec<String>,
+}
+
+/// Return the nine explicit official adapter specifications.
+///
+/// The source links and the date on which each entry was verified are kept in
+/// `docs/E6_ADAPTER_CONTRACTS.md`.  If that document does not establish a
+/// resume surface, this function returns [`NativeResume::Degraded`] instead of
+/// inventing one.
+#[must_use]
+pub fn official_adapter_specs() -> Vec<AdapterSpec> {
+    use AdapterDialect::{
+        AgyStreamJson, ClaudeStreamJson, CodexAppServer, HermesAcp, KimiAcp, OpenCodeServer,
+        PiRpc, QoderAcp, QwenAcp,
+    };
+    use AdapterTransport::{LocalHttp, StdioJsonl, StdioJsonRpc};
+
+    vec![
+        AdapterSpec {
+            profile_id: "codex".into(),
+            transport: StdioJsonRpc,
+            dialect: CodexAppServer,
+            start_args: vec!["app-server".into()],
+            resume: NativeResume::Negotiated {
+                method: "thread/resume".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["thread_start".into(), "thread_resume".into()],
+        },
+        AdapterSpec {
+            profile_id: "claude-code".into(),
+            transport: StdioJsonl,
+            dialect: ClaudeStreamJson,
+            start_args: vec![
+                "-p".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            resume: NativeResume::Argv {
+                args: vec!["--resume".into(), "{{native_id}}".into()],
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "kimi-code".into(),
+            transport: StdioJsonRpc,
+            dialect: KimiAcp,
+            start_args: vec!["acp".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "opencode".into(),
+            transport: LocalHttp,
+            dialect: OpenCodeServer,
+            start_args: vec!["serve".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/get".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["local_server".into(), "session_api".into()],
+        },
+        AdapterSpec {
+            profile_id: "pi".into(),
+            transport: StdioJsonl,
+            dialect: PiRpc,
+            start_args: vec!["--mode".into(), "rpc".into()],
+            resume: NativeResume::Negotiated {
+                method: "switch_session".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["strict_lf_jsonl".into()],
+        },
+        AdapterSpec {
+            profile_id: "agy".into(),
+            transport: StdioJsonl,
+            dialect: AgyStreamJson,
+            start_args: vec![
+                "--print".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            resume: NativeResume::Degraded,
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "qwen-code".into(),
+            transport: StdioJsonRpc,
+            dialect: QwenAcp,
+            start_args: vec!["--acp".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "hermes-agent".into(),
+            transport: StdioJsonRpc,
+            dialect: HermesAcp,
+            start_args: vec!["acp".into()],
+            resume: NativeResume::Argv {
+                args: vec!["--resume".into(), "{{native_id}}".into()],
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "qoder".into(),
+            transport: StdioJsonRpc,
+            dialect: QoderAcp,
+            start_args: vec!["--acp".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into()],
+        },
+    ]
+}
+
+/// Retrieve an official adapter specification by stable profile ID or alias.
+#[must_use]
+pub fn official_adapter_spec(id: &str) -> Option<AdapterSpec> {
+    let canonical = OfficialProfileId::parse(id)?.as_str();
+    official_adapter_specs()
+        .into_iter()
+        .find(|spec| spec.profile_id == canonical)
+}
+
 /// Official profile identifiers — must match `OWNMESH_SPECIFICATION.ja.md` §13.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1139,6 +1352,101 @@ pub struct NormalizedEvent {
     pub raw_type: String,
 }
 
+/// Maximum accepted adapter record length, excluding the trailing LF.
+pub const MAX_ADAPTER_LINE_BYTES: usize = 64 * 1024;
+/// Maximum normalized events returned in one replay page.
+pub const MAX_ADAPTER_EVENTS_PER_PAGE: usize = 256;
+
+/// A normalized adapter record with an absolute raw-byte cursor.
+///
+/// `cursor` points just after the record's terminating LF.  It therefore
+/// remains meaningful when the caller appends more bytes to a local spool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterEventRecord {
+    pub cursor: u64,
+    pub event: Option<NormalizedEvent>,
+    pub error: Option<String>,
+}
+
+/// Bounded result of parsing raw adapter output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterEventPage {
+    /// Cursor supplied by the caller, usually the spool base offset.
+    pub base_cursor: u64,
+    /// Cursor to pass for the next page.  No bytes after it were consumed.
+    pub next_cursor: u64,
+    pub events: Vec<AdapterEventRecord>,
+    /// More complete LF records remain after `next_cursor`.
+    pub has_more: bool,
+}
+
+/// Parse one bounded page of LF-delimited adapter output.
+///
+/// This deliberately does not use `str::lines`: Pi's documented RPC mode
+/// requires LF framing and generic line readers may also split Unicode line
+/// separators inside a JSON payload.  An unterminated tail is left for a later
+/// append and is never converted into a partial event.
+#[must_use]
+pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPage {
+    let mut events = Vec::new();
+    let mut consumed = 0_usize;
+    let mut scan = 0_usize;
+
+    while scan < raw.len() && events.len() < MAX_ADAPTER_EVENTS_PER_PAGE {
+        let Some(relative_lf) = raw[scan..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let end = scan + relative_lf;
+        let line = &raw[scan..end];
+        let record_end = end + 1;
+        let cursor = base_cursor.saturating_add(record_end as u64);
+        let record = if line.len() > MAX_ADAPTER_LINE_BYTES {
+            AdapterEventRecord {
+                cursor,
+                event: None,
+                error: Some(format!("adapter record exceeds {MAX_ADAPTER_LINE_BYTES} byte limit")),
+            }
+        } else {
+            match std::str::from_utf8(line) {
+                Ok(text) => match normalize_event_json(text.trim_end_matches('\r')) {
+                    Some(event) => AdapterEventRecord {
+                        cursor,
+                        event: Some(event),
+                        error: None,
+                    },
+                    None => AdapterEventRecord {
+                        cursor,
+                        event: None,
+                        error: Some("malformed adapter JSON event".into()),
+                    },
+                },
+                Err(_) => AdapterEventRecord {
+                    cursor,
+                    event: None,
+                    error: Some("adapter record is not UTF-8 JSON".into()),
+                },
+            }
+        };
+        events.push(record);
+        consumed = record_end;
+        scan = record_end;
+    }
+
+    // Do not claim there is another record for a partial (no-LF) tail.  The
+    // caller must append it before parsing again.
+    let has_more = if events.len() == MAX_ADAPTER_EVENTS_PER_PAGE {
+        raw[consumed..].contains(&b'\n')
+    } else {
+        false
+    };
+    AdapterEventPage {
+        base_cursor,
+        next_cursor: base_cursor.saturating_add(consumed as u64),
+        events,
+        has_more,
+    }
+}
+
 /// Best-effort event normalization from JSONL adapter lines.
 pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -1357,6 +1665,72 @@ acp = false
         assert_eq!(p.interface_order[0], InterfacePreference::StructuredRpc);
         assert_eq!(p.structured_start_args, vec!["app-server".to_string()]);
         assert!(p.supports_native_resume);
+    }
+
+    #[test]
+    fn official_adapter_specs_are_explicit_and_complete() {
+        let specs = official_adapter_specs();
+        assert_eq!(specs.len(), 9);
+        for id in OfficialProfileId::all() {
+            let spec = official_adapter_spec(id.as_str()).expect("adapter spec");
+            assert_eq!(spec.profile_id, id.as_str());
+            assert!(spec.structured_events, "{}", spec.profile_id);
+            assert!(
+                !spec.safe_capabilities.is_empty(),
+                "{} missing safe capabilities",
+                spec.profile_id
+            );
+            assert!(spec.auth_probe.is_none(), "credentials must not be probed");
+        }
+        assert!(matches!(
+            official_adapter_spec("agy").unwrap().resume,
+            NativeResume::Degraded
+        ));
+        assert_eq!(
+            official_adapter_spec("codex").unwrap().transport,
+            AdapterTransport::StdioJsonRpc
+        );
+    }
+
+    #[test]
+    fn bounded_adapter_parser_preserves_absolute_byte_cursors() {
+        let raw = b"{\"type\":\"message\",\"text\":\"one\",\"session_id\":\"n1\"}\n{\"event\":\"tool_call\"}\n";
+        let page = parse_adapter_event_page(raw, 40);
+        assert_eq!(page.base_cursor, 40);
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].event.as_ref().unwrap().kind, "message");
+        assert_eq!(page.events[0].event.as_ref().unwrap().native_session_id.as_deref(), Some("n1"));
+        assert_eq!(page.next_cursor, 40 + raw.len() as u64);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn malformed_and_oversize_records_are_visible_not_silent() {
+        let mut raw = b"{not-json}\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', MAX_ADAPTER_LINE_BYTES + 1));
+        raw.push(b'\n');
+        let page = parse_adapter_event_page(&raw, 0);
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].error.as_deref(), Some("malformed adapter JSON event"));
+        assert!(page.events[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("exceeds"));
+    }
+
+    #[test]
+    fn parser_pages_without_rewinding_or_unicode_line_splitting() {
+        let one = "{\"type\":\"message\",\"text\":\"a\u{2028}b\"}\n";
+        let raw = one.as_bytes().repeat(MAX_ADAPTER_EVENTS_PER_PAGE + 1);
+        let first = parse_adapter_event_page(&raw, 500);
+        assert_eq!(first.events.len(), MAX_ADAPTER_EVENTS_PER_PAGE);
+        assert!(first.has_more);
+        let consumed = usize::try_from(first.next_cursor - first.base_cursor).unwrap();
+        let second = parse_adapter_event_page(&raw[consumed..], first.next_cursor);
+        assert_eq!(second.events.len(), 1);
+        assert!(second.next_cursor > first.next_cursor);
+        assert_eq!(second.events[0].event.as_ref().unwrap().text.as_deref(), Some("a\u{2028}b"));
     }
 
     #[test]
