@@ -522,6 +522,23 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         title: str,
         program: str,
         args: { type: "array", items: { type: "string" } },
+        profile_id: {
+          type: "string",
+          description: "Official adapter id; binds the source-backed local profile contract",
+        },
+        prompt: {
+          type: "string",
+          description: "Single prompt passed as one argv/protocol value for a profile adapter",
+        },
+        native_session_id: {
+          type: "string",
+          description: "Vendor-native session id for explicit continuation; never inferred from output",
+        },
+        adapter_mode: {
+          type: "string",
+          enum: ["auto", "structured", "pty"],
+          description: "Structured refuses a PTY downgrade; PTY is explicit",
+        },
         workspace_id: str,
         idempotency_key: {
           type: "string",
@@ -549,6 +566,23 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         title: str,
         program: str,
         args: { type: "array", items: { type: "string" } },
+        profile_id: {
+          type: "string",
+          description: "Official adapter id; binds the source-backed local profile contract",
+        },
+        prompt: {
+          type: "string",
+          description: "Single prompt passed as one argv/protocol value for a profile adapter",
+        },
+        native_session_id: {
+          type: "string",
+          description: "Vendor-native session id for explicit continuation; never inferred from output",
+        },
+        adapter_mode: {
+          type: "string",
+          enum: ["auto", "structured", "pty"],
+          description: "Structured refuses a PTY downgrade; PTY is explicit",
+        },
         workspace_id: str,
         idempotency_key: {
           type: "string",

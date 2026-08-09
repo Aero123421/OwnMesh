@@ -46,7 +46,7 @@ use ownmesh_policy::{
     temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
     ExecutableIdentityBinding, OperationFacts, PolicyDocument, TemporaryGrant,
 };
-use ownmesh_profiles::{ProfileRegistry, ProfileStatus};
+use ownmesh_profiles::{official_adapter_spec, parse_adapter_event_page, ProfileRegistry, ProfileStatus};
 use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{
     SessionKind, SessionManager, SidecarHostBinding, StreamKind as SessionStreamKind,
@@ -2895,6 +2895,20 @@ full_user_access/full_access for arbitrary commands",
             kind: Option<String>,
             #[serde(default)]
             profile_id: Option<String>,
+            /// A prompt for a profile's documented non-interactive structured
+            /// surface. It remains an individual argv element, never a shell
+            /// fragment.
+            #[serde(default)]
+            prompt: Option<String>,
+            /// Vendor-native continuation id, separate from the OwnMesh
+            /// session id. It is canonical action input and never inferred
+            /// from terminal output.
+            #[serde(default)]
+            native_session_id: Option<String>,
+            /// `auto` follows the source-backed adapter preference;
+            /// `structured` refuses a PTY downgrade; `pty` is explicit.
+            #[serde(default)]
+            adapter_mode: Option<String>,
             #[serde(default)]
             command: Option<Vec<String>>,
             /// MCP schema uses program/args; agent_transport maps them to command.
@@ -2951,6 +2965,31 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             // Explicit profile_id without kind defaults to profile agent session.
             kind = SessionKind::ProfileAgent;
         }
+        let adapter_mode = match p.adapter_mode.as_deref().unwrap_or("auto") {
+            "auto" => "auto",
+            "structured" => "structured",
+            "pty" => "pty",
+            other => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: format!("adapter_mode must be auto|structured|pty (got {other})"),
+                });
+            }
+        };
+        if p.native_session_id.as_deref().is_some_and(|id| {
+            id.is_empty() || id.len() > 512 || id.chars().any(char::is_control)
+        }) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "native_session_id must be a non-control string <= 512 bytes".into(),
+            });
+        }
+        if p.adapter_mode.is_some() && p.profile_id.is_none() {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "adapter_mode requires profile_id; generic program/args are unchanged".into(),
+            });
+        }
         let principal = client.client_name.clone();
         let title = p.title.unwrap_or_else(|| "session".into());
         // Resolve/pin cwd under the selected workspace (custody when enforce is on;
@@ -2987,17 +3026,43 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             .filter(|s| !s.is_empty())
         {
             let reg = ProfileRegistry::with_official();
+            let spec = official_adapter_spec(profile_id).ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("no source-backed adapter contract for profile {profile_id}"),
+            })?;
             let plan = reg
-                .launch_plan(profile_id, None, /* force_pty */ true)
+                // Structured adapters must be allowed to select their declared
+                // stdio/HTTP dialect. PTY is opt-in only; this keeps generic
+                // CLI behavior unchanged while avoiding an accidental terminal
+                // downgrade for an explicit structured profile request.
+                .launch_plan(
+                    profile_id,
+                    p.prompt.as_deref(),
+                    /* force_pty */ adapter_mode == "pty",
+                )
                 .map_err(|e| IpcError::Remote {
                     code: app_error::INVALID_PARAMS,
                     message: format!("profile launch plan failed: {e}"),
                 })?;
+            if adapter_mode == "structured" && plan.use_pty {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!(
+                        "profile {profile_id} cannot provide structured mode; use adapter_mode=pty explicitly"
+                    ),
+                });
+            }
             profile_meta = Some(json!({
                 "profile_id": plan.profile_id,
                 "interface": plan.interface.as_str(),
                 "use_pty": plan.use_pty,
                 "program": plan.program,
+                "adapter_mode": adapter_mode,
+                "transport": spec.transport,
+                "dialect": spec.dialect,
+                "native_resume": spec.resume,
+                "safe_capabilities": spec.safe_capabilities,
+                "structured_requested": adapter_mode == "structured" || (adapter_mode == "auto" && !plan.use_pty),
             }));
             let mut argv = vec![plan.program];
             argv.extend(plan.args);
@@ -3014,7 +3079,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 principal,
                 Self::now(),
                 p.profile_id.clone(),
-                None,
+                p.native_session_id.clone(),
                 command.clone(),
                 cwd.clone(),
                 None,
@@ -3264,6 +3329,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         Ok(json!({
             "profile": profile,
             "status": status,
+            "adapter": official_adapter_spec(&p.id),
+            "auth_status": "unknown_no_credential_probe",
         }))
     }
 
@@ -4441,6 +4508,30 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         let sidecar_bytes_base64 = sidecar_page
             .as_ref()
             .map(|page| base64_standard(&page.bytes));
+        // Structured profiles additionally expose a bounded, normalized view
+        // over the exact raw sidecar spool cursor.  The raw base64 field stays
+        // available for binary-safe recovery; malformed vendor output becomes
+        // an explicit adapter error rather than disappearing into a terminal.
+        let profile_events = self
+            .sessions
+            .get(&p.id)
+            .ok()
+            .and_then(|info| info.profile_id.as_deref())
+            .and_then(official_adapter_spec)
+            .filter(|spec| spec.structured_events)
+            .and_then(|_| {
+                sidecar_page.as_ref().map(|spool| {
+                    let byte_len = u64::try_from(spool.bytes.len()).unwrap_or(u64::MAX);
+                    let tail_after_page = spool.next_offset.unwrap_or(spool.total_bytes);
+                    let base = tail_after_page.saturating_sub(byte_len);
+                    parse_adapter_event_page(&spool.bytes, base)
+                })
+            });
+        let profile_event_cursor = profile_events.as_ref().map(|page| page.next_cursor);
+        let profile_event_truncated = profile_events
+            .as_ref()
+            .is_some_and(|page| page.has_more)
+            || sidecar_truncated;
         Ok(json!({
             "chunks": page.chunks,
             "session_id": p.id,
@@ -4454,6 +4545,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             "sidecar_bytes_base64": sidecar_bytes_base64,
             "sidecar_next_cursor": sidecar_next_cursor,
             "sidecar_total_bytes": sidecar_total_bytes,
+            "profile_events": profile_events.as_ref().map(|page| &page.events),
+            "profile_event_cursor": profile_event_cursor,
+            "profile_event_truncated": profile_event_truncated,
         }))
     }
 

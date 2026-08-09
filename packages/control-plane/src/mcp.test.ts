@@ -113,6 +113,17 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   assert.equal(list.annotations.openWorldHint, false);
 });
 
+test("session open canonically exposes explicit profile adapter inputs", () => {
+  for (const name of ["ownmesh_session_open", "ownmesh_open_session"]) {
+    const tool = MCP_TOOLS.find((candidate) => candidate.name === name)!;
+    const properties = tool.inputSchema.properties as Record<string, unknown>;
+    assert.ok(properties.profile_id, `${name} profile_id`);
+    assert.ok(properties.prompt, `${name} prompt`);
+    assert.ok(properties.native_session_id, `${name} native_session_id`);
+    assert.deepEqual((properties.adapter_mode as { enum?: string[] }).enum, ["auto", "structured", "pty"]);
+  }
+});
+
 test("official profile catalog is 9 entries matching spec ids", () => {
   assert.equal(OFFICIAL_PROFILE_CATALOG.length, 9);
   const ids = OFFICIAL_PROFILE_CATALOG.map((p) => p.id);
