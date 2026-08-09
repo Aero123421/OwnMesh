@@ -608,6 +608,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description:
             "Monotonic per-session controller input sequence (start at 1; gaps/stale rejected)",
         },
+        lease_id: str,
+        controller_epoch: { type: "integer", minimum: 1 },
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once input",
@@ -619,6 +621,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         "data",
         "workspace_id",
         "input_seq",
+        "lease_id",
+        "controller_epoch",
         "idempotency_key",
       ],
     },
@@ -648,6 +652,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description:
             "Monotonic per-session controller resize sequence (start at 1; gaps/stale rejected)",
         },
+        lease_id: str,
+        controller_epoch: { type: "integer", minimum: 1 },
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once resize",
@@ -660,6 +666,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         "rows",
         "workspace_id",
         "resize_seq",
+        "lease_id",
+        "controller_epoch",
         "idempotency_key",
       ],
     },
@@ -1950,6 +1958,7 @@ export function sanitizeMcpArgs(
   clampInt("offset", 0, Number.MAX_SAFE_INTEGER);
   clampInt("input_seq", 1, Number.MAX_SAFE_INTEGER);
   clampInt("resize_seq", 1, Number.MAX_SAFE_INTEGER);
+  clampInt("controller_epoch", 1, Number.MAX_SAFE_INTEGER);
   clampInt("cols", 1, 512);
   clampInt("rows", 1, 512);
   if (out.env !== undefined) {

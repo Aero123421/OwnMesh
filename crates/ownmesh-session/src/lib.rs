@@ -454,6 +454,29 @@ impl SessionManager {
         }
     }
 
+    /// Fail-closed controller authorization for remote mutations. Both the
+    /// opaque lease token and generation must match the currently active seat.
+    pub fn authorize_controller_lease(
+        &self,
+        id: &str,
+        principal: &str,
+        lease_id: &str,
+        epoch: u64,
+        now_unix: i64,
+    ) -> SessionResult<()> {
+        let info = self.get(id)?;
+        match info.active_controller(now_unix) {
+            Some(lease)
+                if lease.principal_id == principal
+                    && lease.lease_id == lease_id
+                    && lease.epoch == epoch =>
+            {
+                Ok(())
+            }
+            _ => Err(SessionError::NotController),
+        }
+    }
+
     /// Attach as observer (no stdin). `now_unix` is part of the uniform ACL surface.
     pub fn attach_observer(
         &mut self,

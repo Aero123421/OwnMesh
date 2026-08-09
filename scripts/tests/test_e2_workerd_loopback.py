@@ -1440,6 +1440,13 @@ def main() -> int:
             if not m_seq:
                 raise RuntimeError(f"could not parse seq session id from {seq_open_done}")
             seq_ses_id = m_seq.group(0)
+            seq_dump = json.dumps(seq_open_done)
+            seq_lease = _re2.search(r"lease_[0-9a-fA-F]+", seq_dump)
+            seq_epoch = _re2.search(r'"epoch"\s*:\s*(\d+)', seq_dump)
+            if not seq_lease or not seq_epoch:
+                raise RuntimeError(f"session.open must return controller lease token+epoch: {seq_open_done}")
+            seq_lease_id = seq_lease.group(0)
+            seq_controller_epoch = int(seq_epoch.group(1))
 
             # Gap: input_seq=2 before 1 must fail.
             gap_sc = structured(
@@ -1480,6 +1487,8 @@ def main() -> int:
                         "workspace_id": "ws_default",
                         "data": "first\n",
                         "input_seq": 1,
+                        "lease_id": seq_lease_id,
+                        "controller_epoch": seq_controller_epoch,
                         "async": True,
                         "idempotency_key": f"idem_ses_seq_w1_{marker}",
                     },
@@ -1531,6 +1540,8 @@ def main() -> int:
                         "workspace_id": "ws_default",
                         "data": "second\n",
                         "input_seq": 2,
+                        "lease_id": seq_lease_id,
+                        "controller_epoch": seq_controller_epoch,
                         "async": True,
                         "idempotency_key": f"idem_ses_seq_w2_{marker}",
                     },
@@ -1555,6 +1566,8 @@ def main() -> int:
                         "cols": 100,
                         "rows": 30,
                         "resize_seq": 1,
+                        "lease_id": seq_lease_id,
+                        "controller_epoch": seq_controller_epoch,
                         "async": True,
                         "idempotency_key": f"idem_ses_rz1_{marker}",
                     },
@@ -1648,6 +1661,13 @@ def main() -> int:
             )
             if str(give_done.get("status")) != "completed":
                 raise RuntimeError(f"session.give to member must complete: {give_done}")
+            give_dump = json.dumps(give_done)
+            other_lease = _re2.search(r"lease_[0-9a-fA-F]+", give_dump)
+            other_epoch = _re2.search(r'"epoch"\s*:\s*(\d+)', give_dump)
+            if not other_lease or not other_epoch:
+                raise RuntimeError(f"session.give must return new lease token+epoch: {give_done}")
+            other_lease_id = other_lease.group(0)
+            other_controller_epoch = int(other_epoch.group(1))
 
             # After handoff, former controller cannot write; new controller can (seq continues).
             owner_after_give_sc = structured(
@@ -1661,6 +1681,8 @@ def main() -> int:
                         "workspace_id": "ws_default",
                         "data": "owner-after\n",
                         "input_seq": 3,
+                        "lease_id": other_lease_id,
+                        "controller_epoch": other_controller_epoch,
                         "async": True,
                         "idempotency_key": f"idem_ses_owner_after_{marker}",
                     },
@@ -1690,6 +1712,8 @@ def main() -> int:
                         "workspace_id": "ws_default",
                         "data": "member-ctrl\n",
                         "input_seq": 3,
+                        "lease_id": other_lease_id,
+                        "controller_epoch": other_controller_epoch,
                         "async": True,
                         "idempotency_key": f"idem_ses_other_ctrl_{marker}",
                     },

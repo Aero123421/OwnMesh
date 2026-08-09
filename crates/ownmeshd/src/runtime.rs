@@ -3264,6 +3264,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             /// Monotonic controller input sequence (required on remote MCP path).
             #[serde(default)]
             input_seq: Option<u64>,
+            #[serde(default)]
+            lease_id: Option<String>,
+            #[serde(default)]
+            controller_epoch: Option<u64>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
@@ -3278,9 +3282,27 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         }
         let now = self.prepare_session_access()?;
         let principal = client.client_name.clone();
-        self.sessions
-            .authorize_stdin(&p.id, &principal, now)
-            .map_err(session_err)?;
+        if is_remote_runtime_principal(&principal) {
+            let lease_id = p
+                .lease_id
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "session.write requires lease_id for remote principals".into(),
+                })?;
+            let epoch = p.controller_epoch.ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.write requires controller_epoch for remote principals".into(),
+            })?;
+            self.sessions
+                .authorize_controller_lease(&p.id, &principal, lease_id, epoch, now)
+                .map_err(session_err)?;
+        } else {
+            self.sessions
+                .authorize_stdin(&p.id, &principal, now)
+                .map_err(session_err)?;
+        }
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         // Validate sequence before side effects; advance only with the durable commit.
         if p.input_seq.is_none() && is_remote_runtime_principal(&principal) {
@@ -3417,10 +3439,32 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             /// Monotonic controller resize sequence (required on remote MCP path).
             #[serde(default)]
             resize_seq: Option<u64>,
+            #[serde(default)]
+            lease_id: Option<String>,
+            #[serde(default)]
+            controller_epoch: Option<u64>,
         }
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
-        self.require_controller(&p.id, &client.client_name, now)?;
+        if is_remote_runtime_principal(&client.client_name) {
+            let lease_id = p
+                .lease_id
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "session.resize requires lease_id for remote principals".into(),
+                })?;
+            let epoch = p.controller_epoch.ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.resize requires controller_epoch for remote principals".into(),
+            })?;
+            self.sessions
+                .authorize_controller_lease(&p.id, &client.client_name, lease_id, epoch, now)
+                .map_err(session_err)?;
+        } else {
+            self.require_controller(&p.id, &client.client_name, now)?;
+        }
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         if p.resize_seq.is_none() && is_remote_runtime_principal(&client.client_name) {
             return Err(IpcError::Remote {
