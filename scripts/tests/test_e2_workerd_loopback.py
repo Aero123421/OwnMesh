@@ -337,6 +337,26 @@ def find_value(value: object, key: str) -> object | None:
     return None
 
 
+def review_chunk_bytes(value: object) -> tuple[list[dict[str, object]], bytes]:
+    """Collect typed review chunks without assuming an MCP envelope nesting."""
+    chunks: list[dict[str, object]] = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            kind = node.get("kind")
+            raw = node.get("bytes")
+            if isinstance(kind, str) and isinstance(raw, list) and all(isinstance(x, int) and 0 <= x <= 255 for x in raw):
+                chunks.append(node)
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return chunks, b"".join(bytes(chunk["bytes"]) for chunk in chunks)
+
+
 def sidecar_bytes(value: object) -> bytes:
     encoded = find_value(value, "sidecar_bytes_base64")
     if not isinstance(encoded, str):
@@ -2741,6 +2761,220 @@ def main() -> int:
                 )
             if delegated_path.read_text(encoding="utf-8") != f"delegated-{marker}":
                 raise RuntimeError("delegated recommended write missing or corrupt on disk")
+
+            # E7 invokes an argv-only process, which is deliberately unavailable
+            # under restricted workspace policy until OS confinement exists.
+            # Restart into the explicit Full User Access fixture policy; this
+            # remains workspace-custodied context while permitting the user's
+            # exact, separately authorized structured command.
+            (config_dir / "policy.toml").write_text(
+                "\n".join(["schema_version = 1", 'preset = "full_user_access"', ""]),
+                encoding="utf-8",
+            )
+            stop_process(daemon_process)
+            daemon_process = None
+            log_path_e7 = temp / "ownmeshd-e7.log"
+            daemon_process = start_daemon(binary, base_env, log_path_e7)
+            wait_for_ready(daemon_process, log_path_e7)
+
+            # E7: exercise the production review path end-to-end, not a direct
+            # runtime call.  The nested disposable repository gives status/diff a
+            # real repository identity and lets this fixture prove that review
+            # execution never creates a commit or changes a ref on its own.
+            git = executable("git")
+            review_root = workspace_dir / "e7-nested" / "review-repo"
+            review_root.mkdir(parents=True, exist_ok=True)
+            run_checked([git, "init"], cwd=review_root, env=base_env)
+            run_checked([git, "config", "user.email", "e7@example.invalid"], cwd=review_root, env=base_env)
+            run_checked([git, "config", "user.name", "OwnMesh E7 fixture"], cwd=review_root, env=base_env)
+            (review_root / "one.txt").write_text("base-one\n", encoding="utf-8")
+            (review_root / "two.txt").write_text("base-two\n", encoding="utf-8")
+            run_checked([git, "add", "one.txt", "two.txt"], cwd=review_root, env=base_env)
+            run_checked([git, "commit", "-m", "fixture baseline"], cwd=review_root, env=base_env)
+            head_before_review = run_checked([git, "rev-parse", "HEAD"], cwd=review_root, env=base_env, capture=True)
+            # The review command itself applies this bounded, workspace-local
+            # two-file patch. `git apply` alters neither index nor refs, and all
+            # later status/diff/test evidence is therefore a result of the public
+            # review command rather than fixture setup.
+            one_new = "changed-one-" + marker * 5000
+            two_new = "changed-two-" + marker * 5000
+            patch_file = review_root.parent / "review.patch"
+            patch_file.write_text(
+                "\n".join([
+                    "diff --git a/one.txt b/one.txt", "--- a/one.txt", "+++ b/one.txt", "@@ -1 +1 @@", "-base-one", f"+{one_new}",
+                    "diff --git a/two.txt b/two.txt", "--- a/two.txt", "+++ b/two.txt", "@@ -1 +1 @@", "-base-two", f"+{two_new}", "",
+                ]),
+                encoding="utf-8",
+            )
+
+            review_args: dict[str, object] = {
+                "device_id": device_id,
+                "workspace_id": "ws_default",
+                "path": "e7-nested/review-repo",
+                "command": {"program": git, "args": ["apply", "--", "../review.patch"], "timeout_ms": 30_000},
+                "tests": [
+                    {"program": git, "args": ["status", "--porcelain=v1"], "timeout_ms": 30_000},
+                    {"program": git, "args": ["diff", "--check"], "timeout_ms": 30_000},
+                    {"program": git, "args": ["diff", "--exit-code"], "timeout_ms": 30_000},
+                ],
+                "async": True,
+                "idempotency_key": f"idem_review_{marker}",
+            }
+            review_sc = structured(mcp_call(issuer, access_token, "ownmesh_review_start", review_args, rpc_id=96))
+            review_op = str(review_sc.get("operation_id") or "")
+            review_done = wait_operation(issuer, access_token, review_op, want={"completed"}, timeout_s=60.0)
+            review_id = find_value(review_done, "review_id")
+            if not isinstance(review_id, str) or not review_id.startswith("rev_"):
+                raise RuntimeError(f"review.start missing durable receipt: {review_done}")
+            if find_value(review_done, "phase") != "failed":
+                raise RuntimeError(f"review must retain failed test result separately: {review_done}")
+            if run_checked([git, "rev-parse", "HEAD"], cwd=review_root, env=base_env, capture=True) != head_before_review:
+                raise RuntimeError("review implicitly changed Git HEAD/ref")
+            if subprocess.run([git, "diff", "--cached", "--quiet"], cwd=review_root, env=base_env, check=False).returncode != 0:
+                raise RuntimeError("review command implicitly changed Git index")
+
+            # The same exact MCP idempotency key reuses the original operation;
+            # a changed payload must be rejected before another review is routed.
+            review_retry = structured(mcp_call(issuer, access_token, "ownmesh_review_start", review_args, rpc_id=97))
+            if str(review_retry.get("operation_id") or "") != review_op:
+                raise RuntimeError(f"review idempotency did not reuse operation: {review_retry}")
+            conflict_args = dict(review_args)
+            conflict_args["path"] = "e7-nested"
+            conflict = structured(mcp_call(issuer, access_token, "ownmesh_review_start", conflict_args, rpc_id=98))
+            if "idempotency" not in json.dumps(conflict).lower():
+                raise RuntimeError(f"review payload conflict was not rejected: {conflict}")
+
+            # Public git reads retain their own cursors before the review
+            # aggregates the same snapshots into its typed, digest-bound spool.
+            status_sc = structured(
+                mcp_call(issuer, access_token, "ownmesh_git_status", {
+                    "device_id": device_id, "workspace_id": "ws_default", "path": "e7-nested/review-repo",
+                    "limit": 1, "async": True, "idempotency_key": f"idem_review_status_{marker}",
+                }, rpc_id=99)
+            )
+            status_done = wait_operation(issuer, access_token, str(status_sc.get("operation_id") or ""), want={"completed"})
+            status_data = status_done.get("data") if isinstance(status_done.get("data"), dict) else {}
+            if status_data.get("next_cursor") in {None, ""}:
+                raise RuntimeError(f"git status missing pagination cursor: {status_done}")
+            diff_sc = structured(
+                mcp_call(issuer, access_token, "ownmesh_git_diff", {
+                    "device_id": device_id, "workspace_id": "ws_default", "path": "e7-nested/review-repo",
+                    "limit": 10, "max_bytes": 128, "async": True, "idempotency_key": f"idem_review_diff_{marker}",
+                }, rpc_id=100)
+            )
+            diff_done = wait_operation(issuer, access_token, str(diff_sc.get("operation_id") or ""), want={"completed"})
+            diff_data = diff_done.get("data") if isinstance(diff_done.get("data"), dict) else {}
+            if diff_data.get("next_cursor") in {None, ""} or diff_data.get("truncated") is not True:
+                raise RuntimeError(f"git diff missing bounded pagination: {diff_done}")
+
+            page_started = structured(mcp_call(issuer, access_token, "ownmesh_review_page", {
+                "device_id": device_id, "review_id": review_id, "cursor": 0, "max_bytes": 1,
+                "idempotency_key": f"idem_review_page_{marker}",
+            }, rpc_id=101))
+            page_sc = wait_operation(issuer, access_token, str(page_started.get("operation_id") or ""), want={"completed"})
+            page_data = page_sc.get("data") if isinstance(page_sc.get("data"), dict) else {}
+            page_dump = json.dumps(page_data)
+            page_digest = page_data.get("sha256")
+            if not isinstance(page_digest, str) or len(page_digest) != 64 or page_data.get("next_cursor") != 1 or '"truncated": true' not in page_dump:
+                raise RuntimeError(f"review page missing bounded cursor/digest: {page_sc}")
+            full_started = structured(mcp_call(issuer, access_token, "ownmesh_review_page", {
+                "device_id": device_id, "review_id": review_id, "cursor": 0, "max_bytes": 49_152,
+                "idempotency_key": f"idem_review_page_full_{marker}",
+            }, rpc_id=102))
+            full_page = wait_operation(issuer, access_token, str(full_started.get("operation_id") or ""), want={"completed"})
+            full_page_data = full_page.get("data") if isinstance(full_page.get("data"), dict) else {}
+            tail_started = structured(mcp_call(issuer, access_token, "ownmesh_review_page", {
+                "device_id": device_id, "review_id": review_id, "cursor": int(full_page_data.get("next_cursor") or 0), "max_bytes": 49_152,
+                "idempotency_key": f"idem_review_page_tail_{marker}",
+            }, rpc_id=103))
+            tail_page = wait_operation(issuer, access_token, str(tail_started.get("operation_id") or ""), want={"completed"})
+            typed_chunks, typed_bytes = review_chunk_bytes(full_page_data)
+            tail_data = tail_page.get("data") if isinstance(tail_page.get("data"), dict) else {}
+            tail_chunks, tail_bytes = review_chunk_bytes(tail_data)
+            typed_chunks.extend(tail_chunks)
+            typed_bytes += tail_bytes
+            final_started = structured(mcp_call(issuer, access_token, "ownmesh_review_page", {
+                "device_id": device_id, "review_id": review_id, "cursor": int(tail_data.get("next_cursor") or 0), "max_bytes": 49_152,
+                "idempotency_key": f"idem_review_page_final_{marker}",
+            }, rpc_id=104))
+            final_page = wait_operation(issuer, access_token, str(final_started.get("operation_id") or ""), want={"completed"})
+            final_data = final_page.get("data") if isinstance(final_page.get("data"), dict) else {}
+            final_chunks, final_bytes = review_chunk_bytes(final_data)
+            typed_chunks.extend(final_chunks)
+            typed_bytes += final_bytes
+            if (
+                not {int(chunk["test_index"]) for chunk in typed_chunks if chunk.get("kind") == "test_stdout" and isinstance(chunk.get("test_index"), int)}.issuperset({0, 2})
+                or b"test[1]: exit=Some(0)" not in typed_bytes
+            ):
+                raise RuntimeError(f"review output did not preserve capped pass/fail test streams: {full_page}")
+
+            # An invalid repository fails on the real device route.  Full User
+            # Access intentionally does not turn workspace context into a hidden
+            # filesystem deny, so cross-workspace rejection is asserted at the
+            # authoritative control-plane ACL boundary with the member who owns
+            # ws_default but has no grant for ws_alt.
+            bad_sc = structured(mcp_call(issuer, access_token, "ownmesh_review_start", {
+                "device_id": device_id, "workspace_id": "ws_default", "path": "e7-nested/not-a-repo", "tests": [],
+                "async": True, "idempotency_key": f"idem_review_bad_105_{marker}",
+            }, rpc_id=105))
+            bad_done = wait_operation(issuer, access_token, str(bad_sc.get("operation_id") or ""), want={"failed", "denied"})
+            if str(bad_done.get("status")) not in {"failed", "denied"}:
+                raise RuntimeError(f"invalid repository review unexpectedly ran: {bad_done}")
+            cross_rejected = mcp_expect_rejected(issuer, access_token_other, "ownmesh_review_start", {
+                "device_id": device_id, "workspace_id": "ws_alt", "path": "e7-nested/review-repo", "tests": [],
+                "async": True, "idempotency_key": f"idem_review_cross_workspace_{marker}",
+            }, rpc_id=106)
+            if "workspace" not in json.dumps(cross_rejected).lower():
+                raise RuntimeError(f"cross-workspace review was not rejected by ACL: {cross_rejected}")
+
+            # A stale HEAD invalidates the receipt rather than replaying old
+            # status/diff bytes under a new repository state.
+            run_checked([git, "add", "one.txt", "two.txt"], cwd=review_root, env=base_env)
+            run_checked([git, "commit", "-m", "fixture stale head"], cwd=review_root, env=base_env)
+            stale_show_started = structured(mcp_call(issuer, access_token, "ownmesh_review_show", {
+                "device_id": device_id, "review_id": review_id, "idempotency_key": f"idem_review_stale_show_{marker}",
+            }, rpc_id=107))
+            stale_show = wait_operation(issuer, access_token, str(stale_show_started.get("operation_id") or ""), want={"failed", "denied"})
+            stale_page_started = structured(mcp_call(issuer, access_token, "ownmesh_review_page", {
+                "device_id": device_id, "review_id": review_id, "cursor": 0, "max_bytes": 8,
+                "idempotency_key": f"idem_review_stale_page_{marker}",
+            }, rpc_id=108))
+            stale_page = wait_operation(issuer, access_token, str(stale_page_started.get("operation_id") or ""), want={"failed", "denied"})
+            if "head changed" not in (json.dumps(stale_show) + json.dumps(stale_page)).lower():
+                raise RuntimeError(f"stale review receipt remained readable: show={stale_show} page={stale_page}")
+
+            # Cancellation remains the generic exact-bound operation.  The
+            # review is deliberately async, so this cancel reaches the live
+            # Agent registry and its process-tree kill handle while sleep/ping is
+            # running; no shell string is used anywhere in the fixture.
+            if os.name == "nt":
+                slow_program, slow_args = executable("ping"), ["-n", "30", "127.0.0.1"]
+            else:
+                slow_program, slow_args = executable("sleep"), ["30"]
+            cancel_review_sc = structured(mcp_call(issuer, access_token, "ownmesh_review_start", {
+                "device_id": device_id, "workspace_id": "ws_default", "path": "e7-nested/review-repo",
+                "tests": [{"program": slow_program, "args": slow_args, "timeout_ms": 60_000}],
+                "async": True, "idempotency_key": f"idem_review_cancel_{marker}",
+            }, rpc_id=109))
+            cancel_review_op = str(cancel_review_sc.get("operation_id") or "")
+            time.sleep(0.5)
+            cancel_sc = structured(mcp_call(issuer, access_token, "ownmesh_cancel_operation", {
+                "operation_id": cancel_review_op, "device_id": device_id,
+                "idempotency_key": f"idem_cancel_review_{marker}",
+            }, rpc_id=110))
+            if "cancel" not in json.dumps(cancel_sc).lower():
+                raise RuntimeError(f"review cancel request was rejected: {cancel_sc}")
+            cancelled_done = wait_operation(issuer, access_token, cancel_review_op, want={"completed"}, timeout_s=45.0)
+            cancel_review_id = find_value(cancelled_done, "review_id")
+            cancel_page_started = structured(mcp_call(issuer, access_token, "ownmesh_review_page", {
+                "device_id": device_id, "review_id": cancel_review_id, "cursor": 0, "max_bytes": 49_152,
+                "idempotency_key": f"idem_review_cancel_page_{marker}",
+            }, rpc_id=111))
+            cancel_page = wait_operation(issuer, access_token, str(cancel_page_started.get("operation_id") or ""), want={"completed"})
+            cancel_page_data = cancel_page.get("data") if isinstance(cancel_page.get("data"), dict) else {}
+            _, cancel_bytes = review_chunk_bytes(cancel_page_data)
+            if find_value(cancelled_done, "phase") != "cancelled" or b"process tree termination requested" not in cancel_bytes:
+                raise RuntimeError(f"review cancellation did not terminate active process tree: {cancelled_done}")
 
             # Restore full_user_access for any later local inspection (cleanup path).
             (config_dir / "policy.toml").write_text(

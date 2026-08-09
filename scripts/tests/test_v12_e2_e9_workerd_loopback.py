@@ -94,6 +94,14 @@ def main() -> int:
             "status, native argv/negotiated resume, explicit unsupported "
             "resume rejection, and exact sidecar cleanup"
         ),
+        "E7": (
+            "nested temporary Git repository through public MCP/workerd/Agent/"
+            "ownmeshd: pinned argv-only `git apply` changes two files without ref "
+            "or index mutation; separate pass/fail tests; bounded status/diff and "
+            "typed multi-page digest/cursor output; idempotency/conflict, ACL "
+            "cross-workspace and invalid-repository rejection, stale-HEAD denial, "
+            "and generic exact-bound cancellation reaching process-tree termination"
+        ),
     }
     proven_partial = {
         "E2": (
@@ -108,19 +116,14 @@ def main() -> int:
             "exactly once via device approval resolution; tenant_members handoff "
             "(partial - team admin UI still out of scope)"
         ),
-        "E7": (
-            "MCP git status/diff + private integrity-bound diff spool + fsmonitor off; "
-            "bounded single-file unified-diff apply on fs.patch; full multi-file review flow still open"
-        ),
     }
     # Rows with no real binary×workerd proof yet (must keep gate red).
     still_open = (
         ("E8", "networkless elevated broker Full Access mint/custody"),
         ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
     )
-    # E4-E6 have real workerd acceptance; remaining rows stay fail-closed.
+    # E4-E7 have real workerd acceptance; remaining rows stay fail-closed.
     incomplete_acceptance = (
-        ("E7", "full Git review workflow (tests/diff pages) beyond single-file unified apply"),
         *still_open,
     )
 
@@ -140,13 +143,13 @@ def main() -> int:
 
     if incomplete_acceptance:
         print(
-            "E2-E9 workerd gate RED: E7-E9 real binary x local Wrangler/workerd "
+            "E2-E9 workerd gate RED: E8-E9 real binary x local Wrangler/workerd "
             "acceptance is not yet complete (partial rows are not completion). "
             "Refusing exit 0 so incomplete work cannot look green.",
             file=sys.stderr,
         )
         print(
-            "v1.2 E2-E9 workerd loopback entrypoint: E2-E6 proven; E7 partial; "
+            "v1.2 E2-E9 workerd loopback entrypoint: E2-E7 proven; "
             "E8/E9 OPEN; gate fail-closed"
         )
         return 2

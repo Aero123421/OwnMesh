@@ -1064,6 +1064,11 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           },
         },
         idempotency_key: str,
+        // Review batches can contain a bounded slow test.  Accepting the common
+        // async control field lets the caller receive its operation id promptly
+        // and use the already exact-bound generic cancel operation while the
+        // Agent owns the process-tree kill handle.
+        async: { type: "boolean" },
       },
       required: ["device_id", "workspace_id", "tests", "idempotency_key"], additionalProperties: false,
     },

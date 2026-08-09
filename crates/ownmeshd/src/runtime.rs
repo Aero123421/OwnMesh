@@ -1886,8 +1886,14 @@ full_user_access/full_access for arbitrary commands",
             #[serde(default)]
             command: Option<CommandRequest>,
             tests: Vec<TestRequestDto>,
+            // Agent transport binds the server-side operation idempotency key
+            // into every mapped method.  It is authority only in the remote
+            // envelope/journal, never a client-selected review receipt field.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
+        let _ = &p.idempotency_key;
         let device_id = self
             .active_remote_device_id
             .as_deref()
@@ -2401,8 +2407,14 @@ full_user_access/full_access for arbitrary commands",
             cursor: u64,
             #[serde(default = "review_page_limit")]
             max_bytes: usize,
+            // The authenticated Agent layer adds its server-owned idempotency
+            // key uniformly to mapped methods. Pagination itself is read-only;
+            // retain no caller authority from this transport field.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
+        let _ = &p.idempotency_key;
         let review = self
             .review_manifests
             .get(&p.review_id)

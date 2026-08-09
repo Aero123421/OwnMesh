@@ -34,6 +34,14 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 ### E7 — bounded unified-diff patch
 - `ownmesh_fs_patch` accepts `patch_format=unified` (or a hash-checked unified body) for single-file apply.
 - Multi-file/binary diffs fail closed. Whole-file replace remains available via `patch_format=replace`.
+- The real public MCP → workerd/DeviceRoom → Agent WSS → ownmeshd fixture now
+  creates a nested temporary Git repository and has `review.start` run pinned
+  argv-only `git apply` for two working-tree files. It proves distinct
+  passing/failing argv tests, status/diff cursor bounds, typed multi-page result
+  spool digests, exact-once/payload-conflict handling, no implicit ref or index
+  mutation, workspace ACL and invalid-repository rejection, stale-HEAD
+  invalidation, and cancellation through process-tree termination. E7 is PROVEN
+  on this local real path.
 
 ### E6 — nine structured profile adapters
 - Device IPC `profile.list` / `profile.show` run real PATH detection for the nine official profile IDs, and public MCP routes both through the Agent to the device.
@@ -42,7 +50,7 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 - CLI `profile *` surfaces remain explicit unsupported; this acceptance covers the remote MCP profile contract.
 
 ## Gate posture
-- `scripts/tests/test_v12_e2_e9_workerd_loopback.py` stays **RED (exit 2)** until E7–E9 acceptance rows are fully evidenced on the real binary × workerd path.
+- `scripts/tests/test_v12_e2_e9_workerd_loopback.py` stays **RED (exit 2)** until E8–E9 acceptance rows are fully evidenced on the real binary × workerd path; E7 is PROVEN.
 - E8 elevated broker mint and E9 resumable transfer remain open.
 - Completeness claim remains false; E10 live-account proof is out of scope for this run.
 
