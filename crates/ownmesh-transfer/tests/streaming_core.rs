@@ -227,6 +227,7 @@ fn startup_cleanup_removes_only_expired_owned_part() {
     let plan = make_plan(b"hello");
     let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
     let lease = store.acquire(&plan, 1, 2).unwrap();
+    store.save_plan(&plan).unwrap();
     let journal = store.claim(&lease, &plan, "owner-a", 1, 1, 1, 2).unwrap();
     let sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
     let part = sink.path().to_path_buf();
@@ -235,6 +236,16 @@ fn startup_cleanup_removes_only_expired_owned_part() {
     assert_eq!(store.cleanup_expired(3).unwrap(), 1);
     assert!(!part.exists());
     assert!(store.load(&plan).unwrap().is_none());
+    assert!(store.load_plan(plan.id(), 3).unwrap().is_none());
+}
+
+#[test]
+fn private_plan_round_trips_and_rechecks_its_grant() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"plan");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    assert_eq!(store.load_plan(plan.id(), 1).unwrap(), Some(plan));
 }
 
 #[test]

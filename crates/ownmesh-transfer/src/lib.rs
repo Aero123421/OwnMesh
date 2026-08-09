@@ -978,6 +978,36 @@ impl JournalStore {
         journal.validate_for(plan)?;
         Ok(Some(journal))
     }
+
+    /// Persist immutable plan metadata separately from progress so a restarted
+    /// daemon can reopen only the exact authorized transfer id.
+    pub fn save_plan(&self, plan: &TransferPlan) -> TransferResult<()> {
+        plan.validate_at(now_unix())?;
+        let bytes = serde_json::to_vec(plan)
+            .map_err(|_| TransferError::InvalidPlan("serialize plan".into()))?;
+        if bytes.len() > self.limits.max_bytes {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        let path = self.path(plan.id(), ".plan.json")?;
+        atomic_write_owner_only(&path, &bytes).map_err(|_| TransferError::CustodyUnavailable)
+    }
+
+    /// Load and revalidate immutable plan metadata from owner-only storage.
+    pub fn load_plan(&self, plan_id: &str, now_unix: u64) -> TransferResult<Option<TransferPlan>> {
+        let path = self.path(plan_id, ".plan.json")?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_owner_only_file_bounded(&path, self.limits.max_bytes)
+            .map_err(|_| TransferError::CorruptJournal)?;
+        let plan: TransferPlan =
+            serde_json::from_slice(&bytes).map_err(|_| TransferError::CorruptJournal)?;
+        plan.validate_at(now_unix)?;
+        if plan.id() != plan_id {
+            return Err(TransferError::CorruptJournal);
+        }
+        Ok(Some(plan))
+    }
     pub fn claim(
         &self,
         lease: &JournalLease,
@@ -1009,7 +1039,11 @@ impl JournalStore {
             let count = fs::read_dir(&self.root)
                 .map_err(io_error)?
                 .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.ends_with(".json") && !name.ends_with(".plan.json")
+                })
                 .count();
             if count >= self.limits.max_journals {
                 return Err(TransferError::JournalQuotaExceeded);
@@ -1041,8 +1075,10 @@ impl JournalStore {
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.file_name()
-                    .is_some_and(|name| name.to_string_lossy().ends_with(".json"))
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.ends_with(".json") && !name.ends_with(".plan.json")
+                })
             })
             .collect();
         if entries.len() > self.limits.max_journals {
@@ -1075,6 +1111,10 @@ impl JournalStore {
                 remove_owner_only_file(&part).map_err(|_| TransferError::CustodyUnavailable)?;
             }
             remove_owner_only_file(&journal_path).map_err(|_| TransferError::CustodyUnavailable)?;
+            let plan = self.path(&journal.plan_id, ".plan.json")?;
+            if plan.exists() {
+                remove_owner_only_file(&plan).map_err(|_| TransferError::CustodyUnavailable)?;
+            }
             removed += 1;
         }
         Ok(removed)
