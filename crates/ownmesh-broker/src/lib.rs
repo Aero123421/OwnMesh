@@ -61,7 +61,9 @@ pub use serve::{
 };
 #[cfg(windows)]
 pub use windows::{
-    load_windows_daemon_trust_record, WindowsDaemonTrustRecord, WindowsTrustedDaemon,
+    load_windows_daemon_trust_record, WindowsBrokerRunner, WindowsDaemonTrustRecord,
+    WindowsPeerAuthorizer, WindowsProductionBrokerServer, WindowsReplayLedger,
+    WindowsTrustedDaemon,
 };
 
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;

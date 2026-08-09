@@ -6,11 +6,23 @@
 //! must call [`WindowsTrustedDaemon::authorize_peer`] immediately after its
 //! first frame and again immediately before staging/spawning an action.
 
+use ownmesh_broker_client::{
+    operation_facts_digest, parse_broker_wire_intent_v2, verify_cancel_intent_v2_message_auth,
+    verify_capability_v2, verify_execute_intent_v2_message_auth, BrokerRequestV2, BrokerResponseV2,
+    BrokerSecret, BrokerWireIntentV2, CapabilitySigningKey, CapabilityTokenV2, CapabilityVerifyKey,
+    PeerProcessBindV2, MAX_BROKER_REQUEST_BYTES,
+};
 use ownmesh_ipc::{windows_running_service_facts, WindowsPipePeerFacts};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 
 const MAX_TRUST_RECORD_BYTES: u64 = 64 * 1024;
+const MAX_WINDOWS_BROKER_CONCURRENCY: usize = 16;
 
 /// Immutable fields recorded by the elevated installer after it has copied the
 /// daemon image into the Admin-controlled installation root. `image_file_id`
@@ -41,6 +53,344 @@ pub struct WindowsTrustedDaemon {
     canonical_image: PathBuf,
     image_file_id: [u8; 16],
     image_sha256: [u8; 32],
+}
+
+/// Injected authorization boundary. Production uses [`WindowsTrustedDaemon`];
+/// tests can use a narrow fake without turning synthetic JSON facts into an
+/// authority source.
+pub trait WindowsPeerAuthorizer: Send + Sync {
+    fn authorize(&self, peer: &WindowsPipePeerFacts) -> Result<(), String>;
+    fn reauthorize_before_spawn(&self, peer: &WindowsPipePeerFacts) -> Result<(), String>;
+}
+
+impl WindowsPeerAuthorizer for WindowsTrustedDaemon {
+    fn authorize(&self, peer: &WindowsPipePeerFacts) -> Result<(), String> {
+        self.authorize_peer(peer)
+    }
+    fn reauthorize_before_spawn(&self, peer: &WindowsPipePeerFacts) -> Result<(), String> {
+        self.reauthorize_peer_before_spawn(peer)
+    }
+}
+
+/// Durable nonce fence supplied by the Windows custody layer. A reservation is
+/// made before the runner is invoked; a crash leaves it consumed.
+pub trait WindowsReplayLedger: Send {
+    fn reserve(&mut self, request: &BrokerRequestV2, now_unix: i64) -> Result<(), String>;
+    fn complete(&mut self, nonce: &str, digest: &str) -> Result<(), String>;
+}
+
+impl WindowsReplayLedger for crate::ReplayLedger {
+    fn reserve(&mut self, request: &BrokerRequestV2, now_unix: i64) -> Result<(), String> {
+        self.reserve_verified_request(request, now_unix)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+    fn complete(&mut self, nonce: &str, digest: &str) -> Result<(), String> {
+        self.mark_completed(nonce, digest)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The Job Object/staging slice implements this trait. Keeping it injected
+/// means this handler has no accidental `Command`/shell fallback.
+pub trait WindowsBrokerRunner: Send + Sync {
+    fn run(&self, request: &BrokerRequestV2) -> BrokerResponseV2;
+}
+
+/// Dedicated Windows v2 data-plane handler. It is intentionally not reachable
+/// from `run_broker` yet: elevated lifecycle must first prove the DACL custody
+/// of its trust record, replay ledger, key material, and staged executable.
+pub struct WindowsProductionBrokerServer<A, L, R> {
+    listener: ownmesh_ipc::LocalListener,
+    authorizer: Arc<A>,
+    ledger: Arc<Mutex<L>>,
+    runner: Arc<R>,
+    secret: BrokerSecret,
+    signing_key: CapabilitySigningKey,
+    verify_key: CapabilityVerifyKey,
+    broker_instance_id: String,
+    broker_key_id: String,
+    concurrency: Arc<Semaphore>,
+}
+
+impl<A, L, R> WindowsProductionBrokerServer<A, L, R>
+where
+    A: WindowsPeerAuthorizer + 'static,
+    L: WindowsReplayLedger + 'static,
+    R: WindowsBrokerRunner + 'static,
+{
+    /// Bind only the fixed pipe with its protected daemon/SYSTEM/Admin DACL.
+    pub async fn bind(
+        daemon_sid: &str,
+        authorizer: A,
+        ledger: L,
+        runner: R,
+        secret: BrokerSecret,
+        signing_key: CapabilitySigningKey,
+    ) -> Result<Self, String> {
+        let listener = ownmesh_ipc::LocalListener::bind_secure_broker_pipe(daemon_sid)
+            .await
+            .map_err(|error| error.to_string())?;
+        let verify_key = signing_key.verify_key();
+        let broker_key_id = hex::encode(sha2::Sha256::digest(verify_key.to_bytes()));
+        let broker_instance_id = hex::encode(sha2::Sha256::digest(
+            [
+                b"ownmesh.windows.broker.instance.v1\0".as_slice(),
+                broker_key_id.as_bytes(),
+            ]
+            .concat(),
+        ));
+        Ok(Self {
+            listener,
+            authorizer: Arc::new(authorizer),
+            ledger: Arc::new(Mutex::new(ledger)),
+            runner: Arc::new(runner),
+            secret,
+            signing_key,
+            verify_key,
+            broker_instance_id,
+            broker_key_id,
+            concurrency: Arc::new(Semaphore::new(MAX_WINDOWS_BROKER_CONCURRENCY)),
+        })
+    }
+
+    /// Accept exactly one client, apply the bounded handler, and write one
+    /// bounded response. Callers may schedule this under their service loop.
+    pub async fn serve_once(&self) -> Result<(), String> {
+        let mut connection = self
+            .listener
+            .accept()
+            .await
+            .map_err(|error| error.to_string())?;
+        let permit = self
+            .concurrency
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "Windows broker busy (bounded concurrency)".to_string())?;
+        let response = self.handle_connection(&mut connection).await;
+        drop(permit);
+        write_windows_response(&mut connection, &response).await
+    }
+
+    async fn handle_connection(
+        &self,
+        connection: &mut ownmesh_ipc::ServerConnection,
+    ) -> BrokerResponseV2 {
+        let result = async {
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_windows_v2_frame(connection),
+            )
+            .await
+            .map_err(|_| "Windows broker request frame timed out".to_string())??;
+            let peer = connection
+                .windows_pipe_peer_facts()
+                .map_err(|error| error.to_string())?;
+            self.authorizer.authorize(&peer)?;
+            let intent = parse_broker_wire_intent_v2(&bytes).map_err(|error| error.to_string())?;
+            match intent {
+                BrokerWireIntentV2::Cancel(cancel) => {
+                    verify_cancel_intent_v2_message_auth(&self.secret, &cancel, crate::now_unix())
+                        .map_err(|error| error.to_string())?;
+                    let request = BrokerRequestV2 {
+                        protocol_version: cancel.protocol_version,
+                        request_id: cancel.request_id.clone(),
+                        operation_id: cancel.operation_id.clone(),
+                        nonce: cancel.nonce.clone(),
+                        issued_at_unix: cancel.issued_at_unix,
+                        expires_at_unix: cancel.expires_at_unix,
+                        facts: ownmesh_broker_client::OperationFactsV2 {
+                            operation: "cancel".into(),
+                            remote_payload_sha256: cancel.target_facts_digest.clone(),
+                            principal_id: "windows-daemon".into(),
+                            tenant_id: "windows".into(),
+                            principal_credential_generation: 0,
+                            timeout_ms: 1,
+                            max_output_bytes: 1,
+                            device_id: "windows".into(),
+                            workspace_id: "windows".into(),
+                            argv: vec!["cancel".into()],
+                            canonical_cwd: None,
+                            sanitized_env: BTreeMap::default(),
+                            executable: ownmesh_broker_client::ExecutablePinV2 {
+                                canonical_path: "cancel".into(),
+                                image_sha256: "0".repeat(64),
+                                image_len: 0,
+                            },
+                        },
+                        capability: None,
+                        mac: cancel.mac.clone(),
+                    };
+                    let digest = operation_facts_digest(&request.facts);
+                    self.ledger
+                        .lock()
+                        .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
+                        .reserve(&request, crate::now_unix())?;
+                    self.ledger
+                        .lock()
+                        .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
+                        .complete(&request.nonce, &digest)?;
+                    Ok(BrokerResponseV2 {
+                        request_id: cancel.request_id,
+                        ok: true,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: None,
+                        timed_out: false,
+                        cancelled: true,
+                        truncated: false,
+                        duration_ms: 0,
+                    })
+                }
+                BrokerWireIntentV2::Execute(execute) => {
+                    verify_execute_intent_v2_message_auth(
+                        &self.secret,
+                        &execute,
+                        crate::now_unix(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    reject_windows_external_action(&execute.facts)?;
+                    self.authorizer.reauthorize_before_spawn(&peer)?;
+                    let external = execute.into_unprepared_request();
+                    let peer_bind = windows_peer_bind(&peer)?;
+                    let now = crate::now_unix();
+                    let capability = CapabilityTokenV2::issue(
+                        &self.signing_key,
+                        &self.broker_instance_id,
+                        &self.broker_key_id,
+                        &external.facts.principal_id,
+                        &external.operation_id,
+                        &external.facts,
+                        &external.nonce,
+                        peer_bind.clone(),
+                        now,
+                        external.expires_at_unix.saturating_sub(now),
+                    );
+                    let mut internal = external;
+                    internal.capability = Some(capability);
+                    verify_capability_v2(
+                        &self.verify_key,
+                        &internal,
+                        &self.broker_instance_id,
+                        &self.broker_key_id,
+                        &peer_bind,
+                        now,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let digest = operation_facts_digest(&internal.facts);
+                    self.ledger
+                        .lock()
+                        .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
+                        .reserve(&internal, now)?;
+                    let mut response = self.runner.run(&internal);
+                    if let Err(error) = self
+                        .ledger
+                        .lock()
+                        .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
+                        .complete(&internal.nonce, &digest)
+                    {
+                        response.ok = false;
+                        response.error = Some(format!(
+                            "durable Windows replay ledger finalize failed: {error}"
+                        ));
+                    }
+                    Ok(response)
+                }
+            }
+        }
+        .await;
+        result.unwrap_or_else(|error: String| BrokerResponseV2 {
+            request_id: "unknown".into(),
+            ok: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(error),
+            timed_out: false,
+            cancelled: false,
+            truncated: false,
+            duration_ms: 0,
+        })
+    }
+}
+
+async fn read_windows_v2_frame(
+    connection: &mut ownmesh_ipc::ServerConnection,
+) -> Result<Vec<u8>, String> {
+    let mut line = Vec::with_capacity(1024);
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = connection
+            .read(&mut byte)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("Windows broker peer disconnected before request".into());
+        }
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+        if line.len() >= MAX_BROKER_REQUEST_BYTES {
+            return Err("Windows broker request exceeds byte limit".into());
+        }
+        line.push(byte[0]);
+    }
+}
+
+async fn write_windows_response(
+    connection: &mut ownmesh_ipc::ServerConnection,
+    response: &BrokerResponseV2,
+) -> Result<(), String> {
+    let mut line = serde_json::to_vec(response).map_err(|error| error.to_string())?;
+    line.push(b'\n');
+    connection
+        .write_all(&line)
+        .await
+        .map_err(|error| error.to_string())?;
+    connection.flush().await.map_err(|error| error.to_string())
+}
+
+fn reject_windows_external_action(
+    facts: &ownmesh_broker_client::OperationFactsV2,
+) -> Result<(), String> {
+    if facts.canonical_cwd.is_some() || !facts.sanitized_env.is_empty() || facts.argv.is_empty() {
+        return Err(
+            "Windows broker rejects caller cwd, environment, or empty argv (fail-closed)".into(),
+        );
+    }
+    let first = facts.argv[0].to_ascii_lowercase();
+    if [
+        "cmd",
+        "cmd.exe",
+        "powershell",
+        "powershell.exe",
+        "pwsh",
+        "pwsh.exe",
+        "sh",
+        "bash",
+    ]
+    .contains(&first.as_str())
+    {
+        return Err("Windows broker rejects shell execution (fail-closed)".into());
+    }
+    Ok(())
+}
+
+fn windows_peer_bind(peer: &WindowsPipePeerFacts) -> Result<PeerProcessBindV2, String> {
+    Ok(PeerProcessBindV2 {
+        pid: i32::try_from(peer.pid()).map_err(|_| "Windows peer PID overflow")?,
+        uid: 0,
+        executable_path: peer.image_path().into(),
+        process_birth_id: peer.creation_filetime(),
+        image_identity: format!(
+            "sid={};vol={};file={};sha256={}",
+            peer.user_sid(),
+            peer.image_volume_serial(),
+            hex::encode(peer.image_file_id()),
+            hex::encode(peer.image_sha256())
+        ),
+    })
 }
 
 impl WindowsTrustedDaemon {
