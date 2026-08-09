@@ -2082,4 +2082,46 @@ mod tests {
         assert!(source.contains("WaitNamedPipeW"));
         assert!(source.contains("validate_service_custody(service)"));
     }
+
+    #[test]
+    fn creation_descriptors_parse_to_their_exact_object_masks() {
+        fn masks(descriptor: &CreationDescriptor) -> Vec<u32> {
+            let mut present = 0;
+            let mut defaulted = 0;
+            let mut dacl = ptr::null_mut();
+            assert_ne!(
+                unsafe {
+                    GetSecurityDescriptorDacl(
+                        descriptor.raw,
+                        &mut present,
+                        &mut dacl,
+                        &mut defaulted,
+                    )
+                },
+                0
+            );
+            assert_eq!(present, 1);
+            assert!(!dacl.is_null());
+            (0..2)
+                .map(|index| {
+                    let mut ace = ptr::null_mut();
+                    assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+                    unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask }
+                })
+                .collect()
+        }
+
+        let file = CreationDescriptor::new(false).unwrap();
+        let service = CreationDescriptor::service().unwrap();
+        assert_eq!(masks(&file), vec![0x001f_01ff; 2]);
+        assert_eq!(masks(&service), vec![SERVICE_ALL_ACCESS; 2]);
+    }
+
+    #[test]
+    fn generated_request_secret_has_the_exact_required_length() {
+        assert_eq!(
+            BrokerSecret::generate().as_bytes().len(),
+            BROKER_SECRET_BYTES
+        );
+    }
 }
