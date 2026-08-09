@@ -82,14 +82,29 @@ impl SupervisorClient {
             },
         )
         .with_client_credential(management_credential);
-        let issued: CredentialSecretResult = serde_json::from_value(
-            management
-                .call(
-                    ownmesh_ipc::methods::CREDENTIAL_PROVISION,
-                    Some(json!({"client_id": SUPERVISOR_DAEMON_CLIENT_ID})),
-                )
-                .await?,
-        )?;
+        // Restart path is rotate-first so a still-running predecessor loses
+        // its exact daemon credential before this process receives a client.
+        // First install has no active record and is the only provision fallback.
+        let rotate_params = Some(json!({"client_id": SUPERVISOR_DAEMON_CLIENT_ID}));
+        let issued_value = match management
+            .call(ownmesh_ipc::methods::CREDENTIAL_ROTATE, rotate_params)
+            .await
+        {
+            Ok(value) => value,
+            Err(IpcError::Remote { code, message })
+                if (code == app_error::UNAUTHORIZED || code == app_error::CONFLICT)
+                    && message.contains("no active credential") =>
+            {
+                management
+                    .call(
+                        ownmesh_ipc::methods::CREDENTIAL_PROVISION,
+                        Some(json!({"client_id": SUPERVISOR_DAEMON_CLIENT_ID})),
+                    )
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
+        let issued: CredentialSecretResult = serde_json::from_value(issued_value)?;
         Ok(Self {
             client: IpcClient::new(
                 endpoint,
@@ -200,6 +215,12 @@ impl SupervisorIpcServer {
     #[must_use]
     pub fn server(&self) -> &Arc<IpcServer> {
         &self.server
+    }
+
+    /// Resolved per-user local endpoint (socket or named pipe).
+    #[must_use]
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.server.config().endpoint
     }
 
     /// Owner-only durable management credential delivery directory.
@@ -533,6 +554,37 @@ mod tests {
             .call(SupervisorRpcMethods::TERMINATE, Some(json!(binding)))
             .await
             .unwrap();
+        supervisor.server().request_shutdown();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rotates_predecessor_daemon_credential() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let (supervisor, _) = SupervisorIpcServer::new(&state_dir, &runtime).unwrap();
+        let endpoint = supervisor.endpoint().clone();
+        let server = Arc::clone(supervisor.server());
+        let task = tokio::spawn(async move { server.serve().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let management = read_management_credential(supervisor.credential_state_dir()).unwrap();
+        let first =
+            SupervisorClient::bootstrap(endpoint.clone(), runtime.clone(), management.clone())
+                .await
+                .unwrap();
+        let request: SupervisorSpawnRequest = serde_json::from_value(spawn_params()).unwrap();
+        let binding = first.spawn(request).await.unwrap();
+        let second = SupervisorClient::bootstrap(endpoint, runtime, management)
+            .await
+            .unwrap();
+        assert!(
+            first.status(&binding).await.is_err(),
+            "restart must revoke old daemon credential"
+        );
+        second.status(&binding).await.unwrap();
+        second.terminate(&binding).await.unwrap();
         supervisor.server().request_shutdown();
         task.await.unwrap();
     }
