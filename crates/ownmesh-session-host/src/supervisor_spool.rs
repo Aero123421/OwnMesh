@@ -22,6 +22,7 @@ pub const SUPERVISOR_HOST_MAX_TTL_SECS: i64 = 24 * 60 * 60;
 const MANIFEST_FILE: &str = "host-manifest.json";
 const SPOOL_FILE: &str = "owner-output.spool";
 const CLAIM_FILE: &str = "host.claim";
+const TERMINATION_FILE: &str = "host-terminated.json";
 const MAX_MANIFEST_BYTES: usize = 16 * 1024;
 const MAX_TRANSITION_ID_BYTES: usize = 128;
 const MAX_TRANSITION_DIGEST_BYTES: usize = 128;
@@ -55,6 +56,22 @@ pub struct HostManifest {
 /// Bounded non-secret idempotency witness persisted with the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransitionReceipt {
+    pub transition_id: String,
+    pub payload_digest: String,
+}
+
+/// Durable terminal receipt.  The spool directory is deliberately retained
+/// after process cleanup so an interrupted daemon can retry the exact
+/// termination without treating a missing live host as an ambiguous failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminationReceipt {
+    pub session_id: String,
+    pub device_id: String,
+    pub workspace_id: String,
+    pub owner_principal: String,
+    pub host_nonce: String,
+    pub controller_epoch: u64,
     pub transition_id: String,
     pub payload_digest: String,
 }
@@ -238,6 +255,85 @@ impl OwnerSpool {
         let spool = Self { dir, manifest };
         let _ = spool.read_state()?;
         Ok(spool)
+    }
+
+    /// Read a custody-attested terminal receipt without reviving a host.  A
+    /// missing receipt is normal for a still-live session; malformed or
+    /// replaced state is an error and callers fail closed.
+    pub fn termination_receipt(
+        root: &Path,
+        session_id: &str,
+    ) -> Result<Option<TerminationReceipt>, String> {
+        if !valid_component(session_id) {
+            return Err("invalid supervisor session id".into());
+        }
+        let dir = root.join(session_id);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        prepare_owner_only_state_dir(&dir)
+            .map_err(|e| format!("attest supervisor termination directory: {e}"))?;
+        let path = dir.join(TERMINATION_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = read_owner_only_file_bounded(&path, MAX_MANIFEST_BYTES)
+            .map_err(|e| format!("read supervisor termination receipt: {e}"))?;
+        let receipt: TerminationReceipt = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("parse supervisor termination receipt: {e}"))?;
+        for value in [
+            &receipt.session_id,
+            &receipt.device_id,
+            &receipt.workspace_id,
+            &receipt.owner_principal,
+            &receipt.host_nonce,
+        ] {
+            if !valid_component(value) {
+                return Err("invalid supervisor termination receipt identity".into());
+            }
+        }
+        validate_transition(&receipt.transition_id, &receipt.payload_digest)?;
+        if receipt.controller_epoch == 0 || receipt.session_id != session_id {
+            return Err("invalid supervisor termination receipt".into());
+        }
+        Ok(Some(receipt))
+    }
+
+    /// Persist the exact terminal receipt after the process tree has been
+    /// terminated. Atomic owner-only replacement makes a lost reply safe to
+    /// retry across a daemon or sidecar restart.
+    pub fn record_termination(
+        &self,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<(), String> {
+        validate_transition(transition_id, payload_digest)?;
+        let receipt = TerminationReceipt {
+            session_id: self.manifest.session_id.clone(),
+            device_id: self.manifest.device_id.clone(),
+            workspace_id: self.manifest.workspace_id.clone(),
+            owner_principal: self.manifest.owner_principal.clone(),
+            host_nonce: self.manifest.host_nonce.clone(),
+            controller_epoch: self.manifest.controller_epoch,
+            transition_id: transition_id.into(),
+            payload_digest: payload_digest.into(),
+        };
+        if let Some(existing) = Self::termination_receipt(
+            self.dir.parent().ok_or("supervisor spool has no root")?,
+            &self.manifest.session_id,
+        )? {
+            if existing == receipt {
+                return Ok(());
+            }
+            if existing.transition_id == transition_id {
+                return Err("supervisor termination id payload conflict".into());
+            }
+            return Err("supervisor host already terminated".into());
+        }
+        let bytes = serde_json::to_vec(&receipt)
+            .map_err(|e| format!("encode supervisor termination receipt: {e}"))?;
+        atomic_write_owner_only(&self.dir.join(TERMINATION_FILE), &bytes)
+            .map_err(|e| format!("write supervisor termination receipt: {e}"))
     }
 
     #[must_use]

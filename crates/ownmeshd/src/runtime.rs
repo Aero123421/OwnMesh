@@ -2941,7 +2941,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 };
                 if let Err(err) = self.sessions.set_host_pid(&info.id, status.pid) {
                     if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                        let _ = proxy.terminate(&binding).await;
+                        let _ = proxy
+                            .terminate(&binding, format!("open-rollback:{}:host-pid", info.id))
+                            .await;
                     }
                     self.sessions = snapshot;
                     return Err(session_err(err));
@@ -2960,14 +2962,18 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     .set_sidecar_host_binding(&info.id, Some(durable))
                 {
                     if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                        let _ = proxy.terminate(&binding).await;
+                        let _ = proxy
+                            .terminate(&binding, format!("open-rollback:{}:binding", info.id))
+                            .await;
                     }
                     self.sessions = snapshot;
                     return Err(session_err(err));
                 }
                 if let Err(err) = self.commit_sessions(snapshot) {
                     if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                        let _ = proxy.terminate(&binding).await;
+                        let _ = proxy
+                            .terminate(&binding, format!("open-rollback:{}:persist", info.id))
+                            .await;
                     }
                     return Err(err);
                 }

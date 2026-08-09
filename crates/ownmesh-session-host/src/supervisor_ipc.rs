@@ -227,9 +227,16 @@ impl SupervisorClient {
     ) -> IpcResult<SupervisorBinding> {
         Ok(serde_json::from_value(self.client.call(SupervisorRpcMethods::RENEW, Some(json!({"binding":binding,"binding_expires_unix":binding_expires_unix,"transition_id":transition_id}))).await?)?)
     }
-    pub async fn terminate(&self, binding: &SupervisorBinding) -> IpcResult<()> {
+    pub async fn terminate(
+        &self,
+        binding: &SupervisorBinding,
+        transition_id: String,
+    ) -> IpcResult<()> {
         self.client
-            .call(SupervisorRpcMethods::TERMINATE, Some(json!(binding)))
+            .call(
+                SupervisorRpcMethods::TERMINATE,
+                Some(json!({"binding":binding,"transition_id":transition_id})),
+            )
             .await?;
         Ok(())
     }
@@ -406,8 +413,13 @@ async fn dispatch(
                 .map_err(invalid)?))
         }
         SupervisorRpcMethods::TERMINATE => {
-            let binding: SupervisorBinding = parse(params)?;
-            state.terminate(&binding).await.map_err(invalid)?;
+            let params: TerminateParams = parse(params)?;
+            require_transition_id(&params.transition_id)?;
+            let digest = digest_value(json!({"binding":params.binding}))?;
+            state
+                .terminate_idempotent(&params.binding, &params.transition_id, &digest)
+                .await
+                .map_err(invalid)?;
             Ok(json!({"ok": true}))
         }
         SupervisorRpcMethods::ROTATE => {
@@ -637,6 +649,12 @@ struct RenewParams {
     binding_expires_unix: i64,
     transition_id: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminateParams {
+    binding: SupervisorBinding,
+    transition_id: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -729,7 +747,10 @@ mod tests {
             .is_err());
         let new_daemon = client(endpoint, &runtime, Some(rotated.credential));
         new_daemon
-            .call(SupervisorRpcMethods::TERMINATE, Some(json!(binding)))
+            .call(
+                SupervisorRpcMethods::TERMINATE,
+                Some(json!({"binding":binding,"transition_id":"terminate-ipc"})),
+            )
             .await
             .unwrap();
         supervisor.server().request_shutdown();
@@ -762,7 +783,10 @@ mod tests {
             "restart must revoke old daemon credential"
         );
         second.status(&binding).await.unwrap();
-        second.terminate(&binding).await.unwrap();
+        second
+            .terminate(&binding, "terminate-bootstrap".into())
+            .await
+            .unwrap();
         supervisor.server().request_shutdown();
         task.await.unwrap();
     }

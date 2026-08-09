@@ -505,16 +505,54 @@ impl SupervisorState {
         count
     }
 
-    pub async fn terminate(&self, binding: &SupervisorBinding) -> Result<(), String> {
+    /// Terminate a host exactly once.  The receipt survives removal from the
+    /// in-memory map, so a lost daemon reply/restart can be retried only with
+    /// the same exact binding and server-derived payload digest.
+    pub async fn terminate_idempotent(
+        &self,
+        binding: &SupervisorBinding,
+        transition_id: &str,
+        payload_digest: &str,
+    ) -> Result<(), String> {
         let mut hosts = self.hosts.lock().await;
-        let hosted = hosts
-            .get(&binding.session_id)
+        if let Some(hosted) = hosts.get_mut(&binding.session_id) {
+            exact(binding, &hosted.manifest)?;
+            hosted.host.terminate()?;
+            // Do not remove the host until the terminal receipt is durable:
+            // a persistence failure remains retryable without claiming a
+            // process was cleaned up when it was not.
+            hosted
+                .spool
+                .record_termination(transition_id, payload_digest)?;
+            hosts.remove(&binding.session_id);
+            return Ok(());
+        }
+        drop(hosts);
+        let receipt = OwnerSpool::termination_receipt(&self.root, &binding.session_id)?
             .ok_or("supervisor host unavailable")?;
-        exact(binding, &hosted.manifest)?;
-        let mut hosted = hosts
-            .remove(&binding.session_id)
-            .ok_or("supervisor host unavailable")?;
-        hosted.host.terminate()
+        let matches_binding = receipt.session_id == binding.session_id
+            && receipt.device_id == binding.device_id
+            && receipt.workspace_id == binding.workspace_id
+            && receipt.owner_principal == binding.owner_principal
+            && receipt.host_nonce == binding.host_nonce
+            && receipt.controller_epoch == binding.controller_epoch;
+        if !matches_binding {
+            return Err("supervisor termination binding mismatch".into());
+        }
+        if receipt.transition_id == transition_id && receipt.payload_digest == payload_digest {
+            Ok(())
+        } else if receipt.transition_id == transition_id {
+            Err("supervisor termination id payload conflict".into())
+        } else {
+            Err("supervisor host already terminated".into())
+        }
+    }
+
+    /// Compatibility helper for older in-process tests. Local IPC always uses
+    /// [`Self::terminate_idempotent`] with a caller-specific transition id.
+    pub async fn terminate(&self, binding: &SupervisorBinding) -> Result<(), String> {
+        self.terminate_idempotent(binding, "legacy-in-process-terminate", "legacy")
+            .await
     }
 }
 
@@ -774,6 +812,49 @@ mod tests {
                 .unwrap()
         );
         state.terminate(&renewed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminate_receipt_survives_reply_loss_and_rejects_stale_or_conflicting_replay() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let binding = state
+            .spawn(
+                HostManifest::new(
+                    "ses_terminal",
+                    "dev",
+                    "ws",
+                    "owner_a",
+                    1,
+                    unix_now() + 60,
+                    unix_now() + 600,
+                )
+                .unwrap(),
+                shell_command(),
+                PtySize::default(),
+            )
+            .await
+            .unwrap();
+        state
+            .terminate_idempotent(&binding, "tr_terminate", "digest_terminal")
+            .await
+            .unwrap();
+        // This is the reply-loss/restart path: the in-memory host is gone but
+        // the owner-only tombstone returns the same success exactly once.
+        state
+            .terminate_idempotent(&binding, "tr_terminate", "digest_terminal")
+            .await
+            .unwrap();
+        assert!(state
+            .terminate_idempotent(&binding, "tr_terminate", "other_digest")
+            .await
+            .is_err());
+        let mut stale = binding.clone();
+        stale.host_nonce = "host_stale".into();
+        assert!(state
+            .terminate_idempotent(&stale, "tr_terminate", "digest_terminal")
+            .await
+            .is_err());
     }
 
     fn shell_command() -> PtyCommand {
