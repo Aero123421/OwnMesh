@@ -2154,6 +2154,7 @@ version = "1.2.0-beta.12"
 dependencies = [
  "clap",
  "futures-util",
+ "hex",
  "ownmesh-broker-client",
  "ownmesh-config",
  "ownmesh-domain",
@@ -2169,6 +2170,7 @@ dependencies = [
  "ownmesh-session-host",
  "ownmesh-transfer",
  "ring",
+ "rustix 1.1.4",
  "rustls",
  "serde",
  "serde_json",
