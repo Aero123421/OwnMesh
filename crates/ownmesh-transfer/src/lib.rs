@@ -675,10 +675,8 @@ impl TransferSender {
             .checked_add(u64::try_from(expected).map_err(|_| TransferError::Overflow)?)
             .ok_or(TransferError::Overflow)?;
         self.remaining = next_remaining;
-        if self.remaining == 0 {
-            if hex::encode(self.hasher.clone().finalize()) != self.plan.sha256 {
-                return Err(TransferError::SourceChanged);
-            }
+        if self.remaining == 0 && hex::encode(self.hasher.clone().finalize()) != self.plan.sha256 {
+            return Err(TransferError::SourceChanged);
         }
         Ok(Some(chunk))
     }
