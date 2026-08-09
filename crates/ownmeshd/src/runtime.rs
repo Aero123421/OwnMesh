@@ -2489,7 +2489,7 @@ full_user_access/full_access for arbitrary commands",
             session_methods::RENEW => self.handle_session_renew(params, client),
             session_methods::DETACH => self.handle_session_detach(params, client).await,
             session_methods::RELEASE => self.handle_session_release(params, client),
-            session_methods::GIVE => self.handle_session_give(params, client),
+            session_methods::GIVE => self.handle_session_give(params, client).await,
             session_methods::CLOSE => self.handle_session_close(params, client),
             session_methods::TERMINATE => self.handle_session_terminate(params, client),
             session_methods::REPLAY => self.handle_session_replay(params, client).await,
@@ -3624,7 +3624,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         }))
     }
 
-    fn handle_session_give(
+    async fn handle_session_give(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -3679,11 +3679,102 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         // controller is a remote MCP principal (same tenant namespace).
         let to = normalize_handoff_target(&from, &p.to)?;
         let snapshot = self.sessions.clone();
-        let lease = self
-            .sessions
+        let mut preview = self.sessions.clone();
+        let lease = preview
             .give_controller(&p.id, &from, to, now)
             .map_err(session_err)?;
-        self.commit_sessions(snapshot)?;
+        if let Some(old_binding) = self
+            .sessions
+            .get(&p.id)
+            .map_err(session_err)?
+            .sidecar_host
+            .clone()
+        {
+            // The old controller's exact remote seat was authorized above.
+            // Keep the transition ID bound to that seat, so a retried handoff
+            // cannot rotate a successor generation or target a different owner.
+            let transition_id = format!(
+                "give:{}:{}:{}",
+                p.id,
+                p.lease_id.as_deref().unwrap_or(&lease.lease_id),
+                p.controller_epoch.unwrap_or(lease.epoch),
+            );
+            // Recover outstanding work before creating this intent, otherwise
+            // bootstrap could consume this operation's just-created row.
+            self.ensure_remote_supervisor().await?;
+            let record = TransitionRecord {
+                transition_id: transition_id.clone(),
+                kind: TransitionKind::Give,
+                phase: TransitionPhase::Intent,
+                session_id: p.id.clone(),
+                device_id: old_binding.device_id.clone(),
+                workspace_id: bound_ws.clone(),
+                authenticated_principal: from.clone(),
+                old_binding: old_binding.clone(),
+                target: TransitionTarget {
+                    principal: lease.principal_id.clone(),
+                    controller_epoch: lease.epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    controller_attached: true,
+                },
+                new_binding: None,
+                created_unix: now,
+                expires_unix: old_binding.host_expires_unix,
+            };
+            self.transition_journal
+                .begin(record)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("begin sidecar give journal: {e}"),
+                })?;
+            let old = supervisor_binding_from(&p.id, &old_binding);
+            let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "sidecar unavailable after bootstrap".into(),
+            })?;
+            let returned = proxy
+                .rotate(
+                    &old,
+                    lease.principal_id.clone(),
+                    lease.epoch,
+                    lease.expires_unix,
+                    transition_id.clone(),
+                )
+                .await
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("sidecar give failed: {e}"),
+                })?;
+            let new_binding = SidecarHostBinding {
+                device_id: old_binding.device_id.clone(),
+                workspace_id: old_binding.workspace_id.clone(),
+                owner_principal: lease.principal_id.clone(),
+                host_nonce: returned.host_nonce,
+                controller_epoch: returned.controller_epoch,
+                binding_expires_unix: lease.expires_unix,
+                host_expires_unix: old_binding.host_expires_unix,
+            };
+            self.transition_journal
+                .mark_applied(&transition_id, new_binding.clone())
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("mark sidecar give journal: {e}"),
+                })?;
+            preview
+                .set_sidecar_host_binding(&p.id, Some(new_binding))
+                .map_err(session_err)?;
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+            self.transition_journal
+                .clear(&transition_id)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("clear sidecar give journal: {e}"),
+                })?;
+        } else {
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+        }
         let readers: Vec<String> = self
             .sessions
             .readers(&p.id, now)
