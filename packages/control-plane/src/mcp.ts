@@ -2755,7 +2755,7 @@ async function buildTransferStartOperation(opts: {
     principal_credential_generation: opts.principalCredentialGeneration,
     // The bearer is carried only on the Agent request; intentionally exclude it
     // from any public/audited action representation.
-    facts: Object.fromEntries(Object.entries(args).filter(([key]) => key !== "ticket")),
+    facts: transferStartAuditedFacts(args),
   };
   const bound = await bindCanonicalAction(canonical, { operationId: opts.operationId, expiresAt: meta.expires_at, claimVersion: 1 });
   return {
@@ -2765,6 +2765,13 @@ async function buildTransferStartOperation(opts: {
     payload: { operation_contract: OPERATION_CONTRACT_V1, operation_id: opts.operationId, capability: "transfer.start",
       idempotency_key: opts.operationId, payload_hash: bound.payload_hash, authorization: { bound_action: bound.bound }, arguments: args, workspace_id: workspaceId },
   };
+}
+
+/** Match the Agent's common exact-action normalizer: workspace_id is already
+ * signed at the action envelope level, while the live-only bearer is verified
+ * independently and must never enter durable/audited facts. */
+export function transferStartAuditedFacts(args: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(args).filter(([key]) => key !== "ticket" && key !== "workspace_id"));
 }
 
 async function transferAuthorities(

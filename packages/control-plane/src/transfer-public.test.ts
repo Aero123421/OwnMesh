@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildTicketlessTransferStartOutbox, finalTransferPlanHash, handleMcp, MCP_TOOLS, OperationTracker, type OperationRouter, type TransferPlanMeta } from "./mcp.ts";
+import { buildTicketlessTransferStartOutbox, finalTransferPlanHash, handleMcp, MCP_TOOLS, OperationTracker, transferStartAuditedFacts, type OperationRouter, type TransferPlanMeta } from "./mcp.ts";
 import { MemoryStore } from "./store.ts";
 
 function request(token: string, name: string, args: Record<string, unknown>): Request {
@@ -235,4 +235,13 @@ test("durable transfer-start outbox recursively excludes bearer, JTI, and epheme
   assert.equal(forbidden(stored), false);
   assert.equal(JSON.stringify(stored).includes("bearer.secret"), false);
   assert.equal(stored.non_redeliverable, true);
+});
+
+test("transfer start audited facts exclude live bearer and duplicate workspace routing", () => {
+  assert.deepEqual(transferStartAuditedFacts({
+    ticket: "live-only", workspace_id: "ws_destination", transfer_id: "xfer_1",
+    destination_workspace_id: "ws_destination", epoch: 1, fence: 2,
+  }), {
+    transfer_id: "xfer_1", destination_workspace_id: "ws_destination", epoch: 1, fence: 2,
+  });
 });
