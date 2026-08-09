@@ -14,6 +14,7 @@ use ownmesh_ipc::{
 use ownmesh_session::{PtyCommand, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -172,12 +173,13 @@ impl SupervisorClient {
         owner_principal: String,
         controller_epoch: u64,
         binding_expires_unix: i64,
+        transition_id: String,
     ) -> IpcResult<SupervisorBinding> {
         Ok(serde_json::from_value(
             self.client
                 .call(
                     SupervisorRpcMethods::ROTATE,
-                    Some(json!({"binding":binding,"owner_principal":owner_principal,"controller_epoch":controller_epoch,"binding_expires_unix":binding_expires_unix})),
+                    Some(json!({"binding":binding,"owner_principal":owner_principal,"controller_epoch":controller_epoch,"binding_expires_unix":binding_expires_unix,"transition_id":transition_id})),
                 )
                 .await?,
         )?)
@@ -307,6 +309,7 @@ fn supervisor_handler(state: Arc<SupervisorState>) -> MethodHandler {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch(
     state: &SupervisorState,
     method: &str,
@@ -380,12 +383,16 @@ async fn dispatch(
         SupervisorRpcMethods::ROTATE => {
             let params: RotateParams = parse(params)?;
             require_component(&params.owner_principal, "owner_principal")?;
+            require_transition_id(&params.transition_id)?;
+            let digest = transition_digest(&params)?;
             let binding = state
-                .rotate_binding(
+                .rotate_binding_idempotent(
                     &params.binding,
                     params.owner_principal,
                     params.controller_epoch,
                     params.binding_expires_unix,
+                    &params.transition_id,
+                    &digest,
                 )
                 .await
                 .map_err(invalid)?;
@@ -464,6 +471,26 @@ fn validate_spawn(params: &SupervisorSpawnRequest) -> IpcResult<()> {
     Ok(())
 }
 
+fn require_transition_id(value: &str) -> IpcResult<()> {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(invalid("invalid supervisor transition id"));
+    }
+    Ok(())
+}
+
+fn transition_digest(params: &RotateParams) -> IpcResult<String> {
+    // Digest is derived by the authenticated sidecar from the exact parsed
+    // request; callers never get to supply an idempotency payload digest.
+    let bytes = serde_json::to_vec(&json!({
+        "binding": params.binding,
+        "owner_principal": params.owner_principal,
+        "controller_epoch": params.controller_epoch,
+        "binding_expires_unix": params.binding_expires_unix,
+    }))
+    .map_err(|err| invalid(format!("encode supervisor transition: {err}")))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 impl SupervisorCommand {
     fn into_command(self) -> PtyCommand {
         PtyCommand {
@@ -505,6 +532,7 @@ struct RotateParams {
     owner_principal: String,
     controller_epoch: u64,
     binding_expires_unix: i64,
+    transition_id: String,
 }
 
 #[cfg(test)]
