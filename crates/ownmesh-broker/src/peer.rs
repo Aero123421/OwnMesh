@@ -4,7 +4,7 @@
 //! the connecting PID/UID and independently resolve that PID's executable. The
 //! executable supplied by a request or CLI is never authoritative.
 
-use ownmesh_broker_client::{BrokerEndpoint, PeerBind, PeerCred};
+use ownmesh_broker_client::{BrokerEndpoint, PeerBind, PeerCred, PeerProcessBindV2};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -12,6 +12,13 @@ use std::path::{Path, PathBuf};
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Display for FileIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "dev={};ino={}", self.device, self.inode)
+    }
 }
 
 /// Exact policy required before the broker may mint a capability for ownmeshd.
@@ -116,6 +123,7 @@ impl TrustedPeerPolicy {
             return Ok(AuthorizedPeer {
                 peer: resolved.peer,
                 process_start_time: resolved.start_time,
+                image_identity: resolved.executable_file_id.to_string(),
             });
         }
         #[cfg(not(target_os = "linux"))]
@@ -139,6 +147,8 @@ pub struct AuthorizedPeer {
     /// This is retained separately from the externally bound PID so a later PID
     /// reuse cannot compare equal during request-time refresh.
     process_start_time: u64,
+    /// Kernel-derived identity of the executable held by the peer process.
+    image_identity: String,
 }
 
 impl AuthorizedPeer {
@@ -150,6 +160,18 @@ impl AuthorizedPeer {
     #[must_use]
     pub fn process_start_time(&self) -> u64 {
         self.process_start_time
+    }
+
+    /// V2 token binding facts derived from the accepted OS peer only.
+    #[must_use]
+    pub fn process_bind_v2(&self) -> PeerProcessBindV2 {
+        PeerProcessBindV2 {
+            pid: self.peer.pid,
+            uid: self.peer.uid,
+            executable_path: self.peer.exe_path.clone(),
+            process_birth_id: self.process_start_time,
+            image_identity: self.image_identity.clone(),
+        }
     }
 
     #[allow(dead_code)]
@@ -538,10 +560,12 @@ mod tests {
         let accepted = AuthorizedPeer {
             peer: peer.clone(),
             process_start_time: 10,
+            image_identity: "dev=1;ino=1".into(),
         };
         let reused_pid = AuthorizedPeer {
             peer,
             process_start_time: 11,
+            image_identity: "dev=1;ino=1".into(),
         };
 
         assert_eq!(accepted.peer_bind(), reused_pid.peer_bind());

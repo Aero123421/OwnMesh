@@ -525,6 +525,7 @@ pub struct PeerProcessBindV2 {
 pub struct OperationFactsV2 {
     pub operation: String,
     pub remote_payload_sha256: String,
+    pub principal_id: String,
     pub principal_credential_generation: u64,
     pub device_id: String,
     pub workspace_id: String,
@@ -569,7 +570,11 @@ pub struct BrokerRequestV2 {
     pub issued_at_unix: i64,
     pub expires_at_unix: i64,
     pub facts: OperationFactsV2,
-    pub capability: CapabilityTokenV2,
+    /// Optional only at the daemon-to-broker boundary.  A missing capability
+    /// may be minted solely after the broker has authenticated the live OS
+    /// peer; a request MAC on its own never grants that authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<CapabilityTokenV2>,
     /// HMAC is message authentication only; it is never capability authority.
     pub mac: String,
 }
@@ -646,11 +651,32 @@ pub fn verify_request_v2(
     peer: &PeerProcessBindV2,
     now_unix: i64,
 ) -> BrokerResult<()> {
+    verify_request_v2_message_auth(secret, req, now_unix)?;
+    verify_capability_v2(
+        verify_key,
+        req,
+        expected_broker_instance_id,
+        expected_broker_key_id,
+        peer,
+        now_unix,
+    )
+}
+
+/// Verify only the broker-issued capability embedded in an already
+/// message-authenticated request.  This supports the production sequence where
+/// the external daemon frame carries no capability, the broker mints one after
+/// OS peer authorization, and the internal-only clone is then verified.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_capability_v2(
+    verify_key: &CapabilityVerifyKey,
+    req: &BrokerRequestV2,
+    expected_broker_instance_id: &str,
+    expected_broker_key_id: &str,
+    peer: &PeerProcessBindV2,
+    now_unix: i64,
+) -> BrokerResult<()> {
     validate_v2_request_shape(req, now_unix)?;
-    if !constant_time_hex_eq(&compute_mac_v2(secret, req), &req.mac) {
-        return Err(BrokerError::BadSignature);
-    }
-    let cap = &req.capability;
+    let cap = req.capability.as_ref().ok_or(BrokerError::InvalidToken)?;
     if now_unix > cap.expires_at_unix || cap.issued_at_unix > now_unix {
         return Err(BrokerError::Expired);
     }
@@ -666,6 +692,22 @@ pub fn verify_request_v2(
     }
     let signature = hex::decode(&cap.signature).map_err(|_| BrokerError::BadSignature)?;
     verify_key.verify(&canonical_capability_v2_bytes(cap), &signature)
+}
+
+/// Verify only strict request framing, exact facts, expiry, and the local
+/// message MAC.  This deliberately returns no authority: production serving
+/// must additionally authenticate a trusted OS peer before it mints a missing
+/// capability or accepts a supplied one through [`verify_request_v2`].
+pub fn verify_request_v2_message_auth(
+    secret: &BrokerSecret,
+    req: &BrokerRequestV2,
+    now_unix: i64,
+) -> BrokerResult<()> {
+    validate_v2_request_shape(req, now_unix)?;
+    if !constant_time_hex_eq(&compute_mac_v2(secret, req), &req.mac) {
+        return Err(BrokerError::BadSignature);
+    }
+    Ok(())
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
@@ -706,6 +748,7 @@ fn canonical_operation_facts_v2_bytes(facts: &OperationFactsV2) -> Vec<u8> {
     buf.extend_from_slice(OPERATION_FACTS_V2_DOMAIN);
     put_str(&mut buf, &facts.operation);
     put_str(&mut buf, &facts.remote_payload_sha256);
+    put_str(&mut buf, &facts.principal_id);
     put_u64(&mut buf, facts.principal_credential_generation);
     put_str(&mut buf, &facts.device_id);
     put_str(&mut buf, &facts.workspace_id);
@@ -765,9 +808,18 @@ fn canonical_request_v2_bytes(req: &BrokerRequestV2) -> Vec<u8> {
     put_i64(&mut buf, req.expires_at_unix);
     let facts = canonical_operation_facts_v2_bytes(&req.facts);
     put_bytes(&mut buf, &facts);
-    let capability = canonical_capability_v2_bytes(&req.capability);
-    put_bytes(&mut buf, &capability);
-    put_str(&mut buf, &req.capability.signature);
+    match &req.capability {
+        Some(capability) => {
+            buf.push(1);
+            let capability = canonical_capability_v2_bytes(capability);
+            put_bytes(&mut buf, &capability);
+            put_str(
+                &mut buf,
+                req.capability.as_ref().map_or("", |cap| &cap.signature),
+            );
+        }
+        None => buf.push(0),
+    }
     buf
 }
 
@@ -804,26 +856,12 @@ fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResu
         ("operation_id", req.operation_id.as_str()),
         ("nonce", req.nonce.as_str()),
         ("facts.operation", req.facts.operation.as_str()),
+        ("principal_id", req.facts.principal_id.as_str()),
         ("device_id", req.facts.device_id.as_str()),
         ("workspace_id", req.facts.workspace_id.as_str()),
         (
             "executable path",
             req.facts.executable.canonical_path.as_str(),
-        ),
-        ("capability token id", req.capability.token_id.as_str()),
-        (
-            "broker instance id",
-            req.capability.broker_instance_id.as_str(),
-        ),
-        ("broker key id", req.capability.broker_key_id.as_str()),
-        ("capability principal", req.capability.principal.as_str()),
-        (
-            "peer executable path",
-            req.capability.peer.executable_path.as_str(),
-        ),
-        (
-            "peer image identity",
-            req.capability.peer.image_identity.as_str(),
         ),
     ] {
         validate_bounded_field(name, value)?;
@@ -834,9 +872,7 @@ fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResu
         || req.facts.sanitized_env.len() > MAX_BROKER_ENV
         || !is_sha256_hex(&req.facts.remote_payload_sha256)
         || !is_sha256_hex(&req.facts.executable.image_sha256)
-        || !is_sha256_hex(&req.capability.operation_facts_digest)
-        || req.capability.peer.pid <= 0
-        || req.capability.peer.process_birth_id == 0
+        || req.facts.argv[0] != req.facts.executable.canonical_path
     {
         return Err(BrokerError::Protocol(
             "invalid bounded operation facts".into(),
@@ -862,6 +898,24 @@ fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResu
         }
         if value.len() > MAX_BROKER_FIELD_BYTES || value.contains('\0') {
             return Err(BrokerError::Protocol("invalid environment value".into()));
+        }
+    }
+    if let Some(cap) = &req.capability {
+        for (name, value) in [
+            ("capability token id", cap.token_id.as_str()),
+            ("broker instance id", cap.broker_instance_id.as_str()),
+            ("broker key id", cap.broker_key_id.as_str()),
+            ("capability principal", cap.principal.as_str()),
+            ("peer executable path", cap.peer.executable_path.as_str()),
+            ("peer image identity", cap.peer.image_identity.as_str()),
+        ] {
+            validate_bounded_field(name, value)?;
+        }
+        if !is_sha256_hex(&cap.operation_facts_digest)
+            || cap.peer.pid <= 0
+            || cap.peer.process_birth_id == 0
+        {
+            return Err(BrokerError::Protocol("invalid capability binding".into()));
         }
     }
     Ok(())
@@ -1511,6 +1565,7 @@ mod v2_tests {
         OperationFactsV2 {
             operation: "command.exec.elevated".into(),
             remote_payload_sha256: "a".repeat(64),
+            principal_id: "principal-1".into(),
             principal_credential_generation: 7,
             device_id: "device_1".into(),
             workspace_id: "workspace_1".into(),
@@ -1568,7 +1623,7 @@ mod v2_tests {
             issued_at_unix: 100,
             expires_at_unix: 130,
             facts,
-            capability: cap,
+            capability: Some(cap),
             mac: String::new(),
         };
         request.mac = compute_mac_v2(&secret, &request);
@@ -1627,6 +1682,26 @@ mod v2_tests {
             131,
         )
         .is_err());
+    }
+
+    #[test]
+    fn v2_mac_only_frame_cannot_verify_as_a_capability() {
+        let (secret, verify, mut request, peer) = signed_v2();
+        request.capability = None;
+        request.mac = compute_mac_v2(&secret, &request);
+        verify_request_v2_message_auth(&secret, &request, 110).unwrap();
+        assert!(matches!(
+            verify_request_v2(
+                &secret,
+                &verify,
+                &request,
+                "broker-instance",
+                "broker-key-1",
+                &peer,
+                110,
+            ),
+            Err(BrokerError::InvalidToken)
+        ));
     }
 
     #[test]

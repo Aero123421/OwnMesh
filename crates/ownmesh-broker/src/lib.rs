@@ -1,11 +1,12 @@
 //! OwnMesh networkless privileged broker library.
 //!
-//! **Production elevated broker is unsupported** until a secure mint authority
-//! is established. `run_broker` / install / status never bind or claim success.
+//! Production serving is available only for the Linux Unix-socket path after
+//! root-controlled custody plus exact SO_PEERCRED, `/proc` process-birth, and
+//! executable-identity checks. Windows/macOS remain fail-closed unsupported.
 //!
 //! In-process test helpers may still exercise MAC/capability over loopback TCP
 //! with a synthetic peer bind (`execute_verified*`, `handle_tcp_conn`) — these
-//! paths are unreachable from production CLI entry points.
+//! paths are unreachable from the production Unix-socket serve path.
 //!
 //! Never opens outbound network connections or non-loopback listeners.
 //!

@@ -1,4 +1,5 @@
-//! Production elevated broker is fixed as unsupported — no success wire E2E.
+//! Production broker must fail closed before bind when its root-controlled
+//! custody prerequisites are absent.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -20,8 +21,8 @@
 #![cfg(target_os = "linux")]
 
 use ownmesh_broker::{
-    broker_status, install_broker_with_config, production_elevated_broker_unsupported, run_broker,
-    BrokerInstallConfig, BrokerServeConfig, UnixSocketSecurity,
+    broker_status, install_broker_with_config, run_broker, BrokerInstallConfig, BrokerServeConfig,
+    UnixSocketSecurity,
 };
 use ownmesh_broker_client::BrokerEndpoint;
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ fn secure_run_dir() -> PathBuf {
 }
 
 #[tokio::test]
-async fn production_run_broker_is_explicitly_unsupported() {
+async fn production_run_broker_requires_real_custody_before_bind() {
     let base = secure_run_dir();
     let _ = std::fs::create_dir_all(&base);
     let err = run_broker(BrokerServeConfig {
@@ -56,12 +57,12 @@ async fn production_run_broker_is_explicitly_unsupported() {
         addr_file: None,
     })
     .await
-    .expect_err("production run_broker must be unsupported");
+    .expect_err("temporary test path must not satisfy production custody");
     assert!(
-        err.contains("unsupported") && err.contains("fail-closed"),
-        "expected production unsupported, got: {err}"
+        err.contains("fail-closed") || err.contains("root-owned"),
+        "{err}"
     );
-    assert_eq!(err, production_elevated_broker_unsupported());
+    assert!(!base.join("broker.sock").exists());
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -136,7 +137,7 @@ async fn production_install_and_status_never_claim_success() {
     );
     assert_eq!(st.support, "unsupported");
 
-    // Even if a socket file appears, production serve remains unsupported.
+    // A mutable temporary parent still cannot satisfy production custody.
     let ready = tokio::time::timeout(
         Duration::from_secs(2),
         run_broker(BrokerServeConfig {
@@ -155,8 +156,13 @@ async fn production_install_and_status_never_claim_success() {
     )
     .await
     .expect("run_broker returns promptly")
-    .expect_err("must not serve");
-    assert!(ready.contains("unsupported"), "{ready}");
+    .expect_err("must fail closed");
+    assert!(
+        ready.contains("fail-closed")
+            || ready.contains("root-owned")
+            || ready.contains("addr_file"),
+        "{ready}"
+    );
     assert!(!base.join("ready.addr").exists());
     assert!(!base.join("should-not-bind.sock").exists());
 

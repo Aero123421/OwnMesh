@@ -1,12 +1,21 @@
 //! Broker accept loop and elevated execution.
 
 use crate::now_unix;
-use crate::peer::AuthorizedPeer;
+use crate::peer::{self, AuthorizedPeer};
+#[cfg(target_os = "linux")]
+use crate::{ReplayLedger, ReplayLedgerError};
+#[cfg(target_os = "linux")]
+use ownmesh_broker_client::{
+    operation_facts_digest, parse_broker_request_v2, verify_capability_v2,
+    verify_request_v2_message_auth, BrokerRequestV2, CapabilityTokenV2, MAX_BROKER_REQUEST_BYTES,
+};
 use ownmesh_broker_client::{
     verify_request, verify_request_mac, BrokerEndpoint, BrokerRequest, BrokerResponse,
     BrokerSecret, CapabilitySigningKey, CapabilityToken, CapabilityVerifyKey, ElevatedCommand,
     PeerBind, ReplayCache, DEFAULT_CAPABILITY_TTL_SECS, ELEVATED_CAPABILITY_SCOPE,
 };
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -697,7 +706,8 @@ fn run_elevated(request_id: &str, command: &ElevatedCommand) -> BrokerResponse {
     cmd.args(&command.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .env_clear();
     if let Some(cwd) = &command.cwd {
         cmd.current_dir(cwd);
     }
@@ -777,20 +787,303 @@ fn join_bounded_output(handle: Option<std::thread::JoinHandle<String>>) -> Strin
         .unwrap_or_else(|| "[ownmesh broker output reader unavailable]".into())
 }
 
-/// Production elevated broker serve is fixed as **unsupported** until a secure
-/// mint authority exists. Never binds an endpoint or executes processes.
-///
-/// In-process helpers (`execute_verified*`) remain available for unit tests only
-/// and are unreachable from this production entry point.
+/// Serve the production broker only on a peer-verifiable Linux Unix socket.
+/// Windows and macOS remain explicit fail-closed unsupported paths until their
+/// native process-birth/image identity guarantees have equivalent proofs.
 pub async fn run_broker(cfg: BrokerServeConfig) -> Result<(), String> {
-    let _ = cfg;
-    Err(production_elevated_broker_unsupported())
+    peer::assert_endpoint_peer_verifiable(&cfg.endpoint)?;
+    #[cfg(target_os = "linux")]
+    {
+        let BrokerEndpoint::UnixSocket(path) = cfg.endpoint.clone() else {
+            return Err(
+                "unsupported: production broker requires Linux UnixSocket IPC (fail-closed)".into(),
+            );
+        };
+        return run_linux_broker(cfg, path).await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cfg;
+        Err(production_elevated_broker_unsupported())
+    }
 }
 
 /// Stable operator-facing reason for production elevated broker disablement.
 #[must_use]
 pub fn production_elevated_broker_unsupported() -> String {
-    "unsupported: elevated broker production serve is disabled until a secure mint authority is established; refusing to bind or execute (fail-closed)".into()
+    "unsupported: production elevated broker requires Linux SO_PEERCRED plus /proc process-birth and executable identity verification; refusing to bind or execute (fail-closed)".into()
+}
+
+#[cfg(target_os = "linux")]
+struct ProductionState {
+    secret: BrokerSecret,
+    signing_key: CapabilitySigningKey,
+    verify_key: CapabilityVerifyKey,
+    broker_instance_id: String,
+    broker_key_id: String,
+    ledger: ReplayLedger,
+}
+
+#[cfg(target_os = "linux")]
+async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Result<(), String> {
+    if let Some(addr_file) = &cfg.addr_file {
+        return Err(format!(
+            "addr_file {} is unsupported for production broker; do not publish a mutable endpoint marker",
+            addr_file.display()
+        ));
+    }
+    let daemon_uid = validate_daemon_dac_policy(cfg.socket_security, &cfg.allowed_uids)?;
+    ensure_broker_key_separation(&cfg.secret_file, &cfg.signing_key_file)?;
+    let policy = peer::load_trusted_peer_policy(&cfg.trusted_executable, cfg.allowed_uids.clone())?;
+    prepare_linux_socket_path(&socket_path, cfg.socket_security)?;
+    let secret = load_or_create_request_secret(&cfg.secret_file, daemon_uid)?;
+    let (signing_key, verify_key) = load_or_create_capability_keys(&cfg.signing_key_file)?;
+    let broker_key_id = hex::encode(Sha256::digest(verify_key.to_bytes()));
+    let broker_instance_id = hex::encode(Sha256::digest(
+        [
+            broker_key_id.as_bytes(),
+            socket_path.as_os_str().as_encoded_bytes(),
+        ]
+        .concat(),
+    ));
+    let ledger_path = cfg.signing_key_file.with_file_name("replay-ledger.json");
+    let ledger = ReplayLedger::open(ledger_path, 16_384).map_err(|error| replay_error(&error))?;
+    let listener = tokio::net::UnixListener::bind(&socket_path)
+        .map_err(|error| format!("bind broker socket {}: {error}", socket_path.display()))?;
+    apply_linux_socket_custody(&socket_path, cfg.socket_security)?;
+    let mut state = ProductionState {
+        secret,
+        signing_key,
+        verify_key,
+        broker_instance_id,
+        broker_key_id,
+        ledger,
+    };
+    loop {
+        let (mut stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+        let response = handle_linux_production_connection(&mut stream, &policy, &mut state).await;
+        if let Err(error) = write_resp(&mut stream, &response).await {
+            // One untrusted peer's broken connection never changes broker state.
+            let _ = error;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn handle_linux_production_connection(
+    stream: &mut tokio::net::UnixStream,
+    policy: &crate::peer::TrustedPeerPolicy,
+    state: &mut ProductionState,
+) -> BrokerResponse {
+    let request_id = "unknown".to_string();
+    let result: Result<BrokerResponse, String> = async {
+        let accepted = peer::authorize_unix_peer(stream, policy)?;
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_bounded_v2_frame(stream),
+        )
+        .await
+        .map_err(|_| "broker request frame timed out".to_string())??;
+        let external = parse_broker_request_v2(&bytes).map_err(|error| error.to_string())?;
+        if external.capability.is_some() {
+            return Err(
+                "external v2 requests must not carry a capability token (fail-closed)".into(),
+            );
+        }
+        verify_request_v2_message_auth(&state.secret, &external, crate::now_unix())
+            .map_err(|error| error.to_string())?;
+        let refreshed = policy.authorize_process(accepted.peer_bind().pid)?;
+        accepted.validate_refresh(&refreshed)?;
+        let peer = refreshed.process_bind_v2();
+        validate_executable_facts(&external)?;
+        let now = crate::now_unix();
+        let capability = CapabilityTokenV2::issue(
+            &state.signing_key,
+            &state.broker_instance_id,
+            &state.broker_key_id,
+            &external.facts.principal_id,
+            &external.operation_id,
+            &external.facts,
+            &external.nonce,
+            peer.clone(),
+            now,
+            external.expires_at_unix.saturating_sub(now),
+        );
+        let mut internal = external.clone();
+        internal.capability = Some(capability);
+        verify_capability_v2(
+            &state.verify_key,
+            &internal,
+            &state.broker_instance_id,
+            &state.broker_key_id,
+            &peer,
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+        state
+            .ledger
+            .reserve_verified_request(&internal, now)
+            .map_err(|error| replay_error(&error))?;
+        let mut response = run_v2_elevated(&internal);
+        let digest = operation_facts_digest(&internal.facts);
+        if let Err(error) = state.ledger.mark_completed(&internal.nonce, &digest) {
+            response.ok = false;
+            response.error = Some(format!("durable ledger finalize failed: {error}"));
+        }
+        Ok(response)
+    }
+    .await;
+    result.unwrap_or_else(|error| BrokerResponse {
+        request_id,
+        ok: false,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: Some(error),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn replay_error(error: &ReplayLedgerError) -> String {
+    format!("replay ledger authorization denied: {error}")
+}
+
+#[cfg(target_os = "linux")]
+async fn read_bounded_v2_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut frame = Vec::with_capacity(MAX_BROKER_REQUEST_BYTES.min(4096));
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream
+            .read(&mut byte)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("broker peer closed before request frame".into());
+        }
+        if byte[0] == b'\n' {
+            return Ok(frame);
+        }
+        if frame.len() >= MAX_BROKER_REQUEST_BYTES {
+            return Err("broker request frame exceeds byte limit".into());
+        }
+        frame.push(byte[0]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_linux_socket_path(path: &Path, expected: UnixSocketSecurity) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| "broker socket requires a root-controlled parent".to_string())?;
+    let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+    if !parent_metadata.file_type().is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != 0
+        || parent_metadata.mode() & 0o022 != 0
+    {
+        return Err(
+            "broker socket parent must be root-owned and not group/other writable (fail-closed)"
+                .into(),
+        );
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() || metadata.file_type().is_symlink() {
+                return Err(
+                    "existing broker endpoint is not a safe Unix socket (fail-closed)".into(),
+                );
+            }
+            validate_socket_custody_metadata(
+                SocketCustodyMetadata {
+                    owner_uid: metadata.uid(),
+                    group_gid: metadata.gid(),
+                    mode: metadata.mode(),
+                    is_socket: true,
+                    is_symlink: false,
+                },
+                expected,
+            )?;
+            std::fs::remove_file(path).map_err(|error| {
+                format!("remove stale broker socket {}: {error}", path.display())
+            })?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect broker socket {}: {error}", path.display())),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_socket_custody(path: &Path, expected: UnixSocketSecurity) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    rustix::fs::chown(
+        path.as_os_str().as_bytes(),
+        Some(rustix::process::Uid::from_raw(expected.owner_uid)),
+        Some(rustix::process::Gid::from_raw(expected.group_gid)),
+    )
+    .map_err(|error| format!("chown broker socket {}: {error}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(expected.mode))
+        .map_err(|error| format!("chmod broker socket {}: {error}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    validate_socket_custody_metadata(
+        SocketCustodyMetadata {
+            owner_uid: metadata.uid(),
+            group_gid: metadata.gid(),
+            mode: metadata.mode(),
+            is_socket: metadata.file_type().is_socket(),
+            is_symlink: metadata.file_type().is_symlink(),
+        },
+        expected,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_executable_facts(request: &BrokerRequestV2) -> Result<(), String> {
+    let facts = &request.facts;
+    let actual_path = std::fs::canonicalize(&facts.argv[0])
+        .map_err(|error| format!("canonicalize pinned executable: {error}"))?;
+    if actual_path != Path::new(&facts.executable.canonical_path) {
+        return Err(
+            "structured argv[0] does not resolve to the pinned executable (fail-closed)".into(),
+        );
+    }
+    let metadata = std::fs::metadata(&actual_path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("pinned executable is not a regular file (fail-closed)".into());
+    }
+    let mut file = std::fs::File::open(&actual_path).map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut chunk).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&chunk[..read]);
+    }
+    if hex::encode(digest.finalize()) != facts.executable.image_sha256 {
+        return Err("pinned executable image hash changed (fail-closed)".into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_v2_elevated(request: &BrokerRequestV2) -> BrokerResponse {
+    let facts = &request.facts;
+    let command = ElevatedCommand {
+        program: facts.executable.canonical_path.clone(),
+        args: facts.argv[1..].to_vec(),
+        cwd: facts.canonical_cwd.clone(),
+        env: facts
+            .sanitized_env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    };
+    run_elevated(&request.request_id, &command)
 }
 
 /// Handle a TCP connection (public for tests of strict MAC/capability path only).
