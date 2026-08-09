@@ -18,14 +18,17 @@
     clippy::redundant_closure_for_method_calls,
     clippy::case_sensitive_file_extension_comparisons,
     clippy::needless_borrows_for_generic_args,
-    clippy::cast_possible_wrap
+    clippy::cast_possible_wrap,
+    clippy::struct_excessive_bools
 )]
 
 mod transport;
 
 pub use transport::{
-    broker_endpoint_display, connect_and_call, default_broker_endpoint, is_loopback_socket_addr,
-    resolve_broker_endpoint, BrokerEndpoint, PeerCred, TransportKind,
+    broker_endpoint_display, build_cancel_intent_v2, connect_and_call, connect_and_cancel_v2,
+    connect_and_execute_v2, connect_and_execute_v2_cancellable, default_broker_endpoint,
+    is_loopback_socket_addr, resolve_broker_endpoint, BrokerEndpoint, BrokerV2ClientError,
+    BrokerV2ClientResult, PeerCred, TransportKind, V2TimeoutPhase,
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -71,6 +74,9 @@ pub const MAX_BROKER_FIELD_BYTES: usize = 4096;
 /// Maximum exact action limits accepted by protocol v2.
 pub const MAX_BROKER_TIMEOUT_MS: u64 = 300_000;
 pub const MAX_BROKER_OUTPUT_BYTES: usize = 1_000_000;
+/// Hard byte ceiling for one v2 JSON broker response, including both bounded
+/// output streams and envelope overhead.
+pub const MAX_BROKER_RESPONSE_BYTES: usize = (2 * MAX_BROKER_OUTPUT_BYTES) + (16 * 1024);
 
 /// Default local endpoint basename (pipe / socket).
 pub const DEFAULT_BROKER_ENDPOINT: &str = "ownmesh-privileged";
@@ -493,6 +499,25 @@ pub struct BrokerResponse {
     pub error: Option<String>,
 }
 
+/// Strict response emitted by the production v2 broker wire.
+///
+/// The response is deliberately execution-only.  It never transports a
+/// capability, signing material, or request-MAC secret back to the caller.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerResponseV2 {
+    pub request_id: String,
+    pub ok: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub error: Option<String>,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    pub truncated: bool,
+    pub duration_ms: u64,
+}
+
 /// Pin for the executable selected by the unprivileged operation planner.
 /// The broker compares this immutable fact with its independently checked peer
 /// and executable policy before starting a process.
@@ -534,6 +559,8 @@ pub struct OperationFactsV2 {
     pub operation: String,
     pub remote_payload_sha256: String,
     pub principal_id: String,
+    /// Tenant identity is an authorization boundary, not audit-only metadata.
+    pub tenant_id: String,
     pub principal_credential_generation: u64,
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
@@ -878,6 +905,7 @@ fn canonical_operation_facts_v2_bytes(facts: &OperationFactsV2) -> Vec<u8> {
     put_str(&mut buf, &facts.operation);
     put_str(&mut buf, &facts.remote_payload_sha256);
     put_str(&mut buf, &facts.principal_id);
+    put_str(&mut buf, &facts.tenant_id);
     put_u64(&mut buf, facts.principal_credential_generation);
     put_u64(&mut buf, facts.timeout_ms);
     put_u32(
@@ -1008,6 +1036,7 @@ fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResu
         ("nonce", req.nonce.as_str()),
         ("facts.operation", req.facts.operation.as_str()),
         ("principal_id", req.facts.principal_id.as_str()),
+        ("tenant_id", req.facts.tenant_id.as_str()),
         ("device_id", req.facts.device_id.as_str()),
         ("workspace_id", req.facts.workspace_id.as_str()),
         (
@@ -1727,6 +1756,7 @@ mod v2_tests {
             operation: "command.exec.elevated".into(),
             remote_payload_sha256: "a".repeat(64),
             principal_id: "principal-1".into(),
+            tenant_id: "tenant-1".into(),
             principal_credential_generation: 7,
             timeout_ms: 30_000,
             max_output_bytes: 64 * 1024,
@@ -1934,5 +1964,30 @@ mod v2_tests {
             operation_facts_digest(&left),
             operation_facts_digest(&right)
         );
+    }
+
+    #[test]
+    fn v2_tenant_is_required_lowercase_hashes_are_strict_and_tenant_mutation_binds_mac() {
+        let (secret, _verify, request, _peer) = signed_v2();
+        let original_digest = operation_facts_digest(&request.facts);
+
+        let mut changed = request.clone();
+        changed.facts.tenant_id = "tenant-2".into();
+        assert_ne!(original_digest, operation_facts_digest(&changed.facts));
+        changed.mac = compute_mac_v2(&secret, &changed);
+        assert_ne!(request.mac, changed.mac);
+
+        let mut missing_tenant = serde_json::to_value(&request).unwrap();
+        missing_tenant
+            .get_mut("facts")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("tenant_id");
+        assert!(parse_broker_request_v2(&serde_json::to_vec(&missing_tenant).unwrap()).is_err());
+
+        let mut uppercase_hash = request.clone();
+        uppercase_hash.facts.remote_payload_sha256 = "A".repeat(64);
+        uppercase_hash.mac = compute_mac_v2(&secret, &uppercase_hash);
+        assert!(verify_request_v2_message_auth(&secret, &uppercase_hash, 110).is_err());
     }
 }

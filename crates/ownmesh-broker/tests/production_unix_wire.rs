@@ -217,6 +217,7 @@ fn execute_intent(
             operation: operation_id.into(),
             remote_payload_sha256: "a".repeat(64),
             principal_id: "root-proof-principal".into(),
+            tenant_id: "root-proof-tenant".into(),
             principal_credential_generation: 1,
             timeout_ms,
             max_output_bytes: 64 * 1024,

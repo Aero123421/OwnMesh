@@ -10,10 +10,79 @@
 //! - <https://www.man7.org/linux/man-pages/man7/unix.7.html> (`SO_PEERCRED`)
 //! - <https://www.man7.org/linux/man-pages/man7/socket.7.html>
 
-use crate::{BrokerError, BrokerRequest, BrokerResponse, BrokerResult, DEFAULT_BROKER_ENDPOINT};
+use crate::{
+    compute_cancel_intent_mac_v2, operation_facts_digest, BrokerError, BrokerRequest,
+    BrokerResponse, BrokerResponseV2, BrokerResult, BrokerSecret, BrokerWireIntentV2,
+    CancelIntentV2, ExecuteIntentV2, DEFAULT_BROKER_ENDPOINT, DEFAULT_CAPABILITY_TTL_SECS,
+    MAX_BROKER_REQUEST_BYTES,
+};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::watch;
+use uuid::Uuid;
+
+#[cfg(unix)]
+use crate::MAX_BROKER_RESPONSE_BYTES;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+
+/// Timeout phase for the strict v2 Unix-socket client path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2TimeoutPhase {
+    Connect,
+    Write,
+    Read,
+}
+
+impl std::fmt::Display for V2TimeoutPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect => f.write_str("connect"),
+            Self::Write => f.write_str("write"),
+            Self::Read => f.write_str("read"),
+        }
+    }
+}
+
+/// Typed failure surface for a v2 execution attempt.
+///
+/// [`Self::ExecutionUncertain`] is intentionally non-retriable: after an
+/// Execute frame may have reached the broker, submitting it again could run a
+/// privileged action twice.  Callers must reconcile through a durable broker
+/// receipt rather than automatically re-executing it.
+#[derive(Debug, Error)]
+pub enum BrokerV2ClientError {
+    #[error("v2 execution requires a Unix domain socket endpoint")]
+    UnixSocketRequired,
+    #[error("v2 {phase} timed out")]
+    Timeout { phase: V2TimeoutPhase },
+    #[error("v2 request exceeds byte limit")]
+    RequestTooLarge,
+    #[error("v2 response exceeds byte limit")]
+    ResponseTooLarge,
+    #[error("malformed strict v2 response: {0}")]
+    MalformedResponse(String),
+    #[error("v2 response request_id mismatch")]
+    RequestIdMismatch,
+    #[error("v2 transport failed before execute submission: {0}")]
+    Connect(String),
+    #[error("v2 execution outcome uncertain; do not retry: {0}")]
+    ExecutionUncertain(String),
+}
+
+/// Result type for the production v2 client path.
+pub type BrokerV2ClientResult<T> = Result<T, BrokerV2ClientError>;
+
+#[cfg(unix)]
+const V2_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const V2_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const V2_RESPONSE_GRACE: Duration = Duration::from_secs(5);
 
 /// Transport kind selected for a broker endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +289,289 @@ pub async fn connect_and_call(
             "unix socket {} unsupported on this OS",
             path.display()
         ))),
+    }
+}
+
+/// Build a fresh, exact cancellation intent for one submitted execute intent.
+/// The target facts digest and all target identifiers are copied from the
+/// original frame; callers cannot turn a local cancel signal into a free-form
+/// broker operation.
+#[must_use]
+pub fn build_cancel_intent_v2(
+    secret: &BrokerSecret,
+    execute: &ExecuteIntentV2,
+    now_unix: i64,
+) -> CancelIntentV2 {
+    let expires_at_unix = now_unix
+        .saturating_add(DEFAULT_CAPABILITY_TTL_SECS)
+        .min(execute.expires_at_unix);
+    let mut cancel = CancelIntentV2 {
+        protocol_version: crate::BROKER_PROTOCOL_V2,
+        request_id: format!("cancel_{}", Uuid::new_v4().simple()),
+        operation_id: execute.operation_id.clone(),
+        nonce: format!("cancel_nonce_{}", Uuid::new_v4().simple()),
+        issued_at_unix: now_unix,
+        expires_at_unix,
+        target_request_id: execute.request_id.clone(),
+        target_operation_id: execute.operation_id.clone(),
+        target_nonce: execute.nonce.clone(),
+        target_facts_digest: operation_facts_digest(&execute.facts),
+        mac: String::new(),
+    };
+    cancel.mac = compute_cancel_intent_mac_v2(secret, &cancel);
+    cancel
+}
+
+/// Submit one exact v2 Execute intent over a Unix domain socket and keep that
+/// socket open until the broker returns the matching response.
+///
+/// No TCP, loopback, or named-pipe fallback exists on this path: v2 elevation
+/// relies on Unix peer credentials and the server treats this connection's EOF
+/// as an execution-cancel signal.
+pub async fn connect_and_execute_v2(
+    endpoint: &BrokerEndpoint,
+    execute: &ExecuteIntentV2,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let (mut stream, request_id) = submit_execute_v2(endpoint, execute).await?;
+    read_execute_response_v2(&mut stream, &request_id, execute.facts.timeout_ms).await
+}
+
+/// Send an already-MACed, exact v2 Cancel intent over a fresh Unix socket.
+/// This deliberately does not reuse the execute socket, which is held open by
+/// the pending execution and is itself part of the broker's disconnect fence.
+pub async fn connect_and_cancel_v2(
+    endpoint: &BrokerEndpoint,
+    cancel: &CancelIntentV2,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let request_id = cancel.request_id.clone();
+    let frame = serialize_v2_intent(&BrokerWireIntentV2::Cancel(cancel.clone()))?;
+    #[cfg(unix)]
+    {
+        let mut stream = connect_v2_unix(endpoint).await?;
+        write_v2_frame(&mut stream, &frame).await.map_err(|error| {
+            BrokerV2ClientError::ExecutionUncertain(format!("cancel write: {error}"))
+        })?;
+        read_v2_response(&mut stream, &request_id, V2_CONNECT_TIMEOUT)
+            .await
+            .map_err(cancel_response_error)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (endpoint, frame, request_id);
+        Err(BrokerV2ClientError::UnixSocketRequired)
+    }
+}
+
+/// Execute while watching a local cancellation signal.  Once signaled, this
+/// submits one freshly MACed exact Cancel intent on a separate socket while
+/// continuing to await the original Execute response.  It never retries or
+/// re-executes the privileged operation.
+pub async fn connect_and_execute_v2_cancellable(
+    endpoint: &BrokerEndpoint,
+    secret: &BrokerSecret,
+    execute: &ExecuteIntentV2,
+    cancel_signal: &mut watch::Receiver<bool>,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let (mut stream, request_id) = submit_execute_v2(endpoint, execute).await?;
+    let mut cancel_sent = false;
+    let mut response = Box::pin(read_execute_response_v2(
+        &mut stream,
+        &request_id,
+        execute.facts.timeout_ms,
+    ));
+
+    loop {
+        tokio::select! {
+            result = &mut response => return result,
+            changed = cancel_signal.changed(), if !cancel_sent => {
+                if changed.is_err() || *cancel_signal.borrow() {
+                    cancel_sent = true;
+                    let cancel = build_cancel_intent_v2(secret, execute, now_unix());
+                    // A cancel transport failure does not justify abandoning a
+                    // still-live execute connection; its final response is the
+                    // only authoritative outcome. If that connection becomes
+                    // uncertain, read_execute_response_v2 returns the explicit
+                    // non-retriable ExecutionUncertain outcome.
+                    let _ = connect_and_cancel_v2(endpoint, &cancel).await;
+                }
+            }
+        }
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn serialize_v2_intent(intent: &BrokerWireIntentV2) -> BrokerV2ClientResult<Vec<u8>> {
+    let frame = serde_json::to_vec(intent)
+        .map_err(|error| BrokerV2ClientError::MalformedResponse(error.to_string()))?;
+    if frame.len() > MAX_BROKER_REQUEST_BYTES {
+        return Err(BrokerV2ClientError::RequestTooLarge);
+    }
+    Ok(frame)
+}
+
+#[allow(clippy::unused_async)]
+async fn submit_execute_v2(
+    endpoint: &BrokerEndpoint,
+    execute: &ExecuteIntentV2,
+) -> BrokerV2ClientResult<(V2ExecuteStream, String)> {
+    let request_id = execute.request_id.clone();
+    let frame = serialize_v2_intent(&BrokerWireIntentV2::Execute(execute.clone()))?;
+    #[cfg(unix)]
+    {
+        let mut stream = connect_v2_unix(endpoint).await?;
+        write_v2_frame(&mut stream, &frame).await.map_err(|error| {
+            BrokerV2ClientError::ExecutionUncertain(format!("execute write: {error}"))
+        })?;
+        Ok((stream, request_id))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (endpoint, frame, request_id);
+        Err(BrokerV2ClientError::UnixSocketRequired)
+    }
+}
+
+#[cfg(unix)]
+type V2ExecuteStream = tokio::net::UnixStream;
+
+#[cfg(not(unix))]
+type V2ExecuteStream = ();
+
+#[cfg(unix)]
+async fn connect_v2_unix(
+    endpoint: &BrokerEndpoint,
+) -> BrokerV2ClientResult<tokio::net::UnixStream> {
+    let BrokerEndpoint::UnixSocket(path) = endpoint else {
+        return Err(BrokerV2ClientError::UnixSocketRequired);
+    };
+    tokio::time::timeout(V2_CONNECT_TIMEOUT, tokio::net::UnixStream::connect(path))
+        .await
+        .map_err(|_| BrokerV2ClientError::Timeout {
+            phase: V2TimeoutPhase::Connect,
+        })?
+        .map_err(|error| BrokerV2ClientError::Connect(format!("{}: {error}", path.display())))
+}
+
+#[cfg(unix)]
+async fn write_v2_frame<S>(stream: &mut S, frame: &[u8]) -> Result<(), String>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut line = Vec::with_capacity(frame.len() + 1);
+    line.extend_from_slice(frame);
+    line.push(b'\n');
+    tokio::time::timeout(V2_WRITE_TIMEOUT, async {
+        stream.write_all(&line).await?;
+        stream.flush().await
+    })
+    .await
+    .map_err(|_| "write timed out".to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(unix)]
+#[allow(clippy::unused_async)]
+async fn read_execute_response_v2(
+    stream: &mut tokio::net::UnixStream,
+    request_id: &str,
+    execution_timeout_ms: u64,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    let timeout = Duration::from_millis(execution_timeout_ms).saturating_add(V2_RESPONSE_GRACE);
+    read_v2_response(stream, request_id, timeout)
+        .await
+        .map_err(|error| match error {
+            BrokerV2ClientError::Timeout { .. }
+            | BrokerV2ClientError::Connect(_)
+            | BrokerV2ClientError::ExecutionUncertain(_) => {
+                BrokerV2ClientError::ExecutionUncertain(error.to_string())
+            }
+            other => other,
+        })
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unused_async)]
+async fn read_execute_response_v2(
+    _stream: &mut V2ExecuteStream,
+    _request_id: &str,
+    _execution_timeout_ms: u64,
+) -> BrokerV2ClientResult<BrokerResponseV2> {
+    Err(BrokerV2ClientError::UnixSocketRequired)
+}
+
+#[cfg(unix)]
+async fn read_v2_response<S>(
+    stream: &mut S,
+    request_id: &str,
+    timeout: Duration,
+) -> BrokerV2ClientResult<BrokerResponseV2>
+where
+    S: AsyncRead + Unpin,
+{
+    let line = tokio::time::timeout(timeout, read_bounded_v2_line(stream))
+        .await
+        .map_err(|_| BrokerV2ClientError::Timeout {
+            phase: V2TimeoutPhase::Read,
+        })??;
+    let response: BrokerResponseV2 = serde_json::from_slice(&line)
+        .map_err(|error| BrokerV2ClientError::MalformedResponse(error.to_string()))?;
+    if response.request_id != request_id {
+        return Err(BrokerV2ClientError::RequestIdMismatch);
+    }
+    if response.stdout.len() > crate::MAX_BROKER_OUTPUT_BYTES
+        || response.stderr.len() > crate::MAX_BROKER_OUTPUT_BYTES
+        || response
+            .error
+            .as_ref()
+            .is_some_and(|error| error.len() > crate::MAX_BROKER_OUTPUT_BYTES)
+    {
+        return Err(BrokerV2ClientError::ResponseTooLarge);
+    }
+    Ok(response)
+}
+
+#[cfg(unix)]
+async fn read_bounded_v2_line<S>(stream: &mut S) -> BrokerV2ClientResult<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut line = Vec::with_capacity(1024);
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = stream
+            .read(&mut byte)
+            .await
+            .map_err(|error| BrokerV2ClientError::ExecutionUncertain(error.to_string()))?;
+        if read == 0 {
+            return Err(BrokerV2ClientError::ExecutionUncertain(
+                "broker closed before a response".into(),
+            ));
+        }
+        if byte[0] == b'\n' {
+            return Ok(line);
+        }
+        if line.len() >= MAX_BROKER_RESPONSE_BYTES {
+            return Err(BrokerV2ClientError::ResponseTooLarge);
+        }
+        line.push(byte[0]);
+    }
+}
+
+#[cfg(unix)]
+fn cancel_response_error(error: BrokerV2ClientError) -> BrokerV2ClientError {
+    match error {
+        BrokerV2ClientError::Timeout { .. }
+        | BrokerV2ClientError::Connect(_)
+        | BrokerV2ClientError::ExecutionUncertain(_) => {
+            BrokerV2ClientError::ExecutionUncertain(format!("cancel outcome uncertain: {error}"))
+        }
+        other => other,
     }
 }
 
