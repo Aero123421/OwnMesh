@@ -739,7 +739,7 @@ pub fn read_management_credential(state_dir: impl AsRef<Path>) -> IpcResult<Stri
 }
 
 /// Write `data` via a unique temp sibling, flush it, and atomically replace `path`.
-pub(crate) fn atomic_write_owner_only(path: &Path, data: &[u8]) -> IpcResult<()> {
+pub fn atomic_write_owner_only(path: &Path, data: &[u8]) -> IpcResult<()> {
     let parent = path.parent().ok_or_else(|| {
         IpcError::Protocol(format!(
             "credential registry path has no parent: {}",
@@ -786,6 +786,71 @@ pub(crate) fn atomic_write_owner_only(path: &Path, data: &[u8]) -> IpcResult<()>
         let dir = fs::File::open(parent)?;
         dir.sync_all()?;
     }
+    Ok(())
+}
+
+/// Prepare and attest a private per-user state directory.
+///
+/// This is shared by local supervisors that use the same owner/DACL/reparse
+/// custody rules as the daemon credential registry. It never creates a network
+/// endpoint and is not a credential issuance API.
+pub fn prepare_owner_only_state_dir(path: &Path) -> IpcResult<()> {
+    let _custody = prepare_secure_state_dir(path)?;
+    Ok(())
+}
+
+/// Read a regular owner-only file through the no-follow custody path with a
+/// pre-allocation byte ceiling. This prevents a substituted or attacker-grown
+/// state file from being decoded into an unbounded buffer.
+pub fn read_owner_only_file_bounded(path: &Path, max_bytes: usize) -> IpcResult<Vec<u8>> {
+    if max_bytes == 0 {
+        return Err(IpcError::Protocol(
+            "owner-only read byte limit must be positive".into(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let mut file = open_existing_nofollow_read(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    let len = file.metadata()?.len();
+    if len > max_bytes as u64 {
+        return Err(IpcError::Protocol(format!(
+            "owner-only file exceeds {max_bytes} byte budget: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = vec![0; len as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Create an owner-only regular file exactly once, refusing a pre-existing,
+/// symlink, reparse, or replacement target. The data is flushed before the
+/// caller receives success.
+pub fn create_owner_only_file_new(path: &Path, data: &[u8]) -> IpcResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    reject_symlink_or_reparse_if_present(path)?;
+    let mut file = create_owner_only_new(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    let write_result = (|| -> IpcResult<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if write_result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    write_result?;
+    validate_owned_regular_file_path(path)?;
     Ok(())
 }
 

@@ -50,8 +50,9 @@ pub use endpoint::{Endpoint, IpcBus};
 pub use error::{IpcError, IpcResult};
 pub use frame::{read_frame, write_frame, FrameDecoder, MAX_FRAME_BYTES};
 pub use registry::{
-    read_management_credential, BootstrapStatus, CLIENT_CREDENTIAL_ENV,
-    MANAGEMENT_CREDENTIAL_FILE_NAME,
+    atomic_write_owner_only, create_owner_only_file_new, prepare_owner_only_state_dir,
+    read_management_credential, read_owner_only_file_bounded, BootstrapStatus,
+    CLIENT_CREDENTIAL_ENV, MANAGEMENT_CREDENTIAL_FILE_NAME,
 };
 pub use rpc::{
     app_error, methods, CredentialClientParams, CredentialProvisionParams, CredentialSecretResult,
