@@ -151,6 +151,53 @@ impl SupervisorClient {
             .await?;
         Ok(())
     }
+    pub async fn drain(
+        &self,
+        binding: &SupervisorBinding,
+        offset: u64,
+        max_bytes: usize,
+    ) -> IpcResult<crate::SpoolPage> {
+        Ok(serde_json::from_value(
+            self.client
+                .call(
+                    SupervisorRpcMethods::DRAIN,
+                    Some(json!({"binding":binding,"offset":offset,"max_bytes":max_bytes})),
+                )
+                .await?,
+        )?)
+    }
+    pub async fn rotate(
+        &self,
+        binding: &SupervisorBinding,
+        owner_principal: String,
+        controller_epoch: u64,
+        binding_expires_unix: i64,
+    ) -> IpcResult<SupervisorBinding> {
+        Ok(serde_json::from_value(
+            self.client
+                .call(
+                    SupervisorRpcMethods::ROTATE,
+                    Some(json!({"binding":binding,"owner_principal":owner_principal,"controller_epoch":controller_epoch,"binding_expires_unix":binding_expires_unix})),
+                )
+                .await?,
+        )?)
+    }
+    pub async fn reclaim(
+        &self,
+        binding: &SupervisorBinding,
+        owner_principal: String,
+        controller_epoch: u64,
+        binding_expires_unix: i64,
+    ) -> IpcResult<SupervisorBinding> {
+        Ok(serde_json::from_value(
+            self.client
+                .call(
+                    SupervisorRpcMethods::RECLAIM,
+                    Some(json!({"binding":binding,"owner_principal":owner_principal,"controller_epoch":controller_epoch,"binding_expires_unix":binding_expires_unix})),
+                )
+                .await?,
+        )?)
+    }
     pub async fn terminate(&self, binding: &SupervisorBinding) -> IpcResult<()> {
         self.client
             .call(SupervisorRpcMethods::TERMINATE, Some(json!(binding)))

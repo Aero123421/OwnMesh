@@ -3469,6 +3469,10 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             limit: Option<usize>,
             #[serde(default)]
             max_bytes: Option<usize>,
+            /// Absolute sidecar spool cursor. Independent per observer and
+            /// encoded explicitly because PTY output is raw bytes.
+            #[serde(default)]
+            sidecar_cursor: Option<u64>,
             /// Ignored: read ACL uses authenticated client identity.
             #[serde(default)]
             principal: Option<String>,
@@ -3480,7 +3484,32 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         let now = self.prepare_session_access()?;
         self.require_reader(&p.id, &client.client_name, now)?;
         let _bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
-        // Fold live host output into the durable spool before serving the page.
+        let sidecar_page = if self
+            .sessions
+            .get(&p.id)
+            .map_err(session_err)?
+            .sidecar_host
+            .is_some()
+        {
+            let binding = self.sidecar_binding(&p.id)?;
+            let max_bytes = p
+                .max_bytes
+                .unwrap_or(ownmesh_session::MAX_REPLAY_PAGE_BYTES)
+                .min(ownmesh_session::MAX_REPLAY_PAGE_BYTES);
+            let supervisor = self.ensure_remote_supervisor().await?;
+            Some(
+                supervisor
+                    .drain(&binding, p.sidecar_cursor.unwrap_or(0), max_bytes)
+                    .await
+                    .map_err(|err| IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!("persistent session sidecar drain failed: {err}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+        // Fold embedded live host output into the legacy durable replay ring.
         let drained = self.drain_live_output_into_session(&p.id)?;
         let page = self
             .sessions
@@ -3514,15 +3543,28 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     .or(Some(1));
             }
         }
+        let sidecar_truncated = sidecar_page
+            .as_ref()
+            .map(|page| page.truncated)
+            .unwrap_or(false);
+        let sidecar_next_cursor = sidecar_page.as_ref().and_then(|page| page.next_offset);
+        let sidecar_total_bytes = sidecar_page.as_ref().map(|page| page.total_bytes);
+        let sidecar_bytes_base64 = sidecar_page
+            .as_ref()
+            .map(|page| base64_standard(&page.bytes));
         Ok(json!({
             "chunks": page.chunks,
             "session_id": p.id,
-            "truncated": truncated,
+            "truncated": truncated || sidecar_truncated,
             "next_seq": next_seq,
             "returned_bytes": page.returned_bytes,
             "live_drained_bytes": drained,
             "live_pending_bytes": live_pending,
-            "live_pty": self.live_hosts.contains_key(&p.id),
+            "live_pty": self.live_hosts.contains_key(&p.id) || sidecar_page.is_some(),
+            "sidecar_bytes_encoding": sidecar_page.as_ref().map(|_| "base64"),
+            "sidecar_bytes_base64": sidecar_bytes_base64,
+            "sidecar_next_cursor": sidecar_next_cursor,
+            "sidecar_total_bytes": sidecar_total_bytes,
         }))
     }
 
