@@ -1526,6 +1526,16 @@ test("transfer start receipts reject bearer/byte fields and require exact immuta
   assert.deepEqual(wrongArtifact, { ok: false, error: "transfer_start_result_binding_mismatch" });
   const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: receipt } });
   assert.equal(accepted.ok, true); assert.deepEqual((await store.getMcpOperation(opId))?.data, receipt);
+
+  const reconnectId = randomId("op_");
+  await store.putMcpOperation({ operation_id: reconnectId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_destination", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: reconnectId, workspace_id: "ws_destination", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const reconnect = await applyMcpOperationResult(store, { operationId: reconnectId, correlationId: reconnectId, deviceId, payload: { operation_id: reconnectId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_RECONNECT", message: "bearer distinctive-ticket-secret", details: { ciphertext_base64: "must-not-persist" } } } });
+  assert.equal(reconnect.ok, true);
+  const storedReconnect = await store.getMcpOperation(reconnectId);
+  assert.deepEqual(storedReconnect?.data, { error: { code: "OWNMESH_E_TRANSFER_RECONNECT" } });
+  assert.equal(storedReconnect?.summary, "transfer start requires a fresh connection proof");
+  assert.equal(JSON.stringify(storedReconnect).includes("distinctive-ticket-secret"), false);
+  assert.equal(JSON.stringify(storedReconnect).includes("must-not-persist"), false);
 });
 
 test("transfer cancel controls persist only target-bound cleanup proof", async () => {

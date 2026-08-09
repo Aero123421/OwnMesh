@@ -3200,6 +3200,7 @@ export async function applyMcpOperationResult(
     status = op.status === "pending" ? "running" : op.status;
   }
 
+  let safeSummary: string | undefined;
   let data =
     payload.result && typeof payload.result === "object"
       ? (payload.result as Record<string, unknown>)
@@ -3215,6 +3216,7 @@ export async function applyMcpOperationResult(
       data = sanitized.data;
     } else {
       data = {};
+      safeSummary = "transfer preflight failed";
     }
   }
   if (op.tool === "__transfer_artifact_get") {
@@ -3225,6 +3227,7 @@ export async function applyMcpOperationResult(
     } else {
       // Errors remain the normal bounded error envelope, never a byte channel.
       data = {};
+      safeSummary = "transfer artifact request failed";
     }
   }
   if (op.tool === "__transfer_start_source" || op.tool === "__transfer_start_destination") {
@@ -3233,7 +3236,13 @@ export async function applyMcpOperationResult(
       if ("error" in sanitized) return { ok: false, error: sanitized.error };
       data = sanitized.data;
     } else {
-      data = {};
+      // The coordinator needs only these two stable codes to advance epoch
+      // and fence after a real Agent/Room disconnect. Never retain the Agent
+      // message, details, ticket, keys, paths, or byte-shaped diagnostics.
+      const code = errCode === "OWNMESH_E_TRANSFER_RECONNECT"
+        || errCode === "OWNMESH_E_TRANSFER_SESSION_LOST" ? errCode : "";
+      data = code ? { error: { code } } : {};
+      safeSummary = code ? "transfer start requires a fresh connection proof" : "transfer start failed";
     }
   }
   if (op.tool === "__transfer_cancel_control") {
@@ -3243,6 +3252,7 @@ export async function applyMcpOperationResult(
       data = sanitized.data;
     } else {
       data = {};
+      safeSummary = "transfer cancellation control failed";
     }
   }
   if (status === "approval_required" && errDetails) {
@@ -3281,7 +3291,8 @@ export async function applyMcpOperationResult(
     {
       status,
       summary: String(
-        payload.summary ||
+        safeSummary ||
+          payload.summary ||
           (errDetails?.reason != null ? String(errDetails.reason) : undefined) ||
           (errObj?.message != null ? String(errObj.message) : undefined) ||
           payload.reason ||
