@@ -127,7 +127,7 @@ impl WindowsJobProcess {
         if unsafe { GetExitCodeProcess(self.process.0, &mut code) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(code as i32)
+        Ok(code.cast_signed())
     }
 }
 
@@ -166,7 +166,7 @@ pub fn spawn_suspended_windows_job(
         if SetInformationJobObject(
             job.0,
             JobObjectExtendedLimitInformation,
-            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::ptr::from_ref(&limits).cast(),
             u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap(),
         ) == 0
         {
@@ -179,10 +179,7 @@ pub fn spawn_suspended_windows_job(
             bInheritHandle: 1,
         };
         let (stdout_read, stdout_write) = create_parent_read_pipe(&mut attributes)?;
-        let (stderr_read, stderr_write) = match create_parent_read_pipe(&mut attributes) {
-            Ok(pipe) => pipe,
-            Err(error) => return Err(error),
-        };
+        let (stderr_read, stderr_write) = create_parent_read_pipe(&mut attributes)?;
         let mut startup: STARTUPINFOW = std::mem::zeroed();
         startup.cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).unwrap();
         startup.dwFlags = STARTF_USESTDHANDLES;

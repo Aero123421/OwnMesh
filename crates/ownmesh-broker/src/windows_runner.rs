@@ -40,8 +40,8 @@ impl WindowsJobRunner {
     /// directory created and ACL-verified by the future elevated installer.
     /// This constructor only does structural checks; it never claims lifecycle
     /// custody and therefore cannot promote Windows to supported by itself.
-    pub fn new(staging_dir: PathBuf) -> Result<Self, String> {
-        let metadata = std::fs::symlink_metadata(&staging_dir).map_err(|error| {
+    pub fn new(staging_dir: &Path) -> Result<Self, String> {
+        let metadata = std::fs::symlink_metadata(staging_dir).map_err(|error| {
             format!(
                 "Windows broker staging directory {} is unavailable: {error}",
                 staging_dir.display()
@@ -50,7 +50,7 @@ impl WindowsJobRunner {
         if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
             return Err("Windows broker staging directory must be a non-reparse directory".into());
         }
-        let canonical = std::fs::canonicalize(&staging_dir)
+        let canonical = std::fs::canonicalize(staging_dir)
             .map_err(|error| format!("canonicalize Windows broker staging directory: {error}"))?;
         Ok(Self {
             staging_dir: canonical,
@@ -157,9 +157,9 @@ impl WindowsJobRunner {
         let stdout_signal = Arc::clone(&exceeded);
         let stderr_signal = Arc::clone(&exceeded);
         let stdout_reader =
-            std::thread::spawn(move || drain_pipe_bounded(stdout, output_limit, stdout_signal));
+            std::thread::spawn(move || drain_pipe_bounded(stdout, output_limit, &stdout_signal));
         let stderr_reader =
-            std::thread::spawn(move || drain_pipe_bounded(stderr, output_limit, stderr_signal));
+            std::thread::spawn(move || drain_pipe_bounded(stderr, output_limit, &stderr_signal));
         process
             .resume()
             .map_err(|error| format!("resume contained Windows child: {error}"))?;
@@ -367,7 +367,7 @@ struct CapturedPipe {
     truncated: bool,
 }
 
-fn drain_pipe_bounded(mut pipe: File, maximum: usize, exceeded: Arc<AtomicBool>) -> CapturedPipe {
+fn drain_pipe_bounded(mut pipe: File, maximum: usize, exceeded: &AtomicBool) -> CapturedPipe {
     let mut bytes = Vec::with_capacity(maximum.min(8192));
     let mut buffer = [0_u8; 8192];
     let mut truncated = false;
