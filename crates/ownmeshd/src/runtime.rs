@@ -1798,6 +1798,8 @@ full_user_access/full_access for arbitrary commands",
             workspace_id: String,
             #[serde(default)]
             path: String,
+            #[serde(default)]
+            command: Option<crate::review_manifest::ReviewCommand>,
             tests: Vec<TestRequest>,
         }
         let p: P = parse_params(params)?;
@@ -1829,7 +1831,9 @@ full_user_access/full_access for arbitrary commands",
             head_oid,
             principal: client.client_name.clone(),
             phase: ReviewPhase::Planned,
+            command: p.command,
             tests: p.tests,
+            remote_operation_id: self.active_remote_operation_id.clone(),
             status_cursor: 0,
             diff_cursor: 0,
             result_sha256: None,

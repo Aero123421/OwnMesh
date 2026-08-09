@@ -40,6 +40,15 @@ pub struct TestRequest {
     pub timeout_ms: u64,
 }
 
+/// Optional primary agent/direct command; shell strings are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub timeout_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewManifest {
@@ -53,7 +62,11 @@ pub struct ReviewManifest {
     pub head_oid: String,
     pub principal: String,
     pub phase: ReviewPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<ReviewCommand>,
     pub tests: Vec<TestRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_operation_id: Option<String>,
     /// Absolute cursors and digests bind any paged result spool to this receipt.
     #[serde(default)]
     pub status_cursor: u64,
@@ -368,6 +381,9 @@ fn validate(m: &ReviewManifest) -> Result<(), String> {
     if m.tests.len() > MAX_TESTS {
         return Err("review test count exceeds cap".into());
     }
+    if let Some(command) = &m.command {
+        validate_command(&command.program, &command.args, command.timeout_ms)?;
+    }
     for test in &m.tests {
         if test.program.is_empty()
             || test.program.len() > MAX_ARG_BYTES
@@ -388,6 +404,21 @@ fn validate(m: &ReviewManifest) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_command(program: &str, args: &[String], timeout_ms: u64) -> Result<(), String> {
+    if program.is_empty()
+        || program.len() > MAX_ARG_BYTES
+        || program.chars().any(char::is_control)
+        || args.len() > MAX_ARGV_ITEMS
+        || !(1..=300_000).contains(&timeout_ms)
+        || args
+            .iter()
+            .any(|arg| arg.len() > MAX_ARG_BYTES || arg.chars().any(char::is_control))
+    {
+        return Err("invalid argv-only review command".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,11 +434,13 @@ mod tests {
             head_oid: "a".repeat(40),
             principal: "client:remote:test".into(),
             phase: ReviewPhase::Planned,
+            command: None,
             tests: vec![TestRequest {
                 program: "cargo".into(),
                 args: vec!["test".into()],
                 timeout_ms: 60_000,
             }],
+            remote_operation_id: None,
             status_cursor: 0,
             diff_cursor: 0,
             result_sha256: None,
