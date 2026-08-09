@@ -2179,6 +2179,7 @@ full_user_access/full_access for arbitrary commands",
             destination_principal_id: String,
             source_device_id: String,
             destination_device_id: String,
+            source_workspace_id: String,
             destination_workspace_id: String,
             epoch: u32,
             fence: u64,
@@ -2232,6 +2233,7 @@ full_user_access/full_access for arbitrary commands",
                 .bytes()
                 .any(|byte| byte.is_ascii_control())
             || p.workspace_version == 0
+            || p.source_workspace_id != source_workspace_id
             || binding.source_principal_id != authority.principal_id
             || binding.source_device_id != authority.device_id
         {
@@ -2367,6 +2369,7 @@ full_user_access/full_access for arbitrary commands",
             source_device_id: String,
             destination_device_id: String,
             source_workspace_id: String,
+            destination_workspace_id: String,
             workspace_id: String,
             plan_sha256: String,
             epoch: u32,
@@ -2404,6 +2407,7 @@ full_user_access/full_access for arbitrary commands",
                 .bytes()
                 .any(|byte| byte.is_ascii_control())
             || p.workspace_version == 0
+            || p.destination_workspace_id != p.workspace_id
             || !p
                 .plan_sha256
                 .bytes()
@@ -8386,6 +8390,7 @@ mod transfer_runtime_tests {
                     "destination_principal_id": "principal_a",
                     "source_device_id": "dev_transfer_test",
                     "destination_device_id": "dev_destination",
+                    "source_workspace_id": "ws_default",
                     "destination_workspace_id": "ws_destination",
                     "epoch": 1,
                     "fence": 1,
@@ -8425,6 +8430,7 @@ mod transfer_runtime_tests {
             "source_device_id": "dev_transfer_test",
             "destination_device_id": "dev_destination",
             "source_workspace_id": "ws_default",
+            "destination_workspace_id": "ws_destination",
             "workspace_id": "ws_destination",
             "plan_sha256": source["plan_sha256"],
             "epoch": 1,
@@ -8456,6 +8462,7 @@ mod transfer_runtime_tests {
             "source_device_id": "dev_transfer_test",
             "destination_device_id": "dev_destination",
             "source_workspace_id": "ws_default",
+            "destination_workspace_id": "ws_destination",
             "workspace_id": "ws_destination",
             "plan_sha256": "g".repeat(64),
             "epoch": 1,
