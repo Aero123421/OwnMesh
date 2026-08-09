@@ -1096,7 +1096,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
     plan_sha256: "a".repeat(64),
     epoch: 1,
     fence: 1,
-    expires_at: expiresAt,
+    transfer_expires_at: expiresAt,
     device_id: deviceId,
     workspace_id: "ws_source",
     session_nonce: "nonce_preflight_1",
@@ -1132,7 +1132,7 @@ test("transfer preflight results are exact-correlated metadata only", async () =
     epoch: 1,
     fence: 1,
     session_nonce: expected.session_nonce,
-    expires_at: expiresAt,
+    transfer_expires_at: expiresAt,
     ephemeral_public_key: "11".repeat(32),
     ephemeral_signature: "22".repeat(64),
   };

@@ -506,7 +506,7 @@ export default {
       const ticket = await verifyTransferTicket(env.SESSION_SECRET, request.headers.get("x-ownmesh-transfer-ticket"));
       const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
       const credential = bearerToken ? await store.getDeviceCredential(bearerToken) : null;
-      if (!ticket || !credential || ticket.exp <= Date.now() || credential.device_id !== ticket.device_id || credential.tenant_id !== ticket.tenant_id || credential.principal_id !== ticket.principal_id) return json({ error: "invalid_transfer_identity" }, { status: 401 });
+      if (!ticket || !credential || ticket.ticket_exp <= Date.now() || ticket.transfer_expires_at <= Date.now() || credential.device_id !== ticket.device_id || credential.tenant_id !== ticket.tenant_id || credential.principal_id !== ticket.principal_id) return json({ error: "invalid_transfer_identity" }, { status: 401 });
       const device = await store.getDevice(ticket.device_id);
       const sourceDevice = await store.getDevice(ticket.source_device_id);
       const destinationDevice = await store.getDevice(ticket.destination_device_id);

@@ -2576,7 +2576,7 @@ export type ApplyMcpOperationResultOutcome =
  */
 type TransferPreflightExpectation = Pick<
   TransferServerBinding,
-  "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "expires_at"
+  "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "transfer_expires_at"
 > & {
   role: "source" | "destination";
   device_id: string;
@@ -2591,7 +2591,7 @@ function transferPreflightExpectation(op: McpOperationRecord): TransferPreflight
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const allowed = [
-    "role", "transfer_id", "tenant_id", "plan_sha256", "epoch", "fence", "expires_at",
+    "role", "transfer_id", "tenant_id", "plan_sha256", "epoch", "fence", "transfer_expires_at",
     "device_id", "workspace_id", "session_nonce", "coordinator_request_id", "workspace_version",
   ];
   if (Object.keys(raw).some((key) => !allowed.includes(key))) return null;
@@ -2602,14 +2602,14 @@ function transferPreflightExpectation(op: McpOperationRecord): TransferPreflight
     role: role === "source" || role === "destination" ? role : "source",
     transfer_id: text("transfer_id") || "", tenant_id: text("tenant_id") || "",
     plan_sha256: text("plan_sha256") || "", epoch: integer("epoch") ?? 0,
-    fence: integer("fence") ?? 0, expires_at: integer("expires_at") ?? 0,
+    fence: integer("fence") ?? 0, transfer_expires_at: integer("transfer_expires_at") ?? 0,
     device_id: text("device_id") || "", workspace_id: text("workspace_id") || "",
     session_nonce: text("session_nonce") || "", coordinator_request_id: text("coordinator_request_id") || "",
     workspace_version: integer("workspace_version") ?? 0,
   };
   if (!role || expected.device_id !== op.device_id || expected.tenant_id !== op.tenant_id
     || expected.workspace_id !== op.workspace_id || expected.workspace_version < 1
-    || expected.epoch < 1 || expected.fence < 1 || expected.expires_at <= Date.now()
+    || expected.epoch < 1 || expected.fence < 1 || expected.transfer_expires_at <= Date.now()
     // The source Agent is the authority that hashes the pinned source file.
     // Its preflight starts with no server-known plan hash; every other path
     // requires the already CAS-bound hash.
@@ -2644,7 +2644,7 @@ function sanitizeTransferPreflightResult(
     if (Object.keys(p).some((key) => !["plan_id", "sha256", "size_bytes"].includes(key))
       || typeof p.plan_id !== "string" || p.plan_id.length === 0 || p.plan_id.length > 256
       || typeof p.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(p.sha256)
-      || typeof p.size_bytes !== "number" || !Number.isSafeInteger(p.size_bytes) || p.size_bytes < 1) {
+      || typeof p.size_bytes !== "number" || !Number.isSafeInteger(p.size_bytes) || p.size_bytes < 0) {
       return { error: "transfer_preflight_source_plan_invalid" };
     }
     sourcePlan = { plan_id: p.plan_id, sha256: p.sha256, size_bytes: p.size_bytes };

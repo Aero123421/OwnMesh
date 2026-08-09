@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canonicalTransferEphemeralProof, issueTransferTicket, TransferRoomRouter, TRANSFER_PROTOCOL, verifyTransferEphemeralProof, verifyTransferTicket, type TransferMetadata, type TransferTicketClaims } from "./transfer-room.ts";
+import { canonicalTransferEphemeralProof, issueTransferTicket, TransferRoomRouter, TRANSFER_PROTOCOL, validateTransferAttachment, verifyTransferEphemeralProof, verifyTransferTicket, type TransferAttachment, type TransferMetadata, type TransferTicketClaims } from "./transfer-room.ts";
 
 const digest = "a".repeat(64);
-function meta(): TransferMetadata { return { version: 1, transfer_id: "xfer_test", tenant_id: "ten_a", source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, expires_at: Date.now() + 60_000, max_bytes: 128 * 1024, epoch: 1, fence: 7, state: "prepared", contiguous_ack_sequence: null, contiguous_ack_offset: 0 }; }
+function meta(): TransferMetadata { return { version: 1, transfer_id: "xfer_test", tenant_id: "ten_a", source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, transfer_expires_at: Date.now() + 10 * 60_000, max_bytes: 128 * 1024, epoch: 1, fence: 7, state: "prepared", contiguous_ack_sequence: null, contiguous_ack_offset: 0 }; }
 function frame(type: string, fields: Record<string, unknown> = {}) { return JSON.stringify({ protocol: TRANSFER_PROTOCOL, type, transfer_id: "xfer_test", epoch: 1, fence: 7, plan_sha256: digest, ...fields }); }
 function encrypted(length: number): string { return btoa("x".repeat(length + 16)); }
-function ticket(role: "source" | "destination"): TransferTicketClaims { return { v: 1, jti: `jti_${role}`, session_nonce: `nonce_${role}`, transfer_id: "xfer_test", tenant_id: "ten_a", principal_id: "prin_a", device_id: role === "source" ? "dev_source" : "dev_destination", role, source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, epoch: 1, fence: 7, max_bytes: 128 * 1024, exp: Date.now() + 20_000, source_device_public_key: "01".repeat(32), destination_device_public_key: "02".repeat(32), source_ephemeral_public_key: "03".repeat(32), destination_ephemeral_public_key: "04".repeat(32), source_ephemeral_signature: "05".repeat(64), destination_ephemeral_signature: "06".repeat(64) }; }
+function ticket(role: "source" | "destination"): TransferTicketClaims { return { v: 1, jti: `jti_${role}`, session_nonce: `nonce_${role}`, transfer_id: "xfer_test", tenant_id: "ten_a", principal_id: "prin_a", device_id: role === "source" ? "dev_source" : "dev_destination", role, source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, epoch: 1, fence: 7, max_bytes: 128 * 1024, ticket_exp: Date.now() + 20_000, transfer_expires_at: Date.now() + 10 * 60_000, source_device_public_key: "01".repeat(32), destination_device_public_key: "02".repeat(32), source_ephemeral_public_key: "03".repeat(32), destination_ephemeral_public_key: "04".repeat(32), source_ephemeral_signature: "05".repeat(64), destination_ephemeral_signature: "06".repeat(64) }; }
 
 test("transfer tickets are short lived and bind role, device, tenant, plan and session nonce", async () => {
   const secret = "test-secret"; const source = ticket("source");
@@ -14,7 +14,8 @@ test("transfer tickets are short lived and bind role, device, tenant, plan and s
   assert.deepEqual(await verifyTransferTicket(secret, encoded), source);
   assert.equal(await verifyTransferTicket("wrong", encoded), null);
   await assert.rejects(issueTransferTicket(secret, { ...source, role: "source", device_id: "dev_destination" }));
-  await assert.rejects(issueTransferTicket(secret, { ...source, exp: Date.now() - 1 }));
+  await assert.rejects(issueTransferTicket(secret, { ...source, ticket_exp: Date.now() - 1 }));
+  await assert.rejects(issueTransferTicket(secret, { ...source, transfer_expires_at: source.ticket_exp - 1 }));
 });
 
 test("ephemeral proof binds the exact key, role, and immutable transfer facts", async () => {
@@ -39,7 +40,7 @@ test("ephemeral proof golden vector is length-delimited for punctuation-bearing 
     transfer_id: "x|=fer", tenant_id: "t=|", source_device_id: "dev|=",
     source_workspace_id: "ws=|", plan_sha256: "00".repeat(32),
     source_ephemeral_public_key: "11".repeat(32), epoch: 0x0102_0304,
-    fence: 0x0102_0304_0506, session_nonce: "n|=", exp: 1_700_000_000_000,
+    fence: 0x0102_0304_0506, session_nonce: "n|=", transfer_expires_at: 1_700_000_000_000,
   });
   const u32 = (n: number) => Uint8Array.of(0, 0, 0, n);
   const u64 = (n: bigint) => {
@@ -64,7 +65,8 @@ test("TransferRoom forwards one opaque chunk and persists only contiguous ACK me
   const room = new TransferRoomRouter(meta(), async (m) => { saved.push(m); });
   const src = { id: "src", role: "source" as const, device_id: "dev_source", send: (v: string) => source.push(v) };
   const dst = { id: "dst", role: "destination" as const, device_id: "dev_destination", send: (v: string) => destination.push(v) };
-  assert.equal(room.attach(src), true); assert.equal(room.attach(dst), true);
+  assert.equal(room.attach(src), "new"); assert.equal(room.attach(dst), "new");
+  source.length = 0; destination.length = 0;
   const chunk = frame("chunk", { sequence: 0, offset: 0, length: 3, ciphertext_base64: encrypted(3), chunk_sha256: digest });
   assert.deepEqual(await room.handle(src, chunk), { ok: true });
   assert.equal(destination[0], chunk); assert.equal(saved.length, 0);
@@ -78,11 +80,13 @@ test("TransferRoom drops in-flight bytes on disconnect and rejects duplicate/gap
   const src = { id: "src", role: "source" as const, device_id: "dev_source", send: () => {} };
   const dst = { id: "dst", role: "destination" as const, device_id: "dev_destination", send: (v: string) => received.push(v) };
   room.attach(src); room.attach(dst);
+  received.length = 0;
   assert.equal((await room.handle(src, frame("chunk", { sequence: 1, offset: 0, length: 1, ciphertext_base64: encrypted(1), chunk_sha256: digest }))).error, "non_contiguous_or_busy");
   assert.equal((await room.handle(src, frame("chunk", { sequence: 0, offset: 0, length: 1, ciphertext_base64: encrypted(1), chunk_sha256: digest, extra: true }))).error, "bad_chunk");
   assert.equal((await room.handle(src, frame("chunk", { sequence: 0, offset: 0, length: 1, ciphertext_base64: encrypted(1), chunk_sha256: digest }))).ok, true);
   room.detach("destination", "dst");
   const dst2 = { ...dst, id: "dst2" }; room.attach(dst2);
+  received.length = 1; // discard only the resumed destination's ready cursor
   // Same cursor is retransmittable because the prior in-flight ciphertext was dropped.
   assert.equal((await room.handle(src, frame("chunk", { sequence: 0, offset: 0, length: 1, ciphertext_base64: encrypted(1), chunk_sha256: digest }))).ok, true);
   assert.equal(received.length, 2);
@@ -96,8 +100,100 @@ test("TransferRoom does not ACK source when metadata persistence fails", async (
   const src = { id: "src", role: "source" as const, device_id: "dev_source", send: (v: string) => source.push(v) };
   const dst = { id: "dst", role: "destination" as const, device_id: "dev_destination", send: (v: string) => destination.push(v) };
   room.attach(src); room.attach(dst);
+  source.length = 0; destination.length = 0;
   await room.handle(src, frame("chunk", { sequence: 0, offset: 0, length: 1, ciphertext_base64: encrypted(1), chunk_sha256: digest }));
   assert.equal(destination.length, 1);
   assert.equal((await room.handle(dst, frame("ack", { sequence: 0, next_offset: 1 }))).error, "persist_failed");
   assert.equal(source.length, 0);
+});
+
+test("hibernation attachments are strict non-bearer bindings and reconstruct both live peers", async () => {
+  const m = meta(); const sent: string[] = [];
+  const attachment = (role: "source" | "destination"): TransferAttachment => ({ v: 1, peer_id: `${role}-peer`, role, device_id: role === "source" ? m.source_device_id : m.destination_device_id, transfer_id: m.transfer_id, epoch: m.epoch, fence: m.fence, plan_sha256: m.plan_sha256, transfer_expires_at: m.transfer_expires_at });
+  const sourceAttachment = attachment("source"); const destinationAttachment = attachment("destination");
+  assert.equal(JSON.stringify(sourceAttachment).includes("ticket"), false);
+  assert.equal(JSON.stringify(sourceAttachment).includes("ciphertext"), false);
+  assert.deepEqual(validateTransferAttachment(sourceAttachment, m), sourceAttachment);
+  assert.equal(validateTransferAttachment({ ...sourceAttachment, ticket: "bearer" }, m), null);
+  assert.equal(validateTransferAttachment({ ...sourceAttachment, device_id: "dev_destination" }, m), null);
+  // Simulate an evicted DO: reconstruct a fresh router from durable metadata
+  // and the two still-live socket attachments before either sends a frame.
+  const restored = new TransferRoomRouter(structuredClone(m), async () => {});
+  const src = { id: sourceAttachment.peer_id, role: "source" as const, device_id: sourceAttachment.device_id, send: () => {} };
+  const dst = { id: destinationAttachment.peer_id, role: "destination" as const, device_id: destinationAttachment.device_id, send: (raw: string) => sent.push(raw) };
+  assert.equal(restored.attach(src), "new"); assert.equal(restored.attach(dst), "new");
+  sent.length = 0;
+  assert.equal((await restored.handle(src, frame("chunk", { sequence: 0, offset: 0, length: 1, ciphertext_base64: encrypted(1), chunk_sha256: digest }))).ok, true);
+  assert.equal(sent.length, 1);
+});
+
+test("same-role attach is race-safe and cannot replace a live source", async () => {
+  const room = new TransferRoomRouter(meta(), async () => {});
+  const source = { id: "source-1", role: "source" as const, device_id: "dev_source", send: () => {} };
+  assert.equal(room.attach(source), "new");
+  assert.equal(room.attach({ ...source, id: "source-2" }), "reject");
+  // A duplicate restore/message for the exact same socket is harmless.
+  assert.equal(room.attach(source), "existing");
+});
+
+test("exact error detach accepts a fresh peer without evicting a live role", () => {
+  const room = new TransferRoomRouter(meta(), async () => {});
+  const source = { id: "source-1", role: "source" as const, device_id: "dev_source", send: () => {} };
+  room.attach(source);
+  // A malformed attachment cannot name the live peer, so its detach is inert.
+  room.detach("source", "malformed-peer");
+  assert.equal(room.attach({ ...source, id: "source-2" }), "reject");
+  room.detach("source", "source-1");
+  assert.equal(room.attach({ ...source, id: "source-2" }), "new");
+});
+
+test("ready is emitted only after both peers attach and never on ordinary reattach", () => {
+  const sourceFirst: string[] = []; const destinationFirst: string[] = [];
+  const room = new TransferRoomRouter(meta(), async () => {});
+  const source = { id: "source", role: "source" as const, device_id: "dev_source", send: (raw: string) => sourceFirst.push(raw) };
+  const destination = { id: "destination", role: "destination" as const, device_id: "dev_destination", send: (raw: string) => destinationFirst.push(raw) };
+  assert.equal(room.attach(source), "new");
+  assert.equal(sourceFirst.length, 0);
+  assert.equal(room.attach(destination), "new");
+  assert.equal(sourceFirst.length, 1); assert.equal(destinationFirst.length, 1);
+  const ready = JSON.parse(sourceFirst[0]) as Record<string, unknown>;
+  assert.deepEqual(JSON.parse(destinationFirst[0]), ready);
+  assert.deepEqual({ type: ready.type, next_sequence: ready.next_sequence, next_offset: ready.next_offset, epoch: ready.epoch, fence: ready.fence, plan_sha256: ready.plan_sha256 }, { type: "ready", next_sequence: 0, next_offset: 0, epoch: 1, fence: 7, plan_sha256: digest });
+  assert.equal(room.attach(source), "existing");
+  assert.equal(sourceFirst.length, 1); assert.equal(destinationFirst.length, 1);
+  const secondSource: string[] = []; const secondDestination: string[] = [];
+  const destinationFirstRoom = new TransferRoomRouter(meta(), async () => {});
+  const secondSrc = { ...source, id: "source-2", send: (raw: string) => secondSource.push(raw) };
+  const secondDst = { ...destination, id: "destination-2", send: (raw: string) => secondDestination.push(raw) };
+  assert.equal(destinationFirstRoom.attach(secondDst), "new");
+  assert.equal(secondDestination.length, 0);
+  assert.equal(destinationFirstRoom.attach(secondSrc), "new");
+  assert.equal(secondSource.length, 1); assert.equal(secondDestination.length, 1);
+});
+
+test("zero-byte transfer finishes only after destination finish acknowledgement is durable", async () => {
+  const persisted: TransferMetadata[] = []; const source: string[] = []; const destination: string[] = [];
+  const room = new TransferRoomRouter({ ...meta(), max_bytes: 0 }, async (m) => { persisted.push(m); });
+  const src = { id: "source", role: "source" as const, device_id: "dev_source", send: (raw: string) => source.push(raw) };
+  const dst = { id: "destination", role: "destination" as const, device_id: "dev_destination", send: (raw: string) => destination.push(raw) };
+  room.attach(src); room.attach(dst); source.length = 0; destination.length = 0;
+  assert.deepEqual(await room.handle(src, frame("finish")), { ok: true });
+  assert.match(destination[0], /"type":"finish"/);
+  assert.deepEqual(await room.handle(dst, frame("finish_ack")), { ok: true });
+  assert.equal(room.snapshot().state, "completed");
+  assert.equal(persisted.at(-1)?.state, "completed");
+  assert.match(source[0], /"type":"finish_ack"/);
+});
+
+test("cancel persistence failure breaks the room and never forwards a cancel", async () => {
+  const destination: string[] = [];
+  const room = new TransferRoomRouter(meta(), async () => { throw new Error("storage"); });
+  const source = { id: "src", role: "source" as const, device_id: "dev_source", send: () => {} };
+  const dest = { id: "dst", role: "destination" as const, device_id: "dev_destination", send: (raw: string) => destination.push(raw) };
+  room.attach(source); room.attach(dest);
+  destination.length = 0;
+  assert.deepEqual(await room.handle(source, frame("cancel")), { ok: false, error: "persist_failed" });
+  assert.equal(room.isBroken, true);
+  assert.equal(destination.length, 0);
+  assert.equal((await room.handle(source, frame("cancel"))).error, "peer_unavailable");
 });

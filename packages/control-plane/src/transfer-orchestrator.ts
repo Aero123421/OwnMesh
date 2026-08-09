@@ -27,7 +27,10 @@ export type TransferServerBinding = Readonly<{
   max_bytes: number;
   epoch: number;
   fence: number;
-  expires_at: number;
+  /** Short connection authority; minted exact-bound by the coordinator. */
+  ticket_exp: number;
+  /** Immutable plan deadline, distinct from ticket_exp. */
+  transfer_expires_at: number;
   source_device_public_key: string;
   destination_device_public_key: string;
 }>;
@@ -43,7 +46,7 @@ export type AgentEphemeralReply = {
   epoch: number;
   fence: number;
   session_nonce: string;
-  expires_at: number;
+  transfer_expires_at: number;
   ephemeral_public_key: string;
   ephemeral_signature: string;
 };
@@ -53,11 +56,11 @@ export type AgentEphemeralReply = {
  * DeviceRoom correlation path may hand to the coordinator. */
 export function parseTransferPreflightResult(
   value: unknown,
-  expected: Pick<TransferServerBinding, "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "expires_at"> & { role: TransferRole; device_id: string; workspace_id: string; session_nonce: string },
+  expected: Pick<TransferServerBinding, "transfer_id" | "tenant_id" | "plan_sha256" | "epoch" | "fence" | "transfer_expires_at"> & { role: TransferRole; device_id: string; workspace_id: string; session_nonce: string },
 ): AgentEphemeralReply | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const obj = value as Record<string, unknown>;
-  const allowed = ["role", "transfer_id", "tenant_id", "device_id", "workspace_id", "plan_sha256", "epoch", "fence", "session_nonce", "expires_at", "ephemeral_public_key", "ephemeral_signature"];
+  const allowed = ["role", "transfer_id", "tenant_id", "device_id", "workspace_id", "plan_sha256", "epoch", "fence", "session_nonce", "transfer_expires_at", "ephemeral_public_key", "ephemeral_signature"];
   if (Object.keys(obj).some((name) => !allowed.includes(name))) return null;
   const text = (name: string) => typeof obj[name] === "string" ? obj[name] : null;
   const integer = (name: string) => typeof obj[name] === "number" && Number.isSafeInteger(obj[name]) ? obj[name] as number : null;
@@ -65,7 +68,7 @@ export function parseTransferPreflightResult(
     role: text("role") as TransferRole, transfer_id: text("transfer_id") || "", tenant_id: text("tenant_id") || "",
     device_id: text("device_id") || "", workspace_id: text("workspace_id") || "", plan_sha256: text("plan_sha256") || "",
     epoch: integer("epoch") ?? 0, fence: integer("fence") ?? 0, session_nonce: text("session_nonce") || "",
-    expires_at: integer("expires_at") ?? 0, ephemeral_public_key: text("ephemeral_public_key") || "", ephemeral_signature: text("ephemeral_signature") || "",
+    transfer_expires_at: integer("transfer_expires_at") ?? 0, ephemeral_public_key: text("ephemeral_public_key") || "", ephemeral_signature: text("ephemeral_signature") || "",
   };
   return reply.role === expected.role && reply.transfer_id === expected.transfer_id && reply.tenant_id === expected.tenant_id
     && reply.device_id === expected.device_id && reply.workspace_id === expected.workspace_id
@@ -75,7 +78,7 @@ export function parseTransferPreflightResult(
     // lower-case SHA-256 before it can dispatch destination preflight/start.
     && (expected.plan_sha256 === "" && expected.role === "source" ? hash(reply.plan_sha256) : reply.plan_sha256 === expected.plan_sha256)
     && reply.epoch === expected.epoch && reply.fence === expected.fence
-    && reply.session_nonce === expected.session_nonce && reply.expires_at === expected.expires_at
+    && reply.session_nonce === expected.session_nonce && reply.transfer_expires_at === expected.transfer_expires_at
     && key(reply.ephemeral_public_key, 32) && key(reply.ephemeral_signature, 64) ? reply : null;
 }
 
@@ -93,7 +96,7 @@ export type TransferTicketPair = Readonly<{
     plan_sha256: string;
     epoch: number;
     fence: number;
-    expires_at: number;
+    transfer_expires_at: number;
     max_bytes: number;
   }>;
 }>;
@@ -127,8 +130,9 @@ export async function mintTransferTicketPair(
     || !key(binding.source_device_public_key, 32) || !key(binding.destination_device_public_key, 32)
     || !Number.isSafeInteger(binding.epoch) || binding.epoch < 1
     || !Number.isSafeInteger(binding.fence) || binding.fence < 1
-    || !Number.isSafeInteger(binding.max_bytes) || binding.max_bytes < 1
-    || !Number.isSafeInteger(binding.expires_at) || binding.expires_at <= Date.now()) {
+    || !Number.isSafeInteger(binding.max_bytes) || binding.max_bytes < 0
+    || !Number.isSafeInteger(binding.ticket_exp) || binding.ticket_exp <= Date.now() || binding.ticket_exp > Date.now() + 60_000
+    || !Number.isSafeInteger(binding.transfer_expires_at) || binding.transfer_expires_at < binding.ticket_exp) {
     throw new Error("invalid_transfer_server_binding");
   }
   const matchReply = (reply: AgentEphemeralReply, role: TransferRole): boolean =>
@@ -136,7 +140,7 @@ export async function mintTransferTicketPair(
     && reply.device_id === (role === "source" ? binding.source_device_id : binding.destination_device_id)
     && reply.workspace_id === (role === "source" ? binding.source_workspace_id : binding.destination_workspace_id)
     && reply.plan_sha256 === binding.plan_sha256 && reply.epoch === binding.epoch
-    && reply.fence === binding.fence && reply.session_nonce === nonce && reply.expires_at === binding.expires_at
+    && reply.fence === binding.fence && reply.session_nonce === nonce && reply.transfer_expires_at === binding.transfer_expires_at
     && key(reply.ephemeral_public_key, 32) && key(reply.ephemeral_signature, 64);
   if (!matchReply(source, "source") || !matchReply(destination, "destination")) {
     throw new Error("agent_ephemeral_reply_binding_mismatch");
@@ -147,7 +151,9 @@ export async function mintTransferTicketPair(
     role, source_device_id: binding.source_device_id, destination_device_id: binding.destination_device_id,
     source_workspace_id: binding.source_workspace_id, destination_workspace_id: binding.destination_workspace_id,
     plan_sha256: binding.plan_sha256, epoch: binding.epoch, fence: binding.fence,
-    max_bytes: binding.max_bytes, exp: binding.expires_at,
+    max_bytes: binding.max_bytes,
+    ticket_exp: binding.ticket_exp,
+    transfer_expires_at: binding.transfer_expires_at,
     source_device_public_key: binding.source_device_public_key,
     destination_device_public_key: binding.destination_device_public_key,
     source_ephemeral_public_key: source.ephemeral_public_key,
@@ -171,7 +177,7 @@ export async function mintTransferTicketPair(
       source_device_id: binding.source_device_id, destination_device_id: binding.destination_device_id,
       source_workspace_id: binding.source_workspace_id, destination_workspace_id: binding.destination_workspace_id,
       plan_sha256: binding.plan_sha256, epoch: binding.epoch, fence: binding.fence,
-      expires_at: binding.expires_at, max_bytes: binding.max_bytes,
+      transfer_expires_at: binding.transfer_expires_at, max_bytes: binding.max_bytes,
     },
   };
 }

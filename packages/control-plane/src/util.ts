@@ -47,8 +47,8 @@ export function randomId(prefix: string): string {
   return `${prefix}${crypto.randomUUID().replace(/-/g, "").slice(0, 22)}`;
 }
 
-export async function sha256Hex(input: string): Promise<string> {
-  const data = new TextEncoder().encode(input);
+export async function sha256Hex(input: string | Uint8Array): Promise<string> {
+  const data = typeof input === "string" ? new TextEncoder().encode(input) : input;
   const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)]
     .map((b) => b.toString(16).padStart(2, "0"))

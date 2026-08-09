@@ -14,7 +14,7 @@ export const MAX_TRANSFER_FRAME_BYTES = 96 * 1024;
 export const AEAD_TAG_BYTES = 16;
 
 export type TransferRole = "source" | "destination";
-export type TransferState = "prepared" | "active" | "cancelled" | "expired";
+export type TransferState = "prepared" | "active" | "completed" | "cancelled" | "expired";
 
 export type TransferMetadata = {
   version: 1;
@@ -25,7 +25,8 @@ export type TransferMetadata = {
   source_workspace_id: string;
   destination_workspace_id: string;
   plan_sha256: string;
-  expires_at: number;
+  /** Immutable plan deadline; never a connection-ticket deadline. */
+  transfer_expires_at: number;
   max_bytes: number;
   epoch: number;
   fence: number;
@@ -40,6 +41,7 @@ export type TransferPeer = {
   device_id: string;
   send(raw: string): void;
 };
+export type TransferAttachResult = "new" | "existing" | "reject";
 
 /** Worker-minted, single-use ticket consumed by the transfer DO. */
 export type TransferTicketClaims = {
@@ -59,7 +61,10 @@ export type TransferTicketClaims = {
   epoch: number;
   fence: number;
   max_bytes: number;
-  exp: number;
+  /** Short-lived, single-use WebSocket connection authority (<= 60 seconds). */
+  ticket_exp: number;
+  /** Immutable transfer plan lifetime; supports bounded reconnect/resume. */
+  transfer_expires_at: number;
   /** X25519 public keys are ticket-bound and signed by the persistent device
    * Ed25519 identities. These are public session material, never long-lived
    * private keys or plaintext transfer data. */
@@ -72,6 +77,7 @@ export type TransferTicketClaims = {
 };
 
 const TICKET_MAX_MS = 60_000;
+const TRANSFER_MAX_TTL_MS = 24 * 60 * 60_000;
 const STORAGE_METADATA = "ownmesh:transfer:metadata:v1";
 const STORAGE_TICKETS = "ownmesh:transfer:tickets:v1";
 const MAX_TICKET_REPLAYS = 128;
@@ -94,7 +100,8 @@ function canonicalTransferTicketJson(c: TransferTicketClaims): string {
     tenant_id: c.tenant_id, principal_id: c.principal_id, device_id: c.device_id,
     role: c.role, source_device_id: c.source_device_id, destination_device_id: c.destination_device_id,
     source_workspace_id: c.source_workspace_id, destination_workspace_id: c.destination_workspace_id,
-    plan_sha256: c.plan_sha256, epoch: c.epoch, fence: c.fence, max_bytes: c.max_bytes, exp: c.exp,
+    plan_sha256: c.plan_sha256, epoch: c.epoch, fence: c.fence, max_bytes: c.max_bytes,
+    ticket_exp: c.ticket_exp, transfer_expires_at: c.transfer_expires_at,
     source_device_public_key: c.source_device_public_key, destination_device_public_key: c.destination_device_public_key,
     source_ephemeral_public_key: c.source_ephemeral_public_key, destination_ephemeral_public_key: c.destination_ephemeral_public_key,
     source_ephemeral_signature: c.source_ephemeral_signature, destination_ephemeral_signature: c.destination_ephemeral_signature,
@@ -130,7 +137,8 @@ export function canonicalTransferEphemeralProof(claims: TransferTicketClaims, ro
   text("ownmesh-transfer-ephemeral-v1");
   text(claims.transfer_id); text(claims.tenant_id); parts.push(Uint8Array.of(role === "source" ? 1 : 2));
   text(device); text(workspace); parts.push(rawHex(claims.plan_sha256), u32(claims.epoch), u64(claims.fence));
-  text(claims.session_nonce); parts.push(rawHex(ephemeral), u64(claims.exp));
+  // Bind the immutable transfer deadline, not a one-minute connection bearer.
+  text(claims.session_nonce); parts.push(rawHex(ephemeral), u64(claims.transfer_expires_at));
   const length = parts.reduce((total, part) => total + part.byteLength, 0);
   const out = new Uint8Array(length); let offset = 0;
   for (const part of parts) { out.set(part, offset); offset += part.byteLength; }
@@ -159,7 +167,7 @@ export async function verifyTransferEphemeralProof(
 }
 
 export async function issueTransferTicket(secret: string, claims: TransferTicketClaims): Promise<string> {
-  if (!secret || claims.v !== 1 || !id(claims.jti) || !id(claims.session_nonce) || !id(claims.transfer_id) || !id(claims.tenant_id) || !id(claims.principal_id) || !id(claims.device_id) || !id(claims.source_device_id) || !id(claims.destination_device_id) || !id(claims.source_workspace_id) || !id(claims.destination_workspace_id) || !hash(claims.plan_sha256) || !hex(claims.source_device_public_key, 32) || !hex(claims.destination_device_public_key, 32) || !hex(claims.source_ephemeral_public_key, 32) || !hex(claims.destination_ephemeral_public_key, 32) || !hex(claims.source_ephemeral_signature, 64) || !hex(claims.destination_ephemeral_signature, 64) || (claims.role !== "source" && claims.role !== "destination") || claims.device_id !== (claims.role === "source" ? claims.source_device_id : claims.destination_device_id) || claims.exp <= Date.now() || claims.exp > Date.now() + TICKET_MAX_MS || !Number.isSafeInteger(claims.epoch) || claims.epoch < 1 || !Number.isSafeInteger(claims.fence) || claims.fence < 1 || !Number.isSafeInteger(claims.max_bytes) || claims.max_bytes < 1) throw new Error("invalid_transfer_ticket_claims");
+  if (!secret || claims.v !== 1 || !id(claims.jti) || !id(claims.session_nonce) || !id(claims.transfer_id) || !id(claims.tenant_id) || !id(claims.principal_id) || !id(claims.device_id) || !id(claims.source_device_id) || !id(claims.destination_device_id) || !id(claims.source_workspace_id) || !id(claims.destination_workspace_id) || !hash(claims.plan_sha256) || !hex(claims.source_device_public_key, 32) || !hex(claims.destination_device_public_key, 32) || !hex(claims.source_ephemeral_public_key, 32) || !hex(claims.destination_ephemeral_public_key, 32) || !hex(claims.source_ephemeral_signature, 64) || !hex(claims.destination_ephemeral_signature, 64) || (claims.role !== "source" && claims.role !== "destination") || claims.device_id !== (claims.role === "source" ? claims.source_device_id : claims.destination_device_id) || !Number.isSafeInteger(claims.ticket_exp) || claims.ticket_exp <= Date.now() || claims.ticket_exp > Date.now() + TICKET_MAX_MS || !Number.isSafeInteger(claims.transfer_expires_at) || claims.transfer_expires_at <= Date.now() || claims.transfer_expires_at < claims.ticket_exp || claims.transfer_expires_at > Date.now() + TRANSFER_MAX_TTL_MS || !Number.isSafeInteger(claims.epoch) || claims.epoch < 1 || !Number.isSafeInteger(claims.fence) || claims.fence < 1 || !Number.isSafeInteger(claims.max_bytes) || claims.max_bytes < 0) throw new Error("invalid_transfer_ticket_claims");
   const body = base64Url(new TextEncoder().encode(canonicalTransferTicketJson(claims)));
   const signature = new Uint8Array(await crypto.subtle.sign("HMAC", await ticketKey(secret), new TextEncoder().encode(body)));
   return `${body}.${base64Url(signature)}`;
@@ -219,11 +227,30 @@ export class TransferRoomRouter {
     return structuredClone(this.metadata);
   }
 
-  attach(peer: TransferPeer): boolean {
+  /** True only after a persistence barrier failed. Callers must close sockets. */
+  get isBroken(): boolean { return this.broken; }
+
+  attach(peer: TransferPeer): TransferAttachResult {
     const expected = peer.role === "source" ? this.metadata.source_device_id : this.metadata.destination_device_id;
-    if (this.broken || peer.device_id !== expected || this.metadata.state === "cancelled" || this.expired()) return false;
+    if (this.broken || peer.device_id !== expected || this.metadata.state === "cancelled" || this.metadata.state === "completed" || this.expired()) return "reject";
+    // A resumed hibernated socket may be reattached by the same peer id, but a
+    // second same-role socket is always a takeover attempt. Never overwrite a
+    // live sender/receiver: that would let a raced ticket redirect ciphertext.
+    const existing = this.peers.get(peer.role);
+    if (existing && existing.id !== peer.id) return "reject";
+    if (existing) return "existing";
     this.peers.set(peer.role, peer);
-    return true;
+    // Never wake the source alone: it would immediately hit destination_offline
+    // and consume a one-shot start attempt. Once both exact peers exist, send
+    // the same metadata-only durable cursor to both (including reattach).
+    if (this.peers.has("source") && this.peers.has("destination")) this.sendReady();
+    return "new";
+  }
+
+  private sendReady(): void {
+    const ready = JSON.stringify({ protocol: TRANSFER_PROTOCOL, type: "ready", transfer_id: this.metadata.transfer_id, epoch: this.metadata.epoch, fence: this.metadata.fence, plan_sha256: this.metadata.plan_sha256, next_sequence: this.metadata.contiguous_ack_sequence === null ? 0 : this.metadata.contiguous_ack_sequence + 1, next_offset: this.metadata.contiguous_ack_offset });
+    this.peers.get("source")?.send(ready);
+    this.peers.get("destination")?.send(ready);
   }
 
   detach(role: TransferRole, peerId: string): void {
@@ -234,19 +261,21 @@ export class TransferRoomRouter {
   }
 
   private expired(): boolean {
-    if (this.metadata.expires_at > Date.now()) return false;
+    if (this.metadata.transfer_expires_at > Date.now()) return false;
     this.metadata.state = "expired";
     return true;
   }
 
   async handle(peer: TransferPeer, raw: string): Promise<{ ok: boolean; error?: string }> {
     if (new TextEncoder().encode(raw).byteLength > MAX_TRANSFER_FRAME_BYTES) return { ok: false, error: "frame_too_large" };
-    if (this.broken || this.peers.get(peer.role)?.id !== peer.id || this.expired()) return { ok: false, error: "peer_unavailable" };
+    if (this.broken || this.peers.get(peer.role)?.id !== peer.id || this.metadata.state === "completed" || this.expired()) return { ok: false, error: "peer_unavailable" };
     let frame: Record<string, unknown> | null;
     try { frame = object(JSON.parse(raw)); } catch { frame = null; }
     if (!frame || frame.protocol !== TRANSFER_PROTOCOL || frame.transfer_id !== this.metadata.transfer_id || !id(frame.type)) return { ok: false, error: "bad_frame" };
     if (frame.type === "chunk") return this.chunk(peer, frame, raw);
     if (frame.type === "ack") return this.ack(peer, frame);
+    if (frame.type === "finish") return this.finish(peer, frame, raw);
+    if (frame.type === "finish_ack") return this.finishAck(peer, frame);
     if (frame.type === "cancel") return this.cancel(peer, frame);
     return { ok: false, error: "unsupported_type" };
   }
@@ -294,11 +323,43 @@ export class TransferRoomRouter {
     return { ok: true };
   }
 
+  /** Source sends terminal intent only after the exact durable byte cursor.
+   * Destination emits finish_ack only after local finalization is durable. */
+  private async finish(peer: TransferPeer, frame: Record<string, unknown>, raw: string): Promise<{ ok: boolean; error?: string }> {
+    if (peer.role !== "source" || !this.bound(frame) || this.inFlight || !exactlyKeys(frame, ["protocol", "type", "transfer_id", "epoch", "fence", "plan_sha256"])) return { ok: false, error: "bad_finish" };
+    if (this.metadata.contiguous_ack_offset !== this.metadata.max_bytes) return { ok: false, error: "finish_before_complete" };
+    const destination = this.peers.get("destination");
+    if (!destination) return { ok: false, error: "destination_offline" };
+    destination.send(raw);
+    return { ok: true };
+  }
+
+  private async finishAck(peer: TransferPeer, frame: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> {
+    if (peer.role !== "destination" || !this.bound(frame) || this.inFlight || !exactlyKeys(frame, ["protocol", "type", "transfer_id", "epoch", "fence", "plan_sha256"])) return { ok: false, error: "bad_finish_ack" };
+    if (this.metadata.contiguous_ack_offset !== this.metadata.max_bytes) return { ok: false, error: "finish_before_complete" };
+    const before = this.snapshot();
+    this.metadata.state = "completed";
+    try { await this.persist(this.snapshot()); }
+    catch { this.metadata = before; this.broken = true; this.peers.clear(); return { ok: false, error: "persist_failed" }; }
+    this.peers.get("source")?.send(JSON.stringify({ protocol: TRANSFER_PROTOCOL, type: "finish_ack", transfer_id: this.metadata.transfer_id, epoch: this.metadata.epoch, fence: this.metadata.fence, plan_sha256: this.metadata.plan_sha256 }));
+    return { ok: true };
+  }
+
   private async cancel(peer: TransferPeer, frame: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> {
     if (!this.bound(frame) || !exactlyKeys(frame, ["protocol", "type", "transfer_id", "epoch", "fence", "plan_sha256"])) return { ok: false, error: "binding_mismatch" };
+    const before = this.snapshot();
     this.metadata.state = "cancelled";
     this.inFlight = null;
-    await this.persist(this.snapshot());
+    try {
+      await this.persist(this.snapshot());
+    } catch {
+      // Cancellation is authoritative only after persistence. Do not tell a
+      // peer it is cancelled while a revived room could still accept chunks.
+      this.metadata = before;
+      this.broken = true;
+      this.peers.clear();
+      return { ok: false, error: "persist_failed" };
+    }
     const other = peer.role === "source" ? "destination" : "source";
     this.peers.get(other)?.send(JSON.stringify({ protocol: TRANSFER_PROTOCOL, type: "cancel", transfer_id: this.metadata.transfer_id, epoch: this.metadata.epoch, fence: this.metadata.fence, plan_sha256: this.metadata.plan_sha256 }));
     return { ok: true };
@@ -323,7 +384,32 @@ type TransferStorage = {
   setAlarm(time: number): Promise<void>;
 };
 type TransferRoomEnv = { SESSION_SECRET?: string };
-type TransferAttachment = { ticket: string; peer_id: string };
+/** Hibernation attachment: bounded binding facts only, never a ticket bearer. */
+export type TransferAttachment = {
+  v: 1;
+  peer_id: string;
+  role: TransferRole;
+  device_id: string;
+  transfer_id: string;
+  epoch: number;
+  fence: number;
+  plan_sha256: string;
+  transfer_expires_at: number;
+};
+
+/** Validate the bounded, non-bearer state restored from a hibernated socket. */
+export function validateTransferAttachment(raw: unknown, metadata: TransferMetadata | null, now = Date.now()): TransferAttachment | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const a = raw as Record<string, unknown>;
+  if (Object.keys(a).some((key) => !["v", "peer_id", "role", "device_id", "transfer_id", "epoch", "fence", "plan_sha256", "transfer_expires_at"].includes(key))
+    || a.v !== 1 || !id(a.peer_id) || (a.role !== "source" && a.role !== "destination") || !id(a.device_id)
+    || !id(a.transfer_id) || !Number.isSafeInteger(a.epoch) || Number(a.epoch) < 1
+    || !Number.isSafeInteger(a.fence) || Number(a.fence) < 1 || !hash(a.plan_sha256)
+    || !Number.isSafeInteger(a.transfer_expires_at) || Number(a.transfer_expires_at) <= now) return null;
+  if (!metadata || a.transfer_id !== metadata.transfer_id || a.epoch !== metadata.epoch || a.fence !== metadata.fence || a.plan_sha256 !== metadata.plan_sha256 || a.transfer_expires_at !== metadata.transfer_expires_at) return null;
+  const expectedDevice = a.role === "source" ? metadata.source_device_id : metadata.destination_device_id;
+  return a.device_id === expectedDevice ? a as TransferAttachment : null;
+}
 
 /** Actual hibernatable Durable Object. It has no HTTP data plane except a
  * signed ticket-bound WebSocket upgrade; all frame bodies remain in sockets. */
@@ -346,7 +432,32 @@ export class TransferRoom {
     this.metadata = (await this.storage().get<TransferMetadata>(STORAGE_METADATA)) || null;
     const entries = (await this.storage().get<Array<[string, number]>>(STORAGE_TICKETS)) || [];
     for (const [jti, exp] of entries) if (id(jti) && Number.isFinite(exp) && exp > Date.now()) this.consumed.set(jti, exp);
-    if (this.metadata) this.router = new TransferRoomRouter(this.metadata, async (metadata) => this.persistMetadata(metadata));
+    if (this.metadata) {
+      this.router = new TransferRoomRouter(this.metadata, async (metadata) => this.persistMetadata(metadata));
+      // Hibernation resets the peer map, not the live Cloudflare WebSockets.
+      // Reconstruct every peer from our non-bearer attachment before the first
+      // message so either role can route immediately after wake.
+      for (const socket of this.state.getWebSockets()) {
+        const attachment = this.attachment(socket);
+        if (!attachment || this.router.attach(this.peer(socket, attachment)) === "reject") {
+          try { socket.close(1008, "invalid transfer attachment"); } catch { /* closed */ }
+        }
+      }
+    }
+  }
+
+  private attachment(socket: WebSocket): TransferAttachment | null {
+    return validateTransferAttachment(socket.deserializeAttachment(), this.metadata);
+  }
+
+  private peer(socket: WebSocket, attachment: TransferAttachment): TransferPeer {
+    return { id: attachment.peer_id, role: attachment.role, device_id: attachment.device_id, send: (raw) => socket.send(raw) };
+  }
+
+  private closePeers(reason: string): void {
+    for (const socket of this.state.getWebSockets()) {
+      try { socket.close(1011, reason); } catch { /* already closed */ }
+    }
   }
   private async persistMetadata(metadata: TransferMetadata): Promise<void> {
     // This object intentionally contains no chunk bytes, ciphertext, plaintext,
@@ -357,58 +468,85 @@ export class TransferRoom {
   private async consume(claims: TransferTicketClaims): Promise<boolean> {
     for (const [jti, exp] of this.consumed) if (exp <= Date.now()) this.consumed.delete(jti);
     if (this.consumed.has(claims.jti) || this.consumed.size >= MAX_TICKET_REPLAYS) return false;
-    this.consumed.set(claims.jti, claims.exp);
+    this.consumed.set(claims.jti, claims.ticket_exp);
     await this.storage().put(STORAGE_TICKETS, [...this.consumed]);
     return true;
   }
   private metadataFor(claims: TransferTicketClaims): TransferMetadata {
-    return { version: 1, transfer_id: claims.transfer_id, tenant_id: claims.tenant_id, source_device_id: claims.source_device_id, destination_device_id: claims.destination_device_id, source_workspace_id: claims.source_workspace_id, destination_workspace_id: claims.destination_workspace_id, plan_sha256: claims.plan_sha256, expires_at: claims.exp, max_bytes: claims.max_bytes, epoch: claims.epoch, fence: claims.fence, state: "prepared", contiguous_ack_sequence: null, contiguous_ack_offset: 0 };
+    return { version: 1, transfer_id: claims.transfer_id, tenant_id: claims.tenant_id, source_device_id: claims.source_device_id, destination_device_id: claims.destination_device_id, source_workspace_id: claims.source_workspace_id, destination_workspace_id: claims.destination_workspace_id, plan_sha256: claims.plan_sha256, transfer_expires_at: claims.transfer_expires_at, max_bytes: claims.max_bytes, epoch: claims.epoch, fence: claims.fence, state: "prepared", contiguous_ack_sequence: null, contiguous_ack_offset: 0 };
   }
   private sameMetadata(metadata: TransferMetadata, claims: TransferTicketClaims): boolean {
-    return metadata.transfer_id === claims.transfer_id && metadata.tenant_id === claims.tenant_id && metadata.source_device_id === claims.source_device_id && metadata.destination_device_id === claims.destination_device_id && metadata.source_workspace_id === claims.source_workspace_id && metadata.destination_workspace_id === claims.destination_workspace_id && metadata.plan_sha256 === claims.plan_sha256 && metadata.epoch === claims.epoch && metadata.fence === claims.fence && metadata.max_bytes === claims.max_bytes && metadata.expires_at === claims.exp;
+    return metadata.transfer_id === claims.transfer_id && metadata.tenant_id === claims.tenant_id && metadata.source_device_id === claims.source_device_id && metadata.destination_device_id === claims.destination_device_id && metadata.source_workspace_id === claims.source_workspace_id && metadata.destination_workspace_id === claims.destination_workspace_id && metadata.plan_sha256 === claims.plan_sha256 && metadata.epoch === claims.epoch && metadata.fence === claims.fence && metadata.max_bytes === claims.max_bytes && metadata.transfer_expires_at === claims.transfer_expires_at;
+  }
+  /** A reconnect mints a new one-minute ticket pair under exactly the next
+   * epoch/fence. The cursor and immutable plan identity cannot change. */
+  private canAdvanceMetadata(metadata: TransferMetadata, claims: TransferTicketClaims): boolean {
+    return metadata.transfer_id === claims.transfer_id && metadata.tenant_id === claims.tenant_id
+      && metadata.source_device_id === claims.source_device_id && metadata.destination_device_id === claims.destination_device_id
+      && metadata.source_workspace_id === claims.source_workspace_id && metadata.destination_workspace_id === claims.destination_workspace_id
+      && metadata.plan_sha256 === claims.plan_sha256 && metadata.max_bytes === claims.max_bytes
+      && metadata.transfer_expires_at === claims.transfer_expires_at
+      && claims.epoch === metadata.epoch + 1 && claims.fence === metadata.fence + 1;
   }
   async fetch(request: Request): Promise<Response> {
     await this.ready;
     if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected websocket", { status: 426 });
     const ticket = await verifyTransferTicket(this.env.SESSION_SECRET, request.headers.get("x-ownmesh-transfer-ticket"));
-    if (!ticket || ticket.exp <= Date.now()) return new Response("invalid ticket", { status: 401 });
+    if (!ticket || ticket.ticket_exp <= Date.now()) return new Response("invalid ticket", { status: 401 });
     const expectedDevice = ticket.role === "source" ? ticket.source_device_id : ticket.destination_device_id;
     if (ticket.device_id !== expectedDevice) return new Response("ticket device mismatch", { status: 403 });
-    if (this.metadata && !this.sameMetadata(this.metadata, ticket)) return new Response("transfer binding mismatch", { status: 403 });
-    if (this.metadata?.state === "cancelled" || this.metadata?.expires_at && this.metadata.expires_at <= Date.now()) return new Response("transfer expired", { status: 410 });
-    // A same-role takeover is rejected before consuming the ticket. Agents must
-    // reconnect only after the old socket has closed, never replace a live peer.
+    if (this.metadata && !this.sameMetadata(this.metadata, ticket)) {
+      if (!this.canAdvanceMetadata(this.metadata, ticket)) return new Response("transfer binding mismatch", { status: 403 });
+      const advanced: TransferMetadata = { ...this.metadata, epoch: ticket.epoch, fence: ticket.fence };
+      try { await this.persistMetadata(advanced); }
+      catch { return new Response("storage unavailable", { status: 503 }); }
+      this.router = new TransferRoomRouter(advanced, async (metadata) => this.persistMetadata(metadata));
+      // All previously attached peers carry the retired epoch in their
+      // attachment and must not race the new session.
+      for (const socket of this.state.getWebSockets()) {
+        try { socket.close(1008, "transfer epoch advanced"); } catch { /* closed */ }
+      }
+    }
+    if (this.metadata?.state === "cancelled" || this.metadata?.state === "completed" || this.metadata?.transfer_expires_at && this.metadata.transfer_expires_at <= Date.now()) return new Response("transfer expired", { status: 410 });
+    // A same-role takeover is rejected before consuming the ticket. Attachments
+    // are non-bearer and exact-bound, so they remain safe to inspect after wake.
     for (const socket of this.state.getWebSockets()) {
-      const attachment = socket.deserializeAttachment() as TransferAttachment | null;
-      const existing = attachment && await verifyTransferTicket(this.env.SESSION_SECRET, attachment.ticket);
-      if (existing?.role === ticket.role) return new Response("role already connected", { status: 409 });
+      const attachment = this.attachment(socket);
+      if (attachment?.role === ticket.role) return new Response("role already connected", { status: 409 });
     }
     try { if (!(await this.consume(ticket))) return new Response("ticket replay", { status: 409 }); }
     catch { return new Response("storage unavailable", { status: 503 }); }
     if (!this.metadata) {
       const metadata = this.metadataFor(ticket);
-      try { await this.persistMetadata(metadata); await this.storage().setAlarm(metadata.expires_at); }
+      try { await this.persistMetadata(metadata); await this.storage().setAlarm(metadata.transfer_expires_at); }
       catch { return new Response("storage unavailable", { status: 503 }); }
       this.router = new TransferRoomRouter(metadata, async (m) => this.persistMetadata(m));
     }
     const pair = new WebSocketPair(); const client = pair[0]; const server = pair[1];
     const peerId = crypto.randomUUID(); const peer: TransferPeer = { id: peerId, role: ticket.role, device_id: ticket.device_id, send: (raw) => server.send(raw) };
-    if (!this.router?.attach(peer)) return new Response("peer rejected", { status: 403 });
-    server.serializeAttachment({ ticket: request.headers.get("x-ownmesh-transfer-ticket")!, peer_id: peerId } satisfies TransferAttachment);
+    if (this.router?.attach(peer) === "reject") return new Response("peer rejected", { status: 403 });
+    server.serializeAttachment({ v: 1, peer_id: peerId, role: ticket.role, device_id: ticket.device_id, transfer_id: ticket.transfer_id, epoch: ticket.epoch, fence: ticket.fence, plan_sha256: ticket.plan_sha256, transfer_expires_at: ticket.transfer_expires_at } satisfies TransferAttachment);
     this.state.acceptWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
   }
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     await this.ready;
-    const attachment = socket.deserializeAttachment() as TransferAttachment | null;
-    const ticket = attachment && await verifyTransferTicket(this.env.SESSION_SECRET, attachment.ticket);
-    if (!attachment || !ticket || ticket.exp <= Date.now() || typeof message !== "string" || !this.router) { socket.close(1008, "invalid transfer session"); return; }
-    const peer: TransferPeer = { id: attachment.peer_id, role: ticket.role, device_id: ticket.device_id, send: (raw) => socket.send(raw) };
-    // Reattach hibernated socket only if no active same-role peer exists.
-    this.router.attach(peer);
+    const attachment = this.attachment(socket);
+    if (!attachment || typeof message !== "string" || !this.router) { socket.close(1008, "invalid transfer session"); return; }
+    const peer = this.peer(socket, attachment);
+    if (this.router.attach(peer) === "reject") { socket.close(1008, "transfer peer unavailable"); return; }
     const result = await this.router.handle(peer, message);
-    if (!result.ok) socket.send(JSON.stringify({ protocol: TRANSFER_PROTOCOL, type: "error", code: result.error || "rejected" }));
+    if (!result.ok) {
+      if (result.error === "persist_failed" || this.router.isBroken) { this.closePeers("transfer persistence failed"); return; }
+      socket.send(JSON.stringify({ protocol: TRANSFER_PROTOCOL, type: "error", code: result.error || "rejected" }));
+    }
   }
-  webSocketClose(socket: WebSocket): void { const a = socket.deserializeAttachment() as TransferAttachment | null; const t = a && this.env.SESSION_SECRET ? null : null; void t; if (a && this.router) { /* role recovered on next message; never persist frame */ this.router.detach("source", a.peer_id); this.router.detach("destination", a.peer_id); } }
-  async alarm(): Promise<void> { await this.ready; if (!this.metadata || this.metadata.expires_at > Date.now()) return; this.metadata.state = "expired"; try { await this.persistMetadata(this.metadata); await this.storage().delete(STORAGE_TICKETS); } finally { for (const ws of this.state.getWebSockets()) ws.close(1008, "transfer expired"); } }
+  webSocketClose(socket: WebSocket): void { const attachment = this.attachment(socket); if (attachment && this.router) this.router.detach(attachment.role, attachment.peer_id); }
+  webSocketError(socket: WebSocket): void {
+    // An error can remove a hibernatable WebSocket without a close callback.
+    // Only an exact valid attachment may detach its own role/peer identity.
+    const attachment = this.attachment(socket);
+    if (attachment && this.router) this.router.detach(attachment.role, attachment.peer_id);
+  }
+  async alarm(): Promise<void> { await this.ready; if (!this.metadata || this.metadata.transfer_expires_at > Date.now()) return; this.metadata.state = "expired"; try { await this.persistMetadata(this.metadata); await this.storage().delete(STORAGE_TICKETS); } finally { for (const ws of this.state.getWebSockets()) ws.close(1008, "transfer expired"); } }
 }

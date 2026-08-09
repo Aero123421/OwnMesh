@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { finalTransferPlanHash, handleMcp, MCP_TOOLS, OperationTracker, type OperationRouter, type TransferPlanMeta } from "./mcp.ts";
+import { buildTicketlessTransferStartOutbox, finalTransferPlanHash, handleMcp, MCP_TOOLS, OperationTracker, type OperationRouter, type TransferPlanMeta } from "./mcp.ts";
 import { MemoryStore } from "./store.ts";
 
 function request(token: string, name: string, args: Record<string, unknown>): Request {
@@ -64,7 +64,36 @@ test("final transfer-plan digest is the Rust length-prefixed golden vector", asy
     source_workspace_id: "ws_s", destination_workspace_id: "ws_d",
     source_path: "in/a.bin", destination_path: "out/a.bin",
     source_workspace_version: 1, destination_workspace_version: 1,
-    epoch: 1, fence: 1, expires_at: new Date(1_700_000_000_000).toISOString(), state: "ready",
+    epoch: 1, fence: 1, ttl_seconds: 3600, expires_at: new Date(1_700_000_000_000).toISOString(), state: "ready",
   };
   assert.equal(await finalTransferPlanHash(meta, "a".repeat(64), "b".repeat(64), 7), "5b337e7db7ac9f39f8c32dc2a9612893fd469a6222e10cd89cff9a2fd56d5fa8");
+});
+
+test("final transfer-plan digest uses UTF-8 byte lengths for Japanese and emoji paths", async () => {
+  // Independently generated from the Rust canonical byte stream. UTF-16 code
+  // unit lengths would produce a different digest for every non-ASCII field.
+  const meta: TransferPlanMeta = {
+    transfer_id: "op_転送😀", tenant_id: "ten_東京", principal_id: "prin_😀",
+    source_device_id: "dev_源", destination_device_id: "dev_先",
+    source_workspace_id: "ws_入力", destination_workspace_id: "ws_出力",
+    source_path: "入力/😀.bin", destination_path: "出力/📦.bin",
+    source_workspace_version: 1, destination_workspace_version: 1,
+    epoch: 1, fence: 1, ttl_seconds: 3600, expires_at: new Date(1_700_000_000_000).toISOString(), state: "ready",
+  };
+  assert.equal(await finalTransferPlanHash(meta, "a".repeat(64), "b".repeat(64), 7), "0756a7508b6e927c63b8e58542d64c2a5b8e25821c69d00c926d154f575de23c");
+});
+
+test("durable transfer-start outbox recursively excludes bearer, JTI, and ephemeral fields", () => {
+  const stored = buildTicketlessTransferStartOutbox({
+    type: "operation.request", correlation_id: "op_start", payload: {
+      arguments: { transfer_id: "xfer", ticket: "bearer.secret", jti: "jti_secret", source_ephemeral_public_key: "11".repeat(32), destination_ephemeral_signature: "22".repeat(64) },
+    },
+  });
+  const forbidden = (value: unknown): boolean => {
+    if (!value || typeof value !== "object") return false;
+    return Object.entries(value as Record<string, unknown>).some(([key, child]) => /ticket|jti|ephemeral/i.test(key) || forbidden(child));
+  };
+  assert.equal(forbidden(stored), false);
+  assert.equal(JSON.stringify(stored).includes("bearer.secret"), false);
+  assert.equal(stored.non_redeliverable, true);
 });
