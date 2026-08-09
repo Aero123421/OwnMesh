@@ -17,6 +17,19 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 if (-not (Test-Path -LiteralPath $Broker -PathType Leaf)) {
     throw "Broker binary not found: $Broker"
 }
+
+# Repair only the known failed non-admin test residue. Never remove a real
+# custody configuration or any caller-supplied path.
+$leakedBrokerDir = Join-Path $env:ProgramData 'OwnMesh\broker'
+$leakedConfig = Join-Path $leakedBrokerDir 'broker-service.json'
+if ((Test-Path -LiteralPath $leakedBrokerDir -PathType Container) -and -not (Test-Path -LiteralPath $leakedConfig -PathType Leaf)) {
+    $resolvedLeak = [IO.Path]::GetFullPath($leakedBrokerDir)
+    $expectedLeak = [IO.Path]::GetFullPath((Join-Path $env:ProgramData 'OwnMesh\broker'))
+    if ($resolvedLeak -ne $expectedLeak) { throw 'refusing unexpected broker cleanup target' }
+    if ($PSCmdlet.ShouldProcess($resolvedLeak, 'remove exact leaked non-admin E8 custody directory')) {
+        Remove-Item -LiteralPath $resolvedLeak -Recurse -Force
+    }
+}
 if ((sc.exe query OwnMeshDaemon) -notmatch 'RUNNING') {
     throw 'OwnMeshDaemon must already be installed and RUNNING; this broker-only receipt never installs ownmeshd.'
 }

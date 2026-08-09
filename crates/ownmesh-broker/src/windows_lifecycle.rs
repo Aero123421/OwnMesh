@@ -21,15 +21,20 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SERVICE_EXISTS};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetLengthSid, GetSecurityDescriptorControl, GetSidSubAuthority, GetSidSubAuthorityCount,
-    GetTokenInformation, TokenIntegrityLevel, TokenUser, DACL_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
+    TokenIntegrityLevel, TokenUser, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
@@ -40,7 +45,10 @@ use windows_sys::Win32::System::Services::{
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
     SERVICE_STOP, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
-use windows_sys::Win32::System::Threading::OpenProcessToken;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
+};
 
 const BROKER_SERVICE: &str = "OwnMeshPrivilegedBroker";
 const DAEMON_SERVICE: &str = "OwnMeshDaemon";
@@ -72,23 +80,91 @@ fn wide(value: &OsStr) -> Vec<u16> {
 }
 
 fn data_root() -> Result<PathBuf, String> {
-    std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .map(|root| root.join("OwnMesh").join("broker"))
-        .ok_or_else(|| "ProgramData is unavailable; Windows broker paths must be fixed".into())
+    Ok(known_folder(&FOLDERID_ProgramData)?
+        .join("OwnMesh")
+        .join("broker"))
 }
 
 fn binary_path() -> Result<PathBuf, String> {
-    std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .map(|root| root.join("OwnMesh").join("ownmesh-broker.exe"))
-        .ok_or_else(|| {
-            "ProgramFiles is unavailable; Windows broker binary path must be fixed".into()
-        })
+    Ok(known_folder(&FOLDERID_ProgramFiles)?
+        .join("OwnMesh")
+        .join("ownmesh-broker.exe"))
+}
+
+fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf, String> {
+    let mut raw = ptr::null_mut();
+    let status = unsafe { SHGetKnownFolderPath(id, 0, ptr::null_mut(), &mut raw) };
+    if status < 0 || raw.is_null() {
+        return Err("resolve fixed Windows Known Folder path".into());
+    }
+    let len = unsafe {
+        let mut value = 0usize;
+        while *raw.add(value) != 0 {
+            value += 1;
+        }
+        value
+    };
+    let path = PathBuf::from(String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(raw, len)
+    }));
+    unsafe {
+        CoTaskMemFree(raw.cast());
+    }
+    if !path.is_absolute() {
+        return Err("Windows Known Folder path is not absolute".into());
+    }
+    Ok(path)
 }
 
 fn config_path() -> Result<PathBuf, String> {
     Ok(data_root()?.join(CONFIG_NAME))
+}
+
+/// The install transaction must prove elevation before it even resolves a
+/// fixed filesystem path.  SCM create access is checked in addition to the
+/// token bit because UAC split tokens and service ACL policy can disagree.
+fn require_elevated_scm_admin() -> Result<(), String> {
+    let mut token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+        || token.is_null()
+    {
+        return Err("Windows broker install requires an elevated Administrator token".into());
+    }
+    let result = (|| {
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned = 0_u32;
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap_or(u32::MAX),
+                &mut returned,
+            )
+        } == 0
+            || elevation.TokenIsElevated == 0
+        {
+            return Err("Windows broker install requires an elevated Administrator token".into());
+        }
+        let manager = unsafe {
+            OpenSCManagerW(
+                ptr::null(),
+                ptr::null(),
+                SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE,
+            )
+        };
+        if manager.is_null() {
+            return Err("Windows broker install requires SCM create-service access".into());
+        }
+        unsafe {
+            let _ = CloseServiceHandle(manager);
+        }
+        Ok(())
+    })();
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    result
 }
 
 fn command_line(binary: &Path, config: &Path) -> String {
@@ -101,9 +177,9 @@ fn command_line(binary: &Path, config: &Path) -> String {
 
 fn system_admin_sddl(directory: bool) -> String {
     if directory {
-        "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".into()
+        "O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".into()
     } else {
-        "D:P(A;;FA;;;SY)(A;;FA;;;BA)".into()
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".into()
     }
 }
 
@@ -130,6 +206,8 @@ fn apply_system_admin_custody(path: &Path, directory: bool) -> Result<(), String
         let mut present = 0;
         let mut defaulted = 0;
         let mut dacl = ptr::null_mut();
+        let mut owner: PSID = ptr::null_mut();
+        let mut owner_defaulted = 0;
         if unsafe {
             windows_sys::Win32::Security::GetSecurityDescriptorDacl(
                 descriptor,
@@ -143,13 +221,20 @@ fn apply_system_admin_custody(path: &Path, directory: bool) -> Result<(), String
         {
             return Err("SYSTEM/Admin DACL is malformed".into());
         }
+        if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) } == 0
+            || owner.is_null()
+        {
+            return Err("SYSTEM/Admin owner is malformed".into());
+        }
         let name = wide(path.as_os_str());
         let status = unsafe {
             SetNamedSecurityInfoW(
                 name.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner,
                 ptr::null_mut(),
                 dacl,
                 ptr::null_mut(),
@@ -171,13 +256,35 @@ fn apply_system_admin_custody(path: &Path, directory: bool) -> Result<(), String
 }
 
 fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
+    fn sid(value: &str) -> Result<PSID, String> {
+        let value = wide(OsStr::new(value));
+        let mut parsed = ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut parsed) } == 0 || parsed.is_null() {
+            return Err("parse expected Windows custody SID".into());
+        }
+        Ok(parsed)
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink()
+        || (!metadata.file_type().is_dir() && !metadata.file_type().is_file())
+    {
+        return Err(format!(
+            "{} is reparse/non-regular custody object",
+            path.display()
+        ));
+    }
+    let expected_flags = if metadata.file_type().is_dir() {
+        0x03
+    } else {
+        0
+    };
     let name = wide(path.as_os_str());
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     let status = unsafe {
         GetNamedSecurityInfoW(
             name.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),
@@ -192,24 +299,78 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
             std::io::Error::from_raw_os_error(status as i32)
         ));
     }
-    let mut control = 0_u16;
-    let mut revision = 0_u32;
-    let protected =
-        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0
-            && control & SE_DACL_PROTECTED != 0;
+    let system = sid("S-1-5-18")?;
+    let admins = sid("S-1-5-32-544")?;
+    let result = (|| {
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err("custody DACL is not protected".into());
+        }
+        let mut owner: PSID = ptr::null_mut();
+        let mut owner_defaulted = 0;
+        if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) } == 0
+            || owner.is_null()
+            || unsafe { EqualSid(owner, admins) } == 0
+        {
+            return Err("custody owner is not BUILTIN\\Administrators (fail-closed)".into());
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return Err("custody DACL is absent".into());
+        }
+        let mut info = unsafe { std::mem::zeroed::<ACL_SIZE_INFORMATION>() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
+                AclSizeInformation,
+            )
+        } == 0
+            || info.AceCount != 2
+        {
+            return Err("custody DACL has unexpected ACE count".into());
+        }
+        for (index, expected) in [system, admins].into_iter().enumerate() {
+            let mut ace = ptr::null_mut();
+            if unsafe { GetAce(dacl, u32::try_from(index).unwrap_or(u32::MAX), &mut ace) } == 0
+                || ace.is_null()
+            {
+                return Err("custody DACL ACE retrieval failed".into());
+            }
+            let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let ace_sid: PSID = (&raw const ace.SidStart).cast_mut().cast();
+            if ace.Header.AceType != 0
+                || ace.Header.AceFlags != expected_flags
+                || u32::from(ace.Header.AceFlags) & INHERITED_ACE != 0
+                || ace.Mask != 0x001f_01ff
+                || unsafe { EqualSid(ace_sid, expected) } == 0
+            {
+                return Err("custody DACL differs from exact SYSTEM/Admin policy".into());
+            }
+        }
+        Ok(())
+    })();
     unsafe {
+        let _ = LocalFree(system.cast());
+        let _ = LocalFree(admins.cast());
         let _ = LocalFree(descriptor);
     }
-    if !protected {
-        return Err(format!(
-            "{} lacks a protected SYSTEM/Admin DACL (fail-closed)",
-            path.display()
-        ));
-    }
-    Ok(())
+    result.map_err(|error: String| format!("{}: {error}", path.display()))
 }
 
-fn ensure_custody_dir(path: &Path) -> Result<(), String> {
+/// Return `true` only when this call created the exact directory. Existing
+/// objects are verified but never re-ACL'd or otherwise adopted.
+fn ensure_custody_dir(path: &Path) -> Result<bool, String> {
     if let Ok(metadata) = std::fs::symlink_metadata(path) {
         if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
             return Err(format!(
@@ -217,10 +378,64 @@ fn ensure_custody_dir(path: &Path) -> Result<(), String> {
                 path.display()
             ));
         }
+        verify_system_admin_custody(path)?;
+        return Ok(false);
     } else {
-        std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        std::fs::create_dir(path).map_err(|e| format!("create {}: {e}", path.display()))?;
     }
-    apply_system_admin_custody(path, true)
+    if let Err(error) = apply_system_admin_custody(path, true) {
+        let _ = std::fs::remove_dir(path);
+        return Err(error);
+    }
+    Ok(true)
+}
+
+fn ensure_custody_chain(path: &Path, trusted_base: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current
+                    .parent()
+                    .ok_or("Windows custody directory has no parent")?;
+            }
+            Err(error) => return Err(format!("inspect {}: {error}", current.display())),
+        }
+    }
+    let metadata = std::fs::symlink_metadata(current).map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{} is not a regular non-reparse directory",
+            current.display()
+        ));
+    }
+    if current != trusted_base {
+        verify_system_admin_custody(current)?;
+    }
+    missing.reverse();
+    let mut created = Vec::new();
+    for directory in missing {
+        match ensure_custody_dir(&directory) {
+            Ok(true) => created.push(directory),
+            Ok(false) => {
+                return Err("Windows custody path changed during creation (fail-closed)".into())
+            }
+            Err(error) => {
+                rollback_created_dirs(&created);
+                return Err(error);
+            }
+        }
+    }
+    Ok(created)
+}
+
+fn rollback_created_dirs(created: &[PathBuf]) {
+    for directory in created.iter().rev() {
+        let _ = std::fs::remove_dir(directory);
+    }
 }
 
 fn write_custodied_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -431,7 +646,7 @@ fn daemon_trust_record() -> Result<crate::WindowsDaemonTrustRecord, String> {
     })
 }
 
-fn create_or_validate_service(binary: &Path, config: &Path) -> Result<(), String> {
+fn create_or_validate_service(binary: &Path, config: &Path) -> Result<bool, String> {
     let manager = unsafe {
         OpenSCManagerW(
             ptr::null(),
@@ -507,7 +722,7 @@ fn create_or_validate_service(binary: &Path, config: &Path) -> Result<(), String
     unsafe {
         let _ = CloseServiceHandle(manager);
     }
-    Ok(())
+    Ok(!service.is_null())
 }
 
 fn query_service_command(
@@ -607,71 +822,120 @@ fn wait_service_state(
     }
 }
 
+fn with_windows_install_preflight<T>(
+    preflight: impl FnOnce() -> Result<(), String>,
+    install: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    preflight()?;
+    install()
+}
+
 pub fn install_windows_broker(_base: &Path) -> Result<InstallRecord, String> {
-    let root = data_root()?;
+    // This is intentionally the first operation: a non-admin invocation must
+    // not create a ProgramData/ProgramFiles directory or alter any DACL.
+    with_windows_install_preflight(
+        require_elevated_scm_admin,
+        install_windows_broker_after_preflight,
+    )
+}
+
+fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
+    let program_data = known_folder(&FOLDERID_ProgramData)?;
+    let program_files = known_folder(&FOLDERID_ProgramFiles)?;
+    let root = program_data.join("OwnMesh").join("broker");
     let config_path = config_path()?;
     let trust_path = root.join(TRUST_NAME);
     let staging = root.join(STAGING_NAME);
-    ensure_custody_dir(&root)?;
-    ensure_custody_dir(&staging)?;
-    let destination = binary_path()?;
+    let destination = program_files.join("OwnMesh").join("ownmesh-broker.exe");
     let binary_parent = destination
         .parent()
         .ok_or("Windows broker binary lacks parent")?;
-    ensure_custody_dir(binary_parent)?;
-    let source = std::env::current_exe().map_err(|e| e.to_string())?;
-    if destination.exists() {
-        if hash_file(&destination)? != hash_file(&source)? {
-            return Err(
-                "fixed broker binary differs from invoking binary; refusing overwrite".into(),
-            );
+    let mut created_dirs = ensure_custody_chain(&root, &program_data)?;
+    let mut created_files = Vec::<PathBuf>::new();
+    let mut created_service = false;
+    let outcome = (|| {
+        if ensure_custody_dir(&staging)? {
+            created_dirs.push(staging.clone());
         }
-    } else {
-        std::fs::copy(&source, &destination)
-            .map_err(|e| format!("copy broker into SYSTEM/Admin custody: {e}"))?;
-        apply_system_admin_custody(&destination, false)?;
-    }
-    let trust = daemon_trust_record()?;
-    if trust_path.exists() {
-        verify_system_admin_custody(&trust_path)?;
-        let existing = load_windows_daemon_trust_record(&trust_path)?;
-        if existing.record() != &trust {
-            return Err("existing daemon trust record mismatches live SCM daemon identity; refusing adoption".into());
+        created_dirs.extend(ensure_custody_chain(binary_parent, &program_files)?);
+        let source = std::env::current_exe().map_err(|e| e.to_string())?;
+        let created_binary = if destination.exists() {
+            if hash_file(&destination)? != hash_file(&source)? {
+                return Err(
+                    "fixed broker binary differs from invoking binary; refusing overwrite".into(),
+                );
+            }
+            false
+        } else {
+            std::fs::copy(&source, &destination)
+                .map_err(|e| format!("copy broker into SYSTEM/Admin custody: {e}"))?;
+            if let Err(error) = apply_system_admin_custody(&destination, false) {
+                let _ = std::fs::remove_file(&destination);
+                return Err(error);
+            }
+            created_files.push(destination.clone());
+            true
+        };
+        let trust = daemon_trust_record()?;
+        let created_trust = if trust_path.exists() {
+            verify_system_admin_custody(&trust_path)?;
+            if load_windows_daemon_trust_record(&trust_path)?.record() != &trust {
+                return Err("existing daemon trust record mismatches live SCM daemon identity; refusing adoption".into());
+            }
+            false
+        } else {
+            write_custodied_new(
+                &trust_path,
+                &serde_json::to_vec_pretty(&trust).map_err(|e| e.to_string())?,
+            )?;
+            created_files.push(trust_path.clone());
+            true
+        };
+        let cfg = WindowsBrokerConfig {
+            schema_version: 1,
+            broker_service_name: BROKER_SERVICE.into(),
+            daemon_service_name: DAEMON_SERVICE.into(),
+            broker_binary: destination.clone(),
+            trust_record: trust_path.clone(),
+            request_secret: root.join(SECRET_NAME),
+            signing_key: root.join(SIGNING_NAME),
+            replay_ledger: root.join(LEDGER_NAME),
+            staging_dir: staging.clone(),
+        };
+        let created_config = if config_path.exists() {
+            verify_system_admin_custody(&config_path)?;
+            let existing: WindowsBrokerConfig =
+                serde_json::from_slice(&std::fs::read(&config_path).map_err(|e| e.to_string())?)
+                    .map_err(|e| format!("parse existing Windows broker config: {e}"))?;
+            if existing != cfg {
+                return Err("existing Windows broker config mismatch; refusing overwrite".into());
+            }
+            false
+        } else {
+            write_custodied_new(
+                &config_path,
+                &serde_json::to_vec_pretty(&cfg).map_err(|e| e.to_string())?,
+            )?;
+            created_files.push(config_path.clone());
+            true
+        };
+        created_service = create_or_validate_service(&destination, &config_path)?;
+        if let Err(error) = start_and_wait() {
+            let _ = (created_config, created_trust, created_binary);
+            return Err(error);
         }
-    } else {
-        write_custodied_new(
-            &trust_path,
-            &serde_json::to_vec_pretty(&trust).map_err(|e| e.to_string())?,
-        )?;
-    }
-    let cfg = WindowsBrokerConfig {
-        schema_version: 1,
-        broker_service_name: BROKER_SERVICE.into(),
-        daemon_service_name: DAEMON_SERVICE.into(),
-        broker_binary: destination.clone(),
-        trust_record: trust_path.clone(),
-        request_secret: root.join(SECRET_NAME),
-        signing_key: root.join(SIGNING_NAME),
-        replay_ledger: root.join(LEDGER_NAME),
-        staging_dir: staging,
-    };
-    if config_path.exists() {
-        verify_system_admin_custody(&config_path)?;
-        let existing: WindowsBrokerConfig =
-            serde_json::from_slice(&std::fs::read(&config_path).map_err(|e| e.to_string())?)
-                .map_err(|e| format!("parse existing Windows broker config: {e}"))?;
-        if existing != cfg {
-            return Err("existing Windows broker config mismatch; refusing overwrite".into());
+        Ok(InstallRecord { installed: true, installed_at_unix: crate::now_unix(), endpoint: ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME.into(), endpoint_kind: "named_pipe".into(), unit_path: Some(BROKER_SERVICE.into()), secret_file: cfg.request_secret.display().to_string(), signing_key_file: cfg.signing_key.display().to_string(), verify_key_file: String::new(), trusted_executable: trust.image_path.display().to_string(), socket_owner_uid: 0, socket_group_gid: 0, socket_mode: 0, allowed_uids: vec![], daemon_uid: 0, daemon_gid: 0, broker_binary: destination.display().to_string(), config_path: config_path.display().to_string(), broker_sha256: hash_file(&destination)?, trusted_executable_sha256: trust.image_sha256, config_sha256: hash_file(&config_path)?, unit_sha256: String::new(), notes: vec!["Windows SCM broker service is installed; support remains pending an opt-in elevated receipt".into()], support: "unsupported".into() })
+    })();
+    if outcome.is_err() {
+        if created_service {
+            let _ = uninstall_windows_broker(Path::new("."));
         }
-    } else {
-        write_custodied_new(
-            &config_path,
-            &serde_json::to_vec_pretty(&cfg).map_err(|e| e.to_string())?,
-        )?;
+        for file in created_files.iter().rev() {
+            let _ = std::fs::remove_file(file);
+        }
+        rollback_created_dirs(&created_dirs);
     }
-    create_or_validate_service(&destination, &config_path)?;
-    start_and_wait()?;
-    Ok(InstallRecord { installed: true, installed_at_unix: crate::now_unix(), endpoint: ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME.into(), endpoint_kind: "named_pipe".into(), unit_path: Some(BROKER_SERVICE.into()), secret_file: cfg.request_secret.display().to_string(), signing_key_file: cfg.signing_key.display().to_string(), verify_key_file: String::new(), trusted_executable: trust.image_path.display().to_string(), socket_owner_uid: 0, socket_group_gid: 0, socket_mode: 0, allowed_uids: vec![], daemon_uid: 0, daemon_gid: 0, broker_binary: destination.display().to_string(), config_path: config_path.display().to_string(), broker_sha256: hash_file(&destination)?, trusted_executable_sha256: trust.image_sha256, config_sha256: hash_file(&config_path)?, unit_sha256: String::new(), notes: vec!["Windows SCM broker service is installed; support remains pending an opt-in elevated receipt".into()], support: "unsupported".into() })
+    outcome
 }
 
 pub fn broker_status_windows(_base: &Path) -> Result<InstallStatus, String> {
@@ -858,4 +1122,46 @@ pub fn run_windows_service_dispatcher() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denied_preflight_leaves_programdata_and_programfiles_test_paths_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let program_data = temp
+            .path()
+            .join("ProgramData")
+            .join("OwnMesh")
+            .join("broker");
+        let program_files = temp.path().join("ProgramFiles").join("OwnMesh");
+        let result = with_windows_install_preflight(
+            || Err("requires elevation".into()),
+            || {
+                std::fs::create_dir_all(&program_data).unwrap();
+                std::fs::create_dir_all(&program_files).unwrap();
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !program_data.exists(),
+            "denied preflight created ProgramData path"
+        );
+        assert!(
+            !program_files.exists(),
+            "denied preflight created ProgramFiles path"
+        );
+    }
+
+    #[test]
+    fn environment_values_cannot_choose_fixed_windows_paths() {
+        // `data_root` / `binary_path` use SHGetKnownFolderPath, never these
+        // mutable process-environment aliases.
+        let source = include_str!("windows_lifecycle.rs");
+        assert!(!source.contains("var_os(\"ProgramData\")"));
+        assert!(!source.contains("var_os(\"ProgramFiles\")"));
+    }
 }
