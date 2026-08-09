@@ -33,7 +33,8 @@ use ownmesh_fs::{
 };
 use ownmesh_ipc::{
     app_error, canonicalize_principal_key, is_credentialed_client_principal, is_human_os_principal,
-    methods, ClientIdentity, IpcError, IpcResult, MethodHandler, RevokedClients,
+    methods, read_management_credential, ClientIdentity, Endpoint, IpcBus, IpcError, IpcResult,
+    MethodHandler, RevokedClients,
 };
 use ownmesh_logs::{
     register_builtin_providers, BuiltinProviderConfig, LogCursor, LogError, LogRegistry,
@@ -45,12 +46,18 @@ use ownmesh_policy::{
 };
 use ownmesh_profiles::{ProfileRegistry, ProfileStatus};
 use ownmesh_session::{PtyCommand, PtySize};
-use ownmesh_session::{SessionKind, SessionManager, StreamKind as SessionStreamKind};
-use ownmesh_session_host::{default_shell_command, LiveHost};
+use ownmesh_session::{
+    SessionKind, SessionManager, SidecarHostBinding, StreamKind as SessionStreamKind,
+};
+use ownmesh_session_host::{
+    default_shell_command, LiveHost, SupervisorBinding, SupervisorClient, SupervisorCommand,
+    SupervisorEnv, SupervisorSpawnRequest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -366,6 +373,9 @@ pub struct DaemonRuntime {
     /// Process-local live PTY hosts keyed by session id (not persisted).
     /// Metadata/leases survive restart; live hosts are re-created only on open.
     live_hosts: HashMap<String, LiveHost>,
+    /// Dedicated local-only proxy for remote/cloud PTY sessions. Local CLI
+    /// compatibility keeps the legacy embedded host path until fully migrated.
+    supervisor: Option<SupervisorClient>,
     broker_endpoint: Option<BrokerEndpoint>,
     broker_secret: Option<BrokerSecret>,
     /// Optional cancel signal for the currently executing remote command.
@@ -458,6 +468,7 @@ impl DaemonRuntime {
             sessions,
             sessions_path,
             live_hosts: HashMap::new(),
+            supervisor: None,
             broker_endpoint,
             broker_secret,
             active_cancel: None,
@@ -2458,7 +2469,7 @@ full_user_access/full_access for arbitrary commands",
             methods::DAEMON_LOCKDOWN => self.handle_lockdown(),
             methods::DAEMON_UNLOCK => self.handle_unlock(),
             methods::TOKEN_REVOKE => self.handle_token_revoke(params),
-            session_methods::OPEN => self.handle_session_open(params, client),
+            session_methods::OPEN => self.handle_session_open(params, client).await,
             session_methods::LIST => self.handle_session_list(params, client),
             session_methods::SHOW => self.handle_session_show(params, client),
             session_methods::ATTACH => self.handle_session_attach(params, client),
@@ -2469,10 +2480,10 @@ full_user_access/full_access for arbitrary commands",
             session_methods::GIVE => self.handle_session_give(params, client),
             session_methods::CLOSE => self.handle_session_close(params, client),
             session_methods::TERMINATE => self.handle_session_terminate(params, client),
-            session_methods::REPLAY => self.handle_session_replay(params, client),
+            session_methods::REPLAY => self.handle_session_replay(params, client).await,
             session_methods::PUSH_OUTPUT => self.handle_session_push_output(params, client),
-            session_methods::WRITE => self.handle_session_write(params, client),
-            session_methods::RESIZE => self.handle_session_resize(params, client),
+            session_methods::WRITE => self.handle_session_write(params, client).await,
+            session_methods::RESIZE => self.handle_session_resize(params, client).await,
             other => Err(IpcError::Remote {
                 code: app_error::METHOD_NOT_FOUND,
                 message: format!("method not found: {other}"),
@@ -2480,7 +2491,92 @@ full_user_access/full_access for arbitrary commands",
         }
     }
 
-    fn handle_session_open(
+    async fn ensure_remote_supervisor(&mut self) -> IpcResult<&SupervisorClient> {
+        if self.supervisor.is_none() {
+            let state_dir = self.paths.state_dir.join("session-supervisor");
+            let endpoint =
+                Endpoint::default_for(&self.paths.runtime_dir, IpcBus::SessionSupervisor);
+            // The sibling binary is pinned and revalidated; never resolve it
+            // through PATH where a same-user replacement could be selected.
+            let ownmeshd = std::env::current_exe().map_err(|err| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("resolve ownmeshd executable for sidecar: {err}"),
+            })?;
+            let host_name = if cfg!(windows) {
+                "ownmesh-session-host.exe"
+            } else {
+                "ownmesh-session-host"
+            };
+            let host = ownmeshd
+                .parent()
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: "ownmeshd executable has no parent directory".into(),
+                })?
+                .join(host_name);
+            let pin =
+                pin_executable(&host, CommandKind::Structured).map_err(|err| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("session-host executable custody failed: {err}"),
+                })?;
+            verify_executable_pin(&host, &pin).map_err(|err| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("session-host executable changed before launch: {err}"),
+            })?;
+            let mut command = Command::new(&host);
+            command
+                .arg("supervise")
+                .arg("--state-dir")
+                .arg(&state_dir)
+                .arg("--runtime-dir")
+                .arg(&self.paths.runtime_dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
+            // A second daemon may race this launch. The sidecar listener is the
+            // singleton authority; a duplicate immediately fails bind and is
+            // harmless. We never fall back to an embedded remote PTY.
+            let _ = command.spawn();
+            let credential_dir = state_dir.join("session-supervisor-credentials");
+            let mut last = "sidecar did not provision management credential".to_owned();
+            for _ in 0..40 {
+                if let Ok(management) = read_management_credential(&credential_dir) {
+                    match SupervisorClient::bootstrap(
+                        endpoint.clone(),
+                        self.paths.runtime_dir.clone(),
+                        management,
+                    )
+                    .await
+                    {
+                        Ok(client) => {
+                            self.supervisor = Some(client);
+                            break;
+                        }
+                        Err(err) => last = format!("sidecar credential bootstrap: {err}"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            if self.supervisor.is_none() {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("persistent session sidecar unavailable: {last}"),
+                });
+            }
+        }
+        self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: "persistent session sidecar state unavailable".into(),
+        })
+    }
+
+    async fn handle_session_open(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -2644,6 +2740,101 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 cols: info.cols,
                 rows: info.rows,
             };
+            if is_remote_runtime_principal(&client.client_name) {
+                let lease = info.controller.as_ref().ok_or_else(|| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: "remote session open did not produce a controller lease".into(),
+                })?;
+                let request = SupervisorSpawnRequest {
+                    session_id: info.id.clone(),
+                    // Device identity is local custody context; remote callers
+                    // cannot choose it and workspace is checked above.
+                    device_id: "device-local".into(),
+                    workspace_id: workspace_id.clone(),
+                    owner_principal: client.client_name.clone(),
+                    controller_epoch: info.controller_epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    host_expires_unix: Self::now().saturating_add(24 * 60 * 60),
+                    command: SupervisorCommand {
+                        program: pty_cmd.program,
+                        args: pty_cmd.args,
+                        cwd: pty_cmd.cwd,
+                        env: pty_cmd
+                            .env
+                            .into_iter()
+                            .map(|(key, value)| SupervisorEnv { key, value })
+                            .collect(),
+                    },
+                    cols: size.cols,
+                    rows: size.rows,
+                };
+                let binding = {
+                    let supervisor = self.ensure_remote_supervisor().await?;
+                    supervisor
+                        .spawn(request)
+                        .await
+                        .map_err(|err| IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!("persistent session sidecar spawn failed: {err}"),
+                        })?
+                };
+                let status = {
+                    let supervisor = self.ensure_remote_supervisor().await?;
+                    supervisor
+                        .status(&binding)
+                        .await
+                        .map_err(|err| IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!("persistent session sidecar status failed: {err}"),
+                        })?
+                };
+                if let Err(err) = self.sessions.set_host_pid(&info.id, status.pid) {
+                    if let Ok(proxy) = self.ensure_remote_supervisor().await {
+                        let _ = proxy.terminate(&binding).await;
+                    }
+                    self.sessions = snapshot;
+                    return Err(session_err(err));
+                }
+                let durable = SidecarHostBinding {
+                    device_id: "device-local".into(),
+                    workspace_id: workspace_id.clone(),
+                    owner_principal: client.client_name.clone(),
+                    host_nonce: binding.host_nonce.clone(),
+                    controller_epoch: binding.controller_epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    host_expires_unix: Self::now().saturating_add(24 * 60 * 60),
+                };
+                if let Err(err) = self
+                    .sessions
+                    .set_sidecar_host_binding(&info.id, Some(durable))
+                {
+                    if let Ok(proxy) = self.ensure_remote_supervisor().await {
+                        let _ = proxy.terminate(&binding).await;
+                    }
+                    self.sessions = snapshot;
+                    return Err(session_err(err));
+                }
+                if let Err(err) = self.commit_sessions(snapshot) {
+                    if let Ok(proxy) = self.ensure_remote_supervisor().await {
+                        let _ = proxy.terminate(&binding).await;
+                    }
+                    return Err(err);
+                }
+                let mut value =
+                    serde_json::to_value(self.sessions.get(&info.id).map_err(session_err)?)
+                        .map_err(|e| IpcError::Remote {
+                            code: app_error::INTERNAL,
+                            message: e.to_string(),
+                        })?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("live_pty".into(), json!(true));
+                    obj.insert("persistent_sidecar".into(), json!(true));
+                    if let Some(meta) = profile_meta {
+                        obj.insert("profile".into(), meta);
+                    }
+                }
+                return Ok(value);
+            }
             match LiveHost::spawn(&pty_cmd, size) {
                 Ok(host) => {
                     let pid = host.handle.pid;
@@ -3264,7 +3455,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         Ok(json!({ "terminated": 1, "session_id": id, "workspace_id": bound_ws }))
     }
 
-    fn handle_session_replay(
+    async fn handle_session_replay(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -3364,7 +3555,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         Ok(json!({ "chunk": chunk }))
     }
 
-    fn handle_session_write(
+    async fn handle_session_write(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -3427,7 +3618,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 message: "session.write requires input_seq for remote principals".into(),
             });
         }
-        if !self.live_hosts.contains_key(&p.id) {
+        if !self.live_hosts.contains_key(&p.id)
+            && self
+                .sessions
+                .get(&p.id)
+                .map_err(session_err)?
+                .sidecar_host
+                .is_none()
+        {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: format!(
@@ -3499,6 +3697,22 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     message: format!("live PTY stdin write failed: {e}"),
                 });
             }
+        } else if self
+            .sessions
+            .get(&p.id)
+            .map_err(session_err)?
+            .sidecar_host
+            .is_some()
+        {
+            let binding = self.sidecar_binding(&p.id)?;
+            let supervisor = self.ensure_remote_supervisor().await?;
+            supervisor
+                .write(&binding, p.data.as_bytes().to_vec())
+                .await
+                .map_err(|err| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("persistent session sidecar stdin write failed: {err}"),
+                })?;
         } else {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -3540,7 +3754,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         }))
     }
 
-    fn handle_session_resize(
+    async fn handle_session_resize(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -3591,7 +3805,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         // Fail closed before reserving/finalizing when no live host exists.
         // Persisted/stale sessions after daemon recovery must not consume sequences
         // or report resized:true without a real PTY side effect (matches write).
-        if !self.live_hosts.contains_key(&p.id) {
+        if !self.live_hosts.contains_key(&p.id)
+            && self
+                .sessions
+                .get(&p.id)
+                .map_err(session_err)?
+                .sidecar_host
+                .is_none()
+        {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: format!(
@@ -3633,17 +3854,22 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         }
 
         if should_deliver {
-            let host = self.live_hosts.get(&p.id).ok_or_else(|| IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: format!(
-                    "session {} has no live PTY host (restarted daemon or non-PTY kind)",
-                    p.id
-                ),
-            })?;
-            host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: format!("live PTY resize failed: {e}"),
-            })?;
+            if let Some(host) = self.live_hosts.get(&p.id) {
+                host.resize(p.cols, p.rows).map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("live PTY resize failed: {e}"),
+                })?;
+            } else {
+                let binding = self.sidecar_binding(&p.id)?;
+                let supervisor = self.ensure_remote_supervisor().await?;
+                supervisor
+                    .resize(&binding, p.cols, p.rows)
+                    .await
+                    .map_err(|err| IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!("persistent session sidecar resize failed: {err}"),
+                    })?;
+            }
             let principal = client.client_name.as_str();
             let snapshot = self.sessions.clone();
             if let Some(seq) = applied_seq {
@@ -3951,6 +4177,22 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             }
         }
         Ok(bound)
+    }
+
+    fn sidecar_binding(&self, session_id: &str) -> IpcResult<SupervisorBinding> {
+        let info = self.sessions.get(session_id).map_err(session_err)?;
+        let binding = info.sidecar_host.clone().ok_or_else(|| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: format!("session {session_id} has no persistent sidecar binding"),
+        })?;
+        Ok(SupervisorBinding {
+            session_id: info.id.clone(),
+            device_id: binding.device_id,
+            workspace_id: binding.workspace_id,
+            owner_principal: binding.owner_principal,
+            host_nonce: binding.host_nonce,
+            controller_epoch: binding.controller_epoch,
+        })
     }
 
     /// Move pending live-host bytes into the session replay ring (bounded chunks).
