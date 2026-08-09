@@ -190,12 +190,13 @@ impl SupervisorClient {
         owner_principal: String,
         controller_epoch: u64,
         binding_expires_unix: i64,
+        transition_id: String,
     ) -> IpcResult<SupervisorBinding> {
         Ok(serde_json::from_value(
             self.client
                 .call(
                     SupervisorRpcMethods::RECLAIM,
-                    Some(json!({"binding":binding,"owner_principal":owner_principal,"controller_epoch":controller_epoch,"binding_expires_unix":binding_expires_unix})),
+                    Some(json!({"binding":binding,"owner_principal":owner_principal,"controller_epoch":controller_epoch,"binding_expires_unix":binding_expires_unix,"transition_id":transition_id})),
                 )
                 .await?,
         )?)

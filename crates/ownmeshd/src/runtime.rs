@@ -2580,68 +2580,149 @@ full_user_access/full_access for arbitrary commands",
                 });
             }
         }
-        self.recover_sidecar_transitions()?;
+        self.recover_sidecar_transitions().await?;
         self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
             code: app_error::INTERNAL,
             message: "persistent session sidecar state unavailable".into(),
         })
     }
 
-    fn recover_sidecar_transitions(&mut self) -> IpcResult<()> {
+    async fn recover_sidecar_transitions(&mut self) -> IpcResult<()> {
         if self.transition_recovery_running {
             return Ok(());
         }
         self.transition_recovery_running = true;
-        let result = (|| {
-            for record in self.transition_journal.pending() {
-                if record.expires_unix <= Self::now() {
-                    return Err(IpcError::Remote {
-                        code: app_error::CONFLICT,
-                        message: format!(
-                            "expired sidecar transition journal record {}",
-                            record.transition_id
-                        ),
-                    });
-                }
-                if record.phase == TransitionPhase::Intent {
-                    // An intent does not prove that the sidecar mutation ran.
-                    // Keep it durable and fail closed until the transition RPC
-                    // is replayed with its exact id/facts by the owning handler.
-                    return Err(IpcError::Remote {
-                        code: app_error::CONFLICT,
-                        message: format!(
-                            "unapplied sidecar transition requires exact recovery: {}",
-                            record.transition_id
-                        ),
-                    });
-                }
-                let binding = record.new_binding.clone().ok_or_else(|| IpcError::Remote {
+        let records = self.transition_journal.pending();
+        for record in records {
+            let result = self.recover_transition_record(record).await;
+            if let Err(error) = result {
+                self.transition_recovery_running = false;
+                return Err(error);
+            }
+        }
+        self.transition_recovery_running = false;
+        Ok(())
+    }
+
+    async fn recover_transition_record(
+        &mut self,
+        record: session_transition_journal::TransitionRecord,
+    ) -> IpcResult<()> {
+        if record.expires_unix <= Self::now() {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "expired sidecar transition journal record {}",
+                    record.transition_id
+                ),
+            });
+        }
+        let current = self.sessions.get(&record.session_id).map_err(session_err)?;
+        if current.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "sidecar transition workspace mismatch during recovery".into(),
+            });
+        }
+        let binding = match record.phase {
+            TransitionPhase::Applied => {
+                record.new_binding.clone().ok_or_else(|| IpcError::Remote {
                     code: app_error::INTERNAL,
                     message: "applied sidecar transition missing binding".into(),
+                })?
+            }
+            TransitionPhase::Intent => {
+                let old = supervisor_binding_from(&record.session_id, &record.old_binding);
+                let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: "sidecar unavailable during transition recovery".into(),
                 })?;
-                let current = self.sessions.get(&record.session_id).map_err(session_err)?;
-                if current.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
-                    return Err(IpcError::Remote {
-                        code: app_error::CONFLICT,
-                        message: "sidecar transition workspace mismatch during recovery".into(),
-                    });
+                let next = match record.kind {
+                    session_transition_journal::TransitionKind::Detach => {
+                        proxy
+                            .detach(
+                                &old,
+                                record.target.controller_epoch,
+                                record.transition_id.clone(),
+                            )
+                            .await
+                    }
+                    session_transition_journal::TransitionKind::Claim => {
+                        proxy
+                            .claim(
+                                &old,
+                                record.target.principal.clone(),
+                                record.target.controller_epoch,
+                                record.target.binding_expires_unix,
+                                record.transition_id.clone(),
+                            )
+                            .await
+                    }
+                    session_transition_journal::TransitionKind::Give => {
+                        proxy
+                            .rotate(
+                                &old,
+                                record.target.principal.clone(),
+                                record.target.controller_epoch,
+                                record.target.binding_expires_unix,
+                                record.transition_id.clone(),
+                            )
+                            .await
+                    }
+                    session_transition_journal::TransitionKind::Renew => {
+                        proxy
+                            .renew(
+                                &old,
+                                record.target.binding_expires_unix,
+                                record.transition_id.clone(),
+                            )
+                            .await
+                    }
+                    session_transition_journal::TransitionKind::Reclaim => {
+                        proxy
+                            .reclaim(
+                                &old,
+                                record.target.principal.clone(),
+                                record.target.controller_epoch,
+                                record.target.binding_expires_unix,
+                                record.transition_id.clone(),
+                            )
+                            .await
+                    }
                 }
-                let snapshot = self.sessions.clone();
-                self.sessions
-                    .set_sidecar_host_binding(&record.session_id, Some(binding))
-                    .map_err(session_err)?;
-                self.commit_sessions(snapshot)?;
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("replay sidecar transition: {e}"),
+                })?;
+                let binding = SidecarHostBinding {
+                    device_id: record.device_id.clone(),
+                    workspace_id: record.workspace_id.clone(),
+                    owner_principal: record.target.principal.clone(),
+                    host_nonce: next.host_nonce,
+                    controller_epoch: next.controller_epoch,
+                    binding_expires_unix: record.target.binding_expires_unix,
+                    host_expires_unix: record.old_binding.host_expires_unix,
+                };
                 self.transition_journal
-                    .clear(&record.transition_id)
+                    .mark_applied(&record.transition_id, binding.clone())
                     .map_err(|e| IpcError::Remote {
                         code: app_error::INTERNAL,
-                        message: format!("clear recovered transition journal: {e}"),
+                        message: format!("mark recovered transition applied: {e}"),
                     })?;
+                binding
             }
-            Ok(())
-        })();
-        self.transition_recovery_running = false;
-        result
+        };
+        let snapshot = self.sessions.clone();
+        self.sessions
+            .set_sidecar_host_binding(&record.session_id, Some(binding))
+            .map_err(session_err)?;
+        self.commit_sessions(snapshot)?;
+        self.transition_journal
+            .clear(&record.transition_id)
+            .map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!("clear recovered transition journal: {e}"),
+            })
     }
 
     async fn handle_session_open(
@@ -4884,6 +4965,17 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// RFC 4648 standard Base64 with `=` padding (not base64url).
+fn supervisor_binding_from(session_id: &str, binding: &SidecarHostBinding) -> SupervisorBinding {
+    SupervisorBinding {
+        session_id: session_id.into(),
+        device_id: binding.device_id.clone(),
+        workspace_id: binding.workspace_id.clone(),
+        owner_principal: binding.owner_principal.clone(),
+        host_nonce: binding.host_nonce.clone(),
+        controller_epoch: binding.controller_epoch,
+    }
+}
+
 fn base64_standard(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
