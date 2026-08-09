@@ -194,8 +194,8 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
             transport: StdioJsonRpc,
             dialect: KimiAcp,
             start_args: vec!["acp".into()],
-            resume: NativeResume::Negotiated {
-                method: "session/load".into(),
+            resume: NativeResume::Argv {
+                args: vec!["--session".into(), "{{native_id}}".into()],
             },
             auth_probe: None,
             structured_events: true,
@@ -218,9 +218,7 @@ pub fn official_adapter_specs() -> Vec<AdapterSpec> {
             transport: StdioJsonl,
             dialect: PiRpc,
             start_args: vec!["--mode".into(), "rpc".into()],
-            resume: NativeResume::Negotiated {
-                method: "switch_session".into(),
-            },
+            resume: NativeResume::Degraded,
             auth_probe: None,
             structured_events: true,
             safe_capabilities: vec!["strict_lf_jsonl".into()],
@@ -467,13 +465,15 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: true,
+            // App-server continuation is the negotiated `thread/resume` RPC,
+            // not a guessed process argv invocation.
+            supports_native_resume: false,
             supports_structured: true,
             supports_acp: false,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["exec".into(), "--json".into(), "{{prompt}}".into()],
             structured_start_args: vec!["app-server".into()],
-            resume_args: vec!["resume".into(), "{{native_id}}".into()],
+            resume_args: vec![],
             official: true,
         },
         Profile {
@@ -515,7 +515,7 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: false,
+            supports_native_resume: true,
             supports_structured: true,
             supports_acp: true,
             min_version: Some("0.1.0".into()),
@@ -525,8 +525,8 @@ pub fn official_profiles() -> Vec<Profile> {
                 "--output-format".into(),
                 "stream-json".into(),
             ],
-            structured_start_args: vec!["--acp".into()],
-            resume_args: vec![],
+            structured_start_args: vec!["acp".into()],
+            resume_args: vec!["--session".into(), "{{native_id}}".into()],
             official: true,
         },
         Profile {
@@ -558,14 +558,15 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: true,
+            supports_native_resume: false,
             supports_structured: true,
             supports_acp: false,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["--mode".into(), "rpc".into()],
             structured_start_args: vec!["--mode".into(), "rpc".into()],
-            // Session resume when native id is known (PTY/RPC host tracks OwnMesh session separately).
-            resume_args: vec!["--resume".into(), "{{native_id}}".into()],
+            // The documented RPC integration is process-local; OwnMesh does
+            // not invent an argv resume surface.
+            resume_args: vec![],
             official: true,
         },
         Profile {
@@ -580,8 +581,18 @@ pub fn official_profiles() -> Vec<Profile> {
             supports_structured: true,
             supports_acp: false,
             min_version: Some("0.1.0".into()),
-            non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
-            structured_start_args: vec![],
+            non_interactive_args: vec![
+                "--print".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            structured_start_args: vec![
+                "--print".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
             resume_args: vec![],
             official: true,
         },
@@ -602,7 +613,7 @@ pub fn official_profiles() -> Vec<Profile> {
             supports_acp: true,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["-p".into(), "{{prompt}}".into()],
-            structured_start_args: vec![],
+            structured_start_args: vec!["--acp".into()],
             resume_args: vec![],
             official: true,
         },
@@ -623,8 +634,8 @@ pub fn official_profiles() -> Vec<Profile> {
             supports_acp: true,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
-            structured_start_args: vec![],
-            resume_args: vec!["resume".into(), "{{native_id}}".into()],
+            structured_start_args: vec!["acp".into()],
+            resume_args: vec!["--resume".into(), "{{native_id}}".into()],
             official: true,
         },
         Profile {
@@ -1664,7 +1675,11 @@ acp = false
         let p = reg.get("codex").unwrap();
         assert_eq!(p.interface_order[0], InterfacePreference::StructuredRpc);
         assert_eq!(p.structured_start_args, vec!["app-server".to_string()]);
-        assert!(p.supports_native_resume);
+        assert!(!p.supports_native_resume);
+        assert!(matches!(
+            official_adapter_spec("codex").unwrap().resume,
+            NativeResume::Negotiated { ref method } if method == "thread/resume"
+        ));
     }
 
     #[test]
@@ -1690,6 +1705,30 @@ acp = false
             official_adapter_spec("codex").unwrap().transport,
             AdapterTransport::StdioJsonRpc
         );
+    }
+
+    #[test]
+    fn profile_launch_argv_matches_each_source_backed_adapter_start() {
+        let reg = ProfileRegistry::with_official();
+        for spec in official_adapter_specs() {
+            let plan = reg
+                .launch_plan(&spec.profile_id, Some("fixture prompt"), false)
+                .unwrap_or_else(|err| panic!("{}: {err}", spec.profile_id));
+            let expected: Vec<_> = spec
+                .start_args
+                .iter()
+                .map(|arg| arg.replace("{{prompt}}", "fixture prompt"))
+                .collect();
+            assert_eq!(plan.args, expected, "{}", spec.profile_id);
+            if let NativeResume::Argv { args } = spec.resume {
+                let resume = reg.resume_plan(&spec.profile_id, "native_fixture").unwrap();
+                let expected_resume: Vec<_> = args
+                    .iter()
+                    .map(|arg| arg.replace("{{native_id}}", "native_fixture"))
+                    .collect();
+                assert_eq!(resume.args, expected_resume, "{}", spec.profile_id);
+            }
+        }
     }
 
     #[test]
