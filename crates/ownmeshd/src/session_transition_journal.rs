@@ -35,6 +35,8 @@ pub enum TransitionKind {
     Give,
     Renew,
     Reclaim,
+    Close,
+    Terminate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,10 @@ pub struct TransitionTarget {
     pub controller_epoch: u64,
     pub binding_expires_unix: i64,
     pub controller_attached: bool,
+    /// A terminal transition has no successor binding: recovery must first
+    /// replay the sidecar tombstone then persist the terminal session state.
+    #[serde(default)]
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +146,26 @@ impl SessionTransitionJournal {
         validate(record)?;
         self.persist()
     }
+    pub fn mark_terminal_applied(&mut self, id: &str) -> Result<(), String> {
+        let record = self
+            .entries
+            .get_mut(id)
+            .ok_or("transition journal record not found")?;
+        if !record.target.terminal {
+            return Err("non-terminal transition cannot record terminal receipt".into());
+        }
+        if record.phase == TransitionPhase::Applied {
+            return if record.new_binding.is_none() {
+                Ok(())
+            } else {
+                Err("terminal transition applied binding conflict".into())
+            };
+        }
+        record.phase = TransitionPhase::Applied;
+        record.new_binding = None;
+        validate(record)?;
+        self.persist()
+    }
     pub fn clear(&mut self, id: &str) -> Result<(), String> {
         self.entries.remove(id);
         self.persist()
@@ -197,7 +223,10 @@ fn validate(record: &TransitionRecord) -> Result<(), String> {
             return Err("invalid transition journal binding".into());
         }
     }
-    if record.phase == TransitionPhase::Applied && record.new_binding.is_none() {
+    if record.phase == TransitionPhase::Applied
+        && record.new_binding.is_none()
+        && !record.target.terminal
+    {
         return Err("applied transition missing binding".into());
     }
     Ok(())
@@ -245,6 +274,7 @@ mod tests {
                 controller_epoch: 1,
                 binding_expires_unix: 200,
                 controller_attached: true,
+                terminal: false,
             },
             new_binding: None,
             created_unix: 100,
@@ -279,5 +309,23 @@ mod tests {
         assert!(SessionTransitionJournal::open(dir.path()).is_err());
         std::fs::write(dir.path().join(FILE), vec![0_u8; MAX_BYTES + 1]).unwrap();
         assert!(SessionTransitionJournal::open(dir.path()).is_err());
+    }
+    #[test]
+    fn terminal_receipt_has_no_successor_binding_and_survives_reload() {
+        let dir = tempdir().unwrap();
+        let mut j = SessionTransitionJournal::open(dir.path()).unwrap();
+        let mut terminal = record();
+        terminal.transition_id = "tr_terminal".into();
+        terminal.kind = TransitionKind::Terminate;
+        terminal.target.terminal = true;
+        j.begin(terminal).unwrap();
+        j.mark_terminal_applied("tr_terminal").unwrap();
+        let pending = SessionTransitionJournal::open(dir.path())
+            .unwrap()
+            .pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].phase, TransitionPhase::Applied);
+        assert!(pending[0].new_binding.is_none());
+        assert!(j.mark_applied("tr_terminal", binding()).is_err());
     }
 }

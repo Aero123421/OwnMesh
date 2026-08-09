@@ -849,10 +849,10 @@ mod tests {
             .terminate_idempotent(&binding, "tr_terminate", "other_digest")
             .await
             .is_err());
-        let mut stale = binding.clone();
-        stale.host_nonce = "host_stale".into();
+        let mut stale_binding = binding.clone();
+        stale_binding.host_nonce = "host_stale".into();
         assert!(state
-            .terminate_idempotent(&stale, "tr_terminate", "digest_terminal")
+            .terminate_idempotent(&stale_binding, "tr_terminate", "digest_terminal")
             .await
             .is_err());
     }

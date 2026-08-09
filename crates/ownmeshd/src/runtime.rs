@@ -2490,8 +2490,8 @@ full_user_access/full_access for arbitrary commands",
             session_methods::DETACH => self.handle_session_detach(params, client).await,
             session_methods::RELEASE => self.handle_session_release(params, client),
             session_methods::GIVE => self.handle_session_give(params, client).await,
-            session_methods::CLOSE => self.handle_session_close(params, client),
-            session_methods::TERMINATE => self.handle_session_terminate(params, client),
+            session_methods::CLOSE => self.handle_session_close(params, client).await,
+            session_methods::TERMINATE => self.handle_session_terminate(params, client).await,
             session_methods::REPLAY => self.handle_session_replay(params, client).await,
             session_methods::PUSH_OUTPUT => self.handle_session_push_output(params, client),
             session_methods::WRITE => self.handle_session_write(params, client).await,
@@ -2619,7 +2619,28 @@ full_user_access/full_access for arbitrary commands",
                 ),
             });
         }
-        let current = self.sessions.get(&record.session_id).map_err(session_err)?;
+        let terminal = matches!(
+            record.kind,
+            TransitionKind::Close | TransitionKind::Terminate
+        );
+        let current = match self.sessions.get(&record.session_id) {
+            Ok(current) => current,
+            // `terminate` removes its SessionManager entry. If the durable
+            // sidecar tombstone and the session snapshot were both committed,
+            // a crash can leave only the harmless journal cleanup outstanding.
+            Err(ownmesh_session::SessionError::NotFound)
+                if terminal && record.phase == TransitionPhase::Applied =>
+            {
+                return self
+                    .transition_journal
+                    .clear(&record.transition_id)
+                    .map_err(|e| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: format!("clear completed terminal transition: {e}"),
+                    });
+            }
+            Err(error) => return Err(session_err(error)),
+        };
         if current.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -2628,10 +2649,14 @@ full_user_access/full_access for arbitrary commands",
         }
         let binding = match record.phase {
             TransitionPhase::Applied => {
-                record.new_binding.clone().ok_or_else(|| IpcError::Remote {
-                    code: app_error::INTERNAL,
-                    message: "applied sidecar transition missing binding".into(),
-                })?
+                if terminal {
+                    None
+                } else {
+                    Some(record.new_binding.clone().ok_or_else(|| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: "applied sidecar transition missing binding".into(),
+                    })?)
+                }
             }
             TransitionPhase::Intent => {
                 let old = supervisor_binding_from(&record.session_id, &record.old_binding);
@@ -2639,85 +2664,132 @@ full_user_access/full_access for arbitrary commands",
                     code: app_error::CONFLICT,
                     message: "sidecar unavailable during transition recovery".into(),
                 })?;
-                let next = match record.kind {
-                    session_transition_journal::TransitionKind::Detach => {
-                        proxy
-                            .detach(
-                                &old,
-                                record.target.controller_epoch,
-                                record.transition_id.clone(),
-                            )
-                            .await
-                    }
-                    session_transition_journal::TransitionKind::Claim => {
-                        proxy
-                            .claim(
-                                &old,
-                                record.target.principal.clone(),
-                                record.target.controller_epoch,
-                                record.target.binding_expires_unix,
-                                record.transition_id.clone(),
-                            )
-                            .await
-                    }
-                    session_transition_journal::TransitionKind::Give => {
-                        proxy
-                            .rotate(
-                                &old,
-                                record.target.principal.clone(),
-                                record.target.controller_epoch,
-                                record.target.binding_expires_unix,
-                                record.transition_id.clone(),
-                            )
-                            .await
-                    }
-                    session_transition_journal::TransitionKind::Renew => {
-                        proxy
-                            .renew(
-                                &old,
-                                record.target.binding_expires_unix,
-                                record.transition_id.clone(),
-                            )
-                            .await
-                    }
-                    session_transition_journal::TransitionKind::Reclaim => {
-                        proxy
-                            .reclaim(
-                                &old,
-                                record.target.principal.clone(),
-                                record.target.controller_epoch,
-                                record.target.binding_expires_unix,
-                                record.transition_id.clone(),
-                            )
-                            .await
-                    }
-                }
-                .map_err(|e| IpcError::Remote {
-                    code: app_error::CONFLICT,
-                    message: format!("replay sidecar transition: {e}"),
-                })?;
-                let binding = SidecarHostBinding {
-                    device_id: record.device_id.clone(),
-                    workspace_id: record.workspace_id.clone(),
-                    owner_principal: record.target.principal.clone(),
-                    host_nonce: next.host_nonce,
-                    controller_epoch: next.controller_epoch,
-                    binding_expires_unix: record.target.binding_expires_unix,
-                    host_expires_unix: record.old_binding.host_expires_unix,
+                let next = if terminal {
+                    proxy
+                        .terminate(&old, record.transition_id.clone())
+                        .await
+                        .map_err(|e| IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!("replay sidecar transition: {e}"),
+                        })?;
+                    None
+                } else {
+                    Some(
+                        match record.kind {
+                            session_transition_journal::TransitionKind::Detach => {
+                                proxy
+                                    .detach(
+                                        &old,
+                                        record.target.controller_epoch,
+                                        record.transition_id.clone(),
+                                    )
+                                    .await
+                            }
+                            session_transition_journal::TransitionKind::Claim => {
+                                proxy
+                                    .claim(
+                                        &old,
+                                        record.target.principal.clone(),
+                                        record.target.controller_epoch,
+                                        record.target.binding_expires_unix,
+                                        record.transition_id.clone(),
+                                    )
+                                    .await
+                            }
+                            session_transition_journal::TransitionKind::Give => {
+                                proxy
+                                    .rotate(
+                                        &old,
+                                        record.target.principal.clone(),
+                                        record.target.controller_epoch,
+                                        record.target.binding_expires_unix,
+                                        record.transition_id.clone(),
+                                    )
+                                    .await
+                            }
+                            session_transition_journal::TransitionKind::Renew => {
+                                proxy
+                                    .renew(
+                                        &old,
+                                        record.target.binding_expires_unix,
+                                        record.transition_id.clone(),
+                                    )
+                                    .await
+                            }
+                            session_transition_journal::TransitionKind::Reclaim => {
+                                proxy
+                                    .reclaim(
+                                        &old,
+                                        record.target.principal.clone(),
+                                        record.target.controller_epoch,
+                                        record.target.binding_expires_unix,
+                                        record.transition_id.clone(),
+                                    )
+                                    .await
+                            }
+                            TransitionKind::Close | TransitionKind::Terminate => {
+                                unreachable!("terminal transition handled above")
+                            }
+                        }
+                        .map_err(|e| IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!("replay sidecar transition: {e}"),
+                        })?,
+                    )
                 };
-                self.transition_journal
-                    .mark_applied(&record.transition_id, binding.clone())
-                    .map_err(|e| IpcError::Remote {
+                if terminal {
+                    self.transition_journal
+                        .mark_terminal_applied(&record.transition_id)
+                        .map_err(|e| IpcError::Remote {
+                            code: app_error::INTERNAL,
+                            message: format!("mark recovered terminal transition applied: {e}"),
+                        })?;
+                    None
+                } else {
+                    let next = next.ok_or_else(|| IpcError::Remote {
                         code: app_error::INTERNAL,
-                        message: format!("mark recovered transition applied: {e}"),
+                        message: "non-terminal sidecar transition returned no binding".into(),
                     })?;
-                binding
+                    let binding = SidecarHostBinding {
+                        device_id: record.device_id.clone(),
+                        workspace_id: record.workspace_id.clone(),
+                        owner_principal: record.target.principal.clone(),
+                        host_nonce: next.host_nonce,
+                        controller_epoch: next.controller_epoch,
+                        binding_expires_unix: record.target.binding_expires_unix,
+                        host_expires_unix: record.old_binding.host_expires_unix,
+                    };
+                    self.transition_journal
+                        .mark_applied(&record.transition_id, binding.clone())
+                        .map_err(|e| IpcError::Remote {
+                            code: app_error::INTERNAL,
+                            message: format!("mark recovered transition applied: {e}"),
+                        })?;
+                    Some(binding)
+                }
             }
         };
         let snapshot = self.sessions.clone();
-        self.sessions
-            .set_sidecar_host_binding(&record.session_id, Some(binding))
-            .map_err(session_err)?;
+        if let Some(binding) = binding {
+            self.sessions
+                .set_sidecar_host_binding(&record.session_id, Some(binding))
+                .map_err(session_err)?;
+        } else {
+            match record.kind {
+                TransitionKind::Close => self
+                    .sessions
+                    .close(&record.session_id)
+                    .map_err(session_err)?,
+                TransitionKind::Terminate => self
+                    .sessions
+                    .terminate(&record.session_id)
+                    .map_err(session_err)?,
+                _ => unreachable!("only terminal transitions omit a binding"),
+            }
+            self.sessions
+                .set_sidecar_host_binding(&record.session_id, None)
+                .map_err(session_err)?;
+        }
         self.commit_sessions(snapshot)?;
         self.transition_journal
             .clear(&record.transition_id)
@@ -3365,6 +3437,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: lease.epoch,
                     binding_expires_unix: lease.expires_unix,
                     controller_attached: true,
+                    terminal: false,
                 },
                 new_binding: None,
                 created_unix: now,
@@ -3534,6 +3607,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: lease.epoch,
                     binding_expires_unix: lease.expires_unix,
                     controller_attached: true,
+                    terminal: false,
                 },
                 new_binding: None,
                 created_unix: now,
@@ -3655,6 +3729,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: next_epoch,
                     binding_expires_unix: old_binding.binding_expires_unix,
                     controller_attached: false,
+                    terminal: false,
                 },
                 new_binding: None,
                 created_unix: now,
@@ -3808,6 +3883,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: lease.epoch,
                     binding_expires_unix: lease.expires_unix,
                     controller_attached: true,
+                    terminal: false,
                 },
                 new_binding: None,
                 created_unix: now,
@@ -3876,7 +3952,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         Ok(json!({ "lease": lease, "readers": readers, "workspace_id": bound_ws }))
     }
 
-    fn handle_session_close(
+    async fn handle_session_close(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -3885,23 +3961,127 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         struct P {
             id: String,
             #[serde(default)]
+            lease_id: Option<String>,
+            #[serde(default)]
+            controller_epoch: Option<u64>,
+            #[serde(default)]
             workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
-        self.require_controller(&p.id, &client.client_name, now)?;
+        let remote = is_remote_runtime_principal(&client.client_name);
+        if remote {
+            let lease_id = p
+                .lease_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "session.close requires lease_id for remote principals".into(),
+                })?;
+            let epoch = p.controller_epoch.ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.close requires controller_epoch for remote principals".into(),
+            })?;
+            self.sessions
+                .authorize_controller_lease(&p.id, &client.client_name, lease_id, epoch, now)
+                .map_err(session_err)?;
+        } else {
+            self.require_controller(&p.id, &client.client_name, now)?;
+        }
         let _ = self.drain_live_output_into_session(&p.id);
-        // Snapshot before host teardown so a failed sessions persist rolls back
-        // the complete manager (including host_pid) transactionally.
         let snapshot = self.sessions.clone();
-        self.sessions.close(&p.id).map_err(session_err)?;
-        self.commit_sessions(snapshot)?;
-        self.stop_live_host(&p.id);
+        let mut preview = self.sessions.clone();
+        let active = self
+            .sessions
+            .get(&p.id)
+            .map_err(session_err)?
+            .controller
+            .clone()
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "session has no active controller".into(),
+            })?;
+        preview.close(&p.id).map_err(session_err)?;
+        if let Some(old_binding) = self
+            .sessions
+            .get(&p.id)
+            .map_err(session_err)?
+            .sidecar_host
+            .clone()
+        {
+            let transition_id = format!(
+                "close:{}:{}:{}",
+                p.id,
+                p.lease_id.as_deref().unwrap_or(&active.lease_id),
+                p.controller_epoch.unwrap_or(active.epoch),
+            );
+            self.ensure_remote_supervisor().await?;
+            let record = TransitionRecord {
+                transition_id: transition_id.clone(),
+                kind: TransitionKind::Close,
+                phase: TransitionPhase::Intent,
+                session_id: p.id.clone(),
+                device_id: old_binding.device_id.clone(),
+                workspace_id: bound_ws.clone(),
+                authenticated_principal: client.client_name.clone(),
+                old_binding: old_binding.clone(),
+                target: TransitionTarget {
+                    principal: client.client_name.clone(),
+                    controller_epoch: active.epoch,
+                    binding_expires_unix: active.expires_unix,
+                    controller_attached: true,
+                    terminal: true,
+                },
+                new_binding: None,
+                created_unix: now,
+                expires_unix: old_binding.host_expires_unix,
+            };
+            self.transition_journal
+                .begin(record)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("begin sidecar close journal: {e}"),
+                })?;
+            let binding = supervisor_binding_from(&p.id, &old_binding);
+            let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "sidecar unavailable after bootstrap".into(),
+            })?;
+            proxy
+                .terminate(&binding, transition_id.clone())
+                .await
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("sidecar close failed: {e}"),
+                })?;
+            self.transition_journal
+                .mark_terminal_applied(&transition_id)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("mark sidecar close journal: {e}"),
+                })?;
+            preview
+                .set_sidecar_host_binding(&p.id, None)
+                .map_err(session_err)?;
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+            self.transition_journal
+                .clear(&transition_id)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("clear sidecar close journal: {e}"),
+                })?;
+        } else {
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+            self.stop_live_host(&p.id);
+        }
         Ok(json!({ "closed": true, "session_id": p.id, "workspace_id": bound_ws }))
     }
 
-    fn handle_session_terminate(
+    async fn handle_session_terminate(
         &mut self,
         params: Option<Value>,
         client: &ClientIdentity,
@@ -3914,10 +4094,21 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             all: bool,
             #[serde(default)]
             workspace_id: Option<String>,
+            #[serde(default)]
+            lease_id: Option<String>,
+            #[serde(default)]
+            controller_epoch: Option<u64>,
         }
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
         if p.all {
+            if is_remote_runtime_principal(&client.client_name) {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: "remote session.terminate all is forbidden; terminate one exact lease"
+                        .into(),
+                });
+            }
             // Only sessions this principal actively controls may be mass-terminated.
             let controlled: Vec<String> = self
                 .sessions
@@ -3952,12 +4143,114 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             message: "id or all required".into(),
         })?;
         let bound_ws = self.require_session_workspace(&id, p.workspace_id.as_deref())?;
-        self.require_controller(&id, &client.client_name, now)?;
+        let remote = is_remote_runtime_principal(&client.client_name);
+        if remote {
+            let lease_id = p
+                .lease_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "session.terminate requires lease_id for remote principals".into(),
+                })?;
+            let epoch = p.controller_epoch.ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "session.terminate requires controller_epoch for remote principals".into(),
+            })?;
+            self.sessions
+                .authorize_controller_lease(&id, &client.client_name, lease_id, epoch, now)
+                .map_err(session_err)?;
+        } else {
+            self.require_controller(&id, &client.client_name, now)?;
+        }
         let _ = self.drain_live_output_into_session(&id);
         let snapshot = self.sessions.clone();
-        self.sessions.terminate(&id).map_err(session_err)?;
-        self.commit_sessions(snapshot)?;
-        self.stop_live_host(&id);
+        let mut preview = self.sessions.clone();
+        let active = self
+            .sessions
+            .get(&id)
+            .map_err(session_err)?
+            .controller
+            .clone()
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "session has no active controller".into(),
+            })?;
+        preview.terminate(&id).map_err(session_err)?;
+        if let Some(old_binding) = self
+            .sessions
+            .get(&id)
+            .map_err(session_err)?
+            .sidecar_host
+            .clone()
+        {
+            let transition_id = format!(
+                "terminate:{}:{}:{}",
+                id,
+                p.lease_id.as_deref().unwrap_or(&active.lease_id),
+                p.controller_epoch.unwrap_or(active.epoch),
+            );
+            self.ensure_remote_supervisor().await?;
+            let record = TransitionRecord {
+                transition_id: transition_id.clone(),
+                kind: TransitionKind::Terminate,
+                phase: TransitionPhase::Intent,
+                session_id: id.clone(),
+                device_id: old_binding.device_id.clone(),
+                workspace_id: bound_ws.clone(),
+                authenticated_principal: client.client_name.clone(),
+                old_binding: old_binding.clone(),
+                target: TransitionTarget {
+                    principal: client.client_name.clone(),
+                    controller_epoch: active.epoch,
+                    binding_expires_unix: active.expires_unix,
+                    controller_attached: true,
+                    terminal: true,
+                },
+                new_binding: None,
+                created_unix: now,
+                expires_unix: old_binding.host_expires_unix,
+            };
+            self.transition_journal
+                .begin(record)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("begin sidecar terminate journal: {e}"),
+                })?;
+            let binding = supervisor_binding_from(&id, &old_binding);
+            let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "sidecar unavailable after bootstrap".into(),
+            })?;
+            proxy
+                .terminate(&binding, transition_id.clone())
+                .await
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!("sidecar terminate failed: {e}"),
+                })?;
+            self.transition_journal
+                .mark_terminal_applied(&transition_id)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("mark sidecar terminate journal: {e}"),
+                })?;
+            preview
+                .set_sidecar_host_binding(&id, None)
+                .map_err(session_err)?;
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+            self.transition_journal
+                .clear(&transition_id)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("clear sidecar terminate journal: {e}"),
+                })?;
+        } else {
+            self.sessions = preview;
+            self.commit_sessions(snapshot)?;
+            self.stop_live_host(&id);
+        }
         Ok(json!({ "terminated": 1, "session_id": id, "workspace_id": bound_ws }))
     }
 
