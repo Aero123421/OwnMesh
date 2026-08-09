@@ -10,6 +10,8 @@
 export const TRANSFER_PROTOCOL = "ownmesh.transfer/1.0";
 export const MAX_TRANSFER_CHUNK_BYTES = 64 * 1024;
 export const MAX_TRANSFER_FRAME_BYTES = 96 * 1024;
+/** AES-GCM / ChaCha20-Poly1305 authentication tag length. */
+export const AEAD_TAG_BYTES = 16;
 
 export type TransferRole = "source" | "destination";
 export type TransferState = "prepared" | "active" | "cancelled" | "expired";
@@ -69,6 +71,7 @@ export class TransferRoomRouter {
   private inFlight: InFlight | null = null;
   private metadata: TransferMetadata;
   private readonly persist: (metadata: TransferMetadata) => Promise<void>;
+  private broken = false;
 
   constructor(metadata: TransferMetadata, persist: (metadata: TransferMetadata) => Promise<void>) {
     this.metadata = metadata;
@@ -81,7 +84,7 @@ export class TransferRoomRouter {
 
   attach(peer: TransferPeer): boolean {
     const expected = peer.role === "source" ? this.metadata.source_device_id : this.metadata.destination_device_id;
-    if (peer.device_id !== expected || this.metadata.state === "cancelled" || this.expired()) return false;
+    if (this.broken || peer.device_id !== expected || this.metadata.state === "cancelled" || this.expired()) return false;
     this.peers.set(peer.role, peer);
     return true;
   }
@@ -101,7 +104,7 @@ export class TransferRoomRouter {
 
   async handle(peer: TransferPeer, raw: string): Promise<{ ok: boolean; error?: string }> {
     if (new TextEncoder().encode(raw).byteLength > MAX_TRANSFER_FRAME_BYTES) return { ok: false, error: "frame_too_large" };
-    if (this.peers.get(peer.role)?.id !== peer.id || this.expired()) return { ok: false, error: "peer_unavailable" };
+    if (this.broken || this.peers.get(peer.role)?.id !== peer.id || this.expired()) return { ok: false, error: "peer_unavailable" };
     let frame: Record<string, unknown> | null;
     try { frame = object(JSON.parse(raw)); } catch { frame = null; }
     if (!frame || frame.protocol !== TRANSFER_PROTOCOL || frame.transfer_id !== this.metadata.transfer_id || !id(frame.type)) return { ok: false, error: "bad_frame" };
@@ -120,7 +123,8 @@ export class TransferRoomRouter {
     if (!exactlyKeys(frame, ["protocol", "type", "transfer_id", "epoch", "fence", "plan_sha256", "sequence", "offset", "length", "ciphertext_base64", "chunk_sha256"]) || !hash(frame.chunk_sha256) || !b64(frame.ciphertext_base64)) return { ok: false, error: "bad_chunk" };
     const sequence = Number(frame.sequence); const offset = Number(frame.offset); const length = Number(frame.length);
     const expectedSequence = this.metadata.contiguous_ack_sequence === null ? 0 : this.metadata.contiguous_ack_sequence + 1;
-    if (!Number.isSafeInteger(sequence) || !Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || sequence !== expectedSequence || offset !== this.metadata.contiguous_ack_offset || length < 1 || length > MAX_TRANSFER_CHUNK_BYTES || offset + length > this.metadata.max_bytes || this.inFlight) return { ok: false, error: "non_contiguous_or_busy" };
+    const ciphertextBytes = decodedBase64Bytes(String(frame.ciphertext_base64));
+    if (!Number.isSafeInteger(sequence) || !Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || sequence !== expectedSequence || offset !== this.metadata.contiguous_ack_offset || length < 1 || length > MAX_TRANSFER_CHUNK_BYTES || offset + length > this.metadata.max_bytes || ciphertextBytes !== length + AEAD_TAG_BYTES || this.inFlight) return { ok: false, error: "non_contiguous_or_busy" };
     const destination = this.peers.get("destination");
     if (!destination) return { ok: false, error: "destination_offline" };
     this.metadata.state = "active";
@@ -134,10 +138,21 @@ export class TransferRoomRouter {
     if (peer.role !== "destination" || !this.bound(frame) || !this.inFlight || !exactlyKeys(frame, ["protocol", "type", "transfer_id", "epoch", "fence", "plan_sha256", "sequence", "next_offset"])) return { ok: false, error: "bad_ack" };
     const sequence = Number(frame.sequence); const next = Number(frame.next_offset);
     if (!Number.isSafeInteger(sequence) || !Number.isSafeInteger(next) || sequence !== this.inFlight.sequence || next !== this.inFlight.offset + this.inFlight.length) return { ok: false, error: "ack_mismatch" };
+    const before = this.snapshot();
     this.metadata.contiguous_ack_sequence = sequence;
     this.metadata.contiguous_ack_offset = next;
     this.inFlight = null;
-    await this.persist(this.snapshot());
+    try {
+      await this.persist(this.snapshot());
+    } catch {
+      // Source must never observe an ACK that did not cross the durable
+      // metadata barrier. Drop both sockets and leave the source to retry from
+      // its last known ACK after reconnect.
+      this.metadata = before;
+      this.broken = true;
+      this.peers.clear();
+      return { ok: false, error: "persist_failed" };
+    }
     this.peers.get("source")?.send(JSON.stringify({ protocol: TRANSFER_PROTOCOL, type: "ack", transfer_id: this.metadata.transfer_id, epoch: this.metadata.epoch, fence: this.metadata.fence, plan_sha256: this.metadata.plan_sha256, sequence, next_offset: next }));
     return { ok: true };
   }
@@ -150,5 +165,16 @@ export class TransferRoomRouter {
     const other = peer.role === "source" ? "destination" : "source";
     this.peers.get(other)?.send(JSON.stringify({ protocol: TRANSFER_PROTOCOL, type: "cancel", transfer_id: this.metadata.transfer_id, epoch: this.metadata.epoch, fence: this.metadata.fence, plan_sha256: this.metadata.plan_sha256 }));
     return { ok: true };
+  }
+}
+
+/** Strictly decode only bounded canonical Base64 and return raw byte length. */
+function decodedBase64Bytes(value: string): number | null {
+  try {
+    const decoded = atob(value);
+    if (btoa(decoded) !== value) return null;
+    return decoded.length;
+  } catch {
+    return null;
   }
 }
