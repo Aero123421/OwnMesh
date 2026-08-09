@@ -350,16 +350,73 @@ fn retired_holder_late_write_is_isolated_from_new_generation_part() {
     assert!(first_attempt.is_ok() || matches!(&first_attempt, Err(TransferError::LeaseBusy)));
     barrier.wait();
     assert_eq!(writer.join().unwrap(), Err(TransferError::StaleFence));
-    let current_sink = match first_attempt {
-        Ok(sink) => sink,
+    let (current_sink, _current_lease) = match first_attempt {
+        Ok(sink) => (sink, current_lease),
         Err(TransferError::LeaseBusy) => {
-            PartFileSink::create(&store, &plan, 2, current_journal.bytes_received()).unwrap()
+            drop(current_lease);
+            let next_lease = store.acquire_for_fence(&plan, 3, 9_000, 3, 3).unwrap();
+            let next_journal = store
+                .claim(&next_lease, &plan, "owner-a", 3, 3, 3, 9_000)
+                .unwrap();
+            (
+                PartFileSink::create(&store, &plan, 3, next_journal.bytes_received()).unwrap(),
+                next_lease,
+            )
         }
         Err(error) => panic!("unexpected generation staging error: {error}"),
     };
     let current_path = current_sink.path().to_path_buf();
     assert_ne!(retired_path, current_path);
     assert_eq!(std::fs::read(&current_path).unwrap(), b"abc");
+}
+
+#[test]
+fn fresh_fence_recovers_after_generation_staging_conflict() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"abc1234567");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let first_lease = store.acquire_for_fence(&plan, 1, 9_000, 1, 1).unwrap();
+    let first_journal = store
+        .claim(&first_lease, &plan, "owner-a", 1, 1, 1, 9_000)
+        .unwrap();
+    let mut first_sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+    let mut receiver =
+        TransferReceiver::resume_from_part(plan.clone(), first_journal, first_sink.path()).unwrap();
+    receiver
+        .receive(
+            &mut first_sink,
+            TransferChunk::new(0, 0, b"abc".to_vec()).unwrap(),
+        )
+        .unwrap();
+    store
+        .save(&first_lease, &receiver.journal_snapshot())
+        .unwrap();
+    drop(first_sink);
+    drop(first_lease);
+
+    // Model a Windows staging conflict: the journal claim committed epoch 2,
+    // while removing an open retired epoch-1 part failed and the staged epoch-2
+    // part was rolled back. A fresh coordinator generation must still recover.
+    let conflicted_lease = store.acquire_for_fence(&plan, 2, 9_000, 2, 2).unwrap();
+    let conflicted = store
+        .claim(&conflicted_lease, &plan, "owner-a", 2, 2, 2, 9_000)
+        .unwrap();
+    assert_eq!(conflicted.bytes_received(), 3);
+    drop(conflicted_lease);
+
+    let fresh_lease = store.acquire_for_fence(&plan, 3, 9_000, 3, 3).unwrap();
+    let fresh = store
+        .claim(&fresh_lease, &plan, "owner-a", 3, 3, 3, 9_000)
+        .unwrap();
+    let fresh_sink = PartFileSink::create(&store, &plan, 3, fresh.bytes_received()).unwrap();
+    assert_eq!(std::fs::read(fresh_sink.path()).unwrap(), b"abc");
+    let parts: Vec<_> = std::fs::read_dir(store.root())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+        .collect();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].path(), fresh_sink.path());
 }
 
 #[test]

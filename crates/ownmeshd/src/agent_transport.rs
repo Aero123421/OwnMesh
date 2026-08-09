@@ -461,9 +461,9 @@ async fn transfer_next_text(
     }
 }
 
-/// Only transport loss is safe for the coordinator to resume. Integrity,
-/// custody and binding failures deliberately remain terminal and never cause
-/// an automatic re-key/re-ticket attempt.
+/// Transport loss and a local generation-staging conflict are safe for the
+/// coordinator to resume with a fresh fence. Integrity, custody and binding
+/// failures deliberately remain terminal and never cause an automatic retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferSessionFailure {
     Reconnect,
@@ -472,6 +472,14 @@ enum TransferSessionFailure {
 }
 
 fn classify_transfer_failure(error: &str) -> TransferSessionFailure {
+    // A newly fenced destination may race an old process that still owns the
+    // retired part handle. Generation staging then fails without mutating the
+    // active part; only another fresh ticket/fence can safely retry it.
+    if error.contains("transfer lease is held by another owner")
+        || error.contains("journal lease or fence is stale")
+    {
+        return TransferSessionFailure::Reconnect;
+    }
     match error {
         "transfer cancelled" => TransferSessionFailure::Cancelled,
         "transfer socket closed; fresh ticket required for reconnect"
@@ -4940,6 +4948,14 @@ fn transfer_failure_classification_only_retries_connection_loss() {
     assert_eq!(
         classify_transfer_failure("transfer cancelled"),
         TransferSessionFailure::Cancelled
+    );
+    assert_eq!(
+        classify_transfer_failure("remote error: transfer lease is held by another owner"),
+        TransferSessionFailure::Reconnect
+    );
+    assert_eq!(
+        classify_transfer_failure("remote error: journal lease or fence is stale"),
+        TransferSessionFailure::Reconnect
     );
     for terminal in [
         "transfer frame binding mismatch",
