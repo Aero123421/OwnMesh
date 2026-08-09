@@ -2719,7 +2719,7 @@ fn map_request_to_method(
     // side-effect journal and deliberately expose strict, ticket/plan-bound
     // parameter schemas.  Still validate any duplicate arguments-side key
     // above, but do not leak the transport contract field into those schemas.
-    if internal_preflight || internal_start {
+    if internal_preflight || internal_start || request.capability == "transfer.artifact_get" {
         args.remove("idempotency_key");
     } else {
         args.insert(
@@ -4740,6 +4740,31 @@ mod tests {
         let mut mismatched_preflight = request.clone();
         mismatched_preflight.arguments["idempotency_key"] = json!("other-contract");
         assert!(map_request_to_method(&mismatched_preflight)
+            .unwrap_err()
+            .contains("differs from operation contract"));
+
+        let artifact = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_artifact_get_1").unwrap(),
+            capability: "transfer.artifact_get".into(),
+            workspace_id: Some(ownmesh_domain::WorkspaceId::parse("ws_destination").unwrap()),
+            idempotency_key: "idem_artifact_get_1".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({
+                "action": "artifact_get",
+                "plan_id": "plan_destination",
+                "offset": 0,
+                "max_bytes": 32768,
+            }),
+        };
+        let (method, args) = map_request_to_method(&artifact).unwrap();
+        assert_eq!(method, methods::TRANSFER_ARTIFACT_GET);
+        assert_eq!(args["workspace_id"], json!("ws_destination"));
+        assert!(args.get("idempotency_key").is_none());
+        let mut mismatched_artifact = artifact;
+        mismatched_artifact.arguments["idempotency_key"] = json!("other-contract");
+        assert!(map_request_to_method(&mismatched_artifact)
             .unwrap_err()
             .contains("differs from operation contract"));
 
