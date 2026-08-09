@@ -174,6 +174,11 @@ pub enum StreamKind {
 pub struct ControllerLease {
     pub principal_id: String,
     pub lease_id: String,
+    /// Monotonic generation for this session's controller seat. A request must
+    /// echo both lease_id and epoch; an old controller cannot mutate after a
+    /// handoff, expiry reclaim, or reconnect claim.
+    #[serde(default)]
+    pub epoch: u64,
     pub expires_unix: i64,
 }
 
@@ -193,6 +198,10 @@ pub struct SessionInfo {
     pub state: SessionState,
     pub title: String,
     pub controller: Option<ControllerLease>,
+    /// Last issued controller generation, retained even while detached so the
+    /// next claim cannot reuse an epoch after restart.
+    #[serde(default)]
+    pub controller_epoch: u64,
     pub observers: Vec<String>,
     pub cols: u16,
     pub rows: u16,
@@ -370,6 +379,7 @@ impl SessionManager {
         let lease = ControllerLease {
             principal_id: creator.clone(),
             lease_id: format!("lease_{}", Uuid::new_v4().simple()),
+            epoch: 1,
             expires_unix: now_unix + self.default_lease_ttl_secs,
         };
         let size = size.unwrap_or_default();
@@ -379,6 +389,7 @@ impl SessionManager {
             state: SessionState::Running,
             title: title.into(),
             controller: Some(lease),
+            controller_epoch: 1,
             observers: vec![],
             cols: size.cols,
             rows: size.rows,
@@ -492,12 +503,19 @@ impl SessionManager {
             }
         }
         s.info.observers.retain(|o| o != &principal);
+        let epoch = s
+            .info
+            .controller_epoch
+            .checked_add(1)
+            .ok_or_else(|| SessionError::Invalid("controller epoch exhausted".into()))?;
         let lease = ControllerLease {
             principal_id: principal,
             lease_id: format!("lease_{}", Uuid::new_v4().simple()),
+            epoch,
             expires_unix: now_unix + self.default_lease_ttl_secs,
         };
         s.info.controller = Some(lease.clone());
+        s.info.controller_epoch = epoch;
         s.info.state = SessionState::Running;
         Ok(lease)
     }
@@ -523,12 +541,19 @@ impl SessionManager {
         }
         let to = to.into();
         s.info.observers.retain(|o| o != &to);
+        let epoch = s
+            .info
+            .controller_epoch
+            .checked_add(1)
+            .ok_or_else(|| SessionError::Invalid("controller epoch exhausted".into()))?;
         let lease = ControllerLease {
             principal_id: to,
             lease_id: format!("lease_{}", Uuid::new_v4().simple()),
+            epoch,
             expires_unix: now_unix + self.default_lease_ttl_secs,
         };
         s.info.controller = Some(lease.clone());
+        s.info.controller_epoch = epoch;
         Ok(lease)
     }
 
