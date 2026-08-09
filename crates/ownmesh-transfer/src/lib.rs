@@ -1153,6 +1153,41 @@ impl JournalStore {
         Ok(self.root.join(format!(".{plan_id}{suffix}")))
     }
 
+    fn part_path(&self, plan_id: &str, epoch: u64) -> TransferResult<PathBuf> {
+        if epoch == 0 {
+            return Err(TransferError::StaleFence);
+        }
+        self.path(plan_id, &format!(".{epoch}.part"))
+    }
+
+    fn generation_parts(&self, plan_id: &str) -> TransferResult<Vec<(u64, PathBuf)>> {
+        let prefix = format!(".{plan_id}.");
+        let mut parts = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(epoch) = name
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".part"))
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if epoch == 0 || self.part_path(plan_id, epoch)? != path {
+                return Err(TransferError::CustodyUnavailable);
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
+            if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
+                return Err(TransferError::CustodyUnavailable);
+            }
+            parts.push((epoch, path));
+        }
+        parts.sort_by_key(|(epoch, _)| *epoch);
+        Ok(parts)
+    }
+
     fn lock_store(&self) -> TransferResult<StoreLock> {
         self.lock_store_with_attempts(20)
     }
@@ -1673,7 +1708,7 @@ impl JournalStore {
         if journal.state != JournalState::Completed || journal.bytes_received != plan.size_bytes {
             return Err(TransferError::Terminal);
         }
-        let part = self.path(plan.id(), ".part")?;
+        let part = self.part_path(plan.id(), journal.epoch)?;
         let mut file = open_owner_only_file_append_linkable(&part)
             .map_err(|_| TransferError::CustodyUnavailable)?;
         file.seek(SeekFrom::Start(0)).map_err(io_error)?;
@@ -1763,11 +1798,7 @@ impl JournalStore {
         }
         let mut removed = 0;
         for (journal_path, journal) in expired {
-            let part = self.path(&journal.plan_id, ".part")?;
-            if let Ok(metadata) = fs::symlink_metadata(&part) {
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
-                    return Err(TransferError::CustodyUnavailable);
-                }
+            for (_, part) in self.generation_parts(&journal.plan_id)? {
                 remove_owner_only_file(&part).map_err(|_| TransferError::CustodyUnavailable)?;
             }
             let source = self.path(&journal.plan_id, ".source")?;
@@ -1883,8 +1914,9 @@ impl JournalStore {
     }
 }
 
-/// Private `.part` sink. It writes in-order, syncs before acknowledgement, and
-/// deletes only its exact generated part on cancellation.
+/// Private generation-bound part sink. A newer fence copies only the prior
+/// durable ACK prefix into a new inode/path, so a retired process holding the
+/// old file handle cannot append into the active generation.
 pub struct PartFileSink {
     path: PathBuf,
     file: Option<File>,
@@ -1903,10 +1935,73 @@ impl PartFileSink {
         resume_at: u64,
     ) -> TransferResult<Self> {
         plan.validate_at(now_unix())?;
-        let _ = epoch;
-        let path = store.path(plan.id(), ".part")?;
-        if create_owner_only_file_new(&path, &[]).is_err() && !path.exists() {
-            return Err(TransferError::CustodyUnavailable);
+        if resume_at > plan.size_bytes {
+            return Err(TransferError::CorruptJournal);
+        }
+        let path = store.part_path(plan.id(), epoch)?;
+        let existing = store.generation_parts(plan.id())?;
+        if existing.len() > 1 {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        let retired_bytes = existing.iter().try_fold(0_u64, |total, (_, candidate)| {
+            let len = fs::metadata(candidate).map_err(io_error)?.len();
+            if len > plan.size_bytes {
+                return Err(TransferError::JournalQuotaExceeded);
+            }
+            total.checked_add(len).ok_or(TransferError::Overflow)
+        })?;
+        if retired_bytes > plan.size_bytes
+            || retired_bytes
+                .checked_add(resume_at)
+                .ok_or(TransferError::Overflow)?
+                > plan.size_bytes.saturating_mul(2)
+        {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        let current_exists = existing.iter().any(|(_, candidate)| candidate == &path);
+        if !current_exists {
+            let predecessor = if resume_at > 0 {
+                Some(
+                    existing
+                        .iter()
+                        .rev()
+                        .find(|(candidate_epoch, _)| *candidate_epoch < epoch)
+                        .ok_or(TransferError::CorruptJournal)?,
+                )
+            } else {
+                None
+            };
+            create_owner_only_file_new(&path, &[]).map_err(|_| TransferError::LeaseBusy)?;
+            let staged = (|| -> TransferResult<()> {
+                let mut file = open_owner_only_file_append(&path)
+                    .map_err(|_| TransferError::CustodyUnavailable)?;
+                if let Some((_, predecessor)) = predecessor {
+                    let mut prior = open_owner_only_file_read_retry(predecessor)
+                        .map_err(|_| TransferError::CustodyUnavailable)?;
+                    if prior.metadata().map_err(io_error)?.len() < resume_at {
+                        return Err(TransferError::CorruptJournal);
+                    }
+                    let copied = std::io::copy(
+                        &mut std::io::Read::by_ref(&mut prior).take(resume_at),
+                        &mut file,
+                    )
+                    .map_err(io_error)?;
+                    if copied != resume_at {
+                        return Err(TransferError::CorruptJournal);
+                    }
+                }
+                file.sync_all().map_err(io_error)
+            })();
+            if let Err(error) = staged {
+                let _ = remove_owner_only_file_retry(&path);
+                return Err(error);
+            }
+            for (_, retired) in &existing {
+                if remove_owner_only_file_retry(retired).is_err() {
+                    let _ = remove_owner_only_file_retry(&path);
+                    return Err(TransferError::LeaseBusy);
+                }
+            }
         }
         let mut file =
             open_owner_only_file_append(&path).map_err(|_| TransferError::CustodyUnavailable)?;

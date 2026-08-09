@@ -568,6 +568,17 @@ async fn run_source_transfer_pump(
             {
                 return Err("transfer finish acknowledgement binding mismatch".into());
             }
+            // Only the authenticated Room finish_ack makes source custody
+            // terminal. Before it, the retained snapshot is the sole safe
+            // resume source if the original pathname changes or disappears.
+            let _ = transfer_runtime_call(
+                runtime,
+                authority,
+                methods::TRANSFER_CANCEL,
+                json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence}),
+                None,
+            )
+            .await;
             return Ok(
                 json!({"transfer_id":ticket.transfer_id,"state":"source_finished","plan_sha256":ticket.plan_sha256}),
             );

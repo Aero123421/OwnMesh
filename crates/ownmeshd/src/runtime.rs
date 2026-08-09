@@ -2794,9 +2794,10 @@ full_user_access/full_access for arbitrary commands",
         let Some(chunk) = next else {
             self.transfer_senders.remove(plan.id());
             self.transfer_last_chunks.remove(plan.id());
-            self.transfer_store
-                .remove_source_terminal_state(&plan)
-                .map_err(Self::transfer_error)?;
+            // Keep the immutable source snapshot + plan until the Agent has
+            // received the Room's authenticated finish_ack. A disconnect
+            // after the last destination ACK must be able to reopen exactly
+            // this retained handle at offset == size without trusting a path.
             return Ok(json!({ "plan_id": plan.id(), "sequence": p.sequence, "eof": true }));
         };
         if chunk.sequence != p.sequence {
@@ -8734,6 +8735,59 @@ mod transfer_runtime_tests {
             )
             .await
             .unwrap();
+
+        let first = source
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 0 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["eof"], Value::Null);
+        let eof = source
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 1 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(eof["eof"], json!(true));
+        std::fs::write(
+            source_paths.state_dir.join("workspace").join("source.bin"),
+            b"mutated after final destination ACK",
+        )
+        .unwrap();
+        source
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "sequence": 1, "offset": content.len(), "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .expect("retained source snapshot must reopen after pathname mutation");
+        assert_eq!(
+            source
+                .handle_transfer_source_chunk(
+                    Some(json!({ "plan_id": plan_id, "sequence": 1 })),
+                    &client,
+                )
+                .await
+                .unwrap()["eof"],
+            json!(true)
+        );
+        source
+            .handle_transfer_cancel(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1 })),
+                &client,
+            )
+            .await
+            .expect("finish_ack cleanup removes retained source custody");
+        assert!(source
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "sequence": 1, "offset": content.len(), "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

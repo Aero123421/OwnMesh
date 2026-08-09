@@ -306,6 +306,112 @@ fn newer_fence_reclaims_crash_orphan_and_retired_holder_cannot_save() {
 }
 
 #[test]
+fn retired_holder_late_write_is_isolated_from_new_generation_part() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"abclate!");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let retired_lease = store.acquire_for_fence(&plan, 1, 9_000, 1, 1).unwrap();
+    let retired_journal = store
+        .claim(&retired_lease, &plan, "owner-a", 1, 1, 1, 9_000)
+        .unwrap();
+    let mut retired_sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+    let retired_path = retired_sink.path().to_path_buf();
+    let mut retired_receiver =
+        TransferReceiver::resume_from_part(plan.clone(), retired_journal, &retired_path).unwrap();
+    retired_receiver
+        .receive(
+            &mut retired_sink,
+            TransferChunk::new(0, 0, b"abc".to_vec()).unwrap(),
+        )
+        .unwrap();
+    store
+        .save(&retired_lease, &retired_receiver.journal_snapshot())
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_barrier = Arc::clone(&barrier);
+    let retired_store = store.clone();
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        retired_receiver
+            .receive(
+                &mut retired_sink,
+                TransferChunk::new(1, 3, b"late".to_vec()).unwrap(),
+            )
+            .unwrap();
+        retired_store.save(&retired_lease, &retired_receiver.journal_snapshot())
+    });
+
+    let current_lease = store.acquire_for_fence(&plan, 2, 9_000, 2, 2).unwrap();
+    let current_journal = store
+        .claim(&current_lease, &plan, "owner-a", 2, 2, 2, 9_000)
+        .unwrap();
+    let first_attempt = PartFileSink::create(&store, &plan, 2, current_journal.bytes_received());
+    assert!(first_attempt.is_ok() || matches!(&first_attempt, Err(TransferError::LeaseBusy)));
+    barrier.wait();
+    assert_eq!(writer.join().unwrap(), Err(TransferError::StaleFence));
+    let current_sink = match first_attempt {
+        Ok(sink) => sink,
+        Err(TransferError::LeaseBusy) => {
+            PartFileSink::create(&store, &plan, 2, current_journal.bytes_received()).unwrap()
+        }
+        Err(error) => panic!("unexpected generation staging error: {error}"),
+    };
+    let current_path = current_sink.path().to_path_buf();
+    assert_ne!(retired_path, current_path);
+    assert_eq!(std::fs::read(&current_path).unwrap(), b"abc");
+}
+
+#[test]
+fn repeated_fence_resume_keeps_one_bounded_generation_part() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"abc1234567");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let first_lease = store.acquire_for_fence(&plan, 1, 9_000, 1, 1).unwrap();
+    let first_journal = store
+        .claim(&first_lease, &plan, "owner-a", 1, 1, 1, 9_000)
+        .unwrap();
+    let mut first_sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+    let mut receiver =
+        TransferReceiver::resume_from_part(plan.clone(), first_journal, first_sink.path()).unwrap();
+    receiver
+        .receive(
+            &mut first_sink,
+            TransferChunk::new(0, 0, b"abc".to_vec()).unwrap(),
+        )
+        .unwrap();
+    store
+        .save(&first_lease, &receiver.journal_snapshot())
+        .unwrap();
+    drop(first_sink);
+    drop(first_lease);
+
+    for epoch in 2..=24_u64 {
+        let lease = store
+            .acquire_for_fence(&plan, epoch, 9_000, epoch, epoch)
+            .unwrap();
+        let journal = store
+            .claim(&lease, &plan, "owner-a", epoch, epoch, epoch, 9_000)
+            .unwrap();
+        let sink = PartFileSink::create(&store, &plan, epoch, journal.bytes_received()).unwrap();
+        assert_eq!(std::fs::read(sink.path()).unwrap(), b"abc");
+        let parts: Vec<_> = std::fs::read_dir(store.root())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert_eq!(
+            parts.len(),
+            1,
+            "retired generation parts must not accumulate"
+        );
+        assert_eq!(parts[0].metadata().unwrap().len(), 3);
+        drop(sink);
+        drop(lease);
+    }
+}
+
+#[test]
 fn startup_cleanup_removes_only_expired_owned_part() {
     let dir = tempdir().unwrap();
     let plan = make_plan(b"hello");
