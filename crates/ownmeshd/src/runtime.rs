@@ -3177,6 +3177,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     },
                     cols: size.cols,
                     rows: size.rows,
+                    io_mode: ownmesh_session_host::HostIoMode::Pty,
+                    profile_id: None,
+                    adapter_dialect: None,
                 };
                 let binding = {
                     let supervisor = self.ensure_remote_supervisor().await?;

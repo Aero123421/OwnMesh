@@ -141,6 +141,7 @@ impl StructuredProcessHost {
 
     pub fn drain_stdout(&self, max: usize) -> Result<RawDrainOutput, String> { drain_ring(&self.stdout, max) }
     pub fn drain_stderr(&self, max: usize) -> Result<RawDrainOutput, String> { drain_ring(&self.stderr, max) }
+    pub fn pending_output_bytes(&self) -> usize { self.stdout.lock().map(|r| r.remaining()).unwrap_or(0).saturating_add(self.stderr.lock().map(|r| r.remaining()).unwrap_or(0)) }
 
     pub fn terminate(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::SeqCst);

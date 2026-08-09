@@ -8,6 +8,7 @@ use ownmesh_ipc::{
     atomic_write_owner_only, create_owner_only_file_new, prepare_owner_only_state_dir,
     read_owner_only_file_bounded,
 };
+use crate::HostIoMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,12 @@ pub struct HostManifest {
     pub device_id: String,
     pub workspace_id: String,
     pub owner_principal: String,
+    #[serde(default)]
+    pub io_mode: HostIoMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_dialect: Option<String>,
     /// `false` after exact detach: the PTY/spool remains alive but no binding
     /// may mutate it until a claim CAS installs a successor controller.
     #[serde(default = "default_controller_attached")]
@@ -91,6 +98,9 @@ impl HostManifest {
             device_id: device_id.into(),
             workspace_id: workspace_id.into(),
             owner_principal: owner_principal.into(),
+            io_mode: HostIoMode::Pty,
+            profile_id: None,
+            adapter_dialect: None,
             controller_attached: true,
             host_nonce: format!("host_{}", Uuid::new_v4().simple()),
             controller_epoch,

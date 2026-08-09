@@ -5,7 +5,7 @@
 //! enforced by `ownmesh-ipc`; this module additionally binds every operation to
 //! the exact manifest nonce and controller epoch.
 
-use crate::{HostManifest, SupervisorBinding, SupervisorState};
+use crate::{HostIoMode, HostManifest, SupervisorBinding, SupervisorState};
 use ownmesh_ipc::{
     app_error, current_os_user_id, AuthGate, BootstrapStatus, ClientIdentity, ClientOptions,
     CredentialSecretResult, Endpoint, IpcBus, IpcClient, IpcError, IpcResult, IpcServer,
@@ -40,6 +40,12 @@ pub struct SupervisorSpawnRequest {
     pub command: SupervisorCommand,
     pub cols: u16,
     pub rows: u16,
+    #[serde(default)]
+    pub io_mode: HostIoMode,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub adapter_dialect: Option<String>,
 }
 
 /// Serializable bounded command description for local IPC only.
@@ -356,7 +362,7 @@ async fn dispatch(
         SupervisorRpcMethods::SPAWN => {
             let params: SupervisorSpawnRequest = parse(params)?;
             validate_spawn(&params)?;
-            let manifest = HostManifest::new(
+            let mut manifest = HostManifest::new(
                 params.session_id,
                 params.device_id,
                 params.workspace_id,
@@ -366,14 +372,18 @@ async fn dispatch(
                 params.host_expires_unix,
             )
             .map_err(invalid)?;
+            manifest.io_mode = params.io_mode;
+            manifest.profile_id.clone_from(&params.profile_id);
+            manifest.adapter_dialect.clone_from(&params.adapter_dialect);
             let binding = state
-                .spawn(
+                .spawn_with_io(
                     manifest,
                     params.command.into_command(),
                     PtySize {
                         cols: params.cols,
                         rows: params.rows,
                     },
+                    params.io_mode,
                 )
                 .await
                 .map_err(invalid)?;
@@ -408,7 +418,7 @@ async fn dispatch(
                 return Err(invalid("invalid supervisor drain budget"));
             }
             Ok(json!(state
-                .drain(&params.binding, params.offset, params.max_bytes)
+                .drain(&params.binding, params.offset, params.max_bytes, params.stream.as_deref() == Some("stderr"))
                 .await
                 .map_err(invalid)?))
         }
@@ -566,6 +576,10 @@ fn validate_spawn(params: &SupervisorSpawnRequest) -> IpcResult<()> {
     if let Some(cwd) = &params.command.cwd {
         require_component(cwd, "cwd")?;
     }
+    if matches!(params.io_mode, HostIoMode::StructuredPipes) {
+        require_component(params.profile_id.as_deref().unwrap_or(""), "profile_id")?;
+        require_component(params.adapter_dialect.as_deref().unwrap_or(""), "adapter_dialect")?;
+    }
     Ok(())
 }
 
@@ -625,6 +639,8 @@ struct DrainParams {
     binding: SupervisorBinding,
     offset: u64,
     max_bytes: usize,
+    #[serde(default)]
+    stream: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

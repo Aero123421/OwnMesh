@@ -1,6 +1,7 @@
 //! In-process state behind the persistent local session-supervisor IPC service.
 
-use crate::{HostManifest, LiveHost, OwnerSpool, SpoolPage};
+use crate::{HostIoMode, HostManifest, LiveHost, OwnerSpool, SpoolPage, StructuredProcessHost};
+use crate::pty_host::RawDrainOutput;
 use ownmesh_session::{PtyCommand, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,7 +45,18 @@ pub struct SupervisorStatus {
 struct Hosted {
     manifest: HostManifest,
     spool: OwnerSpool,
-    host: LiveHost,
+    stderr_spool: Option<OwnerSpool>,
+    host: HostedHost,
+}
+
+enum HostedHost { Pty(LiveHost), Structured(StructuredProcessHost) }
+
+impl HostedHost {
+    fn write(&self, bytes: &[u8]) -> Result<(), String> { match self { Self::Pty(h) => h.write_stdin(bytes), Self::Structured(h) => h.write_frame(bytes) } }
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> { match self { Self::Pty(h) => h.resize(cols, rows), Self::Structured(_) => Err("structured pipe hosts cannot resize".into()) } }
+    fn drain(&self, stderr: bool, max: usize) -> Result<RawDrainOutput, String> { match self { Self::Pty(h) if stderr => Ok((Vec::new(), false, h.is_exited(), None, 0)), Self::Pty(h) => h.drain_output_bytes(max), Self::Structured(h) if stderr => h.drain_stderr(max), Self::Structured(h) => h.drain_stdout(max) } }
+    fn terminate(&mut self) -> Result<(), String> { match self { Self::Pty(h) => h.terminate(), Self::Structured(h) => h.terminate() } }
+    fn status(&self) -> SupervisorStatus { match self { Self::Pty(h) => status(h), Self::Structured(h) => SupervisorStatus { pid: h.handle.pid, pending_output_bytes: h.pending_output_bytes(), exited: false } } }
 }
 
 /// Bounded supervisor host map. A disconnected daemon client leaves this
@@ -68,6 +80,14 @@ impl SupervisorState {
         manifest: HostManifest,
         command: PtyCommand,
         size: PtySize,
+    ) -> Result<SupervisorBinding, String> { self.spawn_with_io(manifest, command, size, HostIoMode::Pty).await }
+
+    pub async fn spawn_with_io(
+        &self,
+        manifest: HostManifest,
+        command: PtyCommand,
+        size: PtySize,
+        io_mode: HostIoMode,
     ) -> Result<SupervisorBinding, String> {
         // Refuse bad TTLs before allocating a PTY/process tree.
         manifest.validate_runtime_lifetimes(unix_now())?;
@@ -78,16 +98,18 @@ impl SupervisorState {
         if hosts.contains_key(&manifest.session_id) {
             return Err("supervisor host already live".into());
         }
-        let host = LiveHost::spawn(&command, size)?;
+        let host = match io_mode { HostIoMode::Pty => HostedHost::Pty(LiveHost::spawn(&command, size)?), HostIoMode::StructuredPipes => HostedHost::Structured(StructuredProcessHost::spawn(&command, size)?) };
         // Do not reserve durable identity until a PTY exists. If custody/spool
         // creation fails, dropping this newly spawned host cleans its tree.
         let spool = OwnerSpool::create(&self.root, manifest.clone())?;
+        let stderr_spool = matches!(io_mode, HostIoMode::StructuredPipes).then(|| OwnerSpool::create(&self.root.join("stderr"), manifest.clone())).transpose()?;
         let binding = binding_of(&manifest);
         hosts.insert(
             manifest.session_id.clone(),
             Hosted {
                 manifest,
                 spool,
+                stderr_spool,
                 host,
             },
         );
@@ -95,24 +117,24 @@ impl SupervisorState {
     }
 
     pub async fn reattach(&self, binding: &SupervisorBinding) -> Result<SupervisorStatus, String> {
-        let hosts = self.hosts.lock().await;
+        let mut hosts = self.hosts.lock().await;
         let hosted = hosts
-            .get(&binding.session_id)
+            .get_mut(&binding.session_id)
             .ok_or("supervisor host unavailable")?;
         exact_identity(binding, &hosted.manifest)?;
-        Ok(status(&hosted.host))
+        Ok(hosted.host.status())
     }
 
     pub async fn write(&self, binding: &SupervisorBinding, bytes: &[u8]) -> Result<(), String> {
         if bytes.len() > MAX_STDIN_BYTES {
             return Err("supervisor stdin frame exceeds budget".into());
         }
-        let hosts = self.hosts.lock().await;
+        let mut hosts = self.hosts.lock().await;
         let hosted = hosts
-            .get(&binding.session_id)
+            .get_mut(&binding.session_id)
             .ok_or("supervisor host unavailable")?;
         exact(binding, &hosted.manifest)?;
-        hosted.host.write_stdin(bytes)
+        hosted.host.write(bytes)
     }
 
     pub async fn resize(
@@ -137,17 +159,19 @@ impl SupervisorState {
         binding: &SupervisorBinding,
         offset: u64,
         max_bytes: usize,
+        stderr: bool,
     ) -> Result<SpoolPage, String> {
-        let hosts = self.hosts.lock().await;
+        let mut hosts = self.hosts.lock().await;
         let hosted = hosts
-            .get(&binding.session_id)
+            .get_mut(&binding.session_id)
             .ok_or("supervisor host unavailable")?;
         exact(binding, &hosted.manifest)?;
-        let (bytes, truncated, _, _, _) = hosted.host.drain_output_bytes(max_bytes)?;
+        let (bytes, truncated, _, _, _) = hosted.host.drain(stderr, max_bytes)?;
+        let spool = if stderr { hosted.stderr_spool.as_mut().ok_or("stderr stream unavailable")? } else { &mut hosted.spool };
         if !bytes.is_empty() {
-            hosted.spool.append(&bytes)?;
+            spool.append(&bytes)?;
         }
-        let mut page = hosted.spool.read_page(offset, max_bytes)?;
+        let mut page = spool.read_page(offset, max_bytes)?;
         page.truncated |= truncated;
         Ok(page)
     }
