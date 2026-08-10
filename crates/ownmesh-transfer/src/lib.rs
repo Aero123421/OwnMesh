@@ -497,6 +497,15 @@ fn validate_retained_file(file: &File) -> TransferResult<()> {
     Ok(())
 }
 
+fn owner_only_file_present(path: &Path) -> TransferResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !is_reparse_or_symlink(&metadata) => Ok(true),
+        Ok(_) => Err(TransferError::CustodyUnavailable),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error(error)),
+    }
+}
+
 /// A bounded binary frame. Header: sequence (u64 BE), offset (u64 BE), length
 /// (u32 BE), SHA-256 (32 bytes), then payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1111,6 +1120,105 @@ struct SourceReservation {
     expires_at_unix: u64,
     bytes: u64,
 }
+
+const SOURCE_CLEANUP_SCHEMA: u8 = 1;
+const MAX_SOURCE_CLEANUP_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Exact authenticated facts allowed to resume a source cleanup after the
+/// immutable plan itself has already been deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCleanupBinding {
+    pub plan_id: String,
+    pub tenant_id: String,
+    pub principal_id: String,
+    pub device_id: String,
+    pub epoch: u64,
+    pub fence: u64,
+}
+
+impl SourceCleanupBinding {
+    fn validate(&self) -> TransferResult<()> {
+        if !self.plan_id.starts_with("xfer_")
+            || self.plan_id.len() != 37
+            || !self.plan_id[5..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            || self.epoch == 0
+            || self.fence == 0
+        {
+            return Err(TransferError::InvalidBinding(
+                "source cleanup binding".into(),
+            ));
+        }
+        valid_id(&self.tenant_id, "source cleanup tenant")?;
+        valid_id(&self.principal_id, "source cleanup principal")?;
+        valid_id(&self.device_id, "source cleanup device")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceCleanupPhase {
+    Intent,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceCleanupReceipt {
+    schema: u8,
+    phase: SourceCleanupPhase,
+    plan_id: String,
+    plan_sha256: String,
+    source_sha256: String,
+    source_size: u64,
+    tenant_id: String,
+    principal_id: String,
+    device_id: String,
+    epoch: u64,
+    fence: u64,
+    expires_at_unix: u64,
+}
+
+impl SourceCleanupReceipt {
+    fn validate(&self) -> TransferResult<()> {
+        SourceCleanupBinding {
+            plan_id: self.plan_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            principal_id: self.principal_id.clone(),
+            device_id: self.device_id.clone(),
+            epoch: self.epoch,
+            fence: self.fence,
+        }
+        .validate()?;
+        if self.schema != SOURCE_CLEANUP_SCHEMA
+            || self.expires_at_unix == 0
+            || self.source_size > PlanLimits::default().max_bytes
+        {
+            return Err(TransferError::CorruptJournal);
+        }
+        validate_hash(&self.plan_sha256, "source cleanup plan sha256")?;
+        validate_hash(&self.source_sha256, "source cleanup source sha256")?;
+        if self.plan_id != format!("xfer_{}", &self.plan_sha256[..32]) {
+            return Err(TransferError::CorruptJournal);
+        }
+        Ok(())
+    }
+
+    fn exact_binding(&self, binding: &SourceCleanupBinding) -> bool {
+        self.plan_id == binding.plan_id
+            && self.tenant_id == binding.tenant_id
+            && self.principal_id == binding.principal_id
+            && self.device_id == binding.device_id
+            && self.epoch == binding.epoch
+            && self.fence == binding.fence
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceCleanupOutcome {
+    pub replayed: bool,
+}
 impl Drop for JournalLease {
     fn drop(&mut self) {
         // A stale holder must never unlink a newly acquired lease. Serialize
@@ -1456,6 +1564,9 @@ impl JournalStore {
         {
             let _store_lock = self.lock_store()?;
             self.cleanup_expired_unlocked(now_unix())?;
+            if owner_only_file_present(&self.path(plan.id(), ".source-cleanup.json")?)? {
+                return Err(TransferError::Terminal);
+            }
             if reservation.exists() {
                 let record = read_owner_only_file_bounded(&reservation, 512)
                     .map_err(|_| TransferError::CustodyUnavailable)?;
@@ -1575,12 +1686,242 @@ impl JournalStore {
         Ok(())
     }
 
+    fn load_source_cleanup_unlocked(
+        &self,
+        plan_id: &str,
+        now_unix: u64,
+    ) -> TransferResult<Option<SourceCleanupReceipt>> {
+        let path = self.path(plan_id, ".source-cleanup.json")?;
+        if !owner_only_file_present(&path)? {
+            return Ok(None);
+        }
+        let bytes = read_owner_only_file_bounded(&path, self.limits.max_bytes)
+            .map_err(|_| TransferError::CorruptJournal)?;
+        let receipt: SourceCleanupReceipt =
+            serde_json::from_slice(&bytes).map_err(|_| TransferError::CorruptJournal)?;
+        receipt.validate()?;
+        if receipt.plan_id != plan_id
+            || receipt.expires_at_unix
+                > now_unix
+                    .checked_add(MAX_SOURCE_CLEANUP_TTL_SECS)
+                    .ok_or(TransferError::Overflow)?
+        {
+            return Err(TransferError::CorruptJournal);
+        }
+        Ok(Some(receipt))
+    }
+
+    fn source_cleanup_usage_unlocked(&self, now_unix: u64) -> TransferResult<(usize, usize)> {
+        let mut count = 0_usize;
+        let mut bytes = 0_usize;
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(plan_id) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".source-cleanup.json"))
+            else {
+                continue;
+            };
+            if self.path(plan_id, ".source-cleanup.json")? != path {
+                return Err(TransferError::CorruptJournal);
+            }
+            let raw = read_owner_only_file_bounded(&path, self.limits.max_bytes)
+                .map_err(|_| TransferError::CorruptJournal)?;
+            let receipt: SourceCleanupReceipt =
+                serde_json::from_slice(&raw).map_err(|_| TransferError::CorruptJournal)?;
+            receipt.validate()?;
+            if receipt.plan_id != plan_id
+                || receipt.expires_at_unix
+                    > now_unix
+                        .checked_add(MAX_SOURCE_CLEANUP_TTL_SECS)
+                        .ok_or(TransferError::Overflow)?
+            {
+                return Err(TransferError::CorruptJournal);
+            }
+            count = count.checked_add(1).ok_or(TransferError::Overflow)?;
+            bytes = bytes
+                .checked_add(raw.len())
+                .ok_or(TransferError::Overflow)?;
+        }
+        Ok((count, bytes))
+    }
+
+    /// Durably record source cleanup intent before deleting either the source
+    /// snapshot or immutable plan. A retry can authenticate entirely from this
+    /// bounded non-bearer record after the plan pathname has disappeared.
+    pub fn begin_source_cleanup(
+        &self,
+        plan: &TransferPlan,
+        binding: &SourceCleanupBinding,
+        now_unix: u64,
+    ) -> TransferResult<()> {
+        binding.validate()?;
+        plan.validate_at(now_unix)?;
+        if plan.grant.expires_at_unix
+            > now_unix
+                .checked_add(MAX_SOURCE_CLEANUP_TTL_SECS)
+                .ok_or(TransferError::Overflow)?
+        {
+            return Err(TransferError::InvalidPlan(
+                "source cleanup receipt lifetime exceeds bound".into(),
+            ));
+        }
+        if binding.plan_id != plan.id
+            || binding.tenant_id != plan.binding.tenant_id
+            || binding.principal_id != plan.binding.source_principal_id
+            || binding.device_id != plan.binding.source_device_id
+        {
+            return Err(TransferError::StaleFence);
+        }
+        let _store_lock = self.lock_store()?;
+        self.cleanup_expired_unlocked(now_unix)?;
+        if let Some(existing) = self.load_source_cleanup_unlocked(plan.id(), now_unix)? {
+            return if existing.exact_binding(binding)
+                && existing.plan_sha256 == plan.plan_sha256
+                && existing.source_sha256 == plan.sha256
+                && existing.source_size == plan.size_bytes
+            {
+                Ok(())
+            } else {
+                Err(TransferError::StaleFence)
+            };
+        }
+        let receipt = SourceCleanupReceipt {
+            schema: SOURCE_CLEANUP_SCHEMA,
+            phase: SourceCleanupPhase::Intent,
+            plan_id: plan.id.clone(),
+            plan_sha256: plan.plan_sha256.clone(),
+            source_sha256: plan.sha256.clone(),
+            source_size: plan.size_bytes,
+            tenant_id: binding.tenant_id.clone(),
+            principal_id: binding.principal_id.clone(),
+            device_id: binding.device_id.clone(),
+            epoch: binding.epoch,
+            fence: binding.fence,
+            expires_at_unix: plan.grant.expires_at_unix,
+        };
+        let raw = serde_json::to_vec(&receipt).map_err(|_| TransferError::CorruptJournal)?;
+        if raw.len() > self.limits.max_bytes {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        let (count, bytes) = self.source_cleanup_usage_unlocked(now_unix)?;
+        if count >= self.limits.max_plans
+            || bytes
+                .checked_add(raw.len())
+                .ok_or(TransferError::Overflow)?
+                > self.limits.max_plan_bytes
+        {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        atomic_write_owner_only(&self.path(plan.id(), ".source-cleanup.json")?, &raw)
+            .map_err(|_| TransferError::CustodyUnavailable)
+    }
+
+    /// Resume an exact source cleanup intent. Validation precedes each delete;
+    /// a partial delete is safe to retry, while a substituted plan/snapshot is
+    /// rejected. `Completed` is written only after every exact source record is
+    /// absent, so only a pre-existing completed receipt reports replay.
+    pub fn complete_source_cleanup(
+        &self,
+        binding: &SourceCleanupBinding,
+        now_unix: u64,
+    ) -> TransferResult<Option<SourceCleanupOutcome>> {
+        binding.validate()?;
+        let _store_lock = self.lock_store()?;
+        let Some(mut receipt) = self.load_source_cleanup_unlocked(&binding.plan_id, now_unix)?
+        else {
+            return Ok(None);
+        };
+        if !receipt.exact_binding(binding) {
+            return Err(TransferError::StaleFence);
+        }
+        if receipt.expires_at_unix <= now_unix {
+            return Err(TransferError::InvalidPlan(
+                "expired source cleanup receipt".into(),
+            ));
+        }
+        let plan_path = self.path(&binding.plan_id, ".plan.json")?;
+        let snapshot_path = self.path(&binding.plan_id, ".source")?;
+        let reservation_path = self.path(&binding.plan_id, ".source.reserve")?;
+        if receipt.phase == SourceCleanupPhase::Completed {
+            if owner_only_file_present(&plan_path)?
+                || owner_only_file_present(&snapshot_path)?
+                || owner_only_file_present(&reservation_path)?
+            {
+                return Err(TransferError::CorruptJournal);
+            }
+            return Ok(Some(SourceCleanupOutcome { replayed: true }));
+        }
+        if owner_only_file_present(&plan_path)? {
+            let raw = read_owner_only_file_bounded(&plan_path, self.limits.max_bytes)
+                .map_err(|_| TransferError::CorruptJournal)?;
+            let plan: TransferPlan =
+                serde_json::from_slice(&raw).map_err(|_| TransferError::CorruptJournal)?;
+            plan.validate_at(now_unix)?;
+            if plan.id != receipt.plan_id
+                || plan.plan_sha256 != receipt.plan_sha256
+                || plan.sha256 != receipt.source_sha256
+                || plan.size_bytes != receipt.source_size
+                || plan.binding.tenant_id != receipt.tenant_id
+                || plan.binding.source_principal_id != receipt.principal_id
+                || plan.binding.source_device_id != receipt.device_id
+            {
+                return Err(TransferError::CorruptJournal);
+            }
+        }
+        if owner_only_file_present(&snapshot_path)? {
+            let mut snapshot = open_owner_only_file_read(&snapshot_path)
+                .map_err(|_| TransferError::CustodyUnavailable)?;
+            let metadata = snapshot.metadata().map_err(io_error)?;
+            if metadata.len() != receipt.source_size {
+                return Err(TransferError::CorruptJournal);
+            }
+            let (size, digest) = hash_reader(&mut snapshot, receipt.source_size)?;
+            if size != receipt.source_size || digest != receipt.source_sha256 {
+                return Err(TransferError::CorruptJournal);
+            }
+        }
+        if owner_only_file_present(&reservation_path)? {
+            let raw = read_owner_only_file_bounded(&reservation_path, 512)
+                .map_err(|_| TransferError::CustodyUnavailable)?;
+            let reservation = parse_source_reservation(&raw, &binding.plan_id)
+                .ok_or(TransferError::CustodyUnavailable)?;
+            if reservation.expires_at_unix != receipt.expires_at_unix
+                || reservation.bytes != receipt.source_size
+            {
+                return Err(TransferError::CorruptJournal);
+            }
+        }
+        for path in [&snapshot_path, &reservation_path, &plan_path] {
+            if owner_only_file_present(path)? {
+                remove_owner_only_file_retry(path)?;
+            }
+        }
+        if owner_only_file_present(&plan_path)?
+            || owner_only_file_present(&snapshot_path)?
+            || owner_only_file_present(&reservation_path)?
+        {
+            return Err(TransferError::CustodyUnavailable);
+        }
+        receipt.phase = SourceCleanupPhase::Completed;
+        let raw = serde_json::to_vec(&receipt).map_err(|_| TransferError::CorruptJournal)?;
+        atomic_write_owner_only(&self.path(&binding.plan_id, ".source-cleanup.json")?, &raw)
+            .map_err(|_| TransferError::CustodyUnavailable)?;
+        Ok(Some(SourceCleanupOutcome { replayed: false }))
+    }
+
     /// Persist immutable plan metadata separately from progress so a restarted
     /// daemon can reopen only the exact authorized transfer id.
     pub fn save_plan(&self, plan: &TransferPlan) -> TransferResult<()> {
         let _store_lock = self.lock_store()?;
         plan.validate_at(now_unix())?;
         self.cleanup_expired_unlocked(now_unix())?;
+        if owner_only_file_present(&self.path(plan.id(), ".source-cleanup.json")?)? {
+            return Err(TransferError::Terminal);
+        }
         let bytes = serde_json::to_vec(plan)
             .map_err(|_| TransferError::InvalidPlan("serialize plan".into()))?;
         if bytes.len() > self.limits.max_bytes {
@@ -1764,7 +2105,9 @@ impl JournalStore {
                 .filter(|entry| {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
-                    name.ends_with(".json") && !name.ends_with(".plan.json")
+                    name.ends_with(".json")
+                        && !name.ends_with(".plan.json")
+                        && !name.ends_with(".source-cleanup.json")
                 })
                 .count();
             if count >= self.limits.max_journals {
@@ -1887,7 +2230,9 @@ impl JournalStore {
             .filter(|path| {
                 path.file_name().is_some_and(|name| {
                     let name = name.to_string_lossy();
-                    name.ends_with(".json") && !name.ends_with(".plan.json")
+                    name.ends_with(".json")
+                        && !name.ends_with(".plan.json")
+                        && !name.ends_with(".source-cleanup.json")
                 })
             })
             .collect();
@@ -2021,6 +2366,41 @@ impl JournalStore {
             let reservation = parse_source_reservation(&bytes, plan_id)
                 .ok_or(TransferError::CustodyUnavailable)?;
             if reservation.expires_at_unix <= now_unix {
+                remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
+                removed += 1;
+            }
+        }
+        let (cleanup_count, cleanup_bytes) = self.source_cleanup_usage_unlocked(now_unix)?;
+        if cleanup_count > self.limits.max_plans || cleanup_bytes > self.limits.max_plan_bytes {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        for entry in fs::read_dir(&self.root).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(plan_id) = name
+                .strip_prefix('.')
+                .and_then(|value| value.strip_suffix(".source-cleanup.json"))
+            else {
+                continue;
+            };
+            let Some(receipt) = self.load_source_cleanup_unlocked(plan_id, now_unix)? else {
+                return Err(TransferError::CorruptJournal);
+            };
+            if receipt.expires_at_unix <= now_unix {
+                // Expired plans/snapshots/reservations were swept above. Never
+                // retain a completed or interrupted cleanup receipt past its
+                // immutable grant deadline.
+                let plan = self.path(plan_id, ".plan.json")?;
+                let snapshot = self.path(plan_id, ".source")?;
+                let reservation = self.path(plan_id, ".source.reserve")?;
+                if owner_only_file_present(&plan)?
+                    || owner_only_file_present(&snapshot)?
+                    || owner_only_file_present(&reservation)?
+                {
+                    return Err(TransferError::CustodyUnavailable);
+                }
                 remove_owner_only_file(&path).map_err(|_| TransferError::CustodyUnavailable)?;
                 removed += 1;
             }

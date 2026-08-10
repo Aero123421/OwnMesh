@@ -80,9 +80,9 @@ use ownmesh_session_host::{
     SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest,
 };
 use ownmesh_transfer::{
-    JournalLimits, JournalState, JournalStore, PartFileSink, PlanLimits, TransferBinding,
-    TransferChunk, TransferError, TransferGrant, TransferPlan, TransferReceiver, TransferSender,
-    MAX_CHUNK_BYTES,
+    JournalLimits, JournalState, JournalStore, PartFileSink, PlanLimits, SourceCleanupBinding,
+    TransferBinding, TransferChunk, TransferError, TransferGrant, TransferPlan, TransferReceiver,
+    TransferSender, MAX_CHUNK_BYTES,
 };
 use review_manifest::{
     ResultKind, ReviewCommand, ReviewManifest, ReviewManifestStore, ReviewPhase, ReviewResultChunk,
@@ -3164,6 +3164,25 @@ full_user_access/full_access for arbitrary commands",
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
+        let cleanup_binding = SourceCleanupBinding {
+            plan_id: p.plan_id.clone(),
+            tenant_id: authority.tenant_id.clone(),
+            principal_id: authority.principal_id.clone(),
+            device_id: authority.device_id.clone(),
+            epoch: p.epoch,
+            fence: p.fence,
+        };
+        if let Some(outcome) = self
+            .transfer_store
+            .complete_source_cleanup(&cleanup_binding, Self::now() as u64)
+            .map_err(Self::transfer_error)?
+        {
+            self.transfer_senders.remove(&p.plan_id);
+            self.transfer_last_chunks.remove(&p.plan_id);
+            return Ok(
+                json!({ "plan_id": p.plan_id, "cancelled": true, "source_only": true, "replayed": outcome.replayed }),
+            );
+        }
         let plan = self.transfer_plan_for(&p.plan_id, &authority, None)?;
         let journal = match self.transfer_store.load_for_fence(&plan, p.epoch, p.fence) {
             Ok(journal) => journal,
@@ -3178,9 +3197,19 @@ full_user_access/full_access for arbitrary commands",
                 self.transfer_senders.remove(plan.id());
                 self.transfer_last_chunks.remove(plan.id());
                 self.transfer_store
-                    .remove_source_terminal_state(&plan)
+                    .begin_source_cleanup(&plan, &cleanup_binding, Self::now() as u64)
                     .map_err(Self::transfer_error)?;
-                return Ok(json!({ "plan_id": plan.id(), "cancelled": true, "source_only": true }));
+                let outcome = self
+                    .transfer_store
+                    .complete_source_cleanup(&cleanup_binding, Self::now() as u64)
+                    .map_err(Self::transfer_error)?
+                    .ok_or_else(|| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: "source cleanup intent disappeared".into(),
+                    })?;
+                return Ok(
+                    json!({ "plan_id": plan.id(), "cancelled": true, "source_only": true, "replayed": outcome.replayed }),
+                );
             }
             Err(error) => return Err(Self::transfer_error(error)),
         };
@@ -8808,13 +8837,26 @@ mod transfer_runtime_tests {
                 .unwrap()["eof"],
             json!(true)
         );
-        source
+        let cleanup = source
             .handle_transfer_cancel(
                 Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1 })),
                 &client,
             )
             .await
             .expect("finish_ack cleanup removes retained source custody");
+        assert_eq!(cleanup["replayed"], json!(false));
+        drop(source);
+        let mut source = DaemonRuntime::open(&source_paths).unwrap();
+        bind_remote_transfer(&mut source);
+        source.active_remote_device_id = Some("dev_source".into());
+        let replayed = source
+            .handle_transfer_cancel(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1 })),
+                &client,
+            )
+            .await
+            .expect("lost cleanup reply replays from the completed tombstone");
+        assert_eq!(replayed["replayed"], json!(true));
         assert!(source
             .handle_transfer_source_open(
                 Some(json!({ "plan_id": plan_id, "sequence": 1, "offset": content.len(), "workspace_id": "ws_default" })),

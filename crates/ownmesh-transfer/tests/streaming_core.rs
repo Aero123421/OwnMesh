@@ -1,8 +1,8 @@
 use ownmesh_fs::WorkspaceRoot;
 use ownmesh_transfer::{
     ChunkSink, JournalLimits, JournalState, JournalStore, PartFileSink, PlanLimits,
-    TransferBinding, TransferChunk, TransferError, TransferGrant, TransferPlan, TransferReceiver,
-    MAX_CHUNK_BYTES,
+    SourceCleanupBinding, TransferBinding, TransferChunk, TransferError, TransferGrant,
+    TransferPlan, TransferReceiver, MAX_CHUNK_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
@@ -41,8 +41,26 @@ fn make_plan(bytes: &[u8]) -> TransferPlan {
     TransferPlan::from_verified(binding(), grant(), bytes.len() as u64, digest(bytes)).unwrap()
 }
 
+fn cleanup_binding(plan: &TransferPlan, epoch: u64, fence: u64) -> SourceCleanupBinding {
+    SourceCleanupBinding {
+        plan_id: plan.id().to_owned(),
+        tenant_id: plan.binding().tenant_id.clone(),
+        principal_id: plan.binding().source_principal_id.clone(),
+        device_id: plan.binding().source_device_id.clone(),
+        epoch,
+        fence,
+    }
+}
+
 fn workspace(dir: &std::path::Path) -> WorkspaceRoot {
     WorkspaceRoot::new(dir, true).unwrap()
+}
+
+fn write_owner_only_for_test(path: &std::path::Path, bytes: &[u8]) {
+    if path.exists() {
+        ownmesh_ipc::remove_owner_only_file(path).unwrap();
+    }
+    ownmesh_ipc::create_owner_only_file_new(path, bytes).unwrap();
 }
 
 #[derive(Default)]
@@ -941,6 +959,362 @@ fn source_terminal_cleanup_never_hides_snapshot_unlink_failure() {
         plan_path.exists(),
         "plan must remain retryable after cleanup failure"
     );
+}
+
+#[test]
+fn source_cleanup_intent_recovers_after_files_deleted_before_completed_receipt() {
+    let dir = tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut cleanup_grant = grant();
+    cleanup_grant.expires_at_unix = now + 60;
+    let plan = TransferPlan::from_verified(
+        binding(),
+        cleanup_grant,
+        b"cleanup-reply-loss".len() as u64,
+        digest(b"cleanup-reply-loss"),
+    )
+    .unwrap();
+    let root = dir.path().join("state");
+    let store = JournalStore::open(&root, JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    std::fs::write(dir.path().join("input.bin"), b"cleanup-reply-loss").unwrap();
+    let ws = workspace(dir.path());
+    drop(
+        store
+            .open_source_sender_at(
+                plan.clone(),
+                ws.open_verified_read("input.bin").unwrap(),
+                0,
+                0,
+            )
+            .unwrap(),
+    );
+    let binding = cleanup_binding(&plan, 3, 3);
+    store.begin_source_cleanup(&plan, &binding, now).unwrap();
+    let receipt = store
+        .root()
+        .join(format!(".{}.source-cleanup.json", plan.id()));
+    let source = store.root().join(format!(".{}.source", plan.id()));
+    let plan_path = store.root().join(format!(".{}.plan.json", plan.id()));
+    assert!(receipt.exists() && source.exists() && plan_path.exists());
+
+    // Crash window: the exact files disappeared, but the process died before
+    // atomically promoting Intent to Completed.
+    std::fs::remove_file(&source).unwrap();
+    std::fs::remove_file(&plan_path).unwrap();
+    drop(store);
+    let restored = JournalStore::open(&root, JournalLimits::default()).unwrap();
+    let completed = restored
+        .complete_source_cleanup(&binding, now + 1)
+        .unwrap()
+        .unwrap();
+    assert!(!completed.replayed);
+    assert!(
+        restored
+            .complete_source_cleanup(&binding, now + 1)
+            .unwrap()
+            .unwrap()
+            .replayed
+    );
+    assert_eq!(restored.save_plan(&plan), Err(TransferError::Terminal));
+
+    let mut wrong = binding.clone();
+    wrong.epoch += 1;
+    assert_eq!(
+        restored.complete_source_cleanup(&wrong, now + 1),
+        Err(TransferError::StaleFence)
+    );
+    let mut uppercase = binding.clone();
+    uppercase.plan_id = uppercase.plan_id.to_ascii_uppercase();
+    assert!(matches!(
+        restored.complete_source_cleanup(&uppercase, now + 1),
+        Err(TransferError::InvalidBinding(_))
+    ));
+}
+
+#[test]
+fn source_cleanup_intent_recovers_after_only_snapshot_was_deleted() {
+    let dir = tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut cleanup_grant = grant();
+    cleanup_grant.expires_at_unix = now + 60;
+    let plan = TransferPlan::from_verified(
+        binding(),
+        cleanup_grant,
+        b"cleanup-partial".len() as u64,
+        digest(b"cleanup-partial"),
+    )
+    .unwrap();
+    let root = dir.path().join("state");
+    let store = JournalStore::open(&root, JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    std::fs::write(dir.path().join("input.bin"), b"cleanup-partial").unwrap();
+    let ws = workspace(dir.path());
+    drop(
+        store
+            .open_source_sender_at(
+                plan.clone(),
+                ws.open_verified_read("input.bin").unwrap(),
+                0,
+                0,
+            )
+            .unwrap(),
+    );
+    let binding = cleanup_binding(&plan, 5, 5);
+    store.begin_source_cleanup(&plan, &binding, now).unwrap();
+    let source = store.root().join(format!(".{}.source", plan.id()));
+    let plan_path = store.root().join(format!(".{}.plan.json", plan.id()));
+
+    // The process died after its first exact delete. The surviving plan is
+    // revalidated before the retry removes it and promotes the tombstone.
+    std::fs::remove_file(&source).unwrap();
+    assert!(plan_path.exists());
+    drop(store);
+    let restored = JournalStore::open(&root, JournalLimits::default()).unwrap();
+    assert!(
+        !restored
+            .complete_source_cleanup(&binding, now + 1)
+            .unwrap()
+            .unwrap()
+            .replayed
+    );
+    assert!(!plan_path.exists());
+    assert!(
+        restored
+            .complete_source_cleanup(&binding, now + 1)
+            .unwrap()
+            .unwrap()
+            .replayed
+    );
+}
+
+#[test]
+fn source_cleanup_rejects_substituted_snapshot_and_corrupt_receipt() {
+    let dir = tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut cleanup_grant = grant();
+    cleanup_grant.expires_at_unix = now + 60;
+    let plan = TransferPlan::from_verified(
+        binding(),
+        cleanup_grant,
+        b"source-original".len() as u64,
+        digest(b"source-original"),
+    )
+    .unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    std::fs::write(dir.path().join("input.bin"), b"source-original").unwrap();
+    let ws = workspace(dir.path());
+    drop(
+        store
+            .open_source_sender_at(
+                plan.clone(),
+                ws.open_verified_read("input.bin").unwrap(),
+                0,
+                0,
+            )
+            .unwrap(),
+    );
+    let binding = cleanup_binding(&plan, 1, 1);
+    store.begin_source_cleanup(&plan, &binding, now).unwrap();
+    let source = store.root().join(format!(".{}.source", plan.id()));
+    std::fs::write(&source, b"source-tampered").unwrap();
+    assert_eq!(
+        store.complete_source_cleanup(&binding, now + 1),
+        Err(TransferError::CorruptJournal)
+    );
+    assert!(source.exists(), "substituted source must not be deleted");
+
+    let receipt = store
+        .root()
+        .join(format!(".{}.source-cleanup.json", plan.id()));
+    std::fs::write(&receipt, b"{}").unwrap();
+    assert_eq!(
+        store.complete_source_cleanup(&binding, now + 1),
+        Err(TransferError::CorruptJournal)
+    );
+}
+
+#[test]
+fn source_cleanup_rejects_substituted_plan_and_reservation_facts() {
+    let dir = tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut cleanup_grant = grant();
+    cleanup_grant.expires_at_unix = now + 60;
+    let plan = TransferPlan::from_verified(
+        binding(),
+        cleanup_grant,
+        b"cleanup-facts".len() as u64,
+        digest(b"cleanup-facts"),
+    )
+    .unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    let cleanup = cleanup_binding(&plan, 7, 7);
+    store.begin_source_cleanup(&plan, &cleanup, now).unwrap();
+    let plan_path = store.root().join(format!(".{}.plan.json", plan.id()));
+
+    let mut other_binding = binding();
+    other_binding.source_relative_path = "substituted.bin".into();
+    let mut other_grant = grant();
+    other_grant.grant_id = "grant-substituted".into();
+    other_grant.operation_id = "operation-substituted".into();
+    other_grant.expires_at_unix = now + 60;
+    let other_plan =
+        TransferPlan::from_verified(other_binding, other_grant, 4, digest(b"evil")).unwrap();
+    std::fs::write(&plan_path, serde_json::to_vec(&other_plan).unwrap()).unwrap();
+    assert_eq!(
+        store.complete_source_cleanup(&cleanup, now + 1),
+        Err(TransferError::CorruptJournal),
+        "a valid but different plan must not authorize cleanup",
+    );
+    assert!(plan_path.exists(), "substituted plan must not be deleted");
+
+    std::fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let reservation = store.root().join(format!(".{}.source.reserve", plan.id()));
+    let nonce = "00000000-0000-4000-8000-000000000000";
+    write_owner_only_for_test(
+        &reservation,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            plan.id(),
+            plan.grant().expires_at_unix,
+            plan.size_bytes() + 1,
+            nonce
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        store.complete_source_cleanup(&cleanup, now + 1),
+        Err(TransferError::CorruptJournal),
+        "a reservation with substituted bytes must fail closed",
+    );
+    assert!(
+        reservation.exists(),
+        "substituted reservation must not be deleted"
+    );
+
+    write_owner_only_for_test(
+        &reservation,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            plan.id(),
+            plan.grant().expires_at_unix - 1,
+            plan.size_bytes(),
+            nonce
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        store.complete_source_cleanup(&cleanup, now + 1),
+        Err(TransferError::CorruptJournal),
+        "a reservation with substituted expiry must fail closed",
+    );
+}
+
+#[test]
+fn expired_source_cleanup_receipt_and_source_state_are_swept() {
+    let dir = tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut cleanup_grant = grant();
+    cleanup_grant.expires_at_unix = now + 2;
+    let plan = TransferPlan::from_verified(
+        binding(),
+        cleanup_grant,
+        b"expire-cleanup".len() as u64,
+        digest(b"expire-cleanup"),
+    )
+    .unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    let binding = cleanup_binding(&plan, 1, 1);
+    store.begin_source_cleanup(&plan, &binding, now).unwrap();
+    assert_eq!(
+        store.complete_source_cleanup(&binding, now + 3),
+        Err(TransferError::InvalidPlan(
+            "expired source cleanup receipt".into()
+        ))
+    );
+    assert!(store.cleanup_expired(now + 3).unwrap() >= 2);
+    assert!(!store
+        .root()
+        .join(format!(".{}.source-cleanup.json", plan.id()))
+        .exists());
+    assert!(!store
+        .root()
+        .join(format!(".{}.plan.json", plan.id()))
+        .exists());
+}
+
+#[test]
+fn source_cleanup_receipts_have_count_byte_and_lifetime_bounds() {
+    let dir = tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let limits = JournalLimits {
+        max_journals: 4,
+        max_bytes: 4096,
+        max_snapshots: 2,
+        max_snapshot_bytes: 4096,
+        max_plans: 1,
+        max_plan_bytes: 4096,
+    };
+    let store = JournalStore::open(dir.path().join("state"), limits).unwrap();
+    let mut first_grant = grant();
+    first_grant.expires_at_unix = now + 60;
+    let first = TransferPlan::from_verified(binding(), first_grant, 3, digest(b"one")).unwrap();
+    store.save_plan(&first).unwrap();
+    let first_binding = cleanup_binding(&first, 1, 1);
+    store
+        .begin_source_cleanup(&first, &first_binding, now)
+        .unwrap();
+    store
+        .complete_source_cleanup(&first_binding, now)
+        .unwrap()
+        .unwrap();
+
+    let mut second_plan_binding = binding();
+    second_plan_binding.source_relative_path = "two.bin".into();
+    let mut second_grant = grant();
+    second_grant.expires_at_unix = now + 60;
+    second_grant.grant_id = "grant-2".into();
+    second_grant.operation_id = "operation-2".into();
+    let second =
+        TransferPlan::from_verified(second_plan_binding, second_grant, 3, digest(b"two")).unwrap();
+    store.save_plan(&second).unwrap();
+    assert_eq!(
+        store.begin_source_cleanup(&second, &cleanup_binding(&second, 1, 1), now),
+        Err(TransferError::JournalQuotaExceeded),
+        "completed tombstones stay inside the hard receipt count cap",
+    );
+
+    let far_dir = dir.path().join("far-future");
+    let far_store = JournalStore::open(far_dir, JournalLimits::default()).unwrap();
+    let mut far_grant = grant();
+    far_grant.expires_at_unix = now + 24 * 60 * 60 + 1;
+    let far_plan = TransferPlan::from_verified(binding(), far_grant, 3, digest(b"far")).unwrap();
+    far_store.save_plan(&far_plan).unwrap();
+    assert!(matches!(
+        far_store.begin_source_cleanup(&far_plan, &cleanup_binding(&far_plan, 1, 1), now),
+        Err(TransferError::InvalidPlan(_))
+    ));
 }
 
 #[test]
