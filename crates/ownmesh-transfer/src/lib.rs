@@ -64,6 +64,8 @@ pub enum TransferError {
     SourceChanged,
     #[error("source or destination custody is unavailable on this platform")]
     CustodyUnavailable,
+    #[error("restricted transfer publication is unsupported on this platform")]
+    PlatformUnsupported,
     #[error("source exceeds the configured transfer quota")]
     QuotaExceeded,
     #[error("chunk exceeds the 64 KiB limit")]
@@ -2188,6 +2190,17 @@ impl JournalStore {
                     if source.kind() == std::io::ErrorKind::AlreadyExists =>
                 {
                     TransferError::DestinationExists
+                }
+                // `ownmesh-fs` fails restricted handle-relative publication
+                // closed with this exact platform capability sentinel. Keep
+                // it distinct from malformed destination paths so callers
+                // can report a supported surface that is unavailable on this
+                // OS instead of a generic transfer failure.
+                ownmesh_fs::FsError::InvalidPath(message)
+                    if message
+                        == "restricted retained transfer publish is unsupported on this platform" =>
+                {
+                    TransferError::PlatformUnsupported
                 }
                 _ => TransferError::CustodyUnavailable,
             })

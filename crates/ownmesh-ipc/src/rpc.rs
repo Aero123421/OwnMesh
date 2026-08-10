@@ -394,4 +394,7 @@ pub mod app_error {
     pub const TOKEN_REVOKED: i64 = -32_012;
     /// Conflict (e.g. approval already decided).
     pub const CONFLICT: i64 = -32_013;
+    /// A requested operation is intentionally unavailable on this OS because
+    /// its required custody primitive is not implemented there.
+    pub const PLATFORM_UNSUPPORTED: i64 = -32_014;
 }

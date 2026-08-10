@@ -2156,6 +2156,7 @@ full_user_access/full_access for arbitrary commands",
             | TransferError::MalformedChunk
             | TransferError::ChunkHashMismatch
             | TransferError::Overflow => app_error::INVALID_PARAMS,
+            TransferError::PlatformUnsupported => app_error::PLATFORM_UNSUPPORTED,
             TransferError::SourceChanged
             | TransferError::HashMismatch
             | TransferError::StaleFence
@@ -3423,6 +3424,12 @@ full_user_access/full_access for arbitrary commands",
             .unwrap_or(64 * 1024)
             .clamp(1, MAX_CHUNK_BYTES as u64);
         let total = artifact.size_bytes();
+        if p.offset > total {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "transfer artifact offset exceeds its immutable total size".into(),
+            });
+        }
         let mut file = artifact.into_file();
         self.transfer_store
             .verify_published_destination_handle(&plan, &mut file)
@@ -9432,6 +9439,31 @@ mod transfer_runtime_tests {
             .unwrap()
             .unwrap()
             .published());
+        let error = runtime
+            .handle_transfer_artifact_get(
+                Some(json!({ "plan_id": plan_id, "workspace_id": "ws_destination", "offset": content.len() + 1 })),
+                &client,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                ref message,
+            } if message == "transfer artifact offset exceeds its immutable total size"
+        ));
+    }
+
+    #[test]
+    fn transfer_platform_unsupported_is_not_an_internal_error() {
+        assert!(matches!(
+            DaemonRuntime::transfer_error(TransferError::PlatformUnsupported),
+            IpcError::Remote {
+                code: app_error::PLATFORM_UNSUPPORTED,
+                ref message,
+            } if message == "restricted transfer publication is unsupported on this platform"
+        ));
     }
 
     #[cfg(windows)]
