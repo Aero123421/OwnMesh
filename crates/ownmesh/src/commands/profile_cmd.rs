@@ -57,18 +57,8 @@ fn dispatch_profile_with(
         ProfileCmd::Resume { id, native_id } => {
             open_profile(cli, call_local_daemon, id, Some(native_id.as_str()))
         }
-        ProfileCmd::Login { id } => unavailable(
-            cli,
-            "profile login",
-            id,
-            "ownmeshd exposes no credential-safe profile login IPC method",
-        ),
-        ProfileCmd::Test { id } => unavailable(
-            cli,
-            "profile test",
-            id,
-            "ownmeshd exposes no profile conformance-test IPC method",
-        ),
+        ProfileCmd::Login { id } => open_profile_login(cli, call_local_daemon, id),
+        ProfileCmd::Test { id } => test_profile(cli, call_local_daemon, id),
     }
 }
 
@@ -99,29 +89,99 @@ fn open_profile(
     Ok(())
 }
 
-fn unavailable(cli: &Cli, command: &str, profile_id: &str, message: &str) -> Result<(), ExitCode> {
+fn open_profile_login(
+    cli: &Cli,
+    call_local_daemon: &impl Fn(&str, Option<Value>) -> Result<Value, ExitCode>,
+    profile_id: &str,
+) -> Result<(), ExitCode> {
+    // Login remains inside the profile's own interactive PTY. OwnMesh neither
+    // reads nor copies the profile's credentials.
+    let value = call_local_daemon(
+        "session.open",
+        Some(json!({
+            "title": format!("profile-login:{profile_id}"),
+            "kind": "profile_agent",
+            "profile_id": profile_id,
+            "adapter_mode": "pty",
+        })),
+    )?;
+    let Some(session_id) = value.get("id").and_then(Value::as_str) else {
+        eprintln!("profile login: session.open returned no session id");
+        return Err(ExitCode::Internal);
+    };
+    let attach_command = format!("ownmesh session attach {session_id}");
     if cli.json {
         println!(
             "{}",
             json!({
                 "schema_version": 1,
-                "status": "unsupported",
-                "code": "OWNMESH_E_PROFILE_METHOD_UNAVAILABLE",
-                "command": command,
                 "profile_id": profile_id,
-                "message": message,
+                "session_id": session_id,
+                "state": value.get("state"),
+                "adapter_mode": "pty",
+                "attach_command": attach_command,
+                "session": value,
             })
         );
     } else {
-        eprintln!("{command} {profile_id}: {message}");
+        println!(
+            "profile {profile_id} login session={session_id} state={}",
+            value["state"].as_str().unwrap_or("?")
+        );
+        println!("attach with: {attach_command}");
     }
-    Err(ExitCode::ProfileUnavailable)
+    Ok(())
+}
+
+fn test_profile(
+    cli: &Cli,
+    call_local_daemon: &impl Fn(&str, Option<Value>) -> Result<Value, ExitCode>,
+    profile_id: &str,
+) -> Result<(), ExitCode> {
+    // profile.show performs one bounded, read-only PATH/version probe. It does
+    // not inspect or export credentials.
+    let value = call_local_daemon(methods::PROFILE_SHOW, Some(json!({ "id": profile_id })))?;
+    let Some(status) = value.get("status") else {
+        eprintln!("profile test: profile.show returned no status");
+        return Err(ExitCode::Internal);
+    };
+    let (Some(detected), Some(state)) = (
+        status.get("detected").and_then(Value::as_bool),
+        status.get("state").and_then(Value::as_str),
+    ) else {
+        eprintln!("profile test: profile.show returned an invalid status");
+        return Err(ExitCode::Internal);
+    };
+    let passed = detected && state != "unsupported_version";
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "schema_version": 1,
+                "profile_id": profile_id,
+                "status": if passed { "pass" } else { "fail" },
+                "detected": detected,
+                "profile_state": state,
+                "details": status,
+            })
+        );
+    } else if passed {
+        println!("PASS  {profile_id}  state={state}");
+    } else {
+        eprintln!("FAIL  {profile_id}  detected={detected} state={state}");
+    }
+
+    if passed {
+        Ok(())
+    } else {
+        Err(ExitCode::ProfileUnavailable)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
 
     fn cli() -> Cli {
         Cli {
@@ -154,14 +214,36 @@ mod tests {
     }
 
     #[test]
-    fn login_fails_without_calling_daemon() {
-        let called = Cell::new(false);
+    fn login_opens_an_explicit_profile_pty() {
+        let calls = RefCell::new(Vec::new());
         let cmd = ProfileCmd::Login { id: "codex".into() };
-        let result = dispatch_profile_with(&cli(), &cmd, &|_, _| {
-            called.set(true);
-            Ok(json!({}))
+        dispatch_profile_with(&cli(), &cmd, &|method, params| {
+            calls.borrow_mut().push((method.to_owned(), params));
+            Ok(json!({ "id": "ses_login", "state": "running" }))
+        })
+        .expect("login PTY");
+
+        let calls = calls.borrow();
+        assert_eq!(calls[0].0, "session.open");
+        let params = calls[0].1.as_ref().unwrap();
+        assert_eq!(params["kind"], "profile_agent");
+        assert_eq!(params["profile_id"], "codex");
+        assert_eq!(params["adapter_mode"], "pty");
+        assert!(params.get("prompt").is_none());
+    }
+
+    #[test]
+    fn profile_test_rejects_an_unsupported_detected_version() {
+        let cmd = ProfileCmd::Test { id: "codex".into() };
+        let result = dispatch_profile_with(&cli(), &cmd, &|method, _| {
+            assert_eq!(method, methods::PROFILE_SHOW);
+            Ok(json!({
+                "status": {
+                    "detected": true,
+                    "state": "unsupported_version"
+                }
+            }))
         });
         assert_eq!(result, Err(ExitCode::ProfileUnavailable));
-        assert!(!called.get());
     }
 }

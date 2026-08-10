@@ -1,5 +1,6 @@
 //! Safe `ownmesh config` inspection and mutation.
 
+use crate::auth::SessionPaths;
 use crate::cli::{Cli, ConfigCmd};
 use ownmesh_config::{
     appears_secret_free, load_config, load_policy, save_config, validate_control_plane_base_url,
@@ -249,6 +250,9 @@ fn set_config(paths: &OwnMeshPaths, key: &str, value: &str) -> Result<(), Config
 
     cfg.validate()
         .map_err(|_| ConfigCommandError::Usage("configuration value is invalid"))?;
+    if key == "active_instance" {
+        validate_session_issuer_binding(paths, &cfg)?;
+    }
     save_config(paths, &cfg)
         .map_err(|_| ConfigCommandError::Internal("configuration could not be saved"))
 }
@@ -415,6 +419,9 @@ fn edit_config_with(
         .try_into()
         .map_err(|_| ConfigCommandError::Usage("edited configuration is invalid"))?;
     validate_edited_config(&edited)?;
+    if active_issuer(&cfg) != active_issuer(&edited) {
+        validate_session_issuer_binding(paths, &edited)?;
+    }
     save_config(paths, &edited)
         .map_err(|_| ConfigCommandError::Internal("configuration could not be saved"))
 }
@@ -561,6 +568,39 @@ fn validate_edited_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError>
     Ok(())
 }
 
+fn validate_session_issuer_binding(
+    paths: &OwnMeshPaths,
+    cfg: &OwnMeshConfig,
+) -> Result<(), ConfigCommandError> {
+    let Some(target) = active_issuer(cfg) else {
+        return Ok(());
+    };
+    let session = SessionPaths::from_paths(paths.clone())
+        .load_session()
+        .map_err(|_| ConfigCommandError::Usage("authentication metadata is invalid"))?;
+    if !session.has_refresh_token || session.issuer.is_empty() {
+        return Ok(());
+    }
+    let bound = validate_control_plane_base_url(&session.issuer)
+        .map_err(|_| ConfigCommandError::Usage("authentication metadata is invalid"))?;
+    if bound == target {
+        Ok(())
+    } else {
+        Err(ConfigCommandError::Usage(
+            "log out before switching to a different control-plane instance",
+        ))
+    }
+}
+
+fn active_issuer(cfg: &OwnMeshConfig) -> Option<String> {
+    let active = cfg.active_instance.as_deref()?;
+    let instance = cfg
+        .instances
+        .iter()
+        .find(|instance| instance.id == active)?;
+    validate_control_plane_base_url(&instance.base_url).ok()
+}
+
 fn validate_subtable(
     value: Option<&toml::Value>,
     allowed: &[&str],
@@ -643,6 +683,7 @@ impl Drop for EditFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthSession;
     use std::cell::Cell;
     use tempfile::tempdir;
 
@@ -663,6 +704,37 @@ mod tests {
         assert_eq!(
             error.message(),
             "configuration values must not contain secret material"
+        );
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+
+        let mut cfg = load_config(&paths).unwrap();
+        cfg.instances = vec![
+            ownmesh_config::InstanceConfig {
+                id: "home".into(),
+                base_url: "https://home.example.test".into(),
+                display_name: None,
+            },
+            ownmesh_config::InstanceConfig {
+                id: "other".into(),
+                base_url: "https://other.example.test".into(),
+                display_name: None,
+            },
+        ];
+        cfg.active_instance = Some("home".into());
+        save_config(&paths, &cfg).unwrap();
+        SessionPaths::from_paths(paths.clone())
+            .save_session(&AuthSession {
+                issuer: "https://home.example.test".into(),
+                client_id: "client".into(),
+                has_refresh_token: true,
+                ..AuthSession::default()
+            })
+            .unwrap();
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let error = set_config(&paths, "active_instance", "other").unwrap_err();
+        assert_eq!(
+            error.message(),
+            "log out before switching to a different control-plane instance"
         );
         assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
     }

@@ -40,9 +40,11 @@ pub use status::run_status;
 ///
 /// v1.1.0 removed: setup, doctor, service lifecycle, and signed update surfaces.
 pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
-    "profile login",
-    "profile test",
-    "approval watch",
+    "approval approve",
+    "approval deny",
+    "policy preset",
+    "unlock",
+    "tokens revoke",
     "mcp serve",
 ];
 

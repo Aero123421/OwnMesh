@@ -1,5 +1,6 @@
 //! Control-plane instance management backed by `config.toml`.
 
+use crate::auth::SessionPaths;
 use crate::cli::{Cli, InstanceCmd};
 use ownmesh_config::{
     load_config, redact_control_plane_url, save_config, validate_control_plane_base_url,
@@ -197,7 +198,7 @@ fn add_instance(
         display_name: None,
     };
     cfg.instances.push(instance.clone());
-    if cfg.active_instance.is_none() {
+    if cfg.active_instance.is_none() && session_may_use(paths, &instance.base_url)? {
         cfg.active_instance = Some(instance.id.clone());
     }
     cfg.validate()
@@ -222,6 +223,19 @@ fn use_instance(paths: &OwnMeshPaths, id: &str) -> Result<(), InstanceCommandErr
     if !cfg.instances.iter().any(|instance| instance.id == id) {
         return Err(InstanceCommandError::Usage("instance does not exist"));
     }
+    if cfg.active_instance.as_deref() == Some(id) {
+        return Ok(());
+    }
+    let target = cfg
+        .instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .expect("existence checked above");
+    if !session_may_use(paths, &target.base_url)? {
+        return Err(InstanceCommandError::Usage(
+            "log out before switching to a different control-plane instance",
+        ));
+    }
     cfg.active_instance = Some(id.to_owned());
     save(paths, &cfg)
 }
@@ -235,7 +249,12 @@ fn remove_instance(paths: &OwnMeshPaths, id: &str) -> Result<Option<String>, Ins
         return Err(InstanceCommandError::Usage("instance does not exist"));
     }
     if cfg.active_instance.as_deref() == Some(id) {
-        cfg.active_instance = cfg.instances.first().map(|instance| instance.id.clone());
+        cfg.active_instance = match cfg.instances.first() {
+            Some(instance) if session_may_use(paths, &instance.base_url)? => {
+                Some(instance.id.clone())
+            }
+            _ => None,
+        };
     }
     save(paths, &cfg)?;
     Ok(cfg.active_instance)
@@ -283,6 +302,23 @@ fn validate_registry(cfg: &OwnMeshConfig) -> Result<(), InstanceCommandError> {
     Ok(())
 }
 
+fn session_may_use(
+    paths: &OwnMeshPaths,
+    target_issuer: &str,
+) -> Result<bool, InstanceCommandError> {
+    let session = SessionPaths::from_paths(paths.clone())
+        .load_session()
+        .map_err(|_| InstanceCommandError::Usage("authentication metadata is invalid"))?;
+    if !session.has_refresh_token || session.issuer.is_empty() {
+        return Ok(true);
+    }
+    let bound = validate_control_plane_base_url(&session.issuer)
+        .map_err(|_| InstanceCommandError::Usage("authentication metadata is invalid"))?;
+    let target = validate_control_plane_base_url(target_issuer)
+        .map_err(|_| InstanceCommandError::Usage("configured instance registry is invalid"))?;
+    Ok(bound == target)
+}
+
 fn safe_url(raw: &str) -> String {
     let redacted = redact_control_plane_url(raw);
     if redacted.is_empty() {
@@ -303,6 +339,7 @@ fn instance_json(instance: &InstanceConfig, active: bool) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthSession;
     use tempfile::tempdir;
 
     #[test]
@@ -328,6 +365,33 @@ mod tests {
         let active = remove_instance(&paths, "server-2").unwrap();
         assert_eq!(active.as_deref(), Some("home"));
         assert_eq!(load_config(&paths).unwrap().instances.len(), 1);
+    }
+
+    #[test]
+    fn instance_switch_never_retargets_an_existing_refresh_token() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        add_instance(&paths, "home", "https://home.example.test").unwrap();
+        add_instance(&paths, "other", "https://other.example.test").unwrap();
+        SessionPaths::from_paths(paths.clone())
+            .save_session(&AuthSession {
+                issuer: "https://home.example.test".into(),
+                client_id: "client".into(),
+                has_refresh_token: true,
+                ..AuthSession::default()
+            })
+            .unwrap();
+
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let error = use_instance(&paths, "other").unwrap_err();
+        assert_eq!(
+            error.message(),
+            "log out before switching to a different control-plane instance"
+        );
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+
+        let active = remove_instance(&paths, "home").unwrap();
+        assert_eq!(active, None);
     }
 
     #[test]
