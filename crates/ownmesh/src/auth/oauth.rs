@@ -53,6 +53,7 @@ fn default_interval() -> u64 {
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
+    #[serde(default)]
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
@@ -425,6 +426,14 @@ fn urlencoding_encode(s: &str) -> String {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn device_poll_error_without_access_token_deserializes() {
+        let body: TokenResponse = serde_json::from_str(r#"{"error":"authorization_pending"}"#)
+            .expect("RFC 8628 polling errors do not contain access_token");
+        assert_eq!(body.error.as_deref(), Some("authorization_pending"));
+        assert!(body.access_token.is_empty());
+    }
 
     #[tokio::test]
     async fn token_bearing_endpoints_reject_non_loopback_http_before_network() {
