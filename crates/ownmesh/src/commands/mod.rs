@@ -1,14 +1,18 @@
 //! Command dispatch.
 
 mod approval;
+mod config_cmd;
 pub(crate) mod device_cmd;
 mod doctor;
 mod exec;
+mod instance_cmd;
 mod ipc_util;
 mod lockdown;
 pub(crate) mod login;
 mod policy_cmd;
 mod privileged;
+mod process_cmd;
+mod profile_cmd;
 mod service;
 mod session_cmd;
 mod setup;
@@ -18,11 +22,14 @@ mod update_cmd;
 mod workspace_cmd;
 
 use crate::cli::{
-    Cli, Commands, ConfigCmd, DeviceCmd, InstanceCmd, McpCmd, PrivilegedCmd, ProcessCmd,
-    ProfileCmd, ServiceCmd, SessionCmd, TransferCmd, WorkspaceCmd,
+    Cli, Commands, DeviceCmd, McpCmd, PrivilegedCmd, ServiceCmd, SessionCmd, TransferCmd,
+    WorkspaceCmd,
 };
+use clap::CommandFactory;
+use clap_complete::{generate, shells};
 use ownmesh_domain::ExitCode;
 use serde_json::json;
+use std::io::IsTerminal;
 
 pub use status::run_status;
 
@@ -33,26 +40,8 @@ pub use status::run_status;
 ///
 /// v1.1.0 removed: setup, doctor, service lifecycle, and signed update surfaces.
 pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
-    "tui",
-    "completion",
-    "config get",
-    "config set",
-    "config edit",
-    "instance add",
-    "instance list",
-    "instance use",
-    "instance remove",
-    "process start",
-    "process status",
-    "process logs",
-    "process stop",
-    "profile scan",
-    "profile list",
-    "profile show",
     "profile login",
     "profile test",
-    "profile start",
-    "profile resume",
     "approval watch",
     "mcp serve",
 ];
@@ -82,14 +71,14 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Lockdown) => lockdown::run_lockdown(cli),
         Some(Commands::Unlock) => lockdown::run_unlock(cli),
         Some(Commands::Tokens(cmd)) => lockdown::dispatch_tokens(cli, cmd),
-        Some(Commands::Config(cmd)) => dispatch_config(cli, cmd),
-        Some(Commands::Instance(cmd)) => dispatch_instance(cli, cmd),
+        Some(Commands::Config(cmd)) => config_cmd::dispatch_config(cli, cmd),
+        Some(Commands::Instance(cmd)) => instance_cmd::dispatch_instance(cli, cmd),
         Some(Commands::Device(cmd)) => dispatch_device(cli, cmd),
         Some(Commands::Workspace(cmd)) => dispatch_workspace(cli, cmd),
         Some(Commands::Exec(args)) => exec::run_exec(cli, args),
-        Some(Commands::Process(cmd)) => dispatch_process(cli, cmd),
+        Some(Commands::Process(cmd)) => process_cmd::dispatch_process(cli, cmd),
         Some(Commands::Session(cmd)) => dispatch_session(cli, cmd),
-        Some(Commands::Profile(cmd)) => dispatch_profile(cli, cmd),
+        Some(Commands::Profile(cmd)) => profile_cmd::dispatch_profile(cli, cmd),
         Some(Commands::Approval(cmd)) => approval::dispatch_approval(cli, cmd),
         Some(Commands::Policy(cmd)) => policy_cmd::dispatch_policy(cli, cmd),
         Some(Commands::Transfer(cmd)) => dispatch_transfer(cli, cmd),
@@ -97,78 +86,75 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Privileged(cmd)) => dispatch_privileged(cli, cmd),
         Some(Commands::Update(cmd)) => update_cmd::dispatch_update(cli, cmd),
         Some(Commands::Mcp(cmd)) => dispatch_mcp(cli, cmd),
-        Some(Commands::Completion(args)) => stub(
-            cli,
-            "completion",
-            &format!("completion for {:?} (later)", args.shell),
-        ),
+        Some(Commands::Completion(args)) => run_completion(args),
     }
 }
 
 fn run_tui_launch(cli: &Cli) -> Result<(), ExitCode> {
-    unsupported(
-        cli,
-        "tui",
-        "Launch `ownmesh-tui`; the combined no-argument entrypoint is unsupported.",
-    )
-}
+    if cli.json || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        if cli.json {
+            println!(
+                "{}",
+                json!({
+                    "schema_version": 1,
+                    "ok": false,
+                    "error": "interactive_terminal_required",
+                    "message": "run an explicit subcommand when stdin/stdout is not an interactive terminal",
+                })
+            );
+        } else {
+            eprintln!(
+                "ownmesh: no subcommand; an interactive terminal is required to launch the TUI"
+            );
+        }
+        return Err(ExitCode::UsageConfig);
+    }
 
-fn dispatch_config(cli: &Cli, cmd: &ConfigCmd) -> Result<(), ExitCode> {
-    match cmd {
-        ConfigCmd::Get { key } => stub(cli, "config get", &format!("key={key}")),
-        ConfigCmd::Set { key, value } => {
-            // Never echo secret-looking values.
-            let safe = if looks_secret(key) || looks_secret(value) {
-                "[REDACTED]"
-            } else {
-                value.as_str()
-            };
-            stub(cli, "config set", &format!("key={key} value={safe}"))
-        }
-        ConfigCmd::Edit => stub(cli, "config edit", "editor integration later"),
-        ConfigCmd::Validate => {
-            match ownmesh_config::OwnMeshPaths::discover()
-                .and_then(|p| ownmesh_config::load_config(&p).map(|c| (p, c)))
-            {
-                Ok((paths, cfg)) => {
-                    if let Err(err) = cfg.validate() {
-                        eprintln!("config invalid: {err}");
-                        return Err(ExitCode::UsageConfig);
-                    }
-                    if let Err(err) = ownmesh_config::load_policy(&paths) {
-                        eprintln!("policy invalid: {err}");
-                        return Err(ExitCode::UsageConfig);
-                    }
-                    if cli.json {
-                        println!(
-                            "{}",
-                            json!({"schema_version": 1, "ok": true, "config": paths.config_file()})
-                        );
-                    } else {
-                        println!("config ok: {}", paths.config_file().display());
-                    }
-                    Ok(())
-                }
-                Err(err) => {
-                    eprintln!("config error: {err}");
-                    Err(ExitCode::UsageConfig)
-                }
-            }
-        }
+    let current = std::env::current_exe().map_err(|err| {
+        eprintln!("ownmesh: cannot locate the installed executable: {err}");
+        ExitCode::Internal
+    })?;
+    let tui = current.with_file_name(format!("ownmesh-tui{}", std::env::consts::EXE_SUFFIX));
+    if !tui.is_file() {
+        eprintln!(
+            "ownmesh: bundled TUI not found at {}; reinstall OwnMesh or run an explicit subcommand",
+            tui.display()
+        );
+        return Err(ExitCode::ProfileUnavailable);
+    }
+    let status = std::process::Command::new(&tui).status().map_err(|err| {
+        eprintln!("ownmesh: failed to launch {}: {err}", tui.display());
+        ExitCode::Internal
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        eprintln!("ownmesh: TUI exited unsuccessfully ({status})");
+        Err(ExitCode::Internal)
     }
 }
 
-fn dispatch_instance(cli: &Cli, cmd: &InstanceCmd) -> Result<(), ExitCode> {
-    match cmd {
-        // Full multi-instance management remains unsupported for v1.0.2; keep the
-        // surface registered and hard-erroring rather than partially enabling add-only.
-        InstanceCmd::Add { id, base_url } => {
-            stub(cli, "instance add", &format!("{id} -> {base_url}"))
+fn run_completion(args: &crate::cli::CompletionArgs) -> Result<(), ExitCode> {
+    let mut command = Cli::command();
+    let mut stdout = std::io::stdout();
+    match args.shell {
+        crate::cli::CompletionShell::Bash => {
+            generate(shells::Bash, &mut command, "ownmesh", &mut stdout);
         }
-        InstanceCmd::List => stub(cli, "instance list", "chapter 5"),
-        InstanceCmd::Use { id } => stub(cli, "instance use", id),
-        InstanceCmd::Remove { id } => stub(cli, "instance remove", id),
+        crate::cli::CompletionShell::Zsh => {
+            generate(shells::Zsh, &mut command, "ownmesh", &mut stdout);
+        }
+        crate::cli::CompletionShell::Fish => {
+            generate(shells::Fish, &mut command, "ownmesh", &mut stdout);
+        }
+        crate::cli::CompletionShell::Powershell => {
+            generate(shells::PowerShell, &mut command, "ownmesh", &mut stdout);
+        }
+        crate::cli::CompletionShell::Elvish => {
+            generate(shells::Elvish, &mut command, "ownmesh", &mut stdout);
+        }
     }
+    Ok(())
 }
 
 fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {
@@ -179,31 +165,8 @@ fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode> {
     workspace_cmd::dispatch_workspace(cli, cmd)
 }
 
-fn dispatch_process(cli: &Cli, cmd: &ProcessCmd) -> Result<(), ExitCode> {
-    match cmd {
-        ProcessCmd::Start { command } => stub(cli, "process start", &format!("{command:?}")),
-        ProcessCmd::Status { id } => stub(cli, "process status", id),
-        ProcessCmd::Logs { id } => stub(cli, "process logs", id),
-        ProcessCmd::Stop { id } => stub(cli, "process stop", id),
-    }
-}
-
 fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
     session_cmd::dispatch_session(cli, cmd)
-}
-
-fn dispatch_profile(cli: &Cli, cmd: &ProfileCmd) -> Result<(), ExitCode> {
-    match cmd {
-        ProfileCmd::Scan => stub(cli, "profile scan", "chapter 11"),
-        ProfileCmd::List => stub(cli, "profile list", "chapter 11"),
-        ProfileCmd::Show { id } => stub(cli, "profile show", id),
-        ProfileCmd::Login { id } => stub(cli, "profile login", id),
-        ProfileCmd::Test { id } => stub(cli, "profile test", id),
-        ProfileCmd::Start { id } => stub(cli, "profile start", id),
-        ProfileCmd::Resume { id, native_id } => {
-            stub(cli, "profile resume", &format!("{id} {native_id}"))
-        }
-    }
 }
 
 fn dispatch_transfer(cli: &Cli, cmd: &TransferCmd) -> Result<(), ExitCode> {
@@ -261,14 +224,6 @@ pub(crate) fn unsupported(cli: &Cli, command: &str, detail: &str) -> Result<(), 
         eprintln!("ownmesh {command}: not implemented yet — {detail}");
     }
     Err(exit)
-}
-
-fn looks_secret(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("private")
 }
 
 #[cfg(test)]

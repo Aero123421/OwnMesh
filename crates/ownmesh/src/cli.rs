@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueEnum};
     name = "ownmesh",
     version,
     about = "OwnMesh — capability runtime for user-owned PCs",
-    long_about = "OwnMesh CLI. The rich TUI is the separate `ownmesh-tui` binary; running without a subcommand is unsupported."
+    long_about = "OwnMesh CLI. Run without a subcommand in an interactive terminal to launch the bundled OwnMesh TUI."
 )]
 pub struct Cli {
     /// Emit machine-readable JSON on stdout.
@@ -22,7 +22,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "OWNMESH_LANG")]
     pub lang: Option<String>,
 
-    /// Subcommand. When omitted, ownmesh exits with an error; launch `ownmesh-tui` separately for the TUI.
+    /// Subcommand. When omitted in an interactive terminal, launches the bundled TUI.
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
