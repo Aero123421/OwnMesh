@@ -392,7 +392,7 @@ impl App {
     }
 
     #[must_use]
-    pub fn border_set(&self) -> ratatui::symbols::border::Set {
+    pub fn border_set(&self) -> ratatui::symbols::border::Set<'_> {
         ratatui::symbols::border::PLAIN
     }
 
