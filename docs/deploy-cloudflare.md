@@ -29,29 +29,25 @@ Docs: [Deploy to Cloudflare buttons](https://developers.cloudflare.com/workers/p
 - Node 22+ and pnpm 9+
 - Logged in: `pnpm exec wrangler login`
 
-## Wrangler deploy (recommended for developers)
+## Guided deploy (recommended)
 
 ```bash
 cd packages/control-plane
-pnpm install
-
-# 1) Create D1 (once per account)
-pnpm exec wrangler d1 create ownmesh
-# Copy the printed database_id into wrangler.jsonc → d1_databases[0].database_id
-
-# 2) Apply SQL migrations (remote)
-# Use the binding name DB so renames stay correct:
-# https://developers.cloudflare.com/workers/platform/deploy-buttons/
-pnpm exec wrangler d1 migrations apply DB --remote
-
-# 3) Deploy Worker + Durable Objects
-pnpm run deploy
-
-# 4) Create the one-time owner passkey bootstrap code (shown once)
-pnpm run owner:init
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run deploy:guided
 ```
 
-`package.json` `deploy` script runs migrations against binding `DB` then `wrangler deploy`.
+The guided command opens Cloudflare sign-in when needed, creates or reuses the
+single D1 database named `ownmesh`, applies migrations, deploys the Worker and
+Durable Objects, and provisions secrets without writing a plaintext secret
+file. It finishes by printing the owner sign-in URL, the one-time owner code,
+and the ChatGPT MCP URL.
+Re-running it is idempotent: existing owner/signing secrets are not rotated.
+
+For CI or an already-provisioned account, `pnpm run deploy` only applies
+migrations and deploys. `pnpm run owner:init` rotates the one-time owner
+bootstrap separately.
 
 ### Local dev
 
@@ -95,8 +91,42 @@ Reference `.dev.vars.example` in this package for local-only vars.
 ```jsonc
 d1_databases: [{ binding: "DB", database_name: "ownmesh", migrations_dir: "migrations" }]
 durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
+ratelimits: [{ name: "AUTH_RATE_LIMITER", ... }, { name: "MCP_RATE_LIMITER", ... }]
 // no r2_buckets, no turn
 ```
+
+The rate-limit bindings are coarse abuse/cost guards. They run before D1 access,
+use hashed credentials (or a hashed connecting IP fallback), and never replace
+OAuth scopes, device policy, operation binding, or replay protection.
+
+## Capacity and cost guardrails
+
+OwnMesh is tuned for a personal or small-team control plane, not a public file
+hosting service:
+
+- Cloudflare currently includes 100,000 Worker requests/day and 10 ms CPU per
+  request on Workers Free; D1 Free includes 5 million rows read/day and 100,000
+  rows written/day. Check the live [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+  and [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/) before
+  a larger deployment.
+- Device and transfer rooms use the Durable Objects WebSocket Hibernation API,
+  so an idle connected Agent does not keep a JavaScript isolate billed as active.
+  Cloudflare bills incoming WebSocket messages at a 20:1 ratio for DO request
+  billing; see [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/).
+- Transfer payloads are end-to-end encrypted and relayed as bounded WebSocket
+  frames; they are not written to D1 or Durable Object storage. A 5 GiB transfer
+  uses about 81,920 64-KiB data frames plus acknowledgements (roughly 8,200 DO
+  billable requests at Cloudflare's current 20:1 message ratio, before retries).
+  Repeated multi-gigabyte transfers should use Workers Paid and be monitored.
+- `AUTH_RATE_LIMITER` (60/minute) and `MCP_RATE_LIMITER` (120/minute) protect D1
+  and operator budgets from coarse abuse. Cloudflare counters are intentionally
+  approximate, so OAuth, local device policy, exact action binding, and replay
+  fencing remain the security boundary.
+
+Monitor Worker errors/CPU, Durable Object requests/duration, and D1 row reads
+and writes in the Cloudflare dashboard. A `429` from OwnMesh means the caller
+should honor `Retry-After`; a Cloudflare 1027/1102 means the account or CPU limit
+was reached.
 
 - **D1 Worker API**: https://developers.cloudflare.com/d1/worker-api/
 - **DO WebSocket hibernation**: https://developers.cloudflare.com/durable-objects/best-practices/websockets/

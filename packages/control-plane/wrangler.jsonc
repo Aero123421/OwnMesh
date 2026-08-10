@@ -11,8 +11,8 @@
   "workers_dev": true,
   "preview_urls": false,
   "vars": {
-    // Set to your Worker URL after first deploy if it differs from request origin.
-    "OAUTH_ISSUER": "https://ownmesh-control-plane.namaste114.workers.dev",
+    // OAUTH_ISSUER is intentionally omitted: the Worker uses its request origin.
+    // Set it only when deploying behind a stable custom domain.
     // Security-sensitive development escape hatch. Keep false in deployments.
     "OWNMESH_DEV_AUTH_BYPASS": "false",
     // Advertise DCR so ChatGPT can connect from only the MCP URL. Exact ChatGPT
@@ -28,9 +28,21 @@
     {
       "binding": "DB",
       "database_name": "ownmesh",
-      // Replace via `wrangler d1 create ownmesh` (Deploy to Cloudflare button fills this).
-      "database_id": "4198b4d0-c043-4dda-b641-16578d84c091",
+      // Wrangler / Deploy to Cloudflare resolves or provisions this by name.
+      // Never commit an operator's account-specific database_id.
       "migrations_dir": "migrations"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "AUTH_RATE_LIMITER",
+      "namespace_id": "120260811",
+      "simple": { "limit": 60, "period": 60 }
+    },
+    {
+      "name": "MCP_RATE_LIMITER",
+      "namespace_id": "120260812",
+      "simple": { "limit": 120, "period": 60 }
     }
   ],
   "durable_objects": {

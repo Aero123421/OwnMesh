@@ -73,6 +73,75 @@ export interface Env {
   ALLOW_DYNAMIC_CLIENT_REGISTRATION?: string;
   OWNMESH_ALLOWED_ORIGINS?: string;
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
+  AUTH_RATE_LIMITER?: RateLimitBinding;
+  MCP_RATE_LIMITER?: RateLimitBinding;
+}
+
+type RateLimitBinding = {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+};
+
+type RateLimitClass = "auth" | "mcp";
+
+function rateLimitClass(pathname: string, method: string): RateLimitClass | null {
+  if (pathname === "/mcp") return "mcp";
+  if (method !== "POST") return null;
+  if (
+    pathname === "/login" ||
+    pathname === "/logout" ||
+    pathname === "/approve" ||
+    pathname === "/oauth/register" ||
+    pathname === "/oauth/authorize" ||
+    pathname === "/oauth/token" ||
+    pathname === "/oauth/revoke" ||
+    pathname === "/oauth/device_authorization" ||
+    pathname === "/oauth/device" ||
+    pathname.startsWith("/auth/passkey/")
+  ) {
+    return "auth";
+  }
+  return null;
+}
+
+async function enforceRateLimit(
+  request: Request,
+  env: Env,
+  issuer: string,
+  pathname: string,
+): Promise<Response | null> {
+  const category = rateLimitClass(pathname, request.method.toUpperCase());
+  if (!category) return null;
+  const limiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;
+  if (!limiter) return null;
+
+  // Never send bearer/cookie material to the counter service. Authenticated
+  // callers are keyed by a digest of their stable credential; unauthenticated
+  // bootstrap traffic falls back to Cloudflare's connection address.
+  const actor =
+    request.headers.get("authorization") ||
+    request.headers.get("cookie") ||
+    request.headers.get("cf-connecting-ip") ||
+    "anonymous";
+  const actorDigest = await sha256Hex(actor);
+  const issuerHost = new URL(issuer).host;
+  try {
+    const result = await limiter.limit({
+      key: `${issuerHost}:${category}:${actorDigest}`,
+    });
+    if (result.success) return null;
+  } catch {
+    // This is an abuse/cost guard, not an authorization boundary. Preserve
+    // availability if Cloudflare's approximate counter is temporarily absent.
+    return null;
+  }
+  return json(
+    { error: "rate_limited", retry_after: 60 },
+    {
+      status: 429,
+      noStore: true,
+      headers: { "retry-after": "60" },
+    },
+  );
 }
 
 export { DeviceRoom, TransferRoom, MCP_TOOLS };
@@ -343,6 +412,9 @@ export default {
     if (request.method === "OPTIONS") {
       return json({ error: "cors_not_enabled" }, { status: 405 });
     }
+
+    const rateLimited = await enforceRateLimit(request, env, issuer, url.pathname);
+    if (rateLimited) return rateLimited;
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       const base = {

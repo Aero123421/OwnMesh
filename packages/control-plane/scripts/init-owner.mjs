@@ -36,6 +36,17 @@ try {
 
 const names = new Set(existing.map((entry) => entry.name));
 const resetPasskey = process.argv.includes("--reset-passkey");
+const onlyIfMissing = process.argv.includes("--if-missing");
+const config = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
+const issuer = process.env.OWNMESH_ISSUER
+  || /"OAUTH_ISSUER"\s*:\s*"([^"]+)"/.exec(config)?.[1]
+  || "https://<your-worker>.workers.dev";
+if (onlyIfMissing && names.has("SESSION_SECRET") && names.has("OWNER_TOKEN_HASH")) {
+  process.stdout.write("\nOwnMesh secrets already exist; nothing was rotated.\n");
+  process.stdout.write(`Owner sign-in:     ${issuer}/login\n`);
+  process.stdout.write(`ChatGPT MCP URL:   ${issuer}/mcp\n`);
+  process.exit(0);
+}
 const ownerCode = `own_${randomBytes(24).toString("base64url")}`;
 const secrets = {
   OWNER_TOKEN_HASH: createHash("sha256").update(ownerCode, "utf8").digest("hex"),
@@ -57,8 +68,6 @@ if (resetPasskey) {
   ], { stdio: ["ignore", "inherit", "inherit"] });
 }
 
-const config = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
-const issuer = /"OAUTH_ISSUER"\s*:\s*"([^"]+)"/.exec(config)?.[1] || "https://<your-worker>.workers.dev";
 process.stdout.write("\nOwnMesh owner passkey bootstrap is ready.\n");
 process.stdout.write("Open the sign-in URL, enter this code once, and create your passkey.\n\n");
 process.stdout.write(`  ${ownerCode}\n\n`);
