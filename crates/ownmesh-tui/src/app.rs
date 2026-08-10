@@ -15,7 +15,6 @@ use ownmesh_diagnostics::{
 use ownmesh_ipc::DaemonStatus;
 use ownmesh_policy::AccessPreset;
 use ownmesh_profiles::official_profiles;
-use ownmesh_transfer::TransferConfig;
 use serde_json::Value;
 use std::fs;
 
@@ -310,14 +309,13 @@ impl App {
 
     #[must_use]
     pub fn transfer_lines(&self) -> Vec<String> {
-        let cfg = TransferConfig::default();
         vec![
             t(self.lang, Msg::TransfersLocalPlan).to_owned(),
             t(self.lang, Msg::TransfersLocalCopy).to_owned(),
             format!(
                 "{} (relay_enabled={})",
                 t(self.lang, Msg::TransfersRelayOff),
-                cfg.relay_enabled
+                false
             ),
             t(self.lang, Msg::TransfersRelayFailClosed).to_owned(),
             t(self.lang, Msg::TransfersNoLanPromise).to_owned(),
@@ -422,7 +420,7 @@ fn doctor_input_from_local(
             telemetry_project: cfg.telemetry.project,
             telemetry_crash_upload: cfg.telemetry.crash_upload,
             telemetry_usage_analytics: cfg.telemetry.usage_analytics,
-            relay_enabled: TransferConfig::default().relay_enabled,
+            relay_enabled: false,
             update_mode: Some(cfg.update.mode.clone()),
             update_channel: Some(cfg.update.channel.clone()),
             update_network_off: cfg.update.mode == "off",
