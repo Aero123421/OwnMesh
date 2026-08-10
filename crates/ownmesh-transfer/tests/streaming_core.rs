@@ -306,6 +306,174 @@ fn newer_fence_reclaims_crash_orphan_and_retired_holder_cannot_save() {
 }
 
 #[test]
+fn fresh_fence_rolls_local_save_back_to_room_ack_cursor() {
+    let dir = tempdir().unwrap();
+    let bytes: Vec<u8> = (0..(MAX_CHUNK_BYTES * 2 + 17))
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let plan = make_plan(&bytes);
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let first_lease = store.acquire_for_fence(&plan, 1, 9_000, 1, 1).unwrap();
+    let first_journal = store
+        .claim_at_room_cursor(&first_lease, &plan, "owner-a", 1, 1, 1, 9_000, 0, 0)
+        .unwrap();
+    let mut first_sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+    let first_path = first_sink.path().to_path_buf();
+    let mut first_receiver =
+        TransferReceiver::resume_from_part(plan.clone(), first_journal, &first_path).unwrap();
+    for sequence in 0..2_u64 {
+        let offset = usize::try_from(sequence).unwrap() * MAX_CHUNK_BYTES;
+        first_receiver
+            .receive(
+                &mut first_sink,
+                TransferChunk::new(
+                    sequence,
+                    offset as u64,
+                    bytes[offset..offset + MAX_CHUNK_BYTES].to_vec(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .save(&first_lease, &first_receiver.journal_snapshot())
+            .unwrap();
+    }
+    assert_eq!(
+        std::fs::read(&first_path).unwrap(),
+        bytes[..MAX_CHUNK_BYTES * 2]
+    );
+    drop(first_sink);
+
+    // Model a crash after the second local journal save but before its Room
+    // ACK. Only the first chunk is in the relay's durable cursor.
+    let second_lease = store.acquire_for_fence(&plan, 2, 9_000, 2, 2).unwrap();
+    assert_eq!(
+        store.claim_at_room_cursor(
+            &second_lease,
+            &plan,
+            "owner-a",
+            2,
+            2,
+            2,
+            9_000,
+            3,
+            (MAX_CHUNK_BYTES * 2 + 17) as u64,
+        ),
+        Err(TransferError::Gap),
+        "Room cursor may never move local progress forward",
+    );
+    assert_eq!(
+        store.claim_at_room_cursor(
+            &second_lease,
+            &plan,
+            "owner-a",
+            2,
+            2,
+            2,
+            9_000,
+            1,
+            (MAX_CHUNK_BYTES + 1) as u64,
+        ),
+        Err(TransferError::Gap),
+        "sequence/offset pair must be a canonical source chunk boundary",
+    );
+    assert_eq!(
+        std::fs::read(&first_path).unwrap(),
+        bytes[..MAX_CHUNK_BYTES * 2]
+    );
+
+    let resumed = store
+        .claim_at_room_cursor(
+            &second_lease,
+            &plan,
+            "owner-a",
+            2,
+            2,
+            2,
+            9_000,
+            1,
+            MAX_CHUNK_BYTES as u64,
+        )
+        .unwrap();
+    assert_eq!(resumed.state(), JournalState::Receiving);
+    assert_eq!(resumed.contiguous_ack(), Some(0));
+    assert_eq!(resumed.bytes_received(), MAX_CHUNK_BYTES as u64);
+    let second_sink = PartFileSink::create(&store, &plan, 2, resumed.bytes_received()).unwrap();
+    assert_ne!(second_sink.path(), first_path);
+    assert_eq!(
+        std::fs::read(second_sink.path()).unwrap(),
+        bytes[..MAX_CHUNK_BYTES]
+    );
+    assert!(
+        !first_path.exists(),
+        "retired generation is removed after prefix staging"
+    );
+}
+
+#[test]
+fn room_cursor_at_size_rehashes_the_fresh_generation_part() {
+    let dir = tempdir().unwrap();
+    let bytes: Vec<u8> = (0..(MAX_CHUNK_BYTES + 17))
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    let plan = make_plan(&bytes);
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let first_lease = store.acquire_for_fence(&plan, 1, 9_000, 1, 1).unwrap();
+    let first_journal = store
+        .claim_at_room_cursor(&first_lease, &plan, "owner-a", 1, 1, 1, 9_000, 0, 0)
+        .unwrap();
+    let mut first_sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+    let mut receiver =
+        TransferReceiver::resume_from_part(plan.clone(), first_journal, first_sink.path()).unwrap();
+    receiver
+        .receive(
+            &mut first_sink,
+            TransferChunk::new(0, 0, bytes[..MAX_CHUNK_BYTES].to_vec()).unwrap(),
+        )
+        .unwrap();
+    receiver
+        .receive(
+            &mut first_sink,
+            TransferChunk::new(1, MAX_CHUNK_BYTES as u64, bytes[MAX_CHUNK_BYTES..].to_vec())
+                .unwrap(),
+        )
+        .unwrap();
+    store
+        .save(&first_lease, &receiver.journal_snapshot())
+        .unwrap();
+    drop(first_sink);
+
+    let second_lease = store.acquire_for_fence(&plan, 2, 9_000, 2, 2).unwrap();
+    let completed = store
+        .claim_at_room_cursor(
+            &second_lease,
+            &plan,
+            "owner-a",
+            2,
+            2,
+            2,
+            9_000,
+            2,
+            bytes.len() as u64,
+        )
+        .unwrap();
+    assert_eq!(completed.state(), JournalState::Completed);
+    let mut second_sink =
+        PartFileSink::create(&store, &plan, 2, completed.bytes_received()).unwrap();
+    second_sink.verify_complete().unwrap();
+    let second_path = second_sink.path().to_path_buf();
+    drop(second_sink);
+    let mut substituted = std::fs::read(&second_path).unwrap();
+    substituted[0] ^= 0xff;
+    std::fs::write(&second_path, substituted).unwrap();
+    let mut reopened = PartFileSink::create(&store, &plan, 2, completed.bytes_received()).unwrap();
+    assert!(matches!(
+        reopened.verify_complete(),
+        Err(TransferError::Sink(_))
+    ));
+}
+
+#[test]
 fn retired_holder_late_write_is_isolated_from_new_generation_part() {
     let dir = tempdir().unwrap();
     let plan = make_plan(b"abclate!");

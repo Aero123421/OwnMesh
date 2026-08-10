@@ -2862,6 +2862,8 @@ full_user_access/full_access for arbitrary commands",
             plan_id: String,
             epoch: u64,
             fence: u64,
+            next_sequence: u64,
+            next_offset: u64,
             workspace_id: String,
         }
         let p: Params = parse_params(params)?;
@@ -2916,7 +2918,7 @@ full_user_access/full_access for arbitrary commands",
             .map_err(Self::transfer_error)?;
         let journal = self
             .transfer_store
-            .claim(
+            .claim_at_room_cursor(
                 &lease,
                 &plan,
                 &authority.principal_id,
@@ -2924,6 +2926,8 @@ full_user_access/full_access for arbitrary commands",
                 p.fence,
                 now,
                 authority.expires_at_unix,
+                p.next_sequence,
+                p.next_offset,
             )
             .map_err(Self::transfer_error)?;
         let mut sink = PartFileSink::create(
@@ -2933,19 +2937,10 @@ full_user_access/full_access for arbitrary commands",
             journal.bytes_received(),
         )
         .map_err(Self::transfer_error)?;
-        if plan.size_bytes() == 0 {
-            let mut receiver =
-                TransferReceiver::resume_from_part(plan.clone(), journal, sink.path())
-                    .map_err(Self::transfer_error)?;
-            receiver
-                .complete_empty(&mut sink)
-                .map_err(Self::transfer_error)?;
-            let updated = receiver.journal_snapshot();
-            self.transfer_store
-                .save(&lease, &updated)
-                .map_err(Self::transfer_error)?;
+        if journal.state() == JournalState::Completed {
+            sink.verify_complete().map_err(Self::transfer_error)?;
             return Ok(
-                json!({ "plan_id": plan.id(), "state": updated.state(), "next_sequence": 0, "next_offset": 0, "epoch": updated.epoch(), "fence": updated.fence(), "completed": true }),
+                json!({ "plan_id": plan.id(), "state": journal.state(), "next_sequence": p.next_sequence, "next_offset": p.next_offset, "epoch": journal.epoch(), "fence": journal.fence(), "completed": true }),
             );
         }
         Ok(
@@ -8768,7 +8763,7 @@ mod transfer_runtime_tests {
         destination
             .handle_transfer_destination_prepare(
                 Some(
-                    json!({"plan_id":plan_id,"epoch":1,"fence":1,"workspace_id":"ws_destination"}),
+                    json!({"plan_id":plan_id,"epoch":1,"fence":1,"next_sequence":0,"next_offset":0,"workspace_id":"ws_destination"}),
                 ),
                 &client,
             )
@@ -8950,7 +8945,7 @@ mod transfer_runtime_tests {
         let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
         runtime
             .handle_transfer_destination_prepare(
-                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination" })),
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "next_sequence": 0, "next_offset": 0, "workspace_id": "ws_destination" })),
                 &client,
             )
             .await
@@ -8985,13 +8980,30 @@ mod transfer_runtime_tests {
             )
             .await
             .is_err());
+        // Deterministic crash window: chunk 1 has reached the destination
+        // journal, but its relay ACK was not durably committed. The Room will
+        // therefore resume at the earlier chunk-0 cursor after restart.
+        let locally_saved_without_room_ack = runtime
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 1 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        runtime
+            .handle_transfer_destination_chunk(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination", "frame_base64": locally_saved_without_room_ack["frame_base64"] })),
+                &client,
+            )
+            .await
+            .unwrap();
         drop(runtime);
 
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
         bind_remote_transfer(&mut runtime);
         runtime
             .handle_transfer_destination_prepare(
-                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination" })),
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "next_sequence": 1, "next_offset": MAX_CHUNK_BYTES, "workspace_id": "ws_destination" })),
                 &client,
             )
             .await

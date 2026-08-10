@@ -818,6 +818,35 @@ impl TransferJournal {
     }
 }
 
+/// Production senders emit exactly one full 64 KiB chunk until the final
+/// chunk. This makes the relay's bounded `(next_sequence, next_offset)` pair
+/// independently checkable without retaining an unbounded chunk history.
+fn validate_room_cursor(
+    plan: &TransferPlan,
+    next_sequence: u64,
+    next_offset: u64,
+) -> TransferResult<()> {
+    if next_offset > plan.size_bytes {
+        return Err(TransferError::Gap);
+    }
+    let chunk_bytes = u64::try_from(MAX_CHUNK_BYTES).map_err(|_| TransferError::Overflow)?;
+    if next_offset < plan.size_bytes && !next_offset.is_multiple_of(chunk_bytes) {
+        return Err(TransferError::Gap);
+    }
+    let expected_sequence = if next_offset == 0 {
+        0
+    } else {
+        next_offset
+            .checked_add(chunk_bytes - 1)
+            .ok_or(TransferError::Overflow)?
+            / chunk_bytes
+    };
+    if next_sequence != expected_sequence {
+        return Err(TransferError::Gap);
+    }
+    Ok(())
+}
+
 /// A sink receives exactly one bounded chunk per call. It must durably write a
 /// chunk before returning success; the journal is advanced only afterwards.
 pub trait ChunkSink {
@@ -1636,13 +1665,68 @@ impl JournalStore {
         now_unix: u64,
         expires_at_unix: u64,
     ) -> TransferResult<TransferJournal> {
+        self.claim_inner(
+            lease,
+            plan,
+            owner_id,
+            epoch,
+            fence,
+            now_unix,
+            expires_at_unix,
+            None,
+        )
+    }
+
+    /// Claim a fresh destination generation at the relay's durable ACK
+    /// cursor. A process can crash after saving one local chunk but before the
+    /// Room commits its ACK; only the Room cursor is safe for both peers to
+    /// resume. The new journal may therefore roll local progress back, never
+    /// forward, and the generation-bound part copies only that prefix.
+    pub fn claim_at_room_cursor(
+        &self,
+        lease: &JournalLease,
+        plan: &TransferPlan,
+        owner_id: &str,
+        epoch: u64,
+        fence: u64,
+        now_unix: u64,
+        expires_at_unix: u64,
+        next_sequence: u64,
+        next_offset: u64,
+    ) -> TransferResult<TransferJournal> {
+        self.claim_inner(
+            lease,
+            plan,
+            owner_id,
+            epoch,
+            fence,
+            now_unix,
+            expires_at_unix,
+            Some((next_sequence, next_offset)),
+        )
+    }
+
+    fn claim_inner(
+        &self,
+        lease: &JournalLease,
+        plan: &TransferPlan,
+        owner_id: &str,
+        epoch: u64,
+        fence: u64,
+        now_unix: u64,
+        expires_at_unix: u64,
+        room_cursor: Option<(u64, u64)>,
+    ) -> TransferResult<TransferJournal> {
         let _store_lock = self.lock_store()?;
         plan.validate_at(now_unix)?;
         if lease.plan_id != plan.id || expires_at_unix <= now_unix {
             return Err(TransferError::StaleFence);
         }
         let journal = if let Some(mut existing) = self.load(plan)? {
-            if existing.state.terminal()
+            if matches!(
+                existing.state,
+                JournalState::Cancelled | JournalState::Failed | JournalState::Published
+            ) || (existing.state == JournalState::Completed && room_cursor.is_none())
                 || existing.expires_at_unix <= now_unix
                 || epoch <= existing.epoch
                 || fence <= existing.fence
@@ -1653,6 +1737,25 @@ impl JournalStore {
             existing.epoch = epoch;
             existing.fence = fence;
             existing.expires_at_unix = expires_at_unix;
+            if let Some((next_sequence, next_offset)) = room_cursor {
+                let local_next_sequence = existing
+                    .contiguous_ack
+                    .map(|sequence| sequence.checked_add(1).ok_or(TransferError::Overflow))
+                    .transpose()?
+                    .unwrap_or(0);
+                validate_room_cursor(plan, local_next_sequence, existing.bytes_received)?;
+                validate_room_cursor(plan, next_sequence, next_offset)?;
+                if next_sequence > local_next_sequence || next_offset > existing.bytes_received {
+                    return Err(TransferError::Gap);
+                }
+                existing.contiguous_ack = next_sequence.checked_sub(1);
+                existing.bytes_received = next_offset;
+                existing.state = if next_offset == plan.size_bytes {
+                    JournalState::Completed
+                } else {
+                    JournalState::Receiving
+                };
+            }
             existing
         } else {
             let count = fs::read_dir(&self.root)
@@ -1667,7 +1770,19 @@ impl JournalStore {
             if count >= self.limits.max_journals {
                 return Err(TransferError::JournalQuotaExceeded);
             }
-            TransferJournal::fresh(plan, owner_id, epoch, fence, expires_at_unix)?
+            let mut fresh = TransferJournal::fresh(plan, owner_id, epoch, fence, expires_at_unix)?;
+            if let Some((next_sequence, next_offset)) = room_cursor {
+                validate_room_cursor(plan, next_sequence, next_offset)?;
+                if next_sequence != 0 || next_offset != 0 {
+                    return Err(TransferError::Gap);
+                }
+                fresh.state = if plan.size_bytes == 0 {
+                    JournalState::Completed
+                } else {
+                    JournalState::Receiving
+                };
+            }
+            fresh
         };
         self.save_unlocked(lease, &journal)?;
         Ok(journal)
@@ -2023,6 +2138,13 @@ impl PartFileSink {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Verify a fully staged generation before treating an at-size Room cursor
+    /// as completed. This hashes the new generation part; journal metadata
+    /// alone is never sufficient to resume directly into publication.
+    pub fn verify_complete(&mut self) -> TransferResult<()> {
+        self.finalize().map_err(TransferError::Sink)
     }
 }
 impl ChunkSink for PartFileSink {

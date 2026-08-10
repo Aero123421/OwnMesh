@@ -657,7 +657,7 @@ async fn run_destination_transfer_pump(
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<Value, String> {
     let prepared = transfer_runtime_call(runtime, authority, methods::TRANSFER_DESTINATION_PREPARE,
-        json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"workspace_id":ticket.destination_workspace_id}), None).await?;
+        json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"next_sequence":cursor.0,"next_offset":cursor.1,"workspace_id":ticket.destination_workspace_id}), None).await?;
     let mut expected_sequence = prepared
         .get("next_sequence")
         .and_then(Value::as_u64)
