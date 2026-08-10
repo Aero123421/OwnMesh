@@ -3124,8 +3124,8 @@ async function reconcileTransferCancellation(
  * it must treat the old pair as uncertain and advance the Room fence instead
  * of ever attempting to replay an unknowably consumed ticket. */
 function transferNeedsFreshGeneration(meta: TransferPlanMeta, source: McpOperationRecord | null, destination: McpOperationRecord | null): boolean {
-  return (typeof meta.live_ticket_deadline_ms === "number" && Date.now() >= meta.live_ticket_deadline_ms)
-    || !meta.source_start_routed || !meta.destination_start_routed
+  const dispatchIncomplete = !meta.source_start_routed || !meta.destination_start_routed;
+  return dispatchIncomplete
     || retryableTransferStartFailure(source) || retryableTransferStartFailure(destination);
 }
 
@@ -3729,7 +3729,11 @@ export async function handleMcp(
         try { destinationRouted = await router.routeLiveToDevice(meta.destination_device_id, destinationStart); } catch { destinationRouted = { status: "dispatch_uncertain" }; }
         if (destinationRouted.status === "dispatch_uncertain") return mcpResult(id, toolContent({ ...sourceAck, data: { transfer: publicTransferMeta(sourceAckMeta), next: "route uncertain; repeat send to fence into a fresh proof generation" } }));
         if (destinationRouted.status !== "routed_to_device") return mcpError(id, -32009, "destination transfer start dispatch failed");
-        const completeAckMeta: TransferPlanMeta = { ...sourceAckMeta, destination_start_routed: true };
+        // Ticket expiry bounds admission only. Once both live routes are
+        // durably acknowledged, the established pumps may run until the
+        // immutable transfer deadline; their terminal/reconnect receipts are
+        // the only authority to advance the generation.
+        const completeAckMeta: TransferPlanMeta = { ...sourceAckMeta, destination_start_routed: true, live_ticket_deadline_ms: undefined };
         const completeAck = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "ticket-bound transfer started", data: { [TRANSFER_META_KEY]: completeAckMeta } }, ["running"]);
         if (!completeAck) return mcpError(id, -32009, "transfer start route receipt race");
         return mcpResult(id, toolContent({ ...completeAck, data: { transfer: publicTransferMeta(completeAckMeta) } }));

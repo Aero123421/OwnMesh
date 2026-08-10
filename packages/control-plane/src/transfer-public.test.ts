@@ -148,6 +148,42 @@ test("crash before either start route is also recovered with fresh proofs", asyn
   assert.equal(((f.routed[0].operation.payload as Record<string, unknown>).capability), "transfer.preflight_source");
 });
 
+test("admitted long-running start pair is not rekeyed when its ticket admission TTL passes", async () => {
+  const f = await fixture();
+  const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/large.bin", destination_path: "out/large.bin", idempotency_key: "long-plan" });
+  const transferId = created.result!.structuredContent!.operation_id;
+  const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
+  const original = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
+  const sourceId = "op_long_source";
+  const destinationId = "op_long_destination";
+  const admitted = {
+    ...original,
+    state: "sending",
+    source_start_operation_id: sourceId,
+    destination_start_operation_id: destinationId,
+    source_start_routed: true,
+    destination_start_routed: true,
+    live_ticket_deadline_ms: Date.now() - 1,
+    pair_generation: 1,
+  };
+  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: admitted } });
+  for (const [operation_id, device_id] of [[sourceId, "dev_source"], [destinationId, "dev_destination"]] as const) {
+    await f.store.putMcpOperation({ ...parent, operation_id, correlation_id: operation_id, device_id, tool: "__transfer_start", status: "pending", summary: "live admitted transfer pump", data: {}, idempotency_key: operation_id, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  }
+
+  const routedBefore = f.routed.length;
+  const polled = await invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "long-send" });
+  const transfer = polled.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(transfer.state, "sending");
+  assert.equal(transfer.epoch, 1);
+  assert.equal(transfer.fence, 1);
+  assert.equal(f.routed.length, routedBefore, "an admitted live pair must not receive fresh preflight");
+  const unchanged = await f.store.getMcpOperation(transferId);
+  const unchangedMeta = unchanged!.data.__ownmesh_transfer_plan as Record<string, unknown>;
+  assert.equal(unchangedMeta.source_start_operation_id, sourceId);
+  assert.equal(unchangedMeta.destination_start_operation_id, destinationId);
+});
+
 test("integrity failure is terminal and never rekeys a transfer", async () => {
   const f = await fixture();
   const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "terminal-plan" });
