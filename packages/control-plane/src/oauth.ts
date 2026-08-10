@@ -10,7 +10,7 @@
  */
 
 import type { ControlPlaneStore } from "./store.ts";
-import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
+import { AUTH_PAGE_CSP, authPage, oauthConsentCsp } from "./auth-ui.ts";
 import { chatGptOAuthClientId, chatGptOAuthPair } from "./owner-auth.ts";
 import {
   ACCESS_TOKEN_TTL_MS,
@@ -493,7 +493,7 @@ export async function handleAuthorize(
   return html(page, {
     status: 200,
     noStore: true,
-    headers: { "content-security-policy": AUTH_PAGE_CSP },
+    headers: { "content-security-policy": oauthConsentCsp(redirect) },
   });
 }
 

@@ -3,6 +3,26 @@ import { OWNMESH_WORDMARK_SVG_BASE64 } from "./brand-wordmark.ts";
 export const AUTH_PAGE_CSP =
   "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
+/**
+ * Consent POSTs return through the client's already-validated redirect URI.
+ * Chrome applies form-action to that redirect as well, so admit only its
+ * canonical origin while keeping every other form destination blocked.
+ */
+export function oauthConsentCsp(redirectUri: string): string {
+  try {
+    const redirect = new URL(redirectUri);
+    if (redirect.protocol !== "https:" && redirect.protocol !== "http:") {
+      return AUTH_PAGE_CSP;
+    }
+    return AUTH_PAGE_CSP.replace(
+      "form-action 'self'",
+      `form-action 'self' ${redirect.origin}`,
+    );
+  } catch {
+    return AUTH_PAGE_CSP;
+  }
+}
+
 type AuthPageOptions = {
   title: string;
   eyebrow: string;

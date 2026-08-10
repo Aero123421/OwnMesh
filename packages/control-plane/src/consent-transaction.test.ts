@@ -153,6 +153,10 @@ test("GET consent issues one-time tx bound to full snapshot", async () => {
     { principal: PRINCIPAL },
   );
   assert.equal(page.status, 200);
+  assert.match(
+    page.headers.get("content-security-policy") || "",
+    /form-action 'self' http:\/\/127\.0\.0\.1:8750(?:;| )/,
+  );
   const html = await page.text();
   assert.match(html, /transaction_id/);
   assert.match(html, /csrf_token/);
