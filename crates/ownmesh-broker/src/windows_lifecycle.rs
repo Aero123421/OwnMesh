@@ -353,12 +353,14 @@ fn final_path(handle: HANDLE) -> Result<PathBuf, String> {
     if written == 0 || usize::try_from(written).unwrap_or(usize::MAX) >= words.len() {
         return Err("read final custody path".into());
     }
-    let mut value = String::from_utf16_lossy(&words[..written as usize]);
+    let value = String::from_utf16_lossy(&words[..written as usize]);
     // Win32 returns a verbatim path (usually \\?\); normalise only that API
     // prefix, never resolve a caller supplied path through canonicalize().
-    if let Some(stripped) = value.strip_prefix(r"\\?\") {
-        value = stripped.to_owned();
-    }
+    let value = if let Some(stripped) = value.strip_prefix(r"\\?\") {
+        stripped.to_owned()
+    } else {
+        value
+    };
     Ok(PathBuf::from(value))
 }
 
@@ -797,7 +799,7 @@ fn hash_file(path: &Path) -> Result<String, String> {
         return Err("broker image changed or exceeded bound while opening (fail-closed)".into());
     }
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut read = 0_u64;
     loop {
         let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
@@ -904,7 +906,10 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
                 std::io::Error::last_os_error()
             ));
         }
-        let user = unsafe { &*bytes.as_ptr().cast::<TOKEN_USER>() };
+        if bytes.len() < std::mem::size_of::<TOKEN_USER>() {
+            return Err("daemon TokenUser buffer is too short".into());
+        }
+        let user = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<TOKEN_USER>()) };
         let sid_len = unsafe { GetLengthSid(user.User.Sid) };
         if sid_len == 0 {
             return Err("daemon TokenUser SID is invalid".into());
@@ -959,7 +964,12 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
         {
             return Err("query daemon integrity level".into());
         }
-        let label = unsafe { &*integrity_bytes.as_ptr().cast::<TOKEN_MANDATORY_LABEL>() };
+        if integrity_bytes.len() < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() {
+            return Err("daemon integrity buffer is too short".into());
+        }
+        let label = unsafe {
+            std::ptr::read_unaligned(integrity_bytes.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
+        };
         let count = unsafe { GetSidSubAuthorityCount(label.Label.Sid) };
         if count.is_null() || unsafe { *count } == 0 {
             return Err("daemon integrity SID is invalid".into());
@@ -1159,24 +1169,6 @@ fn daemon_command_matches_exact_image(command: &str, image: &str) -> bool {
 fn query_service_config(
     service: windows_sys::Win32::System::Services::SC_HANDLE,
 ) -> Result<ServiceConfigSnapshot, String> {
-    let mut needed = 0_u32;
-    let _ = unsafe { QueryServiceConfigW(service, ptr::null_mut(), 0, &raw mut needed) };
-    if needed < u32::try_from(std::mem::size_of::<QUERY_SERVICE_CONFIGW>()).unwrap_or(u32::MAX) {
-        return Err("query broker SCM command size".into());
-    }
-    let words = usize::try_from(needed)
-        .map_err(|_| "broker SCM command length overflow")?
-        .div_ceil(std::mem::size_of::<usize>());
-    let mut buffer = vec![0_usize; words];
-    if unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &raw mut needed) }
-        == 0
-    {
-        return Err(format!(
-            "query broker SCM command: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
     fn returned_string(
         ptr: *mut u16,
         start: usize,
@@ -1214,6 +1206,25 @@ fn query_service_config(
         };
         Ok(raw.len() >= 2 && raw[0] == 0 && raw[1] == 0)
     }
+
+    let mut needed = 0_u32;
+    let _ = unsafe { QueryServiceConfigW(service, ptr::null_mut(), 0, &raw mut needed) };
+    if needed < u32::try_from(std::mem::size_of::<QUERY_SERVICE_CONFIGW>()).unwrap_or(u32::MAX) {
+        return Err("query broker SCM command size".into());
+    }
+    let words = usize::try_from(needed)
+        .map_err(|_| "broker SCM command length overflow")?
+        .div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    if unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &raw mut needed) }
+        == 0
+    {
+        return Err(format!(
+            "query broker SCM command: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
     let start = buffer.as_ptr() as usize;
     let end = start
         .checked_add(buffer.len() * std::mem::size_of::<usize>())
@@ -1389,7 +1400,7 @@ fn validate_service_custody(
             GetAclInformation(
                 dacl,
                 (&raw mut info).cast(),
-                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
                 AclSizeInformation,
             )
         } == 0
@@ -1399,7 +1410,9 @@ fn validate_service_custody(
         }
         for (index, expected) in [system, admins].into_iter().enumerate() {
             let mut ace = ptr::null_mut();
-            if unsafe { GetAce(dacl, index as u32, &raw mut ace) } == 0 || ace.is_null() {
+            if unsafe { GetAce(dacl, u32::try_from(index).unwrap_or(u32::MAX), &raw mut ace) } == 0
+                || ace.is_null()
+            {
                 return Err("read broker service DACL ACE".into());
             }
             let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
