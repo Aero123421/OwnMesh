@@ -32,6 +32,7 @@ import { handleApprove, handleMcp, MCP_TOOLS } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
 import {
   TransferRoom,
+  issueTransferTerminalControl,
   verifyTransferEphemeralProof,
   verifyTransferTicket,
 } from "./transfer-room.ts";
@@ -500,7 +501,20 @@ export default {
               ? { principal_id: mcpAccess.principal, tenant_id: mcpAccess.tenant_id }
               : undefined, true),
         },
-        { issuer, transferTicketSecret: env.SESSION_SECRET },
+        {
+          issuer,
+          transferTicketSecret: env.SESSION_SECRET,
+          terminalizeTransferRoom: env.TRANSFER_ROOM && env.SESSION_SECRET ? async (control) => {
+            const signed = await issueTransferTerminalControl(env.SESSION_SECRET!, { v: 1, ...control });
+            const stub = env.TRANSFER_ROOM!.get(env.TRANSFER_ROOM!.idFromName(control.transfer_id));
+            const response = await stub.fetch(new Request("https://transfer-room/terminal", {
+              method: "POST",
+              headers: { "content-type": "application/json", "content-length": String(new TextEncoder().encode(signed.body).byteLength), "x-ownmesh-transfer-control": signed.signature },
+              body: signed.body,
+            }));
+            return response.ok;
+          } : undefined,
+        },
       );
     }
 

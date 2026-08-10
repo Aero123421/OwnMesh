@@ -82,6 +82,7 @@ const STORAGE_METADATA = "ownmesh:transfer:metadata:v1";
 const STORAGE_TICKETS = "ownmesh:transfer:tickets:v1";
 const MAX_TICKET_REPLAYS = 128;
 const MAX_ADMISSION_QUEUE = 16;
+const MAX_TERMINAL_CONTROL_BYTES = 1024;
 
 /** Persist only a domain-separated replay fingerprint.  A JTI is not a
  * bearer by itself, but retaining its raw value is unnecessary durable link
@@ -111,6 +112,75 @@ function fromBase64Url(value: string): Uint8Array | null {
   try { const raw = atob(value.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat((4 - value.length % 4) % 4)); return Uint8Array.from(raw, (c) => c.charCodeAt(0)); } catch { return null; }
 }
 async function ticketKey(secret: string): Promise<CryptoKey> { return crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]); }
+
+export type TransferTerminalControl = {
+  v: 1;
+  transfer_id: string;
+  plan_sha256: string;
+  epoch: number;
+  fence: number;
+  /** Digest of the destination's already-published receipt. The relay never
+   * sees plaintext and therefore cannot independently recompute this value;
+   * its authority is the Worker-only HMAC plus the exact room/plan fence. It
+   * is authenticated for audit continuity but deliberately not persisted. */
+  artifact_sha256: string;
+};
+
+function canonicalTransferTerminalControl(control: TransferTerminalControl): string {
+  return JSON.stringify({ v: control.v, transfer_id: control.transfer_id, plan_sha256: control.plan_sha256, epoch: control.epoch, fence: control.fence, artifact_sha256: control.artifact_sha256 });
+}
+
+export async function issueTransferTerminalControl(
+  secret: string,
+  control: TransferTerminalControl,
+): Promise<{ body: string; signature: string }> {
+  if (!secret || control.v !== 1 || !id(control.transfer_id) || !hash(control.plan_sha256)
+    || !hash(control.artifact_sha256) || !Number.isSafeInteger(control.epoch) || control.epoch < 1
+    || !Number.isSafeInteger(control.fence) || control.fence < 1) throw new Error("invalid_transfer_terminal_control");
+  const body = canonicalTransferTerminalControl(control);
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", await ticketKey(secret), new TextEncoder().encode(body)));
+  return { body, signature: base64Url(signature) };
+}
+
+async function verifyTransferTerminalControl(
+  secret: string | undefined,
+  body: string,
+  signature: string | null,
+): Promise<TransferTerminalControl | null> {
+  if (!secret || !signature) return null;
+  const rawSignature = fromBase64Url(signature); if (!rawSignature) return null;
+  if (!(await crypto.subtle.verify("HMAC", await ticketKey(secret), rawSignature, new TextEncoder().encode(body)))) return null;
+  let control: TransferTerminalControl; try { control = JSON.parse(body) as TransferTerminalControl; } catch { return null; }
+  if (body !== canonicalTransferTerminalControl(control)) return null;
+  try { await issueTransferTerminalControl(secret, control); } catch { return null; }
+  return control;
+}
+
+/** Read an internal terminal control without ever buffering beyond its fixed
+ * wire budget. The signed representation is canonical ASCII JSON, so invalid
+ * UTF-8 is rejected rather than normalized before HMAC verification. */
+async function readTerminalControlBody(request: Request, expectedBytes: number): Promise<string | null> {
+  if (!request.body) return null;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > MAX_TERMINAL_CONTROL_BYTES || total > expectedBytes) {
+      try { await reader.cancel(); } catch { /* already closed */ }
+      return null;
+    }
+    chunks.push(value);
+  }
+  if (total !== expectedBytes) return null;
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return null; }
+}
 
 /** Fixed-key JSON before the ticket HMAC. JSON is used only as a transport
  * container; verification rejects any non-canonical ordering/extra keys. */
@@ -541,6 +611,39 @@ export class TransferRoom {
     }
   }
   private async fetchAdmitted(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/terminal") {
+      if (request.headers.get("content-type") !== "application/json") return new Response("expected canonical JSON", { status: 415 });
+      const contentLength = request.headers.get("content-length");
+      if (contentLength === null) return new Response("content length required", { status: 411 });
+      if (!/^[1-9][0-9]*$/.test(contentLength)) return new Response("invalid content length", { status: 400 });
+      const contentBytes = Number(contentLength);
+      if (!Number.isSafeInteger(contentBytes)) return new Response("invalid content length", { status: 400 });
+      if (contentBytes > MAX_TERMINAL_CONTROL_BYTES) return new Response("control too large", { status: 413 });
+      const body = await readTerminalControlBody(request, contentBytes);
+      if (body === null) return new Response("control length mismatch", { status: 400 });
+      const control = await verifyTransferTerminalControl(this.env.SESSION_SECRET, body, request.headers.get("x-ownmesh-transfer-control"));
+      if (!control) return new Response("invalid terminal control", { status: 401 });
+      if (!this.metadata || control.transfer_id !== this.metadata.transfer_id
+        || control.plan_sha256 !== this.metadata.plan_sha256 || control.epoch !== this.metadata.epoch
+        || control.fence !== this.metadata.fence) return new Response("terminal control binding mismatch", { status: 403 });
+      if (this.metadata.state === "cancelled" || this.metadata.state === "expired") return new Response("transfer already terminal", { status: 409 });
+      if (this.metadata.state !== "completed") {
+        const completed: TransferMetadata = { ...this.metadata, state: "completed" };
+        try { await this.persistMetadata(completed); }
+        catch { return new Response("storage unavailable", { status: 503 }); }
+        this.router = new TransferRoomRouter(completed, async (metadata) => this.persistMetadata(metadata));
+      }
+      // Always retry replay-ledger deletion, including after a prior request
+      // persisted `completed` but lost storage while deleting the ledger.
+      try { await this.storage().delete(STORAGE_TICKETS); }
+      catch { return new Response("storage unavailable", { status: 503 }); }
+      this.consumed.clear();
+      for (const socket of this.state.getWebSockets()) {
+        try { socket.close(1000, "transfer completed by published receipt"); } catch { /* already closed */ }
+      }
+      return new Response(JSON.stringify({ completed: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }
     if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected websocket", { status: 426 });
     const ticket = await verifyTransferTicket(this.env.SESSION_SECRET, request.headers.get("x-ownmesh-transfer-ticket"));
     if (!ticket || ticket.ticket_exp <= Date.now()) return new Response("invalid ticket", { status: 401 });

@@ -1941,6 +1941,9 @@ export type McpHandleOptions = {
   /** Worker-only ticket signer.  Absent in unit-only callers, where transfer
    * execution fails closed after preflight rather than minting an unsigned key. */
   transferTicketSecret?: string;
+  terminalizeTransferRoom?: (control: {
+    transfer_id: string; plan_sha256: string; epoch: number; fence: number; artifact_sha256: string;
+  }) => Promise<boolean>;
   /**
    * When set, MCP waits briefly for device result (test harness / low-latency path).
    * Production Worker typically returns routed/async immediately.
@@ -2588,6 +2591,7 @@ export type TransferPlanMeta = {
   source_cleanup_operation_id?: string;
   source_cleanup_attempts?: number;
   source_cleanup_retry_after_ms?: number;
+  room_terminalized?: boolean;
   cancellation_idempotency_key?: string;
   destination_plan_id?: string;
   pair_generation?: number;
@@ -2646,6 +2650,7 @@ function transferMeta(data: Record<string, unknown> | null | undefined): Transfe
   for (const key of ["source_start_routed", "destination_start_routed"]) {
     if (value[key] !== undefined && typeof value[key] !== "boolean") return null;
   }
+  if (value.room_terminalized !== undefined && typeof value.room_terminalized !== "boolean") return null;
   if (value.live_ticket_deadline_ms !== undefined && (!Number.isSafeInteger(value.live_ticket_deadline_ms) || Number(value.live_ticket_deadline_ms) <= 0)) return null;
   if (value.pair_generation !== undefined && (!Number.isSafeInteger(value.pair_generation) || Number(value.pair_generation) < 1)) return null;
   if (value.source_cleanup_attempts !== undefined && (!Number.isSafeInteger(value.source_cleanup_attempts) || Number(value.source_cleanup_attempts) < 0 || Number(value.source_cleanup_attempts) > 8)) return null;
@@ -2817,6 +2822,7 @@ type TransferCleanupContext = {
   tenant: string;
   clientId: string;
   principalCredentialGeneration: number;
+  terminalizeTransferRoom?: McpHandleOptions["terminalizeTransferRoom"];
 };
 
 async function routeStoredTransferControl(
@@ -2837,7 +2843,20 @@ async function reconcilePublishedSourceCleanup(
   context?: TransferCleanupContext,
 ): Promise<{ plan: TrackedOperation; meta: TransferPlanMeta }> {
   if (meta.state !== "source_cleanup" || !context || !meta.source_start_operation_id || !meta.source_plan_id) return { plan, meta };
-  const source = await store.getMcpOperation(meta.source_start_operation_id);
+  const sourceStartOperationId = meta.source_start_operation_id;
+  if (!meta.room_terminalized) {
+    if (!context.terminalizeTransferRoom || !meta.plan_sha256 || !meta.source_sha256) return { plan, meta };
+    let terminalized = false;
+    try {
+      terminalized = await context.terminalizeTransferRoom({ transfer_id: meta.transfer_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, artifact_sha256: meta.source_sha256 });
+    } catch { terminalized = false; }
+    if (!terminalized) return { plan, meta };
+    const next: TransferPlanMeta = { ...meta, room_terminalized: true };
+    const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "destination published; transfer room terminalized", data: { [TRANSFER_META_KEY]: next } }, ["running", "pending"]);
+    if (!updated) return { plan, meta };
+    plan = updated; meta = next;
+  }
+  const source = await store.getMcpOperation(sourceStartOperationId);
   if (meta.source_cleanup_retry_after_ms && Date.now() < meta.source_cleanup_retry_after_ms) return { plan, meta };
   const complete = async () => {
     const completed: TransferPlanMeta = { ...meta, state: "completed" };
@@ -2873,15 +2892,15 @@ async function reconcilePublishedSourceCleanup(
 
   if (!meta.source_cleanup_control_operation_id) {
     const operationId = randomId("op_");
-    const idempotencyKey = `transfer-source-stop:${meta.transfer_id}:${meta.source_start_operation_id}`;
+    const idempotencyKey = `transfer-source-stop:${meta.transfer_id}:${sourceStartOperationId}`;
     const deviceOp = await buildDeviceOperation({
       toolName: "ownmesh_cancel_operation", operationId, deviceId: meta.source_device_id,
       principalId: context.principal, tenantId: context.tenant, expiresAt: meta.expires_at,
       principalCredentialGeneration: context.principalCredentialGeneration, oauthClientId: context.clientId,
       workspaceBinding: { workspace_id: meta.source_workspace_id, version: meta.source_workspace_version },
-      args: { target_operation_id: meta.source_start_operation_id, idempotency_key: idempotencyKey },
+      args: { target_operation_id: sourceStartOperationId, idempotency_key: idempotencyKey },
     });
-    await store.putMcpOperation({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_cancel_control", status: "pending", summary: "published transfer source stop requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, target_operation_id: meta.source_start_operation_id }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
+    await store.putMcpOperation({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_cancel_control", status: "pending", summary: "published transfer source stop requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, target_operation_id: sourceStartOperationId }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
     const next: TransferPlanMeta = { ...meta, source_cleanup_control_operation_id: operationId };
     const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "destination published; stopping source transfer", data: { [TRANSFER_META_KEY]: next } }, ["running", "pending"]);
     if (updated) await routeStoredTransferControl(await store.getMcpOperation(operationId) as McpOperationRecord, meta.source_device_id, context);
@@ -3422,7 +3441,7 @@ export async function handleMcp(
       }
       ({ plan, meta } = await reconcileTransferStart(store, tracker, plan, meta, router ? {
         router, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id,
-        principalCredentialGeneration,
+        principalCredentialGeneration, terminalizeTransferRoom: opts.terminalizeTransferRoom,
       } : undefined));
       ({ plan, meta } = await reconcileTransferCancellation(store, tracker, plan, meta));
       const authority = await transferAuthorities(store, meta, rec.principal, rec.tenant_id);
@@ -3686,7 +3705,7 @@ export async function handleMcp(
         if (!candidate || !transfer || candidate.principal !== rec.principal || candidate.tenant_id !== rec.tenant_id) continue;
         ({ plan: candidate, meta: transfer } = await reconcileTransferStart(store, tracker, candidate, transfer, router ? {
           router, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id,
-          principalCredentialGeneration,
+          principalCredentialGeneration, terminalizeTransferRoom: opts.terminalizeTransferRoom,
         } : undefined));
         ({ plan: candidate, meta: transfer } = await reconcileTransferCancellation(store, tracker, candidate, transfer));
         transfers.push({ operation_id: candidate.operation_id, created_at: candidate.created_at || item.created_at, ...publicTransferMeta(transfer) });

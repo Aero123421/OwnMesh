@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canonicalTransferEphemeralProof, issueTransferTicket, TransferRoom, TransferRoomRouter, TRANSFER_PROTOCOL, validateTransferAttachment, verifyTransferEphemeralProof, verifyTransferTicket, type TransferAttachment, type TransferMetadata, type TransferTicketClaims } from "./transfer-room.ts";
+import { canonicalTransferEphemeralProof, issueTransferTerminalControl, issueTransferTicket, TransferRoom, TransferRoomRouter, TRANSFER_PROTOCOL, validateTransferAttachment, verifyTransferEphemeralProof, verifyTransferTicket, type TransferAttachment, type TransferMetadata, type TransferTicketClaims } from "./transfer-room.ts";
 
 const digest = "a".repeat(64);
 function meta(): TransferMetadata { return { version: 1, transfer_id: "xfer_test", tenant_id: "ten_a", source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", plan_sha256: digest, transfer_expires_at: Date.now() + 10 * 60_000, max_bytes: 128 * 1024, epoch: 1, fence: 7, state: "prepared", contiguous_ack_sequence: null, contiguous_ack_offset: 0 }; }
@@ -31,13 +31,14 @@ function installTransferWebSocketPair(): void {
 function transferState(
   storage: Map<string, unknown>, sockets: TransferMockSocket[] = [],
   beforePut?: (key: string, value: unknown) => Promise<void>,
+  beforeDelete?: (key: string) => Promise<void>,
 ): DurableObjectState {
   return {
     id: { toString: () => "xfer_test", equals: () => false, name: "xfer_test" } as DurableObjectId,
     storage: {
       get: async (key: string) => structuredClone(storage.get(key)),
       put: async (key: string, value: unknown) => { await beforePut?.(key, value); storage.set(key, structuredClone(value)); },
-      delete: async (key: string) => storage.delete(key),
+      delete: async (key: string) => { await beforeDelete?.(key); return storage.delete(key); },
       setAlarm: async () => undefined,
     },
     getWebSockets: () => sockets as unknown as WebSocket[],
@@ -167,6 +168,87 @@ test("TransferRoom serializes concurrent two-role generation advance", async () 
   assert.ok(sockets.every((socket) => socket.sent.some((raw) => raw.includes('"type":"ready"'))));
   const ledger = storage.get("ownmesh:transfer:tickets:v1");
   assert.equal(Array.isArray(ledger) ? ledger.length : -1, 2, "overflow admission must not consume a ticket");
+});
+
+test("service-HMAC terminal control completes a prepared Room without persisting the receipt digest", async () => {
+  installTransferWebSocketPair();
+  const secret = "terminal-control-secret";
+  const storage = new Map<string, unknown>();
+  const sockets: TransferMockSocket[] = [];
+  const room = new TransferRoom(transferState(storage, sockets), { SESSION_SECRET: secret });
+  const source = ticket("source");
+  const destination = { ...ticket("destination"), transfer_expires_at: source.transfer_expires_at };
+  assert.equal(await transferUpgrade(room, await issueTransferTicket(secret, source)), 101);
+  assert.equal(await transferUpgrade(room, await issueTransferTicket(secret, destination)), 101);
+  const artifactSha256 = "d".repeat(64);
+  const signed = await issueTransferTerminalControl(secret, {
+    v: 1, transfer_id: source.transfer_id, plan_sha256: source.plan_sha256,
+    epoch: source.epoch, fence: source.fence, artifact_sha256: artifactSha256,
+  });
+  const terminalRequest = (body: string, signature: string, headers: Record<string, string> = {}) => new Request("https://room.invalid/terminal", {
+    method: "POST", headers: {
+      "content-type": "application/json",
+      "content-length": String(new TextEncoder().encode(body).byteLength),
+      "x-ownmesh-transfer-control": signature,
+      ...headers,
+    }, body,
+  });
+  const invalid = await room.fetch(new Request("https://room.invalid/terminal", {
+    method: "POST", headers: {
+      "content-type": "application/json", "content-length": String(signed.body.length),
+      "x-ownmesh-transfer-control": "invalid",
+    }, body: signed.body,
+  }));
+  assert.equal(invalid.status, 401);
+  assert.equal((await room.fetch(new Request("https://room.invalid/terminal", {
+    method: "POST", headers: { "content-type": "application/json", "x-ownmesh-transfer-control": signed.signature }, body: signed.body,
+  }))).status, 411, "missing content length must fail closed");
+  assert.equal((await room.fetch(terminalRequest(signed.body, signed.signature, { "content-length": String(signed.body.length + 1) }))).status, 400, "spoofed content length must fail closed");
+  assert.equal((await room.fetch(terminalRequest(`${signed.body}${" ".repeat(1025)}`, signed.signature, { "content-length": String(signed.body.length) }))).status, 400, "streamed body beyond the declared bound must fail closed");
+  assert.equal((await room.fetch(terminalRequest(signed.body, signed.signature, { "content-length": "-1" }))).status, 400);
+  assert.equal((await room.fetch(terminalRequest(signed.body, signed.signature, { "content-length": "NaN" }))).status, 400);
+  assert.equal((await room.fetch(terminalRequest(signed.body, signed.signature, { "content-length": `0${signed.body.length}` }))).status, 400, "content length must be canonical decimal");
+  assert.equal((await room.fetch(terminalRequest(signed.body, signed.signature, { "content-length": "1025" }))).status, 413, "declared overflow must fail before reading the body");
+  assert.equal((await room.fetch(terminalRequest(`${signed.body}${" ".repeat(1025)}`, signed.signature))).status, 413, "actual overflow must fail closed");
+  assert.equal((await room.fetch(terminalRequest(signed.body, signed.signature, { "content-type": "application/json; charset=utf-8" }))).status, 415, "content type must be exact");
+  const completed = await room.fetch(terminalRequest(signed.body, signed.signature));
+  assert.equal(completed.status, 200);
+  assert.equal((storage.get("ownmesh:transfer:metadata:v1") as TransferMetadata).state, "completed");
+  assert.equal(storage.has("ownmesh:transfer:tickets:v1"), false);
+  assert.ok(sockets.every((socket) => socket.closed));
+  assert.equal(JSON.stringify([...storage.entries()]).includes(artifactSha256), false);
+  const replay = new TransferRoom(transferState(storage), { SESSION_SECRET: secret });
+  assert.equal((await replay.fetch(terminalRequest(signed.body, signed.signature))).status, 200);
+});
+
+test("terminal control retries replay-ledger deletion after completed metadata was persisted", async () => {
+  installTransferWebSocketPair();
+  const secret = "terminal-delete-retry-secret";
+  const current = meta();
+  const storage = new Map<string, unknown>([
+    ["ownmesh:transfer:metadata:v1", current],
+    ["ownmesh:transfer:tickets:v1", [["b".repeat(64), Date.now() + 10_000]]],
+  ]);
+  let deleteAttempts = 0;
+  const room = new TransferRoom(transferState(storage, [], undefined, async (key) => {
+    if (key === "ownmesh:transfer:tickets:v1" && ++deleteAttempts === 1) throw new Error("injected delete failure");
+  }), { SESSION_SECRET: secret });
+  const signed = await issueTransferTerminalControl(secret, {
+    v: 1, transfer_id: current.transfer_id, plan_sha256: current.plan_sha256,
+    epoch: current.epoch, fence: current.fence, artifact_sha256: "e".repeat(64),
+  });
+  const request = () => new Request("https://room.invalid/terminal", {
+    method: "POST", headers: {
+      "content-type": "application/json", "content-length": String(signed.body.length),
+      "x-ownmesh-transfer-control": signed.signature,
+    }, body: signed.body,
+  });
+  assert.equal((await room.fetch(request())).status, 503);
+  assert.equal((storage.get("ownmesh:transfer:metadata:v1") as TransferMetadata).state, "completed");
+  assert.equal(storage.has("ownmesh:transfer:tickets:v1"), true);
+  assert.equal((await room.fetch(request())).status, 200);
+  assert.equal(storage.has("ownmesh:transfer:tickets:v1"), false);
+  assert.equal(deleteAttempts, 2);
 });
 
 test("ephemeral proof binds the exact key, role, and immutable transfer facts", async () => {

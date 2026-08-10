@@ -19,15 +19,16 @@ async function fixture() {
   await store.putWorkspace({ workspace_id: "ws_destination", tenant_id: "ten_default", device_id: "dev_destination", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const routed: Array<{ deviceId: string; operation: Record<string, unknown> }> = [];
   const liveRouted: Array<{ deviceId: string; operation: Record<string, unknown> }> = [];
+  const roomTerminalized: Array<Record<string, unknown>> = [];
   const router: OperationRouter = {
     async routeToDevice(deviceId, operation) { routed.push({ deviceId, operation: operation as unknown as Record<string, unknown> }); return { status: "routed_to_device" }; },
     async routeLiveToDevice(deviceId, operation) { liveRouted.push({ deviceId, operation: operation as unknown as Record<string, unknown> }); return { status: "routed_to_device" }; },
   };
-  return { store, token: token.access_token, foreignToken: foreign.access_token, router, routed, liveRouted };
+  return { store, token: token.access_token, foreignToken: foreign.access_token, router, routed, liveRouted, roomTerminalized };
 }
 
 async function invoke(f: Awaited<ReturnType<typeof fixture>>, name: string, args: Record<string, unknown>, token = f.token) {
-  const response = await handleMcp(request(token, name, args), f.store, new URL("https://cp.test/mcp"), f.router, { tracker: new OperationTracker(), transferTicketSecret: "transfer-public-test-secret" });
+  const response = await handleMcp(request(token, name, args), f.store, new URL("https://cp.test/mcp"), f.router, { tracker: new OperationTracker(), transferTicketSecret: "transfer-public-test-secret", terminalizeTransferRoom: async (control) => { f.roomTerminalized.push(control); return true; } });
   return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown> } }; error?: { message: string } };
 }
 
@@ -134,12 +135,14 @@ test("source reply loss after destination publication completes only after exact
   const transferId = created.result!.structuredContent!.operation_id;
   const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
   const meta = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
-  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: { ...meta, state: "sending", source_plan_id: "plan_source", source_sha256: "d".repeat(64), source_size_bytes: 7, source_start_operation_id: "op_lost_source", destination_start_operation_id: "op_published_destination", source_start_routed: true, destination_start_routed: true } } });
+  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: { ...meta, state: "sending", plan_sha256: "a".repeat(64), source_plan_id: "plan_source", source_sha256: "d".repeat(64), source_size_bytes: 7, source_start_operation_id: "op_lost_source", destination_start_operation_id: "op_published_destination", source_start_routed: true, destination_start_routed: true } } });
   await f.store.putMcpOperation({ ...parent, operation_id: "op_lost_source", correlation_id: "op_lost_source", device_id: "dev_source", tool: "__transfer_start_source", status: "failed", summary: "finish ack lost", data: { error: { code: "OWNMESH_E_TRANSFER_SESSION_LOST" } }, idempotency_key: "op_lost_source", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   await f.store.putMcpOperation({ ...parent, operation_id: "op_published_destination", correlation_id: "op_published_destination", device_id: "dev_destination", tool: "__transfer_start_destination", status: "completed", summary: "published", data: { transfer_id: transferId, plan_id: "plan_destination", role: "destination", published: true, completed: true, artifact_sha256: "d".repeat(64) }, idempotency_key: "op_published_destination", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const pending = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
   const pendingTransfer = pending.result!.structuredContent!.data.transfer as Record<string, unknown>;
   assert.equal(pendingTransfer.state, "source_cleanup"); assert.equal(pendingTransfer.epoch, 1);
+  assert.equal(f.roomTerminalized.length, 1);
+  assert.deepEqual(f.roomTerminalized[0], { transfer_id: transferId, plan_sha256: "a".repeat(64), epoch: 1, fence: 1, artifact_sha256: "d".repeat(64) });
   assert.equal((f.routed.at(-1)!.operation.payload as Record<string, unknown>).capability, "operation.cancel");
   let current = await f.store.getMcpOperation(transferId); assert.ok(current);
   let currentMeta = current.data.__ownmesh_transfer_plan as TransferPlanMeta;
