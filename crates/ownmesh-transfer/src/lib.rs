@@ -2189,6 +2189,28 @@ impl JournalStore {
             })
     }
 
+    /// Remove only this plan's private generation part after a durable
+    /// publication receipt exists. The receipt is deliberately authoritative:
+    /// a crash or sharing violation after it is saved can retry this bounded
+    /// unlink without republishing or touching another transfer's part.
+    pub fn cleanup_published_generation_parts(&self, plan: &TransferPlan) -> TransferResult<usize> {
+        plan.validate_at(now_unix())?;
+        let _store_lock = self.lock_store()?;
+        let journal = self.load(plan)?.ok_or(TransferError::Terminal)?;
+        if !journal.published() || journal.bytes_received != plan.size_bytes {
+            return Err(TransferError::Terminal);
+        }
+        let part = self.part_path(plan.id(), journal.epoch)?;
+        if !owner_only_file_present(&part)? {
+            return Ok(0);
+        }
+        remove_owner_only_file_retry(&part)?;
+        if owner_only_file_present(&part)? {
+            return Err(TransferError::CustodyUnavailable);
+        }
+        Ok(1)
+    }
+
     /// Verify that an already custody-verified retained destination handle
     /// contains exactly the artifact authorized by `plan`. The runtime must
     /// pass the same handle onward for paging, never reopen its pathname.

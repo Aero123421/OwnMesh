@@ -63,6 +63,37 @@ fn write_owner_only_for_test(path: &std::path::Path, bytes: &[u8]) {
     ownmesh_ipc::create_owner_only_file_new(path, bytes).unwrap();
 }
 
+fn persist_published_receipt(
+    root: &std::path::Path,
+    bytes: &[u8],
+    epoch: u64,
+) -> (JournalStore, TransferPlan, std::path::PathBuf) {
+    let plan = make_plan(bytes);
+    let store = JournalStore::open(root.join("state"), JournalLimits::default()).unwrap();
+    let lease = store
+        .acquire_for_fence(&plan, 1, u64::MAX, epoch, epoch)
+        .unwrap();
+    let journal = store
+        .claim(&lease, &plan, "owner-a", epoch, epoch, 1, u64::MAX)
+        .unwrap();
+    let mut sink = PartFileSink::create(&store, &plan, epoch, 0).unwrap();
+    let part = sink.path().to_path_buf();
+    let mut receiver = TransferReceiver::resume_from_part(plan.clone(), journal, &part).unwrap();
+    receiver
+        .receive(&mut sink, TransferChunk::new(0, 0, bytes.to_vec()).unwrap())
+        .unwrap();
+    store.save(&lease, &receiver.journal_snapshot()).unwrap();
+    drop(sink);
+    store
+        .publish_completed_no_replace(&plan, &workspace(root))
+        .unwrap();
+    let mut receipt = store.load_for_fence(&plan, epoch, epoch).unwrap();
+    receipt.mark_published(&plan).unwrap();
+    store.save(&lease, &receipt).unwrap();
+    drop(lease);
+    (store, plan, part)
+}
+
 #[derive(Default)]
 struct TestSink(Vec<u8>);
 impl ChunkSink for TestSink {
@@ -229,6 +260,61 @@ fn part_cancel_only_deletes_its_own_private_part_and_publish_refuses_overwrite()
         .unwrap_err();
     assert_eq!(publish_error, TransferError::DestinationExists);
     assert_eq!(std::fs::read(&destination).unwrap(), b"do not replace");
+}
+
+#[test]
+fn published_receipt_cleanup_removes_only_the_exact_generation_part() {
+    let dir = tempdir().unwrap();
+    let (store, plan, part) = persist_published_receipt(dir.path(), b"published", 1);
+    assert!(part.exists());
+
+    let other_plan = make_plan(b"unrelated");
+    let other_sink = PartFileSink::create(&store, &other_plan, 7, 0).unwrap();
+    let other_part = other_sink.path().to_path_buf();
+    assert_ne!(part, other_part);
+    assert_eq!(store.cleanup_published_generation_parts(&plan).unwrap(), 1);
+    assert!(!part.exists());
+    assert!(other_part.exists(), "another transfer's part must remain");
+    assert_eq!(
+        std::fs::read(dir.path().join("output.bin")).unwrap(),
+        b"published"
+    );
+    assert!(store.load(&plan).unwrap().unwrap().published());
+    assert_eq!(
+        store.cleanup_published_generation_parts(&plan).unwrap(),
+        0,
+        "cleanup must be idempotent after the exact unlink"
+    );
+}
+
+#[test]
+fn published_receipt_cleanup_replays_after_restart_before_unlink_reply() {
+    let dir = tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (store, plan, part) = persist_published_receipt(dir.path(), b"reply-loss", 3);
+    assert!(part.exists());
+
+    // Crash after Published was durable but before private-part unlink/reply.
+    drop(store);
+    let restored = JournalStore::open(&state, JournalLimits::default()).unwrap();
+    assert_eq!(
+        restored.cleanup_published_generation_parts(&plan).unwrap(),
+        1
+    );
+    assert!(!part.exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("output.bin")).unwrap(),
+        b"reply-loss"
+    );
+    assert!(restored.load(&plan).unwrap().unwrap().published());
+    drop(restored);
+
+    let replayed = JournalStore::open(&state, JournalLimits::default()).unwrap();
+    assert_eq!(
+        replayed.cleanup_published_generation_parts(&plan).unwrap(),
+        0
+    );
+    assert!(replayed.load(&plan).unwrap().unwrap().published());
 }
 
 #[test]

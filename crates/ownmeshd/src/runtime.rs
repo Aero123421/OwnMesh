@@ -3053,6 +3053,10 @@ full_user_access/full_access for arbitrary commands",
             self.transfer_store
                 .verify_published_destination_handle(&plan, &mut artifact)
                 .map_err(Self::transfer_error)?;
+            drop(artifact);
+            self.transfer_store
+                .cleanup_published_generation_parts(&plan)
+                .map_err(Self::transfer_error)?;
             return Ok(
                 json!({ "plan_id": plan.id(), "published": true, "replayed": true, "sha256": plan.sha256(), "size_bytes": plan.size_bytes() }),
             );
@@ -3099,6 +3103,9 @@ full_user_access/full_access for arbitrary commands",
             .map_err(Self::transfer_error)?;
         self.transfer_store
             .save(&lease, &receipt)
+            .map_err(Self::transfer_error)?;
+        self.transfer_store
+            .cleanup_published_generation_parts(&plan)
             .map_err(Self::transfer_error)?;
         Ok(
             json!({ "plan_id": plan.id(), "published": true, "replayed": false, "sha256": plan.sha256(), "size_bytes": plan.size_bytes() }),
@@ -8952,6 +8959,98 @@ mod transfer_runtime_tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn normal_transfer_finalize_unlinks_its_published_generation_part() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_destination".into(),
+                root: temp.path().join("destination"),
+                label: Some("destination".into()),
+            })
+            .unwrap();
+        let content = b"normal-published-transfer";
+        std::fs::write(
+            paths.state_dir.join("workspace").join("normal.bin"),
+            content,
+        )
+        .unwrap();
+        bind_remote_transfer(&mut runtime);
+        let client = remote_client();
+        let plan = runtime
+            .handle_transfer_plan(
+                Some(json!({
+                    "source_path": "normal.bin",
+                    "destination_path": "normal-output.bin",
+                    "destination_workspace_id": "ws_destination",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
+        runtime
+            .handle_transfer_destination_prepare(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "next_sequence": 0, "next_offset": 0, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let chunk = runtime
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 0 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        runtime
+            .handle_transfer_destination_chunk(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination", "frame_base64": chunk["frame_base64"] })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let finalized = runtime
+            .handle_transfer_finalize(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(finalized["replayed"], json!(false));
+        assert!(!paths
+            .state_dir
+            .join("transfers")
+            .join(format!(".{plan_id}.1.part"))
+            .exists());
+        assert_eq!(
+            std::fs::read(temp.path().join("destination").join("normal-output.bin")).unwrap(),
+            content
+        );
+        let stored_plan = runtime
+            .transfer_store
+            .load_plan(&plan_id, DaemonRuntime::now() as u64)
+            .unwrap()
+            .unwrap();
+        assert!(runtime
+            .transfer_store
+            .load(&stored_plan)
+            .unwrap()
+            .unwrap()
+            .published());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn transfer_streams_binary_resumes_after_restart_and_pages_artifact() {
         let temp = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(temp.path());
@@ -9098,6 +9197,27 @@ mod transfer_runtime_tests {
             .await
             .unwrap();
         assert_eq!(recovered["replayed"], json!(false));
+        for epoch in [1_u64, 2] {
+            assert!(
+                !paths
+                    .state_dir
+                    .join("transfers")
+                    .join(format!(".{plan_id}.{epoch}.part"))
+                    .exists(),
+                "published generation parts must be removed after recovery"
+            );
+        }
+        let published_plan = runtime
+            .transfer_store
+            .load_plan(&plan_id, DaemonRuntime::now() as u64)
+            .unwrap()
+            .unwrap();
+        assert!(runtime
+            .transfer_store
+            .load(&published_plan)
+            .unwrap()
+            .unwrap()
+            .published());
         let mut reconstructed = Vec::new();
         let mut offset = 0_u64;
         loop {
@@ -9128,6 +9248,17 @@ mod transfer_runtime_tests {
             .await
             .unwrap();
         assert_eq!(replay["replayed"], json!(true));
+        for epoch in [1_u64, 2] {
+            assert!(!paths
+                .state_dir
+                .join("transfers")
+                .join(format!(".{plan_id}.{epoch}.part"))
+                .exists());
+        }
+        assert_eq!(
+            std::fs::read(temp.path().join("destination").join("received.bin")).unwrap(),
+            bytes
+        );
         std::fs::write(
             temp.path().join("destination").join("received.bin"),
             b"substituted",
