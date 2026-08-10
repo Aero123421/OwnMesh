@@ -489,8 +489,29 @@ fn classify_transfer_failure(error: &str) -> TransferSessionFailure {
         | "transfer ACK send failed"
         | "transfer finish send failed"
         | "transfer finish acknowledgement send failed"
+        | "transfer peer unavailable; fresh ticket required for reconnect"
         | "source cleanup pending" => TransferSessionFailure::Reconnect,
         _ => TransferSessionFailure::Terminal,
+    }
+}
+
+fn transfer_room_reconnect_signal(frame: &serde_json::Map<String, Value>) -> bool {
+    frame.len() == 3
+        && frame.get("protocol").and_then(Value::as_str) == Some("ownmesh.transfer/1.0")
+        && frame.get("type").and_then(Value::as_str) == Some("error")
+        && matches!(
+            frame.get("code").and_then(Value::as_str),
+            Some("destination_offline" | "peer_unavailable")
+        )
+}
+
+fn reject_transfer_room_reconnect_signal(
+    frame: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    if transfer_room_reconnect_signal(frame) {
+        Err("transfer peer unavailable; fresh ticket required for reconnect".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -502,6 +523,7 @@ async fn transfer_ready_cursor(
     let raw = transfer_next_text(socket, cancel).await?;
     let frame: Value = serde_json::from_str(&raw).map_err(|_| "invalid transfer ready frame")?;
     let object = frame.as_object().ok_or("invalid transfer ready frame")?;
+    reject_transfer_room_reconnect_signal(object)?;
     if object.get("type").and_then(Value::as_str) != Some("ready")
         || !transfer_frame_binding(object, ticket)
     {
@@ -572,6 +594,7 @@ async fn run_source_transfer_pump(
             let finish = finish
                 .as_object()
                 .ok_or("invalid transfer finish acknowledgement")?;
+            reject_transfer_room_reconnect_signal(finish)?;
             if finish.get("type").and_then(Value::as_str) != Some("finish_ack")
                 || !transfer_frame_binding(finish, ticket)
             {
@@ -603,6 +626,7 @@ async fn run_source_transfer_pump(
         let raw_ack = transfer_next_text(socket, cancel).await?;
         let ack: Value = serde_json::from_str(&raw_ack).map_err(|_| "invalid transfer ACK")?;
         let object = ack.as_object().ok_or("invalid transfer ACK")?;
+        reject_transfer_room_reconnect_signal(object)?;
         if object.get("type").and_then(Value::as_str) != Some("ack")
             || !transfer_frame_binding(object, ticket)
             || object.get("sequence").and_then(Value::as_u64) != Some(sequence)
@@ -673,6 +697,7 @@ async fn run_destination_transfer_pump(
         let raw = transfer_next_text(socket, cancel).await?;
         let frame: Value = serde_json::from_str(&raw).map_err(|_| "invalid transfer frame")?;
         let object = frame.as_object().ok_or("invalid transfer frame")?;
+        reject_transfer_room_reconnect_signal(object)?;
         if object.get("type").and_then(Value::as_str) == Some("cancel") {
             if transfer_frame_binding(object, ticket) {
                 return Err("transfer cancelled".into());
@@ -5034,6 +5059,10 @@ fn transfer_failure_classification_only_retries_connection_loss() {
         classify_transfer_failure("source cleanup pending"),
         TransferSessionFailure::Reconnect
     );
+    assert_eq!(
+        classify_transfer_failure("transfer peer unavailable; fresh ticket required for reconnect"),
+        TransferSessionFailure::Reconnect
+    );
     for terminal in [
         "transfer frame binding mismatch",
         "chunk hash mismatch",
@@ -5044,5 +5073,27 @@ fn transfer_failure_classification_only_retries_connection_loss() {
             classify_transfer_failure(terminal),
             TransferSessionFailure::Terminal
         );
+    }
+}
+
+#[test]
+fn only_exact_room_peer_unavailable_errors_request_reconnect() {
+    for code in ["destination_offline", "peer_unavailable"] {
+        let frame = json!({
+            "protocol": "ownmesh.transfer/1.0",
+            "type": "error",
+            "code": code,
+        });
+        assert!(transfer_room_reconnect_signal(frame.as_object().unwrap()));
+    }
+    for terminal in [
+        json!({"protocol":"ownmesh.transfer/1.0","type":"error","code":"binding_mismatch"}),
+        json!({"protocol":"ownmesh.transfer/1.0","type":"error","code":"non_contiguous_or_busy"}),
+        json!({"protocol":"ownmesh.transfer/1.0","type":"error","code":"destination_offline","detail":"extra"}),
+        json!({"protocol":"wrong","type":"error","code":"destination_offline"}),
+    ] {
+        assert!(!transfer_room_reconnect_signal(
+            terminal.as_object().unwrap()
+        ));
     }
 }
