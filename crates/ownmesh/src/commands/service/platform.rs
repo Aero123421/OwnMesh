@@ -518,6 +518,29 @@ pub fn resolve_ownmeshd_path(explicit: Option<&str>) -> Result<PathBuf, String> 
         }
         return Err(format!("executable not found: {raw}"));
     }
+    // A macOS privileged-broker install pins this root-owned image by exact
+    // inode and audit token. Prefer it automatically so a normal LaunchAgent
+    // can use elevation without exposing platform paths to the user.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let installed = if cfg!(target_os = "macos") {
+            PathBuf::from("/Library/Application Support/OwnMesh/bin/ownmeshd")
+        } else {
+            PathBuf::from("/usr/lib/ownmesh/ownmeshd")
+        };
+        if installed.is_file() {
+            return Ok(installed);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(program_files) = env::var_os("ProgramFiles") {
+        let installed = PathBuf::from(program_files)
+            .join("OwnMesh")
+            .join("ownmeshd.exe");
+        if installed.is_file() {
+            return Ok(installed);
+        }
+    }
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             for name in ["ownmeshd", "ownmeshd.exe"] {

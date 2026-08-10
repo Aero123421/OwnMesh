@@ -31,6 +31,8 @@ mod session_transition_journal;
 mod structured_adapter;
 #[cfg(target_os = "linux")]
 use broker_runtime::load_linux_broker_client;
+#[cfg(target_os = "macos")]
+use broker_runtime::load_macos_broker_client;
 #[cfg(windows)]
 use broker_runtime::load_windows_broker_client;
 #[cfg(windows)]
@@ -42,7 +44,7 @@ use ownmesh_broker_client::{
     compute_execute_intent_mac_v2, BrokerV2ClientError, ExecutablePinV2, ExecuteIntentV2,
     OperationFactsV2, BROKER_PROTOCOL_V2, DEFAULT_CAPABILITY_TTL_SECS,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use ownmesh_broker_client::{connect_and_execute_v2, connect_and_execute_v2_cancellable};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
@@ -1475,13 +1477,17 @@ impl DaemonRuntime {
     async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
         #[cfg(target_os = "linux")]
         {
-            return self.try_linux_broker_elevated(p).await;
+            return self.try_unix_broker_elevated(p).await;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return self.try_unix_broker_elevated(p).await;
         }
         #[cfg(windows)]
         {
             return self.try_windows_broker_elevated(p).await;
         }
-        #[cfg(not(any(target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = p;
             Err(IpcError::Remote {
@@ -1491,8 +1497,8 @@ impl DaemonRuntime {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    async fn try_linux_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn try_unix_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
         let running_image = std::env::current_exe().map_err(|_| IpcError::Remote {
             code: app_error::INTERNAL,
             message: "elevated execution cannot resolve the running daemon image (fail-closed)"
@@ -1501,9 +1507,13 @@ impl DaemonRuntime {
         // Re-read every custody artifact immediately before the authority-bearing
         // write. Startup state is never sufficient: service/socket/config/key
         // replacement and daemon image drift must take elevation offline.
-        let broker = load_linux_broker_client(&running_image).map_err(|_| IpcError::Remote {
+        #[cfg(target_os = "linux")]
+        let loaded = load_linux_broker_client(&running_image);
+        #[cfg(target_os = "macos")]
+        let loaded = load_macos_broker_client(&running_image);
+        let broker = loaded.map_err(|_| IpcError::Remote {
             code: app_error::INTERNAL,
-            message: "unsupported: elevated execution requires a custody-attested installed Linux broker; broker unavailable or custody validation failed (fail-closed; no local exec)".into(),
+            message: "unsupported: elevated execution requires a custody-attested installed native broker; broker unavailable or custody validation failed (fail-closed; no local exec)".into(),
         })?;
         let execute = self.build_broker_execute_intent(p, &broker.secret)?;
         let response = if let Some(mut cancel) = self.active_cancel.clone() {
@@ -1531,7 +1541,11 @@ impl DaemonRuntime {
         // the installed record, secret, verify key, socket and daemon image
         // are attested again. A post-send failure is intentionally uncertain,
         // so the caller cannot replay a possibly completed privileged command.
-        let reattested = load_linux_broker_client(&running_image).map_err(|_| IpcError::Remote {
+        #[cfg(target_os = "linux")]
+        let reloaded = load_linux_broker_client(&running_image);
+        #[cfg(target_os = "macos")]
+        let reloaded = load_macos_broker_client(&running_image);
+        let reattested = reloaded.map_err(|_| IpcError::Remote {
             code: app_error::CONFLICT,
             message: "broker custody changed after execution; outcome is uncertain and must not be retried".into(),
         })?;

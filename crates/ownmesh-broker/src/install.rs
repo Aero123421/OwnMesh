@@ -127,7 +127,7 @@ fn install_path(_base: &Path) -> PathBuf {
 
 #[must_use]
 pub fn endpoint_kind_peer_enforceable(kind: &str) -> bool {
-    matches!(kind, "unix_socket") && cfg!(target_os = "linux")
+    matches!(kind, "unix_socket") && cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 /// Install using this executable and a sibling `ownmeshd` image.  Distribution
@@ -168,11 +168,44 @@ pub fn install_broker(
         }
         return crate::windows_lifecycle::install_windows_broker(base);
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = base;
+        let daemon_uid = std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|uid| *uid != 0)
+            .ok_or_else(|| {
+                "macOS install requires an explicit non-root daemon identity; invoke through `sudo ownmesh privileged install`"
+                    .to_string()
+            })?;
+        let daemon_gid = std::env::var("SUDO_GID")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|gid| *gid != 0)
+            .ok_or_else(|| "macOS install requires SUDO_GID for the invoking user".to_string())?;
+        let broker = std::env::current_exe()
+            .map_err(|error| format!("resolve broker executable: {error}"))?;
+        let daemon = broker.with_file_name("ownmeshd");
+        let config = BrokerInstallConfig {
+            endpoint: endpoint_override,
+            trusted_executable: daemon,
+            daemon_uid,
+            daemon_gid,
+            socket_security: UnixSocketSecurity {
+                owner_uid: daemon_uid,
+                group_gid: daemon_gid,
+                mode: 0o600,
+            },
+            allowed_uids: vec![daemon_uid],
+        };
+        return crate::macos_lifecycle::install_macos_broker(&broker, &config);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (base, endpoint_override);
         Err(
-            "unsupported: native privileged broker lifecycle is currently supported on Linux only"
+            "unsupported: native privileged broker lifecycle is unavailable on this platform"
                 .into(),
         )
     }
@@ -198,11 +231,18 @@ pub fn install_broker_with_config(
         }
         return crate::windows_lifecycle::install_windows_broker(base);
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = base;
+        let broker = std::env::current_exe()
+            .map_err(|error| format!("resolve broker executable: {error}"))?;
+        return crate::macos_lifecycle::install_macos_broker(&broker, &config);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (base, config);
         Err(
-            "unsupported: native privileged broker lifecycle is currently supported on Linux only"
+            "unsupported: native privileged broker lifecycle is unavailable on this platform"
                 .into(),
         )
     }
@@ -412,11 +452,16 @@ pub fn uninstall_broker(base: &Path) -> Result<(), String> {
     {
         return crate::windows_lifecycle::uninstall_windows_broker(base);
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = base;
+        return crate::macos_lifecycle::uninstall_macos_broker();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = base;
         Err(
-            "unsupported: native privileged broker lifecycle is currently supported on Linux only"
+            "unsupported: native privileged broker lifecycle is unavailable on this platform"
                 .into(),
         )
     }
@@ -481,7 +526,12 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
     {
         return crate::windows_lifecycle::broker_status_windows(base);
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = base;
+        return crate::macos_lifecycle::broker_status_macos();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = base;
         Ok(absent_status(
@@ -490,7 +540,7 @@ pub fn broker_status(base: &Path) -> Result<InstallStatus, String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn absent_status(note: &str) -> InstallStatus {
     InstallStatus {
         installed: false,
@@ -548,10 +598,7 @@ pub fn load_linux_run_config(path: &Path) -> Result<crate::serve::BrokerServeCon
 
 #[cfg(not(target_os = "linux"))]
 pub fn load_linux_run_config(_path: &Path) -> Result<crate::serve::BrokerServeConfig, String> {
-    Err(
-        "unsupported: native privileged broker lifecycle is currently supported on Linux only"
-            .into(),
-    )
+    Err("unsupported: native privileged broker lifecycle is unavailable on this platform".into())
 }
 
 #[cfg(target_os = "linux")]

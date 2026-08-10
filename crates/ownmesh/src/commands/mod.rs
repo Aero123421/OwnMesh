@@ -68,8 +68,6 @@ pub const ADDITIONAL_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "exec --device",
     "session open <device>",
     "policy rule mutation",
-    "privileged broker install",
-    "privileged broker uninstall",
 ];
 
 /// Dispatch a parsed CLI invocation.

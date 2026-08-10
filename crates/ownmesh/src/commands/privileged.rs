@@ -6,9 +6,9 @@
 use crate::cli::{Cli, PrivilegedCmd};
 use ownmesh_domain::ExitCode;
 use serde_json::{json, Value};
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::path::PathBuf;
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::process::Command;
 
 pub fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
@@ -43,10 +43,10 @@ fn run_uninstall(cli: &Cli) -> Result<(), ExitCode> {
 }
 
 fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), ExitCode> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if !effective_uid_is_root() {
-            let message = "native Linux privileged lifecycle requires root; re-run with sudo or another elevation mechanism";
+            let message = "native privileged lifecycle requires root; re-run with sudo";
             if cli.json {
                 println!("{}", lifecycle_failure_json(command, message));
             } else {
@@ -89,10 +89,10 @@ fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), Exi
             Err(ExitCode::UsageConfig)
         }
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let message =
-            "unsupported: native privileged broker lifecycle is currently supported on Linux only";
+            "unsupported: native privileged broker lifecycle is unavailable on this platform";
         if cli.json {
             println!("{}", lifecycle_failure_json(command, message));
         } else {
@@ -111,7 +111,15 @@ fn effective_uid_is_root() -> bool {
         .is_some_and(|uid| uid == "0")
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "macos")]
+fn effective_uid_is_root() -> bool {
+    Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout == b"0\n")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn broker_binary() -> Result<PathBuf, String> {
     #[cfg(windows)]
     {
@@ -127,6 +135,14 @@ fn broker_binary() -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
     {
         let installed = PathBuf::from("/usr/lib/ownmesh/ownmesh-broker");
+        if installed.is_file() {
+            return Ok(installed);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let installed =
+            PathBuf::from("/Library/PrivilegedHelperTools/dev.ownmesh.privileged-broker");
         if installed.is_file() {
             return Ok(installed);
         }

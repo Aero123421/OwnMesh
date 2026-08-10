@@ -189,7 +189,10 @@ fn run_install(
         eprintln!("service install: {e}");
         ExitCode::Internal
     })?;
-    if existing.installed {
+    let same_recorded_executable = read_service_record(paths).is_some_and(|record| {
+        record.executable == service_paths.executable.canonical.display().to_string()
+    });
+    if existing.installed && same_recorded_executable {
         let record = UserServiceRecord {
             schema_version: 1,
             installed: true,
@@ -227,6 +230,16 @@ fn run_install(
             }
         });
         return Ok(());
+    }
+
+    // A privileged-broker install may have introduced a root-pinned ownmeshd
+    // image. Replace an older user descriptor instead of reporting a false
+    // idempotent success with the previous executable.
+    if existing.installed {
+        manager.uninstall().map_err(|e| {
+            eprintln!("service install: replace old descriptor: {e}");
+            ExitCode::Internal
+        })?;
     }
 
     manager.install(&service_paths).map_err(|e| {

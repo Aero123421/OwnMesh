@@ -60,7 +60,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 url = "2.5.4"
 uuid = { version = "1.12.1", features = ["v4", "serde"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]

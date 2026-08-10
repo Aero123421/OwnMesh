@@ -33,6 +33,8 @@
 
 mod install;
 mod ledger;
+#[cfg(target_os = "macos")]
+mod macos_lifecycle;
 pub mod peer;
 mod serve;
 #[cfg(windows)]
@@ -50,6 +52,8 @@ pub use install::{
     uninstall_broker, BrokerInstallConfig, InstallRecord, InstallStatus, INSTALL_FILE,
 };
 pub use ledger::{ReplayLedger, ReplayLedgerError, ReplayReservation};
+#[cfg(target_os = "macos")]
+pub use macos_lifecycle::load_macos_run_config;
 pub use peer::{
     assert_endpoint_peer_verifiable, endpoint_supports_peer_cred_enforcement,
     load_trusted_peer_policy, peer_uid_allowed, PeerCheck, TrustedPeerPolicy,

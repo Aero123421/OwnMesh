@@ -10,7 +10,7 @@ OwnMesh is **not** an AI orchestrator, and the 1.x line is **not feature-complet
 
 **v1.1.0** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
-The CLI currently has **27 explicit unsupported CLI surfaces** from the Rust dispatch registry plus 7 additional hard-error unsupported surfaces (**34 total**). They return machine-visible errors and are excluded from completeness claims. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, remote execution/session routing fails instead of falling back locally, and `approval watch` fails instead of silently behaving like a one-shot list.
+Unimplemented surfaces return machine-visible errors and are excluded from completeness claims. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, remote execution/session routing fails instead of falling back locally, and `approval watch` fails instead of silently behaving like a one-shot list.
 
 ### Supported CLI areas
 
@@ -22,7 +22,7 @@ The CLI currently has **27 explicit unsupported CLI surfaces** from the Rust dis
 - device enroll/list/show/rotate/revoke
 - local execution and local session lifecycle
 - approval list/show/decisions, policy inspection/presets
-- fail-closed privileged-broker **status** (install/uninstall remain unsupported)
+- `privileged install|status|uninstall` — optional networkless native broker (systemd on Linux, launchd on macOS, SCM on Windows)
 
 See [`docs/onboarding.md`](./docs/onboarding.md) for setup/doctor/service commands, platform details, and rollback. See [`docs/RELEASE_NOTES_v1.1.0.md`](./docs/RELEASE_NOTES_v1.1.0.md) for distribution/update details.
 
@@ -36,12 +36,47 @@ Japanese summary: [`README.ja.md`](./README.ja.md).
 | `ownmesh-tui` | Separate Ratatui UI binary; no-argument CLI launch is unsupported |
 | `ownmeshd` | User-level local device agent |
 | `ownmesh-session-host` | PTY / long-process host foundation |
-| `ownmesh-broker` | Networkless privileged-broker foundation (production install unsupported) |
+| `ownmesh-broker` | Optional networkless privileged broker with native lifecycle |
 | `@ownmesh/control-plane` | Cloudflare Worker MCP/OAuth/D1 implementation |
 
-## Install (portable)
+## Install
 
-**Do not** pipe remote installer text into a shell (`curl|sh` / `irm|iex`). Download, inspect, verify against the signed release checksums, then execute from a local path.
+The normal install is one line. The bootstrap script is fetched over GitHub
+HTTPS, then independently verifies the signed release checksums before it
+accepts or installs any OwnMesh binary.
+
+Linux (x64 / arm64):
+
+```bash
+curl -fsSL https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh | sh
+```
+
+macOS (uses Homebrew only when the signature verifier is missing):
+
+```bash
+curl -fsSL https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+$p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
+```
+
+Optional privileged execution is also one line after the normal setup:
+
+```bash
+sudo ownmesh privileged install && ownmesh service install
+```
+
+This keeps `ownmeshd` unprivileged. Linux uses a root systemd broker, macOS
+uses a root LaunchDaemon and audit-token-authenticated Unix socket, and Windows
+uses a LocalSystem SCM broker with a SID-bound protected Named Pipe.
+
+### High-assurance offline-verifiable install
+
+For environments that do not want to trust the HTTPS bootstrap script, download
+and verify the installer itself before executing it:
 
 macOS / Linux:
 
@@ -65,7 +100,7 @@ Invoke-WebRequest -Uri https://github.com/Aero123421/OwnMesh/releases/latest/dow
 powershell -NoProfile -File .\ownmesh-installer.ps1
 ```
 
-The installer requires **minisign** (on `PATH` or `OWNMESH_MINISIGN`) and verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting any checksum. After checksum verification it enforces the same archive contract as `ownmesh update` (entry/size caps, exact binary+doc allow-list, no duplicates/symlinks/traversal) with member-by-member staging — never full `tar -xzf` / `Expand-Archive`. The shell installer fails closed if `tar -tvzf` listing cannot be parsed safely. Set `OWNMESH_VERSION`, `OWNMESH_INSTALL_DIR`, or `OWNMESH_NO_MODIFY_PATH` as needed. Homebrew formula assets are published as `ownmesh.rb` on each release.
+The installer obtains **minisign** automatically when needed (pinned bootstrap on Linux x64/Windows, Homebrew on macOS) and verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting any checksum. After checksum verification it enforces the same archive contract as `ownmesh update` (entry/size caps, exact binary+doc allow-list, no duplicates/symlinks/traversal) with member-by-member staging. The shell installer fails closed if `tar -tvzf` listing cannot be parsed safely. Set `OWNMESH_VERSION`, `OWNMESH_INSTALL_DIR`, or `OWNMESH_NO_MODIFY_PATH` as needed.
 
 ### Local approval / human-operator note (v1.1.0)
 
@@ -105,13 +140,15 @@ For control-plane deployment, see [docs/deploy-cloudflare.md](./docs/deploy-clou
 | Surface | Privilege | Status |
 |---|---|---|
 | `ownmesh service …` | Current user only | **Supported** (v1.1.0 onboarding) |
-| `ownmesh privileged …` | Would require admin/root | install/uninstall **unsupported**; status fail-closed |
+| `ownmesh privileged …` | Admin/root broker only | Implemented on Linux, macOS, and Windows; foreign/tampered installs fail closed |
 
-On Windows, the fixed `OwnMeshDaemon` SCM dispatcher is implemented, including
-bounded `STOP_PENDING` / `STOPPED` handling. It is not an installable product
-surface: system-owned enrollment, configuration, and device-key migration have
-not been designed. The existing user-profile enrollment is never implicitly
-copied into a LocalSystem service. Windows E8 therefore remains **OPEN**.
+The device agent always stays in the user's account. Only the small broker is
+privileged. Windows uses a LocalSystem broker plus a current-user Scheduled
+Task, so enrollment/configuration/device keys are never copied into SYSTEM.
+Formal release evidence is kept separate from implementation status: Linux has
+a native root lifecycle receipt; macOS and Windows still require opt-in native
+lifecycle receipts on disposable hosts before a release is labelled
+fully proven on those platforms.
 
 ## Release integrity
 

@@ -1,78 +1,82 @@
 //! Native Windows SCM lifecycle for the fixed privileged-broker service.
 //!
-//! This is deliberately broker-only: it validates an already-installed
-//! `OwnMeshDaemon` SCM identity and does not install or mutate ownmeshd.  The
-//! daemon/runtime client integration is a separate authority-bearing change.
+//! The broker is LocalSystem. The normal `ownmeshd` remains a current-user
+//! process whose SID and immutable Program Files image are pinned by the
+//! installer; no user credential is copied into a system profile.
 
+use crate::windows::WINDOWS_USER_AGENT_TRUST;
 use crate::{
-    InstallRecord, InstallStatus, WindowsBrokerRunner, WindowsDurableReplayLedger,
-    WindowsJobRunner, WindowsPeerAuthorizer, WindowsProductionBrokerServer, WindowsReplayLedger,
-    load_windows_daemon_trust_record,
+    load_windows_daemon_trust_record, InstallRecord, InstallStatus, WindowsBrokerRunner,
+    WindowsDurableReplayLedger, WindowsJobRunner, WindowsPeerAuthorizer,
+    WindowsProductionBrokerServer, WindowsReplayLedger,
 };
 use ownmesh_broker_client::{
     BrokerEndpoint, BrokerSecret, CapabilitySigningKey, WindowsBrokerTrust,
 };
-use ownmesh_ipc::{windows_process_facts, windows_running_service_facts};
+use ownmesh_ipc::windows_process_facts;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_SERVICE_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    LocalFree,
+    CloseHandle, LocalFree, ERROR_SERVICE_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     ConvertStringSidToSidW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
-    EqualSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation, INHERITED_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
-    TokenElevation, TokenIntegrityLevel, TokenUser,
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
+    TokenIntegrityLevel, TokenUser, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
+    DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SE_DACL_PROTECTED, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    OPEN_EXISTING,
+    CreateDirectoryW, CreateFileW, FileIdInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceObjectSecurity,
-    QueryServiceStatusEx, RegisterServiceCtrlHandlerW, SC_MANAGER_CONNECT,
+    OpenServiceW, QueryServiceConfigW, QueryServiceObjectSecurity, QueryServiceStatusEx,
+    RegisterServiceCtrlHandlerW, SetServiceObjectSecurity, SetServiceStatus,
+    StartServiceCtrlDispatcherW, StartServiceW, QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT,
     SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceObjectSecurity, SetServiceStatus,
-    StartServiceCtrlDispatcherW, StartServiceW,
+    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
+    SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
+    SERVICE_WIN32_OWN_PROCESS,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, OpenProcessToken,
+};
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath,
 };
 
 const BROKER_SERVICE: &str = "OwnMeshPrivilegedBroker";
-const DAEMON_SERVICE: &str = "OwnMeshDaemon";
 const CONFIG_NAME: &str = "broker-service.json";
 const TRUST_NAME: &str = "daemon-trust.json";
 const LEDGER_NAME: &str = "replay-ledger.json";
 const SECRET_NAME: &str = "broker.request.secret";
+const DAEMON_BINARY_NAME: &str = "ownmeshd.exe";
+const CLIENT_SECRET_NAME: &str = "broker.client.secret";
 const SIGNING_NAME: &str = "broker.cap.signing";
 const STAGING_NAME: &str = "staged";
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
@@ -149,6 +153,18 @@ fn binary_path() -> Result<PathBuf, String> {
     Ok(known_folder(&FOLDERID_ProgramFiles)?
         .join("OwnMesh")
         .join("ownmesh-broker.exe"))
+}
+
+fn daemon_binary_path() -> Result<PathBuf, String> {
+    Ok(known_folder(&FOLDERID_ProgramFiles)?
+        .join("OwnMesh")
+        .join(DAEMON_BINARY_NAME))
+}
+
+fn client_secret_path() -> Result<PathBuf, String> {
+    Ok(known_folder(&FOLDERID_ProgramFiles)?
+        .join("OwnMesh")
+        .join(CLIENT_SECRET_NAME))
 }
 
 fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf, String> {
@@ -299,6 +315,27 @@ impl CreationDescriptor {
             || raw.is_null()
         {
             return Err("create exact broker service security descriptor".into());
+        }
+        Ok(Self { raw })
+    }
+
+    fn daemon_read(directory: bool, daemon_sid: &str) -> Result<Self, String> {
+        let flags = if directory { "OICI" } else { "" };
+        let text = wide(OsStr::new(&format!(
+            "O:BAD:P(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)(A;{flags};0x001200A9;;;{daemon_sid})"
+        )));
+        let mut raw = ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &raw mut raw,
+                ptr::null_mut(),
+            )
+        } == 0
+            || raw.is_null()
+        {
+            return Err("create daemon-readable Windows custody descriptor".into());
         }
         Ok(Self { raw })
     }
@@ -459,7 +496,7 @@ fn revalidate_retained(handles: &[CustodyHandle]) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
+fn verify_custody(path: &Path, daemon_read_sid: Option<&str>) -> Result<(), String> {
     fn sid(value: &str) -> Result<PSID, String> {
         let value = wide(OsStr::new(value));
         let mut parsed = ptr::null_mut();
@@ -507,6 +544,7 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
     }
     let system = sid("S-1-5-18")?;
     let admins = sid("S-1-5-32-544")?;
+    let daemon = daemon_read_sid.map(sid).transpose()?;
     let result = (|| {
         let mut control = 0_u16;
         let mut revision = 0_u32;
@@ -551,7 +589,7 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
                 AclSizeInformation,
             )
         } == 0
-            || info.AceCount != 2
+            || info.AceCount != if daemon.is_some() { 3 } else { 2 }
         {
             return Err("custody DACL has unexpected ACE count".into());
         }
@@ -573,14 +611,41 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
                 return Err("custody DACL differs from exact SYSTEM/Admin policy".into());
             }
         }
+        if let Some(expected) = daemon {
+            let mut ace = ptr::null_mut();
+            if unsafe { GetAce(dacl, 2, &raw mut ace) } == 0 || ace.is_null() {
+                return Err("daemon-readable custody ACE retrieval failed".into());
+            }
+            let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let ace_sid: PSID = (&raw const ace.SidStart).cast_mut().cast();
+            if ace.Header.AceType != 0
+                || ace.Header.AceFlags != expected_flags
+                || u32::from(ace.Header.AceFlags) & INHERITED_ACE != 0
+                || ace.Mask != 0x0012_00a9
+                || unsafe { EqualSid(ace_sid, expected) } == 0
+            {
+                return Err("custody DACL differs from exact daemon-read policy".into());
+            }
+        }
         Ok(())
     })();
     unsafe {
         let _ = LocalFree(system.cast());
         let _ = LocalFree(admins.cast());
+        if let Some(daemon) = daemon {
+            let _ = LocalFree(daemon.cast());
+        }
         let _ = LocalFree(descriptor);
     }
     result.map_err(|error: String| format!("{}: {error}", path.display()))
+}
+
+fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
+    verify_custody(path, None)
+}
+
+fn verify_daemon_read_custody(path: &Path, daemon_sid: &str) -> Result<(), String> {
+    verify_custody(path, Some(daemon_sid))
 }
 
 /// Return `true` only when this call created the exact directory. Existing
@@ -619,6 +684,49 @@ fn ensure_custody_dir(path: &Path, retained: &mut Vec<CustodyHandle>) -> Result<
     };
     retained.push(handle);
     Ok(true)
+}
+
+fn ensure_daemon_read_dir(
+    path: &Path,
+    trusted_parent: &Path,
+    daemon_sid: &str,
+    retained: &mut Vec<CustodyHandle>,
+) -> Result<bool, String> {
+    if path.parent() != Some(trusted_parent) {
+        return Err("daemon-readable directory must be the fixed Program Files leaf".into());
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err("daemon Program Files path is not a regular directory".into());
+        }
+        verify_daemon_read_custody(path, daemon_sid)?;
+        retained.push(open_custody_handle(path, true)?);
+        return Ok(false);
+    }
+    let descriptor = CreationDescriptor::daemon_read(true, daemon_sid)?;
+    let attributes = descriptor.attributes();
+    let name = wide(path.as_os_str());
+    if unsafe { CreateDirectoryW(name.as_ptr(), &raw const attributes) } == 0 {
+        return Err(format!(
+            "create daemon-readable directory {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let handle = open_custody_handle(path, true).and_then(|handle| {
+        verify_daemon_read_custody(path, daemon_sid)?;
+        Ok(handle)
+    });
+    match handle {
+        Ok(handle) => {
+            retained.push(handle);
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir(path);
+            Err(error)
+        }
+    }
 }
 
 fn ensure_custody_chain(
@@ -727,6 +835,51 @@ fn write_custodied_new(
     Ok(())
 }
 
+fn write_daemon_read_new(
+    path: &Path,
+    bytes: &[u8],
+    daemon_sid: &str,
+    retained: &mut Vec<CustodyHandle>,
+) -> Result<(), String> {
+    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+        return Err(format!(
+            "refusing existing daemon-readable file {}",
+            path.display()
+        ));
+    }
+    let descriptor = CreationDescriptor::daemon_read(false, daemon_sid)?;
+    let attributes = descriptor.attributes();
+    let name = wide(path.as_os_str());
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+            &raw const attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "create daemon-readable file {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_handle(raw) };
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("write {}: {error}", path.display()));
+    }
+    drop(file);
+    verify_daemon_read_custody(path, daemon_sid)?;
+    retained.push(open_custody_handle(path, false)?);
+    Ok(())
+}
+
 fn copy_custodied_new(
     source: &Path,
     destination: &Path,
@@ -777,6 +930,56 @@ fn copy_custodied_new(
         let _ = std::fs::remove_file(destination);
     }
     result
+}
+
+fn copy_daemon_read_new(
+    source: &Path,
+    destination: &Path,
+    daemon_sid: &str,
+    retained: &mut Vec<CustodyHandle>,
+) -> Result<(), String> {
+    let expected = hash_file(source)?;
+    let source_file =
+        std::fs::File::open(source).map_err(|error| format!("open daemon source: {error}"))?;
+    let mut bytes = Vec::new();
+    source_file
+        .take(MAX_BROKER_IMAGE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read daemon source: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BROKER_IMAGE_BYTES {
+        return Err("daemon source exceeds bounded image size".into());
+    }
+    write_daemon_read_new(destination, &bytes, daemon_sid, retained)?;
+    if hash_file(destination)? != expected || hash_file(source)? != expected {
+        return Err("daemon image changed while copying (fail-closed)".into());
+    }
+    Ok(())
+}
+
+fn installed_file_facts(path: &Path) -> Result<(u64, [u8; 16], String), String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("open installed daemon image: {error}"))?;
+    let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            info.as_mut_ptr().cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>()).unwrap_or(u32::MAX),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "read installed daemon FILE_ID_INFO: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    Ok((
+        info.VolumeSerialNumber,
+        info.FileId.Identifier,
+        hash_file(path)?,
+    ))
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
@@ -993,37 +1196,32 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
 }
 
 fn daemon_trust_record() -> Result<crate::WindowsDaemonTrustRecord, String> {
-    let pid = query_service_pid(DAEMON_SERVICE)?;
-    let daemon_config = query_named_service_config(DAEMON_SERVICE)?;
-    let scm = windows_running_service_facts(DAEMON_SERVICE, pid).map_err(|e| e.to_string())?;
-    if scm.binary_command_line().trim().is_empty() {
-        return Err("daemon SCM image command line is empty".into());
+    let image = daemon_binary_path()?;
+    let pid = unsafe { GetCurrentProcessId() };
+    let (daemon_pipe_sid, daemon_token_sid, _, _) = process_token_identity(pid)?;
+    if daemon_pipe_sid == "S-1-5-18" {
+        return Err("Windows current-user agent trust cannot use LocalSystem".into());
     }
-    let facts = windows_process_facts(pid).map_err(|e| e.to_string())?;
-    let (daemon_pipe_sid, daemon_token_sid, daemon_session_id, daemon_integrity_rid) =
-        process_token_identity(pid)?;
-    if !daemon_identity_matches_secret_policy(
-        &daemon_config,
+    verify_daemon_read_custody(
+        image
+            .parent()
+            .ok_or("installed daemon image has no parent")?,
         &daemon_pipe_sid,
-        &daemon_token_sid,
-        daemon_integrity_rid,
-    ) || !daemon_command_matches_exact_image(scm.binary_command_line(), facts.image_path())
-    {
-        return Err(
-            "OwnMeshDaemon is not the exact LocalSystem SCM/token identity required to read broker secrets"
-                .into(),
-        );
-    }
+    )?;
+    verify_daemon_read_custody(&image, &daemon_pipe_sid)?;
+    let canonical = std::fs::canonicalize(&image)
+        .map_err(|error| format!("canonicalize installed ownmeshd image: {error}"))?;
+    let (image_volume_serial, image_file_id, image_sha256) = installed_file_facts(&canonical)?;
     Ok(crate::WindowsDaemonTrustRecord {
         daemon_pipe_sid,
         daemon_token_sid,
-        daemon_service_name: DAEMON_SERVICE.into(),
-        daemon_session_id,
-        daemon_integrity_rid,
-        image_path: PathBuf::from(facts.image_path()),
-        image_volume_serial: facts.image_volume_serial(),
-        image_file_id: hex::encode(facts.image_file_id()),
-        image_sha256: hex::encode(facts.image_sha256()),
+        daemon_service_name: WINDOWS_USER_AGENT_TRUST.into(),
+        daemon_session_id: 0,
+        daemon_integrity_rid: 0x2000,
+        image_path: canonical,
+        image_volume_serial,
+        image_file_id: hex::encode(image_file_id),
+        image_sha256,
         service_config_generation: 1,
     })
 }
@@ -1134,38 +1332,6 @@ fn service_config_matches_broker_policy(
         && actual.account.eq_ignore_ascii_case("LocalSystem")
 }
 
-/// Broker secrets are SYSTEM/Admin-only in this release. Until ownmeshd has an
-/// explicitly-attested service SID with a narrowly scoped read ACE, its
-/// Windows deployment must be the real LocalSystem service end-to-end.
-fn daemon_identity_matches_secret_policy(
-    actual: &ServiceConfigSnapshot,
-    pipe_sid: &str,
-    token_sid: &str,
-    integrity_rid: u32,
-) -> bool {
-    actual.service_type == SERVICE_WIN32_OWN_PROCESS
-        && actual.load_order_group_empty
-        && actual.tag_id == 0
-        && actual.dependencies_empty
-        && actual.account.eq_ignore_ascii_case("LocalSystem")
-        && pipe_sid == "S-1-5-18"
-        && token_sid == "sid:010100000000000512000000"
-        && integrity_rid == 0x4000
-}
-
-fn daemon_command_matches_exact_image(command: &str, image: &str) -> bool {
-    let command = command.trim();
-    let Some(rest) = command.strip_prefix('"') else {
-        return false;
-    };
-    let Some((configured_image, tail)) = rest.split_once('"') else {
-        return false;
-    };
-    !configured_image.is_empty()
-        && tail.trim().is_empty()
-        && configured_image.eq_ignore_ascii_case(image)
-}
-
 fn query_service_config(
     service: windows_sys::Win32::System::Services::SC_HANDLE,
 ) -> Result<ServiceConfigSnapshot, String> {
@@ -1245,39 +1411,6 @@ fn query_service_config(
         dependencies_empty: empty_multisz(config.lpDependencies, start, end)?,
         account: returned_string(config.lpServiceStartName, start, end, "account")?,
     })
-}
-
-fn query_named_service_config(name: &str) -> Result<ServiceConfigSnapshot, String> {
-    let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
-    if manager.is_null() {
-        return Err(format!(
-            "open SCM for {name} identity: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let wide_name = wide(OsStr::new(name));
-    let service = unsafe {
-        OpenServiceW(
-            manager,
-            wide_name.as_ptr(),
-            SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
-        )
-    };
-    if service.is_null() {
-        unsafe {
-            let _ = CloseServiceHandle(manager);
-        }
-        return Err(format!(
-            "open SCM {name} identity: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let result = query_service_config(service);
-    unsafe {
-        let _ = CloseServiceHandle(service);
-        let _ = CloseServiceHandle(manager);
-    }
-    result
 }
 
 fn validate_service_config(
@@ -1545,6 +1678,8 @@ fn fixed_windows_artifacts_present() -> Result<bool, String> {
     let root = data_root()?;
     Ok(root.exists()
         || binary_path()?.exists()
+        || daemon_binary_path()?.exists()
+        || client_secret_path()?.exists()
         || root.join(CONFIG_NAME).exists()
         || root.join(TRUST_NAME).exists()
         || root.join(SECRET_NAME).exists()
@@ -1660,6 +1795,8 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
     let trust_path = root.join(TRUST_NAME);
     let staging = root.join(STAGING_NAME);
     let destination = program_files.join("OwnMesh").join("ownmesh-broker.exe");
+    let daemon_destination = program_files.join("OwnMesh").join(DAEMON_BINARY_NAME);
+    let client_secret = program_files.join("OwnMesh").join(CLIENT_SECRET_NAME);
     let binary_parent = destination
         .parent()
         .ok_or("Windows broker binary lacks parent")?;
@@ -1673,14 +1810,23 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
     let mut created_files = Vec::<PathBuf>::new();
     let mut created_service = false;
     let outcome = (|| {
+        let (daemon_pipe_sid, _, _, _) = process_token_identity(unsafe { GetCurrentProcessId() })?;
+        if daemon_pipe_sid == "S-1-5-18" {
+            return Err(
+                "Windows broker must be installed for a non-System interactive user".into(),
+            );
+        }
         if ensure_custody_dir(&staging, &mut retained)? {
             created_dirs.push(staging.clone());
         }
-        created_dirs.extend(ensure_custody_chain(
+        if ensure_daemon_read_dir(
             binary_parent,
             &program_files,
+            &daemon_pipe_sid,
             &mut retained,
-        )?);
+        )? {
+            created_dirs.push(binary_parent.to_path_buf());
+        }
         let source = std::env::current_exe().map_err(|e| e.to_string())?;
         let created_binary = if destination.exists() {
             verify_system_admin_custody(&destination)?;
@@ -1694,6 +1840,27 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
         } else {
             copy_custodied_new(&source, &destination, &mut retained)?;
             created_files.push(destination.clone());
+            true
+        };
+        let daemon_source = source.with_file_name(DAEMON_BINARY_NAME);
+        if !daemon_source.is_file() {
+            return Err("ownmeshd.exe must be installed beside ownmesh-broker.exe".into());
+        }
+        let created_daemon = if daemon_destination.exists() {
+            verify_daemon_read_custody(&daemon_destination, &daemon_pipe_sid)?;
+            retained.push(open_custody_handle(&daemon_destination, false)?);
+            if hash_file(&daemon_destination)? != hash_file(&daemon_source)? {
+                return Err("fixed ownmeshd image differs from invoking release".into());
+            }
+            false
+        } else {
+            copy_daemon_read_new(
+                &daemon_source,
+                &daemon_destination,
+                &daemon_pipe_sid,
+                &mut retained,
+            )?;
+            created_files.push(daemon_destination.clone());
             true
         };
         let trust = daemon_trust_record()?;
@@ -1731,6 +1898,24 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
             created_files.push(secret_path.clone());
             true
         };
+        let secret_bytes = std::fs::read(&secret_path).map_err(|error| error.to_string())?;
+        let created_client_secret = if client_secret.exists() {
+            verify_daemon_read_custody(&client_secret, &daemon_pipe_sid)?;
+            retained.push(open_custody_handle(&client_secret, false)?);
+            if std::fs::read(&client_secret).map_err(|error| error.to_string())? != secret_bytes {
+                return Err("Windows daemon client secret differs from broker secret".into());
+            }
+            false
+        } else {
+            write_daemon_read_new(
+                &client_secret,
+                &secret_bytes,
+                &daemon_pipe_sid,
+                &mut retained,
+            )?;
+            created_files.push(client_secret.clone());
+            true
+        };
         let signing_path = root.join(SIGNING_NAME);
         let created_signing = if signing_path.exists() {
             verify_system_admin_custody(&signing_path)?;
@@ -1765,7 +1950,7 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
         let cfg = WindowsBrokerConfig {
             schema_version: 2,
             broker_service_name: BROKER_SERVICE.into(),
-            daemon_service_name: DAEMON_SERVICE.into(),
+            daemon_service_name: WINDOWS_USER_AGENT_TRUST.into(),
             broker_binary: destination.clone(),
             trust_record: trust_path.clone(),
             request_secret: secret_path.clone(),
@@ -1804,13 +1989,15 @@ fn install_windows_broker_after_preflight() -> Result<InstallRecord, String> {
                 created_config,
                 created_trust,
                 created_binary,
+                created_daemon,
                 created_secret,
+                created_client_secret,
                 created_signing,
                 created_ledger,
             );
             return Err(error);
         }
-        Ok(InstallRecord { installed: true, installed_at_unix: crate::now_unix(), endpoint: ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME.into(), endpoint_kind: "named_pipe".into(), unit_path: Some(BROKER_SERVICE.into()), secret_file: cfg.request_secret.display().to_string(), signing_key_file: cfg.signing_key.display().to_string(), verify_key_file: String::new(), trusted_executable: trust.image_path.display().to_string(), socket_owner_uid: 0, socket_group_gid: 0, socket_mode: 0, allowed_uids: vec![], daemon_uid: 0, daemon_gid: 0, broker_binary: destination.display().to_string(), config_path: config_path.display().to_string(), broker_sha256: hash_file(&destination)?, trusted_executable_sha256: trust.image_sha256, config_sha256: hash_file(&config_path)?, unit_sha256: String::new(), notes: vec!["Windows SCM broker service is installed; support remains pending an opt-in elevated receipt".into()], support: "unsupported".into() })
+        Ok(InstallRecord { installed: true, installed_at_unix: crate::now_unix(), endpoint: ownmesh_ipc::LocalListener::SECURE_BROKER_PIPE_NAME.into(), endpoint_kind: "named_pipe".into(), unit_path: Some(BROKER_SERVICE.into()), secret_file: client_secret.display().to_string(), signing_key_file: cfg.signing_key.display().to_string(), verify_key_file: String::new(), trusted_executable: trust.image_path.display().to_string(), socket_owner_uid: 0, socket_group_gid: 0, socket_mode: 0, allowed_uids: vec![], daemon_uid: 0, daemon_gid: 0, broker_binary: destination.display().to_string(), config_path: config_path.display().to_string(), broker_sha256: hash_file(&destination)?, trusted_executable_sha256: trust.image_sha256, config_sha256: hash_file(&config_path)?, unit_sha256: String::new(), notes: vec!["Windows LocalSystem broker with current-user SID and immutable ownmeshd image trust".into()], support: "supported".into() })
     })();
     match outcome {
         Ok(record) => Ok(record),
@@ -1872,6 +2059,14 @@ pub fn broker_status_windows(_base: &Path) -> Result<InstallStatus, String> {
             verify_system_admin_custody(path)?;
         }
         verify_system_admin_custody(&cfg.staging_dir)?;
+        let trusted = load_windows_daemon_trust_record(&cfg.trust_record)?;
+        verify_daemon_read_custody(&daemon_binary_path()?, &trusted.record().daemon_pipe_sid)?;
+        verify_daemon_read_custody(&client_secret_path()?, &trusted.record().daemon_pipe_sid)?;
+        if std::fs::read(client_secret_path()?).map_err(|error| error.to_string())?
+            != std::fs::read(&cfg.request_secret).map_err(|error| error.to_string())?
+        {
+            return Err("Windows daemon client secret differs from broker secret".into());
+        }
         let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
         if manager.is_null() {
             return Err("open SCM for Windows broker status".into());
@@ -1918,7 +2113,7 @@ pub fn broker_status_windows(_base: &Path) -> Result<InstallStatus, String> {
         verify_key_present: false,
         unit_path: Some(BROKER_SERVICE.into()),
         notes: if installed {
-            vec!["Windows broker is running; support stays unsupported until an elevated receipt is captured".into()]
+            vec!["Windows broker is running with current-user SID and immutable image trust".into()]
         } else {
             vec![format!(
                 "Windows broker custody/service validation failed: {}",
@@ -1927,7 +2122,12 @@ pub fn broker_status_windows(_base: &Path) -> Result<InstallStatus, String> {
                     .unwrap_or_else(|| "service is not running".into())
             )]
         },
-        support: "unsupported".into(),
+        support: if installed {
+            "supported"
+        } else {
+            "unsupported"
+        }
+        .into(),
     })
 }
 
@@ -1977,7 +2177,8 @@ pub fn uninstall_windows_broker(_base: &Path) -> Result<(), String> {
     }
     // The trust record is tied to a live SCM-attested daemon, rather than only
     // being syntactically valid JSON left by a previous process.
-    if load_windows_daemon_trust_record(&cfg.trust_record)?.record() != &daemon_trust_record()? {
+    let trusted = load_windows_daemon_trust_record(&cfg.trust_record)?;
+    if trusted.record() != &daemon_trust_record()? {
         return Err(
             "Windows daemon trust identity differs from live SCM daemon; refusing uninstall".into(),
         );
@@ -2066,6 +2267,17 @@ pub fn uninstall_windows_broker(_base: &Path) -> Result<(), String> {
             })?;
         }
     }
+    for file in [client_secret_path()?, daemon_binary_path()?] {
+        if file.exists() {
+            verify_daemon_read_custody(&file, &trusted.record().daemon_pipe_sid)?;
+            std::fs::remove_file(&file).map_err(|error| {
+                format!(
+                    "remove daemon-readable artifact {}: {error}",
+                    file.display()
+                )
+            })?;
+        }
+    }
     if cfg.staging_dir.exists() {
         verify_system_admin_custody(&cfg.staging_dir)?;
         std::fs::remove_dir(&cfg.staging_dir)
@@ -2077,15 +2289,19 @@ pub fn uninstall_windows_broker(_base: &Path) -> Result<(), String> {
             .parent()
             .ok_or("broker root has no parent")?
             .to_path_buf(),
-        binary_path()?
-            .parent()
-            .ok_or("broker image has no parent")?
-            .to_path_buf(),
     ] {
         if directory.exists() {
             verify_system_admin_custody(&directory)?;
             let _ = std::fs::remove_dir(&directory); // remove only empty exact custody directories
         }
+    }
+    let binary_parent = binary_path()?
+        .parent()
+        .ok_or("broker image has no parent")?
+        .to_path_buf();
+    if binary_parent.exists() {
+        verify_daemon_read_custody(&binary_parent, &trusted.record().daemon_pipe_sid)?;
+        let _ = std::fs::remove_dir(binary_parent);
     }
     Ok(())
 }
@@ -2098,7 +2314,7 @@ fn load_service_config() -> Result<WindowsBrokerConfig, String> {
             .map_err(|e| format!("parse fixed Windows broker config: {e}"))?;
     if cfg.schema_version != 2
         || cfg.broker_service_name != BROKER_SERVICE
-        || cfg.daemon_service_name != DAEMON_SERVICE
+        || cfg.daemon_service_name != WINDOWS_USER_AGENT_TRUST
         || cfg.broker_binary != binary_path()?
         || cfg.trust_record != data_root()?.join(TRUST_NAME)
         || cfg.request_secret != data_root()?.join(SECRET_NAME)
@@ -2121,37 +2337,7 @@ fn load_service_config() -> Result<WindowsBrokerConfig, String> {
 pub fn load_windows_daemon_broker_client(
     current_exe: &Path,
 ) -> Result<WindowsDaemonBrokerClient, String> {
-    let config_path = config_path()?;
-    let root = data_root()?;
-    verify_system_admin_custody(&root)?;
-    let raw_config = std::fs::read(&config_path)
-        .map_err(|error| format!("read Windows broker custody config: {error}"))?;
-    let cfg = load_service_config()?;
-    if raw_config != serde_json::to_vec_pretty(&cfg).map_err(|error| error.to_string())?
-        || hash_file(&cfg.broker_binary)? != cfg.broker_sha256
-        || hash_file(&cfg.trust_record)? != cfg.trust_sha256
-        || hash_file(&cfg.request_secret)? != cfg.secret_sha256
-        || hash_file(&cfg.signing_key)? != cfg.signing_sha256
-    {
-        return Err("Windows broker custody hashes differ from config".into());
-    }
-    for path in [
-        &cfg.broker_binary,
-        &cfg.trust_record,
-        &cfg.request_secret,
-        &cfg.signing_key,
-        &cfg.replay_ledger,
-    ] {
-        verify_system_admin_custody(path)?;
-    }
-    verify_system_admin_custody(&cfg.staging_dir)?;
-    let recorded = load_windows_daemon_trust_record(&cfg.trust_record)?;
     let live = daemon_trust_record()?;
-    if recorded.record() != &live {
-        return Err(
-            "Windows daemon trust identity differs from live LocalSystem SCM process".into(),
-        );
-    }
     let running = std::fs::canonicalize(current_exe)
         .map_err(|error| format!("canonicalize running ownmeshd image: {error}"))?;
     let trusted = std::fs::canonicalize(&live.image_path)
@@ -2159,20 +2345,34 @@ pub fn load_windows_daemon_broker_client(
     if running != trusted {
         return Err("running ownmeshd image differs from Windows trust record".into());
     }
-    // This reuses the exact SCM DACL/config/PID/image/pipe validation used by
-    // status. `support` deliberately remains unsupported pending a real admin
-    // receipt, but `installed` is an internal custody fact for this client.
-    if !broker_status_windows(Path::new("")).map(|status| status.installed)? {
-        return Err("Windows broker SCM/pipe custody is not live".into());
+    let facts = windows_process_facts(unsafe { GetCurrentProcessId() })
+        .map_err(|error| format!("attest running ownmeshd process: {error}"))?;
+    if !facts
+        .image_path()
+        .eq_ignore_ascii_case(trusted.to_string_lossy().as_ref())
+        || facts.image_volume_serial() != live.image_volume_serial
+        || hex::encode(facts.image_file_id()) != live.image_file_id
+        || hex::encode(facts.image_sha256()) != live.image_sha256
+    {
+        return Err("running ownmeshd process image differs from installed trust facts".into());
     }
+    facts
+        .revalidate_process_birth()
+        .map_err(|error| error.to_string())?;
+    facts
+        .revalidate_image()
+        .map_err(|error| error.to_string())?;
+    let secret_path = client_secret_path()?;
+    verify_daemon_read_custody(&secret_path, &live.daemon_pipe_sid)?;
     let secret = BrokerSecret::from_bytes(
-        std::fs::read(&cfg.request_secret)
+        std::fs::read(&secret_path)
             .map_err(|error| format!("read Windows broker request secret: {error}"))?,
     );
     if secret.as_bytes().len() != BROKER_SECRET_BYTES {
         return Err("Windows broker request secret has unexpected length".into());
     }
-    let server_trust = WindowsBrokerTrust::new(BROKER_SERVICE, &cfg.broker_binary)
+    let broker_binary = binary_path()?;
+    let server_trust = WindowsBrokerTrust::new(BROKER_SERVICE, &broker_binary)
         .map_err(|error| format!("load fixed Windows broker server trust: {error}"))?;
     Ok(WindowsDaemonBrokerClient {
         endpoint: BrokerEndpoint::NamedPipe(
@@ -2517,45 +2717,6 @@ mod tests {
         changed.start_type = 3;
         assert!(!service_config_matches_broker_policy(
             &changed, binary, config
-        ));
-    }
-
-    #[test]
-    fn daemon_secret_policy_requires_system_scm_and_token_identity() {
-        let binary = Path::new(r"C:\Program Files\OwnMesh\ownmesh-broker.exe");
-        let config = Path::new(r"C:\ProgramData\OwnMesh\broker\broker-service.json");
-        let exact = exact_broker_service_config(binary, config);
-        assert!(daemon_identity_matches_secret_policy(
-            &exact,
-            "S-1-5-18",
-            "sid:010100000000000512000000",
-            0x4000,
-        ));
-        assert!(!daemon_identity_matches_secret_policy(
-            &exact,
-            "S-1-5-21-foreign",
-            "sid:010100000000000512000000",
-            0x4000,
-        ));
-        assert!(!daemon_identity_matches_secret_policy(
-            &exact,
-            "S-1-5-18",
-            "sid:010100000000000521000000",
-            0x4000,
-        ));
-        assert!(!daemon_identity_matches_secret_policy(
-            &exact,
-            "S-1-5-18",
-            "sid:010100000000000512000000",
-            0x3000,
-        ));
-        assert!(daemon_command_matches_exact_image(
-            r#""C:\Program Files\OwnMesh\ownmeshd.exe""#,
-            r"C:\Program Files\OwnMesh\ownmeshd.exe",
-        ));
-        assert!(!daemon_command_matches_exact_image(
-            r#""C:\Program Files\OwnMesh\ownmeshd.exe" --config attacker"#,
-            r"C:\Program Files\OwnMesh\ownmeshd.exe",
         ));
     }
 

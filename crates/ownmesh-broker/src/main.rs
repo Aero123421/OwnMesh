@@ -1,7 +1,7 @@
 //! `OwnMesh` networkless privileged broker binary.
 //!
-//! Linux native lifecycle is backed by a root-owned systemd service.  Other
-//! operating systems remain fail-closed unsupported.
+//! Linux uses a root systemd service, macOS a root LaunchDaemon, and Windows a
+//! protected SCM service. All production transports are local and networkless.
 
 #![allow(
     clippy::doc_markdown,
@@ -20,8 +20,10 @@ use ownmesh_broker::{
     broker_status, install_broker_with_config, uninstall_broker, BrokerInstallConfig,
     UnixSocketSecurity,
 };
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use ownmesh_broker::{load_linux_run_config, run_broker};
+#[cfg(target_os = "macos")]
+use ownmesh_broker::{load_macos_run_config, run_broker};
 use ownmesh_broker_client::BrokerEndpoint;
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;
 use std::path::{Path, PathBuf};
@@ -31,7 +33,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "ownmesh-broker",
     version,
-    about = "OwnMesh privileged broker (Linux native service; networkless)",
+    about = "OwnMesh privileged broker (native networkless service)",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -136,7 +138,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 "ownmesh-broker — networkless privileged broker\n\
                  endpoint basename: {DEFAULT_BROKER_ENDPOINT}\n\
                  commands: help, version, run, status, install, uninstall, exec\n\
-                 Linux: install/status/run/uninstall use a root-owned systemd service; Windows/macOS unsupported"
+                 Linux: root systemd service; macOS: root LaunchDaemon; Windows: protected SCM service"
             );
             Ok(())
         }
@@ -176,7 +178,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 println!("installed=true support={} endpoint={}", rec.support, rec.endpoint);
                 Ok(())
             }
-            #[cfg(not(windows))]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
             let broker = std::env::current_exe().map_err(|e| format!("resolve broker executable: {e}"))?;
             let trusted = trusted_executable.unwrap_or_else(|| broker.with_file_name("ownmeshd"));
@@ -199,9 +201,13 @@ async fn run(cli: Cli) -> Result<(), String> {
                 let _ = config;
                 run_windows_service_dispatcher()
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
             {
                 run_broker(load_linux_run_config(&config)?).await
+            }
+            #[cfg(target_os = "macos")]
+            {
+                run_broker(load_macos_run_config(&config)?).await
             }
         }
         Commands::Exec {
@@ -219,7 +225,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_daemon_identity(uid: Option<u32>, gid: Option<u32>) -> Result<(u32, u32), String> {
     let (uid, gid) = match (uid, gid) {
         (Some(uid), Some(gid)) => (uid, gid),
@@ -238,7 +244,7 @@ fn resolve_daemon_identity(uid: Option<u32>, gid: Option<u32>) -> Result<(u32, u
         _ => return Err("--daemon-uid and --daemon-gid must be supplied together".into()),
     };
     if uid == 0 || gid == 0 {
-        return Err("Linux native broker refuses root ownmeshd identity; choose an explicit non-root daemon UID/GID".into());
+        return Err("native Unix broker refuses root ownmeshd identity; choose an explicit non-root daemon UID/GID".into());
     }
     Ok((uid, gid))
 }

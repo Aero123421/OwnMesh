@@ -7,14 +7,14 @@
 use ownmesh_broker_client::{BrokerEndpoint, PeerBind, PeerCred, PeerProcessBindV2};
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl std::fmt::Display for FileIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "dev={};ino={}", self.device, self.inode)
@@ -27,7 +27,7 @@ pub struct TrustedPeerPolicy {
     trusted_executable: PathBuf,
     allowed_uids: Vec<u32>,
     /// Linux device/inode pinned when loaded from the trusted filesystem.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     trusted_file_id: Option<FileIdentity>,
 }
 
@@ -52,7 +52,7 @@ impl TrustedPeerPolicy {
         Ok(Self {
             trusted_executable,
             allowed_uids,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             trusted_file_id: None,
         })
     }
@@ -134,6 +134,47 @@ impl TrustedPeerPolicy {
                     .into(),
             )
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn authorize_macos_socket_peer(
+        &self,
+        facts: &ownmesh_ipc::MacOsUnixPeerFacts,
+    ) -> Result<AuthorizedPeer, String> {
+        let pinned = self.trusted_file_id.ok_or_else(|| {
+            "trusted macOS executable is not pinned to root-controlled file identity (fail-closed)"
+                .to_string()
+        })?;
+        let current_before = trusted_executable_identity(&self.trusted_executable)?;
+        if current_before != pinned {
+            return Err("trusted macOS ownmeshd executable identity changed (fail-closed)".into());
+        }
+        facts.revalidate().map_err(|error| error.to_string())?;
+        let process_image = trusted_executable_identity(facts.image_path())?;
+        if process_image != pinned {
+            return Err(
+                "macOS peer executable file identity differs from trusted ownmeshd (fail-closed)"
+                    .into(),
+            );
+        }
+        let peer = PeerBind::new(
+            facts.pid(),
+            facts.effective_uid(),
+            facts.image_path().to_string_lossy(),
+        );
+        self.check_bind(&peer)?;
+        let current_after = trusted_executable_identity(&self.trusted_executable)?;
+        if current_after != pinned {
+            return Err(
+                "trusted macOS ownmeshd executable changed during authorization (fail-closed)"
+                    .into(),
+            );
+        }
+        Ok(AuthorizedPeer {
+            peer,
+            process_start_time: u64::from(facts.pid_version()),
+            image_identity: process_image.to_string(),
+        })
     }
 }
 
@@ -229,11 +270,12 @@ pub fn assert_endpoint_peer_verifiable(endpoint: &BrokerEndpoint) -> Result<(), 
     }
 }
 
-/// Production is currently supported only on Linux: Tokio supplies SO_PEERCRED
-/// and `/proc/<pid>/exe` supplies an independently OS-derived exact executable.
+/// Production Unix peers are supported on Linux (`SO_PEERCRED` + `/proc`) and
+/// macOS (`LOCAL_PEERTOKEN` + audit-token-bound libproc image resolution).
 #[must_use]
 pub fn endpoint_supports_peer_cred_enforcement(endpoint: &BrokerEndpoint) -> bool {
-    matches!(endpoint, BrokerEndpoint::UnixSocket(_)) && cfg!(target_os = "linux")
+    matches!(endpoint, BrokerEndpoint::UnixSocket(_))
+        && cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 #[must_use]
@@ -384,7 +426,7 @@ pub fn load_trusted_peer_policy(
     executable: &Path,
     allowed_uids: Vec<u32>,
 ) -> Result<TrustedPeerPolicy, String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let canonical = std::fs::canonicalize(executable).map_err(|e| {
             format!(
@@ -397,7 +439,7 @@ pub fn load_trusted_peer_policy(
         policy.trusted_file_id = Some(file_id);
         Ok(policy)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (executable, allowed_uids);
         Err("trusted executable enforcement is unsupported on this OS (fail-closed)".into())
@@ -418,7 +460,7 @@ fn validate_process_executable_identity(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn trusted_executable_identity(path: &Path) -> Result<FileIdentity, String> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
@@ -442,7 +484,7 @@ fn trusted_executable_identity(path: &Path) -> Result<FileIdentity, String> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_root_controlled_ancestors(start: &Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
     let mut current = Some(start);
@@ -466,29 +508,50 @@ fn validate_root_controlled_ancestors(start: &Path) -> Result<(), String> {
 
 #[cfg(unix)]
 pub fn check_unix_peer(stream: &tokio::net::UnixStream) -> Result<PeerCheck, String> {
-    let ucred = stream
-        .peer_cred()
-        .map_err(|e| format!("peer credential retrieval failed (SO_PEERCRED/fail-closed): {e}"))?;
-    let pid = ucred.pid().unwrap_or(0);
-    if pid <= 0 {
-        return Err("peer pid missing from SO_PEERCRED (fail-closed)".into());
+    #[cfg(target_os = "macos")]
+    {
+        let facts =
+            ownmesh_ipc::macos_unix_peer_facts(stream).map_err(|error| error.to_string())?;
+        return Ok(PeerCheck {
+            cred: PeerCred {
+                pid: facts.pid(),
+                uid: facts.effective_uid(),
+                gid: facts.effective_gid(),
+            },
+            exe_path: facts.image_path().to_string_lossy().into_owned(),
+            method: "LOCAL_PEERTOKEN+proc_pidpath_audittoken",
+            notes: vec![
+                "pid/uid/gid/PID-version obtained from the socket audit token".into(),
+                "executable resolved for that exact audit token".into(),
+            ],
+        });
     }
-    // tokio::net::unix::{uid_t,gid_t} are u32 on every Unix target we ship.
-    let cred = PeerCred {
-        pid,
-        uid: ucred.uid(),
-        gid: ucred.gid(),
-    };
-    let exe_path = resolve_peer_exe(pid)?;
-    Ok(PeerCheck {
-        cred,
-        exe_path,
-        method: "SO_PEERCRED+/proc/pid/exe",
-        notes: vec![
-            "pid/uid independently obtained from peer credentials".into(),
-            "executable independently resolved from peer PID".into(),
-        ],
-    })
+    #[cfg(not(target_os = "macos"))]
+    {
+        let ucred = stream.peer_cred().map_err(|e| {
+            format!("peer credential retrieval failed (SO_PEERCRED/fail-closed): {e}")
+        })?;
+        let pid = ucred.pid().unwrap_or(0);
+        if pid <= 0 {
+            return Err("peer pid missing from SO_PEERCRED (fail-closed)".into());
+        }
+        // tokio::net::unix::{uid_t,gid_t} are u32 on every Unix target we ship.
+        let cred = PeerCred {
+            pid,
+            uid: ucred.uid(),
+            gid: ucred.gid(),
+        };
+        let exe_path = resolve_peer_exe(pid)?;
+        Ok(PeerCheck {
+            cred,
+            exe_path,
+            method: "SO_PEERCRED+/proc/pid/exe",
+            notes: vec![
+                "pid/uid independently obtained from peer credentials".into(),
+                "executable independently resolved from peer PID".into(),
+            ],
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -496,13 +559,22 @@ pub fn authorize_unix_peer(
     stream: &tokio::net::UnixStream,
     policy: &TrustedPeerPolicy,
 ) -> Result<AuthorizedPeer, String> {
-    let check = check_unix_peer(stream)?;
-    let socket_peer = check.peer_bind();
-    let authorized = policy.authorize_process(socket_peer.pid)?;
-    if authorized.peer_bind() != &socket_peer {
-        return Err("socket peer identity changed during authorization (fail-closed)".into());
+    #[cfg(target_os = "macos")]
+    {
+        let facts =
+            ownmesh_ipc::macos_unix_peer_facts(stream).map_err(|error| error.to_string())?;
+        return policy.authorize_macos_socket_peer(&facts);
     }
-    Ok(authorized)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let check = check_unix_peer(stream)?;
+        let socket_peer = check.peer_bind();
+        let authorized = policy.authorize_process(socket_peer.pid)?;
+        if authorized.peer_bind() != &socket_peer {
+            return Err("socket peer identity changed during authorization (fail-closed)".into());
+        }
+        Ok(authorized)
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,10 @@ const MAX_TRUST_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_WINDOWS_BROKER_CONNECTIONS: usize = 16;
 const MAX_WINDOWS_EXECUTE_CONCURRENCY: usize = MAX_WINDOWS_BROKER_CONNECTIONS - 1;
 const WINDOWS_RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Marker for the normal current-user OwnMesh agent. Unlike the broker, this
+/// process is intentionally not an SCM service; its TokenUser SID and immutable
+/// Program Files image are the authority.
+pub(crate) const WINDOWS_USER_AGENT_TRUST: &str = "OwnMeshUserAgent";
 
 /// Immutable fields recorded by the elevated installer after it has copied the
 /// daemon image into the Admin-controlled installation root. `image_file_id`
@@ -567,7 +571,9 @@ impl WindowsTrustedDaemon {
         if pipe_sid != token_sid {
             return Err("Windows daemon pipe SID and TokenUser SID differ (fail-closed)".into());
         }
-        validate_service_name(&record.daemon_service_name)?;
+        if record.daemon_service_name != WINDOWS_USER_AGENT_TRUST {
+            validate_service_name(&record.daemon_service_name)?;
+        }
         if record.daemon_integrity_rid == 0 {
             return Err("Windows daemon integrity RID must be explicit (fail-closed)".into());
         }
@@ -613,8 +619,15 @@ impl WindowsTrustedDaemon {
         if peer.user_sid() != self.record.daemon_token_sid {
             return Err("named-pipe peer SID differs from trusted daemon SID (fail-closed)".into());
         }
-        if peer.session_id() != self.record.daemon_session_id
-            || peer.integrity_rid() != self.record.daemon_integrity_rid
+        let integrity_matches = if self.record.daemon_service_name == WINDOWS_USER_AGENT_TRUST {
+            peer.integrity_rid() >= self.record.daemon_integrity_rid
+                && peer.integrity_rid() <= 0x3000
+        } else {
+            peer.integrity_rid() == self.record.daemon_integrity_rid
+        };
+        if (self.record.daemon_service_name != WINDOWS_USER_AGENT_TRUST
+            && peer.session_id() != self.record.daemon_session_id)
+            || !integrity_matches
         {
             return Err(
                 "named-pipe peer session or integrity differs from trust record (fail-closed)"
@@ -652,13 +665,17 @@ impl WindowsTrustedDaemon {
         if pid == 0 || creation_filetime == 0 {
             return Err("named-pipe peer PID/birth is missing (fail-closed)".into());
         }
-        let service = windows_running_service_facts(&self.record.daemon_service_name, pid)
-            .map_err(|error| format!("trusted daemon SCM identity failed: {error}"))?;
-        let service_image = extract_service_image(service.binary_command_line())?;
-        let service_image = std::fs::canonicalize(service_image)
-            .map_err(|error| format!("canonicalize SCM daemon image: {error}"))?;
-        if !same_windows_path(&service_image, &self.canonical_image)
-            || !image_path.eq_ignore_ascii_case(self.canonical_image.to_string_lossy().as_ref())
+        if self.record.daemon_service_name != WINDOWS_USER_AGENT_TRUST {
+            let service = windows_running_service_facts(&self.record.daemon_service_name, pid)
+                .map_err(|error| format!("trusted daemon SCM identity failed: {error}"))?;
+            let service_image = extract_service_image(service.binary_command_line())?;
+            let service_image = std::fs::canonicalize(service_image)
+                .map_err(|error| format!("canonicalize SCM daemon image: {error}"))?;
+            if !same_windows_path(&service_image, &self.canonical_image) {
+                return Err("trusted daemon SCM image differs from the install record".into());
+            }
+        }
+        if !image_path.eq_ignore_ascii_case(self.canonical_image.to_string_lossy().as_ref())
             || volume_serial != self.record.image_volume_serial
             || file_id != self.image_file_id
             || image_sha256 != self.image_sha256

@@ -10,7 +10,7 @@ OwnMesh は AI オーケストレータではありません。また 1.x ライ
 
 **v1.1.0** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
 
-CLI には Rust ディスパッチ登録上 **32** の明示 unsupported 面に加え、追加 hard-error 面が **7**（合計 **39**）あります。機械可読な対応範囲は [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json) です。
+未実装の面は機械可読エラーで停止し、完成扱いには含めません。対応範囲は [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json) です。
 
 ### サポートする CLI 領域
 
@@ -25,7 +25,7 @@ CLI には Rust ディスパッチ登録上 **32** の明示 unsupported 面に�
 - device enroll/list/show/rotate/revoke
 - ローカル exec / session
 - approval / policy
-- privileged broker は **status のみ**（install/uninstall は unsupported）
+- `privileged install|status|uninstall` — 任意のネットワークレス特権ブローカー（Linux systemd / macOS launchd / Windows SCM）
 
 詳細とロールバック: [`docs/onboarding.md`](./docs/onboarding.md)
 配布/更新: [`docs/RELEASE_NOTES_v1.1.0.md`](./docs/RELEASE_NOTES_v1.1.0.md)
@@ -39,30 +39,24 @@ English: [`README.md`](./README.md)
 | `ownmesh-tui` | 別バイナリ。引数なし CLI 起動は unsupported |
 | `ownmeshd` | ユーザー権限のローカル agent |
 | `ownmesh-session-host` | PTY / 長時間プロセス基盤 |
-| `ownmesh-broker` | ネットワークレス特権ブローカー基盤（本番 install は unsupported） |
+| `ownmesh-broker` | ネットワークレス特権ブローカー（任意導入） |
 | `@ownmesh/control-plane` | Cloudflare Worker MCP/OAuth/D1 |
 
 ## インストール（ポータブル）
 
-macOS / Linux:
+Linux（x64 / arm64）/ macOS:
 
 ```bash
-# リモートスクリプトをシェルに直接流し込まないこと（curl|sh / irm|iex 禁止）
-curl -fsSL -o ownmesh-installer.sh \
-  https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh
-# SHA256SUMS + SHA256SUMS.minisig を minisign で検証し、スクリプトを確認してから:
-sh ./ownmesh-installer.sh
+curl -fsSL https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-Invoke-WebRequest -Uri https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile ownmesh-installer.ps1
-# minisign で署名検証・内容確認の後:
-powershell -NoProfile -File .\ownmesh-installer.ps1
+$p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
 ```
 
-可能なら installer を一度ダウンロードして内容を確認してから実行してください。minisign 必須。チェックサム検証後、updater と同等のアーカイブ契約（件数/展開サイズ上限・必須バイナリ+文書のみ・symlink/重複/path traversal 拒否）を**展開前**に強制し、メンバー単位でステージングします（フル `tar -xzf` / `Expand-Archive` は使いません）。`tar -tvzf` が安全に使えない環境では fail-closed します。
+minisign は必要時に自動準備されます。バイナリは固定公開鍵による署名済みチェックサムを検証してから、件数/サイズ上限・許可ファイル・symlink/重複/path traversal 拒否を適用して導入します。HTTPS の bootstrap script 自体も検証したい環境向けの手順は英語 README の high-assurance 節にあります。
 
 ## 初回セットアップ（ビルド後）
 
@@ -80,7 +74,15 @@ ownmesh update check
 | 面 | 権限 | 状態 |
 |---|---|---|
 | `ownmesh service …` | 現在ユーザーのみ | **サポート**（v1.1.0 onboarding） |
-| `ownmesh privileged …` | 管理者/root が必要になり得る | install/uninstall **unsupported**、status は fail-closed |
+| `ownmesh privileged …` | 管理者/root の別プロセス | Linux / macOS / Windows 実装済み。改ざん・未知の既存物は fail-closed |
+
+Linux / macOS で特権実行も有効にする場合:
+
+```bash
+sudo ownmesh privileged install && ownmesh service install
+```
+
+Windows は管理者 PowerShell で `ownmesh privileged install` を実行し、その後通常ユーザーで `ownmesh service install` を実行します。`ownmeshd` 自体は全 OS でユーザー権限のままです。
 
 ## ロールバック要点
 

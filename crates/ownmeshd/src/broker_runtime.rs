@@ -6,15 +6,15 @@
 //! installation written by the native installer. Windows delegates unsafe
 //! ACL/SCM/token work to the broker crate's narrow, safe facade.
 
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 use ownmesh_broker_client::{BrokerEndpoint, BrokerSecret, CapabilityVerifyKey};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 const LINUX_BROKER: &str = "/usr/lib/ownmesh/ownmesh-broker";
@@ -27,9 +27,19 @@ const LINUX_CONFIG: &str = "/etc/ownmesh/ownmesh-broker.json";
 const LINUX_UNIT: &str = "/etc/systemd/system/ownmesh-broker.service";
 const LINUX_SOCKET: &str = "/run/ownmesh/broker.sock";
 
+const MAC_BROKER: &str = "/Library/PrivilegedHelperTools/dev.ownmesh.privileged-broker";
+const MAC_DAEMON: &str = "/Library/Application Support/OwnMesh/bin/ownmeshd";
+const MAC_STATE: &str = "/Library/Application Support/OwnMesh/broker";
+const MAC_RECORD: &str = "/Library/Application Support/OwnMesh/broker/broker-install.json";
+const MAC_SECRET: &str = "/Library/Application Support/OwnMesh/broker/broker.secret";
+const MAC_VERIFY: &str = "/Library/Application Support/OwnMesh/broker/broker.cap.verify";
+const MAC_CONFIG: &str = "/Library/Application Support/OwnMesh/broker/ownmesh-broker.json";
+const MAC_PLIST: &str = "/Library/LaunchDaemons/dev.ownmesh.privileged-broker.plist";
+const MAC_SOCKET: &str = "/private/var/run/ownmesh/broker.sock";
+
 /// The only local broker inputs the unprivileged daemon may use.
 #[derive(Clone)]
-pub(crate) struct LinuxBrokerClient {
+pub(crate) struct UnixBrokerClient {
     pub(crate) endpoint: BrokerEndpoint,
     pub(crate) secret: BrokerSecret,
     /// Loaded and custody-checked even though v2 responses contain no
@@ -65,7 +75,7 @@ pub(crate) fn load_windows_broker_client(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct LinuxBrokerInstallPaths {
+pub(crate) struct UnixBrokerInstallPaths {
     record: PathBuf,
     broker: PathBuf,
     daemon: PathBuf,
@@ -76,8 +86,8 @@ pub(crate) struct LinuxBrokerInstallPaths {
     socket: PathBuf,
 }
 
-impl LinuxBrokerInstallPaths {
-    pub(crate) fn production() -> Self {
+impl UnixBrokerInstallPaths {
+    pub(crate) fn production_linux() -> Self {
         Self {
             record: PathBuf::from(LINUX_RECORD),
             broker: PathBuf::from(LINUX_BROKER),
@@ -87,6 +97,19 @@ impl LinuxBrokerInstallPaths {
             secret: PathBuf::from(LINUX_SECRET),
             verify: PathBuf::from(LINUX_VERIFY),
             socket: PathBuf::from(LINUX_SOCKET),
+        }
+    }
+
+    pub(crate) fn production_macos() -> Self {
+        Self {
+            record: PathBuf::from(MAC_RECORD),
+            broker: PathBuf::from(MAC_BROKER),
+            daemon: PathBuf::from(MAC_DAEMON),
+            config: PathBuf::from(MAC_CONFIG),
+            unit: PathBuf::from(MAC_PLIST),
+            secret: PathBuf::from(MAC_SECRET),
+            verify: PathBuf::from(MAC_VERIFY),
+            socket: PathBuf::from(MAC_SOCKET),
         }
     }
 }
@@ -125,22 +148,35 @@ struct InstallRecord {
 
 /// Load the fixed Linux installation. Any custody, identity, endpoint, or
 /// daemon-image mismatch is an error; callers must leave elevation unavailable.
-pub(crate) fn load_linux_broker_client(current_exe: &Path) -> Result<LinuxBrokerClient, String> {
-    load_linux_broker_client_at(current_exe, &LinuxBrokerInstallPaths::production())
+pub(crate) fn load_linux_broker_client(current_exe: &Path) -> Result<UnixBrokerClient, String> {
+    load_unix_broker_client_at(
+        current_exe,
+        &UnixBrokerInstallPaths::production_linux(),
+        LINUX_STATE,
+    )
 }
 
-fn load_linux_broker_client_at(
+pub(crate) fn load_macos_broker_client(current_exe: &Path) -> Result<UnixBrokerClient, String> {
+    load_unix_broker_client_at(
+        current_exe,
+        &UnixBrokerInstallPaths::production_macos(),
+        MAC_STATE,
+    )
+}
+
+fn load_unix_broker_client_at(
     current_exe: &Path,
-    paths: &LinuxBrokerInstallPaths,
-) -> Result<LinuxBrokerClient, String> {
-    #[cfg(target_os = "linux")]
+    paths: &UnixBrokerInstallPaths,
+    state: &str,
+) -> Result<UnixBrokerClient, String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let record_bytes = read_regular_owned_mode(&paths.record, 0, 0o600)?;
         let record: InstallRecord = serde_json::from_slice(&record_bytes)
             .map_err(|error| format!("parse broker install record: {error}"))?;
         let daemon_uid = rustix::process::geteuid().as_raw();
         let daemon_gid = rustix::process::getegid().as_raw();
-        validate_record(&record, paths, daemon_uid, daemon_gid)?;
+        validate_record(&record, paths, state, daemon_uid, daemon_gid)?;
 
         // The executable that holds the socket peer credential must be the
         // root-installed image that the broker independently pins. Do not
@@ -170,16 +206,16 @@ fn load_linux_broker_client_at(
         let verify_bytes = read_regular_owned_mode(&paths.verify, 0, 0o644)?;
         let verify_key = CapabilityVerifyKey::from_bytes(&verify_bytes)
             .map_err(|error| format!("load broker capability verify key: {error}"))?;
-        Ok(LinuxBrokerClient {
+        Ok(UnixBrokerClient {
             endpoint: BrokerEndpoint::UnixSocket(paths.socket.clone()),
             secret,
             verify_key,
             trusted_executable: paths.daemon.clone(),
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (current_exe, paths);
+        let _ = (current_exe, paths, state);
         Err(
             "unsupported: native privileged broker lifecycle is currently supported on Linux only"
                 .into(),
@@ -187,24 +223,25 @@ fn load_linux_broker_client_at(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn validate_record(
     record: &InstallRecord,
-    paths: &LinuxBrokerInstallPaths,
+    paths: &UnixBrokerInstallPaths,
+    state: &str,
     uid: u32,
     gid: u32,
 ) -> Result<(), String> {
     if !record.installed
         || record.support != "supported"
-        || record.endpoint != LINUX_SOCKET
+        || record.endpoint != paths.socket.to_string_lossy()
         || record.endpoint_kind != "unix_socket"
-        || record.unit_path.as_deref() != Some(LINUX_UNIT)
-        || record.secret_file != LINUX_SECRET
-        || record.verify_key_file != LINUX_VERIFY
-        || record.signing_key_file != format!("{LINUX_STATE}/private/broker.cap.signing")
-        || record.trusted_executable != LINUX_DAEMON
-        || record.broker_binary != LINUX_BROKER
-        || record.config_path != LINUX_CONFIG
+        || record.unit_path.as_deref() != paths.unit.to_str()
+        || record.secret_file != paths.secret.to_string_lossy()
+        || record.verify_key_file != paths.verify.to_string_lossy()
+        || record.signing_key_file != format!("{state}/private/broker.cap.signing")
+        || record.trusted_executable != paths.daemon.to_string_lossy()
+        || record.broker_binary != paths.broker.to_string_lossy()
+        || record.config_path != paths.config.to_string_lossy()
         || record.daemon_uid == 0
         || record.daemon_uid != uid
         || record.daemon_gid == 0
@@ -214,7 +251,7 @@ fn validate_record(
         || record.socket_group_gid != gid
         || record.socket_mode != 0o600
     {
-        return Err("broker install record is not an exact installed Linux custody record".into());
+        return Err("broker install record is not an exact installed Unix custody record".into());
     }
     verify_root_hash(&paths.broker, 0o755, &record.broker_sha256)?;
     verify_root_hash(&paths.daemon, 0o755, &record.trusted_executable_sha256)?;
@@ -223,7 +260,7 @@ fn validate_record(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_regular_owned_mode(path: &Path, uid: u32, mode: u32) -> Result<Vec<u8>, String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("inspect {}: {error}", path.display()))?;
@@ -237,7 +274,7 @@ fn read_regular_owned_mode(path: &Path, uid: u32, mode: u32) -> Result<Vec<u8>, 
     std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_root_hash(path: &Path, mode: u32, expected_hash: &str) -> Result<(), String> {
     if expected_hash.len() != 64 || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(format!("{} has invalid recorded SHA-256", path.display()));
@@ -251,14 +288,14 @@ fn verify_root_hash(path: &Path, mode: u32, expected_hash: &str) -> Result<(), S
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(Sha256::digest(std::fs::read(path).map_err(
         |error| format!("hash {}: {error}", path.display()),
     )?)))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_socket(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("inspect broker socket {}: {error}", path.display()))?;
@@ -281,7 +318,7 @@ mod tests {
     fn malformed_or_authority_substituted_record_is_refused_before_connect() {
         #[cfg(target_os = "linux")]
         {
-            let paths = LinuxBrokerInstallPaths::production();
+            let paths = UnixBrokerInstallPaths::production_linux();
             let record = InstallRecord {
                 installed: true,
                 endpoint: "/tmp/attacker.sock".into(),
@@ -307,7 +344,7 @@ mod tests {
                 installed_at_unix: 1,
                 notes: Vec::new(),
             };
-            assert!(validate_record(&record, &paths, 1000, 1000).is_err());
+            assert!(validate_record(&record, &paths, LINUX_STATE, 1000, 1000).is_err());
         }
     }
 

@@ -2,9 +2,9 @@
 
 use crate::now_unix;
 use crate::peer::{self, AuthorizedPeer};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::{ReplayLedger, ReplayLedgerError};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use ownmesh_broker_client::{
     operation_facts_digest, parse_broker_wire_intent_v2, verify_cancel_intent_v2_message_auth,
     verify_capability_v2, verify_execute_intent_v2_message_auth, BrokerRequestV2, BrokerResponseV2,
@@ -15,23 +15,23 @@ use ownmesh_broker_client::{
     BrokerSecret, CapabilitySigningKey, CapabilityToken, CapabilityVerifyKey, ElevatedCommand,
     PeerBind, ReplayCache, DEFAULT_CAPABILITY_TTL_SECS, ELEVATED_CAPABILITY_SCOPE,
 };
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use ownmesh_exec::{classify_command_kind_in_dir, CommandKind, RunRequest};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Mutex as StdMutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tokio::sync::Semaphore;
 
 /// Default relative name for the capability signing key (broker-only).
@@ -812,21 +812,22 @@ fn join_bounded_output(handle: Option<std::thread::JoinHandle<String>>) -> Strin
         .unwrap_or_else(|| "[ownmesh broker output reader unavailable]".into())
 }
 
-/// Serve the production broker only on a peer-verifiable Linux Unix socket.
-/// Windows and macOS remain explicit fail-closed unsupported paths until their
-/// native process-birth/image identity guarantees have equivalent proofs.
+/// Serve the production broker only on a peer-verifiable Unix socket.
+/// Linux uses `SO_PEERCRED` plus `/proc`; macOS uses a socket audit token plus
+/// audit-token-bound libproc image resolution. Windows has a dedicated SCM and
+/// protected Named Pipe service implementation.
 pub async fn run_broker(cfg: BrokerServeConfig) -> Result<(), String> {
     peer::assert_endpoint_peer_verifiable(&cfg.endpoint)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let BrokerEndpoint::UnixSocket(path) = cfg.endpoint.clone() else {
             return Err(
-                "unsupported: production broker requires Linux UnixSocket IPC (fail-closed)".into(),
+                "unsupported: production broker requires UnixSocket IPC (fail-closed)".into(),
             );
         };
         return run_linux_broker(cfg, path).await;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = cfg;
         Err(production_elevated_broker_unsupported())
@@ -836,10 +837,10 @@ pub async fn run_broker(cfg: BrokerServeConfig) -> Result<(), String> {
 /// Stable operator-facing reason for production elevated broker disablement.
 #[must_use]
 pub fn production_elevated_broker_unsupported() -> String {
-    "unsupported: production elevated broker requires Linux SO_PEERCRED plus /proc process-birth and executable identity verification; refusing to bind or execute (fail-closed)".into()
+    "unsupported: production elevated broker requires a native peer-verifiable local IPC boundary; refusing to bind or execute (fail-closed)".into()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct ProductionState {
     secret: BrokerSecret,
     signing_key: CapabilitySigningKey,
@@ -853,7 +854,7 @@ struct ProductionState {
     active: AsyncMutex<HashMap<String, ActiveExecution>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct ActiveExecution {
     request_id: String,
     operation_id: String,
@@ -863,7 +864,7 @@ struct ActiveExecution {
     cancel: watch::Sender<bool>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Result<(), String> {
     if let Some(addr_file) = &cfg.addr_file {
         return Err(format!(
@@ -937,7 +938,7 @@ async fn run_linux_broker(cfg: BrokerServeConfig, socket_path: PathBuf) -> Resul
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn handle_linux_production_connection(
     stream: &mut tokio::net::UnixStream,
     policy: &crate::peer::TrustedPeerPolicy,
@@ -980,7 +981,7 @@ async fn handle_linux_production_connection(
                     crate::now_unix(),
                 )
                 .map_err(|error| replay_error(&error))?;
-            let refreshed = policy.authorize_process(accepted.peer_bind().pid)?;
+            let refreshed = peer::authorize_unix_peer(stream, policy)?;
             accepted.validate_refresh(&refreshed)?;
             let peer = refreshed.process_bind_v2();
             let active = state.active.lock().await;
@@ -1023,7 +1024,7 @@ async fn handle_linux_production_connection(
         };
         verify_execute_intent_v2_message_auth(&state.secret, &execute, crate::now_unix())
             .map_err(|error| error.to_string())?;
-        let refreshed = policy.authorize_process(accepted.peer_bind().pid)?;
+        let refreshed = peer::authorize_unix_peer(stream, policy)?;
         accepted.validate_refresh(&refreshed)?;
         let peer = refreshed.process_bind_v2();
         let external = execute.into_unprepared_request();
@@ -1116,12 +1117,12 @@ async fn handle_linux_production_connection(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn replay_error(error: &ReplayLedgerError) -> String {
     format!("replay ledger authorization denied: {error}")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn read_bounded_v2_frame(stream: &mut tokio::net::UnixStream) -> Result<Vec<u8>, String> {
     use tokio::io::AsyncReadExt;
     let mut frame = Vec::with_capacity(MAX_BROKER_REQUEST_BYTES.min(4096));
@@ -1144,7 +1145,7 @@ async fn read_bounded_v2_frame(stream: &mut tokio::net::UnixStream) -> Result<Ve
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn elapsed_ms(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -1152,7 +1153,7 @@ fn elapsed_ms(started: std::time::Instant) -> u64 {
 /// Wait for closure after the one accepted Execute frame.  We intentionally
 /// treat post-frame input as a disconnect-equivalent: an Execute connection
 /// cannot smuggle a second operation while a privileged child is alive.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn wait_for_execute_disconnect(stream: &tokio::net::UnixStream) {
     loop {
         if stream.readable().await.is_err() {
@@ -1168,7 +1169,7 @@ async fn wait_for_execute_disconnect(stream: &tokio::net::UnixStream) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_linux_socket_path(path: &Path, expected: UnixSocketSecurity) -> Result<(), String> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let parent = path
@@ -1212,7 +1213,7 @@ fn prepare_linux_socket_path(path: &Path, expected: UnixSocketSecurity) -> Resul
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn apply_linux_socket_custody(path: &Path, expected: UnixSocketSecurity) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -1237,12 +1238,12 @@ fn apply_linux_socket_custody(path: &Path, expected: UnixSocketSecurity) -> Resu
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct StagedExecutable {
     path: PathBuf,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn prepare_staging_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     match std::fs::create_dir(path) {
@@ -1269,13 +1270,12 @@ fn prepare_staging_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn stage_linux_executable(
     request: &BrokerRequestV2,
     staging_dir: &Path,
 ) -> Result<StagedExecutable, String> {
-    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
     let facts = &request.facts;
@@ -1286,19 +1286,11 @@ fn stage_linux_executable(
     if !source.is_absolute() {
         return Err("source executable must be absolute (fail-closed)".into());
     }
-    let fd = openat2(
-        CWD,
-        source.as_os_str().as_encoded_bytes(),
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-    )
-    .map_err(|e| format!("openat2 pinned source executable: {e}"))?;
-    let before = rustix::fs::fstat(&fd).map_err(|e| e.to_string())?;
-    if before.st_mode & 0o170_000 != 0o100_000
-        || before.st_size < 0
-        || before.st_size.cast_unsigned() != facts.executable.image_len
-        || before.st_size.cast_unsigned() > 64 * 1024 * 1024
+    let mut input = open_pinned_unix_source(source)?;
+    let before = input.metadata().map_err(|e| e.to_string())?;
+    if !before.file_type().is_file()
+        || before.len() != facts.executable.image_len
+        || before.len() > 64 * 1024 * 1024
     {
         return Err("source executable type or bounded length changed (fail-closed)".into());
     }
@@ -1314,7 +1306,7 @@ fn stage_linux_executable(
         let mut total = 0_u64;
         let mut buf = [0_u8; 8192];
         loop {
-            let n = rustix::io::read(&fd, &mut buf).map_err(|e| e.to_string())?;
+            let n = input.read(&mut buf).map_err(|e| e.to_string())?;
             if n == 0 {
                 break;
             }
@@ -1328,10 +1320,10 @@ fn stage_linux_executable(
             output.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         }
         output.sync_all().map_err(|e| e.to_string())?;
-        let after = rustix::fs::fstat(&fd).map_err(|e| e.to_string())?;
-        if after.st_dev != before.st_dev
-            || after.st_ino != before.st_ino
-            || after.st_size != before.st_size
+        let after = input.metadata().map_err(|e| e.to_string())?;
+        if after.dev() != before.dev()
+            || after.ino() != before.ino()
+            || after.len() != before.len()
             || total != facts.executable.image_len
             || hex::encode(hash.finalize()) != facts.executable.image_sha256
         {
@@ -1358,6 +1350,79 @@ fn stage_linux_executable(
 }
 
 #[cfg(target_os = "linux")]
+fn open_pinned_unix_source(path: &Path) -> Result<std::fs::File, String> {
+    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags, CWD};
+    let fd = openat2(
+        CWD,
+        path.as_os_str().as_encoded_bytes(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|e| format!("openat2 pinned source executable: {e}"))?;
+    Ok(std::fs::File::from(fd))
+}
+
+/// Open every macOS pathname component relative to the retained parent. This
+/// is the `openat2(RESOLVE_NO_SYMLINKS)` equivalent available on Darwin.
+#[cfg(target_os = "macos")]
+fn open_pinned_unix_source(path: &Path) -> Result<std::fs::File, String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    if !path.is_absolute() {
+        return Err("macOS executable path must be absolute (fail-closed)".into());
+    }
+    let parts = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(Ok(name)),
+            std::path::Component::RootDir => None,
+            _ => Some(Err(
+                "macOS executable path contains a non-normal component (fail-closed)".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parts.is_empty() || parts.len() > 128 {
+        return Err("macOS executable path component count is invalid".into());
+    }
+    let mut current =
+        std::fs::File::open("/").map_err(|error| format!("open macOS filesystem root: {error}"))?;
+    for (index, part) in parts.iter().enumerate() {
+        let part = CString::new(part.as_bytes())
+            .map_err(|_| "macOS executable path contains NUL".to_string())?;
+        let final_component = index + 1 == parts.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if final_component {
+                0
+            } else {
+                libc::O_DIRECTORY
+            };
+        // SAFETY: `current` is an owned live directory descriptor, `part` is a
+        // NUL-terminated single component, and a successful fd is immediately
+        // transferred into exactly one `File` owner.
+        let fd = unsafe { libc::openat(current.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(format!(
+                "openat no-follow macOS executable component: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `fd` is a new successful descriptor owned by this scope.
+        let next = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = next.metadata().map_err(|error| error.to_string())?;
+        if (!final_component && !metadata.is_dir()) || (final_component && !metadata.is_file()) {
+            return Err("macOS executable component has unexpected type (fail-closed)".into());
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn run_v2_elevated(
     request: &BrokerRequestV2,
     staged_program: &Path,
@@ -1540,7 +1605,7 @@ async fn write_resp<W: AsyncWriteExt + Unpin>(
 /// Production Unix-socket v2 response writer. Kept separate from the legacy
 /// test-only response shape so a client cannot silently accept a downgraded
 /// wire response.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn write_v2_resp<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     response: &BrokerResponseV2,

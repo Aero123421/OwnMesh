@@ -11,8 +11,10 @@ Machine-checked surface list: [`release/SUPPORTED_SURFACES.json`](../release/SUP
 | `ownmesh setup` | Create config root, control-plane URL, policy preset, privacy defaults |
 | `ownmesh doctor` | Read-only diagnostics (`--json`, stable exit codes) |
 | `ownmesh service install\|start\|stop\|restart\|status\|uninstall` | Current-user `ownmeshd` autostart |
+| `ownmesh privileged install\|status\|uninstall` | Optional networkless root/admin broker |
 
-These are **not** the privileged broker. Elevated broker install/uninstall remain unsupported.
+The normal user service never becomes privileged. When explicitly installed,
+the separate broker uses systemd (Linux), launchd (macOS), or SCM (Windows).
 
 ## Privacy defaults (setup)
 

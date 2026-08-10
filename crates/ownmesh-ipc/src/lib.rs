@@ -33,6 +33,8 @@ mod client;
 mod endpoint;
 mod error;
 mod frame;
+#[cfg(target_os = "macos")]
+mod macos_peer;
 mod registry;
 mod rpc;
 mod server;
@@ -53,6 +55,8 @@ pub use client::{ClientIdentity, ClientOptions, IpcClient};
 pub use endpoint::{Endpoint, IpcBus};
 pub use error::{IpcError, IpcResult};
 pub use frame::{read_frame, write_frame, FrameDecoder, MAX_FRAME_BYTES};
+#[cfg(target_os = "macos")]
+pub use macos_peer::{macos_unix_peer_facts, MacOsUnixPeerFacts};
 pub use registry::{
     atomic_write_owner_only, create_owner_only_file_new, open_owner_only_file_append,
     open_owner_only_file_append_linkable, open_owner_only_file_read, prepare_owner_only_state_dir,

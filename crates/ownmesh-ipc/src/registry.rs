@@ -1008,6 +1008,7 @@ fn open_existing_nofollow_read(path: &Path) -> IpcResult<fs::File> {
 fn open_existing_nofollow_append(path: &Path, linkable: bool) -> IpcResult<fs::File> {
     #[cfg(unix)]
     {
+        let _ = linkable;
         use std::os::unix::io::{FromRawFd, IntoRawFd};
         let fd = rustix::fs::open(
             path,
