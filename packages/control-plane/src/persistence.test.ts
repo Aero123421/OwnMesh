@@ -138,7 +138,7 @@ test("SqlStore public transfer list returns the same owner-visible operation ids
         tracker: new OperationTracker(),
         transferTicketSecret: "sql-transfer-list-secret",
       });
-      return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown> } } };
+      return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown>; next_cursor?: string | null } } };
     };
 
     const ids: string[] = [];
@@ -157,9 +157,61 @@ test("SqlStore public transfer list returns the same owner-visible operation ids
       const status = await invoke("ownmesh_transfer_status", { transfer_id: transferId });
       assert.equal(status.result!.structuredContent!.operation_id, transferId);
     }
-    const listed = await invoke("ownmesh_transfer_list", { limit: 50 });
-    const transfers = listed.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>;
-    assert.deepEqual(new Set(transfers.map((entry) => entry.operation_id)), new Set(ids));
+    const sameCreatedAt = "2026-08-10T12:00:00.000Z";
+    for (const id of ids) {
+      db.prepare("UPDATE mcp_operations SET created_at = ? WHERE operation_id = ?")
+        .run(sameCreatedAt, id);
+    }
+    const template = await store.getMcpOperation(ids[0]);
+    assert.ok(template);
+    const foreignRows = [
+      { operationId: "op_sql_foreign_principal", tenantId: "ten_default", principalId: "prin_foreign" },
+      { operationId: "op_sql_foreign_tenant", tenantId: "ten_foreign", principalId: "prin_dev" },
+    ];
+    for (const foreign of foreignRows) {
+      const meta = template.data.__ownmesh_transfer_plan as Record<string, unknown>;
+      await store.putMcpOperation({
+        ...template,
+        operation_id: foreign.operationId,
+        correlation_id: foreign.operationId,
+        tenant_id: foreign.tenantId,
+        principal_id: foreign.principalId,
+        idempotency_key: foreign.operationId,
+        data: {
+          ...template.data,
+          __ownmesh_transfer_plan: {
+            ...meta,
+            transfer_id: foreign.operationId,
+            tenant_id: foreign.tenantId,
+            principal_id: foreign.principalId,
+          },
+        },
+        created_at: sameCreatedAt,
+        updated_at: sameCreatedAt,
+      });
+    }
+    const foreignBefore = await Promise.all(
+      foreignRows.map((foreign) => store.getMcpOperation(foreign.operationId)),
+    );
+    const first = await invoke("ownmesh_transfer_list", { limit: 2 });
+    const firstContent = first.result!.structuredContent!;
+    assert.equal(firstContent.next_cursor, "cur_2");
+    const second = await invoke("ownmesh_transfer_list", {
+      limit: 2,
+      cursor: firstContent.next_cursor,
+    });
+    const combined = [
+      ...(firstContent.data.transfers as Array<Record<string, unknown>>),
+      ...(second.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>),
+    ].map((entry) => String(entry.operation_id));
+    assert.deepEqual(combined, [...ids].sort().reverse());
+    assert.equal(new Set(combined).size, ids.length, "pagination must not duplicate or omit");
+    for (const foreign of foreignRows) assert.equal(combined.includes(foreign.operationId), false);
+    assert.deepEqual(
+      await Promise.all(foreignRows.map((foreign) => store.getMcpOperation(foreign.operationId))),
+      foreignBefore,
+      "foreign principal/tenant rows must not be reconciled or rewritten",
+    );
   } finally {
     db.close();
   }

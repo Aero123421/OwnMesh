@@ -29,7 +29,7 @@ async function fixture(store = new MemoryStore()) {
 
 async function invoke(f: Awaited<ReturnType<typeof fixture>>, name: string, args: Record<string, unknown>, token = f.token) {
   const response = await handleMcp(request(token, name, args), f.store, new URL("https://cp.test/mcp"), f.router, { tracker: new OperationTracker(), transferTicketSecret: "transfer-public-test-secret", terminalizeTransferRoom: async (control) => { f.roomTerminalized.push(control); return true; } });
-  return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown> } }; error?: { message: string } };
+  return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown>; next_cursor?: string | null } }; error?: { message: string } };
 }
 
 test("public transfer tools have strict schemas and plan stores no payload material", async () => {
@@ -115,9 +115,60 @@ test("Memory transfer list uses owner-bound operations after audit-window churn"
       created_at: new Date(Date.now() + index).toISOString(),
     });
   }
-  const listed = await invoke(f, "ownmesh_transfer_list", { limit: 50 });
-  const transfers = listed.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>;
-  assert.deepEqual(new Set(transfers.map((entry) => entry.operation_id)), new Set(ids));
+  const sameCreatedAt = "2026-08-10T12:00:00.000Z";
+  for (const id of ids) {
+    assert.ok(await f.store.updateMcpOperation(id, { created_at: sameCreatedAt }));
+  }
+  const template = await f.store.getMcpOperation(ids[0]);
+  assert.ok(template);
+  const foreignRows = [
+    { operationId: "op_memory_foreign_principal", tenantId: "ten_default", principalId: "prin_foreign" },
+    { operationId: "op_memory_foreign_tenant", tenantId: "ten_foreign", principalId: "prin_dev" },
+  ];
+  for (const foreign of foreignRows) {
+    const meta = template.data.__ownmesh_transfer_plan as Record<string, unknown>;
+    await f.store.putMcpOperation({
+      ...template,
+      operation_id: foreign.operationId,
+      correlation_id: foreign.operationId,
+      tenant_id: foreign.tenantId,
+      principal_id: foreign.principalId,
+      idempotency_key: foreign.operationId,
+      data: {
+        ...template.data,
+        __ownmesh_transfer_plan: {
+          ...meta,
+          transfer_id: foreign.operationId,
+          tenant_id: foreign.tenantId,
+          principal_id: foreign.principalId,
+        },
+      },
+      created_at: sameCreatedAt,
+      updated_at: sameCreatedAt,
+    });
+  }
+  const foreignBefore = await Promise.all(
+    foreignRows.map((foreign) => f.store.getMcpOperation(foreign.operationId)),
+  );
+  const first = await invoke(f, "ownmesh_transfer_list", { limit: 2 });
+  const firstContent = first.result!.structuredContent!;
+  assert.equal(firstContent.next_cursor, "cur_2");
+  const second = await invoke(f, "ownmesh_transfer_list", {
+    limit: 2,
+    cursor: firstContent.next_cursor,
+  });
+  const combined = [
+    ...(firstContent.data.transfers as Array<Record<string, unknown>>),
+    ...(second.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>),
+  ].map((entry) => String(entry.operation_id));
+  assert.deepEqual(combined, [...ids].sort().reverse());
+  assert.equal(new Set(combined).size, ids.length, "pagination must not duplicate or omit");
+  for (const foreign of foreignRows) assert.equal(combined.includes(foreign.operationId), false);
+  assert.deepEqual(
+    await Promise.all(foreignRows.map((foreign) => f.store.getMcpOperation(foreign.operationId))),
+    foreignBefore,
+    "foreign principal/tenant rows must not be reconciled or rewritten",
+  );
 });
 
 test("uncertain start route recovery fences and creates a fresh preflight generation", async () => {
