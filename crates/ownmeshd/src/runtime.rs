@@ -2060,6 +2060,15 @@ impl DaemonRuntime {
         // Never trust client-supplied pins / policy classification.
         p.executable_pin = None;
         p.policy_kind = None;
+        if p.elevated
+            && (self.policy.preset != AccessPreset::FullAccess
+                || !full_access_has_no_hidden_restrictive_rules(&self.policy))
+        {
+            return Err(IpcError::Remote {
+                code: app_error::POLICY_DENIED,
+                message: "elevated execution requires the Full Access preset".into(),
+            });
+        }
         if p.program.trim().is_empty() {
             return Err(IpcError::Remote {
                 code: app_error::INVALID_PARAMS,

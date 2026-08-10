@@ -14,7 +14,9 @@ import {
   paginateList,
   truncateText,
   approvalRequiredEnvelope,
+  buildDeviceOperation,
   makeEnvelope,
+  sanitizeMcpArgs,
 } from "./mcp.ts";
 import { DeviceRoomHarness, type DeviceEnvelope } from "./device-room.ts";
 import { MemoryStore } from "./store.ts";
@@ -107,10 +109,34 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   assert.equal(run.annotations.destructiveHint, true);
   assert.equal(shell.annotations.openWorldHint, true);
 
+  const runProps = run.inputSchema.properties as Record<string, unknown>;
+  const shellProps = shell.inputSchema.properties as Record<string, unknown>;
+  assert.equal((runProps.elevated as { default?: boolean }).default, false);
+  assert.equal(shellProps.elevated, undefined);
+
   const list = MCP_TOOLS.find((t) => t.name === "ownmesh_list_devices")!;
   assert.equal(list.annotations.readOnlyHint, true);
   assert.equal(list.annotations.idempotentHint, true);
   assert.equal(list.annotations.openWorldHint, false);
+});
+
+test("elevated structured command is normalized and exact-action-bound", async () => {
+  const base = { device_id: "dev_elevated", program: "/bin/true", idempotency_key: "idem_elevated" };
+  const ordinary = sanitizeMcpArgs(base, "ownmesh_command_run");
+  const elevated = sanitizeMcpArgs({ ...base, elevated: true }, "ownmesh_command_run");
+  assert.equal(ordinary.elevated, false);
+  assert.equal(elevated.elevated, true);
+
+  const make = (args: Record<string, unknown>) => buildDeviceOperation({
+    toolName: "ownmesh_command_run", args, operationId: "op_elevated", deviceId: "dev_elevated",
+    principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 7,
+    expiresAt: "2099-01-01T00:00:00.000Z", oauthClientId: "client_mcp",
+  });
+  const [plain, privileged] = await Promise.all([make(ordinary), make(elevated)]);
+  assert.notEqual(plain.payload_hash, privileged.payload_hash);
+  assert.equal((plain.bound_action.facts as Record<string, unknown>).elevated, false);
+  assert.equal((privileged.bound_action.facts as Record<string, unknown>).elevated, true);
+  assert.equal((privileged.payload.arguments as Record<string, unknown>).elevated, true);
 });
 
 test("session open canonically exposes explicit profile adapter inputs", () => {

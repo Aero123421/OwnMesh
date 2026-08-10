@@ -118,6 +118,16 @@ const execBoundProps = {
   },
 };
 
+// An elevated request is an exact structured-command action fact. Broker,
+// custody, and identity authority are deliberately not MCP inputs.
+const elevatedCommandProp = {
+  elevated: {
+    type: "boolean",
+    default: false,
+    description: "Request broker-mediated elevation (Linux only; fail-closed unless installed)",
+  },
+};
+
 export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_list_devices",
@@ -438,6 +448,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         },
         async: { type: "boolean", description: "Return immediately with operation_id" },
         ...execBoundProps,
+        ...elevatedCommandProp,
       },
       required: ["device_id", "program", "idempotency_key"],
     },
@@ -466,6 +477,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         },
         async: { type: "boolean" },
         ...execBoundProps,
+        ...elevatedCommandProp,
       },
       required: ["device_id", "program", "idempotency_key"],
     },
@@ -2238,6 +2250,11 @@ export function sanitizeMcpArgs(
     } else {
       out.env = normalized;
     }
+  }
+  // Absence and explicit false must bind to the same non-elevated action;
+  // malformed values never coerce to privilege.
+  if (toolName === "ownmesh_command_run" || toolName === "ownmesh_run_command") {
+    out.elevated = out.elevated === true;
   }
   return out;
 }

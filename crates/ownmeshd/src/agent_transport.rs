@@ -4246,6 +4246,36 @@ mod tests {
         let (_, mapped) = map_request_to_method(&command_request).unwrap();
         assert_eq!(mapped["workspace_id"], "ws_verified");
 
+        // Elevation is a signed command fact, not a local/Agent toggle. A
+        // matching request reaches runtime; substitution is rejected by the
+        // exact-action check before any broker handoff.
+        command_request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("elevated".into(), json!(true));
+        command_request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap()
+            .get_mut("facts")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert("elevated".into(), json!(true));
+        refresh_bound_hash(&mut command_request);
+        assert!(verify_exact_action_binding(&device, &command_request, Some(&expires)).is_ok());
+        let (_, mapped) = map_request_to_method(&command_request).unwrap();
+        assert_eq!(mapped["elevated"], true);
+        command_request
+            .arguments
+            .as_object_mut()
+            .unwrap()
+            .insert("elevated".into(), json!(false));
+        assert!(verify_exact_action_binding(&device, &command_request, Some(&expires)).is_err());
+
         let (mut unscoped, _) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
         unscoped
             .arguments
