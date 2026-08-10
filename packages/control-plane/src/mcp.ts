@@ -17,6 +17,7 @@
  */
 
 import type { ControlPlaneStore, McpOperationRecord } from "./store.ts";
+import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   bearer,
   BodyTooLargeError,
@@ -5577,11 +5578,17 @@ export async function handleApprove(
           route,
         });
       }
-      return html(
-        `<!doctype html><html><body><h1>${decision === "approve" ? "Approved" : "Denied"}</h1>
-         <p>Operation <code>${escapeHtml(updated.operation_id)}</code> recorded.</p></body></html>`,
-        { noStore: true },
-      );
+      return html(authPage({
+        title: `${decision === "approve" ? "Approved" : "Denied"} — OwnMesh`,
+        eyebrow: "Operation approval",
+        heading: decision === "approve" ? "Operation approved" : "Operation denied",
+        intro: "The decision was recorded against the exact operation and action hash.",
+        body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(updated.operation_id)}</code></dd><dt>Status</dt><dd>${escapeHtml(updated.status)}</dd></dl><p class="note">Local device policy remains the final authority.</p>`,
+        footer: "You can close this tab",
+      }), {
+        noStore: true,
+        headers: { "content-security-policy": AUTH_PAGE_CSP },
+      });
     } catch (err) {
       releaseError =
         err instanceof Error ? err.message.slice(0, 500) : "delivery_error";
@@ -5686,24 +5693,19 @@ export async function handleApprove(
   const actionPreview = op.action
     ? escapeHtml(JSON.stringify(op.action, null, 2))
     : escapeHtml(op.summary || "");
-  const page = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Approve</title></head>
-<body><h1>OwnMesh operation approval</h1>
-<p>Operation <code>${escapeHtml(op.operation_id)}</code></p>
-<p>Tool: <code>${escapeHtml(op.tool || "")}</code></p>
-<p>Device: <code>${escapeHtml(op.device_id || "")}</code></p>
-<p>Expires: <code>${escapeHtml(op.expires_at || nowIso(txExpiresMs))}</code></p>
-<p>Payload hash: <code>${escapeHtml(op.payload_hash || "(none)")}</code></p>
-<pre>${actionPreview}</pre>
-<form method="post" action="/approve?operation_id=${encodeURIComponent(op.operation_id)}">
-<input type="hidden" name="transaction_id" value="${escapeHtml(txId)}"/>
-<input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"/>
-<input type="hidden" name="operation_id" value="${escapeHtml(op.operation_id)}"/>
-<button name="decision" value="approve">Approve</button>
-<button name="decision" value="deny">Deny</button>
-</form>
-<p><small>Issuer ${escapeHtml(issuer)}. ChatGPT confirmation is not an OwnMesh cryptographic attestation. This recovery path binds the exact action hash and expiry before device execution.</small></p>
-</body></html>`;
-  return html(page, { status: 200, noStore: true });
+  const page = authPage({
+    title: "Approve operation — OwnMesh",
+    eyebrow: "Local policy escalation",
+    heading: "Review the exact operation",
+    intro: "This action needs an explicit decision from the authenticated OwnMesh owner.",
+    body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(op.operation_id)}</code></dd><dt>Tool</dt><dd><code>${escapeHtml(op.tool || "")}</code></dd><dt>Device</dt><dd><code>${escapeHtml(op.device_id || "")}</code></dd><dt>Expires</dt><dd><code>${escapeHtml(op.expires_at || nowIso(txExpiresMs))}</code></dd><dt>Payload hash</dt><dd><code>${escapeHtml(op.payload_hash || "(none)")}</code></dd></dl><pre>${actionPreview}</pre><p class="note">ChatGPT confirmation is not a cryptographic attestation. OwnMesh binds this decision to the exact action hash and expiry before device execution.</p><form method="post" action="/approve?operation_id=${encodeURIComponent(op.operation_id)}"><input type="hidden" name="transaction_id" value="${escapeHtml(txId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><input type="hidden" name="operation_id" value="${escapeHtml(op.operation_id)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">Approve operation</button><button class="danger" name="decision" value="deny" type="submit">Deny</button></div></form>`,
+    footer: new URL(issuer).host,
+  });
+  return html(page, {
+    status: 200,
+    noStore: true,
+    headers: { "content-security-policy": AUTH_PAGE_CSP },
+  });
 }
 
 /**

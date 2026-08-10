@@ -34,10 +34,13 @@ export function html(body: string, init: JsonInit = {}): Response {
   if (!headers.has("content-security-policy")) {
     headers.set(
       "content-security-policy",
-      "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     );
   }
-  headers.set("referrer-policy", "no-referrer");
+  // `no-referrer` serializes Origin as `null` for ordinary form POSTs. That
+  // breaks strict same-origin verification. `same-origin` keeps local form
+  // provenance while still suppressing Referer on the OAuth redirect away.
+  headers.set("referrer-policy", "same-origin");
   headers.set("x-content-type-options", "nosniff");
   headers.set("x-frame-options", "DENY");
   if (noStore) applyNoStore(headers);

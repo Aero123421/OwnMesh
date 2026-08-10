@@ -8,6 +8,7 @@ import {
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 import type { ControlPlaneStore, OwnerAuthChallenge } from "./store.ts";
+import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   BodyTooLargeError,
   constantTimeEqual,
@@ -353,16 +354,19 @@ function loginPage(issuer: string, returnTo: string, registered: boolean): Respo
     : '<label for="owner_code">One-time owner code</label><input id="owner_code" name="owner_code" type="password" autocomplete="off" minlength="20" maxlength="128" required>';
   const button = registered ? "Sign in with passkey" : "Create owner passkey";
   return html(
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OwnMesh sign in</title>
-<style>:root{color-scheme:dark}body{margin:0;background:#0d0f12;color:#d9dde3;font:15px ui-monospace,SFMono-Regular,Consolas,monospace}.box{max-width:30rem;margin:12vh auto;padding:2rem;border:1px solid #30343a;background:#15181d}.mark{letter-spacing:.08em;color:#f0f2f4}p{color:#9ba3ad;line-height:1.55}.error{color:#f2a6a6}label{display:block;margin:1.5rem 0 .5rem}input,button{box-sizing:border-box;width:100%;padding:.8rem;border:1px solid #3a4048;background:#0d0f12;color:#f0f2f4;font:inherit}button{margin-top:1rem;background:#d9dde3;color:#111418;cursor:pointer;font-weight:700}button:disabled{opacity:.55;cursor:wait}small{display:block;margin-top:1.25rem;color:#737b86}</style></head>
-<body><main class="box"><h1 class="mark">OWNMESH</h1><h2>${registered ? "Owner sign in" : "Create owner"}</h2><p>${intro}</p>
-<form id="passkey-form" data-mode="${mode}"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">${codeInput}<button type="submit">${button}</button></form><p id="passkey-status" role="status" aria-live="polite"></p>
-<small>Self-hosted instance: ${escapeHtml(new URL(issuer).host)}. Private keys stay in your authenticator; D1 stores only the public credential.</small></main><script src="/auth/passkey.js" defer></script></body></html>`,
+    authPage({
+      title: "OwnMesh sign in",
+      eyebrow: registered ? "Owner authentication" : "Initial owner setup",
+      heading: registered ? "Unlock your private mesh" : "Create the owner identity",
+      intro,
+      body: `<form id="passkey-form" class="stack" data-mode="${mode}"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">${codeInput}<button class="primary wide" type="submit">${button}</button></form><p id="passkey-status" class="status" role="status" aria-live="polite"></p><p class="note">Private keys stay inside your authenticator. OwnMesh stores only the public credential.</p><script src="/auth/passkey.js" defer></script>`,
+      footer: new URL(issuer).host,
+    }),
     {
       status: 200,
       noStore: true,
       headers: {
-        "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        "content-security-policy": AUTH_PAGE_CSP,
       },
     },
   );
@@ -674,10 +678,14 @@ export async function handleChatGptConnector(
 ): Promise<Response> {
   if (request.method === "GET") {
     const csrf = randomToken("csrf_");
-    const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect ChatGPT — OwnMesh</title>
-<style>:root{color-scheme:dark}body{margin:0;background:#0d0f12;color:#d9dde3;font:15px ui-monospace,SFMono-Regular,Consolas,monospace}.box{max-width:38rem;margin:8vh auto;padding:2rem;border:1px solid #30343a;background:#15181d}p,li{color:#9ba3ad;line-height:1.55}code{color:#edf0f3}input,button{box-sizing:border-box;width:100%;padding:.8rem;border:1px solid #3a4048;background:#0d0f12;color:#f0f2f4;font:inherit}button{margin-top:1rem;background:#d9dde3;color:#111418;cursor:pointer;font-weight:700}</style></head>
-<body><main class="box"><h1>OWNMESH</h1><h2>Connect ChatGPT</h2><ol><li>In ChatGPT, create a custom MCP app with <code>${escapeHtml(issuer)}/mcp</code>.</li><li>Copy its callback URL and paste it below.</li><li>Copy the generated client ID back to ChatGPT.</li></ol>
-<form method="post" action="/connect/chatgpt"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><label for="callback">ChatGPT callback URL</label><input id="callback" name="callback" type="url" placeholder="https://chatgpt.com/connector/oauth/..." maxlength="256" required autofocus><button type="submit">Create OAuth client</button></form></main></body></html>`;
+    const page = authPage({
+      title: "Manual ChatGPT fallback — OwnMesh",
+      eyebrow: "Compatibility fallback",
+      heading: "Register an older ChatGPT client",
+      intro: "Current ChatGPT clients need only the MCP URL. Use this page only when automatic OAuth registration is unavailable.",
+      body: `<dl class="meta"><dt>MCP endpoint</dt><dd><code>${escapeHtml(issuer)}/mcp</code></dd><dt>Client type</dt><dd>Public + PKCE S256</dd></dl><form class="stack" method="post" action="/connect/chatgpt"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><div><label for="callback">Exact ChatGPT callback URL</label><input id="callback" name="callback" type="url" placeholder="https://chatgpt.com/connector/oauth/..." maxlength="256" required autofocus></div><button class="primary wide" type="submit">Create fallback client</button></form>`,
+      footer: "Manual fallback only",
+    });
     const headers = new Headers(html(page, { noStore: true }).headers);
     headers.append("set-cookie", cookie(CSRF_COOKIE, csrf, 600, "Strict"));
     return new Response(page, { status: 200, headers });
@@ -710,6 +718,13 @@ export async function handleChatGptConnector(
     redirect_uris: [callback],
     created_at: nowIso(),
   });
-  const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ChatGPT client ready — OwnMesh</title></head><body style="margin:3rem auto;max-width:42rem;background:#0d0f12;color:#d9dde3;font:15px ui-monospace,Consolas,monospace"><h1>ChatGPT client ready</h1><p>Paste this OAuth client ID into ChatGPT:</p><pre style="padding:1rem;border:1px solid #3a4048;overflow:auto">${escapeHtml(clientId)}</pre><p>MCP server URL:</p><pre style="padding:1rem;border:1px solid #3a4048;overflow:auto">${escapeHtml(issuer)}/mcp</pre><p>Authentication: OAuth. The next ChatGPT prompt opens OwnMesh consent.</p></body></html>`;
+  const page = authPage({
+    title: "ChatGPT client ready — OwnMesh",
+    eyebrow: "Compatibility fallback",
+    heading: "OAuth client ready",
+    intro: "Paste the public client ID into ChatGPT, then complete OwnMesh authorization.",
+    body: `<dl class="meta"><dt>Client ID</dt><dd><code>${escapeHtml(clientId)}</code></dd><dt>MCP endpoint</dt><dd><code>${escapeHtml(issuer)}/mcp</code></dd><dt>Authentication</dt><dd>OAuth 2.1 / PKCE S256</dd></dl><p class="note">No client secret is used or generated.</p>`,
+    footer: "Manual fallback only",
+  });
   return html(page, { status: 201, noStore: true });
 }

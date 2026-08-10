@@ -10,6 +10,7 @@
  */
 
 import type { ControlPlaneStore } from "./store.ts";
+import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import { chatGptOAuthClientId, chatGptOAuthPair } from "./owner-auth.ts";
 import {
   ACCESS_TOKEN_TTL_MS,
@@ -62,6 +63,19 @@ const SUPPORTED_SCOPES = new Set([
   "ownmesh.read", "ownmesh.write", "ownmesh.exec", "ownmesh.session", "ownmesh.device", "offline_access",
 ]);
 const DEFAULT_SCOPE = "ownmesh.read ownmesh.device";
+const SCOPE_COPY: Record<string, string> = {
+  "ownmesh.read": "Read device status and permitted workspace content.",
+  "ownmesh.write": "Create or modify content inside permitted workspaces.",
+  "ownmesh.exec": "Run commands allowed by the local device policy.",
+  "ownmesh.session": "Open and control permitted interactive sessions.",
+  "ownmesh.device": "Discover and address devices enrolled in this instance.",
+  offline_access: "Keep ChatGPT connected using rotating refresh tokens.",
+};
+function scopeRows(scope: string): string {
+  return scope.split(/\s+/).filter(Boolean).map((value) =>
+    `<div class="scope"><span class="scope-mark" aria-hidden="true"></span><span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(SCOPE_COPY[value] || "Access requested by this OAuth client.")}</small></span></div>`
+  ).join("");
+}
 function validScope(scope: string): boolean {
   const values = scope.split(/\s+/).filter(Boolean);
   return values.length > 0 && values.every((s) => SUPPORTED_SCOPES.has(s));
@@ -468,13 +482,19 @@ export async function handleAuthorize(
     consumed: false,
   });
 
-  const page = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OwnMesh Authorize</title></head>
-<body><h1>OwnMesh</h1><p>Client <code>${escapeHtml(clientId)}</code> requests:</p><pre>${escapeHtml(scope)}</pre><p>Return to <code>${escapeHtml(new URL(redirect).host)}</code>.</p>
-<form method="post" action="/oauth/authorize">
-<input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"/>
-<input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"/>
-<button name="decision" value="approve">Approve</button><button name="decision" value="deny">Deny</button></form></body></html>`;
-  return html(page, { status: 200, noStore: true });
+  const page = authPage({
+    title: "Authorize ChatGPT — OwnMesh",
+    eyebrow: "OAuth authorization",
+    heading: `Connect ${client.client_name || clientId}`,
+    intro: "Review the capabilities ChatGPT is requesting from this self-hosted OwnMesh instance.",
+    body: `<dl class="meta"><dt>Client</dt><dd>${escapeHtml(client.client_name || clientId)}</dd><dt>Returns to</dt><dd><code>${escapeHtml(new URL(redirect).host)}</code></dd><dt>Protocol</dt><dd>OAuth 2.1 / PKCE S256</dd></dl><div class="scope-list">${scopeRows(scope)}</div><p class="note">Your device policy remains the final authority. ChatGPT cannot bypass local workspace, command, or approval rules.</p><form method="post" action="/oauth/authorize"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">Authorize connection</button><button class="danger" name="decision" value="deny" type="submit">Deny</button></div></form>`,
+    footer: "One-time consent / 5 minute expiry",
+  });
+  return html(page, {
+    status: 200,
+    noStore: true,
+    headers: { "content-security-policy": AUTH_PAGE_CSP },
+  });
 }
 
 function escapeHtml(s: string): string {
@@ -756,9 +776,17 @@ export async function handleDeviceVerification(
     const url = new URL(req.url);
     const userCode = (url.searchParams.get("user_code") || "").trim().toUpperCase();
     if (!userCode) {
-      return html(`<!doctype html><html><body><h1>OwnMesh device login</h1>
-<form method="get" action="/oauth/device"><label>User code <input name="user_code" autocomplete="one-time-code" required/></label>
-<button type="submit">Continue</button></form></body></html>`, { noStore: true });
+      return html(authPage({
+        title: "Device sign in — OwnMesh",
+        eyebrow: "Device authorization",
+        heading: "Enter the code from your terminal",
+        intro: "Use this page when OwnMesh is running on a server without a local browser.",
+        body: `<form class="stack" method="get" action="/oauth/device"><div><label for="user_code">One-time device code</label><input id="user_code" name="user_code" autocomplete="one-time-code" required autofocus></div><button class="primary wide" type="submit">Continue</button></form>`,
+        footer: "RFC 8628 device flow",
+      }), {
+        noStore: true,
+        headers: { "content-security-policy": AUTH_PAGE_CSP },
+      });
     }
     const dc = await store.getDeviceCodeByUserCode(userCode);
     const client = dc ? await store.getClient(dc.client_id) : null;
@@ -772,11 +800,18 @@ export async function handleDeviceVerification(
       principal_id: principal.id, client_id: dc.client_id, scope: dc.scope,
       expires_at: Math.min(dc.expires_at, Date.now() + 5 * 60 * 1000), consumed: false,
     });
-    const page = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Device Login</title></head>
-<body><h1>Authorize device</h1><p>Client <code>${escapeHtml(dc.client_id)}</code> requests:</p><pre>${escapeHtml(dc.scope)}</pre>
-<form method="post" action="/oauth/device"><input type="hidden" name="transaction_id" value="${transactionId}"/>
-<input type="hidden" name="csrf_token" value="${csrf}"/><button name="decision" value="approve">Approve</button></form></body></html>`;
-    return html(page, { noStore: true });
+    const page = authPage({
+      title: "Authorize device — OwnMesh",
+      eyebrow: "Device authorization",
+      heading: `Authorize ${client.client_name || dc.client_id}`,
+      intro: "Confirm the terminal or headless server that requested this one-time code.",
+      body: `<dl class="meta"><dt>Client</dt><dd>${escapeHtml(client.client_name || dc.client_id)}</dd><dt>User code</dt><dd><code>${escapeHtml(userCode)}</code></dd><dt>Expires</dt><dd>${escapeHtml(new Date(dc.expires_at).toISOString())}</dd></dl><div class="scope-list">${scopeRows(dc.scope)}</div><form method="post" action="/oauth/device"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><button class="primary wide" name="decision" value="approve" type="submit">Authorize device</button></form>`,
+      footer: "One-time device authorization",
+    });
+    return html(page, {
+      noStore: true,
+      headers: { "content-security-policy": AUTH_PAGE_CSP },
+    });
   }
   if (req.method === "POST") {
     const body = await readBody(req);
@@ -787,7 +822,17 @@ export async function handleDeviceVerification(
       body.transaction_id, await sha256Hex(body.csrf_token), principal.id,
     );
     if (!tx) return json({ error: "invalid_request", error_description: "invalid, expired, or used transaction" }, { status: 400 });
-    return html(`<!doctype html><html><body><h1>Approved</h1></body></html>`, { noStore: true });
+    return html(authPage({
+      title: "Device authorized — OwnMesh",
+      eyebrow: "Device authorization",
+      heading: "Device authorized",
+      intro: "Return to the terminal. It can now complete the token exchange.",
+      body: `<p class="note">This one-time authorization has been consumed and cannot be replayed.</p>`,
+      footer: "You can close this tab",
+    }), {
+      noStore: true,
+      headers: { "content-security-policy": AUTH_PAGE_CSP },
+    });
   }
   return json({ error: "method_not_allowed" }, { status: 405 });
 }

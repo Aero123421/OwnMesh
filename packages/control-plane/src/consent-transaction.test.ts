@@ -156,6 +156,8 @@ test("GET consent issues one-time tx bound to full snapshot", async () => {
   const html = await page.text();
   assert.match(html, /transaction_id/);
   assert.match(html, /csrf_token/);
+  assert.match(html, /Authorize ChatGPT — OwnMesh/);
+  assert.match(html, /OAuth 2\.1 \/ PKCE S256/);
   // Form must NOT re-submit raw OAuth params as hidden fields.
   assert.doesNotMatch(html, /name="redirect_uri"/);
   assert.doesNotMatch(html, /name="code_challenge"/);

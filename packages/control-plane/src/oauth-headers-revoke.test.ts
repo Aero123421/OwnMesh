@@ -14,7 +14,7 @@ import {
   handleToken,
 } from "./oauth.ts";
 import { DEFAULT_TENANT, MemoryStore } from "./store.ts";
-import { NO_STORE_CACHE_CONTROL, applyNoStore, json, sha256Hex } from "./util.ts";
+import { NO_STORE_CACHE_CONTROL, applyNoStore, html, json, sha256Hex } from "./util.ts";
 
 function assertNoStore(res: Response, label: string): void {
   const cc = (res.headers.get("cache-control") || "").toLowerCase();
@@ -48,6 +48,11 @@ test("util json/html applyNoStore sets no-store, no-cache", () => {
 
   const res = json({ ok: true }, { noStore: true });
   assertNoStore(res, "json(noStore)");
+
+  const page = html("<!doctype html><title>test</title>", { noStore: true });
+  assertNoStore(page, "html(noStore)");
+  assert.equal(page.headers.get("referrer-policy"), "same-origin");
+  assert.match(page.headers.get("content-security-policy") || "", /img-src data:/);
 });
 
 test("sensitive OAuth endpoints set Cache-Control: no-store, no-cache", async () => {
@@ -130,6 +135,8 @@ test("sensitive OAuth endpoints set Cache-Control: no-store, no-cache", async ()
   );
   assert.equal(authz.status, 200);
   assert.match(authz.headers.get("content-type") || "", /text\/html/);
+  assert.equal(authz.headers.get("referrer-policy"), "same-origin");
+  assert.match(await authz.clone().text(), /data:image\/svg\+xml;base64,/);
   assertNoStore(authz, "authorize consent HTML");
 
   // device verification HTML (entry form)

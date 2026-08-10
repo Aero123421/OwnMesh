@@ -252,6 +252,12 @@ test("browser POST origin fallback requires exact same-origin metadata", () => {
     sameOriginBrowserPost(new Request(`${ISSUER}/submit`), ISSUER),
     false,
   );
+  assert.equal(
+    sameOriginBrowserPost(new Request(`${ISSUER}/submit`, {
+      headers: { origin: "null", "sec-fetch-site": "same-origin" },
+    }), ISSUER),
+    false,
+  );
 });
 
 test("authenticated owner registers only an exact ChatGPT callback pair", async () => {
@@ -327,7 +333,7 @@ test("ChatGPT OAuth redirects to passkey login then accepts an owner session", a
       ctx,
     );
     assert.equal(consent.status, 200);
-    assert.match(await consent.text(), /<title>OwnMesh Authorize<\/title>/);
+    assert.match(await consent.text(), /<title>Authorize ChatGPT — OwnMesh<\/title>/);
     assert.deepEqual((await store.getClient(CLIENT_ID))?.redirect_uris, [CALLBACK]);
   } finally {
     __setTestStore(null);
