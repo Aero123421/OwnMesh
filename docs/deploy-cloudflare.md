@@ -77,6 +77,25 @@ run `pnpm run owner:init -- --reset-passkey`. Recovery rotates the browser-sessi
 secret, revokes the owner's OAuth tokens, advances the credential generation,
 and removes only the owner passkey records before issuing a new bootstrap code.
 
+### Cloudflare Access email OTP
+
+Cloudflare Access email OTP is an optional **outer gate for a separate operator
+dashboard**, not a replacement for OwnMesh OAuth, passkeys, or device policy.
+Do not put an interactive Access challenge in front of the OwnMesh MCP hostname:
+ChatGPT and enrolled Agents must reach `/.well-known/*`, `/oauth/*`, `/mcp`,
+`/agent/connect`, and `/v1/devices/*` without an Access login page in the middle.
+Protecting those routes would break OAuth discovery/token exchange or the Agent
+WebSocket rather than add useful security.
+
+OwnMesh does not currently ship a separate admin dashboard, so the recommended
+single-owner setup is the built-in `/login` passkey flow. If a future deployment
+adds an operator-only UI, place it on a distinct hostname or narrowly scoped
+path, allow only the owner's exact email, and keep all protocol endpoints on the
+unmodified OwnMesh hostname. Access OTPs are single-use and expire after ten
+minutes; see Cloudflare's [One-time PIN login](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/one-time-pin/)
+and [Access policy](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/)
+documentation.
+
 Manual example (do not commit values):
 
 ```bash

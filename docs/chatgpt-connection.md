@@ -42,11 +42,19 @@ ChatGPT notes that matter:
 
 ## Prerequisites
 
+The default self-hosted deployment has one OwnMesh owner and needs no Google,
+GitHub, or Cloudflare account login at runtime. Deployment prints a one-time
+bootstrap code; the owner uses it once to register a device passkey. ChatGPT is
+then an OAuth client: the passkey authenticates the owner during connection or
+reauthorization, while a rotating refresh token keeps the approved connector
+working between browser sign-ins. A headless server uses the CLI device-code
+flow and can be approved from a phone or another browser.
+
 1. Control plane deployed to **your** Cloudflare account ([deploy-cloudflare.md](./deploy-cloudflare.md))
 2. D1 migrations applied; DeviceRoom DO bound
 3. Local agent: `ownmeshd run`
 4. Device enrolled: `ownmesh device enroll --issuer https://<your-worker>`
-5. Access preset chosen (`workspace_only` / `recommended` confine FS; arbitrary `command.run` **and** interactive `session.open` / PTY require `full_user_access` or `full_access` until OS process confinement exists — session scope alone cannot launch a shell under restricted presets; `full_access` adds elevated broker when E8 lands)
+5. Access preset chosen (`workspace_only` / `recommended` confine FS; arbitrary `command.run` **and** interactive `session.open` / PTY require `full_user_access` or `full_access` until OS process confinement exists — session scope alone cannot launch a shell under restricted presets; `full_access` permits broker-backed elevation only when the native broker is installed and attested)
 6. Browser can reach `https://<your-worker>/health` and `/.well-known/oauth-authorization-server`
 
 ---
