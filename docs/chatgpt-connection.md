@@ -58,12 +58,15 @@ Exact menu labels move as OpenAI iterates; the flow is:
 1. Enable **Developer mode** (workspace admin / user Advanced settings — see OpenAI help article above).
 2. **Apps → Create** (or Workspace settings → Apps → Create).
 3. **MCP server URL:** `https://<your-worker>/mcp`
-4. **Authentication:** OAuth  
+4. **Icon (optional):** upload [`assets/ownmesh-icon.png`](../assets/ownmesh-icon.png).
+   It is the square, dark variant of the same mesh mark used by the TUI and
+   OwnMesh browser sign-in, and is already below ChatGPT's 10 KiB limit.
+5. **Authentication:** OAuth
    - No client ID, client secret, callback copy, or advanced OAuth fields are needed.
    - ChatGPT discovers OwnMesh OAuth metadata and registers its exact public callback automatically.
    - OwnMesh accepts only `https://chatgpt.com/connector/oauth/<id>` without a prior token;
      other dynamic registrations still require a tenant token with `ownmesh.device`.
-5. Request scopes (minimum useful set):
+6. Request scopes (minimum useful set):
 
    ```text
    ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access
@@ -77,9 +80,9 @@ Exact menu labels move as OpenAI iterates; the flow is:
    | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` under `full_user_access`/`full_access` only (denied in `workspace_only`/`recommended` until OS confinement); controller `input_seq`/`resize_seq` exact-once (RetryPending is at-most-once / uncertain, never re-delivers); E5 partial: reconnect matrix still open; always pass `workspace_id` |
    | `offline_access` | refresh tokens for long-lived ChatGPT connector |
 
-6. Click **Create** and complete OAuth in the browser: owner passkey sign-in → explicit scope consent → automatic return to ChatGPT.
-7. **Scan tools** — you should see the OwnMesh catalog (structured command **separate** from raw shell).
-8. Save as draft → test in a new chat → publish only after you trust write actions.
+7. Click **Create** and complete OAuth in the browser: owner passkey sign-in → explicit scope consent → automatic return to ChatGPT.
+8. **Scan tools** — you should see the OwnMesh catalog (structured command **separate** from raw shell).
+9. Save as draft → test in a new chat → publish only after you trust write actions.
 
 ### Smoke prompts (normal Chat)
 

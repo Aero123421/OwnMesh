@@ -137,6 +137,10 @@ pub struct SetupArgs {
     /// Enroll this machine after login (or using an existing login).
     #[arg(long)]
     pub enroll: bool,
+
+    /// Complete login, device enrollment, and current-user service installation.
+    #[arg(long)]
+    pub quickstart: bool,
 }
 
 /// `ownmesh doctor` arguments.

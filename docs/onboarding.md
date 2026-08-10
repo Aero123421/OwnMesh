@@ -1,6 +1,6 @@
-# OwnMesh onboarding (v1.1.0)
+# OwnMesh onboarding
 
-This document describes the **supported** first-run and user-level service surfaces shipped in the v1.1.0 onboarding train. It is not a claim of full specification completeness.
+This document describes the supported first-run and user-level service flow.
 
 Machine-checked surface list: [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
@@ -27,6 +27,26 @@ the separate broker uses systemd (Linux), launchd (macOS), or SCM (Windows).
 Secrets never appear in `config.toml`, setup JSON input, logs, or doctor output.
 
 ## `ownmesh setup`
+
+### Recommended: finish the machine in one command
+
+Desktop (opens the owner sign-in in the browser):
+
+```bash
+ownmesh setup --control-plane-url https://<worker>.workers.dev --quickstart
+```
+
+SSH, Ubuntu Server, or another headless machine (prints a verification URL and
+short code that can be approved from a phone):
+
+```bash
+ownmesh setup --control-plane-url https://<worker>.workers.dev \
+  --quickstart --device-login --non-interactive --force
+```
+
+`--quickstart` is only shorthand for the existing secure sequence: write local
+config and policy, OAuth login, enroll this device, then install the current-user
+`ownmeshd` autostart. It does not install the optional privileged broker.
 
 ### Interactive (TTY)
 
@@ -155,7 +175,10 @@ Security controls:
 | Wrong control-plane URL | `ownmesh setup --force --control-plane-url …` then `login` / `device enroll` again |
 | Doctor findings only | No mutation — fix underlying config/service/login |
 
-Privileged broker paths are unchanged and remain fail-closed unsupported for install/uninstall.
+The privileged broker is separate and opt-in. Install it only when elevated
+commands are required: `sudo ownmesh privileged install` on Linux/macOS or an
+Administrator PowerShell on Windows. Normal OwnMesh operation remains in the
+user account.
 
 ## Installer archive handling
 
@@ -167,6 +190,6 @@ Portable installers (`installers/ownmesh-installer.sh`, `installers/ownmesh-inst
 ## Out of scope (still unsupported)
 
 - no-argument TUI handoff (`ownmesh` with no subcommand)
-- privileged broker install/uninstall
-- MCP serve, transfer, profile, process, workspace, multi-instance management
+- `mcp serve`, profile/process/multi-instance management, and `approval watch`
+- direct remote `exec --device` and `session open <device>` (use the public MCP tools)
 - Windows MSI/NSIS installers / macOS packages / notarization / Authenticode

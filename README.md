@@ -124,18 +124,28 @@ pnpm -r typecheck
 pnpm -r lint
 ```
 
-### First-run (after building `ownmesh` / `ownmeshd`)
+### First run
 
 ```bash
-ownmesh setup --control-plane-url https://your-worker.example --non-interactive --force
-ownmesh login
-ownmesh device enroll
-ownmesh service install
+# Desktop: browser login, enroll this PC, install current-user autostart.
+ownmesh setup --control-plane-url https://your-worker.example --quickstart
+
+# SSH / Ubuntu Server: display a verification URL and short code instead.
+ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force
+
 ownmesh doctor --json
-ownmesh update check
 ```
 
-For control-plane deployment, see [docs/deploy-cloudflare.md](./docs/deploy-cloudflare.md) and [docs/chatgpt-connection.md](./docs/chatgpt-connection.md). These guides do not imply live-account or full end-to-end certification.
+Deploy the user-owned control plane from a clone with one guided command:
+
+```bash
+cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
+```
+
+It creates/reuses D1, applies migrations, deploys the Worker, provisions secrets,
+and prints the owner-login and ChatGPT MCP URLs. See
+[docs/deploy-cloudflare.md](./docs/deploy-cloudflare.md) and
+[docs/chatgpt-connection.md](./docs/chatgpt-connection.md) for the exact flow.
 
 ## User-level service vs privileged broker
 

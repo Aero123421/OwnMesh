@@ -1,6 +1,6 @@
 //! `ownmesh setup` — first-run config wizard (TTY + non-interactive / JSON).
 
-use crate::cli::{Cli, DeviceCmd, LoginArgs, SetupArgs};
+use crate::cli::{Cli, DeviceCmd, LoginArgs, ServiceActionArgs, ServiceCmd, SetupArgs};
 use ownmesh_config::{
     load_config, recover_config_policy_transaction, redact_control_plane_url,
     save_config_and_policy_transactional, validate_control_plane_base_url, InstanceConfig,
@@ -573,7 +573,7 @@ pub fn run_setup(cli: &Cli, args: &SetupArgs) -> Result<(), ExitCode> {
 
     emit_result(cli, &result);
 
-    if args.login || args.device_login {
+    if args.quickstart || args.login || args.device_login {
         super::login::run_login(
             cli,
             &LoginArgs {
@@ -581,8 +581,11 @@ pub fn run_setup(cli: &Cli, args: &SetupArgs) -> Result<(), ExitCode> {
             },
         )?;
     }
-    if args.enroll {
+    if args.quickstart || args.enroll {
         super::device_cmd::dispatch_device(cli, &DeviceCmd::Enroll)?;
+    }
+    if args.quickstart {
+        super::service::dispatch_service(cli, &ServiceCmd::Install(ServiceActionArgs::default()))?;
     }
     Ok(())
 }
@@ -631,6 +634,7 @@ mod tests {
             login: false,
             device_login: false,
             enroll: false,
+            quickstart: false,
         };
         let err = build_request(&args).unwrap_err();
         assert!(err.contains("secret"));
