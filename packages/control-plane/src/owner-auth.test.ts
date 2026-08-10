@@ -238,10 +238,31 @@ test("authenticated owner registers only an exact ChatGPT callback pair", async 
   const page = await get.text();
   const csrf = /name="csrf_token" value="([^"]+)"/.exec(page)?.[1] || "";
   const csrfCookie = (get.headers.get("set-cookie") || "").split(";", 1)[0]!;
+  const crossSite = await handleChatGptConnector(
+    new Request(`${ISSUER}/connect/chatgpt`, {
+      method: "POST",
+      headers: {
+        referer: "https://evil.example/connect/chatgpt",
+        "sec-fetch-site": "same-origin",
+        cookie: csrfCookie,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({ callback: CALLBACK, csrf_token: csrf }),
+    }),
+    store,
+    ISSUER,
+    { id: "prin_owner", tenant_id: "ten_default", display_name: "Owner" },
+  );
+  assert.equal(crossSite.status, 403);
   const post = await handleChatGptConnector(
     new Request(`${ISSUER}/connect/chatgpt`, {
       method: "POST",
-      headers: { origin: ISSUER, cookie: csrfCookie, "content-type": "application/x-www-form-urlencoded" },
+      headers: {
+        referer: `${ISSUER}/connect/chatgpt`,
+        "sec-fetch-site": "same-origin",
+        cookie: csrfCookie,
+        "content-type": "application/x-www-form-urlencoded",
+      },
       body: new URLSearchParams({ callback: CALLBACK, csrf_token: csrf }),
     }),
     store,

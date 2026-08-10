@@ -128,10 +128,24 @@ function safeReturnTo(raw: string | null, issuer: string, fallback = "/connect/c
 }
 
 function sameOriginPost(request: Request, issuer: string): boolean {
+  const expected = new URL(issuer).origin;
   const origin = request.headers.get("origin");
-  if (!origin) return false;
+  if (origin) {
+    try {
+      return new URL(origin).origin === expected;
+    } catch {
+      return false;
+    }
+  }
+
+  // Some browser form submissions omit Origin. Accept that case only when
+  // browser fetch metadata and the full Referer independently prove that the
+  // request came from this exact OwnMesh origin.
+  if (request.headers.get("sec-fetch-site") !== "same-origin") return false;
+  const referer = request.headers.get("referer");
+  if (!referer) return false;
   try {
-    return new URL(origin).origin === new URL(issuer).origin;
+    return new URL(referer).origin === expected;
   } catch {
     return false;
   }
