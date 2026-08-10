@@ -28,12 +28,15 @@ function installTransferWebSocketPair(): void {
     0 = transferMockSocket(); 1 = transferMockSocket();
   };
 }
-function transferState(storage: Map<string, unknown>, sockets: TransferMockSocket[] = []): DurableObjectState {
+function transferState(
+  storage: Map<string, unknown>, sockets: TransferMockSocket[] = [],
+  beforePut?: (key: string, value: unknown) => Promise<void>,
+): DurableObjectState {
   return {
     id: { toString: () => "xfer_test", equals: () => false, name: "xfer_test" } as DurableObjectId,
     storage: {
       get: async (key: string) => structuredClone(storage.get(key)),
-      put: async (key: string, value: unknown) => { storage.set(key, structuredClone(value)); },
+      put: async (key: string, value: unknown) => { await beforePut?.(key, value); storage.set(key, structuredClone(value)); },
       delete: async (key: string) => storage.delete(key),
       setAlarm: async () => undefined,
     },
@@ -107,6 +110,45 @@ test("TransferRoom accepts both DO sockets before second-role ready sends", asyn
   assert.equal(await transferUpgrade(room, await issueTransferTicket(secret, destination)), 101);
   assert.equal(sockets.length, 2);
   assert.ok(sockets.every((socket) => socket.accepted));
+  assert.ok(sockets.every((socket) => socket.sent.some((raw) => raw.includes('"type":"ready"'))));
+});
+
+test("TransferRoom serializes concurrent two-role generation advance", async () => {
+  installTransferWebSocketPair();
+  const secret = "concurrent-generation-secret";
+  const current = meta();
+  const storage = new Map<string, unknown>([["ownmesh:transfer:metadata:v1", current]]);
+  const sockets: TransferMockSocket[] = [];
+  let advancePuts = 0;
+  let releaseFirst!: () => void;
+  const firstAdvanceBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let markFirstStarted!: () => void;
+  const firstAdvanceStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  const room = new TransferRoom(transferState(storage, sockets, async (key, value) => {
+    if (key !== "ownmesh:transfer:metadata:v1"
+      || Number((value as TransferMetadata).epoch) !== current.epoch + 1) return;
+    advancePuts += 1;
+    if (advancePuts === 1) { markFirstStarted(); await firstAdvanceBlocked; }
+  }), { SESSION_SECRET: secret });
+  const source = {
+    ...ticket("source"), epoch: current.epoch + 1, fence: current.fence + 1,
+    transfer_expires_at: current.transfer_expires_at, max_bytes: current.max_bytes,
+    jti: "jti_source_generation_2",
+  };
+  const destination = {
+    ...ticket("destination"), epoch: current.epoch + 1, fence: current.fence + 1,
+    transfer_expires_at: current.transfer_expires_at, max_bytes: current.max_bytes,
+    jti: "jti_destination_generation_2",
+  };
+  const sourceUpgrade = transferUpgrade(room, await issueTransferTicket(secret, source));
+  await firstAdvanceStarted;
+  const destinationUpgrade = transferUpgrade(room, await issueTransferTicket(secret, destination));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  releaseFirst();
+  assert.deepEqual(await Promise.all([sourceUpgrade, destinationUpgrade]), [101, 101]);
+  assert.equal(advancePuts, 1, "exactly one role may commit the epoch advance");
+  assert.equal(sockets.length, 2);
+  assert.ok(sockets.every((socket) => !socket.closed));
   assert.ok(sockets.every((socket) => socket.sent.some((raw) => raw.includes('"type":"ready"'))));
 });
 

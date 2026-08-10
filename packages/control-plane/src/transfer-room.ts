@@ -437,6 +437,7 @@ export class TransferRoom {
   private router: TransferRoomRouter | null = null;
   private consumed = new Map<string, number>();
   private readonly ready: Promise<void>;
+  private admissionTail: Promise<void> = Promise.resolve();
   private readonly state: DurableObjectState;
   private readonly env: TransferRoomEnv;
 
@@ -518,6 +519,15 @@ export class TransferRoom {
   }
   async fetch(request: Request): Promise<Response> {
     await this.ready;
+    // Ticket consumption, generation advance, peer eviction and attachment
+    // form one admission transaction. Two roles routinely reconnect together;
+    // letting their awaited storage writes interleave can make both advance the
+    // same old epoch and have the second reset the first role's new router.
+    const previousAdmission = this.admissionTail;
+    let releaseAdmission!: () => void;
+    this.admissionTail = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    await previousAdmission;
+    try {
     if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected websocket", { status: 426 });
     const ticket = await verifyTransferTicket(this.env.SESSION_SECRET, request.headers.get("x-ownmesh-transfer-ticket"));
     if (!ticket || ticket.ticket_exp <= Date.now()) return new Response("invalid ticket", { status: 401 });
@@ -562,6 +572,9 @@ export class TransferRoom {
       return new Response("peer rejected", { status: 403 });
     }
     return new Response(null, { status: 101, webSocket: client });
+    } finally {
+      releaseAdmission();
+    }
   }
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     await this.ready;
