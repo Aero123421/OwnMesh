@@ -40,6 +40,8 @@ import {
   handleOwnerPasskeyVerify,
   ownerAuthConfigured,
   ownerLoginRedirect,
+  ownerPresenceForOperation,
+  ownerPresenceRedirect,
   ownerPasskeyScript,
   ownerPrincipalFromRequest,
   sameOriginBrowserPost,
@@ -192,29 +194,61 @@ function devBypass(env: Env, request: Request): boolean {
 }
 
 async function browserPrincipal(request: Request, env: Env): Promise<AuthenticatedPrincipal | null> {
+  return (await browserAuthentication(request, env)).principal;
+}
+
+type BrowserAuthentication = {
+  principal: AuthenticatedPrincipal | null;
+  fresh: boolean;
+};
+
+async function browserAuthentication(
+  request: Request,
+  env: Env,
+  freshOperationId?: string,
+): Promise<BrowserAuthentication> {
   if (devBypass(env, request)) {
     const url = new URL(request.url);
     const id = request.headers.get("x-ownmesh-dev-principal") || url.searchParams.get("login_hint") || "prin_dev";
-    return { id, tenant_id: "ten_default", display_name: id };
+    return { principal: { id, tenant_id: "ten_default", display_name: id }, fresh: true };
   }
   if (env.AUTH_PROVIDER) {
+    const headers = new Headers({
+      authorization: request.headers.get("authorization") || "",
+      cookie: request.headers.get("cookie") || "",
+      "x-ownmesh-request-url": request.url,
+    });
+    if (freshOperationId) {
+      headers.set("x-ownmesh-auth-purpose", "approve");
+      headers.set("x-ownmesh-operation-id", freshOperationId);
+      headers.set("x-ownmesh-require-fresh", "true");
+    }
     const response = await env.AUTH_PROVIDER.fetch(new Request("https://auth-provider/authenticate", {
       method: "POST",
-      headers: {
-        authorization: request.headers.get("authorization") || "",
-        cookie: request.headers.get("cookie") || "",
-        "x-ownmesh-request-url": request.url,
-      },
+      headers,
     }));
     if (response.ok) {
-      const body = await response.json() as { principal_id?: string; tenant_id?: string; display_name?: string };
+      const body = await response.json() as {
+        principal_id?: string;
+        tenant_id?: string;
+        display_name?: string;
+        fresh?: boolean;
+      };
       if (body.principal_id && body.tenant_id) {
-        return { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name };
+        return {
+          principal: { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name },
+          fresh: !freshOperationId || body.fresh === true,
+        };
       }
     }
   }
   const issuer = env.OAUTH_ISSUER || new URL(request.url).origin;
-  return ownerPrincipalFromRequest(request, env, issuer);
+  const owner = await ownerPrincipalFromRequest(request, env, issuer);
+  if (!owner) return { principal: null, fresh: false };
+  const fresh = freshOperationId
+    ? await ownerPresenceForOperation(request, env, issuer, owner, freshOperationId)
+    : true;
+  return { principal: owner, fresh };
 }
 
 function originAllowed(request: Request, env: Env, issuer: string): boolean {
@@ -578,7 +612,8 @@ export default {
     // Human approval for MCP approval_required ops: independent human auth +
     // CSRF + one-time tx, then deliver decision into DeviceRoom (never a stub).
     // OAuth/MCP/device bearer tokens must NOT approve — that enables creator
-    // self-approval of write/exec ops. Only AUTH_PROVIDER browser principal.
+    // self-approval of write/exec ops. A browser principal also needs recent,
+    // operation-bound user verification below.
     if (url.pathname === "/approve") {
       const bearerToken =
         request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
@@ -596,12 +631,28 @@ export default {
         );
       }
 
-      const principal = await browserPrincipal(request, env);
-      if (!principal) {
+      const operationId = url.searchParams.get("operation_id") || "";
+      // The fresh-auth proof is bound to the URL operation. Do not let a POST
+      // move authority into an unverified body-only operation_id.
+      if (request.method === "POST" && !operationId) {
+        return json(
+          { error: "invalid_request", error_description: "operation_id required in approval URL" },
+          { status: 400, noStore: true },
+        );
+      }
+      const authentication = await browserAuthentication(request, env, operationId || undefined);
+      const principal = authentication.principal;
+      if (!principal || !authentication.fresh) {
         if (request.method === "GET" && ownerAuthConfigured(env)) {
-          return ownerLoginRedirect(request, issuer);
+          return ownerPresenceRedirect(request, issuer);
         }
-        return json({ error: "unauthorized" }, { status: 401 });
+        return json(
+          {
+            error: authentication.principal ? "fresh_authentication_required" : "unauthorized",
+            error_description: "approval requires recent user verification for this exact operation",
+          },
+          { status: 401, noStore: true },
+        );
       }
 
       const postOriginOk =

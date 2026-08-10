@@ -16,7 +16,8 @@ mod session;
 
 #[allow(unused_imports)]
 pub use device_api::{
-    enroll_device, list_devices, revoke_device, rotate_local_device_key, DeviceInfo, EnrollResult,
+    enroll_device, list_devices, revoke_device, rotate_local_device_key, update_device_metadata,
+    DeviceInfo, EnrollResult,
 };
 #[allow(unused_imports)]
 pub use oauth::{

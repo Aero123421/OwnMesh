@@ -217,6 +217,52 @@ test("SqlStore public transfer list returns the same owner-visible operation ids
   }
 });
 
+test("SqlStore atomically updates only owned, active device metadata", async () => {
+  const { db, store } = openSqliteStore();
+  try {
+    await store.ensureBootstrap();
+    await store.putDevice({
+      id: "dev_sql_metadata",
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      name: "before",
+      labels: [],
+      hostname: "sql-host",
+      os: "test",
+      arch: "test",
+      agent_version: "test",
+      protocol_version: "ownmesh.device/1.0",
+      public_key: "ab".repeat(32),
+      revoked: false,
+      created_at: new Date().toISOString(),
+      status: "active",
+    });
+
+    const updated = await store.updateDeviceMetadata(
+      "dev_sql_metadata",
+      "prin_dev",
+      { name: "after", labels: ["linux", "gpu"] },
+    );
+    assert.equal(updated?.name, "after");
+    assert.deepEqual(updated?.labels, ["linux", "gpu"]);
+
+    assert.equal(
+      await store.updateDeviceMetadata("dev_sql_metadata", "prin_foreign", { name: "stolen" }),
+      null,
+    );
+    assert.equal((await store.getDevice("dev_sql_metadata"))?.name, "after");
+
+    assert.equal(await store.revokeDevice("dev_sql_metadata", "prin_dev"), true);
+    assert.equal(
+      await store.updateDeviceMetadata("dev_sql_metadata", "prin_dev", { name: "revived" }),
+      null,
+    );
+    assert.equal((await store.getDevice("dev_sql_metadata"))?.name, "after");
+  } finally {
+    db.close();
+  }
+});
+
 test("sql store persists tokens, devices, revoke across store instances", async () => {
   const { db, store } = openSqliteStore();
   await store.ensureBootstrap();

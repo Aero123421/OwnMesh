@@ -841,6 +841,48 @@ export async function handleDeviceVerification(
 // Device registry + enrollment (server contract for cli-auth-09)
 // ---------------------------------------------------------------------------
 
+const DEVICE_METADATA_BODY_MAX_BYTES = 4 * 1024;
+const DEVICE_NAME_MAX_BYTES = 128;
+const DEVICE_LABEL_MAX_BYTES = 64;
+const DEVICE_LABELS_MAX = 16;
+const UNICODE_CONTROL = /\p{Cc}/u;
+
+function normalizeDeviceName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  if (
+    normalized.length === 0 ||
+    UNICODE_CONTROL.test(normalized) ||
+    new TextEncoder().encode(normalized).byteLength > DEVICE_NAME_MAX_BYTES
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+/** Stable first-occurrence dedupe; labels remain non-authoritative metadata. */
+function normalizeDeviceLabels(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > DEVICE_LABELS_MAX) return null;
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (typeof raw !== "string") return null;
+    const label = raw.trim();
+    if (
+      label.length === 0 ||
+      UNICODE_CONTROL.test(label) ||
+      new TextEncoder().encode(label).byteLength > DEVICE_LABEL_MAX_BYTES
+    ) {
+      return null;
+    }
+    if (!seen.has(label)) {
+      seen.add(label);
+      labels.push(label);
+    }
+  }
+  return labels;
+}
+
 /**
  * Enrollment API contract (cli-auth-09 implements CLI side):
  *
@@ -891,6 +933,64 @@ export async function handleDevices(
     return json({ error: "insufficient_scope" }, { status: 403 });
   }
 
+  const metadataPath = /^\/v1\/devices\/([A-Za-z0-9_-]{1,128})$/.exec(url.pathname);
+  if (metadataPath && req.method === "PATCH") {
+    let body: unknown;
+    try {
+      body = await readRequestJsonLimited<unknown>(req, DEVICE_METADATA_BODY_MAX_BYTES);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) {
+        return json({ error: "request_too_large" }, { status: 413 });
+      }
+      return json({ error: "invalid_request", field: "body" }, { status: 400 });
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return json({ error: "invalid_request", field: "body" }, { status: 400 });
+    }
+    const object = body as Record<string, unknown>;
+    const keys = Object.keys(object);
+    if (
+      keys.length === 0 ||
+      keys.some((key) => key !== "name" && key !== "labels")
+    ) {
+      return json({ error: "invalid_request", field: "body" }, { status: 400 });
+    }
+
+    const patch: { name?: string; labels?: string[] } = {};
+    if (Object.prototype.hasOwnProperty.call(object, "name")) {
+      const name = normalizeDeviceName(object.name);
+      if (name === null) {
+        return json({ error: "invalid_request", field: "name" }, { status: 400 });
+      }
+      patch.name = name;
+    }
+    if (Object.prototype.hasOwnProperty.call(object, "labels")) {
+      const labels = normalizeDeviceLabels(object.labels);
+      if (labels === null) {
+        return json({ error: "invalid_request", field: "labels" }, { status: 400 });
+      }
+      patch.labels = labels;
+    }
+
+    const deviceId = metadataPath[1]!;
+    const device = await store.updateDeviceMetadata(deviceId, rec.principal, patch);
+    if (!device) return json({ error: "not_found" }, { status: 404 });
+    await store.appendAudit({
+      id: randomId("aud_"),
+      tenant_id: rec.tenant_id,
+      principal_id: rec.principal,
+      device_id: deviceId,
+      kind: "device.metadata_updated",
+      summary: "device display metadata updated",
+      created_at: nowIso(),
+      meta: {
+        fields: Object.keys(patch).sort(),
+        ...(patch.labels ? { label_count: patch.labels.length } : {}),
+      },
+    });
+    return json({ ok: true, device });
+  }
+
   if (url.pathname === "/v1/devices/enroll" && req.method === "POST") {
     if (!requireScope(rec.scope, "ownmesh.device")) {
       return json({ error: "insufficient_scope" }, { status: 403 });
@@ -903,18 +1003,27 @@ export async function handleDevices(
       agent_version?: string;
       protocol_version?: string;
       public_key?: string;
-      labels?: string[];
+      labels?: unknown;
     };
     if (!body.public_key || !/^[0-9a-fA-F]{64}$/.test(body.public_key)) {
       return json({ error: "invalid_request", field: "public_key" }, { status: 400 });
     }
     const deviceId = randomId("dev_");
     const created = nowIso();
+    const name = normalizeDeviceName(body.name ?? body.hostname ?? deviceId);
+    if (name === null) {
+      return json({ error: "invalid_request", field: "name" }, { status: 400 });
+    }
+    const labels = body.labels === undefined ? [] : normalizeDeviceLabels(body.labels);
+    if (labels === null) {
+      return json({ error: "invalid_request", field: "labels" }, { status: 400 });
+    }
     const device: DeviceRecord = {
       id: deviceId,
       tenant_id: rec.tenant_id,
       principal_id: rec.principal,
-      name: body.name || body.hostname || deviceId,
+      name,
+      labels,
       hostname: body.hostname || body.name || "unknown",
       os: body.os || "unknown",
       arch: body.arch || "unknown",

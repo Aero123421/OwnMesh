@@ -11,6 +11,8 @@ import {
   handleOwnerLogin,
   handleOwnerPasskeyOptions,
   handleOwnerPasskeyRegistrationOptions,
+  issueOwnerPresenceForOperation,
+  ownerPresenceForOperation,
   ownerPrincipalFromRequest,
   sameOriginBrowserPost,
 } from "./owner-auth.ts";
@@ -223,6 +225,145 @@ test("owner session is issuer-bound and rejects tampering", async () => {
     await ownerPrincipalFromRequest(new Request(`${ISSUER}/`, { headers: { cookie: `${cookie}x` } }), authEnv, ISSUER),
     null,
   );
+});
+
+test("approval presence is short-lived, signed, and bound to one exact operation", async () => {
+  const authEnv = await env();
+  const principal = { id: "prin_owner", tenant_id: "ten_default", display_name: "Owner" };
+  const setCookie = await issueOwnerPresenceForOperation(authEnv, ISSUER, principal, "op_alpha_123");
+  assert.ok(setCookie);
+  const cookie = setCookie!.split(";", 1)[0]!;
+  const request = new Request(`${ISSUER}/approve?operation_id=op_alpha_123`, { headers: { cookie } });
+  assert.equal(
+    await ownerPresenceForOperation(request, authEnv, ISSUER, principal, "op_alpha_123"),
+    true,
+  );
+  assert.equal(
+    await ownerPresenceForOperation(request, authEnv, ISSUER, principal, "op_beta_456"),
+    false,
+  );
+
+  const separator = cookie.lastIndexOf(".");
+  assert.ok(separator > 0);
+  const signatureStart = separator + 1;
+  const replacement = cookie[signatureStart] === "A" ? "B" : "A";
+  const tampered = `${cookie.slice(0, signatureStart)}${replacement}${cookie.slice(signatureStart + 1)}`;
+  assert.equal(
+    await ownerPresenceForOperation(
+      new Request(`${ISSUER}/approve?operation_id=op_alpha_123`, { headers: { cookie: tampered } }),
+      authEnv,
+      ISSUER,
+      principal,
+      "op_alpha_123",
+    ),
+    false,
+  );
+});
+
+test("ordinary owner login reuses its session but fresh approval forces passkey verification", async () => {
+  const store = new MemoryStore();
+  await seedPasskey(store);
+  const authEnv = await env();
+  const cookie = await ownerSessionCookie();
+
+  const ordinary = await handleOwnerLogin(
+    new Request(`${ISSUER}/login?return_to=%2Fconnect%2Fchatgpt`, { headers: { cookie } }),
+    store,
+    ISSUER,
+    authEnv,
+  );
+  assert.equal(ordinary.status, 302);
+  assert.equal(new URL(ordinary.headers.get("location")!, ISSUER).pathname, "/connect/chatgpt");
+
+  const fresh = await handleOwnerLogin(
+    new Request(
+      `${ISSUER}/login?fresh=1&return_to=${encodeURIComponent("/approve?operation_id=op_alpha_123")}`,
+      { headers: { cookie } },
+    ),
+    store,
+    ISSUER,
+    authEnv,
+  );
+  assert.equal(fresh.status, 200);
+  assert.match(await fresh.text(), /Sign in with passkey/);
+});
+
+test("worker approval rejects a stale owner session and accepts only explicit fresh provider attestation", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  __setTestStore(store);
+  try {
+    const authEnv = await env();
+    const stale = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=op_alpha_123`, {
+        headers: { cookie: await ownerSessionCookie() },
+      }),
+      authEnv,
+      ctx,
+    );
+    assert.equal(stale.status, 302);
+    const freshLogin = new URL(stale.headers.get("location")!);
+    assert.equal(freshLogin.pathname, "/login");
+    assert.equal(freshLogin.searchParams.get("fresh"), "1");
+    assert.equal(freshLogin.searchParams.get("return_to"), "/approve?operation_id=op_alpha_123");
+
+    const stalePost = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=op_alpha_123`, {
+        method: "POST",
+        headers: { cookie: await ownerSessionCookie(), origin: ISSUER },
+      }),
+      authEnv,
+      ctx,
+    );
+    assert.equal(stalePost.status, 401);
+    assert.equal((await stalePost.json() as { error?: string }).error, "fresh_authentication_required");
+
+    const principal = { id: "prin_owner", tenant_id: "ten_default", display_name: "Owner" };
+    const presence = await issueOwnerPresenceForOperation(authEnv, ISSUER, principal, "op_alpha_123");
+    assert.ok(presence);
+    const authorized = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=op_alpha_123`, {
+        headers: {
+          cookie: `${await ownerSessionCookie()}; ${presence!.split(";", 1)[0]}`,
+        },
+      }),
+      authEnv,
+      ctx,
+    );
+    assert.equal(authorized.status, 404);
+
+    let providerRequest: Request | undefined;
+    const provider = (fresh: boolean) => ({
+      fetch: async (request: Request) => {
+        providerRequest = request;
+        return Response.json({
+          principal_id: "prin_owner",
+          tenant_id: "ten_default",
+          fresh,
+        });
+      },
+    }) as unknown as Fetcher;
+
+    const staleProvider = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=op_alpha_123`),
+      { OAUTH_ISSUER: ISSUER, AUTH_PROVIDER: provider(false) },
+      ctx,
+    );
+    assert.equal(staleProvider.status, 401);
+    assert.equal((await staleProvider.json() as { error?: string }).error, "fresh_authentication_required");
+
+    const freshProvider = await worker.fetch(
+      new Request(`${ISSUER}/approve?operation_id=op_alpha_123`),
+      { OAUTH_ISSUER: ISSUER, AUTH_PROVIDER: provider(true) },
+      ctx,
+    );
+    assert.equal(freshProvider.status, 404);
+    assert.equal(providerRequest?.headers.get("x-ownmesh-auth-purpose"), "approve");
+    assert.equal(providerRequest?.headers.get("x-ownmesh-operation-id"), "op_alpha_123");
+    assert.equal(providerRequest?.headers.get("x-ownmesh-require-fresh"), "true");
+  } finally {
+    __setTestStore(null);
+  }
 });
 
 test("browser POST origin fallback requires exact same-origin metadata", () => {

@@ -6,7 +6,10 @@ use ownmesh_identity::{
     SecretStore, SecretString,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
+use std::time::Duration;
+
+const MAX_DEVICE_API_RESPONSE_BYTES: usize = 64 * 1024;
 
 use super::session::{validate_issuer, SessionPaths};
 
@@ -17,6 +20,8 @@ pub struct DeviceInfo {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
     pub hostname: Option<String>,
     #[serde(default)]
     pub os: Option<String>,
@@ -26,6 +31,8 @@ pub struct DeviceInfo {
     pub public_key: Option<String>,
     #[serde(default)]
     pub revoked: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// Result of a successful enroll + proof exchange.
@@ -191,6 +198,89 @@ pub async fn list_devices(
     Ok(list.devices)
 }
 
+/// Replace the supplied display metadata for one owned device.
+///
+/// This security-sensitive bearer request always disables redirects, applies a
+/// total timeout, bounds the response before parsing, and never includes a raw
+/// response body in errors. The caller's authenticated session/token is reused;
+/// no second login or token copy is created.
+pub async fn update_device_metadata(
+    _http: &reqwest::Client,
+    issuer: &str,
+    access_token: &str,
+    device_id: &str,
+    name: Option<&str>,
+    labels: Option<&[String]>,
+) -> Result<DeviceInfo> {
+    let issuer = validate_issuer(issuer)?;
+    let mut endpoint = url::Url::parse(&issuer).context("build device metadata URL")?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|()| anyhow!("control-plane issuer cannot be a base URL"))?
+        .clear()
+        .extend(["v1", "devices", device_id]);
+
+    let mut patch = Map::new();
+    if let Some(name) = name {
+        patch.insert("name".into(), Value::String(name.to_owned()));
+    }
+    if let Some(labels) = labels {
+        patch.insert("labels".into(), json!(labels));
+    }
+    if patch.is_empty() {
+        bail!("device metadata update requires name and/or labels");
+    }
+
+    let secure_http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build device metadata HTTP client")?;
+    let response = secure_http
+        .patch(endpoint)
+        .bearer_auth(access_token)
+        .json(&patch)
+        .send()
+        .await
+        .context("PATCH /v1/devices/:id")?;
+    let status = response.status();
+    if status.is_redirection() {
+        bail!("device metadata update refused an HTTP redirect ({status})");
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let bytes = read_response_bounded(response).await?;
+    if content_type != "application/json" {
+        bail!("device metadata update returned a non-JSON response ({status})");
+    }
+    if !status.is_success() {
+        bail!(
+            "device metadata update failed ({status}): {}",
+            safe_api_error(&bytes)
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct UpdateResponse {
+        ok: bool,
+        device: DeviceInfo,
+    }
+    let updated: UpdateResponse =
+        serde_json::from_slice(&bytes).context("parse device metadata response")?;
+    if !updated.ok || updated.device.id != device_id {
+        bail!("device metadata response did not match the requested device");
+    }
+    Ok(updated.device)
+}
+
 /// Revoke a device on the control plane (immediate invalidation server-side).
 pub async fn revoke_device(
     http: &reqwest::Client,
@@ -250,4 +340,68 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+async fn read_response_bounded(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DEVICE_API_RESPONSE_BYTES as u64)
+    {
+        bail!("control-plane response exceeds the {MAX_DEVICE_API_RESPONSE_BYTES}-byte limit");
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_DEVICE_API_RESPONSE_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("read device metadata response")?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_DEVICE_API_RESPONSE_BYTES {
+            bail!("control-plane response exceeds the {MAX_DEVICE_API_RESPONSE_BYTES}-byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn safe_api_error(bytes: &[u8]) -> String {
+    #[derive(Deserialize)]
+    struct ApiError {
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        field: Option<String>,
+    }
+    let Ok(error) = serde_json::from_slice::<ApiError>(bytes) else {
+        return "invalid control-plane error response".into();
+    };
+    let code =
+        ownmesh_diagnostics::redact_text(&error.error.unwrap_or_else(|| "request_failed".into()));
+    let field = error
+        .field
+        .map(|value| ownmesh_diagnostics::redact_text(&value))
+        .map(|value| format!(" (field: {value})"));
+    format!("{code}{}", field.as_deref().unwrap_or(""))
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
+}
+
+#[cfg(test)]
+mod device_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn api_error_is_structured_bounded_and_redacted() {
+        let secret = br#"{"error":"failed atk_super_secret","field":"labels"}"#;
+        let rendered = safe_api_error(secret);
+        assert!(!rendered.contains("atk_super_secret"));
+        assert!(rendered.contains("labels"));
+        assert!(rendered.len() <= 512);
+    }
 }

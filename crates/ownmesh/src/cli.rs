@@ -298,6 +298,9 @@ pub struct ExecArgs {
     /// Timeout in milliseconds.
     #[arg(long)]
     pub timeout_ms: Option<u64>,
+    /// Request the installed privileged broker (Linux only; fail closed elsewhere).
+    #[arg(long)]
+    pub elevated: bool,
     /// Command and arguments.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub command: Vec<String>,
@@ -336,6 +339,9 @@ pub enum SessionCmd {
     Open {
         /// Target device.
         device: Option<String>,
+        /// Required exact-once key when opening on a remote device.
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// Remaining argv after `--`.
         #[arg(last = true)]
         command: Vec<String>,

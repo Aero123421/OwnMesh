@@ -11,35 +11,31 @@
     "no-argument TUI launch and completion generation (bash/zsh/fish/powershell/elvish)",
     "config get/set/edit/validate (typed keys, atomic save, no secret fields)",
     "instance add/list/use/remove (validated control-plane URLs)",
-    "device enroll/list/show/rotate-key/revoke",
-    "exec (local device only)",
+    "device enroll/list/show/rename/labels/rotate-key/revoke",
+    "exec (local IPC or authenticated remote MCP; exact argv; explicit remote idempotency)",
     "process start/status/logs/stop (bounded daemon-owned sessions, exact argv)",
-    "session list/show/open/attach/claim/release/give/close/terminate (local device only)",
+    "session list/show/open/attach/claim/release/give/close/terminate (local IPC; authenticated remote creation)",
     "profile scan/list/show/login/test/start/resume (credential-isolated daemon profile/session contract)",
     "approval list/show/watch",
     "policy show/validate/explain",
     "transfer plan/send/list/status/cancel (authenticated control-plane MCP; immutable no-overwrite plans; idempotency keys required for mutations)",
+    "mcp serve --stdio (authenticated configured issuer; bounded JSONL bridge)",
     "service install/start/stop/restart/status/uninstall (user-level ownmeshd autostart only)",
     "privileged broker install/status/uninstall (networkless native lifecycle: Linux systemd, macOS launchd, Windows SCM; native release receipts tracked separately)",
     "update check/download/apply/channel (signed GitHub releases; network off by default)",
     "workspace list/show/add/update/remove (device-local registry via ownmeshd IPC)"
   ],
-  "explicit_unsupported_count": 6,
+  "explicit_unsupported_count": 5,
   "explicit_unsupported_surfaces": [
     "approval approve",
     "approval deny",
     "policy preset",
     "unlock",
-    "tokens revoke",
-    "mcp serve"
+    "tokens revoke"
   ],
   "additional_unsupported": [
-    "device rename",
-    "device labels",
-    "exec --device",
-    "session open <device>",
     "policy rule mutation"
   ],
-  "total_unsupported_surfaces": 11,
+  "total_unsupported_surfaces": 6,
   "notes": "v1.2.0-beta.12 integrity visit: E5 process-tree terminate (taskkill/T + Unix session kill), resize fail-closed without live host, live-ring remaining/continuation visibility, bounded pin/journal/spool/state reads; E6 public real-path nine-adapter structured events/replay/resume and safe auth status (CLI profile surfaces remain unsupported); E7 public real-path nested-repository review runs pinned argv-only git apply, bounded status/diff and typed result pages, pass/fail tests, exact-once/payload conflict, stale HEAD, workspace ACL rejection, and cancellation/process-tree termination without implicit ref/index mutation; E9 public real-path two-Agent transfer proves bounded binary/zero-byte artifacts, 32 MiB durable-cursor restart/resume, partial cancel cleanup, ownership denials and stopped D1/DO at-rest inspection. Transfer CLI uses only the authenticated public MCP transfer contract, keeps idempotency explicit, and has no LAN relay or overwrite/force fallback. E8 implements networkless native broker lifecycle on Linux, macOS, and Windows while leaving ownmeshd in the user account; Windows binds a protected Named Pipe to the exact user SID and immutable Program Files daemon image. Linux has a native root receipt; macOS/Windows native release receipts and the E8 public-route receipt remain open. Live ChatGPT DCR/OAuth/passkey return has a manual compatibility receipt, while automated E10 evidence remains open. completeness_claim stays false for explicit unsupported surfaces. SERVICE_VERSION 1.2.0-beta.12."
 }

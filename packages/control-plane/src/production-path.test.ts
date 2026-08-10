@@ -96,6 +96,7 @@ function openSqlStore(): SqlStore {
 function authProvider(
   principalId = PRINCIPAL_ID,
   tenantId = TENANT_ID,
+  fresh = false,
 ): Fetcher {
   return {
     fetch: async () =>
@@ -103,6 +104,7 @@ function authProvider(
         principal_id: principalId,
         tenant_id: tenantId,
         display_name: principalId,
+        fresh,
       }),
   } as unknown as Fetcher;
 }
@@ -1459,7 +1461,9 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       deviceCredential,
       privateKey,
     });
-    const wenv = workerEnv(adapter, room);
+    const wenv = workerEnv(adapter, room, {
+      AUTH_PROVIDER: authProvider(PRINCIPAL_ID, TENANT_ID, true),
+    });
 
     const opId = randomId("op_");
     const corr = randomId("cor_");
@@ -1513,7 +1517,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     await store.ensurePrincipal("prin_other", "Other", "human", TENANT_ID);
     const wrongPrin = await worker.fetch(
       new Request(`${ISSUER}/approve?operation_id=${opId}`),
-      { ...wenv, AUTH_PROVIDER: authProvider("prin_other", TENANT_ID) },
+      { ...wenv, AUTH_PROVIDER: authProvider("prin_other", TENANT_ID, true) },
       ctx,
     );
     assert.ok(
@@ -1525,7 +1529,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     await store.ensurePrincipal("prin_service", "Svc", "service", TENANT_ID);
     const servicePrin = await worker.fetch(
       new Request(`${ISSUER}/approve?operation_id=${opId}`),
-      { ...wenv, AUTH_PROVIDER: authProvider("prin_service", TENANT_ID) },
+      { ...wenv, AUTH_PROVIDER: authProvider("prin_service", TENANT_ID, true) },
       ctx,
     );
     assert.equal(servicePrin.status, 403, await servicePrin.clone().text());
@@ -1537,7 +1541,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     // Tenant mismatch fail-closed: AUTH_PROVIDER claims owner id but wrong tenant.
     const tenantMismatch = await worker.fetch(
       new Request(`${ISSUER}/approve?operation_id=${opId}`),
-      { ...wenv, AUTH_PROVIDER: authProvider(PRINCIPAL_ID, "ten_other") },
+      { ...wenv, AUTH_PROVIDER: authProvider(PRINCIPAL_ID, "ten_other", true) },
       ctx,
     );
     assert.equal(tenantMismatch.status, 403, await tenantMismatch.clone().text());
@@ -1725,7 +1729,9 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       OAUTH_ISSUER: ISSUER,
     });
     await offlineRoom.ready;
-    const offlineEnv = workerEnv(adapter, offlineRoom);
+    const offlineEnv = workerEnv(adapter, offlineRoom, {
+      AUTH_PROVIDER: authProvider(PRINCIPAL_ID, TENANT_ID, true),
+    });
     const opId3 = randomId("op_");
     await store.putMcpOperation({
       operation_id: opId3,

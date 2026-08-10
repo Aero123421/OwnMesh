@@ -45,6 +45,8 @@ export type DeviceRecord = {
   tenant_id: string;
   principal_id: string;
   name: string;
+  /** Display-only metadata. Labels are never an authorization input. */
+  labels?: string[];
   hostname: string;
   os: string;
   arch: string;
@@ -587,6 +589,16 @@ export interface ControlPlaneStore {
   putDevice(device: DeviceRecord): Promise<void>;
   getDevice(id: string): Promise<DeviceRecord | null>;
   listDevices(principalId: string): Promise<DeviceRecord[]>;
+  /**
+   * Atomically update display metadata only when the device belongs to the
+   * principal and is not revoked. A null result deliberately does not reveal
+   * whether the id is missing, foreign-owned, or revoked.
+   */
+  updateDeviceMetadata(
+    id: string,
+    principalId: string,
+    patch: { name?: string; labels?: string[] },
+  ): Promise<DeviceRecord | null>;
   revokeDevice(id: string, principalId: string): Promise<boolean>;
   activateDeviceWithChallenge(deviceId: string, challengeId: string): Promise<boolean>;
   activateDeviceAndIssueCredential(deviceId: string, challengeId: string, ttlMs?: number): Promise<{ token: string; expires_at: number } | null>;
@@ -779,7 +791,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0008). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0015). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -789,7 +801,7 @@ export type SchemaReadiness = {
     used_refresh_tokens: boolean;
     enrollment_challenges: boolean;
     schema_migrations: boolean;
-    /** 0003 P0 hardening */
+    /** 0003 lifecycle state + 0015 display-only labels */
     devices_status: boolean;
     revoked_refresh_families: boolean;
     device_credentials: boolean;
@@ -874,7 +886,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
     table: "schema_migrations",
     columns: ["id", "applied_at"],
   },
-  devices_status: { table: "devices", columns: ["status"] },
+  devices_status: { table: "devices", columns: ["status", "labels_json"] },
   revoked_refresh_families: {
     table: "revoked_refresh_families",
     columns: ["refresh_family", "detected_at"],
@@ -1445,7 +1457,10 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async putDevice(device: DeviceRecord): Promise<void> {
-    this.devices.set(device.id, { ...device });
+    this.devices.set(device.id, {
+      ...device,
+      labels: [...(device.labels ?? [])],
+    });
   }
   async getDevice(id: string): Promise<DeviceRecord | null> {
     const d = this.devices.get(id);
@@ -1456,6 +1471,21 @@ export class MemoryStore implements ControlPlaneStore {
     return [...this.devices.values()]
       .filter((d) => d.principal_id === principalId && !d.revoked)
       .map(hydrateDevice);
+  }
+  async updateDeviceMetadata(
+    id: string,
+    principalId: string,
+    patch: { name?: string; labels?: string[] },
+  ): Promise<DeviceRecord | null> {
+    const device = this.devices.get(id);
+    if (!device || device.principal_id !== principalId || device.revoked) return null;
+    const updated: DeviceRecord = {
+      ...device,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.labels !== undefined ? { labels: [...patch.labels] } : {}),
+    };
+    this.devices.set(id, updated);
+    return hydrateDevice(updated);
   }
   async revokeDevice(id: string, principalId: string): Promise<boolean> {
     const d = this.devices.get(id);
@@ -3090,14 +3120,15 @@ export class SqlStore implements ControlPlaneStore {
     await this.db
       .prepare(
         `INSERT OR REPLACE INTO devices
-         (id, tenant_id, principal_id, name, public_key, revoked, created_at, last_seen_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, tenant_id, principal_id, name, labels_json, public_key, revoked, created_at, last_seen_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         device.id,
         device.tenant_id,
         device.principal_id,
         device.name,
+        JSON.stringify(device.labels ?? []),
         device.public_key,
         device.revoked ? 1 : 0,
         device.created_at,
@@ -3118,7 +3149,7 @@ export class SqlStore implements ControlPlaneStore {
   async getDevice(id: string): Promise<DeviceRecord | null> {
     const row = await this.db
       .prepare(
-        `SELECT id, tenant_id, principal_id, name, public_key, revoked, created_at, last_seen_at, status FROM devices WHERE id = ?`,
+        `SELECT id, tenant_id, principal_id, name, labels_json, public_key, revoked, created_at, last_seen_at, status FROM devices WHERE id = ?`,
       )
       .bind(id)
       .first<{
@@ -3126,6 +3157,7 @@ export class SqlStore implements ControlPlaneStore {
         tenant_id: string;
         principal_id: string;
         name: string;
+        labels_json: string;
         public_key: string;
         revoked: number;
         created_at: string;
@@ -3139,6 +3171,7 @@ export class SqlStore implements ControlPlaneStore {
       tenant_id: row.tenant_id,
       principal_id: row.principal_id,
       name: row.name,
+      labels: parseDeviceLabels(row.labels_json),
       hostname: meta.hostname || row.name,
       os: meta.os || "unknown",
       arch: meta.arch || "unknown",
@@ -3155,7 +3188,7 @@ export class SqlStore implements ControlPlaneStore {
   async listDevices(principalId: string): Promise<DeviceRecord[]> {
     const res = await this.db
       .prepare(
-        `SELECT id, tenant_id, principal_id, name, public_key, revoked, created_at, last_seen_at, status
+        `SELECT id, tenant_id, principal_id, name, labels_json, public_key, revoked, created_at, last_seen_at, status
          FROM devices WHERE principal_id = ? AND revoked = 0`,
       )
       .bind(principalId)
@@ -3164,6 +3197,7 @@ export class SqlStore implements ControlPlaneStore {
         tenant_id: string;
         principal_id: string;
         name: string;
+        labels_json: string;
         public_key: string;
         revoked: number;
         created_at: string;
@@ -3177,6 +3211,7 @@ export class SqlStore implements ControlPlaneStore {
         tenant_id: row.tenant_id,
         principal_id: row.principal_id,
         name: row.name,
+        labels: parseDeviceLabels(row.labels_json),
         hostname: meta.hostname || row.name,
         os: meta.os || "unknown",
         arch: meta.arch || "unknown",
@@ -3189,6 +3224,41 @@ export class SqlStore implements ControlPlaneStore {
         status: row.status,
       };
     });
+  }
+
+  async updateDeviceMetadata(
+    id: string,
+    principalId: string,
+    patch: { name?: string; labels?: string[] },
+  ): Promise<DeviceRecord | null> {
+    let statement: SqlStatement;
+    if (patch.name !== undefined && patch.labels !== undefined) {
+      statement = this.db
+        .prepare(
+          `UPDATE devices SET name = ?, labels_json = ?
+           WHERE id = ? AND principal_id = ? AND revoked = 0`,
+        )
+        .bind(patch.name, JSON.stringify(patch.labels), id, principalId);
+    } else if (patch.name !== undefined) {
+      statement = this.db
+        .prepare(
+          `UPDATE devices SET name = ?
+           WHERE id = ? AND principal_id = ? AND revoked = 0`,
+        )
+        .bind(patch.name, id, principalId);
+    } else if (patch.labels !== undefined) {
+      statement = this.db
+        .prepare(
+          `UPDATE devices SET labels_json = ?
+           WHERE id = ? AND principal_id = ? AND revoked = 0`,
+        )
+        .bind(JSON.stringify(patch.labels), id, principalId);
+    } else {
+      return null;
+    }
+    const updated = await statement.run();
+    if (sqlChanges(updated) !== 1) return null;
+    return this.getDevice(id);
   }
 
   async revokeDevice(id: string, principalId: string): Promise<boolean> {
@@ -4564,10 +4634,21 @@ function parseDeviceMeta(raw: string): {
   return { public_key: raw };
 }
 
+function parseDeviceLabels(raw: string): string[] {
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!Array.isArray(value) || !value.every((label) => typeof label === "string")) return [];
+    return [...value];
+  } catch {
+    return [];
+  }
+}
+
 function hydrateDevice(d: DeviceRecord): DeviceRecord {
   const meta = parseDeviceMeta(d.public_key);
   return {
     ...d,
+    labels: [...(d.labels ?? [])],
     hostname: d.hostname || meta.hostname || d.name,
     os: d.os && d.os !== "unknown" ? d.os : meta.os || "unknown",
     arch: d.arch && d.arch !== "unknown" ? d.arch : meta.arch || "unknown",

@@ -9,6 +9,8 @@ mod instance_cmd;
 mod ipc_util;
 mod lockdown;
 pub(crate) mod login;
+mod mcp;
+mod mcp_client;
 mod policy_cmd;
 mod privileged;
 mod process_cmd;
@@ -45,7 +47,6 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "policy preset",
     "unlock",
     "tokens revoke",
-    "mcp serve",
 ];
 
 /// Additional hard-error unsupported surfaces beyond the explicit stub registry.
@@ -53,13 +54,7 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
 /// Each entry is paired with a real dispatch/handler hard-error path (not a
 /// soft fallback). Canonical names only — descriptive notes live in the
 /// release manifest.
-pub const ADDITIONAL_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
-    "device rename",
-    "device labels",
-    "exec --device",
-    "session open <device>",
-    "policy rule mutation",
-];
+pub const ADDITIONAL_UNSUPPORTED_CLI_SURFACES: &[&str] = &["policy rule mutation"];
 
 /// Dispatch a parsed CLI invocation.
 pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
@@ -184,13 +179,7 @@ fn dispatch_privileged(cli: &Cli, cmd: &PrivilegedCmd) -> Result<(), ExitCode> {
 }
 
 fn dispatch_mcp(cli: &Cli, cmd: &McpCmd) -> Result<(), ExitCode> {
-    match cmd {
-        McpCmd::Serve { stdio } => stub(cli, "mcp serve", &format!("stdio={stdio}")),
-    }
-}
-
-fn stub(cli: &Cli, command: &str, detail: &str) -> Result<(), ExitCode> {
-    unsupported(cli, command, detail)
+    mcp::dispatch_mcp(cli, cmd)
 }
 
 pub(crate) fn unsupported_exit(command: &str) -> ExitCode {
@@ -207,6 +196,7 @@ pub(crate) fn unsupported_exit(command: &str) -> ExitCode {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn unsupported(cli: &Cli, command: &str, detail: &str) -> Result<(), ExitCode> {
     let exit = unsupported_exit(command);
     if exit == ExitCode::Internal {
@@ -334,7 +324,7 @@ mod registry_tests {
     #[test]
     fn registered_additional_surface_is_not_internal_error() {
         let cli = Cli::try_parse_from(["ownmesh", "status"]).expect("status parses");
-        let err = unsupported(&cli, "device rename", "rename unavailable")
+        let err = unsupported(&cli, "policy rule mutation", "rule mutation unavailable")
             .expect_err("registered additional surface still returns not-implemented");
         assert_eq!(err, ExitCode::ProfileUnavailable);
     }

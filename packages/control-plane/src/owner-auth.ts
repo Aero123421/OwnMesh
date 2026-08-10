@@ -36,7 +36,9 @@ const OWNER_TENANT = "ten_default";
 const SESSION_COOKIE = "__Host-ownmesh_owner";
 const CSRF_COOKIE = "__Host-ownmesh_csrf";
 const PASSKEY_CHALLENGE_COOKIE = "__Host-ownmesh_passkey";
+const PRESENCE_COOKIE = "__Host-ownmesh_presence";
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
+const PRESENCE_TTL_SECONDS = 5 * 60;
 const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const MAX_FORM_BYTES = 8 * 1024;
 const MAX_PASSKEY_BODY_BYTES = 64 * 1024;
@@ -59,6 +61,19 @@ type SessionClaims = {
   exp: number;
   nonce: string;
 };
+
+type PresenceClaims = {
+  v: 1;
+  purpose: "approve";
+  sub: string;
+  tenant: string;
+  aud: string;
+  operation_id: string;
+  exp: number;
+  nonce: string;
+};
+
+const PRESENCE_SIGNING_CONTEXT = "ownmesh.owner.presence.v1:";
 
 function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -125,6 +140,21 @@ function safeReturnTo(raw: string | null, issuer: string, fallback = "/connect/c
     return `${target.pathname}${target.search}`;
   } catch {
     return fallback;
+  }
+}
+
+function validOperationId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
+}
+
+function approvalOperationId(target: string, issuer: string): string | null {
+  try {
+    const url = new URL(target, issuer);
+    if (url.origin !== new URL(issuer).origin || url.pathname !== "/approve") return null;
+    const values = url.searchParams.getAll("operation_id");
+    return values.length === 1 && validOperationId(values[0]!) ? values[0]! : null;
+  } catch {
+    return null;
   }
 }
 
@@ -296,6 +326,92 @@ async function issueSession(secret: string, issuer: string): Promise<string> {
   return `${body}.${bytesToBase64Url(signature)}`;
 }
 
+/**
+ * Mint a short-lived, purpose-separated proof of recent user verification.
+ * The resulting cookie is useful only for the exact approval operation.
+ */
+export async function issueOwnerPresenceForOperation(
+  env: OwnerAuthEnv,
+  issuer: string,
+  principal: OwnerPrincipal,
+  operationId: string,
+): Promise<string | null> {
+  if (
+    !ownerAuthConfigured(env) ||
+    principal.id !== OWNER_ID ||
+    principal.tenant_id !== OWNER_TENANT ||
+    !validOperationId(operationId)
+  ) {
+    return null;
+  }
+  const claims: PresenceClaims = {
+    v: 1,
+    purpose: "approve",
+    sub: principal.id,
+    tenant: principal.tenant_id,
+    aud: new URL(issuer).origin,
+    operation_id: operationId,
+    exp: Date.now() + PRESENCE_TTL_SECONDS * 1000,
+    nonce: randomToken("p_").slice(0, 40),
+  };
+  const body = bytesToBase64Url(new TextEncoder().encode(JSON.stringify(claims)));
+  const signed = `${PRESENCE_SIGNING_CONTEXT}${body}`;
+  const signature = new Uint8Array(
+    await crypto.subtle.sign("HMAC", await hmacKey(env.SESSION_SECRET!), new TextEncoder().encode(signed)),
+  );
+  return cookie(PRESENCE_COOKIE, `${body}.${bytesToBase64Url(signature)}`, PRESENCE_TTL_SECONDS, "Strict");
+}
+
+export async function ownerPresenceForOperation(
+  request: Request,
+  env: OwnerAuthEnv,
+  issuer: string,
+  principal: OwnerPrincipal,
+  operationId: string,
+): Promise<boolean> {
+  if (
+    !ownerAuthConfigured(env) ||
+    principal.id !== OWNER_ID ||
+    principal.tenant_id !== OWNER_TENANT ||
+    !validOperationId(operationId)
+  ) {
+    return false;
+  }
+  const token = cookieValue(request, PRESENCE_COOKIE);
+  if (!token || token.length > 2048) return false;
+  const [body, signature, extra] = token.split(".");
+  if (!body || !signature || extra !== undefined) return false;
+  const bodyBytes = base64UrlToBytes(body);
+  const signatureBytes = base64UrlToBytes(signature);
+  if (!bodyBytes || !signatureBytes) return false;
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    await hmacKey(env.SESSION_SECRET!),
+    signatureBytes,
+    new TextEncoder().encode(`${PRESENCE_SIGNING_CONTEXT}${body}`),
+  );
+  if (!valid) return false;
+  try {
+    const claims = JSON.parse(new TextDecoder().decode(bodyBytes)) as Partial<PresenceClaims>;
+    const now = Date.now();
+    return (
+      claims.v === 1 &&
+      claims.purpose === "approve" &&
+      claims.sub === principal.id &&
+      claims.tenant === principal.tenant_id &&
+      claims.aud === new URL(issuer).origin &&
+      claims.operation_id === operationId &&
+      typeof claims.exp === "number" &&
+      claims.exp > now &&
+      claims.exp <= now + PRESENCE_TTL_SECONDS * 1000 + 60_000 &&
+      typeof claims.nonce === "string" &&
+      claims.nonce.length >= 16
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function ownerPrincipalFromRequest(
   request: Request,
   env: OwnerAuthEnv,
@@ -341,6 +457,18 @@ export function ownerLoginRedirect(request: Request, issuer: string): Response {
   const current = new URL(request.url);
   const login = new URL("/login", issuer);
   login.searchParams.set("return_to", `${current.pathname}${current.search}`);
+  return new Response(null, { status: 302, headers: { location: login.toString() } });
+}
+
+export function ownerPresenceRedirect(request: Request, issuer: string): Response {
+  const current = new URL(request.url);
+  const operationId = approvalOperationId(`${current.pathname}${current.search}`, issuer);
+  if (!operationId) {
+    return json({ error: "invalid_request", error_description: "operation_id required" }, { status: 400, noStore: true });
+  }
+  const login = new URL("/login", issuer);
+  login.searchParams.set("fresh", "1");
+  login.searchParams.set("return_to", `/approve?operation_id=${encodeURIComponent(operationId)}`);
   return new Response(null, { status: 302, headers: { location: login.toString() } });
 }
 
@@ -395,8 +523,10 @@ export async function handleOwnerLogin(
   }
   const url = new URL(request.url);
   const returnTo = safeReturnTo(url.searchParams.get("return_to"), issuer);
+  const forceFreshApproval =
+    url.searchParams.get("fresh") === "1" && approvalOperationId(returnTo, issuer) !== null;
   if (request.method === "GET") {
-    if (await ownerPrincipalFromRequest(request, env, issuer)) {
+    if (!forceFreshApproval && await ownerPrincipalFromRequest(request, env, issuer)) {
       return new Response(null, { status: 302, headers: { location: returnTo } });
     }
     try {
@@ -426,6 +556,23 @@ function challengeResponse(data: unknown, challengeId: string): Response {
 
 function passkeyError(error: string, status: number): Response {
   return json({ error }, { status, noStore: true });
+}
+
+async function appendPresenceCookieForReturnTo(
+  headers: Headers,
+  env: OwnerAuthEnv,
+  issuer: string,
+  returnTo: string,
+): Promise<void> {
+  const operationId = approvalOperationId(returnTo, issuer);
+  if (!operationId) return;
+  const presence = await issueOwnerPresenceForOperation(
+    env,
+    issuer,
+    { id: OWNER_ID, tenant_id: OWNER_TENANT, display_name: "Owner" },
+    operationId,
+  );
+  if (presence) headers.append("set-cookie", presence);
 }
 
 export async function handleOwnerPasskeyRegistrationOptions(
@@ -528,6 +675,7 @@ export async function handleOwnerPasskeyRegistrationVerify(
     const headers = new Headers();
     headers.append("set-cookie", cookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, "Lax"));
     headers.append("set-cookie", passkeyChallengeCookie("", 0));
+    await appendPresenceCookieForReturnTo(headers, env, issuer, challenge.return_to);
     return json({ ok: true, redirect: challenge.return_to }, { status: 200, noStore: true, headers });
   } catch {
     return passkeyError("verification_failed", 401);
@@ -626,6 +774,7 @@ export async function handleOwnerPasskeyVerify(
     const headers = new Headers();
     headers.append("set-cookie", cookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, "Lax"));
     headers.append("set-cookie", passkeyChallengeCookie("", 0));
+    await appendPresenceCookieForReturnTo(headers, env, issuer, challenge.return_to);
     return json({ ok: true, redirect: challenge.return_to }, { status: 200, noStore: true, headers });
   } catch {
     return passkeyError("verification_failed", 401);
@@ -638,11 +787,12 @@ export async function handleOwnerLogout(request: Request, issuer: string): Promi
   }
   return new Response(null, {
     status: 303,
-    headers: {
-      location: "/login",
-      "set-cookie": cookie(SESSION_COOKIE, "", 0, "Lax"),
-      "cache-control": "no-store, no-cache",
-    },
+    headers: [
+      ["location", "/login"],
+      ["set-cookie", cookie(SESSION_COOKIE, "", 0, "Lax")],
+      ["set-cookie", cookie(PRESENCE_COOKIE, "", 0, "Strict")],
+      ["cache-control", "no-store, no-cache"],
+    ],
   });
 }
 

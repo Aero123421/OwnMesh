@@ -589,6 +589,7 @@ test("/approve rejects creator bearer; independent human browser session may dec
         principal_id: "prin_dev",
         tenant_id: "ten_default",
         display_name: "Dev",
+        fresh: true,
       }),
   } as unknown as Fetcher;
 
