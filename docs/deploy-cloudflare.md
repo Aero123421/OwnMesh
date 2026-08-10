@@ -9,6 +9,7 @@ Standard deploy creates **only**:
 | Worker | — | OAuth, MCP `/mcp`, device APIs |
 | D1 | `DB` | tenants, principals, OAuth clients/tokens, devices, grants, audit metadata |
 | Durable Object | `DEVICE_ROOM` | per-device WebSocket room (hibernation) |
+| Durable Object | `TRANSFER_ROOM` | transient encrypted transfer coordination |
 
 **Not** created (fail-closed): R2 buckets, Cloudflare TURN, relay queues.
 
@@ -43,8 +44,11 @@ pnpm exec wrangler d1 create ownmesh
 # https://developers.cloudflare.com/workers/platform/deploy-buttons/
 pnpm exec wrangler d1 migrations apply DB --remote
 
-# 3) Deploy Worker + Durable Object
+# 3) Deploy Worker + Durable Objects
 pnpm run deploy
+
+# 4) Create/rotate the single-owner login code (shown once)
+pnpm run owner:init
 ```
 
 `package.json` `deploy` script runs migrations against binding `DB` then `wrangler deploy`.
@@ -63,16 +67,21 @@ curl http://127.0.0.1:8787/health
 | Name | Required | Notes |
 |---|---|---|
 | `OAUTH_ISSUER` | optional | Defaults to request origin. Set to your canonical `https://<worker>.workers.dev` if behind a custom domain. |
-| `AUTH_PROVIDER` | **required for production browser OAuth** | Cloudflare service binding. `POST /authenticate` must return `{ principal_id, tenant_id, display_name? }` for the current Authorization/cookie context. Browser authorization/device verification returns 503 if the binding is absent. |
+| `OWNER_TOKEN_HASH` | **required by default** | SHA-256 of the high-entropy owner code. `pnpm run owner:init` creates it without storing the plaintext code in D1. |
+| `AUTH_PROVIDER` | optional | External identity service for multi-user deployments. When omitted, the built-in single-owner login is used. |
 | `OWNMESH_DEV_AUTH_BYPASS` | optional, default `false` | Local/test-only escape hatch for `login_hint`. Never enable against production data. |
 | `ALLOW_DYNAMIC_CLIENT_REGISTRATION` | optional, default `false` | Opt-in DCR. Prefer statically provisioned clients. Unknown clients are never auto-registered by `/oauth/authorize`. |
 | `OWNMESH_ALLOWED_ORIGINS` | optional | Comma-separated additional exact origins accepted by device WebSockets. The issuer origin is accepted automatically. |
-| `SESSION_SECRET` | optional | Reserved for signed cookies; generate with `openssl rand -hex 32`. **Do not commit secrets.** |
+| `SESSION_SECRET` | **required** | Signs owner sessions and internal Worker→DO contexts. `owner:init` creates it if absent. **Do not commit secrets.** |
 
-Example (do not commit values):
+`owner:init` sends values directly to Wrangler over stdin and prints only the new
+owner code. Save it in a password manager; rerun the command to rotate it.
+
+Manual example (do not commit values):
 
 ```bash
 pnpm exec wrangler secret put SESSION_SECRET
+pnpm exec wrangler secret put OWNER_TOKEN_HASH
 ```
 
 Reference `.dev.vars.example` in this package for local-only vars.
@@ -134,7 +143,7 @@ Proof body: `{ "device_id", "challenge_id", "signature": "<64-byte ed25519 hex>"
 ## ChatGPT Personal Plugin / MCP
 
 1. Deploy control plane and note `https://<worker>/mcp`
-2. Configure a static OAuth client with **exact** redirect URIs (or deliberately enable `ALLOW_DYNAMIC_CLIENT_REGISTRATION`)
+2. Open `https://<worker>/connect/chatgpt`, sign in with the owner code, paste the callback URL shown by ChatGPT, and copy the generated client ID back to ChatGPT.
 3. In ChatGPT, add the MCP connector / Personal Plugin pointing at your `/mcp` URL
 4. Complete OAuth; scopes: `ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access`
 5. Enroll a device with `ownmesh device enroll` / `ownmesh login` against your issuer URL (CLI ticket **cli-auth-09**)

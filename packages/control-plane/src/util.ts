@@ -31,6 +31,13 @@ export function html(body: string, init: JsonInit = {}): Response {
   if (!headers.has("content-type")) {
     headers.set("content-type", "text/html; charset=utf-8");
   }
+  headers.set(
+    "content-security-policy",
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+  );
+  headers.set("referrer-policy", "no-referrer");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("x-frame-options", "DENY");
   if (noStore) applyNoStore(headers);
   return new Response(body, { ...rest, headers });
 }

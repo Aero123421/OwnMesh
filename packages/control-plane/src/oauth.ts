@@ -10,6 +10,7 @@
  */
 
 import type { ControlPlaneStore } from "./store.ts";
+import { chatGptOAuthPair } from "./owner-auth.ts";
 import {
   DEFAULT_TENANT,
   encodeDevicePublicKey,
@@ -315,13 +316,9 @@ export async function handleAuthorize(
   }
 
   await store.ensureBootstrap();
-  const client = await store.getClient(clientId);
-  if (!client) {
-    return json({ error: "unauthorized_client", error_description: "unknown client" }, { status: 401 });
-  }
-
-  // OAuth 2.1: redirect_uri MUST exactly match a pre-registered URI.
-  if (!client.redirect_uris.includes(redirect)) {
+  let client = await store.getClient(clientId);
+  // For a known client, reject an altered redirect before authentication.
+  if (client && !client.redirect_uris.includes(redirect)) {
     return json(
       {
         error: "invalid_request",
@@ -343,6 +340,33 @@ export async function handleAuthorize(
     return json(
       { error: "unknown_tenant", error_description: "tenant is not provisioned" },
       { status: 403 },
+    );
+  }
+  // ChatGPT provides a per-connector callback slug. A signed-in owner may bind
+  // the matching deterministic client id on first use; anonymous auto-registration
+  // remains impossible and every later redirect still requires exact match.
+  if (!client && chatGptOAuthPair(clientId, redirect)) {
+    client = {
+      client_id: clientId,
+      tenant_id: authenticated.tenant_id,
+      client_name: "ChatGPT",
+      redirect_uris: [redirect],
+      created_at: nowIso(),
+    };
+    await store.putClient(client);
+  }
+  if (!client) {
+    return json({ error: "unauthorized_client", error_description: "unknown client" }, { status: 401 });
+  }
+
+  // OAuth 2.1: redirect_uri MUST exactly match a pre-registered URI.
+  if (!client.redirect_uris.includes(redirect)) {
+    return json(
+      {
+        error: "invalid_request",
+        error_description: "redirect_uri does not exactly match registration",
+      },
+      { status: 400 },
     );
   }
   if (authenticated.tenant_id !== client.tenant_id) return json({ error: "unauthorized_client" }, { status: 403 });
@@ -392,8 +416,8 @@ export async function handleAuthorize(
     consumed: false,
   });
 
-  const page = `<!doctype html><html><head><meta charset="utf-8"><title>OwnMesh Authorize</title></head>
-<body><h1>OwnMesh</h1><p>Client <code>${escapeHtml(clientId)}</code> requests:</p><pre>${escapeHtml(scope)}</pre>
+  const page = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OwnMesh Authorize</title></head>
+<body><h1>OwnMesh</h1><p>Client <code>${escapeHtml(clientId)}</code> requests:</p><pre>${escapeHtml(scope)}</pre><p>Return to <code>${escapeHtml(new URL(redirect).host)}</code>.</p>
 <form method="post" action="/oauth/authorize">
 <input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"/>
 <input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"/>

@@ -62,8 +62,8 @@ Exact menu labels move as OpenAI iterates; the flow is:
    - Authorization server metadata: `https://<your-worker>/.well-known/oauth-authorization-server`  
    - Protected resource metadata: `https://<your-worker>/.well-known/oauth-protected-resource`  
    - **Client registration (production default):** Dynamic Client Registration is **disabled**.
-     Pre-provision a public OAuth client (`token_endpoint_auth_method=none` + PKCE) in the
-     control-plane store / bootstrap, then enter that `client_id` in ChatGPT.
+     Open `https://<your-worker>/connect/chatgpt`, sign in with your deployment owner code,
+     paste ChatGPT's callback URL, then copy the generated public `client_id` into ChatGPT.
    - **Optional DCR:** operators may set Worker env `ALLOW_DYNAMIC_CLIENT_REGISTRATION=true`
      to advertise `registration_endpoint` and accept authenticated `POST /oauth/register`
      (Bearer with `ownmesh.device` scope; public client + PKCE only). Production defaults
@@ -82,7 +82,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
    | `ownmesh.session` | `ownmesh_session_open` / `attach` / `write` / `resize` / `replay` — live PTY owned by `ownmeshd` under `full_user_access`/`full_access` only (denied in `workspace_only`/`recommended` until OS confinement); controller `input_seq`/`resize_seq` exact-once (RetryPending is at-most-once / uncertain, never re-delivers); E5 partial: reconnect matrix still open; always pass `workspace_id` |
    | `offline_access` | refresh tokens for long-lived ChatGPT connector |
 
-6. Complete OAuth in the browser when ChatGPT prompts.
+6. Complete OAuth in the browser: owner sign-in (once per browser) → explicit scope consent.
 7. **Scan tools** — you should see the OwnMesh catalog (structured command **separate** from raw shell).
 8. Save as draft → test in a new chat → publish only after you trust write actions.
 

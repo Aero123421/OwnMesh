@@ -1,7 +1,7 @@
 /**
  * Health + migration readiness: never synthesize applied migrations;
  * probe required P0/MCP schema and return 503 when absent.
- * SESSION_SECRET must be bound for /health 200.
+ * SESSION_SECRET and a browser-auth boundary must be bound for /health 200.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -89,6 +89,7 @@ function readyEnv(extra: Record<string, unknown> = {}): Record<string, unknown> 
   return {
     DEVICE_ROOM: fakeDeviceRoom(),
     SESSION_SECRET: TEST_SESSION_SECRET,
+    OWNER_TOKEN_HASH: "0".repeat(64),
     ...extra,
   };
 }

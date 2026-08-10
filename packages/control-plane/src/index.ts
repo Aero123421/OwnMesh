@@ -31,6 +31,14 @@ import {
 import { handleApprove, handleMcp, MCP_TOOLS } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
 import {
+  handleChatGptConnector,
+  handleOwnerLogin,
+  handleOwnerLogout,
+  ownerAuthConfigured,
+  ownerLoginRedirect,
+  ownerPrincipalFromRequest,
+} from "./owner-auth.ts";
+import {
   TransferRoom,
   issueTransferTerminalControl,
   verifyTransferEphemeralProof,
@@ -53,6 +61,7 @@ export interface Env {
   TRANSFER_ROOM?: DurableObjectNamespace;
   OAUTH_ISSUER?: string;
   SESSION_SECRET?: string;
+  OWNER_TOKEN_HASH?: string;
   AUTH_PROVIDER?: Fetcher;
   OWNMESH_DEV_AUTH_BYPASS?: string;
   ALLOW_DYNAMIC_CLIENT_REGISTRATION?: string;
@@ -113,19 +122,24 @@ async function browserPrincipal(request: Request, env: Env): Promise<Authenticat
     const id = request.headers.get("x-ownmesh-dev-principal") || url.searchParams.get("login_hint") || "prin_dev";
     return { id, tenant_id: "ten_default", display_name: id };
   }
-  if (!env.AUTH_PROVIDER) return null;
-  const response = await env.AUTH_PROVIDER.fetch(new Request("https://auth-provider/authenticate", {
-    method: "POST",
-    headers: {
-      authorization: request.headers.get("authorization") || "",
-      cookie: request.headers.get("cookie") || "",
-      "x-ownmesh-request-url": request.url,
-    },
-  }));
-  if (!response.ok) return null;
-  const body = await response.json() as { principal_id?: string; tenant_id?: string; display_name?: string };
-  if (!body.principal_id || !body.tenant_id) return null;
-  return { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name };
+  if (env.AUTH_PROVIDER) {
+    const response = await env.AUTH_PROVIDER.fetch(new Request("https://auth-provider/authenticate", {
+      method: "POST",
+      headers: {
+        authorization: request.headers.get("authorization") || "",
+        cookie: request.headers.get("cookie") || "",
+        "x-ownmesh-request-url": request.url,
+      },
+    }));
+    if (response.ok) {
+      const body = await response.json() as { principal_id?: string; tenant_id?: string; display_name?: string };
+      if (body.principal_id && body.tenant_id) {
+        return { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name };
+      }
+    }
+  }
+  const issuer = env.OAUTH_ISSUER || new URL(request.url).origin;
+  return ownerPrincipalFromRequest(request, env, issuer);
 }
 
 function originAllowed(request: Request, env: Env, issuer: string): boolean {
@@ -345,9 +359,10 @@ export default {
         const readiness = await store.schemaReadiness();
         const storage = env.DB ? "d1" : store.kind;
         const sessionSecretBound = Boolean(env.SESSION_SECRET);
-        // Ready only when schema is migrated, DeviceRoom DO is bound, and SESSION_SECRET is set.
+        const browserAuthBound = Boolean(env.AUTH_PROVIDER) || ownerAuthConfigured(env);
+        // Browser OAuth must be usable before the instance is declared ready.
         const ready =
-          readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound;
+          readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound && browserAuthBound;
         return json({
           ...base,
           status: ready ? "ok" : "not_ready",
@@ -355,6 +370,7 @@ export default {
           schema_ready: readiness.schema_ready,
           schema_checks: readiness.checks,
           session_secret_bound: sessionSecretBound,
+          browser_auth_bound: browserAuthBound,
           durable_objects: Boolean(env.DEVICE_ROOM),
         }, { status: ready ? 200 : 503 });
       } catch (error) {
@@ -365,6 +381,7 @@ export default {
             storage: "unavailable",
             schema_ready: false,
             session_secret_bound: Boolean(env.SESSION_SECRET),
+            browser_auth_bound: Boolean(env.AUTH_PROVIDER) || ownerAuthConfigured(env),
             durable_objects: Boolean(env.DEVICE_ROOM),
           }, { status: 503 });
         }
@@ -389,6 +406,27 @@ export default {
       throw error;
     }
 
+    if (url.pathname === "/login") {
+      return handleOwnerLogin(request, store, issuer, env);
+    }
+    if (url.pathname === "/logout") {
+      return handleOwnerLogout(request, issuer);
+    }
+    if (url.pathname === "/connect/chatgpt") {
+      const principal = await browserPrincipal(request, env);
+      if (!principal) {
+        if (request.method === "GET" && ownerAuthConfigured(env)) {
+          return ownerLoginRedirect(request, issuer);
+        }
+        return json({ error: "unauthorized" }, { status: 401, noStore: true });
+      }
+      return handleChatGptConnector(request, store, issuer, {
+        id: principal.id,
+        tenant_id: principal.tenant_id,
+        display_name: principal.display_name || principal.id,
+      });
+    }
+
     if (url.pathname === "/oauth/register" && request.method === "POST") {
       // DCR requires explicit flag + authenticated Bearer (ownmesh.device); never enable via devBypass.
       return handleRegister(request, store, {
@@ -411,7 +449,10 @@ export default {
       }
       const principal = await browserPrincipal(authRequest, env);
       const bypass = devBypass(env, request);
-      if (!principal && !env.AUTH_PROVIDER && !bypass) {
+      if (!principal && request.method === "GET" && ownerAuthConfigured(env)) {
+        return ownerLoginRedirect(request, issuer);
+      }
+      if (!principal && !env.AUTH_PROVIDER && !ownerAuthConfigured(env) && !bypass) {
         return json({ error: "auth_provider_unavailable" }, { status: 503 });
       }
       return handleAuthorize(authRequest, store, issuer, { principal: principal || undefined, allowDevBypass: bypass });
@@ -431,7 +472,10 @@ export default {
       }
       const principal = await browserPrincipal(request, env);
       const bypass = devBypass(env, request);
-      if (!principal && !env.AUTH_PROVIDER && !bypass) {
+      if (!principal && request.method === "GET" && ownerAuthConfigured(env)) {
+        return ownerLoginRedirect(request, issuer);
+      }
+      if (!principal && !env.AUTH_PROVIDER && !ownerAuthConfigured(env) && !bypass) {
         return json({ error: "auth_provider_unavailable" }, { status: 503 });
       }
       return handleDeviceVerification(request, store, { principal: principal || undefined, allowDevBypass: bypass });
@@ -459,7 +503,12 @@ export default {
       }
 
       const principal = await browserPrincipal(request, env);
-      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+      if (!principal) {
+        if (request.method === "GET" && ownerAuthConfigured(env)) {
+          return ownerLoginRedirect(request, issuer);
+        }
+        return json({ error: "unauthorized" }, { status: 401 });
+      }
 
       const postOriginOk =
         request.method !== "POST" || originAllowed(request, env, issuer);

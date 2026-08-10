@@ -125,6 +125,18 @@ pub struct SetupArgs {
     /// Never prompt; fail closed when required values are missing (implied when stdin is not a TTY).
     #[arg(long)]
     pub non_interactive: bool,
+
+    /// Sign in after writing the local configuration.
+    #[arg(long)]
+    pub login: bool,
+
+    /// Use the device-code login flow (for SSH/headless servers; implies --login).
+    #[arg(long)]
+    pub device_login: bool,
+
+    /// Enroll this machine after login (or using an existing login).
+    #[arg(long)]
+    pub enroll: bool,
 }
 
 /// `ownmesh doctor` arguments.
