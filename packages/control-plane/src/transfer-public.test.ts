@@ -10,8 +10,8 @@ function request(token: string, name: string, args: Record<string, unknown>): Re
   return new Request("https://cp.test/mcp", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) });
 }
 
-async function fixture() {
-  const store = new MemoryStore(); await store.ensureBootstrap();
+async function fixture(store = new MemoryStore()) {
+  await store.ensureBootstrap();
   const token = await store.issueTokens("client_transfer", "prin_dev", "ownmesh.read ownmesh.write");
   const foreign = await store.issueTokens("client_transfer_foreign", "prin_foreign", "ownmesh.read ownmesh.write");
   for (const id of ["dev_source", "dev_destination"]) await store.putDevice({ id, tenant_id: "ten_default", principal_id: "prin_dev", name: id, hostname: id, os: "test", arch: "test", agent_version: "test", protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false, created_at: new Date().toISOString(), status: "active" });
@@ -166,6 +166,54 @@ test("source reply loss after destination publication completes only after exact
   const completed = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
   const completedTransfer = completed.result!.structuredContent!.data.transfer as Record<string, unknown>;
   assert.equal(completedTransfer.state, "completed"); assert.equal(completedTransfer.epoch, 1);
+});
+
+test("parallel published-cleanup reconciliation claims one control and one cleanup under delayed storage", async () => {
+  const store = new MemoryStore();
+  // Force every durable operation to yield so status polls observe the same
+  // parent snapshot before one of their CAS writes wins.
+  const delay = () => new Promise<void>((resolve) => setTimeout(resolve, 2));
+  const update = store.updateMcpOperation.bind(store);
+  store.updateMcpOperation = async (...args) => { await delay(); return update(...args); };
+  const claim = store.claimMcpOperationByIdempotency.bind(store);
+  store.claimMcpOperationByIdempotency = async (...args) => { await delay(); return claim(...args); };
+  const f = await fixture(store);
+  const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "parallel-cleanup-plan" });
+  const transferId = created.result!.structuredContent!.operation_id;
+  const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
+  const original = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
+  const sourceStart = "op_parallel_lost_source";
+  await f.store.updateMcpOperation(transferId, {
+    status: "running",
+    data: { __ownmesh_transfer_plan: {
+      ...original, state: "source_cleanup", room_terminalized: true,
+      plan_sha256: "a".repeat(64), source_sha256: "b".repeat(64), source_size_bytes: 9,
+      source_plan_id: "plan_parallel_source", destination_plan_id: "plan_parallel_destination",
+      source_start_operation_id: sourceStart, source_start_routed: true,
+    } },
+  });
+  await f.store.putMcpOperation({ ...parent, operation_id: sourceStart, correlation_id: sourceStart, device_id: "dev_source", tool: "__transfer_start", status: "failed", summary: "lost finish acknowledgement", data: {}, idempotency_key: sourceStart, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+
+  const first = await Promise.all(Array.from({ length: 12 }, () => invoke(f, "ownmesh_transfer_status", { transfer_id: transferId })));
+  for (const result of first) assert.equal(result.error, undefined, "parallel status must not surface a 5xx");
+  assert.equal(f.routed.filter((entry) => (entry.operation.payload as Record<string, unknown>).capability === "operation.cancel").length, 1);
+  let current = await f.store.getMcpOperation(transferId); assert.ok(current);
+  let currentMeta = current.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  const controlId = currentMeta.source_cleanup_control_operation_id;
+  assert.equal(typeof controlId, "string", "CAS winner id is retained on the parent");
+  await f.store.updateMcpOperation(controlId!, { status: "completed", summary: "source start already stopped", data: { target_operation_id: sourceStart, cancelled: false, signal_delivered: false } }, ["pending"]);
+
+  const second = await Promise.all(Array.from({ length: 12 }, () => invoke(f, "ownmesh_transfer_status", { transfer_id: transferId })));
+  for (const result of second) assert.equal(result.error, undefined, "parallel cleanup status must not surface a 5xx");
+  assert.equal(f.routed.filter((entry) => (entry.operation.payload as Record<string, unknown>).capability === "transfer.source_cleanup").length, 1);
+  current = await f.store.getMcpOperation(transferId); assert.ok(current);
+  currentMeta = current.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  const cleanupId = currentMeta.source_cleanup_operation_id;
+  assert.equal(typeof cleanupId, "string", "cleanup claim winner id is retained on the parent");
+  assert.ok((currentMeta.cleanup_generation || 0) >= 2, "cleanup parent CAS generation advances monotonically");
+  await f.store.updateMcpOperation(cleanupId!, { status: "completed", summary: "source custody cleaned", data: { plan_id: "plan_parallel_source", cleaned: true, source_only: true } }, ["pending"]);
+  const converged = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+  assert.equal((converged.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "completed");
 });
 
 test("cancel fans out exact generic cancel controls and never retries them as a send", async () => {

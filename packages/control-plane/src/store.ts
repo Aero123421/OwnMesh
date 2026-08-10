@@ -596,6 +596,8 @@ export interface ControlPlaneStore {
     operationId: string,
     patch: Partial<McpOperationRecord>,
     fromStatuses?: string[],
+    /** Exact durable data snapshot required for a compare-and-swap update. */
+    expectedData?: Record<string, unknown>,
   ): Promise<McpOperationRecord | null>;
 
   putMcpApprovalTransaction(tx: McpApprovalTransaction): Promise<void>;
@@ -1535,10 +1537,12 @@ export class MemoryStore implements ControlPlaneStore {
     operationId: string,
     patch: Partial<McpOperationRecord>,
     fromStatuses?: string[],
+    expectedData?: Record<string, unknown>,
   ): Promise<McpOperationRecord | null> {
     const cur = this.mcpOperations.get(operationId);
     if (!cur) return null;
     if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
+    if (expectedData !== undefined && JSON.stringify(cur.data || {}) !== JSON.stringify(expectedData)) return null;
     const next: McpOperationRecord = boundMcpOperationRecord({
       ...cur,
       ...patch,
@@ -3271,10 +3275,12 @@ export class SqlStore implements ControlPlaneStore {
     operationId: string,
     patch: Partial<McpOperationRecord>,
     fromStatuses?: string[],
+    expectedData?: Record<string, unknown>,
   ): Promise<McpOperationRecord | null> {
     const cur = await this.getMcpOperation(operationId);
     if (!cur) return null;
     if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
+    if (expectedData !== undefined && JSON.stringify(cur.data || {}) !== JSON.stringify(expectedData)) return null;
 
     const next: McpOperationRecord = boundMcpOperationRecord({
       ...cur,
@@ -3289,9 +3295,15 @@ export class SqlStore implements ControlPlaneStore {
       updated_at: patch.updated_at || nowIso(),
     });
 
-    // CAS via conditional UPDATE when fromStatuses provided.
-    if (fromStatuses && fromStatuses.length > 0) {
-      const placeholders = fromStatuses.map(() => "?").join(",");
+    // CAS via conditional UPDATE.  `expectedData` is used by coordinators
+    // whose durable data contains a generation/version marker; status alone
+    // is not sufficient to protect concurrent metadata transitions.
+    if ((fromStatuses && fromStatuses.length > 0) || expectedData !== undefined) {
+      const placeholders = fromStatuses?.map(() => "?").join(",") || "";
+      const statusClause = fromStatuses && fromStatuses.length > 0
+        ? ` AND status IN (${placeholders})`
+        : "";
+      const dataClause = expectedData !== undefined ? " AND data_json = ?" : "";
       const result = await this.db
         .prepare(
           `UPDATE mcp_operations SET
@@ -3300,7 +3312,7 @@ export class SqlStore implements ControlPlaneStore {
              approval_url = ?, approval_id = ?, session_id = ?, warnings_json = ?,
              correlation_id = ?, payload_hash = ?, idempotency_key = ?, workspace_id = ?,
              expires_at = ?, claim_version = ?, action_json = ?, updated_at = ?
-           WHERE operation_id = ? AND status IN (${placeholders})`,
+           WHERE operation_id = ?${statusClause}${dataClause}`,
         )
         .bind(
           next.tenant_id,
@@ -3326,7 +3338,8 @@ export class SqlStore implements ControlPlaneStore {
           JSON.stringify(next.action || {}),
           next.updated_at,
           operationId,
-          ...fromStatuses,
+          ...(fromStatuses || []),
+          ...(expectedData !== undefined ? [JSON.stringify(expectedData)] : []),
         )
         .run();
       const changes = Number((result as { meta?: { changes?: number }; changes?: number }).meta?.changes

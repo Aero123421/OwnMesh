@@ -1511,6 +1511,7 @@ async function patchOp(
   operationId: string,
   patch: Partial<TrackedOperation>,
   fromStatuses?: string[],
+  expectedData?: Record<string, unknown>,
 ): Promise<TrackedOperation | undefined> {
   const storePatch: Partial<McpOperationRecord> = { updated_at: nowIso() };
   if (patch.status !== undefined) storePatch.status = patch.status;
@@ -1528,7 +1529,7 @@ async function patchOp(
   if (patch.tool !== undefined) storePatch.tool = patch.tool;
   if (patch.principal !== undefined) storePatch.principal_id = patch.principal;
   if (patch.tenant_id !== undefined) storePatch.tenant_id = patch.tenant_id;
-  const updated = await store.updateMcpOperation(operationId, storePatch, fromStatuses);
+  const updated = await store.updateMcpOperation(operationId, storePatch, fromStatuses, expectedData);
   if (!updated) return undefined;
   const tracked = trackedFromRecord(updated);
   tracker.put(tracked);
@@ -2591,6 +2592,8 @@ export type TransferPlanMeta = {
   source_cleanup_operation_id?: string;
   source_cleanup_attempts?: number;
   source_cleanup_retry_after_ms?: number;
+  /** Monotonic CAS generation for source-cleanup parent transitions. */
+  cleanup_generation?: number;
   room_terminalized?: boolean;
   cancellation_idempotency_key?: string;
   destination_plan_id?: string;
@@ -2655,6 +2658,7 @@ function transferMeta(data: Record<string, unknown> | null | undefined): Transfe
   if (value.pair_generation !== undefined && (!Number.isSafeInteger(value.pair_generation) || Number(value.pair_generation) < 1)) return null;
   if (value.source_cleanup_attempts !== undefined && (!Number.isSafeInteger(value.source_cleanup_attempts) || Number(value.source_cleanup_attempts) < 0 || Number(value.source_cleanup_attempts) > 8)) return null;
   if (value.source_cleanup_retry_after_ms !== undefined && (!Number.isSafeInteger(value.source_cleanup_retry_after_ms) || Number(value.source_cleanup_retry_after_ms) < 1)) return null;
+  if (value.cleanup_generation !== undefined && (!Number.isSafeInteger(value.cleanup_generation) || Number(value.cleanup_generation) < 0)) return null;
   if (value.source_size_bytes !== undefined && (!Number.isSafeInteger(value.source_size_bytes) || Number(value.source_size_bytes) < 0)) return null;
   if (value.source_sha256 !== undefined && (typeof value.source_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.source_sha256))) return null;
   return value as unknown as TransferPlanMeta;
@@ -2835,6 +2839,42 @@ async function routeStoredTransferControl(
   try { await context.router.routeToDevice(deviceId, outbox.body); } catch { /* durable pending outbox retries */ }
 }
 
+/**
+ * Source-cleanup status polls can overlap after an awaited Room/Agent call.
+ * Protect the whole parent snapshot (not merely its coarse status) and carry a
+ * monotonic generation so a caller that loses the CAS always reloads durable
+ * state rather than writing stale transfer metadata back over the winner.
+ */
+async function patchPublishedCleanupPlan(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  plan: TrackedOperation,
+  meta: TransferPlanMeta,
+  patch: Omit<Partial<TrackedOperation>, "data">,
+  nextMeta: TransferPlanMeta,
+): Promise<{ plan: TrackedOperation; meta: TransferPlanMeta; won: boolean }> {
+  const next: TransferPlanMeta = {
+    ...nextMeta,
+    cleanup_generation: (meta.cleanup_generation || 0) + 1,
+  };
+  const updated = await patchOp(
+    store,
+    tracker,
+    plan.operation_id,
+    { ...patch, data: { [TRANSFER_META_KEY]: next } },
+    ["running", "pending"],
+    plan.data || {},
+  );
+  if (updated) return { plan: updated, meta: next, won: true };
+
+  const reloaded = await loadOp(store, tracker, plan.operation_id);
+  const reloadedMeta = transferMeta(reloaded?.data);
+  // A missing/invalid parent is fail-closed; do not manufacture tracker data.
+  return reloaded && reloadedMeta
+    ? { plan: reloaded, meta: reloadedMeta, won: false }
+    : { plan, meta, won: false };
+}
+
 async function reconcilePublishedSourceCleanup(
   store: ControlPlaneStore,
   tracker: OperationTracker,
@@ -2851,20 +2891,22 @@ async function reconcilePublishedSourceCleanup(
       terminalized = await context.terminalizeTransferRoom({ transfer_id: meta.transfer_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, artifact_sha256: meta.source_sha256 });
     } catch { terminalized = false; }
     if (!terminalized) return { plan, meta };
-    const next: TransferPlanMeta = { ...meta, room_terminalized: true };
-    const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "destination published; transfer room terminalized", data: { [TRANSFER_META_KEY]: next } }, ["running", "pending"]);
-    if (!updated) return { plan, meta };
-    plan = updated; meta = next;
+    const claimed = await patchPublishedCleanupPlan(
+      store, tracker, plan, meta,
+      { status: "running", summary: "destination published; transfer room terminalized" },
+      { ...meta, room_terminalized: true },
+    );
+    if (!claimed.won) return { plan: claimed.plan, meta: claimed.meta };
+    plan = claimed.plan; meta = claimed.meta;
   }
   const source = await store.getMcpOperation(sourceStartOperationId);
   if (meta.source_cleanup_retry_after_ms && Date.now() < meta.source_cleanup_retry_after_ms) return { plan, meta };
   const complete = async () => {
     const completed: TransferPlanMeta = { ...meta, state: "completed" };
-    const updated = await patchOp(store, tracker, plan.operation_id, {
+    const updated = await patchPublishedCleanupPlan(store, tracker, plan, meta, {
       status: "completed", summary: "destination publication confirmed and source custody cleaned",
-      data: { [TRANSFER_META_KEY]: completed },
-    }, ["running", "pending"]);
-    return updated ? { plan: updated, meta: completed } : { plan, meta };
+    }, completed);
+    return { plan: updated.plan, meta: updated.meta };
   };
 
   if (meta.source_cleanup_operation_id) {
@@ -2882,11 +2924,10 @@ async function reconcilePublishedSourceCleanup(
     if (cleanup && ["failed", "denied", "device_offline", "cancelled"].includes(cleanup.status)
       && (meta.source_cleanup_attempts || 0) >= 8) {
       const pending: TransferPlanMeta = { ...meta, source_cleanup_operation_id: undefined, source_cleanup_attempts: 0, source_cleanup_retry_after_ms: Date.now() + 5_000 };
-      const updated = await patchOp(store, tracker, plan.operation_id, {
+      const updated = await patchPublishedCleanupPlan(store, tracker, plan, meta, {
         status: "running", summary: "destination published; source cleanup remains pending after bounded retries",
-        data: { [TRANSFER_META_KEY]: pending },
-      }, ["running", "pending"]);
-      return updated ? { plan: updated, meta: pending } : { plan, meta };
+      }, pending);
+      return { plan: updated.plan, meta: updated.meta };
     }
   }
 
@@ -2900,11 +2941,13 @@ async function reconcilePublishedSourceCleanup(
       workspaceBinding: { workspace_id: meta.source_workspace_id, version: meta.source_workspace_version },
       args: { target_operation_id: sourceStartOperationId, idempotency_key: idempotencyKey },
     });
-    await store.putMcpOperation({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_cancel_control", status: "pending", summary: "published transfer source stop requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, target_operation_id: sourceStartOperationId }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
-    const next: TransferPlanMeta = { ...meta, source_cleanup_control_operation_id: operationId };
-    const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "destination published; stopping source transfer", data: { [TRANSFER_META_KEY]: next } }, ["running", "pending"]);
-    if (updated) await routeStoredTransferControl(await store.getMcpOperation(operationId) as McpOperationRecord, meta.source_device_id, context);
-    return updated ? { plan: updated, meta: next } : { plan, meta };
+    const claim = await store.claimMcpOperationByIdempotency({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_cancel_control", status: "pending", summary: "published transfer source stop requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, target_operation_id: sourceStartOperationId }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
+    // The child claim is the single durable owner.  Persist that winner's id;
+    // losing status polls must never point the parent at their throwaway id.
+    const next: TransferPlanMeta = { ...meta, source_cleanup_control_operation_id: claim.op.operation_id };
+    const updated = await patchPublishedCleanupPlan(store, tracker, plan, meta, { status: "running", summary: "destination published; stopping source transfer" }, next);
+    if (updated.won) await routeStoredTransferControl(claim.op, meta.source_device_id, context);
+    return { plan: updated.plan, meta: updated.meta };
   }
 
   const control = await store.getMcpOperation(meta.source_cleanup_control_operation_id);
@@ -2931,11 +2974,11 @@ async function reconcilePublishedSourceCleanup(
     workspaceBinding: { workspace_id: meta.source_workspace_id, version: meta.source_workspace_version },
     args: { plan_id: meta.source_plan_id, epoch: meta.epoch, fence: meta.fence, idempotency_key: idempotencyKey },
   });
-  await store.putMcpOperation({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_source_cleanup", status: "pending", summary: "source transfer custody cleanup", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, plan_id: meta.source_plan_id }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
-  const next: TransferPlanMeta = { ...meta, source_cleanup_operation_id: operationId, source_cleanup_attempts: attempts, source_cleanup_retry_after_ms: undefined };
-  const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "source transfer custody cleanup dispatched", data: { [TRANSFER_META_KEY]: next } }, ["running", "pending"]);
-  if (updated) await routeStoredTransferControl(await store.getMcpOperation(operationId) as McpOperationRecord, meta.source_device_id, context);
-  return updated ? { plan: updated, meta: next } : { plan, meta };
+  const claim = await store.claimMcpOperationByIdempotency({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_source_cleanup", status: "pending", summary: "source transfer custody cleanup", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, plan_id: meta.source_plan_id }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
+  const next: TransferPlanMeta = { ...meta, source_cleanup_operation_id: claim.op.operation_id, source_cleanup_attempts: attempts, source_cleanup_retry_after_ms: undefined };
+  const updated = await patchPublishedCleanupPlan(store, tracker, plan, meta, { status: "running", summary: "source transfer custody cleanup dispatched" }, next);
+  if (updated.won) await routeStoredTransferControl(claim.op, meta.source_device_id, context);
+  return { plan: updated.plan, meta: updated.meta };
 }
 
 /** Reconcile only server-owned start-operation outcomes. The plan is never
