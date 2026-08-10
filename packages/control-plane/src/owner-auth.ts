@@ -127,7 +127,7 @@ function safeReturnTo(raw: string | null, issuer: string, fallback = "/connect/c
   }
 }
 
-function sameOriginPost(request: Request, issuer: string): boolean {
+export function sameOriginBrowserPost(request: Request, issuer: string): boolean {
   const expected = new URL(issuer).origin;
   const origin = request.headers.get("origin");
   if (origin) {
@@ -138,10 +138,14 @@ function sameOriginPost(request: Request, issuer: string): boolean {
     }
   }
 
-  // Some browser form submissions omit Origin. Accept that case only when
-  // browser fetch metadata and the full Referer independently prove that the
-  // request came from this exact OwnMesh origin.
-  if (request.headers.get("sec-fetch-site") !== "same-origin") return false;
+  // Some browser form submissions omit Origin, and OwnMesh intentionally uses
+  // Referrer-Policy: no-referrer. Sec-Fetch-Site is browser-controlled and is
+  // therefore the primary fallback for these exact same-origin submissions.
+  const fetchSite = request.headers.get("sec-fetch-site");
+  if (fetchSite === "same-origin") return true;
+  if (fetchSite) return false;
+
+  // Older clients without Fetch Metadata may fall back to an exact Referer.
   const referer = request.headers.get("referer");
   if (!referer) return false;
   try {
@@ -427,7 +431,7 @@ export async function handleOwnerPasskeyRegistrationOptions(
   env: OwnerAuthEnv,
 ): Promise<Response> {
   if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
-  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  if (!sameOriginBrowserPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
   let body: Record<string, unknown> | null;
   try {
     body = await passkeyJson(request);
@@ -481,7 +485,7 @@ export async function handleOwnerPasskeyRegistrationVerify(
   env: OwnerAuthEnv,
 ): Promise<Response> {
   if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
-  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  if (!sameOriginBrowserPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
   let body: Record<string, unknown> | null;
   try {
     body = await passkeyJson(request);
@@ -533,7 +537,7 @@ export async function handleOwnerPasskeyOptions(
   env: OwnerAuthEnv,
 ): Promise<Response> {
   if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
-  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  if (!sameOriginBrowserPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
   let body: Record<string, unknown> | null;
   try {
     body = await passkeyJson(request);
@@ -573,7 +577,7 @@ export async function handleOwnerPasskeyVerify(
   env: OwnerAuthEnv,
 ): Promise<Response> {
   if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
-  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  if (!sameOriginBrowserPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
   let body: Record<string, unknown> | null;
   try {
     body = await passkeyJson(request);
@@ -625,7 +629,7 @@ export async function handleOwnerPasskeyVerify(
 }
 
 export async function handleOwnerLogout(request: Request, issuer: string): Promise<Response> {
-  if (request.method !== "POST" || !sameOriginPost(request, issuer)) {
+  if (request.method !== "POST" || !sameOriginBrowserPost(request, issuer)) {
     return json({ error: "origin_not_allowed" }, { status: 403, noStore: true });
   }
   return new Response(null, {
@@ -678,7 +682,7 @@ export async function handleChatGptConnector(
   if (request.method !== "POST") {
     return json({ error: "method_not_allowed" }, { status: 405, noStore: true });
   }
-  if (!sameOriginPost(request, issuer)) {
+  if (!sameOriginBrowserPost(request, issuer)) {
     return json({ error: "origin_not_allowed" }, { status: 403, noStore: true });
   }
   const form = await boundedForm(request);

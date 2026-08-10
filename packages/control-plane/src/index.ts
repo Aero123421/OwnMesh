@@ -42,6 +42,7 @@ import {
   ownerLoginRedirect,
   ownerPasskeyScript,
   ownerPrincipalFromRequest,
+  sameOriginBrowserPost,
 } from "./owner-auth.ts";
 import {
   TransferRoom,
@@ -457,7 +458,7 @@ export default {
       // Consent expiry begins on GET receipt, before any form parsing or external
       // AUTH_PROVIDER round trip; POST only consumes an existing transaction.
       if (request.method === "GET") captureAuthorizeRequestReceipt(request);
-      if (request.method === "POST" && request.headers.get("origin") !== new URL(issuer).origin) {
+      if (request.method === "POST" && !sameOriginBrowserPost(request, issuer)) {
         return json({ error: "origin_not_allowed" }, { status: 403 });
       }
       let authRequest = request;
@@ -487,7 +488,7 @@ export default {
       return handleDeviceAuthorization(request, store, issuer);
     }
     if (url.pathname === "/oauth/device") {
-      if (request.method === "POST" && request.headers.get("origin") !== new URL(issuer).origin) {
+      if (request.method === "POST" && !sameOriginBrowserPost(request, issuer)) {
         return json({ error: "origin_not_allowed" }, { status: 403 });
       }
       const principal = await browserPrincipal(request, env);
@@ -531,7 +532,7 @@ export default {
       }
 
       const postOriginOk =
-        request.method !== "POST" || originAllowed(request, env, issuer);
+        request.method !== "POST" || sameOriginBrowserPost(request, issuer);
 
       return handleApprove(request, store, {
         issuer,

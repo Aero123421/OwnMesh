@@ -12,6 +12,7 @@ import {
   handleOwnerPasskeyOptions,
   handleOwnerPasskeyRegistrationOptions,
   ownerPrincipalFromRequest,
+  sameOriginBrowserPost,
 } from "./owner-auth.ts";
 import { MemoryStore, SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
 import { sha256Hex } from "./util.ts";
@@ -224,6 +225,35 @@ test("owner session is issuer-bound and rejects tampering", async () => {
   );
 });
 
+test("browser POST origin fallback requires exact same-origin metadata", () => {
+  assert.equal(
+    sameOriginBrowserPost(new Request(`${ISSUER}/submit`, { headers: { origin: ISSUER } }), ISSUER),
+    true,
+  );
+  assert.equal(
+    sameOriginBrowserPost(new Request(`${ISSUER}/submit`, {
+      headers: { "sec-fetch-site": "same-origin" },
+    }), ISSUER),
+    true,
+  );
+  assert.equal(
+    sameOriginBrowserPost(new Request(`${ISSUER}/submit`, {
+      headers: { referer: "https://evil.example/form", "sec-fetch-site": "cross-site" },
+    }), ISSUER),
+    false,
+  );
+  assert.equal(
+    sameOriginBrowserPost(new Request(`${ISSUER}/submit`, {
+      headers: { referer: `${ISSUER}/form` },
+    }), ISSUER),
+    true,
+  );
+  assert.equal(
+    sameOriginBrowserPost(new Request(`${ISSUER}/submit`), ISSUER),
+    false,
+  );
+});
+
 test("authenticated owner registers only an exact ChatGPT callback pair", async () => {
   assert.equal(chatGptOAuthPair(CLIENT_ID, CALLBACK), true);
   assert.equal(chatGptOAuthPair(CLIENT_ID, "https://evil.example/connector/oauth/b6NcEskp3DnC"), false);
@@ -243,7 +273,7 @@ test("authenticated owner registers only an exact ChatGPT callback pair", async 
       method: "POST",
       headers: {
         referer: "https://evil.example/connect/chatgpt",
-        "sec-fetch-site": "same-origin",
+        "sec-fetch-site": "cross-site",
         cookie: csrfCookie,
         "content-type": "application/x-www-form-urlencoded",
       },
@@ -258,7 +288,6 @@ test("authenticated owner registers only an exact ChatGPT callback pair", async 
     new Request(`${ISSUER}/connect/chatgpt`, {
       method: "POST",
       headers: {
-        referer: `${ISSUER}/connect/chatgpt`,
         "sec-fetch-site": "same-origin",
         cookie: csrfCookie,
         "content-type": "application/x-www-form-urlencoded",
