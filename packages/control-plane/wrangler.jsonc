@@ -8,9 +8,11 @@
   "main": "src/index.ts",
   "compatibility_date": "2024-12-01",
   "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
   "vars": {
     // Set to your Worker URL after first deploy if it differs from request origin.
-    "OAUTH_ISSUER": "",
+    "OAUTH_ISSUER": "https://ownmesh-control-plane.namaste114.workers.dev",
     // Security-sensitive development escape hatch. Keep false in deployments.
     "OWNMESH_DEV_AUTH_BYPASS": "false",
     // Dynamic registration is opt-in; provision static clients unless explicitly needed.
@@ -24,7 +26,7 @@
       "binding": "DB",
       "database_name": "ownmesh",
       // Replace via `wrangler d1 create ownmesh` (Deploy to Cloudflare button fills this).
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "4198b4d0-c043-4dda-b641-16578d84c091",
       "migrations_dir": "migrations"
     }
   ],
