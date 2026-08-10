@@ -1,7 +1,7 @@
-# OwnMesh specification bundle (extracted)
+# OwnMesh schemas and fixtures
 
-This directory holds the machine-readable and example materials from
-`ownmesh-specification-bundle.zip`, plus pointers used by implementation tickets.
+This directory is the source of truth for machine-readable schemas, shared
+fixtures, and example configuration used by the Rust and TypeScript packages.
 
 ## Expected layout
 
@@ -19,15 +19,11 @@ spec-bundle/
 │   ├── policy.recommended.toml
 │   ├── policy.full-access.toml
 │   └── profile.custom.toml
-└── docs/
-    ├── ADR_TEMPLATE.md
-    └── SECURITY_REVIEW_CHECKLIST.md
 ```
 
-Authoritative prose specifications remain at the repository root:
+Related prose documentation:
 
 - `OWNMESH_SPECIFICATION.ja.md`
-- `IMPLEMENTATION_CHECKLIST.md`
-- `SECURITY_REVIEW_CHECKLIST.md`
+- `docs/SECURITY_REVIEW_CHECKLIST.md`
 
-ADRs for the live repository live under `/docs/adr/` (not only here).
+Architecture decisions live under `/docs/adr/`.

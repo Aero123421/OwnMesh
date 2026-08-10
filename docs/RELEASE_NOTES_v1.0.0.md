@@ -32,6 +32,6 @@ See [docs/deploy-cloudflare.md](./deploy-cloudflare.md).
 
 ## Security
 
-See [SECURITY.md](../SECURITY.md) and [SECURITY_REVIEW_CHECKLIST.md](../SECURITY_REVIEW_CHECKLIST.md).
+See [SECURITY.md](../SECURITY.md) and [the security review checklist](./SECURITY_REVIEW_CHECKLIST.md).
 
 External independent audit is recommended for high-risk Full Access deployments; residual risks are documented in the checklists.

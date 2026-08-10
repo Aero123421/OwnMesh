@@ -12,6 +12,8 @@ OwnMesh is **not** an AI orchestrator, and the 1.x line is **not feature-complet
 
 Unimplemented surfaces return machine-visible errors and are excluded from completeness claims. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, remote execution/session routing fails instead of falling back locally, and `approval watch` fails instead of silently behaving like a one-shot list.
 
+The current registry contains **22 explicit unsupported CLI surfaces** and **27 total** unsupported surfaces.
+
 ### Supported CLI areas
 
 - `setup` — TTY wizard + non-interactive flags/JSON; privacy defaults (telemetry/relay/update network **OFF**)
@@ -24,7 +26,7 @@ Unimplemented surfaces return machine-visible errors and are excluded from compl
 - approval list/show/decisions, policy inspection/presets
 - `privileged install|status|uninstall` — optional networkless native broker (systemd on Linux, launchd on macOS, SCM on Windows)
 
-See [`docs/onboarding.md`](./docs/onboarding.md) for setup/doctor/service commands, platform details, and rollback. See [`docs/RELEASE_NOTES_v1.1.0.md`](./docs/RELEASE_NOTES_v1.1.0.md) for distribution/update details.
+See [`docs/onboarding.md`](./docs/onboarding.md) for setup/doctor/service commands, platform details, and rollback.
 
 Japanese summary: [`README.ja.md`](./README.ja.md).
 
@@ -164,14 +166,14 @@ Tag releases invoke the reusable CI and Security workflows before any release bu
 - User-level service management never creates admin/root services
 - Automatic update network checks are off by default
 
-## Specification and release scope
+## Documentation
 
 - [release/SUPPORTED_SURFACES.json](./release/SUPPORTED_SURFACES.json) — machine-checked shipped surface
 - [docs/onboarding.md](./docs/onboarding.md) — setup / doctor / user service
-- [docs/RELEASE_NOTES_v1.1.0.md](./docs/RELEASE_NOTES_v1.1.0.md) — v1.1.0 distribution and onboarding notes
-- [docs/DOD_1.0.md](./docs/DOD_1.0.md) — honest DoD gap audit
+- [docs/deploy-cloudflare.md](./docs/deploy-cloudflare.md) — self-hosted control-plane deployment
+- [docs/chatgpt-connection.md](./docs/chatgpt-connection.md) — ChatGPT OAuth/MCP connection
+- [docs/THREAT_MODEL.md](./docs/THREAT_MODEL.md) — security boundaries and threat model
 - [OWNMESH_SPECIFICATION.ja.md](./OWNMESH_SPECIFICATION.ja.md) — target specification, not a statement of current completeness
-- [IMPLEMENTATION_CHECKLIST.md](./IMPLEMENTATION_CHECKLIST.md) — implementation checklist
 - [CHANGELOG.md](./CHANGELOG.md) — release changelog
 
 ## License

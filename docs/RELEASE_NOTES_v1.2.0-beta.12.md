@@ -80,6 +80,6 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 ## Surface registry
 
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json) records
-**27 explicit unsupported CLI surfaces** and **34 total** unsupported surfaces.
+**22 explicit unsupported CLI surfaces** and **27 total** unsupported surfaces.
 Profile CLI wiring, transfer CLI commands, and elevated broker install remain unsupported.
 Completeness claim remains false.

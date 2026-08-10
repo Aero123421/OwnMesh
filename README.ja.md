@@ -27,8 +27,9 @@ OwnMesh は AI オーケストレータではありません。また 1.x ライ
 - approval / policy
 - `privileged install|status|uninstall` — 任意のネットワークレス特権ブローカー（Linux systemd / macOS launchd / Windows SCM）
 
-詳細とロールバック: [`docs/onboarding.md`](./docs/onboarding.md)
-配布/更新: [`docs/RELEASE_NOTES_v1.1.0.md`](./docs/RELEASE_NOTES_v1.1.0.md)
+- 詳細とロールバック: [`docs/onboarding.md`](./docs/onboarding.md)
+- Cloudflare / ChatGPT 接続: [`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) / [`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md)
+- 変更履歴: [`CHANGELOG.md`](./CHANGELOG.md)
 English: [`README.md`](./README.md)
 
 ## コンポーネント

@@ -137,7 +137,6 @@
 - Add Rust/TypeScript typed parsers, a JSON Schema, and four shared golden fixtures with cross-language round-trip coverage.
 - Reserve `workspace_id` for E4 without promoting workspace or remote-execution surfaces; the existing 39 hard-error unsupported surfaces remain unchanged.
 - Contract notes: [`docs/V1.2_E0_OPERATION_CONTRACT.md`](./docs/V1.2_E0_OPERATION_CONTRACT.md).
-- Beta notes: [`docs/RELEASE_NOTES_v1.2.0-beta.1.md`](./docs/RELEASE_NOTES_v1.2.0-beta.1.md).
 
 ## v1.1.3 — deterministic release gate
 

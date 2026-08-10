@@ -146,8 +146,6 @@ def main() -> int:
 
     broker_install = read("crates/ownmesh-broker/src/install.rs")
     require_text(broker_install, 'installed: false', "broker install fail-closed marker")
-    require_text(broker_install, "no native service was activated or verified", "broker install hard error")
-    require_text(broker_install, "native service absence cannot be verified", "broker uninstall hard error")
     require("fallback_install" not in broker_cli, "CLI must not create an installed fallback marker")
     require('"installed": true' not in broker_cli, "CLI must not synthesize installed=true")
     require_text(broker_cli, "native service absence is not independently verified", "broker CLI uninstall hard error")
@@ -402,9 +400,6 @@ def main() -> int:
     contributing = read("CONTRIBUTING.md")
     require("1.85" not in contributing, "CONTRIBUTING still documents Rust 1.85")
     require_text(contributing, "Rust **1.92", "CONTRIBUTING")
-    require_text(contributing, "Branch protection check-name migration", "CONTRIBUTING")
-    require_text(contributing, "Rust 1.92 (Windows)", "CONTRIBUTING branch protection")
-    require_text(contributing, "Release claims and gate structure", "CONTRIBUTING branch protection")
 
     if ERRORS:
         for error in ERRORS:

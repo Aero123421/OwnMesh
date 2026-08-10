@@ -6,8 +6,8 @@ Accepted (broker-session-03)
 
 ## Context
 
-OwnMesh 1.0 requires a **networkless** privileged broker and durable session
-observer/controller handoff (IMPLEMENTATION_CHECKLIST §8/§9, DoD items 7/8/10).
+OwnMesh requires a **networkless** privileged broker and durable session
+observer/controller handoff (specification §17/§18, DoD items 7/8/10).
 
 ## Decision
 
