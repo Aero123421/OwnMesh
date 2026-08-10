@@ -528,12 +528,37 @@ pub struct DaemonRuntime {
     /// Last returned chunk gives an at-least-once caller a bounded replay window
     /// without advancing the source stream twice after a lost response.
     transfer_last_chunks: HashMap<String, (u64, String)>,
+    /// Process-local destination streams. The durable journal remains the
+    /// authority; this cache only preserves the rolling hash and generation
+    /// part handle between contiguous chunks so an N-chunk transfer does not
+    /// rehash its entire prefix N times. It is bounded by the immutable-plan
+    /// quota and disappears naturally on restart.
+    transfer_receivers: HashMap<String, CachedDestinationTransfer>,
     #[cfg(test)]
     op_journal_persist_fault: AtomicUsize,
     #[cfg(test)]
     approvals_persist_fault: AtomicUsize,
     #[cfg(test)]
     sessions_persist_fault: AtomicUsize,
+    #[cfg(test)]
+    transfer_journal_persist_fault: AtomicUsize,
+    #[cfg(test)]
+    transfer_receiver_rebuilds: AtomicUsize,
+}
+
+const MAX_CACHED_DESTINATION_TRANSFERS: usize = 256;
+
+struct CachedDestinationTransfer {
+    epoch: u64,
+    fence: u64,
+    receiver: TransferReceiver,
+    sink: PartFileSink,
+}
+
+impl CachedDestinationTransfer {
+    fn matches(&self, epoch: u64, fence: u64, journal: &ownmesh_transfer::TransferJournal) -> bool {
+        self.epoch == epoch && self.fence == fence && self.receiver.journal() == journal
+    }
 }
 
 impl DaemonRuntime {
@@ -633,12 +658,17 @@ impl DaemonRuntime {
             transfer_store,
             transfer_senders: HashMap::new(),
             transfer_last_chunks: HashMap::new(),
+            transfer_receivers: HashMap::new(),
             #[cfg(test)]
             op_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
             approvals_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
             sessions_persist_fault: AtomicUsize::new(0),
+            #[cfg(test)]
+            transfer_journal_persist_fault: AtomicUsize::new(0),
+            #[cfg(test)]
+            transfer_receiver_rebuilds: AtomicUsize::new(0),
         })
     }
 
@@ -2139,6 +2169,36 @@ full_user_access/full_access for arbitrary commands",
         }
     }
 
+    fn ensure_destination_cache_capacity(&self, plan_id: &str) -> Result<(), TransferError> {
+        if !self.transfer_receivers.contains_key(plan_id)
+            && self.transfer_receivers.len() >= MAX_CACHED_DESTINATION_TRANSFERS
+        {
+            return Err(TransferError::JournalQuotaExceeded);
+        }
+        Ok(())
+    }
+
+    fn rebuild_destination_transfer(
+        &self,
+        plan: TransferPlan,
+        journal: ownmesh_transfer::TransferJournal,
+        epoch: u64,
+        fence: u64,
+    ) -> Result<CachedDestinationTransfer, TransferError> {
+        let sink =
+            PartFileSink::create(&self.transfer_store, &plan, epoch, journal.bytes_received())?;
+        #[cfg(test)]
+        self.transfer_receiver_rebuilds
+            .fetch_add(1, Ordering::SeqCst);
+        let receiver = TransferReceiver::resume_from_part(plan, journal, sink.path())?;
+        Ok(CachedDestinationTransfer {
+            epoch,
+            fence,
+            receiver,
+            sink,
+        })
+    }
+
     /// Derive every transfer authority fact from the authenticated remote
     /// dispatch.  In particular no transfer RPC parameter can nominate a
     /// principal, tenant, device, consent, payload hash, expiry, relay, or
@@ -2885,6 +2945,7 @@ full_user_access/full_access for arbitrary commands",
             .map_err(Self::transfer_error)?
         {
             if journal.published() {
+                self.transfer_receivers.remove(plan.id());
                 let mut artifact = workspace
                     .open_verified_transfer_artifact_read(Path::new(
                         &plan.binding().destination_relative_path,
@@ -2905,6 +2966,8 @@ full_user_access/full_access for arbitrary commands",
                 message: "destination already exists; overwrite is forbidden".into(),
             });
         }
+        self.ensure_destination_cache_capacity(plan.id())
+            .map_err(Self::transfer_error)?;
         let now = Self::now() as u64;
         let lease = self
             .transfer_store
@@ -2930,19 +2993,27 @@ full_user_access/full_access for arbitrary commands",
                 p.next_offset,
             )
             .map_err(Self::transfer_error)?;
-        let mut sink = PartFileSink::create(
-            &self.transfer_store,
-            &plan,
-            p.epoch,
-            journal.bytes_received(),
-        )
-        .map_err(Self::transfer_error)?;
+        // The fresh durable fence is authoritative now. Drop the prior
+        // generation's retained handle before PartFileSink stages/removes its
+        // generation path (required for no-share-delete Windows handles).
+        self.transfer_receivers.remove(plan.id());
         if journal.state() == JournalState::Completed {
+            let mut sink = PartFileSink::create(
+                &self.transfer_store,
+                &plan,
+                p.epoch,
+                journal.bytes_received(),
+            )
+            .map_err(Self::transfer_error)?;
             sink.verify_complete().map_err(Self::transfer_error)?;
             return Ok(
                 json!({ "plan_id": plan.id(), "state": journal.state(), "next_sequence": p.next_sequence, "next_offset": p.next_offset, "epoch": journal.epoch(), "fence": journal.fence(), "completed": true }),
             );
         }
+        let cached = self
+            .rebuild_destination_transfer(plan.clone(), journal.clone(), p.epoch, p.fence)
+            .map_err(Self::transfer_error)?;
+        self.transfer_receivers.insert(plan.id().to_owned(), cached);
         Ok(
             json!({ "plan_id": plan.id(), "state": journal.state(), "next_sequence": journal.contiguous_ack().map(|v| v + 1).unwrap_or(0), "next_offset": journal.bytes_received(), "epoch": journal.epoch(), "fence": journal.fence() }),
         )
@@ -2991,22 +3062,39 @@ full_user_access/full_access for arbitrary commands",
             .transfer_store
             .load_for_fence(&plan, p.epoch, p.fence)
             .map_err(Self::transfer_error)?;
-        let mut sink = PartFileSink::create(
-            &self.transfer_store,
-            &plan,
-            p.epoch,
-            journal.bytes_received(),
-        )
-        .map_err(Self::transfer_error)?;
-        let mut receiver = TransferReceiver::resume_from_part(plan.clone(), journal, sink.path())
+        self.ensure_destination_cache_capacity(plan.id())
             .map_err(Self::transfer_error)?;
-        receiver
-            .receive(&mut sink, chunk)
+        // Remove while mutating so every error path evicts the rolling state.
+        // Only an exact durable cursor match may reuse the retained handle.
+        let cached = self.transfer_receivers.remove(plan.id());
+        let mut active = match cached {
+            Some(cached) => {
+                if !cached.matches(p.epoch, p.fence, &journal) {
+                    return Err(Self::transfer_error(TransferError::CorruptJournal));
+                }
+                cached
+                    .sink
+                    .validate_cached_position(journal.bytes_received())
+                    .map_err(Self::transfer_error)?;
+                cached
+            }
+            None => self
+                .rebuild_destination_transfer(plan.clone(), journal.clone(), p.epoch, p.fence)
+                .map_err(Self::transfer_error)?,
+        };
+        active
+            .receiver
+            .receive(&mut active.sink, chunk)
             .map_err(Self::transfer_error)?;
-        let updated = receiver.journal_snapshot();
+        let updated = active.receiver.journal_snapshot();
+        #[cfg(test)]
+        self.maybe_inject_persist_fault(&self.transfer_journal_persist_fault, "transfer journal")?;
         self.transfer_store
             .save(&lease, &updated)
             .map_err(Self::transfer_error)?;
+        if updated.state() == JournalState::Receiving {
+            self.transfer_receivers.insert(plan.id().to_owned(), active);
+        }
         Ok(
             json!({ "plan_id": plan.id(), "state": updated.state(), "contiguous_ack": updated.contiguous_ack(), "bytes_received": updated.bytes_received(), "completed": updated.state() == JournalState::Completed }),
         )
@@ -3044,6 +3132,7 @@ full_user_access/full_access for arbitrary commands",
             })?;
         let workspace = self.workspace_for(Some(&p.workspace_id))?;
         if journal.published() {
+            self.transfer_receivers.remove(plan.id());
             let mut artifact = workspace
                 .open_verified_transfer_artifact_read(Path::new(
                     &plan.binding().destination_relative_path,
@@ -3070,6 +3159,10 @@ full_user_access/full_access for arbitrary commands",
                 message: "transfer is incomplete".into(),
             });
         }
+        // Only an exact terminal fence may release the retained append handle
+        // before publish. Stale or premature finalize requests cannot evict a
+        // healthy long-running receiver.
+        self.transfer_receivers.remove(plan.id());
         let lease = self
             .transfer_store
             .acquire(&plan, Self::now() as u64, authority.expires_at_unix)
@@ -3186,6 +3279,7 @@ full_user_access/full_access for arbitrary commands",
         {
             self.transfer_senders.remove(&p.plan_id);
             self.transfer_last_chunks.remove(&p.plan_id);
+            self.transfer_receivers.remove(&p.plan_id);
             return Ok(
                 json!({ "plan_id": p.plan_id, "cancelled": true, "source_only": true, "replayed": outcome.replayed }),
             );
@@ -3234,22 +3328,34 @@ full_user_access/full_access for arbitrary commands",
                 message: "completed or failed transfer cannot be cancelled".into(),
             });
         }
+        // Exact non-terminal fence/state has now been accepted. Stale cancel
+        // requests above cannot evict the active destination stream.
+        let cached_destination = self.transfer_receivers.remove(plan.id());
         let now = Self::now() as u64;
         let lease = self
             .transfer_store
             .acquire(&plan, now, authority.expires_at_unix)
             .map_err(Self::transfer_error)?;
-        let mut sink = PartFileSink::create(
-            &self.transfer_store,
-            &plan,
-            p.epoch,
-            journal.bytes_received(),
-        )
-        .map_err(Self::transfer_error)?;
-        let mut receiver = TransferReceiver::resume_from_part(plan.clone(), journal, sink.path())
+        let mut active = match cached_destination {
+            Some(cached) => {
+                if !cached.matches(p.epoch, p.fence, &journal) {
+                    return Err(Self::transfer_error(TransferError::CorruptJournal));
+                }
+                cached
+                    .sink
+                    .validate_cached_position(journal.bytes_received())
+                    .map_err(Self::transfer_error)?;
+                cached
+            }
+            None => self
+                .rebuild_destination_transfer(plan.clone(), journal.clone(), p.epoch, p.fence)
+                .map_err(Self::transfer_error)?,
+        };
+        active
+            .receiver
+            .cancel(&mut active.sink)
             .map_err(Self::transfer_error)?;
-        receiver.cancel(&mut sink).map_err(Self::transfer_error)?;
-        let updated = receiver.journal_snapshot();
+        let updated = active.receiver.journal_snapshot();
         self.transfer_store
             .save(&lease, &updated)
             .map_err(Self::transfer_error)?;
@@ -8053,6 +8159,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         self.sessions_persist_fault.store(nth, Ordering::SeqCst);
     }
 
+    /// Fault a destination journal save after its part write has completed.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn fail_transfer_journal_persist_on_nth_call_for_test(&self, nth: usize) {
+        self.transfer_journal_persist_fault
+            .store(nth, Ordering::SeqCst);
+    }
+
     /// Test helper: number of in-memory sessions.
     #[cfg(test)]
     #[allow(dead_code)]
@@ -8106,6 +8220,24 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
     /// for direct cloned-store callers.
     pub(crate) fn cleanup_expired_transfers(&mut self) -> Result<usize, String> {
         let now = Self::now() as u64;
+        // Release only stale destination handles before filesystem cleanup.
+        // Live exact-bound streams remain cached across the periodic sweep so
+        // a long transfer is not forced to rehash its prefix every interval.
+        let store = self.transfer_store.clone();
+        self.transfer_receivers.retain(|plan_id, cached| {
+            let Some(plan) = store.load_plan(plan_id, now).ok().flatten() else {
+                return false;
+            };
+            let Ok(journal) = store.load_for_fence(&plan, cached.epoch, cached.fence) else {
+                return false;
+            };
+            journal.expires_at_unix() > now
+                && cached.matches(cached.epoch, cached.fence, &journal)
+                && cached
+                    .sink
+                    .validate_cached_position(journal.bytes_received())
+                    .is_ok()
+        });
         let removed = self
             .transfer_store
             .cleanup_expired(now)
@@ -8955,6 +9087,259 @@ mod transfer_runtime_tests {
                 .is_ok(),
             "unrelated live sender must survive expired-transfer cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn destination_receiver_rehashes_once_per_process_and_ignores_stale_eviction() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let destination_root = temp.path().join("destination");
+        runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_destination".into(),
+                root: destination_root.clone(),
+                label: None,
+            })
+            .unwrap();
+        let mut bytes = vec![0_u8; MAX_CHUNK_BYTES * 5 + 17];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        std::fs::write(
+            paths.state_dir.join("workspace").join("cached-source.bin"),
+            &bytes,
+        )
+        .unwrap();
+        bind_remote_transfer(&mut runtime);
+        let client = remote_client();
+        let plan = runtime
+            .handle_transfer_plan(
+                Some(json!({
+                    "source_path": "cached-source.bin",
+                    "destination_path": "cached-output.bin",
+                    "destination_workspace_id": "ws_destination",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
+        runtime
+            .handle_transfer_destination_prepare(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "next_sequence": 0, "next_offset": 0, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.transfer_receivers.len(), 1);
+        assert_eq!(runtime.cleanup_expired_transfers().unwrap(), 0);
+        assert_eq!(runtime.transfer_receivers.len(), 1);
+        assert_eq!(
+            runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst),
+            1,
+            "periodic cleanup must retain an exact live receiver"
+        );
+        assert!(runtime
+            .handle_transfer_cancel(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2 })),
+                &client,
+            )
+            .await
+            .is_err());
+        assert!(runtime
+            .handle_transfer_finalize(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .is_err());
+        assert_eq!(runtime.transfer_receivers.len(), 1);
+        assert_eq!(
+            runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst),
+            1,
+            "stale cancel and premature finalize must not evict"
+        );
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        for sequence in 0..2_u64 {
+            let chunk = runtime
+                .handle_transfer_source_chunk(
+                    Some(json!({ "plan_id": plan_id, "sequence": sequence })),
+                    &client,
+                )
+                .await
+                .unwrap();
+            runtime
+                .handle_transfer_destination_chunk(
+                    Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination", "frame_base64": chunk["frame_base64"] })),
+                    &client,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst),
+            1,
+            "multiple chunks in one process must reuse one rolling hash"
+        );
+        drop(runtime);
+
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        bind_remote_transfer(&mut runtime);
+        runtime
+            .handle_transfer_destination_prepare(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "next_sequence": 2, "next_offset": MAX_CHUNK_BYTES * 2, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst),
+            1,
+            "restart performs exactly one bounded prefix rebuild"
+        );
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "sequence": 2, "offset": MAX_CHUNK_BYTES * 2, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        for sequence in 2..6_u64 {
+            let chunk = runtime
+                .handle_transfer_source_chunk(
+                    Some(json!({ "plan_id": plan_id, "sequence": sequence })),
+                    &client,
+                )
+                .await
+                .unwrap();
+            runtime
+                .handle_transfer_destination_chunk(
+                    Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination", "frame_base64": chunk["frame_base64"] })),
+                    &client,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst), 1);
+        assert!(runtime.transfer_receivers.is_empty());
+        runtime
+            .handle_transfer_finalize(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(destination_root.join("cached-output.bin")).unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn destination_save_failure_evicts_cache_and_fresh_fence_can_cancel() {
+        assert!(MAX_CACHED_DESTINATION_TRANSFERS <= JournalLimits::default().max_plans);
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_destination".into(),
+                root: temp.path().join("destination"),
+                label: None,
+            })
+            .unwrap();
+        std::fs::write(
+            paths.state_dir.join("workspace").join("fault-source.bin"),
+            vec![7_u8; MAX_CHUNK_BYTES + 1],
+        )
+        .unwrap();
+        bind_remote_transfer(&mut runtime);
+        let client = remote_client();
+        let plan = runtime
+            .handle_transfer_plan(
+                Some(json!({
+                    "source_path": "fault-source.bin",
+                    "destination_path": "fault-output.bin",
+                    "destination_workspace_id": "ws_destination",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
+        runtime
+            .handle_transfer_destination_prepare(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "next_sequence": 0, "next_offset": 0, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let chunk = runtime
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 0 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        runtime.fail_transfer_journal_persist_on_nth_call_for_test(1);
+        assert!(runtime
+            .handle_transfer_destination_chunk(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination", "frame_base64": chunk["frame_base64"] })),
+                &client,
+            )
+            .await
+            .is_err());
+        assert!(runtime.transfer_receivers.is_empty());
+        assert!(runtime
+            .handle_transfer_destination_chunk(
+                Some(json!({ "plan_id": plan_id, "epoch": 1, "fence": 1, "workspace_id": "ws_destination", "frame_base64": chunk["frame_base64"] })),
+                &client,
+            )
+            .await
+            .is_err());
+        runtime
+            .handle_transfer_destination_prepare(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2, "next_sequence": 0, "next_offset": 0, "workspace_id": "ws_destination" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst), 2);
+        runtime
+            .handle_transfer_cancel(
+                Some(json!({ "plan_id": plan_id, "epoch": 2, "fence": 2 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert!(runtime.transfer_receivers.is_empty());
+        assert_eq!(
+            runtime.transfer_receiver_rebuilds.load(Ordering::SeqCst),
+            2,
+            "exact cancel uses the retained receiver without another rehash"
+        );
+        assert!(!paths
+            .state_dir
+            .join("transfers")
+            .join(format!(".{plan_id}.2.part"))
+            .exists());
     }
 
     #[cfg(windows)]

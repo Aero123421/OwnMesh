@@ -808,6 +808,10 @@ impl TransferJournal {
     pub const fn fence(&self) -> u64 {
         self.fence
     }
+    #[must_use]
+    pub const fn expires_at_unix(&self) -> u64 {
+        self.expires_at_unix
+    }
 
     #[must_use]
     pub const fn published(&self) -> bool {
@@ -2540,6 +2544,25 @@ impl PartFileSink {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Cheaply revalidate a process-local cached sink before another chunk is
+    /// allowed to use it. The durable journal is still authoritative; this
+    /// check only proves the retained owner-created regular-file handle and
+    /// its append cursor have not diverged from that journal.
+    pub fn validate_cached_position(&self, expected_offset: u64) -> TransferResult<()> {
+        if self.closed || self.expected_offset != expected_offset {
+            return Err(TransferError::CorruptJournal);
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or(TransferError::CustodyUnavailable)?;
+        validate_retained_file(file)?;
+        if file.metadata().map_err(io_error)?.len() != expected_offset {
+            return Err(TransferError::CorruptJournal);
+        }
+        Ok(())
     }
 
     /// Verify a fully staged generation before treating an at-size Room cursor
