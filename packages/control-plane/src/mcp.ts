@@ -2051,6 +2051,8 @@ function toolCapability(toolName: string): string {
       return "operation.cancel";
     case "__transfer_artifact_get":
       return "transfer.artifact_get";
+    case "__transfer_source_cleanup":
+      return "transfer.source_cleanup";
     default:
       return op;
   }
@@ -2134,6 +2136,8 @@ function toolAction(toolName: string): string {
       return "cancel";
     case "__transfer_artifact_get":
       return "transfer.artifact_get";
+    case "__transfer_source_cleanup":
+      return "transfer.source_cleanup";
     default:
       return op;
   }
@@ -2580,6 +2584,10 @@ export type TransferPlanMeta = {
   live_ticket_deadline_ms?: number;
   source_cancel_operation_id?: string;
   destination_cancel_operation_id?: string;
+  source_cleanup_control_operation_id?: string;
+  source_cleanup_operation_id?: string;
+  source_cleanup_attempts?: number;
+  source_cleanup_retry_after_ms?: number;
   cancellation_idempotency_key?: string;
   destination_plan_id?: string;
   pair_generation?: number;
@@ -2587,7 +2595,7 @@ export type TransferPlanMeta = {
   source_size_bytes?: number;
   source_sha256?: string;
   send_idempotency_key?: string;
-  state: "planned" | "source_preflight" | "source_final_preflight" | "destination_preflight" | "ready" | "sending" | "cancelling" | "completed" | "cancelled" | "failed";
+  state: "planned" | "source_preflight" | "source_final_preflight" | "destination_preflight" | "ready" | "sending" | "source_cleanup" | "cancelling" | "completed" | "cancelled" | "failed";
 };
 
 const TRANSFER_META_KEY = "__ownmesh_transfer_plan";
@@ -2623,7 +2631,7 @@ function transferMeta(data: Record<string, unknown> | null | undefined): Transfe
   const fields = ["transfer_id", "tenant_id", "principal_id", "source_device_id", "destination_device_id", "source_workspace_id", "destination_workspace_id", "expires_at"];
   if (fields.some((key) => !transferText(value[key]))) return null;
   if (!transferPath(value.source_path) || !transferPath(value.destination_path)) return null;
-  if (!["planned", "source_preflight", "source_final_preflight", "destination_preflight", "ready", "sending", "cancelling", "completed", "cancelled", "failed"].includes(String(value.state))) return null;
+  if (!["planned", "source_preflight", "source_final_preflight", "destination_preflight", "ready", "sending", "source_cleanup", "cancelling", "completed", "cancelled", "failed"].includes(String(value.state))) return null;
   const epoch = Number(value.epoch); const fence = Number(value.fence);
   const sv = Number(value.source_workspace_version); const dv = Number(value.destination_workspace_version);
   const ttl = Number(value.ttl_seconds);
@@ -2640,6 +2648,8 @@ function transferMeta(data: Record<string, unknown> | null | undefined): Transfe
   }
   if (value.live_ticket_deadline_ms !== undefined && (!Number.isSafeInteger(value.live_ticket_deadline_ms) || Number(value.live_ticket_deadline_ms) <= 0)) return null;
   if (value.pair_generation !== undefined && (!Number.isSafeInteger(value.pair_generation) || Number(value.pair_generation) < 1)) return null;
+  if (value.source_cleanup_attempts !== undefined && (!Number.isSafeInteger(value.source_cleanup_attempts) || Number(value.source_cleanup_attempts) < 0 || Number(value.source_cleanup_attempts) > 8)) return null;
+  if (value.source_cleanup_retry_after_ms !== undefined && (!Number.isSafeInteger(value.source_cleanup_retry_after_ms) || Number(value.source_cleanup_retry_after_ms) < 1)) return null;
   if (value.source_size_bytes !== undefined && (!Number.isSafeInteger(value.source_size_bytes) || Number(value.source_size_bytes) < 0)) return null;
   if (value.source_sha256 !== undefined && (typeof value.source_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.source_sha256))) return null;
   return value as unknown as TransferPlanMeta;
@@ -2654,6 +2664,7 @@ function publicTransferMeta(meta: TransferPlanMeta): Record<string, unknown> {
     source_workspace_id: meta.source_workspace_id, destination_workspace_id: meta.destination_workspace_id,
     plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: meta.expires_at,
     ...(meta.state === "completed" ? { destination_plan_id: meta.destination_plan_id } : {}),
+    ...(meta.state === "source_cleanup" ? { destination_plan_id: meta.destination_plan_id, cleanup_pending: true } : {}),
   };
 }
 
@@ -2800,12 +2811,122 @@ async function transferAuthorities(
   return { ok: true };
 }
 
+type TransferCleanupContext = {
+  router: OperationRouter;
+  principal: string;
+  tenant: string;
+  clientId: string;
+  principalCredentialGeneration: number;
+};
+
+async function routeStoredTransferControl(
+  operation: McpOperationRecord,
+  deviceId: string,
+  context: TransferCleanupContext,
+): Promise<void> {
+  const outbox = readDispatchOutbox(operation.data);
+  if (!outbox || outbox.non_redeliverable) return;
+  try { await context.router.routeToDevice(deviceId, outbox.body); } catch { /* durable pending outbox retries */ }
+}
+
+async function reconcilePublishedSourceCleanup(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  plan: TrackedOperation,
+  meta: TransferPlanMeta,
+  context?: TransferCleanupContext,
+): Promise<{ plan: TrackedOperation; meta: TransferPlanMeta }> {
+  if (meta.state !== "source_cleanup" || !context || !meta.source_start_operation_id || !meta.source_plan_id) return { plan, meta };
+  const source = await store.getMcpOperation(meta.source_start_operation_id);
+  if (meta.source_cleanup_retry_after_ms && Date.now() < meta.source_cleanup_retry_after_ms) return { plan, meta };
+  const complete = async () => {
+    const completed: TransferPlanMeta = { ...meta, state: "completed" };
+    const updated = await patchOp(store, tracker, plan.operation_id, {
+      status: "completed", summary: "destination publication confirmed and source custody cleaned",
+      data: { [TRANSFER_META_KEY]: completed },
+    }, ["running", "pending"]);
+    return updated ? { plan: updated, meta: completed } : { plan, meta };
+  };
+
+  if (meta.source_cleanup_operation_id) {
+    const cleanup = await store.getMcpOperation(meta.source_cleanup_operation_id);
+    if (cleanup?.status === "completed" && cleanup.data.cleaned === true
+      && cleanup.data.plan_id === meta.source_plan_id && cleanup.data.source_only === true) return complete();
+    if (cleanup?.status === "pending" || cleanup?.status === "running") {
+      if (cleanup.expires_at && Date.parse(cleanup.expires_at) <= Date.now()) {
+        await store.updateMcpOperation(cleanup.operation_id, { status: "failed", summary: "source cleanup operation expired" }, ["pending", "running"]);
+      } else {
+      await routeStoredTransferControl(cleanup, meta.source_device_id, context);
+      return { plan, meta };
+      }
+    }
+    if (cleanup && ["failed", "denied", "device_offline", "cancelled"].includes(cleanup.status)
+      && (meta.source_cleanup_attempts || 0) >= 8) {
+      const pending: TransferPlanMeta = { ...meta, source_cleanup_operation_id: undefined, source_cleanup_attempts: 0, source_cleanup_retry_after_ms: Date.now() + 5_000 };
+      const updated = await patchOp(store, tracker, plan.operation_id, {
+        status: "running", summary: "destination published; source cleanup remains pending after bounded retries",
+        data: { [TRANSFER_META_KEY]: pending },
+      }, ["running", "pending"]);
+      return updated ? { plan: updated, meta: pending } : { plan, meta };
+    }
+  }
+
+  if (!meta.source_cleanup_control_operation_id) {
+    const operationId = randomId("op_");
+    const idempotencyKey = `transfer-source-stop:${meta.transfer_id}:${meta.source_start_operation_id}`;
+    const deviceOp = await buildDeviceOperation({
+      toolName: "ownmesh_cancel_operation", operationId, deviceId: meta.source_device_id,
+      principalId: context.principal, tenantId: context.tenant, expiresAt: meta.expires_at,
+      principalCredentialGeneration: context.principalCredentialGeneration, oauthClientId: context.clientId,
+      workspaceBinding: { workspace_id: meta.source_workspace_id, version: meta.source_workspace_version },
+      args: { target_operation_id: meta.source_start_operation_id, idempotency_key: idempotencyKey },
+    });
+    await store.putMcpOperation({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_cancel_control", status: "pending", summary: "published transfer source stop requested", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, target_operation_id: meta.source_start_operation_id }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
+    const next: TransferPlanMeta = { ...meta, source_cleanup_control_operation_id: operationId };
+    const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "destination published; stopping source transfer", data: { [TRANSFER_META_KEY]: next } }, ["running", "pending"]);
+    if (updated) await routeStoredTransferControl(await store.getMcpOperation(operationId) as McpOperationRecord, meta.source_device_id, context);
+    return updated ? { plan: updated, meta: next } : { plan, meta };
+  }
+
+  const control = await store.getMcpOperation(meta.source_cleanup_control_operation_id);
+  if (control?.status === "pending" || control?.status === "running") {
+    if (control.expires_at && Date.parse(control.expires_at) <= Date.now()) {
+      await store.updateMcpOperation(control.operation_id, { status: "failed", summary: "source stop control expired" }, ["pending", "running"]);
+    } else {
+    await routeStoredTransferControl(control, meta.source_device_id, context);
+    return { plan, meta };
+    }
+  }
+  if (control?.status === "completed" && control.data.signal_delivered === true
+    && source?.status === "cancelled") return complete();
+  if (control?.status === "completed" && control.data.signal_delivered === true
+    && (source?.status === "pending" || source?.status === "running")) return { plan, meta };
+
+  const attempts = (meta.source_cleanup_attempts || 0) + 1;
+  const operationId = randomId("op_");
+  const idempotencyKey = `transfer-source-cleanup:${meta.transfer_id}:${attempts}`;
+  const deviceOp = await buildDeviceOperation({
+    toolName: "__transfer_source_cleanup", operationId, deviceId: meta.source_device_id,
+    principalId: context.principal, tenantId: context.tenant, expiresAt: meta.expires_at,
+    principalCredentialGeneration: context.principalCredentialGeneration, oauthClientId: context.clientId,
+    workspaceBinding: { workspace_id: meta.source_workspace_id, version: meta.source_workspace_version },
+    args: { plan_id: meta.source_plan_id, epoch: meta.epoch, fence: meta.fence, idempotency_key: idempotencyKey },
+  });
+  await store.putMcpOperation({ operation_id: operationId, tenant_id: context.tenant, principal_id: context.principal, device_id: meta.source_device_id, tool: "__transfer_source_cleanup", status: "pending", summary: "source transfer custody cleanup", data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: meta.transfer_id, plan_id: meta.source_plan_id }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: idempotencyKey, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
+  const next: TransferPlanMeta = { ...meta, source_cleanup_operation_id: operationId, source_cleanup_attempts: attempts, source_cleanup_retry_after_ms: undefined };
+  const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "source transfer custody cleanup dispatched", data: { [TRANSFER_META_KEY]: next } }, ["running", "pending"]);
+  if (updated) await routeStoredTransferControl(await store.getMcpOperation(operationId) as McpOperationRecord, meta.source_device_id, context);
+  return updated ? { plan: updated, meta: next } : { plan, meta };
+}
+
 /** Reconcile only server-owned start-operation outcomes. The plan is never
  * completed merely because dispatch was accepted: both Agents must report a
  * terminal successful start/finalize result under the exact plan binding. */
 async function reconcileTransferStart(
   store: ControlPlaneStore, tracker: OperationTracker, plan: TrackedOperation, meta: TransferPlanMeta,
+  cleanupContext?: TransferCleanupContext,
 ): Promise<{ plan: TrackedOperation; meta: TransferPlanMeta }> {
+  if (meta.state === "source_cleanup") return reconcilePublishedSourceCleanup(store, tracker, plan, meta, cleanupContext);
   if (meta.state !== "sending" || !meta.source_start_operation_id || !meta.destination_start_operation_id) return { plan, meta };
   const [source, destination] = await Promise.all([
     store.getMcpOperation(meta.source_start_operation_id), store.getMcpOperation(meta.destination_start_operation_id),
@@ -2820,8 +2941,16 @@ async function reconcileTransferStart(
   // after the receiver atomically published.  The transfer is already terminal
   // in the Room, so minting an epoch+1 pair would be both useless and unsafe.
   else if (destination?.status === "completed" && destinationPublishedReceipt(destination, meta)
-    && source?.status === "failed" && retryableTransferStartFailure(source)) {
-    nextState = "completed"; status = "completed"; summary = "destination publication confirmed after source reply loss";
+    && source?.status !== "completed") {
+    const destinationPlanId = transferText(destination.data?.plan_id);
+    if (!destinationPlanId) { nextState = "failed"; status = "failed"; summary = "destination publication omitted immutable plan id"; }
+    else {
+      const cleanup: TransferPlanMeta = { ...meta, state: "source_cleanup", destination_plan_id: destinationPlanId };
+      const updated = await patchOp(store, tracker, plan.operation_id, { status: "running", summary: "destination publication confirmed; source cleanup required", data: { [TRANSFER_META_KEY]: cleanup } }, ["pending", "running"]);
+      return updated
+        ? reconcilePublishedSourceCleanup(store, tracker, updated, cleanup, cleanupContext)
+        : { plan, meta };
+    }
   }
   else if (states.some((state) => state === "denied" || state === "device_offline") || [source, destination].some((op) => op?.status === "failed" && !retryableTransferStartFailure(op))) { nextState = "failed"; status = "failed"; summary = "transfer execution failed"; }
   else if (source?.status === "completed" && destination?.status === "completed") {
@@ -2843,7 +2972,8 @@ function retryableTransferStartFailure(op: McpOperationRecord | null): boolean {
   if (!op || op.status !== "failed") return false;
   const error = op.data?.error;
   const code = error && typeof error === "object" ? String((error as Record<string, unknown>).code || "") : "";
-  return code === "OWNMESH_E_TRANSFER_RECONNECT" || code === "OWNMESH_E_TRANSFER_SESSION_LOST";
+  return code === "OWNMESH_E_TRANSFER_RECONNECT" || code === "OWNMESH_E_TRANSFER_SESSION_LOST"
+    || code === "OWNMESH_E_TRANSFER_CLEANUP_PENDING";
 }
 
 /** Atomically claim the one live start pair for an authenticated preflight
@@ -3290,7 +3420,10 @@ export async function handleMcp(
       if (meta.tenant_id !== rec.tenant_id || meta.principal_id !== rec.principal) {
         return mcpError(id, -32004, "transfer_not_available");
       }
-      ({ plan, meta } = await reconcileTransferStart(store, tracker, plan, meta));
+      ({ plan, meta } = await reconcileTransferStart(store, tracker, plan, meta, router ? {
+        router, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id,
+        principalCredentialGeneration,
+      } : undefined));
       ({ plan, meta } = await reconcileTransferCancellation(store, tracker, plan, meta));
       const authority = await transferAuthorities(store, meta, rec.principal, rec.tenant_id);
       if (!authority.ok && name !== "ownmesh_transfer_status") return mcpError(id, -32004, authority.error);
@@ -3301,7 +3434,7 @@ export async function handleMcp(
         if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 65536) return mcpError(id, -32602, "invalid artifact page arguments");
         // No fallback to fs.read is allowed: this is an immutable transfer-plan
         // artifact read with destination workspace/version custody rechecked.
-        if (meta.state !== "completed" || !meta.destination_plan_id || !meta.source_sha256
+        if ((meta.state !== "completed" && meta.state !== "source_cleanup") || !meta.destination_plan_id || !meta.source_sha256
           || meta.source_size_bytes === undefined || !router) {
           return mcpError(id, -32009, "transfer artifact is not available", { transfer: publicTransferMeta(meta), max_bytes: 65536 });
         }
@@ -3551,7 +3684,10 @@ export async function handleMcp(
         let candidate = await loadOp(store, tracker, item.operation_id);
         let transfer = candidate?.tool === "ownmesh_transfer_plan" ? transferMeta(candidate.data) : null;
         if (!candidate || !transfer || candidate.principal !== rec.principal || candidate.tenant_id !== rec.tenant_id) continue;
-        ({ plan: candidate, meta: transfer } = await reconcileTransferStart(store, tracker, candidate, transfer));
+        ({ plan: candidate, meta: transfer } = await reconcileTransferStart(store, tracker, candidate, transfer, router ? {
+          router, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id,
+          principalCredentialGeneration,
+        } : undefined));
         ({ plan: candidate, meta: transfer } = await reconcileTransferCancellation(store, tracker, candidate, transfer));
         transfers.push({ operation_id: candidate.operation_id, created_at: candidate.created_at || item.created_at, ...publicTransferMeta(transfer) });
       }

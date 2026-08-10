@@ -3005,6 +3005,25 @@ function sanitizeTransferCancelControlResult(
   return { data: { target_operation_id: expectedTarget, cancelled: raw.cancelled, signal_delivered: raw.signal_delivered } };
 }
 
+function sanitizeTransferSourceCleanupResult(
+  op: McpOperationRecord,
+  payload: Record<string, unknown>,
+): { data: Record<string, unknown> } | { error: string } {
+  const result = payload.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return { error: "transfer_source_cleanup_result_invalid" };
+  const raw = result as Record<string, unknown>;
+  const expectedPlan = op.data.plan_id;
+  const allowed = ["plan_id", "cancelled", "source_only", "replayed", "state"];
+  if (Object.keys(raw).some((key) => !allowed.includes(key))
+    || typeof expectedPlan !== "string" || raw.plan_id !== expectedPlan
+    || raw.cancelled !== true || raw.source_only !== true
+    || (raw.replayed !== undefined && typeof raw.replayed !== "boolean")
+    || (raw.state !== undefined && typeof raw.state !== "string")) {
+    return { error: "transfer_source_cleanup_result_binding_mismatch" };
+  }
+  return { data: { plan_id: expectedPlan, cleaned: true, source_only: true } };
+}
+
 /** Internal transfer coordination is not a diagnostic channel.  The device can
  * report an ordinary completion only through the tool-specific validators
  * above; every other outcome uses these fixed summaries and bounded data. */
@@ -3015,7 +3034,8 @@ function isInternalTransferTool(tool: string): boolean {
     || tool === "__transfer_preflight_source_final"
     || tool === "__transfer_preflight_destination"
     || tool === "__transfer_artifact_get"
-    || tool === "__transfer_cancel_control";
+    || tool === "__transfer_cancel_control"
+    || tool === "__transfer_source_cleanup";
 }
 
 function internalTransferFailureSummary(tool: string, status: string): string {
@@ -3028,6 +3048,9 @@ function internalTransferFailureSummary(tool: string, status: string): string {
   }
   if (tool === "__transfer_cancel_control") {
     return needsApproval ? "transfer cancellation control requires approval" : "transfer cancellation control failed";
+  }
+  if (tool === "__transfer_source_cleanup") {
+    return needsApproval ? "transfer source cleanup requires approval" : "transfer source cleanup failed";
   }
   return needsApproval ? "transfer start requires approval" : "transfer start failed";
 }
@@ -3268,7 +3291,8 @@ export async function applyMcpOperationResult(
       // and fence after a real Agent/Room disconnect. Never retain the Agent
       // message, details, ticket, keys, paths, or byte-shaped diagnostics.
       const code = errCode === "OWNMESH_E_TRANSFER_RECONNECT"
-        || errCode === "OWNMESH_E_TRANSFER_SESSION_LOST" ? errCode : "";
+        || errCode === "OWNMESH_E_TRANSFER_SESSION_LOST"
+        || errCode === "OWNMESH_E_TRANSFER_CLEANUP_PENDING" ? errCode : "";
       // An approval must not retain the Agent-provided approval payload. It is
       // a terminal coordinator state; the durable status bit is sufficient.
       data = status !== "approval_required" && code ? { error: { code } } : {};
@@ -3280,6 +3304,16 @@ export async function applyMcpOperationResult(
   if (op.tool === "__transfer_cancel_control") {
     if (status === "completed") {
       const sanitized = sanitizeTransferCancelControlResult(op, payload);
+      if ("error" in sanitized) return { ok: false, error: sanitized.error };
+      data = sanitized.data;
+    } else {
+      data = {};
+      safeSummary = internalTransferFailureSummary(op.tool, status);
+    }
+  }
+  if (op.tool === "__transfer_source_cleanup") {
+    if (status === "completed") {
+      const sanitized = sanitizeTransferSourceCleanupResult(op, payload);
       if ("error" in sanitized) return { ok: false, error: sanitized.error };
       data = sanitized.data;
     } else {

@@ -128,18 +128,41 @@ test("integrity failure is terminal and never rekeys a transfer", async () => {
   assert.equal(transfer.state, "failed"); assert.equal(transfer.epoch, 1); assert.equal(f.routed.length, 0);
 });
 
-test("source reply loss after authenticated destination publication converges without rekey", async () => {
+test("source reply loss after destination publication completes only after exact source cleanup", async () => {
   const f = await fixture();
   const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "published-loss-plan" });
   const transferId = created.result!.structuredContent!.operation_id;
   const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
   const meta = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
-  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: { ...meta, state: "sending", source_sha256: "d".repeat(64), source_size_bytes: 7, source_start_operation_id: "op_lost_source", destination_start_operation_id: "op_published_destination", source_start_routed: true, destination_start_routed: true } } });
+  await f.store.updateMcpOperation(transferId, { status: "running", data: { __ownmesh_transfer_plan: { ...meta, state: "sending", source_plan_id: "plan_source", source_sha256: "d".repeat(64), source_size_bytes: 7, source_start_operation_id: "op_lost_source", destination_start_operation_id: "op_published_destination", source_start_routed: true, destination_start_routed: true } } });
   await f.store.putMcpOperation({ ...parent, operation_id: "op_lost_source", correlation_id: "op_lost_source", device_id: "dev_source", tool: "__transfer_start_source", status: "failed", summary: "finish ack lost", data: { error: { code: "OWNMESH_E_TRANSFER_SESSION_LOST" } }, idempotency_key: "op_lost_source", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   await f.store.putMcpOperation({ ...parent, operation_id: "op_published_destination", correlation_id: "op_published_destination", device_id: "dev_destination", tool: "__transfer_start_destination", status: "completed", summary: "published", data: { transfer_id: transferId, plan_id: "plan_destination", role: "destination", published: true, completed: true, artifact_sha256: "d".repeat(64) }, idempotency_key: "op_published_destination", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  const status = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
-  const transfer = status.result!.structuredContent!.data.transfer as Record<string, unknown>;
-  assert.equal(transfer.state, "completed"); assert.equal(transfer.epoch, 1); assert.equal(f.routed.length, 0);
+  const pending = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+  const pendingTransfer = pending.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(pendingTransfer.state, "source_cleanup"); assert.equal(pendingTransfer.epoch, 1);
+  assert.equal((f.routed.at(-1)!.operation.payload as Record<string, unknown>).capability, "operation.cancel");
+  let current = await f.store.getMcpOperation(transferId); assert.ok(current);
+  let currentMeta = current.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  assert.equal(typeof currentMeta.source_cleanup_control_operation_id, "string");
+  await f.store.updateMcpOperation(currentMeta.source_cleanup_control_operation_id!, {
+    status: "completed", summary: "source task already gone",
+    data: { target_operation_id: "op_lost_source", cancelled: false, signal_delivered: false },
+  }, ["pending"]);
+
+  const cleaning = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+  assert.equal((cleaning.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "source_cleanup");
+  const cleanupPayload = f.routed.at(-1)!.operation.payload as Record<string, unknown>;
+  assert.equal(cleanupPayload.capability, "transfer.source_cleanup");
+  current = await f.store.getMcpOperation(transferId); assert.ok(current);
+  currentMeta = current.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  assert.equal(typeof currentMeta.source_cleanup_operation_id, "string");
+  await f.store.updateMcpOperation(currentMeta.source_cleanup_operation_id!, {
+    status: "completed", summary: "source custody cleaned",
+    data: { plan_id: "plan_source", cleaned: true, source_only: true },
+  }, ["pending"]);
+  const completed = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+  const completedTransfer = completed.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(completedTransfer.state, "completed"); assert.equal(completedTransfer.epoch, 1);
 });
 
 test("cancel fans out exact generic cancel controls and never retries them as a send", async () => {

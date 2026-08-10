@@ -1536,6 +1536,12 @@ test("transfer start receipts reject bearer/byte fields and require exact immuta
   assert.equal(storedReconnect?.summary, "transfer start requires a fresh connection proof");
   assert.equal(JSON.stringify(storedReconnect).includes("distinctive-ticket-secret"), false);
   assert.equal(JSON.stringify(storedReconnect).includes("must-not-persist"), false);
+
+  const cleanupPendingId = randomId("op_");
+  await store.putMcpOperation({ operation_id: cleanupPendingId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_source", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: cleanupPendingId, workspace_id: "ws_source", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const cleanupPending = await applyMcpOperationResult(store, { operationId: cleanupPendingId, correlationId: cleanupPendingId, deviceId, payload: { operation_id: cleanupPendingId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_CLEANUP_PENDING", message: "distinctive-cleanup-path", details: { path: "must-not-persist" } } } });
+  assert.equal(cleanupPending.ok, true);
+  assert.deepEqual((await store.getMcpOperation(cleanupPendingId))?.data, { error: { code: "OWNMESH_E_TRANSFER_CLEANUP_PENDING" } });
 });
 
 test("transfer cancel controls persist only target-bound cleanup proof", async () => {
@@ -1550,6 +1556,20 @@ test("transfer cancel controls persist only target-bound cleanup proof", async (
   assert.deepEqual((await store.getMcpOperation(opId))?.data, { target_operation_id: target, cancelled: false, signal_delivered: false });
 });
 
+test("source cleanup persists only an exact plan-bound completion receipt", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_cleanup_source_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const planId = "xfer_source_cleanup_01";
+  await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_source_cleanup", status: "pending", summary: "cleanup", data: { plan_id: planId }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: opId, workspace_id: "ws_source", policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const substituted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: "xfer_other", cancelled: true, source_only: true } } });
+  assert.deepEqual(substituted, { ok: false, error: "transfer_source_cleanup_result_binding_mismatch" });
+  const injected = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true, path: "secret/path" } } });
+  assert.deepEqual(injected, { ok: false, error: "transfer_source_cleanup_result_binding_mismatch" });
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true } } });
+  assert.equal(accepted.ok, true);
+  assert.deepEqual((await store.getMcpOperation(opId))?.data, { plan_id: planId, cleaned: true, source_only: true });
+});
+
 test("internal transfer errors and approvals never persist Agent diagnostics", async () => {
   const { db, store } = openSqliteAdapter(); await store.ensureBootstrap();
   const deviceId = "dev_transfer_redaction_01"; await seedActiveDevice(store, deviceId);
@@ -1561,6 +1581,7 @@ test("internal transfer errors and approvals never persist Agent diagnostics", a
     "__transfer_preflight_destination",
     "__transfer_artifact_get",
     "__transfer_cancel_control",
+    "__transfer_source_cleanup",
   ];
   const modes = [
     { name: "approval", status: "failed", approval: true },
