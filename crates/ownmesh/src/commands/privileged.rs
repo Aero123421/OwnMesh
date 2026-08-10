@@ -42,7 +42,7 @@ fn run_uninstall(cli: &Cli) -> Result<(), ExitCode> {
     run_native_backend(cli, "privileged broker uninstall", &["uninstall"])
 }
 
-fn run_native_backend(cli: &Cli, command: &str, _args: &[&str]) -> Result<(), ExitCode> {
+fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), ExitCode> {
     #[cfg(target_os = "linux")]
     {
         if !effective_uid_is_root() {
@@ -58,7 +58,7 @@ fn run_native_backend(cli: &Cli, command: &str, _args: &[&str]) -> Result<(), Ex
             eprintln!("{e}");
             ExitCode::UsageConfig
         })?;
-        let output = Command::new(broker).args(_args).output().map_err(|e| {
+        let output = Command::new(broker).args(args).output().map_err(|e| {
             eprintln!("run native broker backend: {e}");
             ExitCode::UsageConfig
         })?;
@@ -77,7 +77,7 @@ fn run_native_backend(cli: &Cli, command: &str, _args: &[&str]) -> Result<(), Ex
             eprintln!("{e}");
             ExitCode::UsageConfig
         })?;
-        let output = Command::new(broker).args(_args).output().map_err(|e| {
+        let output = Command::new(broker).args(args).output().map_err(|e| {
             eprintln!("run native broker backend: {e}");
             ExitCode::UsageConfig
         })?;

@@ -132,6 +132,7 @@ pub fn endpoint_kind_peer_enforceable(kind: &str) -> bool {
 
 /// Install using this executable and a sibling `ownmeshd` image.  Distribution
 /// archives intentionally place those two files together.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::needless_pass_by_value))]
 pub fn install_broker(
     base: &Path,
     endpoint_override: Option<BrokerEndpoint>,
