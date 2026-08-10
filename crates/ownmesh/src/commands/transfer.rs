@@ -6,14 +6,46 @@
 
 use crate::auth::{load_access_token, open_secret_store, resolve_issuer, SessionPaths};
 use crate::cli::{Cli, TransferCmd};
-use ownmesh_domain::ExitCode;
+use ownmesh_domain::{ErrorCode, ExitCode};
+use reqwest::header::CONTENT_TYPE;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 const MAX_TEXT_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
+const MAX_MCP_RESPONSE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug)]
+struct TransferFailure {
+    code: ErrorCode,
+    message: String,
+    hint: Option<&'static str>,
+}
+
+impl TransferFailure {
+    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    fn with_hint(mut self, hint: &'static str) -> Self {
+        self.hint = Some(hint);
+        self
+    }
+
+    const fn exit_code(&self) -> ExitCode {
+        self.code.exit_code()
+    }
+}
 
 pub fn dispatch_transfer(cli: &Cli, cmd: &TransferCmd) -> Result<(), ExitCode> {
+    dispatch_transfer_inner(cli, cmd).map_err(|failure| emit_failure(cli, &failure))
+}
+
+fn dispatch_transfer_inner(cli: &Cli, cmd: &TransferCmd) -> Result<(), TransferFailure> {
     let (tool, args) = match cmd {
         TransferCmd::Plan {
             source,
@@ -89,24 +121,26 @@ pub fn dispatch_transfer(cli: &Cli, cmd: &TransferCmd) -> Result<(), ExitCode> {
     run_mcp_tool(cli, tool, args)
 }
 
-fn validate_text(name: &str, value: &str) -> Result<(), ExitCode> {
+fn validate_text(name: &str, value: &str) -> Result<(), TransferFailure> {
     let valid = !value.is_empty()
         && value == value.trim()
-        && value.len() <= MAX_TEXT_BYTES
+        && utf8_byte_len(value) <= MAX_TEXT_BYTES
         && !value.bytes().any(|byte| byte.is_ascii_control());
     if valid {
         return Ok(());
     }
-    eprintln!(
-        "invalid {name}: must be a trimmed, non-control string of at most {MAX_TEXT_BYTES} bytes"
-    );
-    Err(ExitCode::UsageConfig)
+    Err(TransferFailure::new(
+        ErrorCode::InvalidArgument,
+        format!(
+            "invalid {name}: must be a trimmed, non-control string of at most {MAX_TEXT_BYTES} UTF-8 bytes"
+        ),
+    ))
 }
 
-fn validate_path(name: &str, value: &str) -> Result<(), ExitCode> {
+fn validate_path(name: &str, value: &str) -> Result<(), TransferFailure> {
     let valid = !value.is_empty()
         && value == value.trim()
-        && value.len() <= MAX_PATH_BYTES
+        && utf8_byte_len(value) <= MAX_PATH_BYTES
         && !value.starts_with(['/', '\\'])
         && !value.contains('\\')
         && !value.bytes().any(|byte| byte.is_ascii_control())
@@ -116,48 +150,50 @@ fn validate_path(name: &str, value: &str) -> Result<(), ExitCode> {
     if valid {
         return Ok(());
     }
-    eprintln!(
-        "invalid {name} path: use a non-empty workspace-relative slash path without traversal"
-    );
-    Err(ExitCode::UsageConfig)
+    Err(TransferFailure::new(
+        ErrorCode::InvalidArgument,
+        format!(
+            "invalid {name} path: use at most {MAX_PATH_BYTES} UTF-8 bytes in a non-empty workspace-relative slash path without traversal"
+        ),
+    ))
 }
 
-fn run_mcp_tool(cli: &Cli, tool: &str, arguments: Value) -> Result<(), ExitCode> {
+const fn utf8_byte_len(value: &str) -> usize {
+    // Rust strings are UTF-8; `str::len` is bytes, not Unicode scalar values.
+    value.len()
+}
+
+fn run_mcp_tool(cli: &Cli, tool: &str, arguments: Value) -> Result<(), TransferFailure> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|err| {
-            eprintln!("failed to start async runtime: {err}");
-            ExitCode::Internal
+            TransferFailure::new(
+                ErrorCode::Internal,
+                format!("failed to start async runtime: {err}"),
+            )
         })?;
     runtime.block_on(async {
-        let paths = SessionPaths::discover().map_err(|err| {
-            eprintln!("path error: {err}");
-            ExitCode::UsageConfig
-        })?;
+        let paths = SessionPaths::discover()
+            .map_err(|err| TransferFailure::new(ErrorCode::Config, format!("path error: {err}")))?;
         let store = open_secret_store(&paths.paths).map_err(|err| {
-            eprintln!("keychain error: {err}");
-            ExitCode::Internal
+            TransferFailure::new(ErrorCode::Internal, format!("keychain error: {err}"))
         })?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|err| {
-                eprintln!("http client error: {err}");
-                ExitCode::Internal
+                TransferFailure::new(ErrorCode::Internal, format!("http client error: {err}"))
             })?;
         let (access, session) = load_access_token(&paths, &store, &http)
             .await
             .map_err(|err| {
-                eprintln!("{err}");
-                eprintln!("hint: run `ownmesh login` first");
-                ExitCode::Authentication
+                TransferFailure::new(ErrorCode::Authentication, err.to_string())
+                    .with_hint("run `ownmesh login` first")
             })?;
-        let issuer = resolve_issuer(&session).map_err(|err| {
-            eprintln!("{err}");
-            ExitCode::UsageConfig
-        })?;
+        let issuer = resolve_issuer(&session)
+            .map_err(|err| TransferFailure::new(ErrorCode::Config, err.to_string()))?;
         let endpoint = format!("{issuer}/mcp");
         let request = json!({
             "jsonrpc": "2.0",
@@ -173,37 +209,42 @@ fn run_mcp_tool(cli: &Cli, tool: &str, arguments: Value) -> Result<(), ExitCode>
             .send()
             .await
             .map_err(|err| {
-                eprintln!("control-plane request failed: {err}");
-                ExitCode::DeviceOffline
+                TransferFailure::new(
+                    ErrorCode::DeviceOffline,
+                    format!("control-plane request failed: {err}"),
+                )
             })?;
         let status = response.status();
-        let body: Value = response.json().await.map_err(|err| {
-            eprintln!("invalid control-plane response: {err}");
-            ExitCode::Internal
-        })?;
+        let body = read_response_json(response).await?;
         if !status.is_success() {
-            eprintln!(
-                "control-plane request failed ({status}): {}",
-                rpc_message(&body)
-            );
-            return Err(http_exit(status));
+            return Err(TransferFailure::new(
+                error_code_for_http(status),
+                format!(
+                    "control-plane request failed ({status}): {}",
+                    rpc_message(&body)
+                ),
+            ));
         }
         if let Some(error) = body.get("error") {
             let code = error
                 .get("code")
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
-            eprintln!("transfer request rejected: {}", rpc_message(&body));
-            return Err(match code {
-                -32602 => ExitCode::UsageConfig,
-                -32004 => ExitCode::Authorization,
-                -32009 => ExitCode::Conflict,
-                _ => ExitCode::Internal,
-            });
+            return Err(TransferFailure::new(
+                match code {
+                    -32602 => ErrorCode::InvalidArgument,
+                    -32004 => ErrorCode::Authorization,
+                    -32009 => ErrorCode::Conflict,
+                    _ => ErrorCode::Internal,
+                },
+                format!("transfer request rejected: {}", rpc_message(&body)),
+            ));
         }
         let value = extract_tool_value(&body).map_err(|message| {
-            eprintln!("invalid control-plane response: {message}");
-            ExitCode::Internal
+            TransferFailure::new(
+                ErrorCode::BadEnvelope,
+                format!("invalid control-plane response: {message}"),
+            )
         })?;
         if cli.json {
             println!(
@@ -218,6 +259,113 @@ fn run_mcp_tool(cli: &Cli, tool: &str, arguments: Value) -> Result<(), ExitCode>
         }
         Ok(())
     })
+}
+
+async fn read_response_json(mut response: reqwest::Response) -> Result<Value, TransferFailure> {
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let expected_len = response.content_length();
+    if expected_len.is_some_and(|len| len > MAX_MCP_RESPONSE_BYTES as u64) {
+        return Err(TransferFailure::new(
+            ErrorCode::BadEnvelope,
+            format!("control-plane response exceeds the {MAX_MCP_RESPONSE_BYTES}-byte limit"),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(
+        expected_len
+            .and_then(|len| usize::try_from(len).ok())
+            .unwrap_or_default()
+            .min(MAX_MCP_RESPONSE_BYTES),
+    );
+    while let Some(chunk) = response.chunk().await.map_err(|err| {
+        TransferFailure::new(
+            ErrorCode::DeviceOffline,
+            format!("failed to read control-plane response: {err}"),
+        )
+    })? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_MCP_RESPONSE_BYTES {
+            return Err(TransferFailure::new(
+                ErrorCode::BadEnvelope,
+                format!("control-plane response exceeds the {MAX_MCP_RESPONSE_BYTES}-byte limit"),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if expected_len.is_some_and(|len| len != bytes.len() as u64) {
+        return Err(TransferFailure::new(
+            ErrorCode::BadEnvelope,
+            "control-plane response content-length does not match the received body",
+        ));
+    }
+    decode_response_json(content_type.as_deref(), &bytes)
+}
+
+fn decode_response_json(
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> Result<Value, TransferFailure> {
+    if bytes.len() > MAX_MCP_RESPONSE_BYTES {
+        return Err(TransferFailure::new(
+            ErrorCode::BadEnvelope,
+            format!("control-plane response exceeds the {MAX_MCP_RESPONSE_BYTES}-byte limit"),
+        ));
+    }
+    let is_json = content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    if !is_json {
+        return Err(TransferFailure::new(
+            ErrorCode::BadEnvelope,
+            "control-plane response content type is not application/json",
+        ));
+    }
+    serde_json::from_slice(bytes).map_err(|err| {
+        TransferFailure::new(
+            ErrorCode::BadEnvelope,
+            format!("control-plane response is not valid JSON: {err}"),
+        )
+    })
+}
+
+fn failure_payload(failure: &TransferFailure) -> Value {
+    let message = ownmesh_diagnostics::redact_text(&failure.message);
+    let mut error = json!({
+        "code": failure.code.as_str(),
+        "message": message,
+        "retryable": failure.code.retryable(),
+    });
+    if let Some(hint) = failure.hint {
+        error["hint"] = json!(ownmesh_diagnostics::redact_text(hint));
+    }
+    json!({
+        "schema_version": 1,
+        "ok": false,
+        "exit_code": failure.exit_code().code(),
+        "error": error,
+    })
+}
+
+fn emit_failure(cli: &Cli, failure: &TransferFailure) -> ExitCode {
+    let payload = failure_payload(failure);
+    if cli.json {
+        println!("{payload}");
+    } else {
+        eprintln!(
+            "{}: {}",
+            failure.code.as_str(),
+            payload["error"]["message"]
+                .as_str()
+                .unwrap_or("transfer failed")
+        );
+        if let Some(hint) = payload["error"]["hint"].as_str() {
+            eprintln!("hint: {hint}");
+        }
+    }
+    failure.exit_code()
 }
 
 /// Decode the standard MCP `tools/call` content shape without a network call.
@@ -241,14 +389,15 @@ fn rpc_message(body: &Value) -> &str {
         .unwrap_or("unknown control-plane error")
 }
 
-fn http_exit(status: reqwest::StatusCode) -> ExitCode {
+fn error_code_for_http(status: reqwest::StatusCode) -> ErrorCode {
     match status.as_u16() {
-        401 => ExitCode::Authentication,
-        403 => ExitCode::Authorization,
-        408 | 504 => ExitCode::TimeoutCancelled,
-        409 => ExitCode::Conflict,
-        _ if status.is_server_error() => ExitCode::DeviceOffline,
-        _ => ExitCode::Internal,
+        400 | 422 => ErrorCode::InvalidArgument,
+        401 => ErrorCode::Authentication,
+        403 => ErrorCode::Authorization,
+        408 | 504 => ErrorCode::Timeout,
+        409 => ErrorCode::Conflict,
+        _ if status.is_server_error() => ErrorCode::DeviceOffline,
+        _ => ErrorCode::Internal,
     }
 }
 
@@ -307,10 +456,12 @@ mod tests {
     #[test]
     fn traversal_path_is_rejected_before_network() {
         assert_eq!(
-            validate_path("source", "../secret"),
-            Err(ExitCode::UsageConfig)
+            validate_path("source", "../secret")
+                .expect_err("traversal must fail")
+                .exit_code(),
+            ExitCode::UsageConfig
         );
-        assert_eq!(validate_path("source", "in/file.bin"), Ok(()));
+        assert!(validate_path("source", "in/file.bin").is_ok());
     }
 
     #[test]
@@ -324,5 +475,38 @@ mod tests {
             extract_tool_value(&response).expect("valid MCP tools/call response"),
             json!({ "operation_id": "tr_1", "data": { "transfer": { "state": "planned" } } })
         );
+    }
+
+    #[test]
+    fn json_error_payload_is_structured_and_redacted() {
+        let failure = TransferFailure::new(
+            ErrorCode::Authentication,
+            "refresh failed: access_token=top-secret-value",
+        )
+        .with_hint("run `ownmesh login` first");
+        let payload = failure_payload(&failure);
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["exit_code"], ExitCode::Authentication.code());
+        assert_eq!(payload["error"]["code"], "OWNMESH_E_AUTHENTICATION");
+        assert_eq!(payload["error"]["hint"], "run `ownmesh login` first");
+        assert!(!payload.to_string().contains("top-secret-value"));
+    }
+
+    #[test]
+    fn oversized_mcp_response_is_rejected_before_json_parse() {
+        let bytes = vec![b' '; MAX_MCP_RESPONSE_BYTES + 1];
+        let failure = decode_response_json(Some("application/json"), &bytes)
+            .expect_err("oversized response must fail");
+        assert_eq!(failure.code, ErrorCode::BadEnvelope);
+        assert!(failure.message.contains("exceeds"));
+    }
+
+    #[test]
+    fn utf8_limits_are_measured_in_bytes() {
+        assert!(validate_text("id", &"é".repeat(MAX_TEXT_BYTES / 2)).is_ok());
+        assert!(validate_text("id", &"é".repeat((MAX_TEXT_BYTES / 2) + 1)).is_err());
+        assert!(validate_path("path", &"界".repeat(MAX_PATH_BYTES / 3)).is_ok());
+        assert!(validate_path("path", &"界".repeat((MAX_PATH_BYTES / 3) + 1)).is_err());
     }
 }
