@@ -30,7 +30,7 @@
         "description": "Required signing secret. Generate with at least 32 random bytes."
       },
       "OWNER_TOKEN_HASH": {
-        "description": "SHA-256 of the one-time owner login code. Store only as a Wrangler secret."
+        "description": "SHA-256 of the one-time owner passkey bootstrap code. Store only as a Wrangler secret."
       },
       "AUTH_PROVIDER": {
         "description": "Optional external identity service for multi-user deployments. Built-in single-owner auth is the default."
@@ -41,9 +41,12 @@
     }
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260730.1",
+    "@cloudflare/workers-types": "^5.20260810.1",
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",
     "wrangler": "^4.116.0"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "13.3.2"
   }
 }

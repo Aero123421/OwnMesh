@@ -62,7 +62,7 @@ Exact menu labels move as OpenAI iterates; the flow is:
    - Authorization server metadata: `https://<your-worker>/.well-known/oauth-authorization-server`  
    - Protected resource metadata: `https://<your-worker>/.well-known/oauth-protected-resource`  
    - **Client registration (production default):** Dynamic Client Registration is **disabled**.
-     Open `https://<your-worker>/connect/chatgpt`, sign in with your deployment owner code,
+     Open `https://<your-worker>/connect/chatgpt`, create or use your owner passkey,
      paste ChatGPT's callback URL, then copy the generated public `client_id` into ChatGPT.
    - **Optional DCR:** operators may set Worker env `ALLOW_DYNAMIC_CLIENT_REGISTRATION=true`
      to advertise `registration_endpoint` and accept authenticated `POST /oauth/register`

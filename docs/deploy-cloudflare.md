@@ -47,7 +47,7 @@ pnpm exec wrangler d1 migrations apply DB --remote
 # 3) Deploy Worker + Durable Objects
 pnpm run deploy
 
-# 4) Create/rotate the single-owner login code (shown once)
+# 4) Create the one-time owner passkey bootstrap code (shown once)
 pnpm run owner:init
 ```
 
@@ -67,15 +67,19 @@ curl http://127.0.0.1:8787/health
 | Name | Required | Notes |
 |---|---|---|
 | `OAUTH_ISSUER` | optional | Defaults to request origin. Set to your canonical `https://<worker>.workers.dev` if behind a custom domain. |
-| `OWNER_TOKEN_HASH` | **required by default** | SHA-256 of the high-entropy owner code. `pnpm run owner:init` creates it without storing the plaintext code in D1. |
-| `AUTH_PROVIDER` | optional | External identity service for multi-user deployments. When omitted, the built-in single-owner login is used. |
+| `OWNER_TOKEN_HASH` | **required by default** | SHA-256 of the high-entropy, one-time passkey bootstrap code. `pnpm run owner:init` creates it without storing the plaintext code in D1. |
+| `AUTH_PROVIDER` | optional | External identity service for multi-user deployments. When omitted, the built-in single-owner passkey login is used. |
 | `OWNMESH_DEV_AUTH_BYPASS` | optional, default `false` | Local/test-only escape hatch for `login_hint`. Never enable against production data. |
 | `ALLOW_DYNAMIC_CLIENT_REGISTRATION` | optional, default `false` | Opt-in DCR. Prefer statically provisioned clients. Unknown clients are never auto-registered by `/oauth/authorize`. |
 | `OWNMESH_ALLOWED_ORIGINS` | optional | Comma-separated additional exact origins accepted by device WebSockets. The issuer origin is accepted automatically. |
 | `SESSION_SECRET` | **required** | Signs owner sessions and internal Worker→DO contexts. `owner:init` creates it if absent. **Do not commit secrets.** |
 
-`owner:init` sends values directly to Wrangler over stdin and prints only the new
-owner code. Save it in a password manager; rerun the command to rotate it.
+`owner:init` sends values directly to Wrangler over stdin and prints only the
+one-time bootstrap code. Open `/login`, enter it once, and register a passkey;
+subsequent sign-ins do not accept the bootstrap code. If all passkeys are lost,
+run `pnpm run owner:init -- --reset-passkey`. Recovery rotates the browser-session
+secret, revokes the owner's OAuth tokens, advances the credential generation,
+and removes only the owner passkey records before issuing a new bootstrap code.
 
 Manual example (do not commit values):
 
@@ -143,7 +147,7 @@ Proof body: `{ "device_id", "challenge_id", "signature": "<64-byte ed25519 hex>"
 ## ChatGPT Personal Plugin / MCP
 
 1. Deploy control plane and note `https://<worker>/mcp`
-2. Open `https://<worker>/connect/chatgpt`, sign in with the owner code, paste the callback URL shown by ChatGPT, and copy the generated client ID back to ChatGPT.
+2. Open `https://<worker>/connect/chatgpt`, create or use the owner passkey, paste the callback URL shown by ChatGPT, and copy the generated client ID back to ChatGPT.
 3. In ChatGPT, add the MCP connector / Personal Plugin pointing at your `/mcp` URL
 4. Complete OAuth; scopes: `ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access`
 5. Enroll a device with `ownmesh device enroll` / `ownmesh login` against your issuer URL (CLI ticket **cli-auth-09**)

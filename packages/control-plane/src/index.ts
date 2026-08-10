@@ -34,8 +34,13 @@ import {
   handleChatGptConnector,
   handleOwnerLogin,
   handleOwnerLogout,
+  handleOwnerPasskeyOptions,
+  handleOwnerPasskeyRegistrationOptions,
+  handleOwnerPasskeyRegistrationVerify,
+  handleOwnerPasskeyVerify,
   ownerAuthConfigured,
   ownerLoginRedirect,
+  ownerPasskeyScript,
   ownerPrincipalFromRequest,
 } from "./owner-auth.ts";
 import {
@@ -408,6 +413,21 @@ export default {
 
     if (url.pathname === "/login") {
       return handleOwnerLogin(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey.js" && request.method === "GET") {
+      return ownerPasskeyScript();
+    }
+    if (url.pathname === "/auth/passkey/register/options" && request.method === "POST") {
+      return handleOwnerPasskeyRegistrationOptions(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey/register/verify" && request.method === "POST") {
+      return handleOwnerPasskeyRegistrationVerify(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey/options" && request.method === "POST") {
+      return handleOwnerPasskeyOptions(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey/verify" && request.method === "POST") {
+      return handleOwnerPasskeyVerify(request, store, issuer, env);
     }
     if (url.pathname === "/logout") {
       return handleOwnerLogout(request, issuer);

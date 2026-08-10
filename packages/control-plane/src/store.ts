@@ -160,6 +160,29 @@ export type PrincipalRecord = {
   created_at: string;
 };
 
+export type OwnerPasskeyRecord = {
+  credential_id: string;
+  principal_id: string;
+  webauthn_user_id: string;
+  public_key: Uint8Array;
+  counter: number;
+  transports: string[];
+  device_type: "singleDevice" | "multiDevice";
+  backed_up: boolean;
+  created_at: string;
+  last_used_at?: string;
+};
+
+export type OwnerAuthChallenge = {
+  id: string;
+  kind: "register" | "authenticate";
+  challenge: string;
+  webauthn_user_id?: string;
+  return_to: string;
+  expires_at: number;
+  created_at: string;
+};
+
 /** Cloud authority for a device-local workspace registration (E4).
  *
  * The path itself deliberately remains on the device.  The control plane owns
@@ -485,6 +508,22 @@ export interface ControlPlaneStore {
   putClient(client: OAuthClientRecord): Promise<void>;
   getClient(clientId: string): Promise<OAuthClientRecord | null>;
 
+  listOwnerPasskeys(): Promise<OwnerPasskeyRecord[]>;
+  getOwnerPasskey(credentialId: string): Promise<OwnerPasskeyRecord | null>;
+  putInitialOwnerPasskey(passkey: OwnerPasskeyRecord): Promise<boolean>;
+  updateOwnerPasskeyUsage(
+    credentialId: string,
+    expectedCounter: number,
+    nextCounter: number,
+    deviceType: "singleDevice" | "multiDevice",
+    backedUp: boolean,
+  ): Promise<boolean>;
+  putOwnerAuthChallenge(challenge: OwnerAuthChallenge): Promise<boolean>;
+  takeOwnerAuthChallenge(
+    id: string,
+    kind: OwnerAuthChallenge["kind"],
+  ): Promise<OwnerAuthChallenge | null>;
+
   ensurePrincipal(
     id: string,
     displayName: string,
@@ -756,6 +795,9 @@ export type SchemaReadiness = {
     mcp_approval_outbox: boolean;
     /** 0012 server-owned principal OAuth credential generation */
     principals_credential_generation: boolean;
+    /** 0013 built-in owner passkeys + one-time WebAuthn challenges */
+    owner_passkeys: boolean;
+    owner_auth_challenges: boolean;
   };
 };
 
@@ -951,6 +993,35 @@ const SCHEMA_READINESS_OBJECTS: Record<
     table: "principals",
     columns: ["id", "credential_generation"],
   },
+  owner_passkeys: {
+    table: "owner_passkeys",
+    columns: [
+      "credential_id",
+      "principal_id",
+      "webauthn_user_id",
+      "public_key",
+      "counter",
+      "transports_json",
+      "device_type",
+      "backed_up",
+      "created_at",
+      "last_used_at",
+    ],
+    indexes: ["idx_owner_passkeys_principal"],
+  },
+  owner_auth_challenges: {
+    table: "owner_auth_challenges",
+    columns: [
+      "id",
+      "kind",
+      "challenge",
+      "webauthn_user_id",
+      "return_to",
+      "expires_at",
+      "created_at",
+    ],
+    indexes: ["idx_owner_auth_challenges_expiry"],
+  },
 };
 
 const DEFAULT_TENANT = "ten_default";
@@ -962,6 +1033,8 @@ const DEFAULT_TENANT = "ten_default";
 export class MemoryStore implements ControlPlaneStore {
   readonly kind = "memory" as const;
   clients = new Map<string, OAuthClientRecord>();
+  ownerPasskeys = new Map<string, OwnerPasskeyRecord>();
+  ownerAuthChallenges = new Map<string, OwnerAuthChallenge>();
   principals = new Map<string, PrincipalRecord>();
   tokensByAccess = new Map<string, TokenRecord>();
   accessByRefresh = new Map<string, string>();
@@ -1018,6 +1091,69 @@ export class MemoryStore implements ControlPlaneStore {
   }
   async getClient(clientId: string): Promise<OAuthClientRecord | null> {
     return this.clients.get(clientId) || null;
+  }
+
+  async listOwnerPasskeys(): Promise<OwnerPasskeyRecord[]> {
+    return [...this.ownerPasskeys.values()].map((passkey) => ({
+      ...passkey,
+      public_key: passkey.public_key.slice(),
+      transports: [...passkey.transports],
+    }));
+  }
+
+  async getOwnerPasskey(credentialId: string): Promise<OwnerPasskeyRecord | null> {
+    const passkey = this.ownerPasskeys.get(credentialId);
+    return passkey
+      ? { ...passkey, public_key: passkey.public_key.slice(), transports: [...passkey.transports] }
+      : null;
+  }
+
+  async putInitialOwnerPasskey(passkey: OwnerPasskeyRecord): Promise<boolean> {
+    if (this.ownerPasskeys.size !== 0 || this.ownerPasskeys.has(passkey.credential_id)) return false;
+    this.ownerPasskeys.set(passkey.credential_id, {
+      ...passkey,
+      public_key: passkey.public_key.slice(),
+      transports: [...passkey.transports],
+    });
+    return true;
+  }
+
+  async updateOwnerPasskeyUsage(
+    credentialId: string,
+    expectedCounter: number,
+    nextCounter: number,
+    deviceType: "singleDevice" | "multiDevice",
+    backedUp: boolean,
+  ): Promise<boolean> {
+    const passkey = this.ownerPasskeys.get(credentialId);
+    if (!passkey || passkey.counter !== expectedCounter) return false;
+    passkey.counter = nextCounter;
+    passkey.device_type = deviceType;
+    passkey.backed_up = backedUp;
+    passkey.last_used_at = nowIso();
+    return true;
+  }
+
+  async putOwnerAuthChallenge(challenge: OwnerAuthChallenge): Promise<boolean> {
+    const now = Date.now();
+    for (const [id, item] of this.ownerAuthChallenges) {
+      if (item.expires_at <= now) this.ownerAuthChallenges.delete(id);
+    }
+    const existing = this.ownerAuthChallenges.get(challenge.id);
+    if (existing && existing.expires_at > now) return false;
+    if (this.ownerAuthChallenges.size >= 64) return false;
+    this.ownerAuthChallenges.set(challenge.id, { ...challenge });
+    return true;
+  }
+
+  async takeOwnerAuthChallenge(
+    id: string,
+    kind: OwnerAuthChallenge["kind"],
+  ): Promise<OwnerAuthChallenge | null> {
+    const challenge = this.ownerAuthChallenges.get(id);
+    if (!challenge || challenge.kind !== kind || challenge.expires_at <= Date.now()) return null;
+    this.ownerAuthChallenges.delete(id);
+    return { ...challenge };
   }
 
   async ensurePrincipal(
@@ -2095,6 +2231,174 @@ export class SqlStore implements ControlPlaneStore {
     return this.db.prepare(
       `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
     ).bind(id).first<PrincipalRecord>();
+  }
+
+  private ownerPasskeyFromRow(row: {
+    credential_id: string;
+    principal_id: string;
+    webauthn_user_id: string;
+    public_key: ArrayBuffer | Uint8Array;
+    counter: number;
+    transports_json: string;
+    device_type: "singleDevice" | "multiDevice";
+    backed_up: number;
+    created_at: string;
+    last_used_at: string | null;
+  }): OwnerPasskeyRecord {
+    let transports: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(row.transports_json);
+      if (Array.isArray(parsed)) transports = parsed.filter((item): item is string => typeof item === "string");
+    } catch {
+      transports = [];
+    }
+    const publicKey = row.public_key instanceof Uint8Array
+      ? row.public_key.slice()
+      : new Uint8Array(row.public_key);
+    return {
+      credential_id: row.credential_id,
+      principal_id: row.principal_id,
+      webauthn_user_id: row.webauthn_user_id,
+      public_key: publicKey,
+      counter: row.counter,
+      transports,
+      device_type: row.device_type,
+      backed_up: Boolean(row.backed_up),
+      created_at: row.created_at,
+      last_used_at: row.last_used_at ?? undefined,
+    };
+  }
+
+  async listOwnerPasskeys(): Promise<OwnerPasskeyRecord[]> {
+    const result = await this.db.prepare(
+      `SELECT credential_id, principal_id, webauthn_user_id, public_key, counter,
+              transports_json, device_type, backed_up, created_at, last_used_at
+       FROM owner_passkeys ORDER BY created_at, credential_id LIMIT 8`,
+    ).all<{
+      credential_id: string; principal_id: string; webauthn_user_id: string;
+      public_key: ArrayBuffer | Uint8Array; counter: number; transports_json: string;
+      device_type: "singleDevice" | "multiDevice"; backed_up: number;
+      created_at: string; last_used_at: string | null;
+    }>();
+    return (result.results || []).map((row) => this.ownerPasskeyFromRow(row));
+  }
+
+  async getOwnerPasskey(credentialId: string): Promise<OwnerPasskeyRecord | null> {
+    const row = await this.db.prepare(
+      `SELECT credential_id, principal_id, webauthn_user_id, public_key, counter,
+              transports_json, device_type, backed_up, created_at, last_used_at
+       FROM owner_passkeys WHERE credential_id = ?`,
+    ).bind(credentialId).first<{
+      credential_id: string; principal_id: string; webauthn_user_id: string;
+      public_key: ArrayBuffer | Uint8Array; counter: number; transports_json: string;
+      device_type: "singleDevice" | "multiDevice"; backed_up: number;
+      created_at: string; last_used_at: string | null;
+    }>();
+    return row ? this.ownerPasskeyFromRow(row) : null;
+  }
+
+  async putInitialOwnerPasskey(passkey: OwnerPasskeyRecord): Promise<boolean> {
+    const publicKey = passkey.public_key.slice().buffer;
+    const inserted = await this.db.prepare(
+      `INSERT INTO owner_passkeys
+       (credential_id, principal_id, webauthn_user_id, public_key, counter,
+        transports_json, device_type, backed_up, created_at, last_used_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL
+       WHERE NOT EXISTS (SELECT 1 FROM owner_passkeys)
+       RETURNING credential_id`,
+    ).bind(
+      passkey.credential_id,
+      passkey.principal_id,
+      passkey.webauthn_user_id,
+      publicKey,
+      passkey.counter,
+      JSON.stringify(passkey.transports),
+      passkey.device_type,
+      passkey.backed_up ? 1 : 0,
+      passkey.created_at,
+    ).first<{ credential_id: string }>();
+    return inserted?.credential_id === passkey.credential_id;
+  }
+
+  async updateOwnerPasskeyUsage(
+    credentialId: string,
+    expectedCounter: number,
+    nextCounter: number,
+    deviceType: "singleDevice" | "multiDevice",
+    backedUp: boolean,
+  ): Promise<boolean> {
+    const updated = await this.db.prepare(
+      `UPDATE owner_passkeys
+       SET counter = ?, device_type = ?, backed_up = ?, last_used_at = ?
+       WHERE credential_id = ? AND counter = ?
+       RETURNING credential_id`,
+    ).bind(
+      nextCounter,
+      deviceType,
+      backedUp ? 1 : 0,
+      nowIso(),
+      credentialId,
+      expectedCounter,
+    ).first<{ credential_id: string }>();
+    return updated?.credential_id === credentialId;
+  }
+
+  async putOwnerAuthChallenge(challenge: OwnerAuthChallenge): Promise<boolean> {
+    const now = nowIso();
+    await this.db.prepare(`DELETE FROM owner_auth_challenges WHERE expires_at <= ?`).bind(now).run();
+    const inserted = await this.db.prepare(
+      `INSERT INTO owner_auth_challenges
+       (id, kind, challenge, webauthn_user_id, return_to, expires_at, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?
+       WHERE (SELECT COUNT(*) FROM owner_auth_challenges WHERE expires_at > ?) < 64
+       ON CONFLICT(id) DO UPDATE SET
+         kind = excluded.kind,
+         challenge = excluded.challenge,
+         webauthn_user_id = excluded.webauthn_user_id,
+         return_to = excluded.return_to,
+         expires_at = excluded.expires_at,
+         created_at = excluded.created_at
+       WHERE owner_auth_challenges.expires_at <= ?
+       RETURNING id`,
+    ).bind(
+      challenge.id,
+      challenge.kind,
+      challenge.challenge,
+      challenge.webauthn_user_id ?? null,
+      challenge.return_to,
+      nowIso(challenge.expires_at),
+      challenge.created_at,
+      now,
+      now,
+    ).first<{ id: string }>();
+    return inserted?.id === challenge.id;
+  }
+
+  async takeOwnerAuthChallenge(
+    id: string,
+    kind: OwnerAuthChallenge["kind"],
+  ): Promise<OwnerAuthChallenge | null> {
+    const row = await this.db.prepare(
+      `DELETE FROM owner_auth_challenges
+       WHERE id = ? AND kind = ? AND expires_at > ?
+       RETURNING challenge, webauthn_user_id, return_to, expires_at, created_at`,
+    ).bind(id, kind, nowIso()).first<{
+      challenge: string;
+      webauthn_user_id: string | null;
+      return_to: string;
+      expires_at: string;
+      created_at: string;
+    }>();
+    if (!row) return null;
+    return {
+      id,
+      kind,
+      challenge: row.challenge,
+      webauthn_user_id: row.webauthn_user_id ?? undefined,
+      return_to: row.return_to,
+      expires_at: Date.parse(row.expires_at),
+      created_at: row.created_at,
+    };
   }
 
   async advancePrincipalCredentialGeneration(id: string): Promise<number | null> {

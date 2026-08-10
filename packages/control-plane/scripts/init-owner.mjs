@@ -35,20 +35,34 @@ try {
 }
 
 const names = new Set(existing.map((entry) => entry.name));
+const resetPasskey = process.argv.includes("--reset-passkey");
 const ownerCode = `own_${randomBytes(24).toString("base64url")}`;
 const secrets = {
   OWNER_TOKEN_HASH: createHash("sha256").update(ownerCode, "utf8").digest("hex"),
 };
-if (!names.has("SESSION_SECRET")) {
+if (!names.has("SESSION_SECRET") || resetPasskey) {
   secrets.SESSION_SECRET = randomBytes(32).toString("hex");
 }
 
 run(["secret", "bulk"], { input: JSON.stringify(secrets), stdio: ["pipe", "inherit", "inherit"] });
 
+if (resetPasskey) {
+  run([
+    "d1",
+    "execute",
+    "DB",
+    "--remote",
+    "--command",
+    "DELETE FROM owner_auth_challenges; DELETE FROM owner_passkeys WHERE principal_id = 'prin_owner'; DELETE FROM oauth_auth_codes WHERE principal_id = 'prin_owner'; UPDATE oauth_tokens SET revoked = 1 WHERE principal_id = 'prin_owner'; UPDATE principals SET credential_generation = credential_generation + 1 WHERE id = 'prin_owner';",
+  ], { stdio: ["ignore", "inherit", "inherit"] });
+}
+
 const config = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
 const issuer = /"OAUTH_ISSUER"\s*:\s*"([^"]+)"/.exec(config)?.[1] || "https://<your-worker>.workers.dev";
-process.stdout.write("\nOwnMesh owner authentication is ready.\n");
-process.stdout.write("Save this owner code now; it cannot be recovered from Cloudflare.\n\n");
+process.stdout.write("\nOwnMesh owner passkey bootstrap is ready.\n");
+process.stdout.write("Open the sign-in URL, enter this code once, and create your passkey.\n\n");
 process.stdout.write(`  ${ownerCode}\n\n`);
-process.stdout.write(`Sign in:          ${issuer}/login\n`);
+process.stdout.write(`Create passkey:   ${issuer}/login\n`);
 process.stdout.write(`Connect ChatGPT:  ${issuer}/connect/chatgpt\n`);
+process.stdout.write("\nAfter registration, daily sign-in uses only the passkey.\n");
+process.stdout.write("If every passkey is lost, run `pnpm run owner:init -- --reset-passkey`.\n");

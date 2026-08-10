@@ -19,7 +19,8 @@
     "ALLOW_DYNAMIC_CLIENT_REGISTRATION": "false",
     // Optional comma-separated WebSocket origins in addition to OAUTH_ISSUER.
     "OWNMESH_ALLOWED_ORIGINS": ""
-    // SESSION_SECRET and OWNER_TOKEN_HASH must be provided via Wrangler secrets.
+    // SESSION_SECRET and the one-time passkey bootstrap hash OWNER_TOKEN_HASH
+    // must be provided via Wrangler secrets.
     // AUTH_PROVIDER is optional when built-in single-owner auth is configured.
   },
   "d1_databases": [

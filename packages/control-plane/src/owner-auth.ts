@@ -1,10 +1,21 @@
-import type { ControlPlaneStore } from "./store.ts";
 import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+  type AuthenticationResponseJSON,
+  type AuthenticatorTransportFuture,
+  type RegistrationResponseJSON,
+} from "@simplewebauthn/server";
+import type { ControlPlaneStore, OwnerAuthChallenge } from "./store.ts";
+import {
+  BodyTooLargeError,
   constantTimeEqual,
   html,
   json,
   nowIso,
   randomToken,
+  readRequestJsonLimited,
   sha256Hex,
 } from "./util.ts";
 
@@ -23,8 +34,21 @@ const OWNER_ID = "prin_owner";
 const OWNER_TENANT = "ten_default";
 const SESSION_COOKIE = "__Host-ownmesh_owner";
 const CSRF_COOKIE = "__Host-ownmesh_csrf";
+const PASSKEY_CHALLENGE_COOKIE = "__Host-ownmesh_passkey";
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
+const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const MAX_FORM_BYTES = 8 * 1024;
+const MAX_PASSKEY_BODY_BYTES = 64 * 1024;
+const REGISTRATION_CHALLENGE_ID = "owner_registration";
+const ALLOWED_TRANSPORTS = new Set<AuthenticatorTransportFuture>([
+  "ble",
+  "cable",
+  "hybrid",
+  "internal",
+  "nfc",
+  "smart-card",
+  "usb",
+]);
 
 type SessionClaims = {
   v: 1;
@@ -50,6 +74,12 @@ function base64UrlToBytes(value: string): Uint8Array | null {
   } catch {
     return null;
   }
+}
+
+function randomBytes(length: number): Uint8Array<ArrayBuffer> {
+  const bytes = new Uint8Array(new ArrayBuffer(length));
+  crypto.getRandomValues(bytes);
+  return bytes;
 }
 
 async function hmacKey(secret: string): Promise<CryptoKey> {
@@ -104,6 +134,110 @@ function sameOriginPost(request: Request, issuer: string): boolean {
     return new URL(origin).origin === new URL(issuer).origin;
   } catch {
     return false;
+  }
+}
+
+function rpId(issuer: string): string {
+  return new URL(issuer).hostname;
+}
+
+function origin(issuer: string): string {
+  return new URL(issuer).origin;
+}
+
+function passkeyChallengeId(request: Request): string | null {
+  const id = cookieValue(request, PASSKEY_CHALLENGE_COOKIE);
+  return id && /^[A-Za-z0-9_-]{8,128}$/.test(id) ? id : null;
+}
+
+function passkeyChallengeCookie(id: string, maxAge = 300): string {
+  return cookie(PASSKEY_CHALLENGE_COOKIE, id, maxAge, "Strict");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function boundedText(value: unknown, max: number): string | null {
+  if (typeof value !== "string" || value.length < 1 || value.length > max) return null;
+  return value;
+}
+
+function base64UrlText(value: unknown, max: number): string | null {
+  const text = boundedText(value, max);
+  return text && /^[A-Za-z0-9_-]+$/.test(text) ? text : null;
+}
+
+function parseTransports(value: unknown): AuthenticatorTransportFuture[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 8) return undefined;
+  const transports: AuthenticatorTransportFuture[] = [];
+  for (const item of value) {
+    if (typeof item === "string" && ALLOWED_TRANSPORTS.has(item as AuthenticatorTransportFuture)) {
+      transports.push(item as AuthenticatorTransportFuture);
+    }
+  }
+  return transports;
+}
+
+function registrationResponse(value: unknown): RegistrationResponseJSON | null {
+  if (!isRecord(value) || !isRecord(value.response)) return null;
+  const id = base64UrlText(value.id, 1024);
+  const rawId = base64UrlText(value.rawId, 1024);
+  const clientDataJSON = base64UrlText(value.response.clientDataJSON, 8192);
+  const attestationObject = base64UrlText(value.response.attestationObject, 48 * 1024);
+  if (!id || !rawId || !clientDataJSON || !attestationObject || value.type !== "public-key") return null;
+  const authenticatorAttachment = value.authenticatorAttachment === "platform" || value.authenticatorAttachment === "cross-platform"
+    ? value.authenticatorAttachment
+    : undefined;
+  return {
+    id,
+    rawId,
+    type: "public-key",
+    authenticatorAttachment,
+    clientExtensionResults: {},
+    response: {
+      clientDataJSON,
+      attestationObject,
+      transports: parseTransports(value.response.transports),
+    },
+  };
+}
+
+function authenticationResponse(value: unknown): AuthenticationResponseJSON | null {
+  if (!isRecord(value) || !isRecord(value.response)) return null;
+  const id = base64UrlText(value.id, 1024);
+  const rawId = base64UrlText(value.rawId, 1024);
+  const clientDataJSON = base64UrlText(value.response.clientDataJSON, 8192);
+  const authenticatorData = base64UrlText(value.response.authenticatorData, 8192);
+  const signature = base64UrlText(value.response.signature, 8192);
+  const userHandle = value.response.userHandle == null
+    ? undefined
+    : base64UrlText(value.response.userHandle, 1024) ?? undefined;
+  if (!id || !rawId || !clientDataJSON || !authenticatorData || !signature || value.type !== "public-key") {
+    return null;
+  }
+  const authenticatorAttachment = value.authenticatorAttachment === "platform" || value.authenticatorAttachment === "cross-platform"
+    ? value.authenticatorAttachment
+    : undefined;
+  return {
+    id,
+    rawId,
+    type: "public-key",
+    authenticatorAttachment,
+    clientExtensionResults: {},
+    response: { clientDataJSON, authenticatorData, signature, userHandle },
+  };
+}
+
+async function passkeyJson(request: Request): Promise<Record<string, unknown> | null> {
+  if (!(request.headers.get("content-type") || "").toLowerCase().startsWith("application/json")) return null;
+  try {
+    const value = await readRequestJsonLimited<unknown>(request, MAX_PASSKEY_BODY_BYTES);
+    return isRecord(value) ? value : null;
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) throw error;
+    return null;
   }
 }
 
@@ -191,18 +325,41 @@ export function ownerLoginRedirect(request: Request, issuer: string): Response {
   return new Response(null, { status: 302, headers: { location: login.toString() } });
 }
 
-function loginPage(issuer: string, returnTo: string, failed = false): Response {
-  const message = failed
-    ? '<p class="error">The owner code was not accepted.</p>'
-    : "<p>Enter the one-time owner code created during deployment.</p>";
+function loginPage(issuer: string, returnTo: string, registered: boolean): Response {
+  const mode = registered ? "authenticate" : "register";
+  const intro = registered
+    ? "Use the passkey registered for this self-hosted instance."
+    : "Enter the one-time owner code, then create the first passkey.";
+  const codeInput = registered
+    ? ""
+    : '<label for="owner_code">One-time owner code</label><input id="owner_code" name="owner_code" type="password" autocomplete="off" minlength="20" maxlength="128" required>';
+  const button = registered ? "Sign in with passkey" : "Create owner passkey";
   return html(
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OwnMesh sign in</title>
-<style>:root{color-scheme:dark}body{margin:0;background:#0d0f12;color:#d9dde3;font:15px ui-monospace,SFMono-Regular,Consolas,monospace}.box{max-width:30rem;margin:12vh auto;padding:2rem;border:1px solid #30343a;background:#15181d}.mark{letter-spacing:.08em;color:#f0f2f4}p{color:#9ba3ad;line-height:1.55}.error{color:#f2a6a6}label{display:block;margin:1.5rem 0 .5rem}input,button{box-sizing:border-box;width:100%;padding:.8rem;border:1px solid #3a4048;background:#0d0f12;color:#f0f2f4;font:inherit}button{margin-top:1rem;background:#d9dde3;color:#111418;cursor:pointer;font-weight:700}small{display:block;margin-top:1.25rem;color:#737b86}</style></head>
-<body><main class="box"><h1 class="mark">OWNMESH</h1><h2>Owner sign in</h2>${message}
-<form method="post" action="/login"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}"><label for="owner_code">Owner code</label><input id="owner_code" name="owner_code" type="password" autocomplete="current-password" minlength="20" maxlength="128" required autofocus><button type="submit">Sign in</button></form>
-<small>Self-hosted instance: ${escapeHtml(new URL(issuer).host)}. The code is checked locally by your Worker and is never stored in D1.</small></main></body></html>`,
-    { status: failed ? 401 : 200, noStore: true },
+<style>:root{color-scheme:dark}body{margin:0;background:#0d0f12;color:#d9dde3;font:15px ui-monospace,SFMono-Regular,Consolas,monospace}.box{max-width:30rem;margin:12vh auto;padding:2rem;border:1px solid #30343a;background:#15181d}.mark{letter-spacing:.08em;color:#f0f2f4}p{color:#9ba3ad;line-height:1.55}.error{color:#f2a6a6}label{display:block;margin:1.5rem 0 .5rem}input,button{box-sizing:border-box;width:100%;padding:.8rem;border:1px solid #3a4048;background:#0d0f12;color:#f0f2f4;font:inherit}button{margin-top:1rem;background:#d9dde3;color:#111418;cursor:pointer;font-weight:700}button:disabled{opacity:.55;cursor:wait}small{display:block;margin-top:1.25rem;color:#737b86}</style></head>
+<body><main class="box"><h1 class="mark">OWNMESH</h1><h2>${registered ? "Owner sign in" : "Create owner"}</h2><p>${intro}</p>
+<form id="passkey-form" data-mode="${mode}"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">${codeInput}<button type="submit">${button}</button></form><p id="passkey-status" role="status" aria-live="polite"></p>
+<small>Self-hosted instance: ${escapeHtml(new URL(issuer).host)}. Private keys stay in your authenticator; D1 stores only the public credential.</small></main><script src="/auth/passkey.js" defer></script></body></html>`,
+    {
+      status: 200,
+      noStore: true,
+      headers: {
+        "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      },
+    },
   );
+}
+
+export function ownerPasskeyScript(): Response {
+  const script = `(()=>{"use strict";const f=document.getElementById("passkey-form"),s=document.getElementById("passkey-status"),b=f&&f.querySelector("button");if(!f||!s||!b)return;const d=x=>{const p="=".repeat((4-x.length%4)%4),v=atob(x.replace(/-/g,"+").replace(/_/g,"/")+p),a=new Uint8Array(v.length);for(let i=0;i<v.length;i++)a[i]=v.charCodeAt(i);return a.buffer},e=x=>{const a=new Uint8Array(x);let v="";for(const n of a)v+=String.fromCharCode(n);return btoa(v).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/g,"")},creation=o=>({ ...o,challenge:d(o.challenge),user:{...o.user,id:d(o.user.id)},excludeCredentials:(o.excludeCredentials||[]).map(c=>({...c,id:d(c.id)}))}),request=o=>({...o,challenge:d(o.challenge),allowCredentials:(o.allowCredentials||[]).map(c=>({...c,id:d(c.id)}))}),json=c=>typeof c.toJSON==="function"?c.toJSON():{id:c.id,rawId:e(c.rawId),type:c.type,authenticatorAttachment:c.authenticatorAttachment||undefined,clientExtensionResults:c.getClientExtensionResults(),response:c.response.attestationObject?{clientDataJSON:e(c.response.clientDataJSON),attestationObject:e(c.response.attestationObject),transports:typeof c.response.getTransports==="function"?c.response.getTransports():undefined}:{clientDataJSON:e(c.response.clientDataJSON),authenticatorData:e(c.response.authenticatorData),signature:e(c.response.signature),userHandle:c.response.userHandle?e(c.response.userHandle):undefined}};f.addEventListener("submit",async n=>{n.preventDefault();if(!window.PublicKeyCredential){s.textContent="Passkeys are not supported by this browser.";return}b.disabled=true;s.textContent="Waiting for your passkey…";try{const mode=f.dataset.mode,ret=f.elements.return_to.value,payload={return_to:ret};if(mode==="register")payload.owner_code=f.elements.owner_code.value;const optionsPath=mode==="register"?"/auth/passkey/register/options":"/auth/passkey/options",verifyPath=mode==="register"?"/auth/passkey/register/verify":"/auth/passkey/verify",or=await fetch(optionsPath,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(payload)}),ob=await or.json();if(!or.ok)throw new Error(ob.error||"passkey_options_failed");const pk=mode==="register"?creation(ob.options):request(ob.options),credential=mode==="register"?await navigator.credentials.create({publicKey:pk}):await navigator.credentials.get({publicKey:pk});if(!credential)throw new Error("passkey_cancelled");const vr=await fetch(verifyPath,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(json(credential))}),vb=await vr.json();if(!vr.ok||!vb.redirect)throw new Error(vb.error||"passkey_verification_failed");location.assign(vb.redirect)}catch(_){s.textContent="Passkey verification failed. Retry from this page.";b.disabled=false}})})();`;
+  return new Response(script, {
+    status: 200,
+    headers: {
+      "content-type": "text/javascript; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+      "x-content-type-options": "nosniff",
+    },
+  });
 }
 
 export async function handleOwnerLogin(
@@ -220,38 +377,237 @@ export async function handleOwnerLogin(
     if (await ownerPrincipalFromRequest(request, env, issuer)) {
       return new Response(null, { status: 302, headers: { location: returnTo } });
     }
-    return loginPage(issuer, returnTo);
+    try {
+      return loginPage(issuer, returnTo, (await store.listOwnerPasskeys()).length > 0);
+    } catch {
+      return json({ error: "owner_auth_schema_unavailable" }, { status: 503, noStore: true });
+    }
   }
-  if (request.method !== "POST") {
-    return json({ error: "method_not_allowed" }, { status: 405, noStore: true });
+  return json({ error: "method_not_allowed" }, { status: 405, noStore: true });
+}
+
+async function ownerPasskeys(store: ControlPlaneStore) {
+  try {
+    return await store.listOwnerPasskeys();
+  } catch {
+    return null;
   }
-  if (!sameOriginPost(request, issuer)) {
-    return json({ error: "origin_not_allowed" }, { status: 403, noStore: true });
-  }
-  const form = await boundedForm(request);
-  if (!form) return json({ error: "invalid_request" }, { status: 400, noStore: true });
-  const submittedReturnTo = safeReturnTo(form.get("return_to"), issuer);
-  const ownerCode = (form.get("owner_code") || "").trim();
-  if (ownerCode.length < 20 || ownerCode.length > 128) return loginPage(issuer, submittedReturnTo, true);
-  const digest = await sha256Hex(ownerCode);
-  if (!constantTimeEqual(digest, env.OWNER_TOKEN_HASH!)) {
-    return loginPage(issuer, submittedReturnTo, true);
-  }
-  await store.ensureBootstrap();
-  if (!(await store.tenantExists(OWNER_TENANT))) {
-    return json({ error: "owner_tenant_unavailable" }, { status: 503, noStore: true });
-  }
-  await store.ensurePrincipal(OWNER_ID, "Owner", "human", OWNER_TENANT);
-  const token = await issueSession(env.SESSION_SECRET!, issuer);
-  return new Response(null, {
-    status: 303,
-    headers: {
-      location: submittedReturnTo,
-      "set-cookie": cookie(SESSION_COOKIE, token, SESSION_TTL_SECONDS, "Lax"),
-      "cache-control": "no-store, no-cache",
-      pragma: "no-cache",
-    },
+}
+
+function challengeResponse(data: unknown, challengeId: string): Response {
+  return json(data, {
+    status: 200,
+    noStore: true,
+    headers: { "set-cookie": passkeyChallengeCookie(challengeId) },
   });
+}
+
+function passkeyError(error: string, status: number): Response {
+  return json({ error }, { status, noStore: true });
+}
+
+export async function handleOwnerPasskeyRegistrationOptions(
+  request: Request,
+  store: ControlPlaneStore,
+  issuer: string,
+  env: OwnerAuthEnv,
+): Promise<Response> {
+  if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
+  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  let body: Record<string, unknown> | null;
+  try {
+    body = await passkeyJson(request);
+  } catch (error) {
+    return passkeyError(error instanceof BodyTooLargeError ? "request_too_large" : "invalid_request", 413);
+  }
+  if (!body) return passkeyError("invalid_request", 400);
+  const ownerCode = boundedText(body.owner_code, 128)?.trim() || "";
+  if (!/^own_[A-Za-z0-9_-]{20,96}$/.test(ownerCode)) return passkeyError("bootstrap_denied", 401);
+  if (!constantTimeEqual(await sha256Hex(ownerCode), env.OWNER_TOKEN_HASH!)) {
+    return passkeyError("bootstrap_denied", 401);
+  }
+  const existing = await ownerPasskeys(store);
+  if (!existing) return passkeyError("owner_auth_schema_unavailable", 503);
+  if (existing.length > 0) return passkeyError("owner_already_registered", 409);
+
+  await store.ensureBootstrap();
+  if (!(await store.tenantExists(OWNER_TENANT))) return passkeyError("owner_tenant_unavailable", 503);
+  await store.ensurePrincipal(OWNER_ID, "Owner", "human", OWNER_TENANT);
+  const userIdBytes = randomBytes(32);
+  const webauthnUserId = bytesToBase64Url(userIdBytes);
+  const options = await generateRegistrationOptions({
+    rpName: "OwnMesh",
+    rpID: rpId(issuer),
+    userName: "owner",
+    userDisplayName: "Owner",
+    userID: userIdBytes,
+    timeout: PASSKEY_CHALLENGE_TTL_MS,
+    attestationType: "none",
+    authenticatorSelection: { residentKey: "required", userVerification: "required" },
+    supportedAlgorithmIDs: [-7, -257],
+  });
+  const createdAt = nowIso();
+  const claimed = await store.putOwnerAuthChallenge({
+    id: REGISTRATION_CHALLENGE_ID,
+    kind: "register",
+    challenge: options.challenge,
+    webauthn_user_id: webauthnUserId,
+    return_to: safeReturnTo(boundedText(body.return_to, 4096), issuer),
+    expires_at: Date.now() + PASSKEY_CHALLENGE_TTL_MS,
+    created_at: createdAt,
+  });
+  if (!claimed) return passkeyError("registration_in_progress", 409);
+  return challengeResponse({ options }, REGISTRATION_CHALLENGE_ID);
+}
+
+export async function handleOwnerPasskeyRegistrationVerify(
+  request: Request,
+  store: ControlPlaneStore,
+  issuer: string,
+  env: OwnerAuthEnv,
+): Promise<Response> {
+  if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
+  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  let body: Record<string, unknown> | null;
+  try {
+    body = await passkeyJson(request);
+  } catch (error) {
+    return passkeyError(error instanceof BodyTooLargeError ? "request_too_large" : "invalid_request", 413);
+  }
+  const response = registrationResponse(body);
+  const challengeId = passkeyChallengeId(request);
+  if (!response || challengeId !== REGISTRATION_CHALLENGE_ID) return passkeyError("verification_failed", 400);
+  const challenge = await store.takeOwnerAuthChallenge(challengeId, "register");
+  if (!challenge?.webauthn_user_id) return passkeyError("challenge_expired", 400);
+  try {
+    const verification = await verifyRegistrationResponse({
+      response,
+      expectedChallenge: challenge.challenge,
+      expectedOrigin: origin(issuer),
+      expectedRPID: rpId(issuer),
+      requireUserVerification: true,
+      supportedAlgorithmIDs: [-7, -257],
+    });
+    if (!verification.verified) return passkeyError("verification_failed", 401);
+    const info = verification.registrationInfo;
+    const inserted = await store.putInitialOwnerPasskey({
+      credential_id: info.credential.id,
+      principal_id: OWNER_ID,
+      webauthn_user_id: challenge.webauthn_user_id,
+      public_key: info.credential.publicKey,
+      counter: info.credential.counter,
+      transports: info.credential.transports || [],
+      device_type: info.credentialDeviceType,
+      backed_up: info.credentialBackedUp,
+      created_at: nowIso(),
+    });
+    if (!inserted) return passkeyError("owner_already_registered", 409);
+    const session = await issueSession(env.SESSION_SECRET!, issuer);
+    const headers = new Headers();
+    headers.append("set-cookie", cookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, "Lax"));
+    headers.append("set-cookie", passkeyChallengeCookie("", 0));
+    return json({ ok: true, redirect: challenge.return_to }, { status: 200, noStore: true, headers });
+  } catch {
+    return passkeyError("verification_failed", 401);
+  }
+}
+
+export async function handleOwnerPasskeyOptions(
+  request: Request,
+  store: ControlPlaneStore,
+  issuer: string,
+  env: OwnerAuthEnv,
+): Promise<Response> {
+  if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
+  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  let body: Record<string, unknown> | null;
+  try {
+    body = await passkeyJson(request);
+  } catch (error) {
+    return passkeyError(error instanceof BodyTooLargeError ? "request_too_large" : "invalid_request", 413);
+  }
+  if (!body) return passkeyError("invalid_request", 400);
+  const passkeys = await ownerPasskeys(store);
+  if (!passkeys) return passkeyError("owner_auth_schema_unavailable", 503);
+  if (passkeys.length === 0) return passkeyError("owner_registration_required", 409);
+  const options = await generateAuthenticationOptions({
+    rpID: rpId(issuer),
+    allowCredentials: passkeys.map((passkey) => ({
+      id: passkey.credential_id,
+      transports: parseTransports(passkey.transports),
+    })),
+    timeout: PASSKEY_CHALLENGE_TTL_MS,
+    userVerification: "required",
+  });
+  const challengeId = randomToken("pka_");
+  const record: OwnerAuthChallenge = {
+    id: challengeId,
+    kind: "authenticate",
+    challenge: options.challenge,
+    return_to: safeReturnTo(boundedText(body.return_to, 4096), issuer),
+    expires_at: Date.now() + PASSKEY_CHALLENGE_TTL_MS,
+    created_at: nowIso(),
+  };
+  if (!(await store.putOwnerAuthChallenge(record))) return passkeyError("too_many_attempts", 429);
+  return challengeResponse({ options }, challengeId);
+}
+
+export async function handleOwnerPasskeyVerify(
+  request: Request,
+  store: ControlPlaneStore,
+  issuer: string,
+  env: OwnerAuthEnv,
+): Promise<Response> {
+  if (!ownerAuthConfigured(env)) return passkeyError("owner_auth_unavailable", 503);
+  if (!sameOriginPost(request, issuer)) return passkeyError("origin_not_allowed", 403);
+  let body: Record<string, unknown> | null;
+  try {
+    body = await passkeyJson(request);
+  } catch (error) {
+    return passkeyError(error instanceof BodyTooLargeError ? "request_too_large" : "invalid_request", 413);
+  }
+  const response = authenticationResponse(body);
+  const challengeId = passkeyChallengeId(request);
+  if (!response || !challengeId) return passkeyError("verification_failed", 400);
+  const challenge = await store.takeOwnerAuthChallenge(challengeId, "authenticate");
+  if (!challenge) return passkeyError("challenge_expired", 400);
+  const passkey = await store.getOwnerPasskey(response.id);
+  if (!passkey || passkey.principal_id !== OWNER_ID) return passkeyError("verification_failed", 401);
+  try {
+    const publicKey = new Uint8Array(new ArrayBuffer(passkey.public_key.byteLength));
+    publicKey.set(passkey.public_key);
+    const verification = await verifyAuthenticationResponse({
+      response,
+      expectedChallenge: challenge.challenge,
+      expectedOrigin: origin(issuer),
+      expectedRPID: rpId(issuer),
+      credential: {
+        id: passkey.credential_id,
+        publicKey,
+        counter: passkey.counter,
+        transports: parseTransports(passkey.transports),
+      },
+      requireUserVerification: true,
+    });
+    if (!verification.verified) return passkeyError("verification_failed", 401);
+    const info = verification.authenticationInfo;
+    if (!(await store.updateOwnerPasskeyUsage(
+      passkey.credential_id,
+      passkey.counter,
+      info.newCounter,
+      info.credentialDeviceType,
+      info.credentialBackedUp,
+    ))) {
+      return passkeyError("verification_conflict", 409);
+    }
+    const session = await issueSession(env.SESSION_SECRET!, issuer);
+    const headers = new Headers();
+    headers.append("set-cookie", cookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, "Lax"));
+    headers.append("set-cookie", passkeyChallengeCookie("", 0));
+    return json({ ok: true, redirect: challenge.return_to }, { status: 200, noStore: true, headers });
+  } catch {
+    return passkeyError("verification_failed", 401);
+  }
 }
 
 export async function handleOwnerLogout(request: Request, issuer: string): Promise<Response> {
