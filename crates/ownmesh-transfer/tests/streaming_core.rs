@@ -1496,9 +1496,7 @@ fn lazy_source_open_failure_removes_its_exact_reservation_and_snapshot() {
         Err(TransferError::CustodyUnavailable)
     ));
     let snapshot = store.root().join(format!(".{}.source", plan.id()));
-    let reservation = store
-        .root()
-        .join(format!(".{}.source.reserve", plan.id()));
+    let reservation = store.root().join(format!(".{}.source.reserve", plan.id()));
     assert!(!snapshot.exists());
     assert!(!reservation.exists());
 

@@ -2227,7 +2227,8 @@ impl JournalStore {
                 Path::new(&plan.binding().destination_relative_path),
                 &file,
             )
-            .map_err(|error| match error {
+            .map_err(|error| {
+                match error {
                 ownmesh_fs::FsError::Io { source, .. }
                     if source.kind() == std::io::ErrorKind::AlreadyExists =>
                 {
@@ -2245,6 +2246,7 @@ impl JournalStore {
                     TransferError::PlatformUnsupported
                 }
                 _ => TransferError::CustodyUnavailable,
+            }
             })
     }
 

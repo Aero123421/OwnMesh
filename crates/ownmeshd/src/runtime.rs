@@ -1658,22 +1658,20 @@ impl DaemonRuntime {
                             &cancel_intent,
                         ),
                     ));
-                    loop {
-                        tokio::select! {
-                            biased;
-                            response = &mut execute_result => return response,
-                            _ = &mut cancel_delivery => {
-                                // Drop the read future before its borrowed
-                                // connection. This closes the exact execute
-                                // pipe and forces the broker to fence the Job,
-                                // even when the independent Cancel pipe was
-                                // rejected by bounded admission.
-                                drop(execute_result);
-                                drop(connection);
-                                return Err(BrokerV2ClientError::ExecutionUncertain(
-                                    "local cancellation closed the original Windows execute pipe; broker outcome is non-retriable".into(),
-                                ));
-                            }
+                    tokio::select! {
+                        biased;
+                        response = &mut execute_result => return response,
+                        _ = &mut cancel_delivery => {
+                            // Drop the read future before its borrowed
+                            // connection. This closes the exact execute
+                            // pipe and forces the broker to fence the Job,
+                            // even when the independent Cancel pipe was
+                            // rejected by bounded admission.
+                            drop(execute_result);
+                            drop(connection);
+                            return Err(BrokerV2ClientError::ExecutionUncertain(
+                                "local cancellation closed the original Windows execute pipe; broker outcome is non-retriable".into(),
+                            ));
                         }
                     }
                 }
@@ -2996,13 +2994,7 @@ full_user_access/full_access for arbitrary commands",
         let now = Self::now() as u64;
         let lease = self
             .transfer_store
-            .acquire_for_fence(
-                &plan,
-                now,
-                authority.expires_at_unix,
-                u64::from(p.epoch),
-                p.fence,
-            )
+            .acquire_for_fence(&plan, now, authority.expires_at_unix, p.epoch, p.fence)
             .map_err(Self::transfer_error)?;
         let journal = self
             .transfer_store
@@ -10332,9 +10324,9 @@ mod broker_intent_tests {
         channel_open = false;
         tokio::select! {
             biased;
-            _ = std::future::pending::<()>() => panic!("pending execute cannot complete"),
+            () = std::future::pending::<()>() => panic!("pending execute cannot complete"),
             _ = cancel.changed(), if channel_open => panic!("closed cancel watch must be disabled"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
         }
     }
 

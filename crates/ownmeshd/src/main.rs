@@ -162,7 +162,7 @@ fn run_daemon() -> ExitCode {
 
 #[cfg(windows)]
 fn run_foreground_exit() -> Result<(), i32> {
-    daemon::run_foreground().map_err(|code| code.code())
+    daemon::run_foreground().map_err(ownmesh_domain::ExitCode::code)
 }
 
 fn init_tracing() {

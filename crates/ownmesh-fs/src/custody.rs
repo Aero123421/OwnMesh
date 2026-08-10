@@ -2045,10 +2045,7 @@ mod tests {
         ] {
             let (buffer, total) =
                 file_link_information_buffer(std::ptr::null_mut::<u8>() as HANDLE, name).unwrap();
-            assert_eq!(
-                buffer.len(),
-                file_name_offset + std::mem::size_of_val(name)
-            );
+            assert_eq!(buffer.len(), file_name_offset + std::mem::size_of_val(name));
             assert_eq!(usize::try_from(total).unwrap(), buffer.len());
             let copied = name
                 .iter()

@@ -96,6 +96,8 @@ pub enum Commands {
 }
 
 /// `ownmesh setup` arguments.
+// These are independent command-line switches, not persistent product state.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Parser)]
 pub struct SetupArgs {
     /// Control-plane base URL (https://…; http:// loopback only).
