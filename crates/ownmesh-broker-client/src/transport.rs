@@ -530,7 +530,7 @@ pub async fn read_submitted_execute_v2_windows(
     execution_timeout_ms: u64,
 ) -> BrokerV2ClientResult<BrokerResponseV2> {
     let timeout = Duration::from_millis(execution_timeout_ms).saturating_add(V2_RESPONSE_GRACE);
-    let response = read_v2_response(connection.connection_mut(), &request_id, timeout)
+    let response = read_v2_response(connection.connection_mut(), request_id, timeout)
         .await
         .map_err(|error| match error {
             BrokerV2ClientError::Timeout { .. }
