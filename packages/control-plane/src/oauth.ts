@@ -12,6 +12,7 @@
 import type { ControlPlaneStore } from "./store.ts";
 import { chatGptOAuthPair } from "./owner-auth.ts";
 import {
+  ACCESS_TOKEN_TTL_MS,
   DEFAULT_TENANT,
   encodeDevicePublicKey,
   generateUserCode,
@@ -519,9 +520,11 @@ export async function handleToken(
     });
     return json({
       access_token: tok.access_token,
-      ...(requireScope(tok.scope, "offline_access") ? { refresh_token: tok.refresh_token } : {}),
+      ...(requireScope(tok.scope, "offline_access") || chatGptOAuthPair(auth.client_id, auth.redirect_uri)
+        ? { refresh_token: tok.refresh_token }
+        : {}),
       token_type: "bearer",
-      expires_in: 900,
+      expires_in: ACCESS_TOKEN_TTL_MS / 1000,
       scope: tok.scope,
     });
   }
@@ -555,7 +558,7 @@ export async function handleToken(
       access_token: result.token.access_token,
       refresh_token: result.token.refresh_token,
       token_type: "bearer",
-      expires_in: 900,
+      expires_in: ACCESS_TOKEN_TTL_MS / 1000,
       scope: result.token.scope,
     });
   }
@@ -605,7 +608,7 @@ export async function handleToken(
       access_token: tok.access_token,
       ...(requireScope(tok.scope, "offline_access") ? { refresh_token: tok.refresh_token } : {}),
       token_type: "bearer",
-      expires_in: 900,
+      expires_in: ACCESS_TOKEN_TTL_MS / 1000,
       scope: tok.scope,
     });
   }

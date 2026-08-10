@@ -213,7 +213,7 @@ test("SQL expired refresh is invalid_grant and never reuse", async () => {
   const { store: s, db } = openStore(); await s.ensureBootstrap();
   const initial = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
   const hash = await sha256Hex(initial.refresh_token);
-  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+  db.prepare(`UPDATE oauth_tokens SET refresh_expires_at = ? WHERE refresh_token_hash = ?`).run(
     new Date(Date.now() - 1_000).toISOString(),
     hash,
   );
@@ -226,7 +226,7 @@ test("SQL expired refresh is invalid_grant and never reuse", async () => {
   const rotated = await s.rotateRefresh(live.refresh_token);
   assert.equal(rotated.ok, true);
   const usedHash = await sha256Hex(live.refresh_token);
-  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+  db.prepare(`UPDATE oauth_tokens SET refresh_expires_at = ? WHERE refresh_token_hash = ?`).run(
     new Date(Date.now() - 1_000).toISOString(),
     usedHash,
   );

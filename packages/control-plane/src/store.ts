@@ -14,6 +14,11 @@ import {
   generateUserCode,
 } from "./util.ts";
 
+/** Short-lived bearer used for API requests. */
+export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
+/** Rolling inactivity limit for a rotated refresh-token family. */
+export const REFRESH_TOKEN_IDLE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+
 export type TokenRecord = {
   access_token: string;
   refresh_token: string;
@@ -21,6 +26,7 @@ export type TokenRecord = {
   scope: string;
   principal: string;
   expires_at: number;
+  refresh_expires_at: number;
   revoked: boolean;
   refresh_family: string;
   refresh_used: boolean;
@@ -543,6 +549,7 @@ export interface ControlPlaneStore {
     scope: string,
     family?: string,
     ttlMs?: number,
+    refreshTtlMs?: number,
   ): Promise<TokenRecord>;
   getAccess(token: string): Promise<TokenRecord | null>;
   rotateRefresh(refreshToken: string): Promise<
@@ -798,6 +805,8 @@ export type SchemaReadiness = {
     /** 0013 built-in owner passkeys + one-time WebAuthn challenges */
     owner_passkeys: boolean;
     owner_auth_challenges: boolean;
+    /** 0014 independent rolling refresh-token inactivity deadline */
+    oauth_tokens_refresh_lifetime: boolean;
   };
 };
 
@@ -806,6 +815,10 @@ const SCHEMA_READINESS_OBJECTS: Record<
   keyof SchemaReadiness["checks"],
   { table: string; columns: string[]; indexes?: string[] }
 > = {
+  oauth_tokens_refresh_lifetime: {
+    table: "oauth_tokens",
+    columns: ["refresh_expires_at"],
+  },
   oauth_auth_codes: {
     table: "oauth_auth_codes",
     columns: [
@@ -1208,7 +1221,8 @@ export class MemoryStore implements ControlPlaneStore {
     principal: string,
     scope: string,
     family?: string,
-    ttlMs = 15 * 60 * 1000,
+    ttlMs = ACCESS_TOKEN_TTL_MS,
+    refreshTtlMs = REFRESH_TOKEN_IDLE_TTL_MS,
   ): Promise<TokenRecord> {
     const principalRecord = (await this.getPrincipal(principal)) || await this.ensurePrincipal(principal, principal);
     const access = randomToken("atk_");
@@ -1220,6 +1234,7 @@ export class MemoryStore implements ControlPlaneStore {
       scope,
       principal,
       expires_at: Date.now() + ttlMs,
+      refresh_expires_at: Date.now() + refreshTtlMs,
       revoked: family ? this.compromisedRefreshFamilies.has(family) : false,
       refresh_family: family || randomToken("fam_"),
       refresh_used: false,
@@ -1251,14 +1266,14 @@ export class MemoryStore implements ControlPlaneStore {
       }
     }
     // Expired refresh is always invalid_grant (reuse detection is in-window only).
-    if (prior && now > prior.expires_at) {
+    if (prior && now > prior.refresh_expires_at) {
       return { ok: false, error: "invalid_grant" };
     }
 
     const usedFamily = this.usedRefresh.get(refreshToken);
     if (usedFamily) {
-      // Reuse only when the prior record is still within expires_at.
-      if (!prior || now > prior.expires_at) {
+      // Reuse only while the prior refresh credential is still within its inactivity window.
+      if (!prior || now > prior.refresh_expires_at) {
         return { ok: false, error: "invalid_grant" };
       }
       this.compromisedRefreshFamilies.add(usedFamily);
@@ -1280,7 +1295,7 @@ export class MemoryStore implements ControlPlaneStore {
     if (!access) return { ok: false, error: "invalid_grant" };
     const old = this.tokensByAccess.get(access);
     if (!old || old.revoked) return { ok: false, error: "invalid_grant" };
-    if (now > old.expires_at) return { ok: false, error: "invalid_grant" };
+    if (now > old.refresh_expires_at) return { ok: false, error: "invalid_grant" };
     if (old.refresh_used) {
       this.compromisedRefreshFamilies.add(old.refresh_family);
       for (const [k, v] of this.tokensByAccess) {
@@ -2461,7 +2476,8 @@ export class SqlStore implements ControlPlaneStore {
     principal: string,
     scope: string,
     family?: string,
-    ttlMs = 15 * 60 * 1000,
+    ttlMs = ACCESS_TOKEN_TTL_MS,
+    refreshTtlMs = REFRESH_TOKEN_IDLE_TTL_MS,
   ): Promise<TokenRecord> {
     const principalRecord = (await this.getPrincipal(principal)) || await this.ensurePrincipal(principal, principal);
     // Never turn token issuance into implicit client registration.
@@ -2472,15 +2488,16 @@ export class SqlStore implements ControlPlaneStore {
     const refresh = randomToken("rtk_");
     const fam = family || randomToken("fam_");
     const expiresAt = Date.now() + ttlMs;
+    const refreshExpiresAt = Date.now() + refreshTtlMs;
     const accessHash = await sha256Hex(access);
     const refreshHash = await sha256Hex(refresh);
     await this.db
       .prepare(
         `INSERT INTO oauth_tokens
-         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, created_at)
+         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, 0,
            CASE WHEN EXISTS (SELECT 1 FROM revoked_refresh_families WHERE refresh_family = ?) THEN 1 ELSE 0 END,
-           ?, ?)`,
+           ?, ?, ?)`,
       )
       .bind(
         accessHash,
@@ -2491,6 +2508,7 @@ export class SqlStore implements ControlPlaneStore {
         fam,
         fam,
         nowIso(expiresAt),
+        nowIso(refreshExpiresAt),
         nowIso(),
       )
       .run();
@@ -2501,6 +2519,7 @@ export class SqlStore implements ControlPlaneStore {
       scope,
       principal,
       expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAt,
       revoked: Boolean(await this.db.prepare(
         `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
       ).bind(fam).first("revoked")),
@@ -2515,7 +2534,7 @@ export class SqlStore implements ControlPlaneStore {
     const row = await this.db
       .prepare(
         `SELECT t.access_token_hash, t.refresh_token_hash, t.client_id, t.principal_id, t.scope,
-                t.refresh_family, t.refresh_used, t.revoked, t.expires_at, p.tenant_id
+                t.refresh_family, t.refresh_used, t.revoked, t.expires_at, t.refresh_expires_at, p.tenant_id
          FROM oauth_tokens t JOIN principals p ON p.id = t.principal_id
          WHERE t.access_token_hash = ?`,
       )
@@ -2528,6 +2547,7 @@ export class SqlStore implements ControlPlaneStore {
         refresh_used: number;
         revoked: number;
         expires_at: string;
+        refresh_expires_at: string;
         tenant_id: string;
       }>();
     if (!row || row.revoked) return null;
@@ -2540,6 +2560,7 @@ export class SqlStore implements ControlPlaneStore {
       scope: row.scope,
       principal: row.principal_id,
       expires_at: exp,
+      refresh_expires_at: Date.parse(row.refresh_expires_at),
       revoked: false,
       refresh_family: row.refresh_family,
       refresh_used: Boolean(row.refresh_used),
@@ -2561,11 +2582,11 @@ export class SqlStore implements ControlPlaneStore {
 
     // Authoritative pre-read for metadata + expiry. CAS in the batch is the claim.
     const row = await this.db.prepare(
-      `SELECT client_id, principal_id, scope, refresh_family, revoked, refresh_used, expires_at
+      `SELECT client_id, principal_id, scope, refresh_family, revoked, refresh_used, refresh_expires_at
        FROM oauth_tokens WHERE refresh_token_hash = ?`,
     ).bind(refreshHash).first<{
       client_id: string; principal_id: string; scope: string;
-      refresh_family: string; revoked: number; refresh_used: number; expires_at: string;
+      refresh_family: string; revoked: number; refresh_used: number; refresh_expires_at: string;
     }>();
 
     if (!row) {
@@ -2573,7 +2594,7 @@ export class SqlStore implements ControlPlaneStore {
       return { ok: false, error: "invalid_grant" };
     }
 
-    const exp = Date.parse(row.expires_at);
+    const exp = Date.parse(row.refresh_expires_at);
     // Expired refresh is always invalid_grant; reuse detection is in-window only.
     if (!Number.isFinite(exp) || nowMs > exp) {
       return { ok: false, error: "invalid_grant" };
@@ -2592,7 +2613,7 @@ export class SqlStore implements ControlPlaneStore {
       return { ok: false, error: "invalid_grant" };
     }
 
-    // Real reuse: ledger hit and/or refresh_used=1 within the expires_at window.
+    // Real reuse: ledger hit and/or refresh_used=1 within the refresh inactivity window.
     if (used || row.refresh_used) {
       const fam = used?.refresh_family || row.refresh_family;
       await this.db.batch([
@@ -2622,12 +2643,13 @@ export class SqlStore implements ControlPlaneStore {
     // Precompute successor material before the batch (same defaults as issueTokens).
     const access = randomToken("atk_");
     const refresh = randomToken("rtk_");
-    const ttlMs = 15 * 60 * 1000;
-    const expiresAt = nowMs + ttlMs;
+    const expiresAt = nowMs + ACCESS_TOKEN_TTL_MS;
+    const refreshExpiresAt = nowMs + REFRESH_TOKEN_IDLE_TTL_MS;
     const accessHash = await sha256Hex(access);
     const newRefreshHash = await sha256Hex(refresh);
     const ts = now;
     const expiresAtIso = nowIso(expiresAt);
+    const refreshExpiresAtIso = nowIso(refreshExpiresAt);
     const fam = row.refresh_family;
 
     type BatchResult = { meta?: { changes?: number }; success?: boolean };
@@ -2643,26 +2665,26 @@ export class SqlStore implements ControlPlaneStore {
          WHERE refresh_token_hash = ?
            AND revoked = 0
            AND refresh_used = 0
-           AND expires_at > ?`,
+           AND refresh_expires_at > ?`,
       ).bind(ts, refreshHash, now),
       this.db.prepare(
         `UPDATE oauth_tokens SET revoked = 1, refresh_used = 1
          WHERE refresh_token_hash = ?
            AND revoked = 0
            AND refresh_used = 0
-           AND expires_at > ?
+           AND refresh_expires_at > ?
            AND EXISTS (
              SELECT 1 FROM used_refresh_tokens WHERE refresh_token_hash = ?
            )`,
       ).bind(refreshHash, now, refreshHash),
       this.db.prepare(
         `INSERT INTO oauth_tokens
-         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, created_at)
+         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at)
          SELECT ?, ?, ot.client_id, ot.principal_id, ot.scope, ot.refresh_family, 0,
            CASE WHEN EXISTS (
              SELECT 1 FROM revoked_refresh_families r WHERE r.refresh_family = ot.refresh_family
            ) THEN 1 ELSE 0 END,
-           ?, ?
+           ?, ?, ?
          FROM oauth_tokens ot
          WHERE ot.refresh_token_hash = ?
            AND ot.refresh_used = 1 AND ot.revoked = 1
@@ -2676,7 +2698,7 @@ export class SqlStore implements ControlPlaneStore {
                AND cur.refresh_used = 0
                AND cur.revoked = 0
            )`,
-      ).bind(accessHash, newRefreshHash, expiresAtIso, ts, refreshHash),
+      ).bind(accessHash, newRefreshHash, expiresAtIso, refreshExpiresAtIso, ts, refreshHash),
       this.db.prepare(
         `UPDATE principals SET credential_generation = credential_generation + 1
          WHERE id = ? AND credential_generation >= 1
@@ -2758,6 +2780,7 @@ export class SqlStore implements ControlPlaneStore {
         scope: row.scope,
         principal: row.principal_id,
         expires_at: expiresAt,
+        refresh_expires_at: refreshExpiresAt,
         revoked: false,
         refresh_family: fam,
         refresh_used: false,

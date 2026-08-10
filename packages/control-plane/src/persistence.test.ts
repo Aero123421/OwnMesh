@@ -339,7 +339,7 @@ test("sql store expired refresh is invalid_grant", async () => {
   const first = await store.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
   const { sha256Hex } = await import("./util.ts");
   const hash = await sha256Hex(first.refresh_token);
-  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+  db.prepare(`UPDATE oauth_tokens SET refresh_expires_at = ? WHERE refresh_token_hash = ?`).run(
     new Date(Date.now() - 5_000).toISOString(),
     hash,
   );

@@ -1,6 +1,4 @@
-/**
- * rotateRefresh: expires_at enforcement + CAS winner-only successor (Memory + SQL).
- */
+/** rotateRefresh lifetime enforcement + CAS winner-only successor (Memory + SQL). */
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync, readdirSync } from "node:fs";
@@ -75,10 +73,10 @@ test("Memory rotateRefresh: expired refresh is invalid_grant", async () => {
     redirect_uris: ["http://localhost/cb"],
     created_at: new Date().toISOString(),
   });
-  const tok = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read", undefined, 1);
+  const tok = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read");
   // Force expiry on the issued row.
   const access = [...s.tokensByAccess.values()].find((t) => t.refresh_token === tok.refresh_token)!;
-  access.expires_at = Date.now() - 1;
+  access.refresh_expires_at = Date.now() - 1;
   s.tokensByAccess.set(access.access_token, access);
 
   const result = await s.rotateRefresh(tok.refresh_token);
@@ -86,7 +84,20 @@ test("Memory rotateRefresh: expired refresh is invalid_grant", async () => {
   if (!result.ok) assert.equal(result.error, "invalid_grant");
 });
 
-test("Memory rotateRefresh: reuse only within expires_at window", async () => {
+test("Memory rotateRefresh: expired access still rotates a live refresh token", async () => {
+  const s = new MemoryStore();
+  await s.ensureBootstrap();
+  const tok = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
+  const row = s.tokensByAccess.get(tok.access_token)!;
+  row.expires_at = Date.now() - 1;
+  row.refresh_expires_at = Date.now() + 60_000;
+
+  const result = await s.rotateRefresh(tok.refresh_token);
+  assert.equal(result.ok, true);
+  if (result.ok) assert.ok(result.token.refresh_expires_at > row.refresh_expires_at);
+});
+
+test("Memory rotateRefresh: reuse only within refresh lifetime", async () => {
   const s = new MemoryStore();
   await s.ensureBootstrap();
   await s.putClient({
@@ -122,7 +133,7 @@ test("Memory rotateRefresh: expired used refresh is invalid_grant not reuse", as
 
   // Expire the prior (used) record, then present the old refresh again.
   const prior = [...s.tokensByAccess.values()].find((t) => t.refresh_token === tok.refresh_token)!;
-  prior.expires_at = Date.now() - 1;
+  prior.refresh_expires_at = Date.now() - 1;
   s.tokensByAccess.set(prior.access_token, prior);
 
   const again = await s.rotateRefresh(tok.refresh_token);
@@ -135,7 +146,7 @@ test("SQL rotateRefresh: expired refresh is invalid_grant", async () => {
   await s.ensureBootstrap();
   const tok = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
   const hash = await sha256Hex(tok.refresh_token);
-  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+  db.prepare(`UPDATE oauth_tokens SET refresh_expires_at = ? WHERE refresh_token_hash = ?`).run(
     new Date(Date.now() - 60_000).toISOString(),
     hash,
   );
@@ -144,7 +155,26 @@ test("SQL rotateRefresh: expired refresh is invalid_grant", async () => {
   if (!result.ok) assert.equal(result.error, "invalid_grant");
 });
 
-test("SQL rotateRefresh: CAS WHERE includes expires_at; concurrent winner is one", async () => {
+test("SQL rotateRefresh: expired access still rotates a live refresh token", async () => {
+  const { store: s, db } = openSql();
+  await s.ensureBootstrap();
+  const tok = await s.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
+  const hash = await sha256Hex(tok.refresh_token);
+  const shortRefreshDeadline = Date.now() + 60_000;
+  db.prepare(
+    `UPDATE oauth_tokens SET expires_at = ?, refresh_expires_at = ? WHERE refresh_token_hash = ?`,
+  ).run(
+    new Date(Date.now() - 60_000).toISOString(),
+    new Date(shortRefreshDeadline).toISOString(),
+    hash,
+  );
+
+  const result = await s.rotateRefresh(tok.refresh_token);
+  assert.equal(result.ok, true);
+  if (result.ok) assert.ok(result.token.refresh_expires_at > shortRefreshDeadline);
+});
+
+test("SQL rotateRefresh: refresh expiry CAS allows only one concurrent winner", async () => {
   const { store: s, db } = openSql();
   await s.ensureBootstrap();
   const initial = await s.issueTokens(
@@ -181,7 +211,7 @@ test("SQL rotateRefresh: expired used refresh is invalid_grant not reuse", async
   assert.equal(rotated.ok, true);
 
   const hash = await sha256Hex(tok.refresh_token);
-  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+  db.prepare(`UPDATE oauth_tokens SET refresh_expires_at = ? WHERE refresh_token_hash = ?`).run(
     new Date(Date.now() - 60_000).toISOString(),
     hash,
   );

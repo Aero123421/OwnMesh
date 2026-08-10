@@ -162,6 +162,55 @@ test("authorization_code + PKCE S256 exchange", async () => {
   assert.ok(tok.refresh_token.startsWith("rtk_"));
 });
 
+test("ChatGPT authorization receives a rotating refresh token without offline_access", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const verifier = "chatgpt-pkce-verifier-012345678901234567890123456789";
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
+  const challenge = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const clientId = "client_chatgpt_b6nceskp3dnc";
+  const redirectUri = "https://chatgpt.com/connector/oauth/b6NcEskp3DnC";
+  await store.putClient({
+    client_id: clientId,
+    tenant_id: "ten_default",
+    client_name: "ChatGPT",
+    redirect_uris: [redirectUri],
+    created_at: new Date().toISOString(),
+  });
+  await store.putAuthCode({
+    code: "code_chatgpt_refresh",
+    client_id: clientId,
+    principal_id: "prin_dev",
+    redirect_uri: redirectUri,
+    scope: "ownmesh.read",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    expires_at: Date.now() + 60_000,
+    used: false,
+  });
+
+  const response = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: "code_chatgpt_refresh",
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        code_verifier: verifier,
+      }),
+    }),
+    store,
+  );
+  assert.equal(response.status, 200);
+  const token = (await response.json()) as { access_token: string; refresh_token?: string };
+  assert.ok(token.access_token.startsWith("atk_"));
+  assert.ok(token.refresh_token?.startsWith("rtk_"));
+});
+
 test("device authorization grant end-to-end", async () => {
   const store = new MemoryStore();
   await store.ensureBootstrap();
