@@ -1,41 +1,56 @@
 //! Ratatui rendering for all screens, wizard, palette, and 80x24 layout.
 
-use crate::app::{App, Overlay, Screen};
+use crate::app::{App, Overlay, OverviewAction, Screen};
 use crate::i18n::{t, Lang, Msg};
 use crate::palette::filter_commands;
+use crate::theme::{ascii_fallback, ColorMode};
 #[cfg(test)]
 use crate::width::display_width;
 use crate::width::truncate_to_width;
 use crate::wizard::{WizardStep, WIZARD_PRESETS};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ownmesh_policy::AccessPreset;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use std::sync::LazyLock;
 
 /// Minimum comfortable layout from the checklist.
 pub const MIN_COLS: u16 = 80;
 pub const MIN_ROWS: u16 = 24;
 
+const LOGO_WIDTH: usize = 74;
+const LOGO_PIXEL_HEIGHT: usize = 12;
+static LOGO_RGB: LazyLock<Vec<u8>> = LazyLock::new(|| {
+    BASE64_STANDARD
+        .decode(include_str!("../assets/ownmesh-wordmark.rgb.b64").trim())
+        .expect("embedded OwnMesh wordmark must be valid base64")
+});
+
 /// Draw the full TUI frame.
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let narrow = area.width < MIN_COLS || area.height < MIN_ROWS;
-
+    let brand_height = if narrow { 3 } else { 8 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(brand_height),
+            Constraint::Min(8),
             Constraint::Length(3),
-            Constraint::Length(if area.height < 12 { 1 } else { 3 }),
-            Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(2),
         ])
         .split(area);
 
-    draw_header(frame, app, chunks[0], narrow);
-    draw_nav(frame, app, chunks[1]);
-    draw_body(frame, app, chunks[2], narrow);
+    draw_brand(frame, app, chunks[0], narrow);
+    if app.screen == Screen::Dashboard {
+        draw_dashboard(frame, app, chunks[1]);
+    } else {
+        draw_body(frame, app, centered_width(chunks[1], 96), narrow);
+    }
+    draw_command_bar(frame, app, chunks[2]);
     draw_footer(frame, app, chunks[3]);
 
     match app.overlay {
@@ -48,87 +63,183 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
-    let daemon = match &app.daemon {
-        Some(s) => format!(
-            "{} · v{} · pid {}",
-            t(app.lang, Msg::DaemonOnline),
-            s.version,
-            s.pid
-        ),
-        None => t(app.lang, Msg::DaemonOffline).to_owned(),
+fn draw_brand(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
+    let state = if app.active_instance.is_none() {
+        "setup required"
+    } else if app.daemon.is_some() {
+        "private mesh online"
+    } else {
+        "private mesh offline"
     };
-    let title = format!(
-        " {}  ·  {}  ·  {} ",
-        t(app.lang, Msg::AppTitle),
-        t(app.lang, app.screen.title_msg()),
-        app.lang.bcp47()
-    );
-    let mut lines = vec![Line::from(Span::styled(
-        truncate_to_width(&title, area.width.saturating_sub(2) as usize),
-        app.theme.title,
-    ))];
-    if !narrow {
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&daemon, area.width.saturating_sub(2) as usize),
-            app.theme.muted,
-        )));
+    let raster_logo = matches!(app.theme.mode, ColorMode::TrueColor | ColorMode::Ansi256);
+    if narrow || area.width < 106 || ascii_fallback() || !raster_logo {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("OwnMesh", app.theme.title)),
+                Line::from(Span::styled(state, app.theme.muted)),
+            ])
+            .alignment(Alignment::Center),
+            area,
+        );
+        return;
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(app.border_set())
-        .border_style(app.theme.border)
-        .title(t(app.lang, Msg::AppTitle));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+
+    let screen = if app.screen == Screen::Dashboard {
+        String::new()
+    } else {
+        format!(
+            "  |  {}",
+            t(app.lang, app.screen.title_msg()).to_ascii_lowercase()
+        )
+    };
+    let total_width = area.width.min(110);
+    let group = Rect {
+        x: area.x + area.width.saturating_sub(total_width) / 2,
+        y: area.y,
+        width: total_width,
+        height: area.height,
+    };
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(76), Constraint::Min(24)])
+        .split(group);
+    frame.render_widget(
+        Paragraph::new(logo_lines(app.theme.mode)),
+        Rect {
+            y: area.y + 1,
+            height: 6,
+            ..columns[0]
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("│  ", app.theme.muted),
+            Span::styled(
+                "▪",
+                if app.daemon.is_some() {
+                    app.theme.ok
+                } else {
+                    app.theme.muted
+                },
+            ),
+            Span::styled(format!("  {state}{screen}"), app.theme.muted),
+        ])),
+        Rect {
+            x: columns[1].x,
+            y: area.y + 3,
+            width: columns[1].width,
+            height: 1,
+        },
+    );
 }
 
-fn draw_nav(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let labels = app.nav_labels();
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, label) in labels.iter().enumerate() {
-        let screen = Screen::from_index(i);
-        let style = if screen == app.screen {
-            app.theme.nav_active
-        } else {
-            app.theme.nav_inactive
-        };
-        let short = if area.width < MIN_COLS {
-            // Single letter / short tag for narrow terminals.
-            truncate_to_width(label, 4)
-        } else {
-            label.clone()
-        };
-        if i > 0 {
-            spans.push(Span::raw(" "));
+fn logo_lines(mode: ColorMode) -> Vec<Line<'static>> {
+    (0..LOGO_PIXEL_HEIGHT / 2)
+        .map(|row| {
+            let spans = (0..LOGO_WIDTH)
+                .map(|column| {
+                    let top = logo_pixel(column, row * 2);
+                    let bottom = logo_pixel(column, row * 2 + 1);
+                    if logo_luma(top) < 24 && logo_luma(bottom) < 24 {
+                        Span::raw(" ")
+                    } else {
+                        Span::styled(
+                            "▀",
+                            Style::default()
+                                .fg(logo_color(mode, top))
+                                .bg(logo_color(mode, bottom)),
+                        )
+                    }
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn logo_pixel(x: usize, y: usize) -> [u8; 3] {
+    let offset = (y * LOGO_WIDTH + x) * 3;
+    [LOGO_RGB[offset], LOGO_RGB[offset + 1], LOGO_RGB[offset + 2]]
+}
+
+fn logo_luma([red, green, blue]: [u8; 3]) -> u8 {
+    let weighted = u16::from(red) * 54 + u16::from(green) * 183 + u16::from(blue) * 19;
+    (weighted / 256) as u8
+}
+
+fn logo_color(mode: ColorMode, rgb @ [red, green, blue]: [u8; 3]) -> Color {
+    match mode {
+        ColorMode::TrueColor => Color::Rgb(red, green, blue),
+        ColorMode::Ansi256 => {
+            let luma = logo_luma(rgb);
+            if luma < 24 {
+                Color::Black
+            } else {
+                Color::Indexed(232 + ((u16::from(luma) * 23 / 255) as u8))
+            }
         }
-        spans.push(Span::styled(format!(" {short} "), style));
+        ColorMode::Ansi16 | ColorMode::NoColor | ColorMode::HighContrast => Color::Reset,
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(app.border_set())
-        .border_style(app.theme.border);
-    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let hint = if app.status_line.is_empty() {
-        t(app.lang, Msg::FooterHint).to_owned()
+    let device_count = usize::from(app.daemon.is_some());
+    let plane = if app.active_instance.is_some() {
+        "control plane connected"
     } else {
-        app.status_line.clone()
+        "control plane not configured"
     };
+    let text = format!(
+        "{device_count} device{} online    |    {plane}    |    v{}",
+        if device_count == 1 { "" } else { "s" },
+        env!("CARGO_PKG_VERSION")
+    );
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_set(app.border_set())
+        .border_style(app.theme.border);
+    frame.render_widget(
+        Paragraph::new(truncate_to_width(
+            &text,
+            area.width.saturating_sub(2) as usize,
+        ))
+        .style(app.theme.muted)
+        .alignment(Alignment::Center)
+        .block(block),
+        area,
+    );
+}
+
+fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let text = if app.status_line.is_empty() {
+        ">   Type a command…".to_owned()
+    } else {
+        format!(">   {}", app.status_line)
+    };
+    let area = centered_width(area, area.width.saturating_sub(8));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(app.border_set())
         .border_style(app.theme.border);
     frame.render_widget(
         Paragraph::new(truncate_to_width(
-            &hint,
+            &text,
             area.width.saturating_sub(2) as usize,
         ))
         .style(app.theme.muted)
         .block(block),
         area,
     );
+}
+
+fn centered_width(area: Rect, max_width: u16) -> Rect {
+    let width = area.width.min(max_width.max(20));
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y,
+        width,
+        height: area.height,
+    }
 }
 
 fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
@@ -167,7 +278,7 @@ fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
     };
 
     match app.screen {
-        Screen::Dashboard => draw_dashboard(frame, app, body),
+        Screen::Dashboard => unreachable!("dashboard is rendered before the framed body"),
         Screen::Devices => draw_devices(frame, app, body),
         Screen::Workspaces => draw_workspaces(frame, app, body),
         Screen::Sessions => draw_list_screen(
@@ -213,39 +324,64 @@ fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
 }
 
 fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let pending = app
-        .approvals
-        .iter()
-        .filter(|a| a.state == "pending")
-        .count();
-    let lines = vec![
-        Line::from(Span::styled(t(app.lang, Msg::DashWelcome), app.theme.body)),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(
-                "{}: {} · {} · pending_approvals={pending}",
-                t(app.lang, Msg::DashStatus),
-                if app.daemon.is_some() {
-                    t(app.lang, Msg::DaemonOnline)
+    let width = area.width.clamp(36, 64);
+    let height = area.height.min(9);
+    let menu = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 3,
+        width,
+        height,
+    };
+    if height < 9 {
+        let lines: Vec<Line> = OverviewAction::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let marker = if index == app.overview_action_cursor {
+                    "> "
                 } else {
-                    t(app.lang, Msg::DaemonOffline)
-                },
-                app.preset_label(),
-            ),
-            app.theme.accent,
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            t(app.lang, Msg::DashQuickActions),
-            app.theme.muted,
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(app.theme.body)
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+                    "  "
+                };
+                Line::from(Span::styled(
+                    format!("{marker}{:<13} {}", action.command(), action.description()),
+                    if index == app.overview_action_cursor {
+                        app.theme.selection
+                    } else {
+                        app.theme.body
+                    },
+                ))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), menu);
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(2),
+        ])
+        .split(menu);
+    for (index, action) in OverviewAction::ALL.iter().enumerate() {
+        let selected = index == app.overview_action_cursor;
+        let line = Line::from(vec![
+            Span::styled(if selected { ">   " } else { "    " }, app.theme.body),
+            Span::styled(format!("{:<15}", action.command()), app.theme.body),
+            Span::styled(action.description(), app.theme.muted),
+        ]);
+        if selected {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_set(app.border_set())
+                .border_style(app.theme.border);
+            frame.render_widget(Paragraph::new(line).block(block), rows[index]);
+        } else {
+            frame.render_widget(Paragraph::new(line), rows[index]);
+        }
+    }
 }
 
 fn draw_devices(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -671,7 +807,7 @@ mod tests {
     fn cjk_width_snapshot_ja_zh() {
         for lang in [Lang::JaJp, Lang::ZhHans] {
             let mut app = test_app(lang);
-            app.screen = Screen::Dashboard;
+            app.screen = Screen::Devices;
             let snap = render_snapshot(&app, MIN_COLS, MIN_ROWS);
             for (i, w) in line_display_widths(&snap).iter().enumerate() {
                 assert!(
@@ -679,8 +815,8 @@ mod tests {
                     "{lang:?} line {i} overflow {w}\n{snap}"
                 );
             }
-            // Nav labels should appear (CJK).
-            let nav = t(lang, Msg::NavDashboard);
+            // The selected screen title remains legible in the quiet shell.
+            let nav = t(lang, Msg::NavDevices);
             assert!(
                 snap.contains(nav) || snap.contains(truncate_to_width(nav, 4).as_str()),
                 "nav missing for {lang:?}: {snap}"
@@ -749,5 +885,25 @@ mod tests {
                 || snap.contains("Wizard")
                 || snap.contains("Configure")
         );
+    }
+
+    #[test]
+    fn overview_renders_selected_linux_console_structure() {
+        let app = test_app(Lang::EnUs);
+        let snapshot = render_snapshot(&app, 120, 32).to_ascii_lowercase();
+        for expected in [
+            "setup required",
+            "/connect",
+            "/devices",
+            "/workspace",
+            "/doctor",
+            "type a command",
+            "control plane not configured",
+        ] {
+            assert!(
+                snapshot.contains(expected),
+                "missing {expected}:\n{snapshot}"
+            );
+        }
     }
 }

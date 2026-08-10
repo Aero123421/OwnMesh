@@ -2,7 +2,7 @@
 
 use crate::i18n::{t, Lang, Msg};
 use crate::palette::{filter_commands, PaletteAction, PaletteState};
-use crate::theme::{ascii_fallback, ColorMode, Theme};
+use crate::theme::{ColorMode, Theme};
 use crate::wizard::{
     apply_setup, preset_from_wire, preset_wire_name, WizardState, WizardStep, WIZARD_PRESETS,
 };
@@ -34,6 +34,7 @@ pub enum Screen {
 }
 
 impl Screen {
+    #[cfg(test)]
     pub const ALL: &'static [Screen] = &[
         Self::Dashboard,
         Self::Devices,
@@ -44,6 +45,16 @@ impl Screen {
         Self::Transfers,
         Self::Activity,
         Self::Diagnostics,
+        Self::Settings,
+    ];
+
+    /// Quiet, task-oriented navigation shown on the main screen. Advanced
+    /// views remain available from the command palette.
+    pub const PRIMARY: &'static [Screen] = &[
+        Self::Dashboard,
+        Self::Devices,
+        Self::Approvals,
+        Self::Transfers,
         Self::Settings,
     ];
 
@@ -64,13 +75,46 @@ impl Screen {
     }
 
     #[must_use]
-    pub fn index(self) -> usize {
-        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    pub fn primary_index(self) -> usize {
+        Self::PRIMARY.iter().position(|s| *s == self).unwrap_or(0)
     }
 
     #[must_use]
-    pub fn from_index(i: usize) -> Self {
-        Self::ALL.get(i).copied().unwrap_or(Self::Dashboard)
+    pub fn from_primary_index(i: usize) -> Self {
+        Self::PRIMARY.get(i).copied().unwrap_or(Self::Dashboard)
+    }
+}
+
+/// First-use actions kept intentionally small on the overview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewAction {
+    Connect,
+    Devices,
+    Workspace,
+    Doctor,
+}
+
+impl OverviewAction {
+    pub const ALL: &'static [Self] = &[Self::Connect, Self::Devices, Self::Workspace, Self::Doctor];
+
+    #[must_use]
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::Connect => "/connect",
+            Self::Devices => "/devices",
+            Self::Workspace => "/workspace",
+            Self::Doctor => "/doctor",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Connect => "Connect ChatGPT",
+            Self::Devices => "Trusted computers",
+            Self::Workspace => "Allowed folders",
+            Self::Doctor => "System health",
+        }
     }
 }
 
@@ -108,6 +152,8 @@ pub struct App {
     pub activity: Vec<String>,
     pub doctor: DoctorReport,
     pub policy_preset: AccessPreset,
+    pub active_instance: Option<String>,
+    pub overview_action_cursor: usize,
     pub status_line: String,
     pub should_quit: bool,
     pub list_cursor: usize,
@@ -121,6 +167,12 @@ impl App {
         let lang = Lang::parse(&cfg.lang);
         let pol = load_policy(&paths).unwrap_or_default();
         let policy_preset = preset_from_wire(pol.preset.as_deref().unwrap_or("recommended"));
+        let active_instance = cfg.active_instance.as_ref().and_then(|id| {
+            cfg.instances
+                .iter()
+                .find(|instance| &instance.id == id)
+                .map(|instance| instance.base_url.clone())
+        });
         // Read-only local observations only: no network probes, no secret material.
         let doctor = run_doctor(&doctor_input_from_local(
             &paths,
@@ -129,7 +181,7 @@ impl App {
             daemon.as_ref(),
         ));
 
-        let mut app = Self {
+        Self {
             lang,
             theme: Theme::new(ColorMode::detect()),
             screen: Screen::Dashboard,
@@ -152,15 +204,12 @@ impl App {
             activity: Vec::new(),
             doctor,
             policy_preset,
+            active_instance,
+            overview_action_cursor: 0,
             status_line: String::new(),
             should_quit: false,
             list_cursor: 0,
-        };
-        // First-run: open wizard when policy still default and no active instance.
-        if cfg.active_instance.is_none() && !app.paths.policy_file().is_file() {
-            app.overlay = Overlay::Wizard;
         }
-        app
     }
 
     /// Replace approvals list from IPC JSON `{ "approvals": [ ... ] }`.
@@ -215,25 +264,45 @@ impl App {
         }
     }
 
-    #[must_use]
-    pub fn nav_labels(&self) -> Vec<String> {
-        Screen::ALL
-            .iter()
-            .map(|s| t(self.lang, s.title_msg()).to_owned())
-            .collect()
-    }
-
     pub fn next_screen(&mut self) {
-        let i = (self.screen.index() + 1) % Screen::ALL.len();
-        self.screen = Screen::from_index(i);
+        let i = (self.screen.primary_index() + 1) % Screen::PRIMARY.len();
+        self.screen = Screen::from_primary_index(i);
         self.list_cursor = 0;
     }
 
     pub fn prev_screen(&mut self) {
-        let n = Screen::ALL.len();
-        let i = (self.screen.index() + n - 1) % n;
-        self.screen = Screen::from_index(i);
+        let n = Screen::PRIMARY.len();
+        let i = (self.screen.primary_index() + n - 1) % n;
+        self.screen = Screen::from_primary_index(i);
         self.list_cursor = 0;
+    }
+
+    pub fn move_overview_action(&mut self, delta: isize) {
+        let len = OverviewAction::ALL.len() as isize;
+        self.overview_action_cursor =
+            (self.overview_action_cursor as isize + delta).rem_euclid(len) as usize;
+    }
+
+    pub fn run_overview_action(&mut self) {
+        match OverviewAction::ALL
+            .get(self.overview_action_cursor)
+            .copied()
+            .unwrap_or(OverviewAction::Connect)
+        {
+            OverviewAction::Connect => {
+                if self.active_instance.is_some() {
+                    self.status_line =
+                        "ChatGPT: add this control plane's /mcp URL in Connectors".into();
+                } else {
+                    self.overlay = Overlay::Wizard;
+                    self.wizard.step = WizardStep::Welcome;
+                    self.wizard.saved = false;
+                }
+            }
+            OverviewAction::Devices => self.screen = Screen::Devices,
+            OverviewAction::Workspace => self.screen = Screen::Workspaces,
+            OverviewAction::Doctor => self.screen = Screen::Diagnostics,
+        }
     }
 
     pub fn open_palette(&mut self) {
@@ -324,11 +393,7 @@ impl App {
 
     #[must_use]
     pub fn border_set(&self) -> ratatui::symbols::border::Set {
-        if ascii_fallback() {
-            ratatui::symbols::border::PLAIN
-        } else {
-            ratatui::symbols::border::ROUNDED
-        }
+        ratatui::symbols::border::PLAIN
     }
 
     #[must_use]

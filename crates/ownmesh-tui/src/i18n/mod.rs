@@ -432,7 +432,7 @@ fn insert(map: &mut BTreeMap<Msg, &'static str>, msg: Msg, value: &'static str) 
 fn en_us() -> BTreeMap<Msg, &'static str> {
     let mut m = BTreeMap::new();
     insert(&mut m, Msg::AppTitle, "OwnMesh");
-    insert(&mut m, Msg::NavDashboard, "Dashboard");
+    insert(&mut m, Msg::NavDashboard, "Overview");
     insert(&mut m, Msg::NavDevices, "Devices");
     insert(&mut m, Msg::NavWorkspaces, "Workspaces");
     insert(&mut m, Msg::NavSessions, "Sessions");
@@ -646,7 +646,7 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
 fn ja_jp() -> BTreeMap<Msg, &'static str> {
     let mut m = BTreeMap::new();
     insert(&mut m, Msg::AppTitle, "OwnMesh");
-    insert(&mut m, Msg::NavDashboard, "ダッシュボード");
+    insert(&mut m, Msg::NavDashboard, "概要");
     insert(&mut m, Msg::NavDevices, "デバイス");
     insert(&mut m, Msg::NavWorkspaces, "ワークスペース");
     insert(&mut m, Msg::NavSessions, "セッション");
@@ -868,7 +868,7 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
 fn zh_hans() -> BTreeMap<Msg, &'static str> {
     let mut m = BTreeMap::new();
     insert(&mut m, Msg::AppTitle, "OwnMesh");
-    insert(&mut m, Msg::NavDashboard, "仪表盘");
+    insert(&mut m, Msg::NavDashboard, "概览");
     insert(&mut m, Msg::NavDevices, "设备");
     insert(&mut m, Msg::NavWorkspaces, "工作区");
     insert(&mut m, Msg::NavSessions, "会话");
@@ -1066,7 +1066,7 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
 fn ru_ru() -> BTreeMap<Msg, &'static str> {
     let mut m = BTreeMap::new();
     insert(&mut m, Msg::AppTitle, "OwnMesh");
-    insert(&mut m, Msg::NavDashboard, "Панель");
+    insert(&mut m, Msg::NavDashboard, "Обзор");
     insert(&mut m, Msg::NavDevices, "Устройства");
     insert(&mut m, Msg::NavWorkspaces, "Рабочие области");
     insert(&mut m, Msg::NavSessions, "Сессии");

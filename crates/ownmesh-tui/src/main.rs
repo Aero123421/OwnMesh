@@ -291,6 +291,12 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
     match key.code {
         KeyCode::Char('q' | 'Q') => app.should_quit = true,
         KeyCode::F(1) | KeyCode::Char('?') => app.overlay = Overlay::Help,
+        KeyCode::Char('/' | ':') => app.open_palette(),
+        KeyCode::Esc if app.screen != Screen::Dashboard => {
+            app.screen = Screen::Dashboard;
+            app.list_cursor = 0;
+        }
+        KeyCode::Tab if app.screen == Screen::Dashboard => app.move_overview_action(1),
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l')
             if !key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -319,6 +325,8 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         KeyCode::Up | KeyCode::Char('k') => {
             if app.screen == Screen::Approvals {
                 app.approval_cursor = app.approval_cursor.saturating_sub(1);
+            } else if app.screen == Screen::Dashboard {
+                app.move_overview_action(-1);
             } else {
                 app.list_cursor = app.list_cursor.saturating_sub(1);
             }
@@ -328,10 +336,13 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
                 if !app.approvals.is_empty() {
                     app.approval_cursor = (app.approval_cursor + 1).min(app.approvals.len() - 1);
                 }
+            } else if app.screen == Screen::Dashboard {
+                app.move_overview_action(1);
             } else {
                 app.list_cursor = app.list_cursor.saturating_add(1);
             }
         }
+        KeyCode::Enter if app.screen == Screen::Dashboard => app.run_overview_action(),
         KeyCode::Char('a') if app.screen == Screen::Approvals => {
             approve_selected(app, rt, true);
         }

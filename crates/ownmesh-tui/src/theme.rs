@@ -1,4 +1,4 @@
-//! Obsidian-inspired theme with color-depth and accessibility fallbacks.
+//! Quiet Linux-console theme with color-depth and accessibility fallbacks.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -76,8 +76,6 @@ pub struct Theme {
     pub mode: ColorMode,
     pub title: Style,
     pub border: Style,
-    pub nav_active: Style,
-    pub nav_inactive: Style,
     pub body: Style,
     pub muted: Style,
     pub warn: Style,
@@ -93,69 +91,48 @@ impl Theme {
         match mode {
             ColorMode::TrueColor => Self {
                 mode,
-                title: Style::default()
-                    .fg(Color::Rgb(197, 164, 114))
-                    .add_modifier(Modifier::BOLD),
-                border: Style::default().fg(Color::Rgb(70, 70, 70)),
-                nav_active: Style::default()
-                    .fg(Color::Rgb(232, 232, 232))
-                    .bg(Color::Rgb(42, 42, 42))
-                    .add_modifier(Modifier::BOLD),
-                nav_inactive: Style::default().fg(Color::Rgb(140, 140, 140)),
-                body: Style::default().fg(Color::Rgb(220, 220, 220)),
-                muted: Style::default().fg(Color::Rgb(120, 120, 120)),
-                warn: Style::default().fg(Color::Rgb(210, 170, 80)),
-                ok: Style::default().fg(Color::Rgb(120, 180, 120)),
-                err: Style::default().fg(Color::Rgb(200, 100, 100)),
-                accent: Style::default().fg(Color::Rgb(120, 160, 200)),
+                title: Style::default().fg(Color::Rgb(196, 196, 196)),
+                border: Style::default().fg(Color::Rgb(92, 92, 92)),
+                body: Style::default().fg(Color::Rgb(214, 214, 214)),
+                muted: Style::default().fg(Color::Rgb(128, 128, 128)),
+                warn: Style::default().fg(Color::Rgb(194, 174, 122)),
+                ok: Style::default().fg(Color::Rgb(126, 170, 136)),
+                err: Style::default().fg(Color::Rgb(190, 116, 116)),
+                accent: Style::default().fg(Color::Rgb(190, 190, 190)),
                 selection: Style::default()
-                    .fg(Color::Rgb(20, 20, 20))
-                    .bg(Color::Rgb(197, 164, 114)),
+                    .fg(Color::Rgb(18, 18, 18))
+                    .bg(Color::Rgb(218, 218, 218)),
             },
             ColorMode::Ansi256 => Self {
                 mode,
-                title: Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                title: Style::default().fg(Color::Gray),
                 border: Style::default().fg(Color::DarkGray),
-                nav_active: Style::default()
-                    .fg(Color::White)
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-                nav_inactive: Style::default().fg(Color::Gray),
                 body: Style::default().fg(Color::White),
                 muted: Style::default().fg(Color::DarkGray),
                 warn: Style::default().fg(Color::Yellow),
                 ok: Style::default().fg(Color::Green),
                 err: Style::default().fg(Color::Red),
-                accent: Style::default().fg(Color::Cyan),
-                selection: Style::default().fg(Color::Black).bg(Color::Yellow),
+                accent: Style::default().fg(Color::Gray),
+                selection: Style::default().fg(Color::Black).bg(Color::White),
             },
             ColorMode::Ansi16 => Self {
                 mode,
                 title: Style::default()
-                    .fg(Color::Yellow)
+                    .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
                 border: Style::default().fg(Color::White),
-                nav_active: Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-                nav_inactive: Style::default().fg(Color::White),
                 body: Style::default().fg(Color::White),
                 muted: Style::default().fg(Color::White),
                 warn: Style::default().fg(Color::Yellow),
                 ok: Style::default().fg(Color::Green),
                 err: Style::default().fg(Color::Red),
-                accent: Style::default().fg(Color::Cyan),
-                selection: Style::default().fg(Color::Black).bg(Color::Cyan),
+                accent: Style::default().fg(Color::White),
+                selection: Style::default().fg(Color::Black).bg(Color::White),
             },
             ColorMode::NoColor => Self {
                 mode,
                 title: Style::default().add_modifier(Modifier::BOLD),
                 border: Style::default(),
-                nav_active: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                nav_inactive: Style::default().add_modifier(Modifier::DIM),
                 body: Style::default(),
                 muted: Style::default().add_modifier(Modifier::DIM),
                 warn: Style::default().add_modifier(Modifier::BOLD),
@@ -171,11 +148,6 @@ impl Theme {
                     .bg(Color::Black)
                     .add_modifier(Modifier::BOLD),
                 border: Style::default().fg(Color::White),
-                nav_active: Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-                nav_inactive: Style::default().fg(Color::White),
                 body: Style::default().fg(Color::White),
                 muted: Style::default().fg(Color::Gray),
                 warn: Style::default()
