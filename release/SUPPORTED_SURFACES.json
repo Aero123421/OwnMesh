@@ -14,12 +14,13 @@
     "session list/show/open/attach/claim/release/give/close/terminate (local device only)",
     "approval list/show/approve/deny",
     "policy show/preset/validate/explain",
+    "transfer plan/send/list/status/cancel (authenticated control-plane MCP; immutable no-overwrite plans; idempotency keys required for mutations)",
     "service install/start/stop/restart/status/uninstall (user-level ownmeshd autostart only)",
     "privileged broker status (fail-closed metadata; native service management unsupported)",
     "update check/download/apply/channel (signed GitHub releases; network off by default)",
     "workspace list/show/add/update/remove (device-local registry via ownmeshd IPC)"
   ],
-  "explicit_unsupported_count": 27,
+  "explicit_unsupported_count": 22,
   "explicit_unsupported_surfaces": [
     "tui",
     "completion",
@@ -42,11 +43,6 @@
     "profile start",
     "profile resume",
     "approval watch",
-    "transfer plan",
-    "transfer send",
-    "transfer list",
-    "transfer status",
-    "transfer cancel",
     "mcp serve"
   ],
   "additional_unsupported": [
@@ -58,6 +54,6 @@
     "privileged broker install",
     "privileged broker uninstall"
   ],
-  "total_unsupported_surfaces": 34,
-  "notes": "v1.2.0-beta.12 integrity visit: E5 process-tree terminate (taskkill/T + Unix session kill), resize fail-closed without live host, live-ring remaining/continuation visibility, bounded pin/journal/spool/state reads; E6 public real-path nine-adapter structured events/replay/resume and safe auth status (CLI profile surfaces remain unsupported); E7 public real-path nested-repository review runs pinned argv-only git apply, bounded status/diff and typed result pages, pass/fail tests, exact-once/payload conflict, stale HEAD, workspace ACL rejection, and cancellation/process-tree termination without implicit ref/index mutation; E9 public real-path two-Agent transfer proves bounded binary/zero-byte artifacts, 32 MiB durable-cursor restart/resume, partial cancel cleanup, ownership denials and stopped D1/DO at-rest inspection (transfer CLI surfaces remain unsupported). Windows has a fixed OwnMeshDaemon SCM dispatcher with STOP_PENDING/STOPPED handling, but no shipped installer: copying a user-profile enrollment/config/device key into LocalSystem is forbidden until an explicit SYSTEM-owned enrollment bundle and migration contract exists. SERVICE_VERSION 1.2.0-beta.12. scripts/tests/test_v12_e2_e9_workerd_loopback.py invokes E9 and stays RED (exit 2) only because E8 remains open. Elevated broker mint/install (E8) and live-account E10 remain open; E9 is PROVEN on the local real path."
+  "total_unsupported_surfaces": 29,
+  "notes": "v1.2.0-beta.12 integrity visit: E5 process-tree terminate (taskkill/T + Unix session kill), resize fail-closed without live host, live-ring remaining/continuation visibility, bounded pin/journal/spool/state reads; E6 public real-path nine-adapter structured events/replay/resume and safe auth status (CLI profile surfaces remain unsupported); E7 public real-path nested-repository review runs pinned argv-only git apply, bounded status/diff and typed result pages, pass/fail tests, exact-once/payload conflict, stale HEAD, workspace ACL rejection, and cancellation/process-tree termination without implicit ref/index mutation; E9 public real-path two-Agent transfer proves bounded binary/zero-byte artifacts, 32 MiB durable-cursor restart/resume, partial cancel cleanup, ownership denials and stopped D1/DO at-rest inspection. Transfer CLI uses only the authenticated public MCP transfer contract, keeps idempotency explicit, and has no LAN relay or overwrite/force fallback. Windows has a fixed OwnMeshDaemon SCM dispatcher with STOP_PENDING/STOPPED handling, but no shipped installer: copying a user-profile enrollment/config/device key into LocalSystem is forbidden until an explicit SYSTEM-owned enrollment bundle and migration contract exists. SERVICE_VERSION 1.2.0-beta.12. scripts/tests/test_v12_e2_e9_workerd_loopback.py invokes E9 and stays RED (exit 2) only because E8 remains open. Elevated broker mint/install (E8) and live-account E10 remain open; E9 is PROVEN on the local real path."
 }

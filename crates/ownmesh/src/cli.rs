@@ -463,22 +463,48 @@ pub enum PolicyCmd {
 /// `ownmesh transfer` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum TransferCmd {
-    /// Plan a transfer.
+    /// Create an immutable cross-device transfer plan (paths are workspace-relative).
     Plan {
-        /// Source path.
+        /// Source workspace-relative path (no absolute paths, traversal, or backslashes).
         source: String,
-        /// Destination spec.
+        /// Destination workspace-relative path (no overwrite/force mode exists).
         dest: String,
+        /// Source enrolled device id.
+        #[arg(long)]
+        source_device: String,
+        /// Destination enrolled device id.
+        #[arg(long)]
+        destination_device: String,
+        /// Source workspace id.
+        #[arg(long)]
+        source_workspace: String,
+        /// Destination workspace id.
+        #[arg(long)]
+        destination_workspace: String,
+        /// Caller-chosen key making this plan safe to retry (1–256 bytes).
+        #[arg(long)]
+        idempotency_key: String,
+        /// Immutable plan lifetime in seconds (60–86400; default 3600).
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(60..=86_400))]
+        ttl_seconds: u32,
     },
-    /// Send a transfer.
+    /// Start or resume a previously planned transfer.
     Send {
-        /// Source path.
-        source: String,
-        /// Destination spec.
-        dest: String,
+        /// Immutable transfer id returned by `transfer plan`.
+        id: String,
+        /// Caller-chosen key making this start/resume safe to retry (1–256 bytes).
+        #[arg(long)]
+        idempotency_key: String,
     },
-    /// List transfers.
-    List,
+    /// List metadata-only transfers visible to the signed-in principal.
+    List {
+        /// Opaque cursor returned by a preceding list response.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum entries to return (1–500; default 50).
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u16).range(1..=500))]
+        limit: u16,
+    },
     /// Show transfer status.
     Status {
         /// Transfer id.
@@ -488,6 +514,9 @@ pub enum TransferCmd {
     Cancel {
         /// Transfer id.
         id: String,
+        /// Caller-chosen key making cancellation safe to retry (1–256 bytes).
+        #[arg(long)]
+        idempotency_key: String,
     },
 }
 

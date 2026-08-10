@@ -13,6 +13,7 @@ mod service;
 mod session_cmd;
 mod setup;
 mod status;
+mod transfer;
 mod update_cmd;
 mod workspace_cmd;
 
@@ -53,11 +54,6 @@ pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
     "profile start",
     "profile resume",
     "approval watch",
-    "transfer plan",
-    "transfer send",
-    "transfer list",
-    "transfer status",
-    "transfer cancel",
     "mcp serve",
 ];
 
@@ -213,17 +209,7 @@ fn dispatch_profile(cli: &Cli, cmd: &ProfileCmd) -> Result<(), ExitCode> {
 }
 
 fn dispatch_transfer(cli: &Cli, cmd: &TransferCmd) -> Result<(), ExitCode> {
-    match cmd {
-        TransferCmd::Plan { source, dest } => {
-            stub(cli, "transfer plan", &format!("{source} -> {dest}"))
-        }
-        TransferCmd::Send { source, dest } => {
-            stub(cli, "transfer send", &format!("{source} -> {dest}"))
-        }
-        TransferCmd::List => stub(cli, "transfer list", "chapter 12"),
-        TransferCmd::Status { id } => stub(cli, "transfer status", id),
-        TransferCmd::Cancel { id } => stub(cli, "transfer cancel", id),
-    }
+    transfer::dispatch_transfer(cli, cmd)
 }
 
 fn dispatch_service(cli: &Cli, cmd: &ServiceCmd) -> Result<(), ExitCode> {
