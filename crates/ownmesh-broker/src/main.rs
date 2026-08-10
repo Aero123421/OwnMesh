@@ -174,7 +174,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     socket_security: UnixSocketSecurity { owner_uid: 0, group_gid: 0, mode: 0 }, allowed_uids: vec![],
                 })?;
                 println!("installed=true support={} endpoint={}", rec.support, rec.endpoint);
-                return Ok(());
+                Ok(())
             }
             #[cfg(not(windows))]
             {

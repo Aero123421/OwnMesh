@@ -5,9 +5,9 @@
 //! daemon/runtime client integration is a separate authority-bearing change.
 
 use crate::{
-    load_windows_daemon_trust_record, InstallRecord, InstallStatus, WindowsBrokerRunner,
-    WindowsDurableReplayLedger, WindowsJobRunner, WindowsPeerAuthorizer,
-    WindowsProductionBrokerServer, WindowsReplayLedger,
+    InstallRecord, InstallStatus, WindowsBrokerRunner, WindowsDurableReplayLedger,
+    WindowsJobRunner, WindowsPeerAuthorizer, WindowsProductionBrokerServer, WindowsReplayLedger,
+    load_windows_daemon_trust_record,
 };
 use ownmesh_broker_client::{
     BrokerEndpoint, BrokerSecret, CapabilitySigningKey, WindowsBrokerTrust,
@@ -21,31 +21,31 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, ERROR_SERVICE_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_SERVICE_EXISTS, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     ConvertStringSidToSidW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenElevation,
-    TokenIntegrityLevel, TokenUser, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
-    DACL_SECURITY_INFORMATION, INHERITED_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    SE_DACL_PROTECTED, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
+    EqualSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation, INHERITED_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    TokenElevation, TokenIntegrityLevel, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW,
     OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -53,14 +53,14 @@ use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, QueryServiceConfigW, QueryServiceObjectSecurity, QueryServiceStatusEx,
-    RegisterServiceCtrlHandlerW, SetServiceObjectSecurity, SetServiceStatus,
-    StartServiceCtrlDispatcherW, StartServiceW, QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT,
+    OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceObjectSecurity,
+    QueryServiceStatusEx, RegisterServiceCtrlHandlerW, SC_MANAGER_CONNECT,
     SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS,
     SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_QUERY_CONFIG,
     SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS,
-    SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOPPED, SERVICE_STOP_PENDING,
-    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_STATUS_HANDLE, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceObjectSecurity, SetServiceStatus,
+    StartServiceCtrlDispatcherW, StartServiceW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::{
@@ -153,7 +153,7 @@ fn binary_path() -> Result<PathBuf, String> {
 
 fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf, String> {
     let mut raw = ptr::null_mut();
-    let status = unsafe { SHGetKnownFolderPath(id, 0, ptr::null_mut(), &mut raw) };
+    let status = unsafe { SHGetKnownFolderPath(id, 0, ptr::null_mut(), &raw mut raw) };
     if status < 0 || raw.is_null() {
         return Err("resolve fixed Windows Known Folder path".into());
     }
@@ -185,7 +185,7 @@ fn config_path() -> Result<PathBuf, String> {
 /// token bit because UAC split tokens and service ACL policy can disagree.
 fn require_elevated_scm_admin() -> Result<(), String> {
     let mut token = ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0
         || token.is_null()
     {
         return Err("Windows broker install requires an elevated Administrator token".into());
@@ -197,9 +197,9 @@ fn require_elevated_scm_admin() -> Result<(), String> {
             GetTokenInformation(
                 token,
                 TokenElevation,
-                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                (&raw mut elevation).cast(),
                 u32::try_from(std::mem::size_of::<TOKEN_ELEVATION>()).unwrap_or(u32::MAX),
-                &mut returned,
+                &raw mut returned,
             )
         } == 0
             || elevation.TokenIsElevated == 0
@@ -258,7 +258,7 @@ impl CreationDescriptor {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 text.as_ptr(),
                 SDDL_REVISION_1,
-                &mut raw,
+                &raw mut raw,
                 ptr::null_mut(),
             )
         } == 0
@@ -292,7 +292,7 @@ impl CreationDescriptor {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 text.as_ptr(),
                 SDDL_REVISION_1,
-                &mut raw,
+                &raw mut raw,
                 ptr::null_mut(),
             )
         } == 0
@@ -364,7 +364,7 @@ fn final_path(handle: HANDLE) -> Result<PathBuf, String> {
 
 fn identity(handle: HANDLE) -> Result<(FileIdentity, u32), String> {
     let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
-    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 {
+    if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
         return Err("read custody file identity".into());
     }
     Ok((
@@ -461,7 +461,9 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
     fn sid(value: &str) -> Result<PSID, String> {
         let value = wide(OsStr::new(value));
         let mut parsed = ptr::null_mut();
-        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut parsed) } == 0 || parsed.is_null() {
+        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &raw mut parsed) } == 0
+            || parsed.is_null()
+        {
             return Err("parse expected Windows custody SID".into());
         }
         Ok(parsed)
@@ -491,7 +493,7 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
             ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),
-            &mut descriptor,
+            &raw mut descriptor,
         )
     };
     if status != 0 || descriptor.is_null() {
@@ -506,14 +508,17 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
     let result = (|| {
         let mut control = 0_u16;
         let mut revision = 0_u32;
-        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+        if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) }
+            == 0
             || control & SE_DACL_PROTECTED == 0
         {
             return Err("custody DACL is not protected".into());
         }
         let mut owner: PSID = ptr::null_mut();
         let mut owner_defaulted = 0;
-        if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut owner_defaulted) } == 0
+        if unsafe {
+            GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut owner_defaulted)
+        } == 0
             || owner.is_null()
             || unsafe { EqualSid(owner, admins) } == 0
         {
@@ -522,8 +527,14 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
         let mut present = 0;
         let mut defaulted = 0;
         let mut dacl = ptr::null_mut();
-        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
-            == 0
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &raw mut present,
+                &raw mut dacl,
+                &raw mut defaulted,
+            )
+        } == 0
             || present == 0
             || dacl.is_null()
         {
@@ -533,7 +544,7 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
         if unsafe {
             GetAclInformation(
                 dacl,
-                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                (&raw mut info).cast(),
                 u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
                 AclSizeInformation,
             )
@@ -544,7 +555,7 @@ fn verify_system_admin_custody(path: &Path) -> Result<(), String> {
         }
         for (index, expected) in [system, admins].into_iter().enumerate() {
             let mut ace = ptr::null_mut();
-            if unsafe { GetAce(dacl, u32::try_from(index).unwrap_or(u32::MAX), &mut ace) } == 0
+            if unsafe { GetAce(dacl, u32::try_from(index).unwrap_or(u32::MAX), &raw mut ace) } == 0
                 || ace.is_null()
             {
                 return Err("custody DACL ACE retrieval failed".into());
@@ -587,7 +598,7 @@ fn ensure_custody_dir(path: &Path, retained: &mut Vec<CustodyHandle>) -> Result<
     let descriptor = CreationDescriptor::new(true)?;
     let attributes = descriptor.attributes();
     let name = wide(path.as_os_str());
-    if unsafe { CreateDirectoryW(name.as_ptr(), &attributes) } == 0 {
+    if unsafe { CreateDirectoryW(name.as_ptr(), &raw const attributes) } == 0 {
         return Err(format!(
             "create SYSTEM/Admin directory {}: {}",
             path.display(),
@@ -687,7 +698,7 @@ fn write_custodied_new(
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &attributes,
+            &raw const attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             ptr::null_mut(),
@@ -703,7 +714,7 @@ fn write_custodied_new(
     // Transfer this newly-created no-delete handle to std::fs only while the
     // write is in progress; retain a fresh pinned handle afterwards.
     let mut file = unsafe { std::fs::File::from_raw_handle(raw) };
-    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = std::fs::remove_file(path);
         return Err(format!("write {}: {error}", path.display()));
@@ -728,7 +739,7 @@ fn copy_custodied_new(
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &attributes,
+            &raw const attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
             ptr::null_mut(),
@@ -827,9 +838,9 @@ fn query_service_pid(name: &str) -> Result<u32, String> {
             QueryServiceStatusEx(
                 service,
                 SC_STATUS_PROCESS_INFO,
-                (&mut status as *mut SERVICE_STATUS_PROCESS).cast(),
+                (&raw mut status).cast(),
                 u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>()).unwrap_or(u32::MAX),
-                &mut needed,
+                &raw mut needed,
             )
         };
         unsafe {
@@ -859,7 +870,7 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
     }
     let mut token = ptr::null_mut();
     let opened =
-        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } != 0 && !token.is_null();
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut token) } != 0 && !token.is_null();
     if !opened {
         unsafe {
             let _ = CloseHandle(process);
@@ -872,14 +883,20 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
     let result = (|| {
         let mut need = 0_u32;
         unsafe {
-            let _ = GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut need);
+            let _ = GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut need);
         }
         if need == 0 {
             return Err("query daemon TokenUser size".into());
         }
         let mut bytes = vec![0_u8; need as usize];
         if unsafe {
-            GetTokenInformation(token, TokenUser, bytes.as_mut_ptr().cast(), need, &mut need)
+            GetTokenInformation(
+                token,
+                TokenUser,
+                bytes.as_mut_ptr().cast(),
+                need,
+                &raw mut need,
+            )
         } == 0
         {
             return Err(format!(
@@ -895,7 +912,7 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
         let sid_bytes =
             unsafe { std::slice::from_raw_parts(user.User.Sid.cast::<u8>(), sid_len as usize) };
         let mut sid_text = ptr::null_mut();
-        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut sid_text) } == 0
             || sid_text.is_null()
         {
             return Err("render daemon TokenUser SID".into());
@@ -913,7 +930,7 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
             let _ = LocalFree(sid_text.cast());
         }
         let mut session = 0_u32;
-        if unsafe { ProcessIdToSessionId(pid, &mut session) } == 0 {
+        if unsafe { ProcessIdToSessionId(pid, &raw mut session) } == 0 {
             return Err("read daemon session id".into());
         }
         let mut integrity_need = 0_u32;
@@ -923,7 +940,7 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
                 TokenIntegrityLevel,
                 ptr::null_mut(),
                 0,
-                &mut integrity_need,
+                &raw mut integrity_need,
             );
         }
         if integrity_need == 0 {
@@ -936,7 +953,7 @@ fn process_token_identity(pid: u32) -> Result<(String, String, u32, u32), String
                 TokenIntegrityLevel,
                 integrity_bytes.as_mut_ptr().cast(),
                 integrity_need,
-                &mut integrity_need,
+                &raw mut integrity_need,
             )
         } == 0
         {
@@ -1054,7 +1071,7 @@ fn create_or_validate_service(binary: &Path, config: &Path) -> Result<bool, Stri
             return Err("open existing broker service for idempotence".into());
         }
         if let Err(error) = validate_service_config(existing, binary, config)
-            .and_then(|_| validate_service_custody(existing))
+            .and_then(|()| validate_service_custody(existing))
         {
             unsafe {
                 let _ = CloseServiceHandle(existing);
@@ -1067,8 +1084,8 @@ fn create_or_validate_service(binary: &Path, config: &Path) -> Result<bool, Stri
         }
     } else {
         let validation = set_service_custody(service)
-            .and_then(|_| validate_service_config(service, binary, config))
-            .and_then(|_| validate_service_custody(service));
+            .and_then(|()| validate_service_config(service, binary, config))
+            .and_then(|()| validate_service_custody(service));
         unsafe {
             let _ = CloseServiceHandle(service);
         }
@@ -1143,7 +1160,7 @@ fn query_service_config(
     service: windows_sys::Win32::System::Services::SC_HANDLE,
 ) -> Result<ServiceConfigSnapshot, String> {
     let mut needed = 0_u32;
-    let _ = unsafe { QueryServiceConfigW(service, ptr::null_mut(), 0, &mut needed) };
+    let _ = unsafe { QueryServiceConfigW(service, ptr::null_mut(), 0, &raw mut needed) };
     if needed < u32::try_from(std::mem::size_of::<QUERY_SERVICE_CONFIGW>()).unwrap_or(u32::MAX) {
         return Err("query broker SCM command size".into());
     }
@@ -1151,7 +1168,8 @@ fn query_service_config(
         .map_err(|_| "broker SCM command length overflow")?
         .div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0_usize; words];
-    if unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &mut needed) } == 0
+    if unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &raw mut needed) }
+        == 0
     {
         return Err(format!(
             "query broker SCM command: {}",
@@ -1292,7 +1310,7 @@ fn validate_service_custody(
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             0,
-            &mut needed,
+            &raw mut needed,
         )
     };
     if needed == 0 || needed > 64 * 1024 {
@@ -1305,7 +1323,7 @@ fn validate_service_custody(
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             bytes.as_mut_ptr().cast(),
             needed,
-            &mut needed,
+            &raw mut needed,
         )
     } == 0
     {
@@ -1317,7 +1335,7 @@ fn validate_service_custody(
     let descriptor = bytes.as_mut_ptr().cast::<std::ffi::c_void>();
     let mut control = 0_u16;
     let mut revision = 0_u32;
-    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+    if unsafe { GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) } == 0
         || control & SE_DACL_PROTECTED == 0
     {
         return Err("broker service DACL is not protected".into());
@@ -1325,7 +1343,7 @@ fn validate_service_custody(
     let admins = {
         let text = wide(OsStr::new("S-1-5-32-544"));
         let mut sid = ptr::null_mut();
-        if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
+        if unsafe { ConvertStringSidToSidW(text.as_ptr(), &raw mut sid) } == 0 {
             return Err("parse Administrators SID".into());
         }
         sid
@@ -1333,7 +1351,7 @@ fn validate_service_custody(
     let system = {
         let text = wide(OsStr::new("S-1-5-18"));
         let mut sid = ptr::null_mut();
-        if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
+        if unsafe { ConvertStringSidToSidW(text.as_ptr(), &raw mut sid) } == 0 {
             unsafe {
                 let _ = LocalFree(admins.cast());
             }
@@ -1344,7 +1362,8 @@ fn validate_service_custody(
     let result = (|| {
         let mut owner = ptr::null_mut();
         let mut defaulted = 0;
-        if unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) } == 0
+        if unsafe { GetSecurityDescriptorOwner(descriptor, &raw mut owner, &raw mut defaulted) }
+            == 0
             || owner.is_null()
             || unsafe { EqualSid(owner, admins) } == 0
         {
@@ -1352,8 +1371,14 @@ fn validate_service_custody(
         }
         let mut present = 0;
         let mut dacl = ptr::null_mut();
-        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
-            == 0
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &raw mut present,
+                &raw mut dacl,
+                &raw mut defaulted,
+            )
+        } == 0
             || present == 0
             || dacl.is_null()
         {
@@ -1363,7 +1388,7 @@ fn validate_service_custody(
         if unsafe {
             GetAclInformation(
                 dacl,
-                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                (&raw mut info).cast(),
                 std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
                 AclSizeInformation,
             )
@@ -1374,7 +1399,7 @@ fn validate_service_custody(
         }
         for (index, expected) in [system, admins].into_iter().enumerate() {
             let mut ace = ptr::null_mut();
-            if unsafe { GetAce(dacl, index as u32, &mut ace) } == 0 || ace.is_null() {
+            if unsafe { GetAce(dacl, index as u32, &raw mut ace) } == 0 || ace.is_null() {
                 return Err("read broker service DACL ACE".into());
             }
             let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
@@ -1455,9 +1480,9 @@ fn wait_service_state(
             QueryServiceStatusEx(
                 service,
                 SC_STATUS_PROCESS_INFO,
-                (&mut status as *mut SERVICE_STATUS_PROCESS).cast(),
+                (&raw mut status).cast(),
                 u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>()).unwrap_or(u32::MAX),
-                &mut needed,
+                &raw mut needed,
             )
         } == 0
         {
@@ -1554,9 +1579,9 @@ fn rollback_created_service() -> Result<(), String> {
         }
     } else {
         let mut ignored = unsafe { std::mem::zeroed::<SERVICE_STATUS>() };
-        let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut ignored) };
+        let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut ignored) };
         let stopped = wait_service_state(service, SERVICE_STOPPED);
-        let deleted = stopped.and_then(|_| {
+        let deleted = stopped.and_then(|()| {
             if unsafe { DeleteService(service) } == 0 {
                 Err("delete transaction-created broker service during rollback".into())
             } else {
@@ -1566,7 +1591,7 @@ fn rollback_created_service() -> Result<(), String> {
         unsafe {
             let _ = CloseServiceHandle(service);
         }
-        deleted.and_then(|_| wait_service_absent(manager, &name))
+        deleted.and_then(|()| wait_service_absent(manager, &name))
     };
     unsafe {
         let _ = CloseServiceHandle(manager);
@@ -1847,7 +1872,7 @@ pub fn broker_status_windows(_base: &Path) -> Result<InstallStatus, String> {
             return Err("open broker SCM service for status".into());
         }
         let service_result = validate_service_config(service, &cfg.broker_binary, &config)
-            .and_then(|_| validate_service_custody(service));
+            .and_then(|()| validate_service_custody(service));
         unsafe {
             let _ = CloseServiceHandle(service);
             let _ = CloseServiceHandle(manager);
@@ -1965,7 +1990,7 @@ pub fn uninstall_windows_broker(_base: &Path) -> Result<(), String> {
         // permission to sweep a record we have not already proved belongs to us.
     } else {
         if let Err(error) = validate_service_config(service, &cfg.broker_binary, &config_path)
-            .and_then(|_| validate_service_custody(service))
+            .and_then(|()| validate_service_custody(service))
         {
             unsafe {
                 let _ = CloseServiceHandle(service);
@@ -1974,7 +1999,7 @@ pub fn uninstall_windows_broker(_base: &Path) -> Result<(), String> {
             return Err(error);
         }
         let mut ignored = unsafe { std::mem::zeroed::<SERVICE_STATUS>() };
-        let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut ignored) };
+        let _ = unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut ignored) };
         if let Err(error) = wait_service_state(service, SERVICE_STOPPED) {
             unsafe {
                 let _ = CloseServiceHandle(service);
@@ -2331,7 +2356,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         dwCheckPoint: 1,
         dwWaitHint: WAIT_LIMIT.as_millis().try_into().unwrap_or(u32::MAX),
     };
-    let _ = SetServiceStatus(handle, &status);
+    let _ = SetServiceStatus(handle, &raw const status);
     let outcome = (|| -> Result<(), String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -2345,7 +2370,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
                 status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
                 status.dwCheckPoint = 0;
                 status.dwWaitHint = 0;
-                if unsafe { SetServiceStatus(handle, &status) } == 0 {
+                if unsafe { SetServiceStatus(handle, &raw const status) } == 0 {
                     return Err("report broker pipe readiness to SCM".into());
                 }
             }
@@ -2366,7 +2391,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     if outcome.is_err() {
         status.dwWin32ExitCode = 1;
     }
-    let _ = SetServiceStatus(handle, &status);
+    let _ = SetServiceStatus(handle, &raw const status);
     SERVICE_STATUS_HANDLE_RAW.store(0, Ordering::Release);
 }
 
@@ -2531,9 +2556,9 @@ mod tests {
                 unsafe {
                     GetSecurityDescriptorDacl(
                         descriptor.raw,
-                        &mut present,
-                        &mut dacl,
-                        &mut defaulted,
+                        &raw mut present,
+                        &raw mut dacl,
+                        &raw mut defaulted,
                     )
                 },
                 0
@@ -2543,7 +2568,7 @@ mod tests {
             (0..2)
                 .map(|index| {
                     let mut ace = ptr::null_mut();
-                    assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+                    assert_ne!(unsafe { GetAce(dacl, index, &raw mut ace) }, 0);
                     unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask }
                 })
                 .collect()
