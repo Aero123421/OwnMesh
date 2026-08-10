@@ -32,7 +32,10 @@ E4_E9_ACCEPTANCE_ROWS: tuple[tuple[str, str], ...] = (
     ("E5", "cloud PTY sessions + controller lease + replay/spool"),
     ("E6", "nine official profile adapters + generic tool execution"),
     ("E7", "bounded unified-diff patch + Git review (no auto-merge)"),
-    ("E8", "networkless elevated broker Full Access mint/custody"),
+    (
+        "E8",
+        "networkless elevated broker Full Access mint/custody; Windows SCM dispatcher exists but SYSTEM enrollment migration/install is intentionally OPEN",
+    ),
     ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
 )
 
@@ -119,7 +122,10 @@ def main() -> int:
     }
     # Rows with no real binary×workerd proof yet (must keep gate red).
     still_open = (
-        ("E8", "networkless elevated broker Full Access mint/custody"),
+        (
+            "E8",
+            "networkless elevated broker Full Access mint/custody; Windows SCM dispatcher exists but SYSTEM enrollment migration/install is intentionally OPEN",
+        ),
         ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
     )
     # E4-E7 have real workerd acceptance; remaining rows stay fail-closed.

@@ -107,6 +107,12 @@ For control-plane deployment, see [docs/deploy-cloudflare.md](./docs/deploy-clou
 | `ownmesh service …` | Current user only | **Supported** (v1.1.0 onboarding) |
 | `ownmesh privileged …` | Would require admin/root | install/uninstall **unsupported**; status fail-closed |
 
+On Windows, the fixed `OwnMeshDaemon` SCM dispatcher is implemented, including
+bounded `STOP_PENDING` / `STOPPED` handling. It is not an installable product
+surface: system-owned enrollment, configuration, and device-key migration have
+not been designed. The existing user-profile enrollment is never implicitly
+copied into a LocalSystem service. Windows E8 therefore remains **OPEN**.
+
 ## Release integrity
 
 Tag releases invoke the reusable CI and Security workflows before any release build. Windows x64, macOS arm64/x64, and Linux musl arm64/x64 **portable archives** are required, and each archive includes `LICENSE`, `NOTICE`, `README.md`, and current release notes. Non-empty CycloneDX SBOMs, per-asset SHA-256 checksums, aggregate `SHA256SUMS`, **minisign signature** (`SHA256SUMS.minisig`), and GitHub build provenance are required. Missing signing keys **fail the release** (no degraded unsigned formal publish). Trust root: [`docs/release-keys/`](./docs/release-keys/). Authenticode and Apple notarization remain unsupported under W-SIGN.
