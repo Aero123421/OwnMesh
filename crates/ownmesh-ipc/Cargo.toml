@@ -39,7 +39,10 @@ tracing = "0.1.41"
 uuid = { version = "1.12.1", features = ["serde", "v4"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["fs", "process"] }
+# `registry.rs` passes standard `File`/`Path` values to rustix.  Enable its
+# std adapters on Unix; without them the Linux-only secure no-follow/lock path
+# does not compile even though the Windows build does.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
