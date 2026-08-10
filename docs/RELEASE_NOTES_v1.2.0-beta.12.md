@@ -49,14 +49,37 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 - The public workerd acceptance path proves all nine unique outputs, delayed turn completion without blocking `session.open`, native argv/negotiated resume where source-backed, explicit degraded rejection otherwise, safe no-credential-probe status, and exact terminate cleanup.
 - CLI `profile *` surfaces remain explicit unsupported; this acceptance covers the remote MCP profile contract.
 
+### E9 — authenticated resumable transfer
+- The public MCP → local Wrangler/workerd → TransferRoom Durable Object → two
+  independently enrolled Agent WSS → two real `ownmeshd` path proves
+  send/get/list/status/cancel, three-plus binary 64 KiB chunks including NUL and
+  non-UTF-8 bytes, zero-byte artifacts, bounded artifact pages and exact hashes.
+- A 32 MiB transfer kills and restarts the destination Agent/daemon after a
+  durable non-zero ACK, then resumes from that Room cursor under a fresh
+  epoch/fence. A separate partial 32 MiB cancellation removes all generation
+  parts and leaves only its bounded terminal journal.
+- The fixture also proves no-overwrite and owner/tenant/device/workspace/path
+  denials. After stopping both Agents and workerd, it snapshots the real
+  D1/Durable Object SQLite files, requires `PRAGMA integrity_check = ok`, and
+  scans raw cells/bytes: bearer tickets, JTI, private ephemeral material and
+  relay ciphertext/plaintext are absent. Only user-requested artifact pages are
+  allowlisted with their 64 KiB cap, hash and expiry.
+- Raw ticket/key/frame substitution is deliberately not injectable through the
+  public MCP surface. Lower-layer wrong-ticket, proof, replay, gap, duplicate,
+  fence, tamper and overflow cases remain covered by strict TransferRoom,
+  transport, runtime and transfer-core tests; the public fixture does not
+  mislabel them as public-client injections.
+
 ## Gate posture
-- `scripts/tests/test_v12_e2_e9_workerd_loopback.py` stays **RED (exit 2)** until E8–E9 acceptance rows are fully evidenced on the real binary × workerd path; E7 is PROVEN.
-- E8 elevated broker mint and E9 resumable transfer remain open.
+- `scripts/tests/test_v12_e2_e9_workerd_loopback.py` invokes both the E2/E3 and
+  E9 real-path fixtures. It stays **RED (exit 2)** because E8 remains open; E9
+  is PROVEN and can no longer be silently skipped by the aggregate gate.
+- E8 elevated broker mint/install remains open.
 - Completeness claim remains false; E10 live-account proof is out of scope for this run.
 
 ## Surface registry
 
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json) records
 **27 explicit unsupported CLI surfaces** and **34 total** unsupported surfaces.
-Profile CLI wiring, transfer, and elevated broker install remain unsupported.
+Profile CLI wiring, transfer CLI commands, and elevated broker install remain unsupported.
 Completeness claim remains false.

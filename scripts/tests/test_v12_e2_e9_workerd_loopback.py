@@ -23,6 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 E2 = ROOT / "scripts" / "tests" / "test_e2_workerd_loopback.py"
+E9 = ROOT / "scripts" / "tests" / "test_e9_workerd_transfer.py"
 SURFACES = ROOT / "release" / "SUPPORTED_SURFACES.json"
 
 # Acceptance rows that each require the same real binary x local workerd path.
@@ -75,6 +76,15 @@ def main() -> int:
         "This is necessary but not sufficient for E2-E9 completion."
     )
 
+    if not E9.is_file():
+        print(f"missing E9 proof script: {E9}", file=sys.stderr)
+        return 1
+    print(f"==> {E9.name} (E9 public two-Agent production path)", flush=True)
+    result = subprocess.run([sys.executable, str(E9)], cwd=ROOT, check=False)
+    if result.returncode != 0:
+        print("E9 public two-Agent workerd proof failed; v1.2 E2-E9 gate red", file=sys.stderr)
+        return result.returncode
+
     # Proven real-path rows for this entrypoint. Only list rows with an actual
     # binary x workerd proof script that this gate invokes. Do not paper over.
     # Partial means production path evidence exists but the full acceptance
@@ -105,6 +115,14 @@ def main() -> int:
             "cross-workspace and invalid-repository rejection, stale-HEAD denial, "
             "and generic exact-bound cancellation reaching process-tree termination"
         ),
+        "E9": (
+            "public MCP/workerd/TransferRoom with two distinct real Agent/ownmeshd "
+            "identities: bounded binary and zero-byte send/get/list/status, exact "
+            "artifact paging/hash, 32 MiB destination disconnect/restart from the "
+            "durable ACK cursor under a fresh epoch/fence, partial cancellation "
+            "cleanup, no-overwrite and owner/tenant/workspace binding denials, plus "
+            "stopped D1/DO SQLite integrity and secret/relay-byte at-rest inspection"
+        ),
     }
     proven_partial = {
         "E2": (
@@ -120,15 +138,14 @@ def main() -> int:
             "(partial - team admin UI still out of scope)"
         ),
     }
-    # Rows with no real binary×workerd proof yet (must keep gate red).
+    # Rows with no complete real binary×workerd proof yet (must keep gate red).
     still_open = (
         (
             "E8",
             "networkless elevated broker Full Access mint/custody; Windows SCM dispatcher exists but SYSTEM enrollment migration/install is intentionally OPEN",
         ),
-        ("E9", "authenticated resumable transfer send/get/list/status/cancel"),
     )
-    # E4-E7 have real workerd acceptance; remaining rows stay fail-closed.
+    # E4-E7/E9 have real workerd acceptance; E8 stays fail-closed.
     incomplete_acceptance = (
         *still_open,
     )
@@ -149,14 +166,14 @@ def main() -> int:
 
     if incomplete_acceptance:
         print(
-            "E2-E9 workerd gate RED: E8-E9 real binary x local Wrangler/workerd "
+            "E2-E9 workerd gate RED: E8 real binary x local Wrangler/workerd "
             "acceptance is not yet complete (partial rows are not completion). "
             "Refusing exit 0 so incomplete work cannot look green.",
             file=sys.stderr,
         )
         print(
-            "v1.2 E2-E9 workerd loopback entrypoint: E2-E7 proven; "
-            "E8/E9 OPEN; gate fail-closed"
+            "v1.2 E2-E9 workerd loopback entrypoint: E2-E7/E9 proven; "
+            "E8 OPEN; gate fail-closed"
         )
         return 2
 
