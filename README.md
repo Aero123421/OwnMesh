@@ -2,13 +2,18 @@
 
 > **Any AI. Any CLI. Any machine. Your cloud.**
 
-OwnMesh is an open-source capability-runtime preview: AI clients, humans, and other machines can use user-owned Windows, macOS, and Linux PCs through a control plane deployed to the user's Cloudflare account.
+OwnMesh is a self-hosted, open-source capability runtime: ChatGPT and other MCP
+clients can use user-owned Windows, macOS, and Linux PCs through a control plane
+deployed to the user's Cloudflare account.
 
-OwnMesh is **not** an AI orchestrator, and the 1.x line is **not feature-complete against the full specification**. It currently provides a tested runtime foundation, authentication/control-plane paths, policy libraries, local execution, sessions, onboarding/doctor/user-service surfaces, signed distribution/update, and security invariants.
+OwnMesh is **not** an AI orchestrator. The current release train has a stable,
+machine-checked supported surface, but does not claim every command in the full
+target specification. Unsupported commands fail explicitly rather than falling
+back to a less secure local action.
 
 ## Status
 
-**v1.1.0** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
+**v1.2.0-beta.12** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
 Unimplemented surfaces return machine-visible errors and are excluded from completeness claims. The audited supported/unsupported contract is [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json). In particular, remote execution/session routing fails instead of falling back locally, and `approval watch` fails instead of silently behaving like a one-shot list.
 
@@ -104,7 +109,7 @@ powershell -NoProfile -File .\ownmesh-installer.ps1
 
 The installer obtains **minisign** automatically when needed (pinned bootstrap on Linux x64/Windows, Homebrew on macOS) and verifies `SHA256SUMS.minisig` against the pinned OwnMesh public key **before** trusting any checksum. After checksum verification it enforces the same archive contract as `ownmesh update` (entry/size caps, exact binary+doc allow-list, no duplicates/symlinks/traversal) with member-by-member staging. The shell installer fails closed if `tar -tvzf` listing cannot be parsed safely. Set `OWNMESH_VERSION`, `OWNMESH_INSTALL_DIR`, or `OWNMESH_NO_MODIFY_PATH` as needed.
 
-### Local approval / human-operator note (v1.1.0)
+### Local approval / human-operator note
 
 `approval approve|deny`, `policy preset`, `unlock`, and `tokens revoke` over ordinary local IPC are **fail-closed** until a distinct OS/UI user-presence proof bound to the operation exists. Same-UID unauthenticated sockets are forgeable and are not treated as human presence.
 
@@ -151,7 +156,7 @@ and prints the owner-login and ChatGPT MCP URLs. See
 
 | Surface | Privilege | Status |
 |---|---|---|
-| `ownmesh service …` | Current user only | **Supported** (v1.1.0 onboarding) |
+| `ownmesh service …` | Current user only | **Supported** |
 | `ownmesh privileged …` | Admin/root broker only | Implemented on Linux, macOS, and Windows; foreign/tampered installs fail closed |
 
 The device agent always stays in the user's account. Only the small broker is

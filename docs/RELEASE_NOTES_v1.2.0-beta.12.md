@@ -74,12 +74,20 @@ Integrity visit focused on Terra E5 blockers plus the next E6/E7 production slic
 - `scripts/tests/test_v12_e2_e9_workerd_loopback.py` invokes both the E2/E3 and
   E9 real-path fixtures. It stays **RED (exit 2)** because E8 remains open; E9
   is PROVEN and can no longer be silently skipped by the aggregate gate.
-- E8 elevated broker mint/install remains open.
-- Completeness claim remains false; E10 live-account proof is out of scope for this run.
+- E8's native broker lifecycle is implemented on Linux, macOS, and Windows, and
+  the Linux root/systemd receipt passes. The aggregate gate stays red until the
+  real public MCP → installed ownmeshd → native broker route and the remaining
+  macOS/Windows native release receipts are recorded.
+- Live Cloudflare deployment plus ChatGPT DCR/OAuth/passkey return has been
+  manually exercised. It is compatibility evidence, not a reproducible release
+  gate and does not replace the local workerd acceptance fixtures.
+- The completeness claim remains false for the explicitly excluded CLI surfaces.
 
 ## Surface registry
 
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json) records
 **22 explicit unsupported CLI surfaces** and **27 total** unsupported surfaces.
-Profile CLI wiring, transfer CLI commands, and elevated broker install remain unsupported.
+Profile CLI wiring remains unsupported. Transfer CLI plan/send/list/status/cancel
+and native privileged broker install/status/uninstall are supported; their exact
+platform evidence is recorded separately in the manifest and E8/E9 notes.
 Completeness claim remains false.

@@ -2,6 +2,21 @@
 
 ## v1.2.0-beta.12 — E5 process-tree/replay integrity + E6 detect + E7 unified diff
 
+- **Self-hosting UX:** portable `wrangler.jsonc`, guided D1/migration/deploy/owner
+  bootstrap, one-command machine `setup --quickstart`, and a headless device-code
+  variant. Re-running guided deploy does not rotate existing secrets.
+- **ChatGPT OAuth:** built-in single-owner passkey login, public-client DCR for
+  exact ChatGPT callbacks, rotating refresh tokens, browser consent, and one-URL
+  MCP setup. RFC 8628 polling errors parse correctly without an access token.
+- **Cloud cost guardrails:** pre-D1 auth/MCP rate-limit bindings keyed only by
+  hashed credentials (IP fallback for unauthenticated bootstrap), plus documented
+  Workers/D1/DO limits. Authorization remains OAuth + device policy.
+- **Transfer:** public authenticated CLI plan/send/status/list/cancel and the E9
+  two-Agent encrypted resume/cancel artifact path are implemented and evidenced.
+- **Privileged boundary:** networkless native broker lifecycle is implemented on
+  Linux, macOS, and Windows; Linux has a root receipt. macOS/Windows native
+  release receipts and the full public-route E8 acceptance remain open evidence.
+
 - **E5 process tree:** live PTY terminate kills the OS process tree (Windows
   `taskkill /T`, Unix session/`pkill -s` + process-group) so background
   descendants of interactive shells cannot survive `session.terminate`.
@@ -18,7 +33,8 @@
   with `device_id` runs real PATH detection; `session.open` with `profile_id`
   builds an official launch plan and owns a live PTY fallback. CLI profile
   surfaces remain explicit unsupported.
-- Gate remains intentionally red until E4–E9 production rows are fully evidenced.
+- Aggregate E2–E9 acceptance remains fail-closed only on the independent E8
+  public-route evidence; E4–E7 and E9 have real-path receipts.
 
 ## v1.2.0-beta.11 — handle-held dir list, PTY at-most-once, workspace CRUD
 
