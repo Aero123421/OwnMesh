@@ -642,8 +642,7 @@ export async function handleOwnerLogout(request: Request, issuer: string): Promi
   });
 }
 
-export function chatGptOAuthPair(clientId: string, redirectUri: string): boolean {
-  if (!/^client_chatgpt_[a-z0-9_-]{8,64}$/.test(clientId)) return false;
+export function chatGptOAuthClientId(redirectUri: string): string | null {
   try {
     const redirect = new URL(redirectUri);
     if (
@@ -654,13 +653,17 @@ export function chatGptOAuthPair(clientId: string, redirectUri: string): boolean
       redirect.search ||
       redirect.hash
     ) {
-      return false;
+      return null;
     }
     const match = /^\/connector\/oauth\/([A-Za-z0-9_-]{8,64})$/.exec(redirect.pathname);
-    return Boolean(match && clientId === `client_chatgpt_${match[1]!.toLowerCase()}`);
+    return match ? `client_chatgpt_${match[1]!.toLowerCase()}` : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function chatGptOAuthPair(clientId: string, redirectUri: string): boolean {
+  return chatGptOAuthClientId(redirectUri) === clientId;
 }
 
 export async function handleChatGptConnector(
@@ -693,15 +696,8 @@ export async function handleChatGptConnector(
     return json({ error: "csrf_failed" }, { status: 403, noStore: true });
   }
   const callback = (form.get("callback") || "").trim();
-  let slug = "";
-  try {
-    const parsed = new URL(callback);
-    slug = /^\/connector\/oauth\/([A-Za-z0-9_-]{8,64})$/.exec(parsed.pathname)?.[1] || "";
-  } catch {
-    slug = "";
-  }
-  const clientId = slug ? `client_chatgpt_${slug.toLowerCase()}` : "";
-  if (!chatGptOAuthPair(clientId, callback)) {
+  const clientId = chatGptOAuthClientId(callback);
+  if (!clientId) {
     return json(
       { error: "invalid_chatgpt_callback", error_description: "Use the exact callback URL shown by ChatGPT." },
       { status: 400, noStore: true },

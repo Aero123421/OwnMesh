@@ -449,7 +449,8 @@ export default {
     }
 
     if (url.pathname === "/oauth/register" && request.method === "POST") {
-      // DCR requires explicit flag + authenticated Bearer (ownmesh.device); never enable via devBypass.
+      // Exact ChatGPT public callbacks may register statelessly. All other DCR
+      // remains tenant-authenticated with ownmesh.device; devBypass never applies.
       return handleRegister(request, store, {
         allowDynamicRegistration: env.ALLOW_DYNAMIC_CLIENT_REGISTRATION === "true",
       });

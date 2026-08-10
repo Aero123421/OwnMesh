@@ -10,7 +10,7 @@
  */
 
 import type { ControlPlaneStore } from "./store.ts";
-import { chatGptOAuthPair } from "./owner-auth.ts";
+import { chatGptOAuthClientId, chatGptOAuthPair } from "./owner-auth.ts";
 import {
   ACCESS_TOKEN_TTL_MS,
   DEFAULT_TENANT,
@@ -23,10 +23,12 @@ import {
 import {
   applyNoStore,
   bearer,
+  BodyTooLargeError,
   html,
   json as jsonBase,
   nowIso,
   readBody,
+  readRequestJsonLimited,
   requireScope,
   verifyPkceS256,
   sha256Hex,
@@ -145,8 +147,10 @@ export function isAllowedDcrRedirectUri(uri: string): boolean {
  *
  * Security contract:
  * - Disabled unless allowDynamicRegistration is explicitly true (flag).
- * - Always requires a Bearer access token with ownmesh.device scope.
- * - New clients bind to the token's tenant_id (never implicit DEFAULT_TENANT).
+ * - Exact ChatGPT public callbacks register statelessly; tenant binding occurs
+ *   only after owner authentication at /oauth/authorize.
+ * - Every other registration requires a Bearer token with ownmesh.device and
+ *   binds to that token's tenant_id (never implicit DEFAULT_TENANT).
  * - redirect_uris must be https:// or loopback http:// only.
  */
 export async function handleRegister(
@@ -158,22 +162,24 @@ export async function handleRegister(
     return json({ error: "registration_disabled" }, { status: 403 });
   }
 
-  const token = bearer(req);
-  if (!token) return json({ error: "unauthorized" }, { status: 401 });
-  const rec = await store.getAccess(token);
-  if (!rec) return json({ error: "invalid_token" }, { status: 401 });
-  if (!requireScope(rec.scope, "ownmesh.device")) {
-    return json({ error: "insufficient_scope" }, { status: 403 });
-  }
-  if (!rec.tenant_id) {
-    return json({ error: "invalid_token", error_description: "missing tenant" }, { status: 401 });
-  }
-
-  const body = (await req.json()) as {
+  let body: {
     client_name?: string;
     redirect_uris?: string[];
     token_endpoint_auth_method?: string;
+    grant_types?: string[];
+    response_types?: string[];
   };
+  try {
+    body = await readRequestJsonLimited(req, 16 * 1024);
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      return json({ error: "invalid_client_metadata", error_description: "registration request too large" }, { status: 413 });
+    }
+    return json({ error: "invalid_client_metadata", error_description: "invalid JSON" }, { status: 400 });
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return json({ error: "invalid_client_metadata", error_description: "JSON object required" }, { status: 400 });
+  }
   // Only public clients (auth method "none") are supported. Reject client_secret_*.
   const authMethod = body.token_endpoint_auth_method || "none";
   if (authMethod !== "none") {
@@ -187,10 +193,55 @@ export async function handleRegister(
     );
   }
   const redirectUris = body.redirect_uris || [];
+  if (!Array.isArray(redirectUris) || redirectUris.length < 1 || redirectUris.length > 8) {
+    return json({ error: "invalid_client_metadata", error_description: "redirect_uris must contain 1 to 8 entries" }, { status: 400 });
+  }
   for (const u of redirectUris) {
-    if (!isAllowedDcrRedirectUri(u)) {
+    if (typeof u !== "string" || !isAllowedDcrRedirectUri(u)) {
       return json({ error: "invalid_redirect_uri", uri: u }, { status: 400 });
     }
+  }
+
+  // ChatGPT discovers this endpoint from OAuth metadata before it has an
+  // OwnMesh token. Permit only its exact public callback form. Registration is
+  // stateless: the deterministic client id is bound to the signed-in owner's
+  // tenant on /oauth/authorize, so anonymous requests cannot create D1 rows.
+  const chatGptClientId = redirectUris.length === 1
+    ? chatGptOAuthClientId(redirectUris[0]!)
+    : null;
+  if (chatGptClientId) {
+    if (
+      (body.response_types &&
+        (!Array.isArray(body.response_types) || body.response_types.some((value) => value !== "code"))) ||
+      (body.grant_types &&
+        (!Array.isArray(body.grant_types) ||
+          body.grant_types.some((value) => value !== "authorization_code" && value !== "refresh_token")))
+    ) {
+      return json({ error: "invalid_client_metadata", error_description: "unsupported OAuth flow" }, { status: 400 });
+    }
+    return json(
+      {
+        client_id: chatGptClientId,
+        client_name: "ChatGPT",
+        redirect_uris: redirectUris,
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+      },
+      { status: 201 },
+    );
+  }
+
+  // General-purpose DCR remains tenant-authenticated and scope-gated.
+  const token = bearer(req);
+  if (!token) return json({ error: "unauthorized" }, { status: 401 });
+  const rec = await store.getAccess(token);
+  if (!rec) return json({ error: "invalid_token" }, { status: 401 });
+  if (!requireScope(rec.scope, "ownmesh.device")) {
+    return json({ error: "insufficient_scope" }, { status: 403 });
+  }
+  if (!rec.tenant_id) {
+    return json({ error: "invalid_token", error_description: "missing tenant" }, { status: 401 });
   }
   const clientId = randomToken("client_").slice(0, 24);
   const clientName = body.client_name || "ownmesh-client";

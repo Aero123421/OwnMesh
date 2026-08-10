@@ -15,8 +15,9 @@
     "OAUTH_ISSUER": "https://ownmesh-control-plane.namaste114.workers.dev",
     // Security-sensitive development escape hatch. Keep false in deployments.
     "OWNMESH_DEV_AUTH_BYPASS": "false",
-    // Dynamic registration is opt-in; provision static clients unless explicitly needed.
-    "ALLOW_DYNAMIC_CLIENT_REGISTRATION": "false",
+    // Advertise DCR so ChatGPT can connect from only the MCP URL. Exact ChatGPT
+    // public callbacks are stateless; all other registrations require a tenant token.
+    "ALLOW_DYNAMIC_CLIENT_REGISTRATION": "true",
     // Optional comma-separated WebSocket origins in addition to OAUTH_ISSUER.
     "OWNMESH_ALLOWED_ORIGINS": ""
     // SESSION_SECRET and the one-time passkey bootstrap hash OWNER_TOKEN_HASH

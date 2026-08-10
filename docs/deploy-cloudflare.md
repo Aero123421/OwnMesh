@@ -70,7 +70,7 @@ curl http://127.0.0.1:8787/health
 | `OWNER_TOKEN_HASH` | **required by default** | SHA-256 of the high-entropy, one-time passkey bootstrap code. `pnpm run owner:init` creates it without storing the plaintext code in D1. |
 | `AUTH_PROVIDER` | optional | External identity service for multi-user deployments. When omitted, the built-in single-owner passkey login is used. |
 | `OWNMESH_DEV_AUTH_BYPASS` | optional, default `false` | Local/test-only escape hatch for `login_hint`. Never enable against production data. |
-| `ALLOW_DYNAMIC_CLIENT_REGISTRATION` | optional, default `false` | Opt-in DCR. Prefer statically provisioned clients. Unknown clients are never auto-registered by `/oauth/authorize`. |
+| `ALLOW_DYNAMIC_CLIENT_REGISTRATION` | optional, default `true` | Enables one-URL ChatGPT setup. Exact ChatGPT public callbacks register statelessly; all other DCR requires a tenant `ownmesh.device` token. Set `false` to require manual client provisioning. |
 | `OWNMESH_ALLOWED_ORIGINS` | optional | Comma-separated additional exact origins accepted by device WebSockets. The issuer origin is accepted automatically. |
 | `SESSION_SECRET` | **required** | Signs owner sessions and internal Worker→DO contexts. `owner:init` creates it if absent. **Do not commit secrets.** |
 
@@ -109,7 +109,7 @@ durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
 |---|---|
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata (includes `device_authorization_endpoint`) |
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata |
-| `POST /oauth/register` | Opt-in Dynamic Client Registration; disabled by default; `redirect_uri` **exact match** policy |
+| `POST /oauth/register` | Dynamic Client Registration; exact ChatGPT public callbacks are stateless, all other clients require tenant authentication; `redirect_uri` **exact match** policy |
 | `GET\|POST /oauth/authorize` | Authenticated principal + explicit consent + auth code + PKCE S256 |
 | `POST /oauth/token` | `authorization_code`, `refresh_token` (rotation + reuse detection), `urn:ietf:params:oauth:grant-type:device_code` |
 | `POST /oauth/revoke` | Token revoke |
@@ -147,9 +147,9 @@ Proof body: `{ "device_id", "challenge_id", "signature": "<64-byte ed25519 hex>"
 ## ChatGPT Personal Plugin / MCP
 
 1. Deploy control plane and note `https://<worker>/mcp`
-2. Open `https://<worker>/connect/chatgpt`, create or use the owner passkey, paste the callback URL shown by ChatGPT, and copy the generated client ID back to ChatGPT.
-3. In ChatGPT, add the MCP connector / Personal Plugin pointing at your `/mcp` URL
-4. Complete OAuth; scopes: `ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access`
+2. In ChatGPT, create a custom MCP app with that `/mcp` URL and choose OAuth. Leave the advanced client fields empty.
+3. Click Create. ChatGPT discovers/registers OAuth and opens OwnMesh sign-in automatically.
+4. Sign in with the owner passkey and approve scopes: `ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access`
 5. Enroll a device with `ownmesh device enroll` / `ownmesh login` against your issuer URL (CLI ticket **cli-auth-09**)
 
 **Policy note:** ChatGPT tool calls are **not** the authorization boundary. The local `ownmeshd` policy engine is final.

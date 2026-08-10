@@ -286,8 +286,8 @@ test("dynamic client registration returns policy", async () => {
         authorization: `Bearer ${tok.access_token}`,
       },
       body: JSON.stringify({
-        client_name: "ChatGPT",
-        redirect_uris: ["https://chatgpt.com/connector/oauth/callback"],
+        client_name: "Tenant App",
+        redirect_uris: ["https://client.example/callback"],
       }),
     }),
     store,
@@ -302,15 +302,15 @@ test("dynamic client registration returns policy", async () => {
     policy: { redirect_uri_match: string; dynamic_client_registration: string };
   };
   assert.ok(body.client_id);
-  assert.equal(body.client_name, "ChatGPT");
-  assert.deepEqual(body.redirect_uris, ["https://chatgpt.com/connector/oauth/callback"]);
+  assert.equal(body.client_name, "Tenant App");
+  assert.deepEqual(body.redirect_uris, ["https://client.example/callback"]);
   assert.equal(body.token_endpoint_auth_method, "none");
   assert.equal(body.policy.redirect_uri_match, "exact");
   assert.equal(body.policy.dynamic_client_registration, "supported");
   const stored = await store.getClient(body.client_id);
   assert.ok(stored);
   assert.equal(stored!.tenant_id, "ten_default");
-  assert.equal(stored!.client_name, "ChatGPT");
+  assert.equal(stored!.client_name, "Tenant App");
 });
 
 test("AS metadata does not advertise client_secret_post", () => {

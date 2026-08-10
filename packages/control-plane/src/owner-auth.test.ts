@@ -305,13 +305,6 @@ test("authenticated owner registers only an exact ChatGPT callback pair", async 
 test("ChatGPT OAuth redirects to passkey login then accepts an owner session", async () => {
   const store = new MemoryStore();
   await store.ensureBootstrap();
-  await store.putClient({
-    client_id: CLIENT_ID,
-    tenant_id: "ten_default",
-    client_name: "ChatGPT",
-    redirect_uris: [CALLBACK],
-    created_at: new Date().toISOString(),
-  });
   __setTestStore(store);
   try {
     const authEnv = await env();
@@ -335,6 +328,7 @@ test("ChatGPT OAuth redirects to passkey login then accepts an owner session", a
     );
     assert.equal(consent.status, 200);
     assert.match(await consent.text(), /<title>OwnMesh Authorize<\/title>/);
+    assert.deepEqual((await store.getClient(CLIENT_ID))?.redirect_uris, [CALLBACK]);
   } finally {
     __setTestStore(null);
   }

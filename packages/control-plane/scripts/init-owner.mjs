@@ -63,6 +63,6 @@ process.stdout.write("\nOwnMesh owner passkey bootstrap is ready.\n");
 process.stdout.write("Open the sign-in URL, enter this code once, and create your passkey.\n\n");
 process.stdout.write(`  ${ownerCode}\n\n`);
 process.stdout.write(`Create passkey:   ${issuer}/login\n`);
-process.stdout.write(`Connect ChatGPT:  ${issuer}/connect/chatgpt\n`);
+process.stdout.write(`ChatGPT MCP URL:  ${issuer}/mcp\n`);
 process.stdout.write("\nAfter registration, daily sign-in uses only the passkey.\n");
 process.stdout.write("If every passkey is lost, run `pnpm run owner:init -- --reset-passkey`.\n");

@@ -1,6 +1,6 @@
 /**
  * (H) Dynamic Client Registration security contract:
- * - no unauthenticated / default-tenant registration
+ * - only exact ChatGPT callbacks may register without an OwnMesh token
  * - Bearer access token with ownmesh.device required
  * - client bound to token tenant
  * - redirect_uris: https or loopback http only
@@ -46,6 +46,32 @@ test("DCR unauthenticated denied even when flag enabled", async () => {
   assert.equal(res.status, 401);
   const body = (await res.json()) as { error?: string };
   assert.equal(body.error, "unauthorized");
+});
+
+test("ChatGPT DCR is public, deterministic, and creates no anonymous tenant row", async () => {
+  const store = new MemoryStore();
+  const callback = "https://chatgpt.com/connector/oauth/b6NcEskp3DnC";
+  const res = await handleRegister(
+    registerReq({
+      client_name: "ChatGPT",
+      redirect_uris: [callback],
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    }),
+    store,
+    { allowDynamicRegistration: true },
+  );
+  assert.equal(res.status, 201);
+  const body = (await res.json()) as {
+    client_id: string;
+    client_secret?: string;
+    redirect_uris: string[];
+  };
+  assert.equal(body.client_id, "client_chatgpt_b6nceskp3dnc");
+  assert.equal(body.client_secret, undefined);
+  assert.deepEqual(body.redirect_uris, [callback]);
+  assert.equal(await store.getClient(body.client_id), null);
 });
 
 test("DCR invalid bearer denied", async () => {
