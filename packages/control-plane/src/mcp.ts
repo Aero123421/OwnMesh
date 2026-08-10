@@ -32,6 +32,7 @@ import {
 import { SERVICE_NAME, SERVICE_VERSION } from "./util.ts";
 import {
   MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
+  MCP_OPS_MAX_PER_TENANT,
   randomId,
   nowIso,
 } from "./store.ts";
@@ -3737,13 +3738,15 @@ export async function handleMcp(
     }
 
     if (name === "ownmesh_transfer_list") {
-      const audit = await store.listAudit(rec.tenant_id, MCP_MAX_LIST_ENTRIES);
-      const ids = audit.filter((entry) => entry.kind === "mcp.tool_call" && entry.summary === "ownmesh_transfer_plan")
-        .map((entry) => ({ operation_id: entry.meta?.operation_id, created_at: entry.created_at }))
-        .filter((entry): entry is { operation_id: string; created_at: string } => typeof entry.operation_id === "string");
+      const candidates = await store.listMcpOperations({
+        tenantId: rec.tenant_id,
+        principalId: rec.principal,
+        tool: "ownmesh_transfer_plan",
+        limit: MCP_OPS_MAX_PER_TENANT,
+      });
       const transfers: Array<Record<string, unknown>> = [];
-      for (const item of ids) {
-        let candidate = await loadOp(store, tracker, item.operation_id);
+      for (const stored of candidates) {
+        let candidate = await loadOp(store, tracker, stored.operation_id);
         let transfer = candidate?.tool === "ownmesh_transfer_plan" ? transferMeta(candidate.data) : null;
         if (!candidate || !transfer || candidate.principal !== rec.principal || candidate.tenant_id !== rec.tenant_id) continue;
         ({ plan: candidate, meta: transfer } = await reconcileTransferStart(store, tracker, candidate, transfer, router ? {
@@ -3751,7 +3754,7 @@ export async function handleMcp(
           principalCredentialGeneration, terminalizeTransferRoom: opts.terminalizeTransferRoom,
         } : undefined));
         ({ plan: candidate, meta: transfer } = await reconcileTransferCancellation(store, tracker, candidate, transfer));
-        transfers.push({ operation_id: candidate.operation_id, created_at: candidate.created_at || item.created_at, ...publicTransferMeta(transfer) });
+        transfers.push({ operation_id: candidate.operation_id, created_at: candidate.created_at || stored.created_at, ...publicTransferMeta(transfer) });
       }
       const page = paginateList(transfers, { cursor: typeof args.cursor === "string" ? args.cursor : undefined, limit: typeof args.limit === "number" ? args.limit : undefined });
       const env = makeEnvelope({ operation_id: operationId, status: "completed", summary: `listed ${page.page.length} transfer(s)`, data: { transfers: page.page }, truncated: page.truncated, next_cursor: page.next_cursor, warnings: injectWarnings });

@@ -87,6 +87,39 @@ test("status CAS-reconciles both durable transfer.start results", async () => {
   assert.equal(transfers.find((entry) => entry.operation_id === transferId)?.state, "completed");
 });
 
+test("Memory transfer list uses owner-bound operations after audit-window churn", async () => {
+  const f = await fixture();
+  const ids: string[] = [];
+  for (let index = 0; index < 4; index += 1) {
+    const created = await invoke(f, "ownmesh_transfer_plan", {
+      source_device_id: "dev_source",
+      destination_device_id: "dev_destination",
+      source_workspace_id: "ws_source",
+      destination_workspace_id: "ws_destination",
+      source_path: `in/${index}.bin`,
+      destination_path: `out/${index}.bin`,
+      idempotency_key: `memory-list-${index}`,
+    });
+    const transferId = created.result!.structuredContent!.operation_id;
+    ids.push(transferId);
+    const status = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+    assert.equal(status.result!.structuredContent!.operation_id, transferId);
+  }
+  for (let index = 0; index < 501; index += 1) {
+    await f.store.appendAudit({
+      id: `audit_noise_${index}`,
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      kind: "mcp.tool_call",
+      summary: "unrelated_tool",
+      created_at: new Date(Date.now() + index).toISOString(),
+    });
+  }
+  const listed = await invoke(f, "ownmesh_transfer_list", { limit: 50 });
+  const transfers = listed.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>;
+  assert.deepEqual(new Set(transfers.map((entry) => entry.operation_id)), new Set(ids));
+});
+
 test("uncertain start route recovery fences and creates a fresh preflight generation", async () => {
   const f = await fixture();
   const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "recovery-plan" });

@@ -10,6 +10,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { handleMcp, OperationTracker, type OperationRouter } from "./mcp.ts";
 import { SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
 import { encodeDevicePublicKey } from "./store.ts";
 
@@ -110,6 +111,57 @@ test("all control-plane migrations apply cleanly on sqlite", () => {
     "schema_migrations",
   ]) {
     assert.ok(names.includes(need), `missing table ${need}`);
+  }
+});
+
+test("SqlStore public transfer list returns the same owner-visible operation ids as status", async () => {
+  const { db, store } = openSqliteStore();
+  try {
+    await store.ensureBootstrap();
+    const token = await store.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read ownmesh.write");
+    for (const id of ["dev_source", "dev_destination"]) {
+      await store.putDevice({ id, tenant_id: "ten_default", principal_id: "prin_dev", name: id, hostname: id, os: "test", arch: "test", agent_version: "test", protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false, created_at: new Date().toISOString(), status: "active" });
+    }
+    await store.putWorkspace({ workspace_id: "ws_source", tenant_id: "ten_default", device_id: "dev_source", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    await store.putWorkspace({ workspace_id: "ws_destination", tenant_id: "ten_default", device_id: "dev_destination", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const router: OperationRouter = {
+      async routeToDevice() { return { status: "routed_to_device" }; },
+      async routeLiveToDevice() { return { status: "routed_to_device" }; },
+    };
+    const invoke = async (name: string, args: Record<string, unknown>) => {
+      const request = new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token.access_token}`, "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+      });
+      const response = await handleMcp(request, store, new URL("https://cp.test/mcp"), router, {
+        tracker: new OperationTracker(),
+        transferTicketSecret: "sql-transfer-list-secret",
+      });
+      return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown> } } };
+    };
+
+    const ids: string[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const created = await invoke("ownmesh_transfer_plan", {
+        source_device_id: "dev_source",
+        destination_device_id: "dev_destination",
+        source_workspace_id: "ws_source",
+        destination_workspace_id: "ws_destination",
+        source_path: `in/${index}.bin`,
+        destination_path: `out/${index}.bin`,
+        idempotency_key: `sql-list-${index}`,
+      });
+      const transferId = created.result!.structuredContent!.operation_id;
+      ids.push(transferId);
+      const status = await invoke("ownmesh_transfer_status", { transfer_id: transferId });
+      assert.equal(status.result!.structuredContent!.operation_id, transferId);
+    }
+    const listed = await invoke("ownmesh_transfer_list", { limit: 50 });
+    const transfers = listed.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>;
+    assert.deepEqual(new Set(transfers.map((entry) => entry.operation_id)), new Set(ids));
+  } finally {
+    db.close();
   }
 });
 

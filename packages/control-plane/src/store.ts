@@ -567,6 +567,13 @@ export interface ControlPlaneStore {
   putMcpOperation(op: McpOperationRecord): Promise<void>;
   getMcpOperation(operationId: string): Promise<McpOperationRecord | null>;
   getMcpOperationByCorrelation(correlationId: string): Promise<McpOperationRecord | null>;
+  /** Bounded newest-first lookup with all ownership facts fixed by the caller. */
+  listMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]>;
   /**
    * Lookup by principal/tenant/device/idempotency_key for exact-action reuse.
    * Newest row wins when multiple historical rows exist.
@@ -1458,6 +1465,24 @@ export class MemoryStore implements ControlPlaneStore {
       }
     }
     return null;
+  }
+  async listMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    return [...this.mcpOperations.values()]
+      .filter((op) => op.tenant_id === opts.tenantId && op.principal_id === opts.principalId && op.tool === opts.tool)
+      .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id))
+      .slice(0, limit)
+      .map((op) => ({
+        ...op,
+        data: { ...op.data },
+        warnings: [...op.warnings],
+        action: op.action ? { ...op.action } : op.action,
+      }));
   }
   async getMcpOperationByIdempotency(opts: {
     principalId: string;
@@ -3167,6 +3192,24 @@ export class SqlStore implements ControlPlaneStore {
       .bind(correlationId)
       .first<Record<string, unknown>>();
     return row ? rowToMcpOperation(row) : null;
+  }
+
+  async listMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    const rows = await this.db
+      .prepare(
+        `SELECT * FROM mcp_operations
+         WHERE tenant_id = ? AND principal_id = ? AND tool = ?
+         ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
+      )
+      .bind(opts.tenantId, opts.principalId, opts.tool, limit)
+      .all<Record<string, unknown>>();
+    return (rows.results || []).map(rowToMcpOperation);
   }
 
   async getMcpOperationByIdempotency(opts: {
