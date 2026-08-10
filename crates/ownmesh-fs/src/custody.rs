@@ -2040,14 +2040,14 @@ mod tests {
             "the native ABI must include WCHAR[1] on both x86 and x64"
         );
         for name in [
-            &[b'a' as u16][..],
-            &[b'a' as u16, b'b' as u16, b'c' as u16][..],
+            &[u16::from(b'a')][..],
+            &[u16::from(b'a'), u16::from(b'b'), u16::from(b'c')][..],
         ] {
             let (buffer, total) =
                 file_link_information_buffer(std::ptr::null_mut::<u8>() as HANDLE, name).unwrap();
             assert_eq!(
                 buffer.len(),
-                file_name_offset + name.len() * std::mem::size_of::<u16>()
+                file_name_offset + std::mem::size_of_val(name)
             );
             assert_eq!(usize::try_from(total).unwrap(), buffer.len());
             let copied = name
