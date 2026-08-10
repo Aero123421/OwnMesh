@@ -743,6 +743,39 @@ fn source_terminal_cleanup_removes_its_plan_and_snapshot() {
 }
 
 #[test]
+fn source_terminal_cleanup_never_hides_snapshot_unlink_failure() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"cleanup-failure");
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    store.save_plan(&plan).unwrap();
+    std::fs::write(dir.path().join("input.bin"), b"cleanup-failure").unwrap();
+    let ws = workspace(dir.path());
+    drop(
+        store
+            .open_source_sender_at(
+                plan.clone(),
+                ws.open_verified_read("input.bin").unwrap(),
+                0,
+                0,
+            )
+            .unwrap(),
+    );
+    let source = store.root().join(format!(".{}.source", plan.id()));
+    let plan_path = store.root().join(format!(".{}.plan.json", plan.id()));
+    std::fs::remove_file(&source).unwrap();
+    std::fs::create_dir(&source).unwrap();
+
+    assert_eq!(
+        store.remove_source_terminal_state(&plan),
+        Err(TransferError::CustodyUnavailable)
+    );
+    assert!(
+        plan_path.exists(),
+        "plan must remain retryable after cleanup failure"
+    );
+}
+
+#[test]
 fn source_mutation_is_detected_before_streaming() {
     let dir = tempdir().unwrap();
     let source = dir.path().join("source.bin");

@@ -3182,7 +3182,9 @@ full_user_access/full_access for arbitrary commands",
             {
                 self.transfer_senders.remove(plan.id());
                 self.transfer_last_chunks.remove(plan.id());
-                let _ = self.transfer_store.remove_source_terminal_state(&plan);
+                self.transfer_store
+                    .remove_source_terminal_state(&plan)
+                    .map_err(Self::transfer_error)?;
                 return Ok(json!({ "plan_id": plan.id(), "cancelled": true, "source_only": true }));
             }
             Err(error) => return Err(Self::transfer_error(error)),

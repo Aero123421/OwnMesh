@@ -488,7 +488,8 @@ fn classify_transfer_failure(error: &str) -> TransferSessionFailure {
         | "transfer send failed"
         | "transfer ACK send failed"
         | "transfer finish send failed"
-        | "transfer finish acknowledgement send failed" => TransferSessionFailure::Reconnect,
+        | "transfer finish acknowledgement send failed"
+        | "source cleanup pending" => TransferSessionFailure::Reconnect,
         _ => TransferSessionFailure::Terminal,
     }
 }
@@ -579,14 +580,7 @@ async fn run_source_transfer_pump(
             // Only the authenticated Room finish_ack makes source custody
             // terminal. Before it, the retained snapshot is the sole safe
             // resume source if the original pathname changes or disappears.
-            let _ = transfer_runtime_call(
-                runtime,
-                authority,
-                methods::TRANSFER_CANCEL,
-                json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence}),
-                None,
-            )
-            .await;
+            cleanup_source_transfer_state(runtime, authority, ticket, plan_id).await?;
             return Ok(
                 json!({"transfer_id":ticket.transfer_id,"state":"source_finished","plan_sha256":ticket.plan_sha256}),
             );
@@ -620,6 +614,36 @@ async fn run_source_transfer_pump(
         sequence += 1;
         offset += chunk.bytes.len() as u64;
     }
+}
+
+async fn cleanup_source_transfer_state(
+    runtime: &Arc<Mutex<DaemonRuntime>>,
+    authority: &TransferSessionAuthority,
+    ticket: &AgentTransferTicket,
+    plan_id: &str,
+) -> Result<(), String> {
+    // Owner-only file removal can briefly contend with an antivirus/indexer or
+    // an older process handle on Windows. Keep the Agent retry bounded; after
+    // that the coordinator receives a fixed cleanup-pending code and routes an
+    // exact source cleanup operation instead of manufacturing success.
+    for attempt in 0..4 {
+        if transfer_runtime_call(
+            runtime,
+            authority,
+            methods::TRANSFER_CANCEL,
+            json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence}),
+            None,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(());
+        }
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    Err("source cleanup pending".into())
 }
 
 async fn run_destination_transfer_pump(
@@ -663,7 +687,10 @@ async fn run_destination_transfer_pump(
                 return Err("transfer finish before durable destination completion".into());
             }
             let finalized = transfer_runtime_call(runtime, authority, methods::TRANSFER_FINALIZE, json!({"plan_id":plan_id,"epoch":ticket.epoch,"fence":ticket.fence,"workspace_id":ticket.destination_workspace_id}), None).await?;
-            socket.send(Message::Text(json!({"protocol":"ownmesh.transfer/1.0","type":"finish_ack","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256}).to_string().into())).await.map_err(|_| "transfer finish acknowledgement send failed")?;
+            // Publication is already atomic and authenticated locally. Preserve
+            // that authoritative receipt even when the reply socket disappears;
+            // the coordinator will stop and clean the source before completing.
+            let _ = socket.send(Message::Text(json!({"protocol":"ownmesh.transfer/1.0","type":"finish_ack","transfer_id":ticket.transfer_id,"epoch":ticket.epoch,"fence":ticket.fence,"plan_sha256":ticket.plan_sha256}).to_string().into())).await;
             return Ok(finalized);
         }
         if object.get("type").and_then(Value::as_str) != Some("chunk")
@@ -2716,6 +2743,9 @@ fn map_request_to_method(
         ("transfer.status", "transfer.status" | "status") => methods::TRANSFER_STATUS,
         ("transfer.list", "transfer.list" | "list") => methods::TRANSFER_LIST,
         ("transfer.cancel", "transfer.cancel" | "cancel") => methods::TRANSFER_CANCEL,
+        ("transfer.source_cleanup", "transfer.source_cleanup" | "source_cleanup") => {
+            methods::TRANSFER_CANCEL
+        }
         ("transfer.artifact_get", "transfer.artifact_get" | "artifact_get") => {
             methods::TRANSFER_ARTIFACT_GET
         }
@@ -2738,8 +2768,15 @@ fn map_request_to_method(
     // side-effect journal and deliberately expose strict, ticket/plan-bound
     // parameter schemas.  Still validate any duplicate arguments-side key
     // above, but do not leak the transport contract field into those schemas.
-    if internal_preflight || internal_start || request.capability == "transfer.artifact_get" {
+    if internal_preflight
+        || internal_start
+        || request.capability == "transfer.artifact_get"
+        || request.capability == "transfer.source_cleanup"
+    {
         args.remove("idempotency_key");
+        if request.capability == "transfer.source_cleanup" {
+            args.remove("workspace_id");
+        }
     } else {
         args.insert(
             "idempotency_key".into(),
@@ -3319,7 +3356,7 @@ async fn dispatch_remote_operation(
                                 ))
                                 .await;
                         }
-                        let _ = transfer_runtime_call(
+                        let cleanup = transfer_runtime_call(
                             runtime,
                             &authority,
                             methods::TRANSFER_CANCEL,
@@ -3327,6 +3364,9 @@ async fn dispatch_remote_operation(
                             None,
                         )
                         .await;
+                        if ticket.role == "source" && cleanup.is_err() {
+                            return Err("source cleanup pending".into());
+                        }
                     }
                     let pump_receipt = pumped?;
                     transfer_start_result(
@@ -3343,10 +3383,21 @@ async fn dispatch_remote_operation(
                         json!({"operation_contract":OPERATION_CONTRACT_V1,"operation_id":operation_id,"status":"completed","result":result})
                     }
                     Err(error) => {
+                        let cleanup_pending = error == "source cleanup pending";
                         let (code, message, retryable) = match classify_transfer_failure(&error) {
                             TransferSessionFailure::Reconnect => ("OWNMESH_E_TRANSFER_RECONNECT", "transfer connection interrupted; obtain a fresh ticket to reconnect", true),
                             TransferSessionFailure::Cancelled => ("OWNMESH_E_TRANSFER_CANCELLED", "transfer cancelled", false),
                             TransferSessionFailure::Terminal => ("OWNMESH_E_TRANSFER_SESSION", "transfer session failed", false),
+                        };
+                        let code = if cleanup_pending {
+                            "OWNMESH_E_TRANSFER_CLEANUP_PENDING"
+                        } else {
+                            code
+                        };
+                        let message = if cleanup_pending {
+                            "source transfer cleanup is pending"
+                        } else {
+                            message
                         };
                         json!({"operation_contract":OPERATION_CONTRACT_V1,"operation_id":operation_id,"status":"failed","error":{"code":code,"message":message,"retryable":retryable}})
                     }
@@ -4787,6 +4838,28 @@ mod tests {
             .unwrap_err()
             .contains("differs from operation contract"));
 
+        let cleanup = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_source_cleanup_1").unwrap(),
+            capability: "transfer.source_cleanup".into(),
+            workspace_id: Some(ownmesh_domain::WorkspaceId::parse("ws_source").unwrap()),
+            idempotency_key: "idem_source_cleanup_1".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({
+                "action": "source_cleanup",
+                "plan_id": "xfer_source_plan",
+                "epoch": 2,
+                "fence": 2,
+            }),
+        };
+        let (method, args) = map_request_to_method(&cleanup).unwrap();
+        assert_eq!(method, methods::TRANSFER_CANCEL);
+        assert_eq!(
+            args,
+            json!({"plan_id":"xfer_source_plan","epoch":2,"fence":2})
+        );
+
         let mut normal = request;
         normal.capability = "transfer.plan".into();
         normal.arguments["action"] = json!("plan");
@@ -4955,6 +5028,10 @@ fn transfer_failure_classification_only_retries_connection_loss() {
     );
     assert_eq!(
         classify_transfer_failure("remote error: journal lease or fence is stale"),
+        TransferSessionFailure::Reconnect
+    );
+    assert_eq!(
+        classify_transfer_failure("source cleanup pending"),
         TransferSessionFailure::Reconnect
     );
     for terminal in [
