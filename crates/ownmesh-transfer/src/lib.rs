@@ -1564,11 +1564,38 @@ impl JournalStore {
         sequence: u64,
         offset: u64,
     ) -> TransferResult<TransferSender> {
+        self.open_source_sender_at_lazy(plan, sequence, offset, || Ok(source))
+    }
+
+    /// Reopen an immutable source sender without requiring a caller to reopen
+    /// the workspace pathname when a complete retained snapshot already
+    /// exists. The source opener runs only after the exact plan has been
+    /// validated and the store has established that it must stage a snapshot.
+    ///
+    /// This preserves the workspace authority boundary for first staging while
+    /// making reconnects independent of later rename, deletion, or replacement
+    /// of the original pathname. The retained `.source` file remains verified
+    /// against the immutable plan before a sender is returned.
+    pub fn open_source_sender_at_lazy<F>(
+        &self,
+        plan: TransferPlan,
+        sequence: u64,
+        offset: u64,
+        open_source: F,
+    ) -> TransferResult<TransferSender>
+    where
+        F: FnOnce() -> TransferResult<WorkspaceReadHandle>,
+    {
         plan.validate_at(now_unix())?;
         let snapshot = self.path(plan.id(), ".source")?;
         let reservation = self.path(plan.id(), ".source.reserve")?;
         {
-            let _store_lock = self.lock_store()?;
+            // A source-open is allowed a bounded wait for another short
+            // reservation transaction. This is not held while staging the
+            // source bytes, so independent plans that fit the aggregate quota
+            // do not fail merely because Windows delayed an owner-only ACL
+            // metadata operation beyond the generic 20 ms lock window.
+            let _store_lock = self.lock_store_with_attempts(2_000)?;
             self.cleanup_expired_unlocked(now_unix())?;
             if owner_only_file_present(&self.path(plan.id(), ".source-cleanup.json")?)? {
                 return Err(TransferError::Terminal);
@@ -1611,7 +1638,22 @@ impl JournalStore {
                 return Err(TransferError::CustodyUnavailable);
             }
         }
-        let mut input = source.into_file();
+        // Do not call this closure before the snapshot check above. In
+        // particular, an authenticated reconnect must not touch an original
+        // workspace pathname after a retained snapshot has become its custody
+        // authority.
+        let mut input = match open_source() {
+            Ok(source) => source.into_file(),
+            Err(error) => {
+                // The reservation and empty snapshot were created for this
+                // exact immutable plan. A custody-open failure must not strand
+                // either one until TTL expiry, or it would turn a retryable
+                // source race into a quota/LeaseBusy denial of service.
+                let _ = remove_owner_only_file_retry(&snapshot);
+                let _ = remove_owner_only_file_retry(&reservation);
+                return Err(error);
+            }
+        };
         let copy_result = (|| -> TransferResult<()> {
             let mut output = open_owner_only_file_append_retry(&snapshot)?;
             let mut hasher = Sha256::new();

@@ -2845,12 +2845,13 @@ full_user_access/full_access for arbitrary commands",
             });
         }
         let workspace = self.workspace_for(Some(&plan.binding().source_workspace_id))?;
-        let source = workspace
-            .open_verified_read(Path::new(&plan.binding().source_relative_path))
-            .map_err(fs_err)?;
         let sender = self
             .transfer_store
-            .open_source_sender_at(plan.clone(), source, p.sequence, p.offset)
+            .open_source_sender_at_lazy(plan.clone(), p.sequence, p.offset, || {
+                workspace
+                    .open_verified_read(Path::new(&plan.binding().source_relative_path))
+                    .map_err(|_| TransferError::CustodyUnavailable)
+            })
             .map_err(Self::transfer_error)?;
         self.transfer_senders.insert(plan.id().to_owned(), sender);
         self.transfer_last_chunks.remove(plan.id());
@@ -9006,6 +9007,119 @@ mod transfer_runtime_tests {
         assert!(source
             .handle_transfer_source_open(
                 Some(json!({ "plan_id": plan_id, "sequence": 1, "offset": content.len(), "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn source_reconnect_reuses_retained_snapshot_after_original_is_removed() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let mut content = vec![0_u8; MAX_CHUNK_BYTES * 2 + 37];
+        for (index, byte) in content.iter_mut().enumerate() {
+            *byte = u8::try_from(index % 251).unwrap();
+        }
+        let source_path = paths.state_dir.join("workspace").join("resume-source.bin");
+        std::fs::write(&source_path, &content).unwrap();
+        bind_remote_transfer(&mut runtime);
+        let client = remote_client();
+        let authority_operation = runtime.active_remote_operation_id.clone().unwrap();
+        let authority_payload = runtime.active_remote_payload_hash.clone().unwrap();
+        let authority_expiry = runtime.active_remote_expires_at_unix.unwrap();
+        let plan = runtime
+            .handle_transfer_plan(
+                Some(json!({
+                    "source_path": "resume-source.bin",
+                    "destination_path": "remote-received.bin",
+                    "destination_workspace_id": "ws_remote_destination",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "sequence": 0, "offset": 0, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let first = runtime
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 0 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let first_frame = base64_decode_strict(first["frame_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            TransferChunk::decode(&first_frame).unwrap().bytes,
+            content[..MAX_CHUNK_BYTES]
+        );
+
+        // A process restart plus original-path deletion must still reopen the
+        // immutable owner-only snapshot at the durable Room cursor.
+        drop(runtime);
+        std::fs::rename(&source_path, source_path.with_extension("removed")).unwrap();
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.active_remote_operation_id = Some(authority_operation.clone());
+        runtime.active_remote_payload_hash = Some(authority_payload.clone());
+        runtime.active_remote_device_id = Some("dev_transfer_test".into());
+        runtime.active_remote_expires_at_unix = Some(authority_expiry);
+        runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "sequence": 1, "offset": MAX_CHUNK_BYTES, "workspace_id": "ws_default" })),
+                &client,
+            )
+            .await
+            .expect("reconnect must not reopen the deleted workspace pathname");
+        let second = runtime
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 1 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let second_frame = base64_decode_strict(second["frame_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            TransferChunk::decode(&second_frame).unwrap().bytes,
+            content[MAX_CHUNK_BYTES..MAX_CHUNK_BYTES * 2]
+        );
+        let third = runtime
+            .handle_transfer_source_chunk(
+                Some(json!({ "plan_id": plan_id, "sequence": 2 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let third_frame = base64_decode_strict(third["frame_base64"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            TransferChunk::decode(&third_frame).unwrap().bytes,
+            content[MAX_CHUNK_BYTES * 2..]
+        );
+
+        // A replacement is never an authority: a retained snapshot whose size
+        // or hash no longer matches the immutable plan must not resume.
+        drop(runtime);
+        let snapshot = paths
+            .state_dir
+            .join("transfers")
+            .join(format!(".{plan_id}.source"));
+        std::fs::remove_file(&snapshot).unwrap();
+        std::fs::write(&snapshot, b"substituted snapshot").unwrap();
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.active_remote_operation_id = Some(authority_operation);
+        runtime.active_remote_payload_hash = Some(authority_payload);
+        runtime.active_remote_device_id = Some("dev_transfer_test".into());
+        runtime.active_remote_expires_at_unix = Some(authority_expiry);
+        assert!(runtime
+            .handle_transfer_source_open(
+                Some(json!({ "plan_id": plan_id, "sequence": 2, "offset": MAX_CHUNK_BYTES * 2, "workspace_id": "ws_default" })),
                 &client,
             )
             .await

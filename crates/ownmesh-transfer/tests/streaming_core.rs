@@ -1463,6 +1463,51 @@ fn source_snapshot_retains_the_verified_file_across_path_replacement() {
     store.remove_source_snapshot(&plan).unwrap();
 }
 
+#[test]
+fn lazy_source_open_failure_removes_its_exact_reservation_and_snapshot() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("input.bin");
+    std::fs::write(&source, b"source").unwrap();
+    let ws = workspace(dir.path());
+    let plan = TransferPlan::for_workspace_source(
+        ws.open_verified_read("input.bin").unwrap(),
+        binding(),
+        grant(),
+        PlanLimits::default(),
+        1,
+    )
+    .unwrap();
+    let store = JournalStore::open(
+        dir.path().join("state"),
+        JournalLimits {
+            max_journals: 1,
+            max_bytes: 1024,
+            max_snapshots: 1,
+            max_snapshot_bytes: 1024,
+            max_plans: 1,
+            max_plan_bytes: 1024,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        store.open_source_sender_at_lazy(plan.clone(), 0, 0, || {
+            Err::<ownmesh_fs::WorkspaceReadHandle, _>(TransferError::CustodyUnavailable)
+        }),
+        Err(TransferError::CustodyUnavailable)
+    ));
+    let snapshot = store.root().join(format!(".{}.source", plan.id()));
+    let reservation = store
+        .root()
+        .join(format!(".{}.source.reserve", plan.id()));
+    assert!(!snapshot.exists());
+    assert!(!reservation.exists());
+
+    // The exact quota reservation was released, so a normal retry can stage.
+    store
+        .open_source_sender_at(plan, ws.open_verified_read("input.bin").unwrap(), 0, 0)
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn source_symlink_is_rejected_without_following_it() {
