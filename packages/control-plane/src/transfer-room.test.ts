@@ -135,21 +135,38 @@ test("TransferRoom serializes concurrent two-role generation advance", async () 
     transfer_expires_at: current.transfer_expires_at, max_bytes: current.max_bytes,
     jti: "jti_source_generation_2",
   };
-  const destination = {
-    ...ticket("destination"), epoch: current.epoch + 1, fence: current.fence + 1,
-    transfer_expires_at: current.transfer_expires_at, max_bytes: current.max_bytes,
-    jti: "jti_destination_generation_2",
-  };
   const sourceUpgrade = transferUpgrade(room, await issueTransferTicket(secret, source));
   await firstAdvanceStarted;
-  const destinationUpgrade = transferUpgrade(room, await issueTransferTicket(secret, destination));
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  const destinationUpgrades: Array<Promise<number>> = [];
+  for (let index = 0; index < 16; index += 1) {
+    const destination = {
+      ...ticket("destination"), epoch: current.epoch + 1, fence: current.fence + 1,
+      transfer_expires_at: current.transfer_expires_at, max_bytes: current.max_bytes,
+      jti: `jti_destination_generation_2_${index}`,
+    };
+    destinationUpgrades.push(transferUpgrade(room, await issueTransferTicket(secret, destination)));
+  }
+  const overflowStatus = await Promise.race([
+    Promise.any(destinationUpgrades.map(async (upgrade) => {
+      const status = await upgrade;
+      if (status !== 429) throw new Error("not overflow");
+      return status;
+    })),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("admission queue was not bounded")), 1_000)),
+  ]);
+  assert.equal(overflowStatus, 429);
   releaseFirst();
-  assert.deepEqual(await Promise.all([sourceUpgrade, destinationUpgrade]), [101, 101]);
+  assert.equal(await sourceUpgrade, 101);
+  const destinationStatuses = await Promise.all(destinationUpgrades);
+  assert.equal(destinationStatuses.filter((status) => status === 101).length, 1);
+  assert.equal(destinationStatuses.filter((status) => status === 409).length, 14);
+  assert.equal(destinationStatuses.filter((status) => status === 429).length, 1);
   assert.equal(advancePuts, 1, "exactly one role may commit the epoch advance");
   assert.equal(sockets.length, 2);
   assert.ok(sockets.every((socket) => !socket.closed));
   assert.ok(sockets.every((socket) => socket.sent.some((raw) => raw.includes('"type":"ready"'))));
+  const ledger = storage.get("ownmesh:transfer:tickets:v1");
+  assert.equal(Array.isArray(ledger) ? ledger.length : -1, 2, "overflow admission must not consume a ticket");
 });
 
 test("ephemeral proof binds the exact key, role, and immutable transfer facts", async () => {

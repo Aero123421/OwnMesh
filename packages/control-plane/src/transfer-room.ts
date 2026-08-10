@@ -81,6 +81,7 @@ const TRANSFER_MAX_TTL_MS = 24 * 60 * 60_000;
 const STORAGE_METADATA = "ownmesh:transfer:metadata:v1";
 const STORAGE_TICKETS = "ownmesh:transfer:tickets:v1";
 const MAX_TICKET_REPLAYS = 128;
+const MAX_ADMISSION_QUEUE = 16;
 
 /** Persist only a domain-separated replay fingerprint.  A JTI is not a
  * bearer by itself, but retaining its raw value is unnecessary durable link
@@ -438,6 +439,7 @@ export class TransferRoom {
   private consumed = new Map<string, number>();
   private readonly ready: Promise<void>;
   private admissionTail: Promise<void> = Promise.resolve();
+  private admissionQueued = 0;
   private readonly state: DurableObjectState;
   private readonly env: TransferRoomEnv;
 
@@ -523,11 +525,22 @@ export class TransferRoom {
     // form one admission transaction. Two roles routinely reconnect together;
     // letting their awaited storage writes interleave can make both advance the
     // same old epoch and have the second reset the first role's new router.
+    if (this.admissionQueued >= MAX_ADMISSION_QUEUE) {
+      return new Response("transfer admission busy", { status: 429 });
+    }
+    this.admissionQueued += 1;
     const previousAdmission = this.admissionTail;
     let releaseAdmission!: () => void;
     this.admissionTail = new Promise<void>((resolve) => { releaseAdmission = resolve; });
     await previousAdmission;
     try {
+      return await this.fetchAdmitted(request);
+    } finally {
+      this.admissionQueued -= 1;
+      releaseAdmission();
+    }
+  }
+  private async fetchAdmitted(request: Request): Promise<Response> {
     if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return new Response("expected websocket", { status: 426 });
     const ticket = await verifyTransferTicket(this.env.SESSION_SECRET, request.headers.get("x-ownmesh-transfer-ticket"));
     if (!ticket || ticket.ticket_exp <= Date.now()) return new Response("invalid ticket", { status: 401 });
@@ -572,9 +585,6 @@ export class TransferRoom {
       return new Response("peer rejected", { status: 403 });
     }
     return new Response(null, { status: 101, webSocket: client });
-    } finally {
-      releaseAdmission();
-    }
   }
   async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
     await this.ready;
