@@ -39,6 +39,8 @@ mod server;
 mod transport;
 #[cfg(windows)]
 mod windows_job;
+#[cfg(windows)]
+mod windows_service;
 
 pub use auth::{
     canonicalize_principal_key, constant_time_eq, current_os_user_id, generate_token,
@@ -72,6 +74,11 @@ pub use transport::{
 };
 #[cfg(windows)]
 pub use windows_job::{spawn_suspended_windows_job, WindowsJobProcess};
+#[cfg(windows)]
+pub use windows_service::{
+    run_ownmesh_daemon_service_dispatcher, windows_daemon_service_stop_requested,
+    WindowsServiceDispatcherOutcome, OWN_MESH_DAEMON_SERVICE_NAME,
+};
 
 /// Stable crate name used by diagnostics and tests.
 #[must_use]

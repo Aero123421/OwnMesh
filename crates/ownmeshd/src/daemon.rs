@@ -445,11 +445,36 @@ async fn wait_for_shutdown() -> Result<(), ExitCode> {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.map_err(|err| {
-            tracing::error!(error = %err, "ctrl-c hook failed");
-            ExitCode::Internal
-        })?;
-        tracing::info!("ctrl-c received");
+        #[cfg(windows)]
+        {
+            let mut service_stop = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        result.map_err(|err| {
+                            tracing::error!(error = %err, "ctrl-c hook failed");
+                            ExitCode::Internal
+                        })?;
+                        tracing::info!("ctrl-c received");
+                        break;
+                    }
+                    _ = service_stop.tick() => {
+                        if ownmesh_ipc::windows_daemon_service_stop_requested() {
+                            tracing::info!("Windows SCM STOP received");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            tokio::signal::ctrl_c().await.map_err(|err| {
+                tracing::error!(error = %err, "ctrl-c hook failed");
+                ExitCode::Internal
+            })?;
+            tracing::info!("ctrl-c received");
+        }
         Ok(())
     }
 }

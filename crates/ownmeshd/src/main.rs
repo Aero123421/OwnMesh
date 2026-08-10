@@ -87,10 +87,7 @@ fn main() -> StdExitCode {
     init_tracing();
     let cli = Cli::parse();
     let code = match cli.command.unwrap_or(Commands::Run) {
-        Commands::Run => match daemon::run_foreground() {
-            Ok(()) => ExitCode::Success,
-            Err(code) => code,
-        },
+        Commands::Run => run_daemon(),
         Commands::Version => {
             println!(
                 "{name} {version}",
@@ -135,6 +132,37 @@ fn main() -> StdExitCode {
     };
     let status = u8::try_from(code.code()).unwrap_or(u8::MAX);
     StdExitCode::from(status)
+}
+
+fn run_daemon() -> ExitCode {
+    #[cfg(windows)]
+    {
+        match ownmesh_ipc::run_ownmesh_daemon_service_dispatcher(run_foreground_exit) {
+            Ok(ownmesh_ipc::WindowsServiceDispatcherOutcome::Dispatched) => ExitCode::Success,
+            Ok(ownmesh_ipc::WindowsServiceDispatcherOutcome::NotService) => {
+                match daemon::run_foreground() {
+                    Ok(()) => ExitCode::Success,
+                    Err(code) => code,
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Windows service dispatcher failed");
+                ExitCode::Internal
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match daemon::run_foreground() {
+            Ok(()) => ExitCode::Success,
+            Err(code) => code,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_foreground_exit() -> Result<(), i32> {
+    daemon::run_foreground().map_err(|code| code.code())
 }
 
 fn init_tracing() {
