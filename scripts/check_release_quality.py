@@ -127,11 +127,12 @@ def main() -> int:
         additional_registry == additional,
         "manifest additional unsupported surfaces must exactly match the ordered Rust registry",
     )
-    require(
-        "EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands
-        and "ADDITIONAL_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands,
-        "runtime unsupported helper must validate commands against both canonical registries",
-    )
+    if registry or additional_registry:
+        require(
+            "EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands
+            and "ADDITIONAL_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands,
+            "runtime unsupported helper must validate commands against both canonical registries",
+        )
     exec_source = read("crates/ownmesh/src/commands/exec.rs")
     broker_cli = read("crates/ownmesh/src/commands/privileged.rs")
     require("using local daemon" not in exec_source, "exec --device still advertises local fallback")

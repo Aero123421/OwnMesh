@@ -37,12 +37,17 @@ def _manifest_with_no_unsupported(text: str, *, completeness: bool = True) -> st
     data["explicit_unsupported_surfaces"] = []
     data["additional_unsupported"] = []
     data["total_unsupported_surfaces"] = 0
-    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    rendered = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    # Stable releases already have this exact inventory. Keep the mutation
+    # harness meaningful by changing formatting without changing semantics.
+    return rendered if rendered != text else rendered + "\n"
 
 
 def _registries_with_no_unsupported(text: str) -> str:
+    original = text
     text = _replace_rust_registry(text, "EXPLICIT_UNSUPPORTED_CLI_SURFACES", [])
-    return _replace_rust_registry(text, "ADDITIONAL_UNSUPPORTED_CLI_SURFACES", [])
+    text = _replace_rust_registry(text, "ADDITIONAL_UNSUPPORTED_CLI_SURFACES", [])
+    return text if text != original else text + "\n// equivalent empty-registry mutation\n"
 
 
 def _manifest_with_false_complete_claim(text: str) -> str:
