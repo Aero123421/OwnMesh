@@ -140,6 +140,10 @@ fn read_json_source(path: &str) -> Result<String, String> {
 }
 
 /// Prompt helpers (TTY only).
+/// Longest single prompt answer accepted, in bytes. Bounded so a pathological
+/// stdin cannot grow the buffer without limit.
+const MAX_PROMPT_BYTES: usize = 4096;
+
 fn prompt_line(
     stdout: &mut impl Write,
     stdin: &mut impl Read,
@@ -152,21 +156,27 @@ fn prompt_line(
         write!(stdout, "{label} [{default}]: ").map_err(|e| e.to_string())?;
     }
     stdout.flush().map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    // Read one line from the provided reader.
+
+    // Collect raw bytes, then decode once as UTF-8. Decoding byte-by-byte with
+    // `byte as char` treats each byte as a Latin-1 code point and mangles every
+    // multi-byte character (`家のPC` became `å®¶ã®PC`).
+    let mut raw: Vec<u8> = Vec::new();
     let mut buf = [0u8; 1];
     loop {
         let n = stdin.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
+        if n == 0 || buf[0] == b'\n' {
             break;
         }
-        if buf[0] == b'\n' {
-            break;
+        if raw.len() >= MAX_PROMPT_BYTES {
+            return Err(format!("input exceeds {MAX_PROMPT_BYTES} bytes"));
         }
         if buf[0] != b'\r' {
-            line.push(buf[0] as char);
+            raw.push(buf[0]);
         }
     }
+    let line = String::from_utf8(raw)
+        .map_err(|_| "input is not valid UTF-8; retry with UTF-8 text".to_string())?;
+
     let trimmed = line.trim();
     if trimmed.is_empty() {
         Ok(default.to_string())
@@ -175,6 +185,9 @@ fn prompt_line(
     }
 }
 
+/// Re-prompt attempts before giving up, so a typo does not abort setup.
+const MAX_PROMPT_RETRIES: usize = 3;
+
 fn prompt_yes_no(
     stdout: &mut impl Write,
     stdin: &mut impl Read,
@@ -182,15 +195,21 @@ fn prompt_yes_no(
     default_yes: bool,
 ) -> Result<bool, String> {
     let def = if default_yes { "Y/n" } else { "y/N" };
-    let answer = prompt_line(stdout, stdin, &format!("{label} ({def})"), "")?;
-    if answer.is_empty() {
-        return Ok(default_yes);
+    for _ in 0..MAX_PROMPT_RETRIES {
+        let answer = prompt_line(stdout, stdin, &format!("{label} ({def})"), "")?;
+        if answer.is_empty() {
+            return Ok(default_yes);
+        }
+        match answer.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            other => {
+                writeln!(stdout, "  please answer y or n (got `{other}`)")
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
-    match answer.to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        other => Err(format!("expected yes/no, got `{other}`")),
-    }
+    Err("expected yes/no".into())
 }
 
 /// Fill missing fields via TTY wizard. Non-interactive callers must supply values.
@@ -220,8 +239,27 @@ pub fn complete_request_interactive(
     }
 
     if req.instance_id.as_deref().unwrap_or("").trim().is_empty() {
-        let id = prompt_line(stdout, stdin, "Instance id", "default")?;
-        req.instance_id = Some(if id.is_empty() { "default".into() } else { id });
+        let mut accepted = None;
+        for _ in 0..MAX_PROMPT_RETRIES {
+            let id = prompt_line(stdout, stdin, "Instance id", "default")?;
+            let id = if id.is_empty() { "default".into() } else { id };
+            if ownmesh_config::valid_instance_id(&id) {
+                accepted = Some(id);
+                break;
+            }
+            writeln!(
+                stdout,
+                "  instance id must match {} (ASCII letters, digits, . _ -)",
+                ownmesh_config::INSTANCE_ID_SYNTAX
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        req.instance_id = Some(accepted.ok_or_else(|| {
+            format!(
+                "instance id must match {}",
+                ownmesh_config::INSTANCE_ID_SYNTAX
+            )
+        })?);
     }
 
     if req.policy_preset.as_deref().unwrap_or("").trim().is_empty() {
@@ -294,10 +332,11 @@ pub fn apply_setup(
         .filter(|s| !s.is_empty())
         .unwrap_or("default")
         .to_string();
-    if instance_id.contains(['/', '\\', '\n', '\r', '\0']) {
-        return Err(ApplySetupError::usage(
-            "instance id contains illegal characters",
-        ));
+    if !ownmesh_config::valid_instance_id(&instance_id) {
+        return Err(ApplySetupError::usage(format!(
+            "instance id `{instance_id}` must match {} (ASCII letters, digits, . _ -)",
+            ownmesh_config::INSTANCE_ID_SYNTAX
+        )));
     }
 
     let preset_name = req
@@ -341,7 +380,9 @@ pub fn apply_setup(
             overwritten = true;
         } else {
             return Err(ApplySetupError::usage(format!(
-                "config already exists at {} (pass --force to overwrite)",
+                "config already exists at {}. Review it with `ownmesh config validate`, \
+                 or re-run with --force to replace it (the previous file is kept as {}.bak)",
+                config_path.display(),
                 config_path.display()
             )));
         }
@@ -721,6 +762,74 @@ mod tests {
         assert_eq!(req.instance_id.as_deref(), Some("home"));
         assert_eq!(req.policy_preset.as_deref(), Some("recommended"));
         assert_eq!(req.lang.as_deref(), Some("ja-JP"));
+    }
+
+    /// Multi-byte answers must survive the prompt reader intact.
+    ///
+    /// Reading byte-by-byte with `byte as char` decoded UTF-8 as Latin-1, so
+    /// `家のPC` was silently stored as `å®¶ã®PC`.
+    #[test]
+    fn prompt_line_preserves_multibyte_utf8() {
+        let mut stdin = Cursor::new("家のPC\n".as_bytes());
+        let mut stdout = Vec::new();
+        let value = prompt_line(&mut stdout, &mut stdin, "Label", "default").unwrap();
+        assert_eq!(value, "家のPC");
+
+        let mut stdin = Cursor::new("Привет мир\r\n".as_bytes());
+        let mut stdout = Vec::new();
+        assert_eq!(
+            prompt_line(&mut stdout, &mut stdin, "Label", "").unwrap(),
+            "Привет мир"
+        );
+    }
+
+    #[test]
+    fn prompt_line_rejects_invalid_utf8_instead_of_mangling_it() {
+        let mut stdin = Cursor::new([0xffu8, 0xfe, b'\n'].as_slice());
+        let mut stdout = Vec::new();
+        let err = prompt_line(&mut stdout, &mut stdin, "Label", "").unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    /// An id the wizard accepts must be one `instance use` also accepts.
+    #[test]
+    fn interactive_reprompts_until_the_instance_id_is_valid() {
+        let input = "https://cp.example.test\n家のPC\nbad id!\nhome\nrecommended\nja-JP\n";
+        let mut stdin = Cursor::new(input.as_bytes());
+        let mut stdout = Vec::new();
+        let req =
+            complete_request_interactive(SetupRequest::default(), &mut stdout, &mut stdin).unwrap();
+        assert_eq!(req.instance_id.as_deref(), Some("home"));
+        let shown = String::from_utf8(stdout).unwrap();
+        assert!(shown.contains("instance id must match"), "{shown}");
+    }
+
+    #[test]
+    fn apply_setup_rejects_an_instance_id_other_commands_would_refuse() {
+        let dir = tempdir().unwrap();
+        let err = run_setup_for_base(
+            dir.path(),
+            &SetupRequest {
+                control_plane_url: Some("https://cp.example.test".into()),
+                instance_id: Some("家のPC".into()),
+                ..SetupRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("instance id"), "{err}");
+        assert!(
+            !OwnMeshPaths::for_base(dir.path()).config_file().exists(),
+            "a rejected setup must not leave a config behind"
+        );
+    }
+
+    #[test]
+    fn prompt_yes_no_reprompts_on_unparseable_input() {
+        let mut stdin = Cursor::new("maybe\nyeah\ny\n".as_bytes());
+        let mut stdout = Vec::new();
+        assert!(prompt_yes_no(&mut stdout, &mut stdin, "Overwrite", false).unwrap());
+        let shown = String::from_utf8(stdout).unwrap();
+        assert!(shown.contains("please answer y or n"), "{shown}");
     }
 
     #[test]

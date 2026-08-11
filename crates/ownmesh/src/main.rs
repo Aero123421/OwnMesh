@@ -44,6 +44,9 @@ fn main() -> StdExitCode {
     match commands::dispatch(&cli) {
         Ok(()) => StdExitCode::SUCCESS,
         Err(code) => {
+            // Guarantees the `--json` failure contract even for error paths
+            // that returned an exit code without emitting their own envelope.
+            commands::emit_fallback_envelope(&cli, code);
             let code = u8::try_from(code.code()).unwrap_or(u8::MAX);
             StdExitCode::from(code)
         }

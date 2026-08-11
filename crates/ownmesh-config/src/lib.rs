@@ -21,8 +21,9 @@ mod store;
 pub use error::{ConfigError, ConfigResult};
 pub use paths::OwnMeshPaths;
 pub use schema::{
-    redact_control_plane_url, validate_control_plane_base_url, InstanceConfig, OwnMeshConfig,
-    PolicyFile, ServiceSocketConfig, TelemetryConfig, UpdateConfig, CONFIG_SCHEMA_VERSION,
+    redact_control_plane_url, valid_instance_id, validate_control_plane_base_url, InstanceConfig,
+    OwnMeshConfig, PolicyFile, ServiceSocketConfig, TelemetryConfig, UpdateConfig,
+    CONFIG_SCHEMA_VERSION, INSTANCE_ID_SYNTAX,
 };
 pub use store::{
     acquire_config_policy_tx_lock, appears_secret_free, atomic_write,
@@ -58,11 +59,21 @@ mod tests {
     fn end_to_end_config_lifecycle() {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
+
+        // Loading an unconfigured root yields defaults without writing.
         let cfg = load_config(&paths).unwrap();
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
+        assert!(!paths.config_file().exists());
+
+        // Persisting is an explicit step, and what it writes stays secret-free.
+        save_config(&paths, &cfg).unwrap();
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
         assert!(appears_secret_free(&text));
+
         let policy = load_policy(&paths).unwrap();
         assert_eq!(policy.schema_version, 1);
+        assert!(!paths.policy_file().exists());
+        save_policy(&paths, &policy).unwrap();
+        assert!(paths.policy_file().exists());
     }
 }

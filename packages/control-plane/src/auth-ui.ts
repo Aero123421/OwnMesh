@@ -45,7 +45,10 @@ function escapeText(value: string): string {
 export function authPage(options: AuthPageOptions): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeText(options.title)}</title>
 <style>
-:root{color-scheme:dark;--bg:#090a0c;--panel:#101216;--panel-2:#0c0e11;--line:#2a2e34;--line-strong:#3a4048;--text:#e5e7ea;--muted:#9299a3;--dim:#626a75;--ok:#a8b3a3;--danger:#c9a0a0}
+/* --dim carries 11-14px labels (.eyebrow, .meta dt, .scope small, .foot,
+   .version). At #626a75 it measured 3.43:1 on --panel, below the WCAG AA 4.5:1
+   floor for normal text; #7d8590 clears it at 4.63:1. */
+:root{color-scheme:dark;--bg:#090a0c;--panel:#101216;--panel-2:#0c0e11;--line:#2a2e34;--line-strong:#3a4048;--text:#e5e7ea;--muted:#9299a3;--dim:#7d8590;--ok:#a8b3a3;--danger:#c9a0a0}
 *{box-sizing:border-box}html{min-height:100%;background:var(--bg)}body{min-height:100vh;margin:0;color:var(--text);background:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.018) 1px,transparent 1px),radial-gradient(circle at 50% -20%,#20242a 0,transparent 45%);background-size:32px 32px,32px 32px,100% 100%;font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace}
 .shell{width:min(100% - 32px,560px);margin:0 auto;padding:7vh 0 40px}.brand{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin:0 2px 22px}.wordmark{display:block;width:min(296px,58vw);height:auto;image-rendering:pixelated}.version{padding-bottom:4px;color:var(--dim);font-size:11px;letter-spacing:.08em;white-space:nowrap}
 .status-line{display:flex;align-items:center;gap:9px;margin:0 2px 10px;color:var(--muted);font-size:11px;letter-spacing:.08em;text-transform:uppercase}.status-dot{width:7px;height:7px;border:1px solid var(--ok);background:#53604f;box-shadow:0 0 0 3px rgba(168,179,163,.06)}

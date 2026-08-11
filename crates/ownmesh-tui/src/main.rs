@@ -62,7 +62,9 @@ struct Cli {
     pub once: bool,
 
     /// Force language (`en-US`, `ja-JP`, `zh-Hans`, `ru-RU`).
-    #[arg(long)]
+    ///
+    /// Resolution order is `--lang`, then `OWNMESH_LANG`, then `config.lang`.
+    #[arg(long, env = "OWNMESH_LANG")]
     pub lang: Option<String>,
 
     /// Open setup wizard immediately.

@@ -455,20 +455,13 @@ fn run_status(
 }
 
 fn fail(cli: &Cli, command: &str, message: &str) -> Result<(), ExitCode> {
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "command": command,
-                "message": message,
-            })
-        );
-    } else {
-        eprintln!("ownmesh {command}: {message}");
-    }
-    Err(ExitCode::Internal)
+    Err(crate::commands::fail::fail(
+        cli,
+        "OWNMESH_E_SERVICE",
+        format!("ownmesh {command}: {message}"),
+        None,
+        ExitCode::Internal,
+    ))
 }
 
 /// Convenience for doctor: probe without constructing CLI state beyond PATH/OS.

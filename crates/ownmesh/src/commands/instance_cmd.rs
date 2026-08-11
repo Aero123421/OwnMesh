@@ -137,20 +137,13 @@ fn dispatch_instance_with_paths(
 }
 
 fn emit_error(cli: &Cli, error: InstanceCommandError) -> ExitCode {
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "error": "instance_error",
-                "message": error.message(),
-            })
-        );
-    } else {
-        eprintln!("ownmesh instance: {}", error.message());
-    }
-    error.exit_code()
+    crate::commands::fail::fail(
+        cli,
+        "OWNMESH_E_INSTANCE",
+        format!("ownmesh instance: {}", error.message()),
+        None,
+        error.exit_code(),
+    )
 }
 
 fn load(paths: &OwnMeshPaths) -> Result<OwnMeshConfig, InstanceCommandError> {
@@ -218,7 +211,6 @@ fn list_instances(
 }
 
 fn use_instance(paths: &OwnMeshPaths, id: &str) -> Result<(), InstanceCommandError> {
-    validate_instance_id(id)?;
     let mut cfg = load(paths)?;
     if !cfg.instances.iter().any(|instance| instance.id == id) {
         return Err(InstanceCommandError::Usage("instance does not exist"));
@@ -241,7 +233,6 @@ fn use_instance(paths: &OwnMeshPaths, id: &str) -> Result<(), InstanceCommandErr
 }
 
 fn remove_instance(paths: &OwnMeshPaths, id: &str) -> Result<Option<String>, InstanceCommandError> {
-    validate_instance_id(id)?;
     let mut cfg = load(paths)?;
     let before = cfg.instances.len();
     cfg.instances.retain(|instance| instance.id != id);
@@ -261,15 +252,7 @@ fn remove_instance(paths: &OwnMeshPaths, id: &str) -> Result<Option<String>, Ins
 }
 
 fn validate_instance_id(id: &str) -> Result<(), InstanceCommandError> {
-    let valid = !id.is_empty()
-        && id.len() <= 64
-        && id != "."
-        && id != ".."
-        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-    if valid {
+    if ownmesh_config::valid_instance_id(id) {
         Ok(())
     } else {
         Err(InstanceCommandError::Usage(
@@ -286,7 +269,7 @@ fn validate_registry(cfg: &OwnMeshConfig) -> Result<(), InstanceCommandError> {
     }
     let mut ids = HashSet::with_capacity(cfg.instances.len());
     for instance in &cfg.instances {
-        if validate_instance_id(&instance.id).is_err() || !ids.insert(instance.id.as_str()) {
+        if !ids.insert(instance.id.as_str()) {
             return Err(InstanceCommandError::Usage(
                 "configured instance registry is invalid",
             ));

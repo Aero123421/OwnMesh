@@ -1,6 +1,6 @@
 # OwnMesh onboarding
 
-This document covers the supported v1.2.0 first-run, ChatGPT connection, and
+This document covers the supported v1.2.1 first-run, ChatGPT connection, and
 user-level service flow. The machine-checked command contract is
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
@@ -25,6 +25,11 @@ members. For a high-assurance bootstrap, download and inspect the installer and
 verify it against `SHA256SUMS`/`SHA256SUMS.minisig` before execution.
 
 ## Recommended first run
+
+`<worker>` below is the URL printed by the guided deploy in
+[Deploy the user-owned control plane](#deploy-the-user-owned-control-plane).
+Run that section first — every command here needs its URL, and the guided
+deploy prints the exact `ownmesh setup` line to paste.
 
 Desktop (opens the owner sign-in in the browser):
 
@@ -188,13 +193,19 @@ files, or services and does not load credential values from keychain APIs.
 ```bash
 ownmesh doctor
 ownmesh doctor --json
-ownmesh doctor --check-network
+ownmesh doctor --check-network   # probes the control plane; failure exits non-zero
+ownmesh doctor --offline         # never touches the network
 ```
 
 It checks binary/config/service state, non-secret credential presence, daemon
 IPC reachability, policy/privacy defaults, and the configured control plane.
-Network is contacted only with `--check-network` or when a control-plane URL is
-already configured. Healthy/warn-only returns `0`; any fail check returns `2`.
+
+The network is contacted **only** with `--check-network`. Earlier releases also
+probed whenever a control-plane URL happened to be configured, which made the
+flag a no-op in practice and meant an offline laptop got a non-zero exit from a
+read-only diagnostic. A control plane that cannot be reached is now reported as
+a warning rather than a failure, because it is not a fault in the machine being
+inspected. Healthy/warn-only returns `0`; any fail check returns `2`.
 
 ## User-level service
 
@@ -252,7 +263,7 @@ public MCP-to-broker E8 receipt remain separate open evidence.
 
 ## Distribution scope
 
-v1.2.0 supports signed portable archives and the verified shell/PowerShell
+v1.2.1 supports signed portable archives and the verified shell/PowerShell
 one-line installers. Windows MSI/NSIS, native/universal macOS packages,
 Authenticode, and Apple notarization are outside this release's distribution
 contract.

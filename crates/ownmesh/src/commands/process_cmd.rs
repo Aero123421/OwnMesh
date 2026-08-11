@@ -17,7 +17,7 @@ const LOG_PAGE_CHUNKS: usize = 64;
 const LOG_PAGE_BYTES: usize = 64 * 1024;
 
 pub fn dispatch_process(cli: &Cli, cmd: &ProcessCmd) -> Result<(), ExitCode> {
-    dispatch_process_with(cli, cmd, &call_daemon)
+    dispatch_process_with(cli, cmd, &|method, params| call_daemon(cli, method, params))
 }
 
 fn dispatch_process_with(

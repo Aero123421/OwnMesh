@@ -1,6 +1,6 @@
-# OwnMesh Threat Model (v1.0.1)
+# OwnMesh Threat Model (v1.2.1)
 
-**Status:** Published for release train v1.0.1  
+**Status:** Published for release train v1.2.1
 **Related:** [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md), [`SECURITY.md`](../SECURITY.md), ADR [`0001-release-signing-sbom-provenance.md`](./adr/0001-release-signing-sbom-provenance.md)  
 **Method:** STRIDE-oriented asset / adversary / control mapping. Full Access is an intentional product mode; the trust boundary is integrity of authenticated intent, not “block the AI.”
 
@@ -10,7 +10,7 @@
 | --- | --- |
 | Device identity keys / enrollment proofs | Bind this machine to a control-plane principal |
 | OAuth access / refresh tokens | Cloud authorization to operate the user’s devices |
-| Local IPC auth token (`daemon.token`) | Proves CLI/TUI/MCP local callers are the same OS user session |
+| Local IPC peer identity + per-client credential | Proves CLI/TUI/MCP local callers are the same OS user session. The historical shared `daemon.token` file is legacy and is **not** an authentication input (`ownmesh-ipc/src/auth.rs`); identity comes from the OS-attested peer plus a server-issued per-client credential |
 | Broker capability / MAC secret | Gates elevated (admin/root) execution |
 | Policy + temporary grants | Machine-side authorization truth |
 | Filesystem / process control on the device | Primary user capability OwnMesh exposes |
@@ -47,6 +47,22 @@
 - Remote network peers claiming to be the broker (broker is networkless / loopback-or-local-IPC only).
 - Unsigned or checksum-mismatched update artifacts.
 
+### Surfaces added since v1.0.1
+
+| Surface | Release | Primary new exposure | Where controls live |
+| --- | --- | --- | --- |
+| Agent transport (E1) | v1.2 | Structured adapter framing between daemon and coding-agent CLIs | `ownmeshd/src/structured_adapter.rs`, `agent_transport.rs` |
+| Remote routing (E2) | v1.2 | Control-plane-routed device operations; no local fallback | `ownmeshd/src/runtime.rs`, `control-plane/src/device-room.ts` |
+| Action binding (E3) | v1.2 | Approval decisions bound to an exact operation + payload hash | `control-plane/src/mcp.ts`, `ownmeshd/src/review_manifest.rs` |
+| Workspace custody (E4) | v1.2 | Workspace-relative path authority and ACL | `control-plane/migrations/0011_workspace_acl.sql` |
+| Windows daemon (E8) | v1.2 | LocalSystem SCM service + SID-bound named pipe | `ownmesh-broker/src/windows*.rs` |
+| Resumable transfer (E9) | v1.2 | `TransferRoom` DO, ephemeral proofs, chunk resumption | `control-plane/src/transfer-room.ts`, `ownmeshd/src/transfer_crypto.rs` |
+
+Each is exercised by the adversarial suites listed in
+[`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md); this table
+records that they are in scope, not that every route has a live receipt — see
+the release notes for the evidence split.
+
 ## 3. Adversaries
 
 | Adversary | Goals | Primary controls |
@@ -55,7 +71,7 @@
 | A2 Stolen OAuth access token | Call MCP / device ops until expiry | Short TTL, audience/scope binding, revoke |
 | A3 Stolen refresh token | Mint new access tokens | Rotation + reuse detection, keychain storage |
 | A4 Prompt-injection (model/tool args) | “Always allow”, forge approval | Device policy is final; injection strings inert for authz |
-| A5 Local cross-user | User B drives User A’s daemon | IPC token + pipe/socket ACL / peer credentials |
+| A5 Local cross-user | User B drives User A’s daemon | OS-attested peer credentials + pipe/socket ACL; per-client credential for privileged IPC methods |
 | A6 Local malware same-user | Replay elevated broker ops | Broker MAC, nonce, expiry, replay cache; capability tokens |
 | A7 Path / symlink attacker | Escape workspace in restricted presets | Canonicalize-then-authorize; Full Access is explicit non-enforce |
 | A8 Command injection | Turn structured argv into shell metachar execution | Structured exec never invokes a shell |
@@ -92,7 +108,7 @@
 
 See [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md) for per-checkbox deep links.
 
-## 6. Explicit non-goals / waivers (v1.0.1)
+## 6. Explicit non-goals / waivers (v1.2.1)
 
 | ID | Scope | Note |
 | --- | --- | --- |

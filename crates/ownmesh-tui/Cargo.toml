@@ -19,7 +19,10 @@ workspace = true
 
 [dependencies]
 base64 = "0.22.1"
-clap = { version = "4.5.27", features = ["derive"] }
+# `env` backs `--lang`'s OWNMESH_LANG binding. Declared here rather than
+# inherited: workspace feature unification supplies it during a full-workspace
+# build, but `cargo run -p ownmesh-tui` compiles this crate alone.
+clap = { version = "4.5.27", features = ["derive", "env"] }
 crossterm = "0.28.1"
 ownmesh-config = { path = "../ownmesh-config" }
 ownmesh-diagnostics = { path = "../ownmesh-diagnostics" }

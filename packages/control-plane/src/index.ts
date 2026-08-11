@@ -77,6 +77,8 @@ export interface Env {
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
   AUTH_RATE_LIMITER?: RateLimitBinding;
   MCP_RATE_LIMITER?: RateLimitBinding;
+  AUTH_IP_RATE_LIMITER?: RateLimitBinding;
+  MCP_IP_RATE_LIMITER?: RateLimitBinding;
 }
 
 type RateLimitBinding = {
@@ -113,24 +115,44 @@ async function enforceRateLimit(
 ): Promise<Response | null> {
   const category = rateLimitClass(pathname, request.method.toUpperCase());
   if (!category) return null;
-  const limiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;
-  if (!limiter) return null;
+  const credentialLimiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;
+  const addressLimiter =
+    category === "mcp" ? env.MCP_IP_RATE_LIMITER : env.AUTH_IP_RATE_LIMITER;
 
-  // Never send bearer/cookie material to the counter service. Authenticated
-  // callers are keyed by a digest of their stable credential; unauthenticated
-  // bootstrap traffic falls back to Cloudflare's connection address.
-  const actor =
-    request.headers.get("authorization") ||
-    request.headers.get("cookie") ||
-    request.headers.get("cf-connecting-ip") ||
-    "anonymous";
-  const actorDigest = await sha256Hex(actor);
   const issuerHost = new URL(issuer).host;
   try {
-    const result = await limiter.limit({
-      key: `${issuerHost}:${category}:${actorDigest}`,
-    });
-    if (result.success) return null;
+    const address = request.headers.get("cf-connecting-ip") || "anonymous";
+    const credential = request.headers.get("authorization") || request.headers.get("cookie");
+    const checks: Array<{ limiter: RateLimitBinding; key: string }> = [];
+    if (credential) {
+      // Authenticated traffic gets a tight per-credential budget and a separate,
+      // deliberately coarser address ceiling. Random credentials therefore
+      // cannot bypass abuse protection, while ordinary unauthenticated traffic
+      // cannot consume a valid credential's budget behind shared NAT egress.
+      if (addressLimiter) {
+        checks.push({
+          limiter: addressLimiter,
+          key: `${issuerHost}:${category}:addr:${await sha256Hex(address)}`,
+        });
+      }
+      if (credentialLimiter) {
+        checks.push({
+          limiter: credentialLimiter,
+          key: `${issuerHost}:${category}:cred:${await sha256Hex(credential)}`,
+        });
+      }
+    } else if (credentialLimiter) {
+      // Bootstrap traffic has no stable credential, so retain the tighter
+      // address-keyed budget on the primary limiter.
+      checks.push({
+        limiter: credentialLimiter,
+        key: `${issuerHost}:${category}:addr:${await sha256Hex(address)}`,
+      });
+    }
+    if (checks.length === 0) return null;
+
+    const results = await Promise.all(checks.map(({ limiter, key }) => limiter.limit({ key })));
+    if (results.every((result) => result.success)) return null;
   } catch {
     // This is an abuse/cost guard, not an authorization boundary. Preserve
     // availability if Cloudflare's approximate counter is temporarily absent.

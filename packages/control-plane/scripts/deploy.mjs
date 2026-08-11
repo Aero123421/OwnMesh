@@ -88,3 +88,8 @@ if (ownerInit.status !== 0) process.exit(ownerInit.status || 1);
 
 process.stdout.write(`\nHealth check:      ${issuer}/health\n`);
 process.stdout.write(`ChatGPT MCP URL:   ${issuer}/mcp\n`);
+// The issuer is the one value the next step needs, so hand it over ready to
+// paste rather than sending the operator back to the README to assemble it.
+process.stdout.write("\nNext, connect a machine to this control plane:\n\n");
+process.stdout.write(`  ownmesh setup --control-plane-url ${issuer} --quickstart\n`);
+process.stdout.write("\nOn a headless or SSH machine, add --device-login --non-interactive --force.\n");

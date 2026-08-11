@@ -11,7 +11,7 @@ use std::time::Duration;
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn dispatch_approval(cli: &Cli, cmd: &ApprovalCmd) -> Result<(), ExitCode> {
-    dispatch_approval_with(cli, cmd, &call_daemon)
+    dispatch_approval_with(cli, cmd, &|method, params| call_daemon(cli, method, params))
 }
 
 fn dispatch_approval_with(

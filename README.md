@@ -12,7 +12,7 @@ networkless broker handles explicitly approved privileged work.
 
 ## Status
 
-**v1.2.0 stable** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
+**v1.2.1 stable** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
 The shipped CLI surface has no intentionally unimplemented entries. Its
 machine-checked contract is
@@ -68,6 +68,22 @@ and reject traversal, links, devices, and duplicate members.
 
 ## First run
 
+### 1. Deploy your control plane
+
+Every later step needs its URL, so this comes first. From a clone:
+
+```bash
+cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
+```
+
+The guided deploy creates or reuses D1, applies migrations, deploys the Worker,
+provisions required secrets, and prints the owner-login URL, the ChatGPT MCP
+URL, and the exact `ownmesh setup` command for step 2. See
+[`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) and
+[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md).
+
+### 2. Connect a machine
+
 Desktop (opens browser login, enrolls this PC, and installs user autostart):
 
 ```bash
@@ -81,22 +97,14 @@ device):
 ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force
 ```
 
-Then verify the machine without changing it:
+### 3. Verify
+
+Read-only; changes nothing. Add `--check-network` to also probe the control
+plane's `/health`:
 
 ```bash
 ownmesh doctor --json
 ```
-
-Deploy the control plane from a clone:
-
-```bash
-cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
-```
-
-The guided deploy creates or reuses D1, applies migrations, deploys the Worker,
-provisions required secrets, and prints the owner-login and ChatGPT MCP URLs.
-See [`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) and
-[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md).
 
 ## Security model
 
@@ -133,7 +141,7 @@ Windows. Linux has a native root lifecycle receipt. macOS/Windows native release
 receipts and the full public MCP → installed agent → broker E8 receipt remain
 open evidence; this is not presented as live proof for those routes.
 Authenticode, Apple notarization, MSI/NSIS, and native macOS packages are not
-part of v1.2.0.
+part of v1.2.1.
 
 ChatGPT dynamic registration, OAuth, passkey return, refresh, and MCP linking
 have a manual live compatibility receipt. The local workerd suites are
@@ -162,7 +170,7 @@ Rust 1.92.0, Node 22, and pnpm 9.15.0 are pinned by the repository.
 - [Cloudflare deployment](./docs/deploy-cloudflare.md)
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
-- [v1.2.0 release notes](./docs/RELEASE_NOTES_v1.2.0.md)
+- [v1.2.1 release notes](./docs/RELEASE_NOTES_v1.2.1.md)
 - [Target specification](./OWNMESH_SPECIFICATION.ja.md) — roadmap authority,
   not a claim that every optional target is shipped
 

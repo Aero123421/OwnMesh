@@ -8,7 +8,12 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-/// Load `config.toml`, migrating when needed. Creates a default file when missing.
+/// Load `config.toml`, migrating when needed.
+///
+/// This is a pure read: when the file is absent it returns
+/// [`OwnMeshConfig::default`] **without** writing anything to disk, so callers
+/// can distinguish "unconfigured machine" from "configured with defaults".
+/// Use [`save_config`] to persist.
 ///
 /// Always recovers any interrupted config+policy transaction under the exclusive
 /// transaction lock **before** the live pair is read or acted upon. Recovery
@@ -27,9 +32,13 @@ pub fn load_config(paths: &OwnMeshPaths) -> ConfigResult<OwnMeshConfig> {
 fn load_config_after_recovery(paths: &OwnMeshPaths) -> ConfigResult<OwnMeshConfig> {
     let path = paths.config_file();
     if !path.exists() {
-        let cfg = OwnMeshConfig::default();
-        save_config_unlocked(paths, &cfg)?;
-        return Ok(cfg);
+        // Reading configuration must never materialize it. Persisting a default
+        // here made read-only commands (`status`, `policy show`, `approval
+        // list`, …) silently create `config.toml` on an unconfigured machine,
+        // which erased doctor's "run `ownmesh setup`" guidance and then made
+        // `ownmesh setup` fail with "config already exists". Callers that
+        // intend to persist call `save_config` explicitly.
+        return Ok(OwnMeshConfig::default());
     }
     let raw = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
         path: Some(path.clone()),
@@ -81,7 +90,10 @@ fn save_config_unlocked(paths: &OwnMeshPaths, cfg: &OwnMeshConfig) -> ConfigResu
     Ok(())
 }
 
-/// Load policy.toml or create a default.
+/// Load `policy.toml`.
+///
+/// Pure read: an absent file yields [`PolicyFile::default`] in memory without
+/// creating it. Use [`save_policy`] to persist.
 ///
 /// Always recovers any interrupted config+policy transaction under the exclusive
 /// transaction lock **before** the live policy is read or acted upon. Recovery
@@ -100,9 +112,8 @@ pub fn load_policy(paths: &OwnMeshPaths) -> ConfigResult<PolicyFile> {
 fn load_policy_after_recovery(paths: &OwnMeshPaths) -> ConfigResult<PolicyFile> {
     let path = paths.policy_file();
     if !path.exists() {
-        let policy = PolicyFile::default();
-        save_policy_unlocked(paths, &policy)?;
-        return Ok(policy);
+        // Same rule as `load_config_after_recovery`: a read never writes.
+        return Ok(PolicyFile::default());
     }
     let raw = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
         path: Some(path.clone()),
@@ -766,6 +777,55 @@ pub fn appears_secret_free(text: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn load_config_does_not_create_the_file() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let cfg = load_config(&paths).unwrap();
+        assert_eq!(cfg, OwnMeshConfig::default());
+        assert!(
+            !paths.config_file().exists(),
+            "reading configuration must never materialize config.toml"
+        );
+        // Repeated reads stay side-effect free.
+        let _ = load_config(&paths).unwrap();
+        assert!(!paths.config_file().exists());
+    }
+
+    #[test]
+    fn loads_legacy_unicode_instance_aliases() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        fs::write(
+            paths.config_file(),
+            r#"schema_version = 1
+lang = "en-US"
+active_instance = "家の PC"
+
+[[instances]]
+id = "家の PC"
+base_url = "https://example.test"
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&paths).expect("v1.2 aliases must remain readable");
+        assert_eq!(config.active_instance.as_deref(), Some("家の PC"));
+    }
+
+    #[test]
+    fn load_policy_does_not_create_the_file() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let policy = load_policy(&paths).unwrap();
+        assert_eq!(policy, PolicyFile::default());
+        assert!(
+            !paths.policy_file().exists(),
+            "reading policy must never materialize policy.toml"
+        );
+    }
 
     #[test]
     fn load_save_roundtrip_and_backup() {

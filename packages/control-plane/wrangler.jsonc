@@ -43,6 +43,16 @@
       "name": "MCP_RATE_LIMITER",
       "namespace_id": "120260812",
       "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      "name": "AUTH_IP_RATE_LIMITER",
+      "namespace_id": "120260813",
+      "simple": { "limit": 600, "period": 60 }
+    },
+    {
+      "name": "MCP_IP_RATE_LIMITER",
+      "namespace_id": "120260814",
+      "simple": { "limit": 1200, "period": 60 }
     }
   ],
   "durable_objects": {

@@ -8,7 +8,7 @@ use ownmesh_ipc::{canonicalize_principal_key, methods};
 use serde_json::json;
 
 pub fn run_lockdown(cli: &Cli) -> Result<(), ExitCode> {
-    let value = call_daemon(methods::DAEMON_LOCKDOWN, None)?;
+    let value = call_daemon(cli, methods::DAEMON_LOCKDOWN, None)?;
     print_value(cli.json, &value, |_| {
         println!("lockdown enabled — new operations denied");
         println!("recover locally with: ownmesh unlock");

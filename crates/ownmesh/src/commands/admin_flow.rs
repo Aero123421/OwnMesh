@@ -137,6 +137,7 @@ pub(super) fn run_admin_operation(
                 "approval_url": json_approval_url,
             })
         );
+        crate::commands::fail::note_envelope_emitted();
         return if json_approval_url.is_some() {
             Err(ExitCode::Authorization)
         } else if terminal_ok {

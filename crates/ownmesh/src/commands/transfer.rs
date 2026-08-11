@@ -224,6 +224,7 @@ fn emit_failure(cli: &Cli, failure: &TransferFailure) -> ExitCode {
     let payload = failure_payload(failure);
     if cli.json {
         println!("{payload}");
+        crate::commands::fail::note_envelope_emitted();
     } else {
         eprintln!(
             "{}: {}",

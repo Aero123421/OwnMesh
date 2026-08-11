@@ -466,6 +466,8 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                     )
                     .with_detail(input.control_plane.url.clone().unwrap_or_default()),
                 ),
+                // A failed opt-in probe must be observable through the process
+                // exit status. The default doctor run does not probe at all.
                 Some(false) => checks.push(DoctorCheck::fail(
                     "control_plane.health",
                     input
@@ -486,7 +488,7 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         } else {
             checks.push(DoctorCheck::pass(
                 "control_plane.health",
-                "network probe skipped (not opted in and no probe requested)",
+                "network probe skipped (pass --check-network to probe /health)",
             ));
         }
     }

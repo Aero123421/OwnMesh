@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.2.1 — Stable UX and contract fixes
+
+- Read-only first-run commands no longer create configuration that blocks setup.
+- JSON failures emit exactly one stable envelope across CLI surfaces.
+- Control-plane rate limits separate authenticated credentials from shared-IP
+  bootstrap traffic while retaining a coarse IP abuse ceiling.
+- `doctor` network access is opt-in, `--offline` overrides aliases, and explicit
+  probe failures return a non-zero status.
+- Existing v1.2 Unicode/space instance aliases remain readable while newly
+  created aliases use the strict portable syntax.
+
 ## v1.2.0 — Stable supported surface
 
 - **Complete shipped CLI:** the machine-checked supported-surface registry has

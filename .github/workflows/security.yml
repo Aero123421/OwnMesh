@@ -198,14 +198,17 @@ jobs:
           -- --nocapture
       - name: Control-plane security hardening tests
         run: pnpm --filter @ownmesh/control-plane test
-      - name: Confirm telemetry/relay defaults remain OFF in source schema
-        run: |
-          set -euo pipefail
-          grep -nE 'project:\s*false|crash_upload:\s*false|usage_analytics:\s*false|relay_enabled:\s*false|telemetry_enabled:\s*false' \
-            crates/ownmesh-config/src/schema.rs \
-            crates/ownmesh-transfer/src/lib.rs \
-            crates/ownmesh-update/src/lib.rs \
-            crates/ownmesh-diagnostics/src/lib.rs
+      # Asserts the values a fresh install actually receives, rather than
+      # grepping for `= false` literals. A source grep passed on incidental
+      # matches (including test fixtures) and could not detect a flipped
+      # default expressed via `#[derive(Default)]` or `#[serde(default = ..)]`.
+      - name: Confirm telemetry/relay/update-network defaults remain OFF
+        run: >-
+          cargo test --locked
+          -p ownmesh-config --test privacy_defaults
+          -p ownmesh-update --test privacy_defaults
+          -p ownmesh-diagnostics --test privacy_and_redaction
+          -- --nocapture
 
   release-policy:
     name: Release cannot bypass CI or security

@@ -8,7 +8,7 @@ use serde_json::json;
 pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode> {
     match cmd {
         WorkspaceCmd::List => {
-            let value = call_daemon("ops.workspace.list", None)?;
+            let value = call_daemon(cli, "ops.workspace.list", None)?;
             print_value(cli.json, &value, |v| {
                 let list = v["workspaces"].as_array().cloned().unwrap_or_default();
                 if list.is_empty() {
@@ -27,7 +27,7 @@ pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode>
             Ok(())
         }
         WorkspaceCmd::Show { id } => {
-            let value = call_daemon("ops.workspace.show", Some(json!({ "id": id })))?;
+            let value = call_daemon(cli, "ops.workspace.show", Some(json!({ "id": id })))?;
             print_value(cli.json, &value, |v| {
                 println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
             });
@@ -41,7 +41,7 @@ pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode>
             if let Some(label) = label {
                 params["label"] = json!(label);
             }
-            let value = call_daemon("ops.workspace.add", Some(params))?;
+            let value = call_daemon(cli, "ops.workspace.add", Some(params))?;
             print_value(cli.json, &value, |v| {
                 println!(
                     "workspace {} root={}",
@@ -59,7 +59,7 @@ pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode>
             if let Some(label) = label {
                 params["label"] = json!(label);
             }
-            let value = call_daemon("ops.workspace.update", Some(params))?;
+            let value = call_daemon(cli, "ops.workspace.update", Some(params))?;
             print_value(cli.json, &value, |v| {
                 println!(
                     "updated {} root={}",
@@ -70,7 +70,7 @@ pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode>
             Ok(())
         }
         WorkspaceCmd::Remove { id } => {
-            let value = call_daemon("ops.workspace.remove", Some(json!({ "id": id })))?;
+            let value = call_daemon(cli, "ops.workspace.remove", Some(json!({ "id": id })))?;
             print_value(cli.json, &value, |v| {
                 println!("removed {}", v["id"].as_str().unwrap_or("?"));
             });
