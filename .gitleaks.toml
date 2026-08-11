@@ -1,0 +1,28 @@
+title = "OwnMesh gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "OwnMesh Minisign public-key ID embedded in the POSIX installer"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^C596813EFB0946A4$''']
+paths = ['''^installers/ownmesh-installer\.sh$''']
+
+[[rules.allowlists]]
+description = "Fixed idempotency value in the Windows event-log daemon test"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^logs-winevt-1$''']
+paths = ['''^crates/ownmeshd/src/daemon\.rs$''']
+
+[[rules.allowlists]]
+description = "Base64url-encoded WebAuthn owner ID used only by control-plane tests"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^d2ViYXV0aG5fb3duZXJfaWQ$''']
+paths = ['''^packages/control-plane/src/owner-auth\.test\.ts$''']
