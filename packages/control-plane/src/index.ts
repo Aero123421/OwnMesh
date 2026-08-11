@@ -116,21 +116,28 @@ async function enforceRateLimit(
   const limiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;
   if (!limiter) return null;
 
-  // Never send bearer/cookie material to the counter service. Authenticated
-  // callers are keyed by a digest of their stable credential; unauthenticated
-  // bootstrap traffic falls back to Cloudflare's connection address.
-  const actor =
-    request.headers.get("authorization") ||
-    request.headers.get("cookie") ||
-    request.headers.get("cf-connecting-ip") ||
-    "anonymous";
-  const actorDigest = await sha256Hex(actor);
   const issuerHost = new URL(issuer).host;
   try {
-    const result = await limiter.limit({
-      key: `${issuerHost}:${category}:${actorDigest}`,
-    });
-    if (result.success) return null;
+    // Count against the connection address first. The address is assigned by
+    // Cloudflare and the client cannot vary it, so this bound holds even when
+    // every other input is attacker-chosen.
+    //
+    // Keying on the `Authorization` header first (as this did) let anyone defeat
+    // the guard outright: an unauthenticated caller who randomises that header
+    // on each request lands in a fresh bucket every time and never reaches the
+    // threshold. Credential material is still never forwarded to the counter —
+    // only a digest — and it is now an *additional* bucket, not a replacement,
+    // so a shared NAT egress cannot starve a legitimate authenticated client.
+    const address = request.headers.get("cf-connecting-ip") || "anonymous";
+    const buckets = [`${issuerHost}:${category}:addr:${await sha256Hex(address)}`];
+
+    const credential = request.headers.get("authorization") || request.headers.get("cookie");
+    if (credential) {
+      buckets.push(`${issuerHost}:${category}:cred:${await sha256Hex(credential)}`);
+    }
+
+    const results = await Promise.all(buckets.map((key) => limiter.limit({ key })));
+    if (results.every((result) => result.success)) return null;
   } catch {
     // This is an abuse/cost guard, not an authorization boundary. Preserve
     // availability if Cloudflare's approximate counter is temporarily absent.

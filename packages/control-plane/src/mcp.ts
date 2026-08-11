@@ -59,6 +59,15 @@ export type McpToolDef = {
   scope: string;
   /** Risk class for approval / async defaults */
   risk: "read" | "write" | "exec" | "session" | "discovery";
+  /**
+   * Canonical tool this entry duplicates.
+   *
+   * Aliases stay callable through `tools/call` for backward compatibility but
+   * are withheld from `tools/list`: publishing two entries with identical
+   * schemas, annotations, scope, and risk gave the model no basis to choose
+   * between them and doubled the catalog's context cost.
+   */
+  aliasOf?: string;
 };
 
 const str = { type: "string" as const };
@@ -324,7 +333,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_fs_list",
-    description: "List files in a workspace path on a device (alias: ownmesh_list_files)",
+    description: "List files in a workspace path on a device",
     inputSchema: {
       type: "object",
       properties: {
@@ -375,10 +384,11 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.read",
     risk: "read",
+    aliasOf: "ownmesh_fs_list",
   },
   {
     name: "ownmesh_fs_read",
-    description: "Read a file from a device workspace (alias: ownmesh_read_file)",
+    description: "Read a file from a device workspace",
     inputSchema: {
       type: "object",
       properties: {
@@ -419,10 +429,11 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.read",
     risk: "read",
+    aliasOf: "ownmesh_fs_read",
   },
   {
     name: "ownmesh_fs_write",
-    description: "Write a file on a device (alias: ownmesh_write_file). Subject to OwnMesh policy.",
+    description: "Write a file on a device. Subject to OwnMesh policy.",
     inputSchema: {
       type: "object",
       properties: {
@@ -469,6 +480,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.write",
     risk: "write",
+    aliasOf: "ownmesh_fs_write",
   },
   {
     name: "ownmesh_fs_stat",
@@ -555,7 +567,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_command_run",
     description:
-      "Run a structured argv command on a device (not raw shell). Alias: ownmesh_run_command.",
+      "Run a structured argv command on a device (not raw shell).",
     inputSchema: {
       type: "object",
       properties: {
@@ -610,11 +622,12 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.exec",
     risk: "exec",
+    aliasOf: "ownmesh_command_run",
   },
   {
     name: "ownmesh_command_shell",
     description:
-      "Run a raw shell command (separate capability from structured run). Alias: ownmesh_run_shell.",
+      "Run a raw shell command (separate capability from structured run).",
     inputSchema: {
       type: "object",
       properties: {
@@ -665,10 +678,11 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.exec",
     risk: "exec",
+    aliasOf: "ownmesh_command_shell",
   },
   {
     name: "ownmesh_session_open",
-    description: "Open an interactive session on a device (alias: ownmesh_open_session)",
+    description: "Open an interactive session on a device",
     inputSchema: {
       type: "object",
       properties: {
@@ -753,6 +767,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.session",
     risk: "session",
+    aliasOf: "ownmesh_session_open",
   },
   {
     name: "ownmesh_session_attach",
@@ -1453,6 +1468,21 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     scope: "ownmesh.write", risk: "write",
   },
 ] as const;
+
+/**
+ * Tools advertised through `tools/list`.
+ *
+ * Alias entries stay in {@link MCP_TOOLS} so `tools/call` keeps accepting them,
+ * but they are withheld here. Publishing `ownmesh_read_file` alongside
+ * `ownmesh_fs_read` — identical `inputSchema`, `annotations`, `scope`, and
+ * `risk`, differing only in prose — gave the model no basis to choose between
+ * them while doubling the schema bytes spent on every request. Several of the
+ * duplicated pairs are `destructiveHint: true` exec tools, so the ambiguity
+ * mattered for more than context cost.
+ */
+export const PUBLISHED_MCP_TOOLS: readonly McpToolDef[] = MCP_TOOLS.filter(
+  (tool) => !tool.aliasOf,
+);
 
 const ADMIN_MCP_TOOL_NAMES = new Set([
   "ownmesh_policy_preset",
@@ -3466,7 +3496,7 @@ export async function handleMcp(
       path: url.pathname,
       transport: "streamable-http",
       protocolVersion: MCP_PROTOCOL_VERSION,
-      tools: MCP_TOOLS.length,
+      tools: PUBLISHED_MCP_TOOLS.length,
       policy_authority: "ownmesh_device",
     });
   }
@@ -3533,7 +3563,7 @@ export async function handleMcp(
 
   if (method === "tools/list") {
     return mcpResult(id, {
-      tools: MCP_TOOLS.map((t) => ({
+      tools: PUBLISHED_MCP_TOOLS.map((t) => ({
         name: t.name,
         description: t.description,
         inputSchema: t.inputSchema,
