@@ -125,10 +125,11 @@ fn run_logs(bin: &str, container: &str, count: usize) -> LogResult<Vec<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::fs;
+    #[cfg(windows)]
     use std::io::Write;
-    #[cfg(not(windows))]
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(windows)]
     use tempfile::tempdir;
 
     #[test]
@@ -140,6 +141,7 @@ mod tests {
 
     #[test]
     fn mock_binary_cursor_pages() {
+        #[cfg(windows)]
         let dir = tempdir().unwrap();
         #[cfg(windows)]
         let bin = {
@@ -152,22 +154,7 @@ mod tests {
             path.to_string_lossy().into_owned()
         };
         #[cfg(not(windows))]
-        let bin = {
-            let path = dir.path().join("mock-docker");
-            let staged = dir.path().join("mock-docker.staged");
-            let mut f = fs::File::create(&staged).unwrap();
-            writeln!(f, "#!/bin/sh").unwrap();
-            writeln!(f, "echo line-a").unwrap();
-            writeln!(f, "echo line-b").unwrap();
-            writeln!(f, "echo line-c").unwrap();
-            f.sync_all().unwrap();
-            drop(f);
-            let mut perms = fs::metadata(&staged).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&staged, perms).unwrap();
-            fs::rename(staged, &path).unwrap();
-            path.to_string_lossy().into_owned()
-        };
+        let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mock-docker");
 
         let p = DockerLogProvider::new("docker", Some("ctr".into())).with_binary(bin);
         let page1 = p.query(None, 2).unwrap();
