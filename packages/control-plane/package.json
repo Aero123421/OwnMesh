@@ -1,7 +1,7 @@
 {
   "name": "@ownmesh/control-plane",
   "private": true,
-  "version": "1.1.3",
+  "version": "1.2.0",
   "description": "OwnMesh Cloudflare Workers control plane",
   "license": "Apache-2.0",
   "type": "module",
@@ -12,7 +12,9 @@
     "dev": "wrangler dev",
     "db:migrations:apply": "wrangler d1 migrations apply DB --remote",
     "db:migrations:apply:local": "wrangler d1 migrations apply DB --local",
-    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy"
+    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
+    "deploy:guided": "node scripts/deploy.mjs",
+    "owner:init": "node scripts/init-owner.mjs"
   },
   "cloudflare": {
     "bindings": {
@@ -26,10 +28,13 @@
         "description": "Optional canonical issuer URL. Defaults to the Worker request origin."
       },
       "SESSION_SECRET": {
-        "description": "Optional signing secret. Generate with `openssl rand -hex 32`."
+        "description": "Required signing secret. Generate with at least 32 random bytes."
+      },
+      "OWNER_TOKEN_HASH": {
+        "description": "SHA-256 of the one-time owner passkey bootstrap code. Store only as a Wrangler secret."
       },
       "AUTH_PROVIDER": {
-        "description": "Required production service binding that authenticates browser requests and returns principal_id + tenant_id. OAuth browser routes return 503 when absent."
+        "description": "Optional external identity service for multi-user deployments. Built-in single-owner auth is the default."
       },
       "OWNMESH_DEV_AUTH_BYPASS": {
         "description": "Explicit local/test-only bypass. Must remain false in production."
@@ -37,9 +42,12 @@
     }
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260730.1",
+    "@cloudflare/workers-types": "^5.20260810.1",
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",
     "wrangler": "^4.116.0"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "13.3.2"
   }
 }

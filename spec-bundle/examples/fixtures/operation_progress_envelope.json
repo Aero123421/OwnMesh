@@ -1,0 +1,19 @@
+{
+  "protocol": "ownmesh.device/1.0",
+  "message_id": "msg_01OPPROGRESS",
+  "type": "operation.progress",
+  "device_id": "dev_windows-01",
+  "correlation_id": "op_01REMOTE",
+  "seq": 125,
+  "sent_at": "2026-08-06T00:00:01Z",
+  "payload": {
+    "operation_contract": "ownmesh.operation/1.0",
+    "operation_id": "op_01REMOTE",
+    "status": "running",
+    "progress_seq": 1,
+    "summary": "reading workspace file",
+    "details": {
+      "bytes_read": 64
+    }
+  }
+}

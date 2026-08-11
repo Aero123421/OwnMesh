@@ -19,6 +19,8 @@ workspace = true
 
 [dependencies]
 clap = { version = "4.5.27", features = ["derive", "env", "wrap_help"] }
+futures-util = { version = "0.3.31", default-features = false, features = ["sink", "std"] }
+hex = "0.4"
 ownmesh-broker-client = { path = "../ownmesh-broker-client" }
 ownmesh-config = { path = "../ownmesh-config" }
 ownmesh-domain = { path = "../ownmesh-domain" }
@@ -28,9 +30,16 @@ ownmesh-identity = { path = "../ownmesh-identity" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
 ownmesh-logs = { path = "../ownmesh-logs" }
 ownmesh-policy = { path = "../ownmesh-policy" }
+ownmesh-profiles = { path = "../ownmesh-profiles" }
+ownmesh-protocol = { path = "../ownmesh-protocol" }
 ownmesh-session = { path = "../ownmesh-session" }
+ownmesh-session-host = { path = "../ownmesh-session-host" }
+ownmesh-transfer = { path = "../ownmesh-transfer" }
+ring = "0.17.14"
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
+sha2 = "0.10"
 tokio = { version = "1.43.0", features = [
     "fs",
     "io-util",
@@ -43,7 +52,19 @@ tokio = { version = "1.43.0", features = [
 ] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-native-roots",
+] }
+url = "2.5.4"
 uuid = { version = "1.12.1", features = ["v4", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+ownmesh-broker = { path = "../ownmesh-broker" }
 
 [dev-dependencies]
 tempfile = "3.15.0"

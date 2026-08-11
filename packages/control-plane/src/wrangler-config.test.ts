@@ -30,6 +30,8 @@ test("wrangler.jsonc has D1 + DeviceRoom and no R2/TURN bindings", () => {
   assert.equal(d1[0]!.binding, "DB");
   assert.equal(d1[0]!.database_name, "ownmesh");
   assert.equal(d1[0]!.migrations_dir, "migrations");
+  assert.equal((d1[0] as { database_id?: string }).database_id, undefined);
+  assert.equal(raw.includes("namaste114"), false);
 
   const dob = cfg.durable_objects as { bindings: { name: string; class_name: string }[] };
   assert.ok(dob.bindings.some((b) => b.name === "DEVICE_ROOM" && b.class_name === "DeviceRoom"));
@@ -58,4 +60,15 @@ test("wrangler.jsonc has D1 + DeviceRoom and no R2/TURN bindings", () => {
   const v1 = migrations.find((m) => m.tag === "v1")!;
   const classes = [...(v1.new_classes || []), ...(v1.new_sqlite_classes || [])];
   assert.ok(classes.includes("DeviceRoom"));
+
+  const rateLimits = cfg.ratelimits as {
+    name: string;
+    namespace_id: string;
+    simple: { limit: number; period: number };
+  }[];
+  assert.deepEqual(
+    rateLimits.map((entry) => entry.name).sort(),
+    ["AUTH_RATE_LIMITER", "MCP_RATE_LIMITER"],
+  );
+  assert.ok(rateLimits.every((entry) => entry.simple.period === 60));
 });

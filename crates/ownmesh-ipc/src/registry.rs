@@ -739,7 +739,7 @@ pub fn read_management_credential(state_dir: impl AsRef<Path>) -> IpcResult<Stri
 }
 
 /// Write `data` via a unique temp sibling, flush it, and atomically replace `path`.
-pub(crate) fn atomic_write_owner_only(path: &Path, data: &[u8]) -> IpcResult<()> {
+pub fn atomic_write_owner_only(path: &Path, data: &[u8]) -> IpcResult<()> {
     let parent = path.parent().ok_or_else(|| {
         IpcError::Protocol(format!(
             "credential registry path has no parent: {}",
@@ -786,6 +786,132 @@ pub(crate) fn atomic_write_owner_only(path: &Path, data: &[u8]) -> IpcResult<()>
         let dir = fs::File::open(parent)?;
         dir.sync_all()?;
     }
+    Ok(())
+}
+
+/// Prepare and attest a private per-user state directory.
+///
+/// This is shared by local supervisors that use the same owner/DACL/reparse
+/// custody rules as the daemon credential registry. It never creates a network
+/// endpoint and is not a credential issuance API.
+pub fn prepare_owner_only_state_dir(path: &Path) -> IpcResult<()> {
+    let _custody = prepare_secure_state_dir(path)?;
+    Ok(())
+}
+
+/// Read a regular owner-only file through the no-follow custody path with a
+/// pre-allocation byte ceiling. This prevents a substituted or attacker-grown
+/// state file from being decoded into an unbounded buffer.
+pub fn read_owner_only_file_bounded(path: &Path, max_bytes: usize) -> IpcResult<Vec<u8>> {
+    if max_bytes == 0 {
+        return Err(IpcError::Protocol(
+            "owner-only read byte limit must be positive".into(),
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let mut file = open_existing_nofollow_read(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    let len = file.metadata()?.len();
+    if len > max_bytes as u64 {
+        return Err(IpcError::Protocol(format!(
+            "owner-only file exceeds {max_bytes} byte budget: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = vec![0; len as usize];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Open an existing owner-only regular file through the no-follow custody path.
+/// The returned handle is pinned to the attested file, so callers can stream it
+/// without reopening a replaceable pathname.
+pub fn open_owner_only_file_read(path: &Path) -> IpcResult<fs::File> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let file = open_existing_nofollow_read(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    Ok(file)
+}
+
+/// Open an existing owner-only regular file for append through a no-follow,
+/// custody-attested handle. This intentionally never creates a file: callers
+/// must use [`create_owner_only_file_new`] for the exclusive creation step.
+pub fn open_owner_only_file_append(path: &Path) -> IpcResult<fs::File> {
+    open_owner_only_file_append_with_link_permission(path, false)
+}
+
+/// Open an owner-only append file with the additional Windows `DELETE` access
+/// required to publish that exact retained handle through `FileLinkInfo`.
+/// This narrow capability is for immutable transfer part files only; ordinary
+/// owner-only state opens intentionally do not request that broader right.
+pub fn open_owner_only_file_append_linkable(path: &Path) -> IpcResult<fs::File> {
+    open_owner_only_file_append_with_link_permission(path, true)
+}
+
+fn open_owner_only_file_append_with_link_permission(
+    path: &Path,
+    linkable: bool,
+) -> IpcResult<fs::File> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let file = open_existing_nofollow_append(path, linkable)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    Ok(file)
+}
+
+/// Remove only an existing owner-only regular file. Symlink/reparse nodes are
+/// rejected rather than followed or reused as stale state.
+pub fn remove_owner_only_file(path: &Path) -> IpcResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    ensure_existing_path_is_regular_file(path)?;
+    let file = open_existing_nofollow_read(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    drop(file);
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Create an owner-only regular file exactly once, refusing a pre-existing,
+/// symlink, reparse, or replacement target. The data is flushed before the
+/// caller receives success.
+pub fn create_owner_only_file_new(path: &Path, data: &[u8]) -> IpcResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        IpcError::Protocol(format!("owner-only path has no parent: {}", path.display()))
+    })?;
+    validate_secure_state_dir(parent)?;
+    let _custody = StateCustody::acquire(parent)?;
+    reject_symlink_or_reparse_if_present(path)?;
+    let mut file = create_owner_only_new(path)?;
+    validate_open_regular_owned_file(&file, path, true)?;
+    let write_result = (|| -> IpcResult<()> {
+        file.write_all(data)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if write_result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    write_result?;
+    validate_owned_regular_file_path(path)?;
     Ok(())
 }
 
@@ -875,7 +1001,93 @@ fn open_existing_nofollow_read(path: &Path) -> IpcResult<fs::File> {
     }
     #[cfg(windows)]
     {
-        open_windows_path(path, false, false, true)
+        open_windows_path(path, false, false, true, false)
+    }
+}
+
+fn open_existing_nofollow_append(path: &Path, linkable: bool) -> IpcResult<fs::File> {
+    #[cfg(unix)]
+    {
+        let _ = linkable;
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        let fd = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::APPEND | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        Ok(unsafe { fs::File::from_raw_fd(fd.into_raw_fd()) })
+    }
+    #[cfg(windows)]
+    {
+        open_windows_path(path, false, false, false, linkable)
+    }
+}
+
+/// Publish the exact currently-held owner-only source file without replacing an
+/// existing destination. The caller retains `file` through this call, so the
+/// source cannot be swapped between verification and publication.
+///
+/// Destination workspace custody is intentionally the caller's responsibility;
+/// this primitive only supplies exact-source/no-replace publication.
+pub fn publish_owner_only_file_no_replace(
+    file: &fs::File,
+    source_path: &Path,
+    destination: &Path,
+) -> IpcResult<()> {
+    validate_open_regular_owned_file(file, source_path, true)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        let empty =
+            CString::new("").map_err(|_| IpcError::Protocol("invalid empty source".into()))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| IpcError::Protocol("destination contains NUL".into()))?;
+        let result = unsafe {
+            libc::linkat(
+                file.as_raw_fd(),
+                empty.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::iter;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
+        let source: Vec<u16> = source_path
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        let destination: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(iter::once(0))
+            .collect();
+        // `open_windows_path` intentionally omitted FILE_SHARE_DELETE, so the
+        // held source handle pins this pathname through CreateHardLinkW.
+        if unsafe { CreateHardLinkW(destination.as_ptr(), source.as_ptr(), std::ptr::null()) } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = destination;
+        Err(IpcError::Protocol(
+            "exact-handle no-replace publish unsupported on this platform".into(),
+        ))
     }
 }
 
@@ -900,7 +1112,7 @@ fn open_owner_only_rw(path: &Path, create: bool) -> IpcResult<fs::File> {
     }
     #[cfg(windows)]
     {
-        open_windows_path(path, create, false, false)
+        open_windows_path(path, create, false, false, false)
     }
 }
 
@@ -924,16 +1136,18 @@ fn create_owner_only_new(path: &Path) -> IpcResult<fs::File> {
     }
     #[cfg(windows)]
     {
-        open_windows_path(path, true, true, false)
+        open_windows_path(path, true, true, false, false)
     }
 }
 
 #[cfg(windows)]
+#[allow(clippy::fn_params_excessive_bools)]
 fn open_windows_path(
     path: &Path,
     create: bool,
     create_new: bool,
     read_only: bool,
+    linkable: bool,
 ) -> IpcResult<fs::File> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
@@ -957,7 +1171,15 @@ fn open_windows_path(
     let access = if read_only {
         GENERIC_READ
     } else {
-        GENERIC_READ | GENERIC_WRITE
+        let mut access = GENERIC_READ | GENERIC_WRITE;
+        if linkable {
+            // FileLinkInfo creates a hardlink from this retained source handle
+            // and requires DELETE access. Restrict this to immutable transfer
+            // parts so unrelated owner-only state keeps its compatibility.
+            // DELETE is the standard access right (0x0001_0000).
+            access |= 0x0001_0000;
+        }
+        access
     };
     let disposition = if create_new {
         CREATE_NEW

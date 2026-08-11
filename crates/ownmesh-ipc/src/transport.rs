@@ -13,6 +13,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 #[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
@@ -34,6 +36,195 @@ pub struct ServerConnection {
 /// Client-side connection.
 pub struct ClientConnection {
     inner: ConnInner,
+}
+
+/// Immutable facts attested by Windows for one connected named-pipe client.
+///
+/// The process and image handles are retained for the lifetime of this value.
+/// A caller must keep this value (rather than only copying the scalar fields)
+/// until it has completed authorization and request processing.  That makes a
+/// PID reuse after pipe accept detectable by a fresh process-time check and
+/// prevents the image handle from being closed under the authorization check.
+///
+/// This is deliberately a safe façade.  The small audited Win32 FFI boundary
+/// stays private to this transport module; consumers cannot manufacture these
+/// facts from JSON or caller-supplied fields.
+#[cfg(windows)]
+pub struct WindowsPipePeerFacts {
+    pid: u32,
+    user_sid: String,
+    integrity_rid: u32,
+    session_id: u32,
+    process: WindowsProcessFacts,
+}
+
+/// Immutable process identity held through the authorization decision.
+/// Constructed only from a Windows process handle and a second image file
+/// handle; user-provided PID/path strings cannot create this value.
+#[cfg(windows)]
+pub struct WindowsProcessFacts {
+    pid: u32,
+    creation_filetime: u64,
+    image_path: String,
+    image_volume_serial: u64,
+    image_file_id: [u8; 16],
+    image_sha256: [u8; 32],
+    process_handle: OwnedHandle,
+    image_handle: std::fs::File,
+}
+
+#[cfg(windows)]
+type WindowsOpenedProcess = (
+    OwnedHandle,
+    std::fs::File,
+    String,
+    u64,
+    [u8; 16],
+    [u8; 32],
+    u64,
+);
+
+#[cfg(windows)]
+impl std::fmt::Debug for WindowsPipePeerFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsPipePeerFacts")
+            .field("pid", &self.pid)
+            .field("user_sid", &self.user_sid)
+            .field("integrity_rid", &self.integrity_rid)
+            .field("session_id", &self.session_id)
+            .field("process", &self.process)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl WindowsPipePeerFacts {
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+    #[must_use]
+    pub fn user_sid(&self) -> &str {
+        &self.user_sid
+    }
+    #[must_use]
+    pub const fn integrity_rid(&self) -> u32 {
+        self.integrity_rid
+    }
+    #[must_use]
+    pub const fn session_id(&self) -> u32 {
+        self.session_id
+    }
+    #[must_use]
+    pub const fn creation_filetime(&self) -> u64 {
+        self.process.creation_filetime()
+    }
+    #[must_use]
+    pub fn image_path(&self) -> &str {
+        self.process.image_path()
+    }
+    #[must_use]
+    pub const fn image_volume_serial(&self) -> u64 {
+        self.process.image_volume_serial()
+    }
+    #[must_use]
+    pub const fn image_file_id(&self) -> [u8; 16] {
+        self.process.image_file_id()
+    }
+    #[must_use]
+    pub const fn image_sha256(&self) -> [u8; 32] {
+        self.process.image_sha256()
+    }
+
+    /// Re-read the process creation time through the retained process handle.
+    /// A mismatch means PID reuse or a closed/replaced process and is denied.
+    pub fn revalidate_process_birth(&self) -> IpcResult<()> {
+        self.process.revalidate_process_birth()
+    }
+
+    /// Re-read the held image handle's file identity and digest.  This catches
+    /// replacement attempts between pipe accept and the privileged action.
+    pub fn revalidate_image(&self) -> IpcResult<()> {
+        self.process.revalidate_image()
+    }
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for WindowsProcessFacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsProcessFacts")
+            .field("pid", &self.pid)
+            .field("creation_filetime", &self.creation_filetime)
+            .field("image_path", &self.image_path)
+            .field("image_volume_serial", &self.image_volume_serial)
+            .field("image_file_id", &self.image_file_id)
+            .field("image_sha256", &self.image_sha256)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl WindowsProcessFacts {
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+    #[must_use]
+    pub const fn creation_filetime(&self) -> u64 {
+        self.creation_filetime
+    }
+    #[must_use]
+    pub fn image_path(&self) -> &str {
+        &self.image_path
+    }
+    #[must_use]
+    pub const fn image_volume_serial(&self) -> u64 {
+        self.image_volume_serial
+    }
+    #[must_use]
+    pub const fn image_file_id(&self) -> [u8; 16] {
+        self.image_file_id
+    }
+    #[must_use]
+    pub const fn image_sha256(&self) -> [u8; 32] {
+        self.image_sha256
+    }
+    pub fn revalidate_process_birth(&self) -> IpcResult<()> {
+        let observed = unsafe { process_creation_filetime(self.process_handle.as_raw_handle()) }
+            .map_err(|error| {
+                IpcError::Unauthorized(format!(
+                    "cannot revalidate process birth (fail-closed): {error}"
+                ))
+            })?;
+        if observed != self.creation_filetime {
+            return Err(IpcError::Unauthorized(
+                "process PID was reused or process birth changed (fail-closed)".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn revalidate_image(&self) -> IpcResult<()> {
+        let (volume, file_id) = unsafe { windows_file_id(self.image_handle.as_raw_handle()) }
+            .map_err(|error| {
+                IpcError::Unauthorized(format!(
+                    "cannot revalidate process image identity (fail-closed): {error}"
+                ))
+            })?;
+        let digest = sha256_file(&self.image_handle).map_err(|error| {
+            IpcError::Unauthorized(format!(
+                "cannot revalidate process image digest (fail-closed): {error}"
+            ))
+        })?;
+        if volume != self.image_volume_serial
+            || file_id != self.image_file_id
+            || digest != self.image_sha256
+        {
+            return Err(IpcError::Unauthorized(
+                "process image changed after attestation (fail-closed)".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 enum ConnInner {
@@ -143,6 +334,20 @@ impl ServerConnection {
         }
         Ok(self.peer.clone())
     }
+
+    /// Capture non-forgeable Windows named-pipe client facts after the first
+    /// message has arrived.  The SID/token values are acquired while the pipe
+    /// client is impersonated and process/image values come from OS handles,
+    /// never from the protocol payload.
+    #[cfg(windows)]
+    pub fn windows_pipe_peer_facts(&mut self) -> IpcResult<WindowsPipePeerFacts> {
+        match &self.inner {
+            ConnInner::PipeServer(server) => windows_pipe_peer_facts(server),
+            ConnInner::PipeClient(_) => Err(IpcError::Protocol(
+                "server peer facts requested from a client connection (fail-closed)".into(),
+            )),
+        }
+    }
 }
 
 impl AsyncRead for ClientConnection {
@@ -176,6 +381,27 @@ impl AsyncWrite for ClientConnection {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         poll_shutdown_inner!(self, cx)
+    }
+}
+
+impl ClientConnection {
+    /// Return the server PID reported by Windows for this exact pipe handle.
+    /// Clients use this before sending authority-bearing broker requests to
+    /// reject a same-name pipe substituted by an untrusted process.
+    #[cfg(windows)]
+    pub fn windows_pipe_server_pid(&self) -> IpcResult<u32> {
+        match &self.inner {
+            ConnInner::PipeClient(client) => {
+                unsafe { named_pipe_server_pid(client.as_raw_handle()) }.map_err(|error| {
+                    IpcError::Unauthorized(format!(
+                        "named pipe server PID retrieval failed (fail-closed): {error}"
+                    ))
+                })
+            }
+            ConnInner::PipeServer(_) => Err(IpcError::Protocol(
+                "server PID requested from a server connection (fail-closed)".into(),
+            )),
+        }
     }
 }
 
@@ -234,6 +460,10 @@ pub struct LocalListener {
     endpoint: Endpoint,
     #[cfg(windows)]
     pipe_name: String,
+    /// Present only for the fixed privileged-broker pipe.  The SID is used to
+    /// recreate and attest the same protected DACL for every pipe instance.
+    #[cfg(windows)]
+    secure_broker_daemon_sid: Option<String>,
     #[cfg(windows)]
     pending: TokioMutex<Option<NamedPipeServer>>,
     #[cfg(unix)]
@@ -244,6 +474,12 @@ pub struct LocalListener {
 }
 
 impl LocalListener {
+    /// Fixed, non-configurable endpoint for the privileged Windows broker.
+    /// Keeping this name out of user configuration prevents an attacker from
+    /// redirecting a high-capability client to a lookalike pipe.
+    #[cfg(windows)]
+    pub const SECURE_BROKER_PIPE_NAME: &'static str = r"\\.\pipe\ownmesh-privileged";
+
     /// Configure the process-wide Unix socket privilege boundary used by [`Self::bind`].
     ///
     /// - `mode`: octal bits; default `0o600` when `None`. Modes with "other" bits are refused.
@@ -302,9 +538,11 @@ impl LocalListener {
             Endpoint::NamedPipe(name) => {
                 let first = ServerOptions::new()
                     .first_pipe_instance(true)
+                    .reject_remote_clients(true)
                     .create(name)?;
                 Ok(Self {
                     pipe_name: name.clone(),
+                    secure_broker_daemon_sid: None,
                     pending: TokioMutex::new(Some(first)),
                     endpoint,
                     allowed_uids: security.allowed_uids,
@@ -332,6 +570,25 @@ impl LocalListener {
         }
     }
 
+    /// Bind the fixed privileged-broker pipe with a protected DACL that grants
+    /// access only to the configured daemon SID, LocalSystem, and Builtin
+    /// Administrators. Remote clients are rejected and first-instance
+    /// substitution is refused.  This is intentionally separate from generic
+    /// [`Self::bind`]: a configurable pipe name must never gain this authority.
+    #[cfg(windows)]
+    pub async fn bind_secure_broker_pipe(daemon_sid: &str) -> IpcResult<Self> {
+        let daemon_sid = validate_windows_sid_text(daemon_sid)?;
+        let pipe_name = Self::SECURE_BROKER_PIPE_NAME.to_owned();
+        let first = create_secure_broker_pipe(&pipe_name, &daemon_sid, true)?;
+        Ok(Self {
+            endpoint: Endpoint::NamedPipe(pipe_name.clone()),
+            pipe_name,
+            secure_broker_daemon_sid: Some(daemon_sid),
+            pending: TokioMutex::new(Some(first)),
+            allowed_uids: Vec::new(),
+        })
+    }
+
     /// Endpoint currently served.
     #[must_use]
     pub fn endpoint(&self) -> &Endpoint {
@@ -351,10 +608,22 @@ impl LocalListener {
             let mut guard = self.pending.lock().await;
             let server = match guard.take() {
                 Some(s) => s,
-                None => ServerOptions::new().create(&self.pipe_name)?,
+                None => match &self.secure_broker_daemon_sid {
+                    Some(daemon_sid) => {
+                        create_secure_broker_pipe(&self.pipe_name, daemon_sid, false)?
+                    }
+                    None => ServerOptions::new()
+                        .reject_remote_clients(true)
+                        .create(&self.pipe_name)?,
+                },
             };
             server.connect().await?;
-            *guard = Some(ServerOptions::new().create(&self.pipe_name)?);
+            *guard = Some(match &self.secure_broker_daemon_sid {
+                Some(daemon_sid) => create_secure_broker_pipe(&self.pipe_name, daemon_sid, false)?,
+                None => ServerOptions::new()
+                    .reject_remote_clients(true)
+                    .create(&self.pipe_name)?,
+            });
             // SID attribution via pipe impersonation is deferred until after the
             // server reads the first message from this exact pipe instance.
             let pid = unsafe { named_pipe_client_pid(server.as_raw_handle()) }.map_err(|err| {
@@ -518,6 +787,809 @@ unsafe fn named_pipe_client_pid(handle: std::os::windows::io::RawHandle) -> Resu
         return Err("GetNamedPipeClientProcessId returned pid 0".into());
     }
     Ok(pid)
+}
+
+/// Get the server PID for a connected named-pipe client instance.
+///
+/// # Safety
+///
+/// `handle` must be a valid open named-pipe client handle connected to a server.
+#[cfg(windows)]
+unsafe fn named_pipe_server_pid(handle: std::os::windows::io::RawHandle) -> Result<u32, String> {
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let mut pid = 0_u32;
+    if GetNamedPipeServerProcessId(handle, &mut pid) == FALSE {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if pid == 0 {
+        return Err("GetNamedPipeServerProcessId returned pid 0".into());
+    }
+    Ok(pid)
+}
+
+#[cfg(windows)]
+fn windows_pipe_peer_facts(server: &NamedPipeServer) -> IpcResult<WindowsPipePeerFacts> {
+    let handle = server.as_raw_handle();
+    let pid = unsafe { named_pipe_client_pid(handle) }.map_err(|error| {
+        IpcError::Unauthorized(format!(
+            "named pipe client PID retrieval failed (fail-closed): {error}"
+        ))
+    })?;
+    let user_sid = unsafe { named_pipe_client_user_sid(handle) }.map_err(|error| {
+        IpcError::Unauthorized(format!(
+            "named pipe client SID retrieval failed (fail-closed): {error}"
+        ))
+    })?;
+    let (integrity_rid, session_id) =
+        unsafe { named_pipe_client_token_context(handle) }.map_err(|error| {
+            IpcError::Unauthorized(format!(
+                "named pipe client token context retrieval failed (fail-closed): {error}"
+            ))
+        })?;
+    let process = windows_process_facts(pid)?;
+    Ok(WindowsPipePeerFacts {
+        pid,
+        user_sid,
+        integrity_rid,
+        session_id,
+        process,
+    })
+}
+
+/// Attest a process using a retained process handle and a retained canonical
+/// image handle.  Clients use this after `GetNamedPipeServerProcessId` before
+/// sending a broker request, and again after receiving its response.
+#[cfg(windows)]
+pub fn windows_process_facts(pid: u32) -> IpcResult<WindowsProcessFacts> {
+    let (
+        process_handle,
+        image_handle,
+        image_path,
+        image_volume_serial,
+        image_file_id,
+        image_sha256,
+        creation_filetime,
+    ) = unsafe { open_process_and_image(pid) }.map_err(|error| {
+        IpcError::Unauthorized(format!(
+            "Windows process attestation failed (fail-closed): {error}"
+        ))
+    })?;
+    Ok(WindowsProcessFacts {
+        pid,
+        creation_filetime,
+        image_path,
+        image_volume_serial,
+        image_file_id,
+        image_sha256,
+        process_handle,
+        image_handle,
+    })
+}
+
+/// SCM-attested identity for a running Windows service.  The service manager,
+/// rather than pipe metadata or a caller-supplied service name, supplies the
+/// PID and configured binary command line.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsServiceFacts {
+    service_name: String,
+    pid: u32,
+    binary_command_line: String,
+}
+
+#[cfg(windows)]
+impl WindowsServiceFacts {
+    #[must_use]
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+    #[must_use]
+    pub fn binary_command_line(&self) -> &str {
+        &self.binary_command_line
+    }
+}
+
+/// Query the local Service Control Manager and require a currently-running
+/// service PID to equal the PID reported by the exact Named Pipe handle.
+/// Callers must additionally attest that PID with [`windows_process_facts`]
+/// and compare its canonical image identity with the installed service image.
+#[cfg(windows)]
+pub fn windows_running_service_facts(
+    service_name: &str,
+    expected_pid: u32,
+) -> IpcResult<WindowsServiceFacts> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW,
+        QueryServiceStatusEx, QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
+        SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
+    };
+
+    if expected_pid == 0
+        || service_name.is_empty()
+        || service_name.len() > 256
+        || !service_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(IpcError::Protocol(
+            "Windows service identity input is invalid (fail-closed)".into(),
+        ));
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(service_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let manager = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) };
+    if manager.is_null() {
+        return Err(IpcError::Unauthorized(format!(
+            "open local Service Control Manager failed (fail-closed): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let result = (|| {
+        let service = unsafe {
+            OpenServiceW(
+                manager,
+                wide.as_ptr(),
+                SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+            )
+        };
+        if service.is_null() {
+            return Err(IpcError::Unauthorized(format!(
+                "open expected broker service failed (fail-closed): {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let service_result = (|| {
+            let mut status = unsafe { std::mem::zeroed::<SERVICE_STATUS_PROCESS>() };
+            let mut status_needed = 0_u32;
+            if unsafe {
+                QueryServiceStatusEx(
+                    service,
+                    SC_STATUS_PROCESS_INFO,
+                    std::ptr::from_mut(&mut status).cast(),
+                    u32::try_from(std::mem::size_of::<SERVICE_STATUS_PROCESS>())
+                        .unwrap_or(u32::MAX),
+                    &mut status_needed,
+                )
+            } == 0
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "query broker service status failed (fail-closed): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if status.dwCurrentState != SERVICE_RUNNING || status.dwProcessId != expected_pid {
+                return Err(IpcError::Unauthorized(format!(
+                    "broker service is not running at the pipe-attested PID {expected_pid} (fail-closed)"
+                )));
+            }
+            let mut needed = 0_u32;
+            let _ = unsafe { QueryServiceConfigW(service, ptr::null_mut(), 0, &mut needed) };
+            if needed
+                < u32::try_from(std::mem::size_of::<QUERY_SERVICE_CONFIGW>()).unwrap_or(u32::MAX)
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "query broker service image size failed (fail-closed): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let bytes = usize::try_from(needed).map_err(|_| {
+                IpcError::Unauthorized("broker service image buffer length overflow".into())
+            })?;
+            let words = bytes.div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0_usize; words];
+            let mut returned = needed;
+            if unsafe {
+                QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &mut returned)
+            } == 0
+                || returned > needed
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "query broker service image failed (fail-closed): {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+            let command_ptr = config.lpBinaryPathName;
+            let start = buffer.as_ptr() as usize;
+            let end = start.checked_add(bytes).ok_or_else(|| {
+                IpcError::Unauthorized("broker service image buffer overflow".into())
+            })?;
+            let command_start = command_ptr as usize;
+            if command_ptr.is_null()
+                || command_start < start
+                || command_start >= end
+                || !command_start.is_multiple_of(std::mem::align_of::<u16>())
+            {
+                return Err(IpcError::Unauthorized(
+                    "broker service image command line is outside SCM buffer (fail-closed)".into(),
+                ));
+            }
+            let units = (end - command_start) / std::mem::size_of::<u16>();
+            let command = unsafe { std::slice::from_raw_parts(command_ptr, units) };
+            let nul = command.iter().position(|unit| *unit == 0).ok_or_else(|| {
+                IpcError::Unauthorized(
+                    "broker service image command line is unterminated (fail-closed)".into(),
+                )
+            })?;
+            let binary_command_line = String::from_utf16(&command[..nul]).map_err(|_| {
+                IpcError::Unauthorized(
+                    "broker service image command line is invalid UTF-16 (fail-closed)".into(),
+                )
+            })?;
+            if binary_command_line.trim().is_empty() {
+                return Err(IpcError::Unauthorized(
+                    "broker service image command line is empty (fail-closed)".into(),
+                ));
+            }
+            Ok(WindowsServiceFacts {
+                service_name: service_name.to_owned(),
+                pid: status.dwProcessId,
+                binary_command_line,
+            })
+        })();
+        unsafe {
+            let _ = CloseServiceHandle(service);
+        }
+        service_result
+    })();
+    unsafe {
+        let _ = CloseServiceHandle(manager);
+    }
+    result
+}
+
+/// Capture the fields from an impersonated client token required to distinguish
+/// a normal user daemon from a service/admin process.  The caller must only use
+/// this after the pipe has received a message; otherwise Windows can report an
+/// unrelated/default client security context.
+///
+/// # Safety
+///
+/// `handle` must be a connected server-side pipe handle.
+#[cfg(windows)]
+unsafe fn named_pipe_client_token_context(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<(u32, u32), String> {
+    use std::mem::{size_of, MaybeUninit};
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidSid,
+        TokenIntegrityLevel, TokenSessionId, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+    if ImpersonateNamedPipeClient(handle) == 0 {
+        return Err(format!(
+            "ImpersonateNamedPipeClient failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let result = (|| {
+        let mut token: HANDLE = ptr::null_mut();
+        if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) == 0 || token.is_null() {
+            return Err(format!(
+                "OpenThreadToken failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let token_result = (|| {
+            let mut session_id = 0_u32;
+            let mut returned = 0_u32;
+            if GetTokenInformation(
+                token,
+                TokenSessionId,
+                std::ptr::from_mut(&mut session_id).cast(),
+                u32::try_from(size_of::<u32>()).map_err(|_| "session size overflow")?,
+                &mut returned,
+            ) == 0
+                || returned
+                    != u32::try_from(size_of::<u32>()).map_err(|_| "session size overflow")?
+            {
+                return Err(format!(
+                    "GetTokenInformation(TokenSessionId) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut required = 0_u32;
+            let _ = GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                ptr::null_mut(),
+                0,
+                &mut required,
+            );
+            if required
+                < u32::try_from(size_of::<TOKEN_MANDATORY_LABEL>())
+                    .map_err(|_| "integrity label size overflow")?
+            {
+                return Err(format!(
+                    "GetTokenInformation(TokenIntegrityLevel) size query failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let required =
+                usize::try_from(required).map_err(|_| "integrity label length overflow")?;
+            let element_size = size_of::<TOKEN_MANDATORY_LABEL>();
+            let elements = required
+                .checked_add(element_size - 1)
+                .map(|bytes| bytes / element_size)
+                .ok_or("integrity label length overflow")?;
+            // TokenMandatoryLabel has pointer alignment. Never cast a byte Vec
+            // to it, because a misaligned allocation is undefined behavior.
+            let mut buffer: Vec<MaybeUninit<TOKEN_MANDATORY_LABEL>> = Vec::new();
+            buffer
+                .try_reserve_exact(elements)
+                .map_err(|_| "integrity label allocation failed")?;
+            buffer.resize_with(elements, MaybeUninit::uninit);
+            let buffer_bytes = buffer
+                .len()
+                .checked_mul(element_size)
+                .ok_or("integrity label length overflow")?;
+            let required_u32 =
+                u32::try_from(required).map_err(|_| "integrity label length overflow")?;
+            let mut returned = required_u32;
+            if GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                buffer.as_mut_ptr().cast(),
+                required_u32,
+                &mut returned,
+            ) == 0
+                || returned
+                    < u32::try_from(size_of::<TOKEN_MANDATORY_LABEL>())
+                        .map_err(|_| "integrity label size overflow")?
+                || usize::try_from(returned).map_err(|_| "integrity returned length overflow")?
+                    > required
+            {
+                return Err(format!(
+                    "GetTokenInformation(TokenIntegrityLevel) failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let returned =
+                usize::try_from(returned).map_err(|_| "integrity returned length overflow")?;
+            if returned > buffer_bytes {
+                return Err("TokenIntegrityLevel returned an out-of-bounds length".into());
+            }
+            let label = buffer
+                .first()
+                .ok_or("TokenIntegrityLevel buffer is empty")?
+                .assume_init_ref();
+            let sid = label.Label.Sid;
+            let buffer_start = buffer.as_ptr() as usize;
+            let sid_start = sid as usize;
+            let sid_offset = sid_start
+                .checked_sub(buffer_start)
+                .ok_or("TokenIntegrityLevel SID points before its buffer")?;
+            let sid_remaining = returned
+                .checked_sub(sid_offset)
+                .ok_or("TokenIntegrityLevel SID points outside its buffer")?;
+            if sid.is_null() || sid_remaining < 8 {
+                return Err("TokenIntegrityLevel returned an invalid SID".into());
+            }
+            let sub_authority_count = usize::from(*sid.cast::<u8>().add(1));
+            let sid_len = 8_usize
+                .checked_add(
+                    sub_authority_count
+                        .checked_mul(4)
+                        .ok_or("integrity SID length overflow")?,
+                )
+                .ok_or("integrity SID length overflow")?;
+            if sid_len > sid_remaining || IsValidSid(sid) == 0 {
+                return Err("TokenIntegrityLevel returned an invalid SID".into());
+            }
+            let count_ptr = GetSidSubAuthorityCount(sid);
+            if count_ptr.is_null()
+                || *count_ptr == 0
+                || usize::from(*count_ptr) != sub_authority_count
+            {
+                return Err("TokenIntegrityLevel SID has no subauthority".into());
+            }
+            let rid_ptr = GetSidSubAuthority(sid, u32::from(*count_ptr - 1));
+            if rid_ptr.is_null() {
+                return Err("TokenIntegrityLevel SID has no integrity RID".into());
+            }
+            Ok((*rid_ptr, session_id))
+        })();
+        let _ = CloseHandle(token);
+        token_result
+    })();
+    if windows_sys::Win32::Security::RevertToSelf() == 0 {
+        return Err(format!(
+            "RevertToSelf failed after pipe impersonation: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    result
+}
+
+/// Open the live process and an image file handle, then attest all immutable
+/// identity data through those handles.  Failure to query any field is an
+/// authorization failure, never a best-effort fallback to a caller path.
+///
+/// # Safety
+///
+/// Calls Win32 process/file APIs with a kernel-supplied PID.  Returned handles
+/// are immediately transferred to RAII owners before this function returns.
+#[cfg(windows)]
+unsafe fn open_process_and_image(pid: u32) -> Result<WindowsOpenedProcess, String> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if raw.is_null() {
+        return Err(format!(
+            "OpenProcess({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let process_handle = OwnedHandle::from_raw_handle(raw);
+    let creation_filetime = process_creation_filetime(process_handle.as_raw_handle())?;
+    let image_query_path = process_image_path_from_handle(process_handle.as_raw_handle())?;
+    let canonical = std::fs::canonicalize(&image_query_path)
+        .map_err(|error| format!("canonicalize live process image {image_query_path}: {error}"))?;
+    let image_handle = std::fs::File::open(&canonical).map_err(|error| {
+        format!(
+            "open canonical live process image {}: {error}",
+            canonical.display()
+        )
+    })?;
+    let (image_volume_serial, image_file_id) = windows_file_id(image_handle.as_raw_handle())?;
+    let image_sha256 = sha256_file(&image_handle)?;
+    Ok((
+        process_handle,
+        image_handle,
+        canonical.to_string_lossy().into_owned(),
+        image_volume_serial,
+        image_file_id,
+        image_sha256,
+        creation_filetime,
+    ))
+}
+
+#[cfg(windows)]
+unsafe fn process_creation_filetime(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<u64, String> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    let mut created = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exited = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(u64::from(created.dwLowDateTime) | (u64::from(created.dwHighDateTime) << 32))
+}
+
+#[cfg(windows)]
+unsafe fn process_image_path_from_handle(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<String, String> {
+    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+
+    let mut capacity = 1024_usize;
+    loop {
+        let mut buf = vec![0_u16; capacity];
+        let mut length = u32::try_from(buf.len()).map_err(|_| "image path buffer too large")?;
+        if QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut length) != 0 && length > 0 {
+            let length = usize::try_from(length).map_err(|_| "image path length overflow")?;
+            return Ok(String::from_utf16_lossy(&buf[..length]));
+        }
+        let error = std::io::Error::last_os_error();
+        if capacity >= 32 * 1024 {
+            return Err(error.to_string());
+        }
+        capacity = capacity.saturating_mul(2);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn windows_file_id(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<(u64, [u8; 16]), String> {
+    use std::mem::size_of;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+
+    let mut info = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+    if GetFileInformationByHandleEx(
+        handle,
+        FileIdInfo,
+        info.as_mut_ptr().cast(),
+        u32::try_from(size_of::<FILE_ID_INFO>()).map_err(|_| "FILE_ID_INFO size overflow")?,
+    ) == 0
+    {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let info = info.assume_init();
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
+}
+
+#[cfg(windows)]
+fn sha256_file(file: &std::fs::File) -> Result<[u8; 32], String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut reader = file.try_clone().map_err(|error| error.to_string())?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest.finalize().into())
+}
+
+/// Validate the textual form before interpolating it into SDDL.  The Win32 SID
+/// parser is the authority; the conservative character check prevents SDDL
+/// grammar injection even if that parser changes its accepted syntax.
+#[cfg(windows)]
+fn validate_windows_sid_text(value: &str) -> IpcResult<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    use windows_sys::Win32::Security::PSID;
+
+    if !value.starts_with("S-")
+        || value.len() > 184
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'S')
+    {
+        return Err(IpcError::Protocol(
+            "daemon SID must be a canonical Windows S-... SID (fail-closed)".into(),
+        ));
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sid: PSID = ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+        return Err(IpcError::Protocol(format!(
+            "daemon SID is not recognized by Windows (fail-closed): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    unsafe {
+        let _ = LocalFree(sid.cast());
+    }
+    Ok(value.to_owned())
+}
+
+/// Create one protected privileged-broker pipe instance.  The only unsafe call
+/// to Tokio's raw-security API is contained here, after the descriptor has been
+/// constructed and before its lifetime ends; callers receive an ordinary safe
+/// `NamedPipeServer` only after the actual handle DACL is re-attested.
+#[cfg(windows)]
+fn create_secure_broker_pipe(
+    pipe_name: &str,
+    daemon_sid: &str,
+    first_instance: bool,
+) -> IpcResult<NamedPipeServer> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+    let sddl_text = format!("D:P(A;;GRGW;;;{daemon_sid})(A;;GA;;;SY)(A;;GA;;;BA)");
+    let sddl: Vec<u16> = sddl_text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+        || descriptor.is_null()
+    {
+        return Err(IpcError::Protocol(format!(
+            "construct protected broker pipe DACL failed (fail-closed): {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut attrs = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let result = (|| {
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first_instance)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(
+                    pipe_name,
+                    std::ptr::from_mut(&mut attrs).cast(),
+                )
+        }
+        .map_err(IpcError::Io)?;
+        verify_secure_broker_pipe_dacl(server.as_raw_handle(), daemon_sid)?;
+        Ok(server)
+    })();
+    unsafe {
+        let _ = LocalFree(descriptor);
+    }
+    result
+}
+
+/// Inspect the live pipe handle rather than trusting the requested SDDL.  The
+/// ACL must be protected and contain exactly the three non-inherited allow ACEs
+/// in canonical order: daemon GR|GW, SYSTEM GA, BUILTIN\\Administrators GA.
+#[cfg(windows)]
+fn verify_secure_broker_pipe_dacl(
+    handle: std::os::windows::io::RawHandle,
+    daemon_sid_text: &str,
+) -> IpcResult<()> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, INHERITED_ACE, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+
+    fn sid_from_text(value: &str) -> IpcResult<PSID> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        let wide: Vec<u16> = std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sid = ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+            return Err(IpcError::Unauthorized(
+                "cannot parse expected broker DACL SID (fail-closed)".into(),
+            ));
+        }
+        Ok(sid)
+    }
+
+    let daemon_sid = sid_from_text(daemon_sid_text)?;
+    let system_sid = sid_from_text("S-1-5-18")?;
+    let admin_sid = sid_from_text("S-1-5-32-544")?;
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    let result = (|| {
+        if status != 0 || descriptor.is_null() {
+            return Err(IpcError::Unauthorized(format!(
+                "cannot inspect live broker pipe DACL (fail-closed): {}",
+                std::io::Error::from_raw_os_error(status.cast_signed())
+            )));
+        }
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err(IpcError::Unauthorized(
+                "broker pipe DACL is not protected (fail-closed)".into(),
+            ));
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+            || present == 0
+            || dacl.is_null()
+        {
+            return Err(IpcError::Unauthorized(
+                "broker pipe DACL is absent (fail-closed)".into(),
+            ));
+        }
+        let mut info = unsafe { std::mem::zeroed::<ACL_SIZE_INFORMATION>() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                std::ptr::from_mut(&mut info).cast(),
+                u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
+                AclSizeInformation,
+            )
+        } == 0
+            || info.AceCount != 3
+        {
+            return Err(IpcError::Unauthorized(
+                "broker pipe DACL has unexpected ACE count (fail-closed)".into(),
+            ));
+        }
+        let expected = [
+            // `CreateNamedPipeW` maps SDDL GR|GW to this pipe-specific access
+            // mask before exposing the live kernel-object DACL.
+            (daemon_sid, 0x0012_019f),
+            // Likewise, GA is mapped by CreateNamedPipeW to the pipe's full
+            // access mask before we inspect the live DACL.
+            (system_sid, 0x001f_01ff),
+            (admin_sid, 0x001f_01ff),
+        ];
+        for (index, (expected_sid, expected_mask)) in expected.into_iter().enumerate() {
+            let mut ace = ptr::null_mut();
+            if unsafe { GetAce(dacl, u32::try_from(index).unwrap_or(u32::MAX), &mut ace) } == 0
+                || ace.is_null()
+            {
+                return Err(IpcError::Unauthorized(
+                    "broker pipe DACL ACE retrieval failed (fail-closed)".into(),
+                ));
+            }
+            let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid: PSID = (&raw const ace.SidStart).cast_mut().cast();
+            if ace.Header.AceType != 0
+                || u32::from(ace.Header.AceFlags) & INHERITED_ACE != 0
+                || ace.Mask != expected_mask
+                || unsafe { EqualSid(sid, expected_sid) } == 0
+            {
+                return Err(IpcError::Unauthorized(format!(
+                    "broker pipe DACL is not the required canonical policy at ACE {index}: type={} flags={} mask={:#x} expected_mask={expected_mask:#x} sid_match={} (fail-closed)",
+                    ace.Header.AceType,
+                    ace.Header.AceFlags,
+                    ace.Mask,
+                    unsafe { EqualSid(sid, expected_sid) },
+                )));
+            }
+        }
+        Ok(())
+    })();
+    unsafe {
+        let _ = LocalFree(daemon_sid.cast());
+        let _ = LocalFree(system_sid.cast());
+        let _ = LocalFree(admin_sid.cast());
+        if !descriptor.is_null() {
+            let _ = LocalFree(descriptor);
+        }
+    }
+    result
 }
 
 /// Server-attested Windows user SID bound to this named-pipe connection.
@@ -771,4 +1843,63 @@ fn apply_unix_socket_security(path: &Path, security: &UnixSocketSecurity) -> Ipc
 #[allow(dead_code)]
 fn enforce_allowed_uid(_peer: &OsPeerIdentity, _allowed_uids: &[u32]) -> IpcResult<()> {
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn named_pipe_peer_facts_are_kernel_attested_and_revalidatable() {
+        let endpoint = Endpoint::NamedPipe(format!(
+            r"\\.\pipe\ownmesh-ipc-peer-facts-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let listener = LocalListener::bind(endpoint.clone()).await.unwrap();
+        let client = tokio::spawn(async move {
+            let mut client = connect(&endpoint).await.unwrap();
+            assert_eq!(
+                client.windows_pipe_server_pid().unwrap(),
+                std::process::id()
+            );
+            client.write_all(b"x").await.unwrap();
+            client.flush().await.unwrap();
+        });
+
+        let mut server = listener.accept().await.unwrap();
+        let mut marker = [0_u8; 1];
+        server.read_exact(&mut marker).await.unwrap();
+        assert_eq!(marker, [b'x']);
+        let facts = server.windows_pipe_peer_facts().unwrap();
+        assert_eq!(facts.pid(), std::process::id());
+        assert!(!facts.user_sid().is_empty());
+        assert!(facts.creation_filetime() > 0);
+        assert!(!facts.image_path().is_empty());
+        assert_ne!(facts.image_file_id(), [0_u8; 16]);
+        facts.revalidate_process_birth().unwrap();
+        facts.revalidate_image().unwrap();
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn secure_broker_pipe_rejects_sid_injection_and_attests_live_dacl() {
+        let Err(error) = LocalListener::bind_secure_broker_pipe("S-1-5-18)(A;;GA;;;WD").await
+        else {
+            panic!("SDDL injection must not reach pipe creation");
+        };
+        assert!(error.to_string().contains("SID"), "{error}");
+
+        // Successful bind proves that the live handle, not just requested
+        // SDDL text, passed the exact protected-DACL attestation. Connection
+        // access is intentionally not asserted here: administrator membership
+        // may be enabled or deny-only depending on the test runner token.
+        let listener = LocalListener::bind_secure_broker_pipe("S-1-5-18")
+            .await
+            .expect("secure broker pipe DACL must be accepted");
+        assert_eq!(
+            listener.endpoint(),
+            &Endpoint::NamedPipe(LocalListener::SECURE_BROKER_PIPE_NAME.into())
+        );
+    }
 }

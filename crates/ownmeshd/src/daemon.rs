@@ -1,9 +1,10 @@
 //! Foreground daemon loop: local IPC + policy-gated operations.
 
+use crate::agent_transport;
 use crate::runtime::{runtime_handler, DaemonRuntime};
 use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
-use ownmesh_identity::{load_or_create_device_key, PreferredSecretStore, DEFAULT_KEYCHAIN_SERVICE};
+use ownmesh_identity::{load_or_create_device_key, PreferredSecretStore};
 use ownmesh_ipc::{
     methods, read_management_credential, AuthGate, BootstrapStatus, ClientIdentity, ClientOptions,
     CredentialSecretResult, Endpoint, IpcClient, IpcError, IpcServer, LocalListener, MethodHandler,
@@ -12,7 +13,12 @@ use ownmesh_ipc::{
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
+
+/// Bound idle interval for reclaiming expired transfer plaintext/state. Every
+/// transfer operation enforces expiry independently; this additionally removes
+/// durable parts and snapshots when the daemon receives no further requests.
+const TRANSFER_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Run ownmeshd until Ctrl-C / shutdown signal.
 pub fn run_foreground() -> Result<(), ExitCode> {
@@ -42,7 +48,7 @@ async fn run_async() -> Result<(), ExitCode> {
     })?;
     tracing::info!(lang = %cfg.lang, "config loaded");
 
-    let public = ensure_device_identity(&paths).map_err(|err| {
+    let public = ensure_device_identity(&paths, &cfg).map_err(|err| {
         tracing::error!(error = %err, "device identity bootstrap failed");
         ExitCode::Internal
     })?;
@@ -66,7 +72,7 @@ async fn run_async() -> Result<(), ExitCode> {
         }
     }
 
-    let (handler, revoked) = build_handler(&paths).map_err(|err| {
+    let (handler, revoked, runtime) = build_handler(&paths).map_err(|err| {
         tracing::error!(error = %err, "runtime bootstrap failed");
         ExitCode::Internal
     })?;
@@ -95,12 +101,72 @@ async fn run_async() -> Result<(), ExitCode> {
         }
     });
 
+    let (cleanup_shutdown, cleanup_shutdown_rx) = watch::channel(false);
+    let cleanup_task = spawn_transfer_cleanup(
+        Arc::clone(&runtime),
+        cleanup_shutdown_rx,
+        TRANSFER_CLEANUP_INTERVAL,
+    );
+
+    let (transport_shutdown, transport_shutdown_rx) = watch::channel(false);
+    let transport_task = match agent_transport::configured_transport(&paths, &cfg) {
+        Ok(Some(config)) => Some(tokio::spawn(agent_transport::run(
+            config,
+            Some(runtime),
+            transport_shutdown_rx,
+        ))),
+        Ok(None) => {
+            tracing::info!("no active enrolled device credential; remote Agent transport disabled");
+            None
+        }
+        Err(err) => {
+            // Fail closed for remote connectivity while keeping the local IPC
+            // boundary available for repair/re-enrollment.
+            tracing::error!(error = %err, "remote Agent transport configuration rejected");
+            None
+        }
+    };
+
     wait_for_shutdown().await?;
 
+    let _ = transport_shutdown.send(true);
+    let _ = cleanup_shutdown.send(true);
     server.request_shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(2), serve_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), cleanup_task).await;
+    if let Some(task) = transport_task {
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
     tracing::info!("ownmeshd stopped");
     Ok(())
+}
+
+fn spawn_transfer_cleanup(
+    runtime: Arc<Mutex<DaemonRuntime>>,
+    mut shutdown: watch::Receiver<bool>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+                _ = ticker.tick() => {
+                    let mut guard = runtime.lock().await;
+                    if let Err(error) = guard.cleanup_expired_transfers() {
+                        // Cleanup is deliberately retryable: a transient disk
+                        // failure must not terminate the policy/IPC service.
+                        tracing::error!(error = %error, "idle transfer cleanup failed");
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn remove_legacy_token(path: &std::path::Path) -> std::io::Result<bool> {
@@ -113,10 +179,22 @@ fn remove_legacy_token(path: &std::path::Path) -> std::io::Result<bool> {
 
 fn build_handler(
     paths: &OwnMeshPaths,
-) -> Result<(MethodHandler, ownmesh_ipc::RevokedClients), String> {
-    let runtime = DaemonRuntime::open(paths)?;
-    let revoked = runtime.revoked_clients_handle();
-    Ok((runtime_handler(Arc::new(Mutex::new(runtime))), revoked))
+) -> Result<
+    (
+        MethodHandler,
+        ownmesh_ipc::RevokedClients,
+        Arc<Mutex<DaemonRuntime>>,
+    ),
+    String,
+> {
+    let runtime = Arc::new(Mutex::new(DaemonRuntime::open(paths)?));
+    let revoked = {
+        let guard = runtime
+            .try_lock()
+            .map_err(|_| "runtime lock unavailable during bootstrap".to_owned())?;
+        guard.revoked_clients_handle()
+    };
+    Ok((runtime_handler(Arc::clone(&runtime)), revoked, runtime))
 }
 
 /// Resolve the daemon IPC endpoint + `AuthGate` from `config.service_socket`.
@@ -334,9 +412,11 @@ fn map_credential_rpc_error(err: IpcError) -> ExitCode {
 
 fn ensure_device_identity(
     paths: &OwnMeshPaths,
+    cfg: &ownmesh_config::OwnMeshConfig,
 ) -> Result<ownmesh_identity::DevicePublicIdentity, String> {
-    let store = PreferredSecretStore::open(DEFAULT_KEYCHAIN_SERVICE, paths.keystore_dir())
-        .map_err(|e| e.to_string())?;
+    let store =
+        PreferredSecretStore::open(agent_transport::keychain_service(cfg), paths.keystore_dir())
+            .map_err(|e| e.to_string())?;
     let key = load_or_create_device_key(&store).map_err(|e| e.to_string())?;
     Ok(key.public_identity())
 }
@@ -365,11 +445,36 @@ async fn wait_for_shutdown() -> Result<(), ExitCode> {
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.map_err(|err| {
-            tracing::error!(error = %err, "ctrl-c hook failed");
-            ExitCode::Internal
-        })?;
-        tracing::info!("ctrl-c received");
+        #[cfg(windows)]
+        {
+            let mut service_stop = tokio::time::interval(Duration::from_millis(200));
+            loop {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        result.map_err(|err| {
+                            tracing::error!(error = %err, "ctrl-c hook failed");
+                            ExitCode::Internal
+                        })?;
+                        tracing::info!("ctrl-c received");
+                        break;
+                    }
+                    _ = service_stop.tick() => {
+                        if ownmesh_ipc::windows_daemon_service_stop_requested() {
+                            tracing::info!("Windows SCM STOP received");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            tokio::signal::ctrl_c().await.map_err(|err| {
+                tracing::error!(error = %err, "ctrl-c hook failed");
+                ExitCode::Internal
+            })?;
+            tracing::info!("ctrl-c received");
+        }
         Ok(())
     }
 }
@@ -460,7 +565,12 @@ mod tests {
         IpcError,
     };
     use ownmesh_policy::{preset_document, AccessPreset, Decision, PolicyDocument, PolicyRule};
+    use ownmesh_transfer::{
+        ChunkSink, JournalLimits, JournalStore, PartFileSink, TransferBinding, TransferGrant,
+        TransferPlan,
+    };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     #[test]
@@ -678,6 +788,68 @@ mod tests {
         std::fs::write(&legacy, b"obsolete").unwrap();
         assert!(remove_legacy_token(&legacy).unwrap());
         assert!(!legacy.exists());
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_removes_expired_transfer_plaintext_without_a_transfer_api_call() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let runtime = Arc::new(Mutex::new(DaemonRuntime::open(&paths).unwrap()));
+        let store = JournalStore::open(paths.state_dir.join("transfers"), JournalLimits::default())
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bytes = b"expired plaintext";
+        let plan = TransferPlan::from_verified(
+            TransferBinding {
+                tenant_id: "tenant".into(),
+                source_principal_id: "source".into(),
+                destination_principal_id: "destination".into(),
+                source_device_id: "source-device".into(),
+                destination_device_id: "destination-device".into(),
+                source_workspace_id: "source-workspace".into(),
+                destination_workspace_id: "destination-workspace".into(),
+                source_relative_path: "source.bin".into(),
+                destination_relative_path: "destination.bin".into(),
+            },
+            TransferGrant {
+                grant_id: "grant".into(),
+                operation_id: "operation".into(),
+                payload_sha256: "a".repeat(64),
+                expires_at_unix: now + 2,
+            },
+            bytes.len() as u64,
+            hex::encode(Sha256::digest(bytes)),
+        )
+        .unwrap();
+        store.save_plan(&plan).unwrap();
+        let lease = store.acquire(&plan, now, now + 1).unwrap();
+        let journal = store
+            .claim(&lease, &plan, "owner", 1, 1, now, now + 1)
+            .unwrap();
+        let mut sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+        sink.write_chunk(0, bytes).unwrap();
+        let part = sink.path().to_path_buf();
+        drop(sink);
+        store.save(&lease, &journal).unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), bytes);
+
+        // No transfer RPC is made after this point. The idle task alone must
+        // acquire the same runtime mutex and delete the expired plaintext.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = spawn_transfer_cleanup(runtime, shutdown_rx, Duration::from_millis(10));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while part.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle cleanup must remove the expired private part");
+        let _ = shutdown.send(true);
+        task.await.unwrap();
     }
 
     fn test_client(endpoint: Endpoint, runtime_dir: impl Into<std::path::PathBuf>) -> IpcClient {
@@ -1348,7 +1520,12 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());
-        let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+        let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+        {
+            let mut g = runtime.lock().await;
+            // Sessions require full_user/full_access until OS confinement exists.
+            g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        }
 
         let chatgpt_cred = server.issue_client_credential("chatgpt").unwrap();
         let human_cred = server.issue_client_credential("human").unwrap();
@@ -1507,7 +1684,11 @@ mod tests {
         let paths = OwnMeshPaths::for_base(dir.path());
 
         let sid = {
-            let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+            let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+            {
+                let mut g = runtime.lock().await;
+                g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+            }
             let chatgpt_cred = server.issue_client_credential("chatgpt").unwrap();
             let chatgpt = named_client(
                 endpoint,
@@ -1611,6 +1792,74 @@ mod tests {
         };
         assert!(
             err.contains("failed to load sessions") || err.contains("sessions"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_approvals_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        // Just over the 4 MiB approval-state budget; must fail closed before deserialize.
+        let oversized = vec![b'A'; 4 * 1024 * 1024 + 64];
+        std::fs::write(paths.state_dir.join("approvals.json"), &oversized).unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("oversized approvals must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("approval state") && err.contains("byte budget"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_grants_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let oversized = vec![b'['; 1024 * 1024 + 32];
+        std::fs::write(paths.state_dir.join("grants.json"), &oversized).unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("oversized grants must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("grants state") && err.contains("byte budget"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_revoked_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let oversized = vec![b'['; 1024 * 1024 + 16];
+        std::fs::write(paths.state_dir.join("revoked-clients.json"), &oversized).unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("oversized revoked must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("revoked client state") && err.contains("byte budget"),
+            "err={err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_approvals_state_fails_runtime_open() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        std::fs::write(paths.state_dir.join("approvals.json"), b"{not-json").unwrap();
+        let err = match DaemonRuntime::open(&paths) {
+            Ok(_) => panic!("corrupt approvals must fail open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("corrupt approval state") || err.contains("approval state"),
             "err={err}"
         );
     }
@@ -1901,5 +2150,344 @@ mod tests {
 
         server.request_shutdown();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn restricted_presets_fail_closed_on_command_escape() {
+        for preset in [AccessPreset::WorkspaceOnly, AccessPreset::Recommended] {
+            let dir = tempdir().unwrap();
+            let paths = OwnMeshPaths::for_base(dir.path());
+            let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+            let client = test_client(endpoint, paths.runtime_dir.clone());
+            {
+                let mut g = runtime.lock().await;
+                g.set_policy_for_test(preset_document(preset));
+            }
+
+            // Interactive session launch is also denied (stdin escapes workspace).
+            let err = client
+                .call(
+                    crate::runtime::session_methods::OPEN,
+                    Some(json!({
+                        "title": "escape-session",
+                        "kind": "pty",
+                        "command": ["/bin/sh", "-c", "touch /tmp/ownmesh-policy-bypass"],
+                        "cwd": if cfg!(windows) { "C:\\" } else { "/tmp" },
+                    })),
+                )
+                .await
+                .expect_err("restricted session.open must deny");
+            match err {
+                IpcError::Remote { code, message } => {
+                    assert_eq!(code, app_error::POLICY_DENIED, "{preset:?}: {message}");
+                    assert!(
+                        message.to_ascii_lowercase().contains("session.open")
+                            || message.to_ascii_lowercase().contains("confinement"),
+                        "{preset:?}: {message}"
+                    );
+                }
+                other => panic!("{preset:?}: unexpected {other:?}"),
+            }
+
+            // Absolute cwd escape attempt.
+            let err = client
+                .call(
+                    methods::OPS_EXEC,
+                    Some(json!({
+                        "program": "echo",
+                        "args": ["escape"],
+                        "cwd": if cfg!(windows) { "C:\\" } else { "/" },
+                        "idempotency_key": format!("escape-cwd-{preset:?}"),
+                    })),
+                )
+                .await
+                .expect_err("restricted command must deny");
+            match err {
+                IpcError::Remote { code, message } => {
+                    assert_eq!(code, app_error::POLICY_DENIED, "{preset:?}: {message}");
+                    let lower = message.to_ascii_lowercase();
+                    assert!(
+                        lower.contains("confinement")
+                            || lower.contains("denied")
+                            || lower.contains("workspace"),
+                        "{preset:?}: {message}"
+                    );
+                }
+                other => panic!("{preset:?}: unexpected {other:?}"),
+            }
+
+            // Interpreter-style structured command with absolute path arg.
+            let err = client
+                .call(
+                    methods::OPS_EXEC,
+                    Some(json!({
+                        "kind": "structured",
+                        "program": if cfg!(windows) { "cmd" } else { "python3" },
+                        "args": if cfg!(windows) {
+                            json!(["/c", "type", "C:\\Windows\\win.ini"])
+                        } else {
+                            json!(["-c", "open('/etc/passwd').read()"])
+                        },
+                        "idempotency_key": format!("escape-interp-{preset:?}"),
+                    })),
+                )
+                .await
+                .expect_err("interpreter escape must deny");
+            match err {
+                IpcError::Remote { code, .. } => {
+                    assert_eq!(code, app_error::POLICY_DENIED, "{preset:?}");
+                }
+                other => panic!("{preset:?}: unexpected {other:?}"),
+            }
+
+            server.request_shutdown();
+            let _ = handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn session_observer_attach_cannot_write() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+        {
+            let mut g = runtime.lock().await;
+            g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        }
+        let client = test_client(endpoint, paths.runtime_dir.clone());
+
+        let opened = client
+            .call(
+                crate::runtime::session_methods::OPEN,
+                Some(json!({ "title": "obs-test", "kind": "pty" })),
+            )
+            .await
+            .expect("open");
+        let sid = opened["id"].as_str().unwrap().to_owned();
+
+        let attached = client
+            .call(
+                crate::runtime::session_methods::ATTACH,
+                Some(json!({
+                    "id": sid,
+                    "role": "observer",
+                })),
+            )
+            .await
+            .expect("observer attach");
+        assert_eq!(attached["read_only"], true);
+        assert_eq!(attached["role"], "observer");
+
+        let err = client
+            .call(
+                crate::runtime::session_methods::WRITE,
+                Some(json!({ "id": sid, "data": "nope" })),
+            )
+            .await
+            .expect_err("observer write");
+        match err {
+            IpcError::Remote { code, message } => {
+                assert!(
+                    code == app_error::CONFLICT || code == app_error::POLICY_DENIED,
+                    "code={code} message={message}"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        server.request_shutdown();
+        let _ = handle.await;
+    }
+
+    /// Remote MCP Ask must retain the control-plane operation id, and a bound
+    /// control-plane recovery decision must execute the deferred side effect
+    /// exactly once under that same operation identity.
+    #[tokio::test]
+    async fn remote_ask_retains_operation_id_and_control_plane_approve_executes() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::Recommended));
+
+        let remote_op = "op_mcp_ask_bind_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let marker = paths.state_dir.join("workspace").join("remote-ask.txt");
+        assert!(!marker.exists());
+
+        let ask = rt
+            .dispatch_cancellable(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "remote-ask.txt",
+                    "content": "from-control-plane-approve",
+                    "idempotency_key": "remote-ask-key-1",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+            )
+            .await
+            .expect("ask");
+        assert_eq!(ask["approval_required"], true);
+        assert_eq!(
+            ask["operation_id"].as_str().unwrap(),
+            remote_op,
+            "Ask must echo the remote MCP operation id"
+        );
+        let approval_id = ask["approval_id"].as_str().unwrap().to_owned();
+        assert!(!marker.exists(), "must not write before approve");
+
+        // Wrong target binding must fail closed.
+        let bad = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": "op_other",
+                "decision": "approve",
+            })))
+            .await
+            .expect_err("mismatched target");
+        match bad {
+            IpcError::Remote { code, .. } => assert_eq!(code, app_error::INVALID_PARAMS),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let approved = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "decision": "approve",
+            })))
+            .await
+            .expect("control-plane approve");
+        assert_eq!(approved["approval_decision_applied"], true);
+        assert_eq!(approved["decision"], "approve");
+        assert_eq!(approved["target_operation_id"], remote_op);
+        assert_eq!(approved["replayed"], false);
+        assert!(marker.exists(), "approve must execute deferred write");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "from-control-plane-approve"
+        );
+
+        // Exact-once: second decision must not re-run the side effect.
+        let before = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let again = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "decision": "approve",
+            })))
+            .await
+            .expect("replay");
+        assert_eq!(again["replayed"], true);
+        let after = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        assert_eq!(before, after, "replay must not rewrite the file");
+    }
+
+    #[tokio::test]
+    async fn remote_ask_control_plane_deny_is_terminal() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let remote_op = "op_mcp_ask_deny_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let ask = rt
+            .dispatch_cancellable(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "deny-me.txt",
+                    "content": "nope",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+            )
+            .await
+            .expect("ask");
+        assert_eq!(ask["operation_id"].as_str().unwrap(), remote_op);
+        let denied = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "target_operation_id": remote_op,
+                "decision": "deny",
+            })))
+            .await
+            .expect("deny");
+        assert_eq!(denied["decision"], "deny");
+        assert_eq!(denied["state"], "denied");
+        assert!(!paths
+            .state_dir
+            .join("workspace")
+            .join("deny-me.txt")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn remote_ask_expired_binding_rejects_recovery_approve() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let remote_op = "op_mcp_ask_expired_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let past = chrono_lite_unix_now().saturating_sub(120);
+        let ask = rt
+            .dispatch_cancellable_bound(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "expired.txt",
+                    "content": "too-late",
+                    "idempotency_key": "expired-ask-1",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+                Some(past),
+                Some("d".repeat(64)),
+                None,
+            )
+            .await
+            .expect("ask");
+        assert_eq!(ask["approval_required"], true);
+        let approval_id = ask["approval_id"].as_str().unwrap().to_owned();
+
+        let err = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "decision": "approve",
+                "target_payload_hash": "d".repeat(64),
+            })))
+            .await
+            .expect_err("expired must fail closed");
+        match err {
+            IpcError::Remote { code, message } => {
+                assert_eq!(code, app_error::UNAUTHORIZED);
+                assert!(
+                    message.to_ascii_lowercase().contains("expired"),
+                    "{message}"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            !paths
+                .state_dir
+                .join("workspace")
+                .join("expired.txt")
+                .exists(),
+            "expired approve must not execute"
+        );
+    }
+
+    fn chrono_lite_unix_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
     }
 }

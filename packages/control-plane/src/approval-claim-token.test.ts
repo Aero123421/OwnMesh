@@ -224,7 +224,7 @@ test("reclaim issues a new token and bumps version; old owner is invalidated", a
       second!.claim_version!,
     );
     assert.ok(finNew);
-    assert.equal(finNew!.status, "pending");
+    assert.equal(finNew!.status, "approval_required");
     assert.equal((await store.getMcpApprovalOutbox(txId))!.delivery_status, "delivered");
   }
 
@@ -329,7 +329,7 @@ test("finalize rejects wrong/missing token or version without state change", asy
 
     const ok = await store.finalizeMcpApprovalDelivery(txId, token, version);
     assert.ok(ok);
-    assert.equal(ok!.status, "pending");
+    assert.equal(ok!.status, "approval_required");
     box = await store.getMcpApprovalOutbox(txId);
     assert.equal(box!.delivery_status, "delivered");
   }

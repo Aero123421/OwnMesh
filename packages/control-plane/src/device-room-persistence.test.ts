@@ -19,6 +19,7 @@ import {
   MAX_PENDING_PAYLOAD_BYTES,
   MAX_SEEN_MESSAGE_IDS,
   MAX_SERIALIZED_STATE_BYTES,
+  LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS,
   PENDING_TTL_MS,
   PROTOCOL,
   ROOM_STATE_STORAGE_KEY,
@@ -52,6 +53,27 @@ async function operationHeaders(
     correlation_id: extra?.correlation_id,
     method: "POST",
     path: "/operation",
+    body_sha256,
+  });
+  return { headers, bodyText };
+}
+
+/** Mint the stricter one-shot internal context used for ticket-bearing starts. */
+async function liveOperationHeaders(
+  deviceId: string,
+  body: unknown,
+  correlationId: string,
+): Promise<{ headers: Headers; bodyText: string }> {
+  const bodyText = JSON.stringify(body);
+  const body_sha256 = await sha256Hex(bodyText);
+  const headers = await internalDoHeaders(SESSION_SECRET, {
+    op: "live_operation",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    correlation_id: correlationId,
+    method: "POST",
+    path: "/live-operation",
     body_sha256,
   });
   return { headers, bodyText };
@@ -191,6 +213,7 @@ test("exportState/importState restores lastSeq, seenMessageIds, pending across h
   const agent = room.connect("agent");
   const client = room.connect("client");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
 
   await room.send(agent, envFor(agent, "ping", deviceId, {}, undefined, { seq: 3, message_id: "mid_a" }));
   await room.send(agent, envFor(agent, "ping", deviceId, {}, undefined, { seq: 7, message_id: "mid_b" }));
@@ -218,6 +241,7 @@ test("exportState/importState restores lastSeq, seenMessageIds, pending across h
     session_id: agent,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   woken.router.registerSession({
     role: "client",
@@ -273,6 +297,7 @@ test("seenMessageIds TTL and hard cap are force-pruned", () => {
     session_id: "ags_1",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   const guard = router.ingressGuards.get("ags_1")!;
   const now = Date.now();
@@ -326,7 +351,7 @@ test("pending TTL and hard cap are force-pruned", () => {
   }
 
   const removed = router.pruneExpiredPending(now);
-  assert.ok(removed > 0);
+  assert.ok(removed.length > 0);
   assert.equal(router.pending.has("expired_op"), false);
   assert.ok(router.pending.size <= MAX_PENDING_OPERATIONS);
   assert.ok(router.pending.size > 0);
@@ -338,6 +363,7 @@ test("operation.request rejects when pending hard cap reached", async () => {
   const agent = room.connect("agent");
   const client = room.connect("client");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const now = Date.now();
   for (let i = 0; i < MAX_PENDING_OPERATIONS; i++) {
     room.router.pending.set(`fill_${i}`, {
@@ -450,6 +476,7 @@ test("DeviceRoom persists lastSeq/seen/pending to storage and restores on new in
     session_id: "ags_p1",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   room1.router.registerSession({
     role: "client",
@@ -500,6 +527,7 @@ test("env.DB missing fails closed: /operation 503 and existing WS closed", async
     session_id: "ags_nodb",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: "deadbeef",
     lastSeq: 1,
   };
@@ -568,6 +596,7 @@ test("revoked / expired device credential is rejected on important ops", async (
     session_id: "ags_cred",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
     lastSeq: 0,
   };
@@ -619,6 +648,7 @@ test("revoked / expired device credential is rejected on important ops", async (
     session_id: "ags_exp",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: hash2,
     lastSeq: 0,
   };
@@ -637,7 +667,21 @@ test("revoked / expired device credential is rejected on important ops", async (
     `UPDATE device_credentials SET expires_at = ? WHERE credential_hash = ?`,
   ).run(new Date(Date.now() - 60_000).toISOString(), hash2);
 
-  const expPayload = { type: "ownmesh_fs_list", correlation_id: "op_exp" };
+  const expPayload = {
+    type: "ownmesh_fs_list",
+    correlation_id: "op_exp",
+    payload: {
+      operation_id: "op_exp",
+      capability: "fs.list",
+      authorization: {
+        bound_action: {
+          principal_id: "prin_dev",
+          tenant_id: DEFAULT_TENANT,
+          principal_credential_generation: 1,
+        },
+      },
+    },
+  };
   const { headers: expHeaders, bodyText: expBody } = await operationHeaders(deviceB, expPayload, {
     correlation_id: "op_exp",
   });
@@ -679,6 +723,7 @@ test("attachment lastSeq mirrors guard and survives register after import", () =
     session_id: "ags_x",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     lastSeq: 5, // attachment stale — must not rewind storage
   });
   assert.equal(router.ingressGuards.get("ags_x")!.lastSeq, 9);
@@ -696,6 +741,7 @@ test("storage restore error fails closed: refuse /operation and close sockets", 
     session_id: "ags_rf",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: "ab".repeat(32),
     lastSeq: 1,
   };
@@ -755,12 +801,28 @@ test("persist failure fails closed: no success response after storage put error"
     session_id: "ags_pf",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   // Force send success without real WS.
   room.router.sendToSession = () => true;
 
   failPut = true;
-  const payload = { type: "ownmesh_fs_list", correlation_id: "op_pf", payload: { path: "/" } };
+  const payload = {
+    type: "ownmesh_fs_list",
+    correlation_id: "op_pf",
+    payload: {
+      operation_id: "op_pf",
+      capability: "fs.list",
+      authorization: {
+        bound_action: {
+          principal_id: "prin_dev",
+          tenant_id: DEFAULT_TENANT,
+          principal_credential_generation: 1,
+        },
+      },
+      arguments: { path: "/" },
+    },
+  };
   const { headers, bodyText } = await operationHeaders(deviceId, payload, { correlation_id: "op_pf" });
   const res = await room.fetch(
     new Request("https://device-room/operation?device_id=" + deviceId, {
@@ -860,6 +922,7 @@ test("pending payload byte budget rejects inject beyond TTL/count caps", () => {
     session_id: "ags_pb",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   const fat = { blob: "z".repeat(Math.floor(MAX_PENDING_PAYLOAD_BYTES / 2) + 100) };
   const r1 = router.injectOperation({
@@ -876,6 +939,79 @@ test("pending payload byte budget rejects inject beyond TTL/count caps", () => {
   assert.equal(r2.status, "rejected");
   assert.equal((r2.detail as { code: string }).code, "OWNMESH_E_PENDING_PAYLOAD_LIMIT");
   assert.ok(router.totalPendingPayloadBytes() <= MAX_PENDING_PAYLOAD_BYTES);
+});
+
+test("credential rotation terminally removes a pending operation before Agent redelivery", async () => {
+  const { adapter, store } = openSqliteAdapter();
+  const deviceId = "dev_generation_redelivery_01";
+  await seedActiveDevice(store, deviceId);
+  const operationId = "op_generation_redelivery_01";
+  const generation = (await store.getPrincipal("prin_dev"))!.credential_generation;
+  const boundAction = {
+    capability: "fs.list",
+    action: "fs.list",
+    tool: "ownmesh_fs_list",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    principal_credential_generation: generation,
+    facts: { path: "/" },
+  };
+  await store.putMcpOperation({
+    operation_id: operationId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_list",
+    status: "pending",
+    summary: "awaiting redelivery",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: operationId,
+    action: boundAction,
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const room = new DeviceRoom(mockDOState(), {
+    DB: adapter as unknown as D1Database,
+    SESSION_SECRET,
+  });
+  await room.ready;
+  room.deviceId = deviceId;
+  room.router.deviceId = deviceId;
+  const agentId = "ags_generation_redelivery";
+  room.router.registerSession({
+    role: "agent", device_id: deviceId, session_id: agentId,
+    connected_at: Date.now(), phase: "ready", remote_routing_enabled: true,
+  });
+  let sends = 0;
+  room.router.sendToSession = () => {
+    sends += 1;
+    return true;
+  };
+  room.router.pending.set(operationId, {
+    correlation_id: operationId,
+    type: "ownmesh_fs_list",
+    from_session: "http_client",
+    created_at: Date.now(),
+    payload: {
+      operation_id: operationId,
+      capability: "fs.list",
+      authorization: { bound_action: boundAction },
+    },
+  });
+
+  await store.advancePrincipalCredentialGeneration("prin_dev");
+  await (room as unknown as { redeliverCurrentPending(sessionId: string): Promise<void> })
+    .redeliverCurrentPending(agentId);
+
+  assert.equal(sends, 0);
+  assert.equal(room.router.pending.has(operationId), false);
+  assert.equal((await store.getMcpOperation(operationId))?.status, "failed");
 });
 
 test("operation.result CAS binds op+correlation+device before forward; mismatch rejected", async () => {
@@ -978,6 +1114,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: "ab".repeat(32),
   });
   room.router.sendToSession = (sid, data) => {
@@ -1041,6 +1178,7 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
     lastSeq: 1,
   });
@@ -1065,6 +1203,437 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
     clientInbox.some((m) => (JSON.parse(m) as DeviceEnvelope).type === "operation.result"),
     "client receives result only after CAS",
   );
+});
+
+test("live transfer tombstone survives hibernation without bearer replay or storage", async () => {
+  const deviceId = "dev_live_ticket_01";
+  const rawBearer = "ticket.live-secret.jti-123";
+  const rawCiphertext = "ciphertext-live-transfer-bytes";
+  const delivered: string[] = [];
+  const router = new DeviceRoomRouter(deviceId, {
+    sendToSession: (sid, raw) => { if (sid === "ags_live") delivered.push(raw); return true; },
+    sendToRole: () => 0,
+  });
+  router.registerSession({ role: "agent", device_id: deviceId, session_id: "ags_live", connected_at: Date.now(), phase: "ready", remote_routing_enabled: true });
+  router.pending.set("op_live", {
+    correlation_id: "op_live", type: "transfer.start", from_session: "", created_at: Date.now(),
+    payload: { operation_id: "op_live", capability: "transfer.start" }, expires_at: new Date(Date.now() + 60_000).toISOString(), live_only: true,
+  });
+  const snapshot = router.exportState();
+  const stored = JSON.stringify(snapshot);
+  for (const forbidden of [rawBearer, rawCiphertext, "ephemeral", "bearer.secret", "raw-transfer-bytes"]) {
+    assert.equal(stored.includes(forbidden), false, `durable state leaked ${forbidden}`);
+  }
+  const resumed = new DeviceRoomRouter(deviceId, { sendToSession: () => true, sendToRole: () => 0 });
+  resumed.importState(snapshot);
+  resumed.registerSession({ role: "agent", device_id: deviceId, session_id: "ags_live", connected_at: Date.now(), phase: "ready", remote_routing_enabled: true });
+  assert.equal(resumed.redeliverPendingToAgent("ags_live"), 0, "live ticket must never be hibernation-replayed");
+  const result = await resumed.handleMessage("ags_live", JSON.stringify(envFor("ags_live", "operation.result", deviceId, { operation_id: "op_live", status: "completed", result: {} }, "op_live")));
+  assert.equal(result.ok, true, "delayed authenticated result still correlates");
+  assert.ok(delivered.length === 0);
+});
+
+test("live-operation sends raw ticket once but persists only a redacted tombstone", async () => {
+  const deviceId = "dev_live_do_boundary_01";
+  const { adapter, store } = openSqliteAdapter();
+  const { token } = await seedActiveDevice(store, deviceId);
+  const authHash = await sha256Hex(token);
+  const storage = new Map<string, unknown>();
+  const att: SessionAttachment = {
+    role: "agent", device_id: deviceId, session_id: "ags_live_boundary", connected_at: Date.now(),
+    phase: "ready", remote_routing_enabled: true, auth_hash: authHash, lastSeq: 0,
+  };
+  const socket = mockSocket(att);
+  const room = new DeviceRoom(mockDOState({ sockets: [socket], storage }), {
+    DB: adapter as unknown as D1Database, SESSION_SECRET,
+  });
+  await room.ready;
+  room.deviceId = deviceId;
+  room.router.deviceId = deviceId;
+  room.wsSessions.set(socket as unknown as WebSocket, att.session_id);
+  room.router.registerSession(att);
+
+  const makeLiveBody = (correlationId: string, ticket: string) => ({
+    type: "operation.request",
+    correlation_id: correlationId,
+    expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    payload: {
+      operation_id: correlationId, capability: "transfer.start",
+      authorization: {
+        bound_action: {
+          principal_id: "prin_dev",
+          tenant_id: DEFAULT_TENANT,
+          principal_credential_generation: 1,
+        },
+      },
+      arguments: {
+        ticket, jti: `jti-${ticket}`, ephemeral_public_key: `ephemeral-${ticket}`,
+        relay_ciphertext: `cipher-${ticket}`,
+      },
+    },
+  });
+  const callLive = async (correlationId: string, ticket: string) => {
+    const { headers, bodyText } = await liveOperationHeaders(deviceId, makeLiveBody(correlationId, ticket), correlationId);
+    return room.fetch(new Request(`https://device-room/live-operation?device_id=${deviceId}`, {
+      method: "POST", headers, body: bodyText,
+    }));
+  };
+
+  const noAgent = new DeviceRoom(mockDOState({ storage: new Map() }), {
+    DB: adapter as unknown as D1Database, SESSION_SECRET,
+  });
+  await noAgent.ready;
+  noAgent.deviceId = deviceId;
+  noAgent.router.deviceId = deviceId;
+  const offline = await (async () => {
+    const correlationId = "op_live_offline";
+    const { headers, bodyText } = await liveOperationHeaders(deviceId, makeLiveBody(correlationId, "ticket-offline"), correlationId);
+    return noAgent.fetch(new Request(`https://device-room/live-operation?device_id=${deviceId}`, { method: "POST", headers, body: bodyText }));
+  })();
+  assert.equal(offline.status, 503);
+  assert.equal(((await offline.json()) as { status: string }).status, "device_offline");
+
+  const marker = "ticket-live-boundary-secret";
+  const delivered = await callLive("op_live_delivered", marker);
+  assert.equal(delivered.status, 200);
+  assert.equal(((await delivered.json()) as { status: string }).status, "routed_to_device");
+  assert.equal(socket.sent.length, 1, "the ready exact Agent receives the one live request");
+  assert.ok(socket.sent[0]!.includes(marker));
+
+  const persisted = JSON.stringify(storage.get(ROOM_STATE_STORAGE_KEY));
+  for (const forbidden of [marker, `jti-${marker}`, `ephemeral-${marker}`, `cipher-${marker}`]) {
+    assert.equal(persisted.includes(forbidden), false, `DO persisted raw live field: ${forbidden}`);
+  }
+  const hibernated = new DeviceRoom(mockDOState({ storage }), {
+    DB: adapter as unknown as D1Database, SESSION_SECRET,
+  });
+  await hibernated.ready;
+  hibernated.deviceId = deviceId;
+  hibernated.router.deviceId = deviceId;
+  hibernated.router.registerSession({ ...att, session_id: "ags_live_after_hibernate" });
+  assert.equal(hibernated.router.redeliverPendingToAgent("ags_live_after_hibernate"), 0, "hibernation never replays a live bearer");
+
+  // A closed socket is a definite non-delivery, so its tombstone is removed
+  // before the offline response and cannot consume room capacity.
+  socket.close(1006, "closed before live send");
+  const sendFalseMarker = "ticket-send-false-secret";
+  const sendFalse = await callLive("op_live_send_false", sendFalseMarker);
+  assert.equal(sendFalse.status, 503);
+  assert.equal(((await sendFalse.json()) as { status: string }).status, "device_offline");
+  const afterFalse = JSON.stringify(storage.get(ROOM_STATE_STORAGE_KEY));
+  assert.equal(afterFalse.includes(sendFalseMarker), false);
+  assert.equal(room.router.pending.has("op_live_send_false"), false);
+
+  // A persist failure precedes socket dispatch. The live request is therefore
+  // non-successful and its bearer never crosses either durable or socket state.
+  const failingStorage = new Map<string, unknown>();
+  const failingSocket = mockSocket({ ...att, session_id: "ags_live_persist_fail" });
+  const failingState = mockDOState({ sockets: [failingSocket], storage: failingStorage });
+  (failingState.storage as unknown as { put: (key: string, value: unknown) => Promise<void> }).put = async () => {
+    throw new Error("live_tombstone_persist_failed");
+  };
+  const persistFailRoom = new DeviceRoom(failingState, { DB: adapter as unknown as D1Database, SESSION_SECRET });
+  await persistFailRoom.ready;
+  persistFailRoom.deviceId = deviceId;
+  persistFailRoom.router.deviceId = deviceId;
+  persistFailRoom.wsSessions.set(failingSocket as unknown as WebSocket, "ags_live_persist_fail");
+  persistFailRoom.router.registerSession({ ...att, session_id: "ags_live_persist_fail" });
+  const persistFailMarker = "ticket-persist-failure-secret";
+  const persistFailCorrelation = "op_live_persist_fail";
+  const persistFailHeaders = await liveOperationHeaders(
+    deviceId, makeLiveBody(persistFailCorrelation, persistFailMarker), persistFailCorrelation,
+  );
+  const persistFail = await persistFailRoom.fetch(new Request(`https://device-room/live-operation?device_id=${deviceId}`, {
+    method: "POST", headers: persistFailHeaders.headers, body: persistFailHeaders.bodyText,
+  }));
+  assert.equal(persistFail.status, 503);
+  assert.equal(((await persistFail.json()) as { error: string }).error, "storage_unavailable");
+  assert.equal(failingSocket.sent.length, 0, "no live bearer send may precede durable tombstone persistence");
+  assert.equal(JSON.stringify(failingStorage).includes(persistFailMarker), false);
+});
+
+test("live transfer tombstones retain only until operation expiry and remain bounded", () => {
+  const deviceId = "dev_live_tombstone_bounds_01";
+  const router = new DeviceRoomRouter(deviceId, { sendToSession: () => true, sendToRole: () => 0 });
+  const now = Date.now();
+  router.pending.set("long_running", {
+    correlation_id: "long_running", type: "transfer.start", from_session: "", payload: { operation_id: "long_running", capability: "transfer.start" },
+    created_at: now - PENDING_TTL_MS - 1, expires_at: new Date(now + LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS).toISOString(), live_only: true,
+  });
+  router.pending.set("expired", {
+    correlation_id: "expired", type: "transfer.start", from_session: "", payload: { operation_id: "expired", capability: "transfer.start" },
+    created_at: now, expires_at: new Date(now - 1).toISOString(), live_only: true,
+  });
+  router.pruneExpiredPending(now);
+  assert.equal(router.pending.has("long_running"), true, "long transfer result remains correlatable past normal dispatch TTL");
+  assert.equal(router.pending.has("expired"), false, "operation deadline clears live correlation tombstone");
+
+  for (let i = 0; i < MAX_PENDING_OPERATIONS + 8; i++) {
+    router.pending.set(`live_${i}`, {
+      correlation_id: `live_${i}`, type: "transfer.start", from_session: "", payload: { operation_id: `live_${i}`, capability: "transfer.start" },
+      created_at: now + i, expires_at: new Date(now + LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS).toISOString(), live_only: true,
+    });
+  }
+  router.pruneExpiredPending(now);
+  assert.ok(router.pending.size <= MAX_PENDING_OPERATIONS, "live-only correlation state is hard bounded");
+});
+
+test("transfer preflight results are exact-correlated metadata only", async () => {
+  const { store } = openSqliteAdapter();
+  await store.ensureBootstrap();
+  const deviceId = "dev_preflight_source_01";
+  await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_");
+  const correlationId = randomId("cor_");
+  const expiresAt = Date.now() + 30_000;
+  const expected = {
+    role: "source",
+    transfer_id: "xfer_preflight_1",
+    tenant_id: DEFAULT_TENANT,
+    plan_sha256: "a".repeat(64),
+    epoch: 1,
+    fence: 1,
+    expires_at: expiresAt,
+    device_id: deviceId,
+    workspace_id: "ws_source",
+    session_nonce: "nonce_preflight_1",
+    coordinator_request_id: "coord_preflight_1",
+    workspace_version: 7,
+  };
+  await store.putMcpOperation({
+    operation_id: opId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "__transfer_preflight_source",
+    status: "pending",
+    summary: "transfer source preflight",
+    data: { __transfer_preflight_expectation: expected },
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: correlationId,
+    workspace_id: "ws_source",
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const proof = {
+    role: "source",
+    transfer_id: expected.transfer_id,
+    tenant_id: expected.tenant_id,
+    device_id: deviceId,
+    workspace_id: expected.workspace_id,
+    plan_sha256: expected.plan_sha256,
+    epoch: 1,
+    fence: 1,
+    session_nonce: expected.session_nonce,
+    expires_at: expiresAt,
+    ephemeral_public_key: "11".repeat(32),
+    ephemeral_signature: "22".repeat(64),
+  };
+  const rejected = await applyMcpOperationResult(store, {
+    operationId: opId,
+    correlationId,
+    deviceId,
+    payload: {
+      operation_id: opId,
+      status: "completed",
+      result: {
+        transfer_preflight: { ...proof, ciphertext_base64: "must-not-persist" },
+        operation_id: opId,
+        coordinator_request_id: expected.coordinator_request_id,
+        principal_id: "prin_dev",
+        workspace_version: expected.workspace_version,
+      },
+    },
+  });
+  assert.deepEqual(rejected, { ok: false, error: "transfer_preflight_proof_mismatch" });
+  assert.equal((await store.getMcpOperation(opId))?.status, "pending");
+
+  const accepted = await applyMcpOperationResult(store, {
+    operationId: opId,
+    correlationId,
+    deviceId,
+    payload: {
+      operation_id: opId,
+      status: "completed",
+      result: {
+        transfer_preflight: proof,
+        operation_id: opId,
+        coordinator_request_id: expected.coordinator_request_id,
+        principal_id: "prin_dev",
+        workspace_version: expected.workspace_version,
+        source_plan: { plan_id: "xfer_local_1", sha256: "b".repeat(64), size_bytes: 1 },
+      },
+    },
+  });
+  assert.equal(accepted.ok, true);
+  const saved = await store.getMcpOperation(opId);
+  assert.equal(saved?.status, "completed");
+  assert.deepEqual(saved?.data, {
+    transfer_preflight: proof,
+    operation_id: opId,
+    coordinator_request_id: expected.coordinator_request_id,
+    principal_id: "prin_dev",
+    workspace_version: expected.workspace_version,
+    source_plan: { plan_id: "xfer_local_1", sha256: "b".repeat(64), size_bytes: 1 },
+  });
+});
+
+test("transfer artifact results are bounded, hash-checked, and exact-plan bound", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_artifact_destination_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const correlationId = randomId("cor_");
+  await store.putMcpOperation({
+    operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
+    tool: "__transfer_artifact_get", status: "pending", summary: "artifact", data: { transfer_id: "xfer_1", offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 3 },
+    truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: correlationId,
+    workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  const bytes = new TextEncoder().encode("abc"); const content_base64 = btoa("abc");
+  const page_sha256 = await sha256Hex(bytes);
+  const base = { plan_id: "plan_destination", offset: 0, bytes: 3, total_bytes: 3, next_offset: null, truncated: false, encoding: "base64", content_base64, page_sha256, sha256: "c".repeat(64) };
+  const tampered = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...base, page_sha256: "d".repeat(64) } } });
+  assert.deepEqual(tampered, { ok: false, error: "transfer_artifact_page_hash_mismatch" });
+  assert.equal((await store.getMcpOperation(opId))?.status, "pending");
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: base } });
+  assert.equal(accepted.ok, true); assert.equal((await store.getMcpOperation(opId))?.data.content_base64, content_base64);
+
+  const mismatchId = randomId("op_");
+  await store.putMcpOperation({ operation_id: mismatchId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact mismatch", data: { offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 3 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: mismatchId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const mismatchedDigest = await applyMcpOperationResult(store, { operationId: mismatchId, correlationId: mismatchId, deviceId, payload: { operation_id: mismatchId, status: "completed", result: { ...base, sha256: "d".repeat(64) } } });
+  assert.deepEqual(mismatchedDigest, { ok: false, error: "transfer_artifact_result_binding_mismatch" });
+
+  const overflowId = randomId("op_");
+  await store.putMcpOperation({ operation_id: overflowId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_artifact_get", status: "pending", summary: "artifact overflow", data: { offset: 0, max_bytes: 65536, expected_sha256: "c".repeat(64), expected_total_bytes: 65537 }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: overflowId, workspace_id: "ws_destination", action: { facts: { plan_id: "plan_destination" } }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const tooMany = new Uint8Array(65537); const overflow = await applyMcpOperationResult(store, { operationId: overflowId, correlationId: overflowId, deviceId, payload: { operation_id: overflowId, status: "completed", result: { ...base, bytes: 65537, total_bytes: 65537, content_base64: btoa(String.fromCharCode(...tooMany)), page_sha256: "e".repeat(64) } } });
+  assert.deepEqual(overflow, { ok: false, error: "transfer_artifact_result_binding_mismatch" });
+});
+
+test("transfer start receipts reject bearer/byte fields and require exact immutable bindings", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_start_destination_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const correlationId = randomId("cor_");
+  const facts = { transfer_id: "xfer_start_1", plan_sha256: "a".repeat(64), content_sha256: "b".repeat(64), epoch: 2, fence: 3 };
+  await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_destination", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: correlationId, workspace_id: "ws_destination", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const receipt = { transfer_id: facts.transfer_id, plan_id: "plan_destination", role: "destination", plan_sha256: facts.plan_sha256, epoch: 2, fence: 3, admitted: true, completed: true, published: true, artifact_sha256: facts.content_sha256 };
+  const rejected = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, ticket: "must-not-store" } } });
+  assert.deepEqual(rejected, { ok: false, error: "transfer_start_result_unknown_field" });
+  const wrongArtifact = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: { ...receipt, artifact_sha256: "c".repeat(64) } } });
+  assert.deepEqual(wrongArtifact, { ok: false, error: "transfer_start_result_binding_mismatch" });
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId, deviceId, payload: { operation_id: opId, status: "completed", result: receipt } });
+  assert.equal(accepted.ok, true); assert.deepEqual((await store.getMcpOperation(opId))?.data, receipt);
+
+  const reconnectId = randomId("op_");
+  await store.putMcpOperation({ operation_id: reconnectId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_destination", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: reconnectId, workspace_id: "ws_destination", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const reconnect = await applyMcpOperationResult(store, { operationId: reconnectId, correlationId: reconnectId, deviceId, payload: { operation_id: reconnectId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_RECONNECT", message: "bearer distinctive-ticket-secret", details: { ciphertext_base64: "must-not-persist" } } } });
+  assert.equal(reconnect.ok, true);
+  const storedReconnect = await store.getMcpOperation(reconnectId);
+  assert.deepEqual(storedReconnect?.data, { error: { code: "OWNMESH_E_TRANSFER_RECONNECT" } });
+  assert.equal(storedReconnect?.summary, "transfer start requires a fresh connection proof");
+  assert.equal(JSON.stringify(storedReconnect).includes("distinctive-ticket-secret"), false);
+  assert.equal(JSON.stringify(storedReconnect).includes("must-not-persist"), false);
+
+  const cleanupPendingId = randomId("op_");
+  await store.putMcpOperation({ operation_id: cleanupPendingId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_start_source", status: "pending", summary: "start", data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: cleanupPendingId, workspace_id: "ws_source", action: { facts }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const cleanupPending = await applyMcpOperationResult(store, { operationId: cleanupPendingId, correlationId: cleanupPendingId, deviceId, payload: { operation_id: cleanupPendingId, status: "failed", error: { code: "OWNMESH_E_TRANSFER_CLEANUP_PENDING", message: "distinctive-cleanup-path", details: { path: "must-not-persist" } } } });
+  assert.equal(cleanupPending.ok, true);
+  assert.deepEqual((await store.getMcpOperation(cleanupPendingId))?.data, { error: { code: "OWNMESH_E_TRANSFER_CLEANUP_PENDING" } });
+});
+
+test("transfer cancel controls persist only target-bound cleanup proof", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_cancel_destination_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const target = "op_transfer_destination";
+  await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_cancel_control", status: "pending", summary: "cancel", data: { target_operation_id: target }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: opId, workspace_id: "ws_destination", policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const substituted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: "op_other", cancelled: true, signal_delivered: true } } });
+  assert.deepEqual(substituted, { ok: false, error: "transfer_cancel_result_binding_mismatch" });
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { target_operation_id: target, cancelled: false, signal_delivered: false, note: "Agent restarted" } } });
+  assert.equal(accepted.ok, true);
+  assert.deepEqual((await store.getMcpOperation(opId))?.data, { target_operation_id: target, cancelled: false, signal_delivered: false });
+});
+
+test("source cleanup persists only an exact plan-bound completion receipt", async () => {
+  const { store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_cleanup_source_01"; await seedActiveDevice(store, deviceId);
+  const opId = randomId("op_"); const planId = "xfer_source_cleanup_01";
+  await store.putMcpOperation({ operation_id: opId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId, tool: "__transfer_source_cleanup", status: "pending", summary: "cleanup", data: { plan_id: planId }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: opId, workspace_id: "ws_source", policy_authority: "ownmesh_device", created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const substituted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: "xfer_other", cancelled: true, source_only: true } } });
+  assert.deepEqual(substituted, { ok: false, error: "transfer_source_cleanup_result_binding_mismatch" });
+  const injected = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true, path: "secret/path" } } });
+  assert.deepEqual(injected, { ok: false, error: "transfer_source_cleanup_result_binding_mismatch" });
+  const accepted = await applyMcpOperationResult(store, { operationId: opId, correlationId: opId, deviceId, payload: { operation_id: opId, status: "completed", result: { plan_id: planId, cancelled: true, source_only: true } } });
+  assert.equal(accepted.ok, true);
+  assert.deepEqual((await store.getMcpOperation(opId))?.data, { plan_id: planId, cleaned: true, source_only: true });
+});
+
+test("internal transfer errors and approvals never persist Agent diagnostics", async () => {
+  const { db, store } = openSqliteAdapter(); await store.ensureBootstrap();
+  const deviceId = "dev_transfer_redaction_01"; await seedActiveDevice(store, deviceId);
+  const tools = [
+    "__transfer_start_source",
+    "__transfer_start_destination",
+    "__transfer_preflight_source",
+    "__transfer_preflight_source_final",
+    "__transfer_preflight_destination",
+    "__transfer_artifact_get",
+    "__transfer_cancel_control",
+    "__transfer_source_cleanup",
+  ];
+  const modes = [
+    { name: "approval", status: "failed", approval: true },
+    // The wire protocol normally uses failed, but a malformed literal error
+    // must not turn this durable row into a diagnostics sink either.
+    { name: "error", status: "error", approval: false },
+  ];
+  const secrets: string[] = [];
+  for (const tool of tools) {
+    for (const mode of modes) {
+      const operationId = randomId("op_");
+      const marker = `distinctive-${tool.slice(11)}-${mode.name}-${operationId}`;
+      secrets.push(marker);
+      await store.putMcpOperation({
+        operation_id: operationId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
+        tool, status: "pending", summary: "internal transfer", data: { safe: true },
+        truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId,
+        workspace_id: "ws_destination", policy_authority: "ownmesh_device",
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      });
+      const applied = await applyMcpOperationResult(store, {
+        operationId, correlationId: operationId, deviceId,
+        payload: {
+          operation_id: operationId, status: mode.status, approval_required: mode.approval,
+          summary: `${marker}-summary`, reason: `${marker}-reason`, approval_id: `${marker}-approval-id`,
+          session_id: `${marker}-session`,
+          result: { ticket: `${marker}-ticket`, path: `${marker}-path`, bytes: `${marker}-bytes` },
+          error: {
+            code: mode.approval ? "OWNMESH_E_APPROVAL_REQUIRED" : "OWNMESH_E_TRANSFER_UNSAFE",
+            message: `${marker}-message`,
+            details: {
+              approval_required: mode.approval, approval_id: `${marker}-details-approval-id`,
+              reason: `${marker}-details-reason`, ticket: `${marker}-details-ticket`,
+              path: `${marker}-details-path`, bytes: `${marker}-details-bytes`, ciphertext: `${marker}-details-ciphertext`,
+            },
+          },
+        },
+      });
+      assert.equal(applied.ok, true);
+      const stored = await store.getMcpOperation(operationId);
+      assert.ok(stored);
+      assert.equal(stored.approval_id ?? null, null);
+      assert.equal(stored.session_id ?? null, null);
+      assert.equal(stored.summary.includes(marker), false);
+      assert.equal(JSON.stringify(stored).includes(marker), false);
+    }
+  }
+  // Check the actual SQLite representation, rather than only the decoded
+  // record, so a future serialization path cannot hide a re-persisted field.
+  const raw = db.prepare("SELECT summary, data_json, approval_id, session_id FROM mcp_operations").all() as Record<string, unknown>[];
+  const serialized = JSON.stringify(raw);
+  for (const marker of secrets) assert.equal(serialized.includes(marker), false, marker);
 });
 
 test("operation.result store write failure fails closed without forward", async () => {
@@ -1141,6 +1710,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
   });
   room.router.pending.set(corr, {
@@ -1156,6 +1726,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: authHash,
     lastSeq: 0,
   });
@@ -1219,6 +1790,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: hash2,
   });
   room2.router.pending.set(corr, {
@@ -1234,6 +1806,7 @@ test("operation.result store write failure fails closed without forward", async 
     session_id: agentId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: hash2,
     lastSeq: 0,
   });

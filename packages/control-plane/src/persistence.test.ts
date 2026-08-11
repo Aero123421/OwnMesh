@@ -10,6 +10,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { handleMcp, OperationTracker, type OperationRouter } from "./mcp.ts";
 import { SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
 import { encodeDevicePublicKey } from "./store.ts";
 
@@ -110,6 +111,155 @@ test("all control-plane migrations apply cleanly on sqlite", () => {
     "schema_migrations",
   ]) {
     assert.ok(names.includes(need), `missing table ${need}`);
+  }
+});
+
+test("SqlStore public transfer list returns the same owner-visible operation ids as status", async () => {
+  const { db, store } = openSqliteStore();
+  try {
+    await store.ensureBootstrap();
+    const token = await store.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read ownmesh.write");
+    for (const id of ["dev_source", "dev_destination"]) {
+      await store.putDevice({ id, tenant_id: "ten_default", principal_id: "prin_dev", name: id, hostname: id, os: "test", arch: "test", agent_version: "test", protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false, created_at: new Date().toISOString(), status: "active" });
+    }
+    await store.putWorkspace({ workspace_id: "ws_source", tenant_id: "ten_default", device_id: "dev_source", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    await store.putWorkspace({ workspace_id: "ws_destination", tenant_id: "ten_default", device_id: "dev_destination", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+    const router: OperationRouter = {
+      async routeToDevice() { return { status: "routed_to_device" }; },
+      async routeLiveToDevice() { return { status: "routed_to_device" }; },
+    };
+    const invoke = async (name: string, args: Record<string, unknown>) => {
+      const request = new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: { authorization: `Bearer ${token.access_token}`, "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+      });
+      const response = await handleMcp(request, store, new URL("https://cp.test/mcp"), router, {
+        tracker: new OperationTracker(),
+        transferTicketSecret: "sql-transfer-list-secret",
+      });
+      return await response.json() as { result?: { structuredContent?: { operation_id: string; data: Record<string, unknown>; next_cursor?: string | null } } };
+    };
+
+    const ids: string[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const created = await invoke("ownmesh_transfer_plan", {
+        source_device_id: "dev_source",
+        destination_device_id: "dev_destination",
+        source_workspace_id: "ws_source",
+        destination_workspace_id: "ws_destination",
+        source_path: `in/${index}.bin`,
+        destination_path: `out/${index}.bin`,
+        idempotency_key: `sql-list-${index}`,
+      });
+      const transferId = created.result!.structuredContent!.operation_id;
+      ids.push(transferId);
+      const status = await invoke("ownmesh_transfer_status", { transfer_id: transferId });
+      assert.equal(status.result!.structuredContent!.operation_id, transferId);
+    }
+    const sameCreatedAt = "2026-08-10T12:00:00.000Z";
+    for (const id of ids) {
+      db.prepare("UPDATE mcp_operations SET created_at = ? WHERE operation_id = ?")
+        .run(sameCreatedAt, id);
+    }
+    const template = await store.getMcpOperation(ids[0]);
+    assert.ok(template);
+    const foreignRows = [
+      { operationId: "op_sql_foreign_principal", tenantId: "ten_default", principalId: "prin_foreign" },
+      { operationId: "op_sql_foreign_tenant", tenantId: "ten_foreign", principalId: "prin_dev" },
+    ];
+    for (const foreign of foreignRows) {
+      const meta = template.data.__ownmesh_transfer_plan as Record<string, unknown>;
+      await store.putMcpOperation({
+        ...template,
+        operation_id: foreign.operationId,
+        correlation_id: foreign.operationId,
+        tenant_id: foreign.tenantId,
+        principal_id: foreign.principalId,
+        idempotency_key: foreign.operationId,
+        data: {
+          ...template.data,
+          __ownmesh_transfer_plan: {
+            ...meta,
+            transfer_id: foreign.operationId,
+            tenant_id: foreign.tenantId,
+            principal_id: foreign.principalId,
+          },
+        },
+        created_at: sameCreatedAt,
+        updated_at: sameCreatedAt,
+      });
+    }
+    const foreignBefore = await Promise.all(
+      foreignRows.map((foreign) => store.getMcpOperation(foreign.operationId)),
+    );
+    const first = await invoke("ownmesh_transfer_list", { limit: 2 });
+    const firstContent = first.result!.structuredContent!;
+    assert.equal(firstContent.next_cursor, "cur_2");
+    const second = await invoke("ownmesh_transfer_list", {
+      limit: 2,
+      cursor: firstContent.next_cursor,
+    });
+    const combined = [
+      ...(firstContent.data.transfers as Array<Record<string, unknown>>),
+      ...(second.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>),
+    ].map((entry) => String(entry.operation_id));
+    assert.deepEqual(combined, [...ids].sort().reverse());
+    assert.equal(new Set(combined).size, ids.length, "pagination must not duplicate or omit");
+    for (const foreign of foreignRows) assert.equal(combined.includes(foreign.operationId), false);
+    assert.deepEqual(
+      await Promise.all(foreignRows.map((foreign) => store.getMcpOperation(foreign.operationId))),
+      foreignBefore,
+      "foreign principal/tenant rows must not be reconciled or rewritten",
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("SqlStore atomically updates only owned, active device metadata", async () => {
+  const { db, store } = openSqliteStore();
+  try {
+    await store.ensureBootstrap();
+    await store.putDevice({
+      id: "dev_sql_metadata",
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      name: "before",
+      labels: [],
+      hostname: "sql-host",
+      os: "test",
+      arch: "test",
+      agent_version: "test",
+      protocol_version: "ownmesh.device/1.0",
+      public_key: "ab".repeat(32),
+      revoked: false,
+      created_at: new Date().toISOString(),
+      status: "active",
+    });
+
+    const updated = await store.updateDeviceMetadata(
+      "dev_sql_metadata",
+      "prin_dev",
+      { name: "after", labels: ["linux", "gpu"] },
+    );
+    assert.equal(updated?.name, "after");
+    assert.deepEqual(updated?.labels, ["linux", "gpu"]);
+
+    assert.equal(
+      await store.updateDeviceMetadata("dev_sql_metadata", "prin_foreign", { name: "stolen" }),
+      null,
+    );
+    assert.equal((await store.getDevice("dev_sql_metadata"))?.name, "after");
+
+    assert.equal(await store.revokeDevice("dev_sql_metadata", "prin_dev"), true);
+    assert.equal(
+      await store.updateDeviceMetadata("dev_sql_metadata", "prin_dev", { name: "revived" }),
+      null,
+    );
+    assert.equal((await store.getDevice("dev_sql_metadata"))?.name, "after");
+  } finally {
+    db.close();
   }
 });
 
@@ -235,7 +385,7 @@ test("sql store expired refresh is invalid_grant", async () => {
   const first = await store.issueTokens("client_ownmesh_cli", "prin_dev", "ownmesh.read offline_access");
   const { sha256Hex } = await import("./util.ts");
   const hash = await sha256Hex(first.refresh_token);
-  db.prepare(`UPDATE oauth_tokens SET expires_at = ? WHERE refresh_token_hash = ?`).run(
+  db.prepare(`UPDATE oauth_tokens SET refresh_expires_at = ? WHERE refresh_token_hash = ?`).run(
     new Date(Date.now() - 5_000).toISOString(),
     hash,
   );

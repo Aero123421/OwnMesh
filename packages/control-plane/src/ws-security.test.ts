@@ -136,7 +136,10 @@ test("ws-security: real Ed25519 hello→challenge→proof→ready completes with
 
   const readyResult = await room.send(
     agent,
-    envFor(agent, "ready", deviceId, { capabilities: ["fs"] }),
+    envFor(agent, "ready", deviceId, {
+      capabilities: ["filesystem.read"],
+      remote_routing_enabled: true,
+    }),
   );
   assert.equal(readyResult.ok, true);
   assert.equal(room.router.sessions.get(agent)?.phase, "ready");

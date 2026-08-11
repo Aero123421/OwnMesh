@@ -180,6 +180,31 @@ test("Memory+SQL putMcpOperation is create-only (conflict does not overwrite)", 
   }
 });
 
+test("Memory+SQL exact-data CAS rejects a stale metadata snapshot", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await store.ensureBootstrap();
+    const op = sampleOp(`op_data_cas_${store.kind || "memory"}`);
+    await store.putMcpOperation(op);
+    const snapshot = (await store.getMcpOperation(op.operation_id))!.data;
+    const winner = await store.updateMcpOperation(
+      op.operation_id,
+      { status: "running", data: { transfer: { cleanup_generation: 1, owner: "winner" } } },
+      ["pending"],
+      snapshot,
+    );
+    assert.ok(winner);
+    const stale = await store.updateMcpOperation(
+      op.operation_id,
+      { data: { transfer: { cleanup_generation: 1, owner: "stale" } } },
+      ["pending", "running"],
+      snapshot,
+    );
+    assert.equal(stale, null, "status still matches, but stale parent data must lose");
+    const retained = (await store.getMcpOperation(op.operation_id))?.data.transfer as Record<string, unknown> | undefined;
+    assert.equal(retained?.owner, "winner");
+  }
+});
+
 test("fast DO terminal result is not overwritten by late route persist (CAS loss returns current)", async () => {
   const store = new MemoryStore();
   const token = await authed(store);

@@ -75,6 +75,242 @@ impl InterfacePreference {
     }
 }
 
+/// The child-process transport selected by an official adapter.
+///
+/// These values are deliberately narrower than a general network transport.
+/// An adapter never creates an inbound listener; `LocalHttp` means that the
+/// vendor's documented child server is contacted only by the local host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterTransport {
+    StdioJsonl,
+    StdioJsonRpc,
+    LocalHttp,
+    Pty,
+}
+
+/// Vendor dialect carried over an [`AdapterTransport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterDialect {
+    CodexAppServer,
+    ClaudeStreamJson,
+    KimiAcp,
+    OpenCodeServer,
+    PiRpc,
+    AgyStreamJson,
+    QwenAcp,
+    HermesAcp,
+    QoderAcp,
+}
+
+impl AdapterDialect {
+    /// Stable manifest binding string; never derive this from debug output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "codex_app_server",
+            Self::ClaudeStreamJson => "claude_stream_json",
+            Self::KimiAcp => "kimi_acp",
+            Self::OpenCodeServer => "opencode_server",
+            Self::PiRpc => "pi_rpc",
+            Self::AgyStreamJson => "agy_stream_json",
+            Self::QwenAcp => "qwen_acp",
+            Self::HermesAcp => "hermes_acp",
+            Self::QoderAcp => "qoder_acp",
+        }
+    }
+}
+
+/// Native-session continuation surface exposed by an adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum NativeResume {
+    /// A native argv resume operation. `{{native_id}}` is a single argv item.
+    Argv { args: Vec<String> },
+    /// The native protocol negotiates load/resume support at runtime.
+    Negotiated { method: String },
+    /// The vendor documents no safe native resume operation for this adapter.
+    Degraded,
+}
+
+/// Read-only profile authentication probe declaration.
+///
+/// An absent probe is intentional: OwnMesh reports `unknown` rather than
+/// reading credential files or guessing a vendor CLI command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthProbe {
+    pub args: Vec<String>,
+    /// Successful process exit codes. Output is capped and redacted by the
+    /// executor; it is never included in an audit record.
+    pub success_exit_codes: Vec<i32>,
+}
+
+/// Explicit, source-backed contract for one official CLI adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterSpec {
+    pub profile_id: String,
+    pub transport: AdapterTransport,
+    pub dialect: AdapterDialect,
+    /// Start argv, excluding the executable.  Prompt/session placeholders are
+    /// expanded only as one complete argument.
+    pub start_args: Vec<String>,
+    pub resume: NativeResume,
+    pub auth_probe: Option<AuthProbe>,
+    /// Structured mode permits event normalization and avoids a PTY.
+    pub structured_events: bool,
+    /// Profile safe capabilities; this is not a permission escalation surface.
+    pub safe_capabilities: Vec<String>,
+}
+
+/// Return the nine explicit official adapter specifications.
+///
+/// The source links and the date on which each entry was verified are kept in
+/// `docs/E6_ADAPTER_CONTRACTS.md`.  If that document does not establish a
+/// resume surface, this function returns [`NativeResume::Degraded`] instead of
+/// inventing one.
+#[must_use]
+pub fn official_adapter_specs() -> Vec<AdapterSpec> {
+    use AdapterDialect::{
+        AgyStreamJson, ClaudeStreamJson, CodexAppServer, HermesAcp, KimiAcp, OpenCodeServer, PiRpc,
+        QoderAcp, QwenAcp,
+    };
+    use AdapterTransport::{StdioJsonRpc, StdioJsonl};
+
+    vec![
+        AdapterSpec {
+            profile_id: "codex".into(),
+            transport: StdioJsonRpc,
+            dialect: CodexAppServer,
+            start_args: vec!["app-server".into()],
+            resume: NativeResume::Negotiated {
+                method: "thread/resume".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["thread_start".into(), "thread_resume".into()],
+        },
+        AdapterSpec {
+            profile_id: "claude-code".into(),
+            transport: StdioJsonl,
+            dialect: ClaudeStreamJson,
+            start_args: vec![
+                "-p".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            resume: NativeResume::Argv {
+                args: vec![
+                    "-p".into(),
+                    "{{prompt}}".into(),
+                    "--resume".into(),
+                    "{{native_id}}".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                ],
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "kimi-code".into(),
+            transport: StdioJsonRpc,
+            dialect: KimiAcp,
+            start_args: vec!["acp".into()],
+            resume: NativeResume::Argv {
+                args: vec!["acp".into(), "--session".into(), "{{native_id}}".into()],
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "opencode".into(),
+            transport: StdioJsonRpc,
+            dialect: OpenCodeServer,
+            start_args: vec!["acp".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "pi".into(),
+            transport: StdioJsonl,
+            dialect: PiRpc,
+            start_args: vec!["--mode".into(), "rpc".into()],
+            resume: NativeResume::Degraded,
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["strict_lf_jsonl".into()],
+        },
+        AdapterSpec {
+            profile_id: "agy".into(),
+            transport: StdioJsonl,
+            dialect: AgyStreamJson,
+            start_args: vec![
+                "--print".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            resume: NativeResume::Degraded,
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "qwen-code".into(),
+            transport: StdioJsonRpc,
+            dialect: QwenAcp,
+            start_args: vec!["--acp".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "hermes-agent".into(),
+            transport: StdioJsonRpc,
+            dialect: HermesAcp,
+            start_args: vec!["acp".into()],
+            resume: NativeResume::Argv {
+                args: vec!["acp".into(), "--resume".into(), "{{native_id}}".into()],
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into(), "stream_events".into()],
+        },
+        AdapterSpec {
+            profile_id: "qoder".into(),
+            transport: StdioJsonRpc,
+            dialect: QoderAcp,
+            start_args: vec!["--acp".into()],
+            resume: NativeResume::Negotiated {
+                method: "session/load".into(),
+            },
+            auth_probe: None,
+            structured_events: true,
+            safe_capabilities: vec!["acp".into()],
+        },
+    ]
+}
+
+/// Retrieve an official adapter specification by stable profile ID or alias.
+#[must_use]
+pub fn official_adapter_spec(id: &str) -> Option<AdapterSpec> {
+    let canonical = OfficialProfileId::parse(id)?.as_str();
+    official_adapter_specs()
+        .into_iter()
+        .find(|spec| spec.profile_id == canonical)
+}
+
 /// Official profile identifiers — must match `OWNMESH_SPECIFICATION.ja.md` §13.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -254,13 +490,15 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
+            // App-server continuation is the negotiated `thread/resume` RPC,
+            // not a guessed process argv invocation.
             supports_native_resume: true,
             supports_structured: true,
             supports_acp: false,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["exec".into(), "--json".into(), "{{prompt}}".into()],
             structured_start_args: vec!["app-server".into()],
-            resume_args: vec!["resume".into(), "{{native_id}}".into()],
+            resume_args: vec![],
             official: true,
         },
         Profile {
@@ -287,7 +525,16 @@ pub fn official_profiles() -> Vec<Profile> {
                 "--output-format".into(),
                 "stream-json".into(),
             ],
-            resume_args: vec!["--resume".into(), "{{native_id}}".into()],
+            // `-p` owns the follow-up prompt; without it a resumed process
+            // would receive neither the requested turn nor stream-json flags.
+            resume_args: vec![
+                "-p".into(),
+                "{{prompt}}".into(),
+                "--resume".into(),
+                "{{native_id}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
             official: true,
         },
         Profile {
@@ -302,7 +549,7 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: false,
+            supports_native_resume: true,
             supports_structured: true,
             supports_acp: true,
             min_version: Some("0.1.0".into()),
@@ -312,8 +559,8 @@ pub fn official_profiles() -> Vec<Profile> {
                 "--output-format".into(),
                 "stream-json".into(),
             ],
-            structured_start_args: vec!["--acp".into()],
-            resume_args: vec![],
+            structured_start_args: vec!["acp".into()],
+            resume_args: vec!["acp".into(), "--session".into(), "{{native_id}}".into()],
             official: true,
         },
         Profile {
@@ -321,19 +568,19 @@ pub fn official_profiles() -> Vec<Profile> {
             display_name: "OpenCode".into(),
             binaries: vec!["opencode".into()],
             interface_order: vec![
-                InterfacePreference::Http,
+                InterfacePreference::Acp,
                 InterfacePreference::Jsonl,
                 InterfacePreference::Pty,
             ],
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: false,
+            supports_native_resume: true,
             supports_structured: true,
-            supports_acp: false,
+            supports_acp: true,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
-            structured_start_args: vec!["serve".into()],
+            structured_start_args: vec!["acp".into()],
             resume_args: vec![],
             official: true,
         },
@@ -345,14 +592,15 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: true,
+            supports_native_resume: false,
             supports_structured: true,
             supports_acp: false,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["--mode".into(), "rpc".into()],
             structured_start_args: vec!["--mode".into(), "rpc".into()],
-            // Session resume when native id is known (PTY/RPC host tracks OwnMesh session separately).
-            resume_args: vec!["--resume".into(), "{{native_id}}".into()],
+            // The documented RPC integration is process-local; OwnMesh does
+            // not invent an argv resume surface.
+            resume_args: vec![],
             official: true,
         },
         Profile {
@@ -367,8 +615,18 @@ pub fn official_profiles() -> Vec<Profile> {
             supports_structured: true,
             supports_acp: false,
             min_version: Some("0.1.0".into()),
-            non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
-            structured_start_args: vec![],
+            non_interactive_args: vec![
+                "--print".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
+            structured_start_args: vec![
+                "--print".into(),
+                "{{prompt}}".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+            ],
             resume_args: vec![],
             official: true,
         },
@@ -384,12 +642,12 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: false,
+            supports_native_resume: true,
             supports_structured: true,
             supports_acp: true,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["-p".into(), "{{prompt}}".into()],
-            structured_start_args: vec![],
+            structured_start_args: vec!["--acp".into()],
             resume_args: vec![],
             official: true,
         },
@@ -410,8 +668,8 @@ pub fn official_profiles() -> Vec<Profile> {
             supports_acp: true,
             min_version: Some("0.1.0".into()),
             non_interactive_args: vec!["run".into(), "{{prompt}}".into()],
-            structured_start_args: vec![],
-            resume_args: vec!["resume".into(), "{{native_id}}".into()],
+            structured_start_args: vec!["acp".into()],
+            resume_args: vec!["acp".into(), "--resume".into(), "{{native_id}}".into()],
             official: true,
         },
         Profile {
@@ -427,7 +685,7 @@ pub fn official_profiles() -> Vec<Profile> {
             version_args: vec!["--version".into()],
             version_regex: Some(r"(\d+\.\d+\.\d+)".into()),
             auth_status_args: vec![],
-            supports_native_resume: false,
+            supports_native_resume: true,
             supports_structured: true,
             supports_acp: true,
             min_version: Some("0.1.0".into()),
@@ -626,6 +884,20 @@ impl ProfileRegistry {
     /// Returns an error when the profile is unknown, has no executable candidate,
     /// or does not support native resume.
     pub fn resume_plan(&self, id: &str, native_id: &str) -> ProfileResult<LaunchPlan> {
+        self.resume_plan_with_prompt(id, native_id, None)
+    }
+
+    /// Build an argv-native resume plan with the explicit follow-up prompt.
+    ///
+    /// This applies only to adapters whose documented continuation is a child
+    /// argv surface. Negotiated JSON-RPC resumes are deliberately performed by
+    /// the structured driver after capability negotiation.
+    pub fn resume_plan_with_prompt(
+        &self,
+        id: &str,
+        native_id: &str,
+        prompt: Option<&str>,
+    ) -> ProfileResult<LaunchPlan> {
         let p = self.get(id)?;
         if !p.supports_native_resume || p.resume_args.is_empty() {
             return Err(ProfileError::Parse(format!(
@@ -633,6 +905,21 @@ impl ProfileRegistry {
             )));
         }
         let status = self.detect(id)?;
+        let needs_prompt = p.resume_args.iter().any(|arg| arg.contains("{{prompt}}"));
+        if needs_prompt && prompt.is_none_or(str::is_empty) {
+            return Err(ProfileError::Parse(format!(
+                "profile {id} native resume requires a non-empty follow-up prompt"
+            )));
+        }
+        if prompt.is_some_and(|value| value.len() > 32 * 1024 || value.contains('\0')) {
+            return Err(ProfileError::Parse(
+                "native resume prompt exceeds bounded argv policy".into(),
+            ));
+        }
+        if native_id.is_empty() || native_id.len() > 512 || native_id.chars().any(char::is_control)
+        {
+            return Err(ProfileError::Parse("invalid native resume id".into()));
+        }
         let program = status
             .binary_path
             .or_else(|| p.binaries.first().cloned())
@@ -640,7 +927,7 @@ impl ProfileRegistry {
         Ok(LaunchPlan {
             profile_id: Some(p.id.clone()),
             program,
-            args: expand_template(&p.resume_args, None, Some(native_id)),
+            args: expand_template(&p.resume_args, prompt, Some(native_id)),
             cwd: None,
             interface: InterfacePreference::StructuredRpc,
             use_pty: false,
@@ -1098,7 +1385,9 @@ pub fn conform_profile(profile: &Profile, fixture: &ProfileFixture) -> ProfileRe
 
     // Resume contract
     if profile.supports_native_resume {
-        if profile.resume_args.is_empty() {
+        let negotiated = official_adapter_spec(&profile.id)
+            .is_some_and(|spec| matches!(spec.resume, NativeResume::Negotiated { .. }));
+        if profile.resume_args.is_empty() && !negotiated {
             return Err(ProfileError::Parse(format!(
                 "{} claims resume but has empty resume_args",
                 profile.id
@@ -1139,15 +1428,115 @@ pub struct NormalizedEvent {
     pub raw_type: String,
 }
 
+/// Maximum accepted adapter record length, excluding the trailing LF.
+pub const MAX_ADAPTER_LINE_BYTES: usize = 64 * 1024;
+/// Maximum normalized events returned in one replay page.
+pub const MAX_ADAPTER_EVENTS_PER_PAGE: usize = 256;
+
+/// A normalized adapter record with an absolute raw-byte cursor.
+///
+/// `cursor` points just after the record's terminating LF.  It therefore
+/// remains meaningful when the caller appends more bytes to a local spool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterEventRecord {
+    pub cursor: u64,
+    pub event: Option<NormalizedEvent>,
+    pub error: Option<String>,
+}
+
+/// Bounded result of parsing raw adapter output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterEventPage {
+    /// Cursor supplied by the caller, usually the spool base offset.
+    pub base_cursor: u64,
+    /// Cursor to pass for the next page.  No bytes after it were consumed.
+    pub next_cursor: u64,
+    pub events: Vec<AdapterEventRecord>,
+    /// More complete LF records remain after `next_cursor`.
+    pub has_more: bool,
+}
+
+/// Parse one bounded page of LF-delimited adapter output.
+///
+/// This deliberately does not use `str::lines`: Pi's documented RPC mode
+/// requires LF framing and generic line readers may also split Unicode line
+/// separators inside a JSON payload.  An unterminated tail is left for a later
+/// append and is never converted into a partial event.
+#[must_use]
+pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPage {
+    let mut events = Vec::new();
+    let mut consumed = 0_usize;
+    let mut scan = 0_usize;
+
+    while scan < raw.len() && events.len() < MAX_ADAPTER_EVENTS_PER_PAGE {
+        let Some(relative_lf) = raw[scan..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let end = scan + relative_lf;
+        let line = &raw[scan..end];
+        let record_end = end + 1;
+        let cursor = base_cursor.saturating_add(record_end as u64);
+        let record = if line.len() > MAX_ADAPTER_LINE_BYTES {
+            AdapterEventRecord {
+                cursor,
+                event: None,
+                error: Some(format!(
+                    "adapter record exceeds {MAX_ADAPTER_LINE_BYTES} byte limit"
+                )),
+            }
+        } else {
+            match std::str::from_utf8(line) {
+                Ok(text) => match normalize_event_json(text.trim_end_matches('\r')) {
+                    Some(event) => AdapterEventRecord {
+                        cursor,
+                        event: Some(event),
+                        error: None,
+                    },
+                    None => AdapterEventRecord {
+                        cursor,
+                        event: None,
+                        error: Some("malformed adapter JSON event".into()),
+                    },
+                },
+                Err(_) => AdapterEventRecord {
+                    cursor,
+                    event: None,
+                    error: Some("adapter record is not UTF-8 JSON".into()),
+                },
+            }
+        };
+        events.push(record);
+        consumed = record_end;
+        scan = record_end;
+    }
+
+    // Do not claim there is another record for a partial (no-LF) tail.  The
+    // caller must append it before parsing again.
+    let has_more = if events.len() == MAX_ADAPTER_EVENTS_PER_PAGE {
+        raw[consumed..].contains(&b'\n')
+    } else {
+        false
+    };
+    AdapterEventPage {
+        base_cursor,
+        next_cursor: base_cursor.saturating_add(consumed as u64),
+        events,
+        has_more,
+    }
+}
+
 /// Best-effort event normalization from JSONL adapter lines.
 pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let raw_type = v
-        .get("type")
-        .or_else(|| v.get("event"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let raw_type = if v.get("error").is_some() {
+        "error".to_owned()
+    } else {
+        v.get("type")
+            .or_else(|| v.get("event"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
     let kind = match raw_type.as_str() {
         "message" | "assistant" | "text" | "content" => "message",
         "tool_call" | "tool" | "function_call" => "tool_call",
@@ -1161,6 +1550,7 @@ pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
         .get("text")
         .or_else(|| v.get("content"))
         .or_else(|| v.pointer("/message/content"))
+        .or_else(|| v.pointer("/error/message"))
         .and_then(|x| {
             if x.is_string() {
                 x.as_str().map(str::to_string)
@@ -1343,8 +1733,13 @@ acp = false
             assert!(pty.use_pty);
             assert_eq!(pty.interface, InterfacePreference::Pty);
 
-            if p.supports_native_resume {
-                let r = reg.resume_plan(id.as_str(), "native_abc").unwrap();
+            if matches!(
+                official_adapter_spec(id.as_str()).unwrap().resume,
+                NativeResume::Argv { .. }
+            ) {
+                let r = reg
+                    .resume_plan_with_prompt(id.as_str(), "native_abc", Some("follow up"))
+                    .unwrap();
                 assert!(r.args.iter().any(|a| a.contains("native_abc")));
             }
         }
@@ -1357,6 +1752,126 @@ acp = false
         assert_eq!(p.interface_order[0], InterfacePreference::StructuredRpc);
         assert_eq!(p.structured_start_args, vec!["app-server".to_string()]);
         assert!(p.supports_native_resume);
+        assert!(matches!(
+            official_adapter_spec("codex").unwrap().resume,
+            NativeResume::Negotiated { ref method } if method == "thread/resume"
+        ));
+    }
+
+    #[test]
+    fn official_adapter_specs_are_explicit_and_complete() {
+        let specs = official_adapter_specs();
+        assert_eq!(specs.len(), 9);
+        for id in OfficialProfileId::all() {
+            let spec = official_adapter_spec(id.as_str()).expect("adapter spec");
+            assert_eq!(spec.profile_id, id.as_str());
+            assert!(spec.structured_events, "{}", spec.profile_id);
+            assert!(
+                !spec.safe_capabilities.is_empty(),
+                "{} missing safe capabilities",
+                spec.profile_id
+            );
+            assert!(spec.auth_probe.is_none(), "credentials must not be probed");
+        }
+        assert!(matches!(
+            official_adapter_spec("agy").unwrap().resume,
+            NativeResume::Degraded
+        ));
+        assert_eq!(
+            official_adapter_spec("codex").unwrap().transport,
+            AdapterTransport::StdioJsonRpc
+        );
+    }
+
+    #[test]
+    fn profile_launch_argv_matches_each_source_backed_adapter_start() {
+        let reg = ProfileRegistry::with_official();
+        for spec in official_adapter_specs() {
+            let plan = reg
+                .launch_plan(&spec.profile_id, Some("fixture prompt"), false)
+                .unwrap_or_else(|err| panic!("{}: {err}", spec.profile_id));
+            let expected: Vec<_> = spec
+                .start_args
+                .iter()
+                .map(|arg| arg.replace("{{prompt}}", "fixture prompt"))
+                .collect();
+            assert_eq!(plan.args, expected, "{}", spec.profile_id);
+            if let NativeResume::Argv { args } = spec.resume {
+                let resume = reg
+                    .resume_plan_with_prompt(
+                        &spec.profile_id,
+                        "native_fixture",
+                        Some("fixture prompt"),
+                    )
+                    .unwrap();
+                let expected_resume: Vec<_> = args
+                    .iter()
+                    .map(|arg| arg.replace("{{prompt}}", "fixture prompt"))
+                    .map(|arg| arg.replace("{{native_id}}", "native_fixture"))
+                    .collect();
+                assert_eq!(resume.args, expected_resume, "{}", spec.profile_id);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_adapter_parser_preserves_absolute_byte_cursors() {
+        let raw = b"{\"type\":\"message\",\"text\":\"one\",\"session_id\":\"n1\"}\n{\"event\":\"tool_call\"}\n";
+        let page = parse_adapter_event_page(raw, 40);
+        assert_eq!(page.base_cursor, 40);
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[0].event.as_ref().unwrap().kind, "message");
+        assert_eq!(
+            page.events[0]
+                .event
+                .as_ref()
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("n1")
+        );
+        assert_eq!(page.next_cursor, 40 + raw.len() as u64);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn malformed_and_oversize_records_are_visible_not_silent() {
+        let mut raw = b"{not-json}\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', MAX_ADAPTER_LINE_BYTES + 1));
+        raw.push(b'\n');
+        let page = parse_adapter_event_page(&raw, 0);
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(
+            page.events[0].error.as_deref(),
+            Some("malformed adapter JSON event")
+        );
+        assert!(page.events[1].error.as_deref().unwrap().contains("exceeds"));
+    }
+
+    #[test]
+    fn post_open_json_rpc_errors_are_visible_structured_events() {
+        let event =
+            normalize_event_json(r#"{"id":3,"error":{"code":-32001,"message":"turn failed"}}"#)
+                .expect("JSON-RPC error must not disappear from replay");
+        assert_eq!(event.kind, "error");
+        assert_eq!(event.text.as_deref(), Some("turn failed"));
+    }
+
+    #[test]
+    fn parser_pages_without_rewinding_or_unicode_line_splitting() {
+        let one = "{\"type\":\"message\",\"text\":\"a\u{2028}b\"}\n";
+        let raw = one.as_bytes().repeat(MAX_ADAPTER_EVENTS_PER_PAGE + 1);
+        let first = parse_adapter_event_page(&raw, 500);
+        assert_eq!(first.events.len(), MAX_ADAPTER_EVENTS_PER_PAGE);
+        assert!(first.has_more);
+        let consumed = usize::try_from(first.next_cursor - first.base_cursor).unwrap();
+        let second = parse_adapter_event_page(&raw[consumed..], first.next_cursor);
+        assert_eq!(second.events.len(), 1);
+        assert!(second.next_cursor > first.next_cursor);
+        assert_eq!(
+            second.events[0].event.as_ref().unwrap().text.as_deref(),
+            Some("a\u{2028}b")
+        );
     }
 
     #[test]
@@ -1365,6 +1880,13 @@ acp = false
         let p = reg.get("claude-code").unwrap();
         assert!(p.non_interactive_args.iter().any(|a| a == "stream-json"));
         assert!(p.supports_native_resume);
+        assert!(reg.resume_plan("claude-code", "native").is_err());
+        assert!(reg
+            .resume_plan_with_prompt("claude-code", "native", Some("\0"))
+            .is_err());
+        assert!(reg
+            .resume_plan_with_prompt("claude-code", "native", Some(&"x".repeat(32 * 1024 + 1)))
+            .is_err());
     }
 
     #[test]

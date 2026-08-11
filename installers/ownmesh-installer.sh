@@ -5,15 +5,15 @@
 #   1. Obtain SHA256SUMS.minisig and verify it with minisign against the pinned
 #      OwnMesh public key (never trust checksums before the signature verifies).
 #   2. Verify the archive digest from the now-trusted SHA256SUMS.
-#   3. Extract only required top-level binaries (never pipe remote script into a shell).
+#   3. Extract only required top-level binaries.
 #
-# Installer integrity: download this script, inspect it, then execute it from a
-# local path. Prefer verifying the script against the release SHA256SUMS after
-# signature verification. Never pipe remote script text into a shell.
+# A curl|sh convenience bootstrap trusts GitHub TLS for this small script; the
+# downloaded binaries still require the independent pinned minisign signature.
+# The documented high-assurance flow additionally verifies this script first.
+# Never pipe remote script in high-assurance or offline-verifiable deployments.
 #
-# Minisign: provide `minisign` on PATH, or set OWNMESH_MINISIGN to a binary.
-# Optional bootstrap: set OWNMESH_BOOTSTRAP_MINISIGN=1 to fetch a pinned minisign
-# release binary (hash-verified) when none is available.
+# Minisign is resolved automatically: a pinned, hash-verified binary on Linux,
+# or Homebrew's package on macOS. Set OWNMESH_MINISIGN for an explicit path.
 
 set -eu
 
@@ -31,7 +31,7 @@ INSTALL_DIR="${OWNMESH_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 ASSET_DIR="${OWNMESH_ASSET_DIR:-}"
 BASE_URL_OVERRIDE="${OWNMESH_BASE_URL:-}"
 MINISIGN_BIN="${OWNMESH_MINISIGN:-}"
-BOOTSTRAP_MINISIGN="${OWNMESH_BOOTSTRAP_MINISIGN:-0}"
+BOOTSTRAP_MINISIGN="${OWNMESH_BOOTSTRAP_MINISIGN:-auto}"
 
 REQUIRED_BINARIES="ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker"
 
@@ -206,12 +206,25 @@ resolve_minisign() {
     return
   fi
   case "$BOOTSTRAP_MINISIGN" in
+    auto)
+      case "$(uname -s 2>/dev/null || true):$(uname -m 2>/dev/null || true)" in
+        Linux:x86_64|Linux:amd64|Linux:aarch64|Linux:arm64) bootstrap_minisign; return ;;
+        Darwin:*)
+          command_exists brew || fail "Homebrew is required for the one-line macOS install (https://brew.sh)"
+          printf '%s\n' "ownmesh installer: installing minisign with Homebrew" >&2
+          brew install minisign >&2 || fail "Homebrew could not install minisign"
+          command_exists minisign || fail "Homebrew completed but minisign is unavailable"
+          command -v minisign
+          return
+          ;;
+      esac
+      ;;
     1|true|TRUE|yes|YES)
       bootstrap_minisign
       return
       ;;
   esac
-  fail "minisign is required to verify SHA256SUMS.minisig (install minisign, set OWNMESH_MINISIGN, or OWNMESH_BOOTSTRAP_MINISIGN=1)"
+  fail "minisign is required to verify SHA256SUMS.minisig (macOS: brew install minisign; Linux arm64: install the minisign package)"
 }
 
 bootstrap_minisign() {
@@ -223,6 +236,11 @@ bootstrap_minisign() {
       url="$PINNED_MINISIGN_LINUX_X64_URL"
       expect="$PINNED_MINISIGN_LINUX_X64_SHA256"
       bootstrap_relpath="minisign-linux/x86_64/minisign"
+      ;;
+    Linux:aarch64|Linux:arm64)
+      url="$PINNED_MINISIGN_LINUX_X64_URL"
+      expect="$PINNED_MINISIGN_LINUX_X64_SHA256"
+      bootstrap_relpath="minisign-linux/aarch64/minisign"
       ;;
     *)
       fail "OWNMESH_BOOTSTRAP_MINISIGN is not supported on $os/$arch; install minisign manually"

@@ -74,6 +74,7 @@ struct DeviceRec {
     id: String,
     principal_id: String,
     name: String,
+    labels: Vec<String>,
     public_key: String,
     revoked: bool,
     /// pending | active
@@ -228,6 +229,9 @@ async fn handle_client(mut stream: TcpStream, inner: Arc<Inner>, base: &str) -> 
         ("POST", "/v1/devices/enroll") => handle_enroll(&inner, &headers, &body).await,
         ("POST", "/v1/devices/enroll/proof") => handle_proof(&inner, &headers, &body).await,
         ("GET", "/v1/devices") => handle_list_devices(&inner, &headers).await,
+        ("PATCH", path) if path.starts_with("/v1/devices/") => {
+            handle_update_device(&inner, &headers, path, &body).await
+        }
         ("POST", "/v1/devices/revoke") => handle_revoke_device(&inner, &headers, &body).await,
         ("GET", "/agent/connect") | ("POST", "/agent/connect") => {
             handle_agent_connect(&inner, &headers, &url).await
@@ -535,12 +539,15 @@ async fn handle_enroll(inner: &Inner, headers: &HashMap<String, String>, body: &
         .and_then(|x| x.as_str())
         .unwrap_or(&device_id)
         .to_owned();
+    let labels = normalize_mock_labels(v.get("labels").unwrap_or(&Value::Array(Vec::new())))
+        .unwrap_or_default();
     inner.devices.lock().await.insert(
         device_id.clone(),
         DeviceRec {
             id: device_id.clone(),
             principal_id: rec.principal.clone(),
             name: name.clone(),
+            labels: labels.clone(),
             public_key: public_key.clone(),
             revoked: false,
             status: "pending".into(),
@@ -581,6 +588,7 @@ async fn handle_enroll(inner: &Inner, headers: &HashMap<String, String>, body: &
             "device": {
                 "id": device_id,
                 "name": name,
+                "labels": labels,
                 "public_key": public_key,
                 "revoked": false
             }
@@ -672,6 +680,7 @@ async fn handle_proof(inner: &Inner, headers: &HashMap<String, String>, body: &s
             "device": {
                 "id": active.id,
                 "name": active.name,
+                "labels": active.labels,
                 "public_key": active.public_key,
                 "revoked": false,
                 "status": "active"
@@ -762,12 +771,113 @@ async fn handle_list_devices(inner: &Inner, headers: &HashMap<String, String>) -
             json!({
                 "id": d.id,
                 "name": d.name,
+                "labels": d.labels,
                 "public_key": d.public_key,
                 "revoked": d.revoked
             })
         })
         .collect();
     json_response(200, json!({"devices": list}))
+}
+
+async fn handle_update_device(
+    inner: &Inner,
+    headers: &HashMap<String, String>,
+    path: &str,
+    body: &str,
+) -> Vec<u8> {
+    let Some(tok) = bearer(headers) else {
+        return json_response(401, json!({"error":"unauthorized"}));
+    };
+    let access = inner.access_tokens.lock().await;
+    let Some(rec) = access.get(&tok).cloned() else {
+        return json_response(401, json!({"error":"invalid_token"}));
+    };
+    drop(access);
+    if !rec
+        .scope
+        .split_whitespace()
+        .any(|scope| scope == "ownmesh.device")
+    {
+        return json_response(403, json!({"error":"insufficient_scope"}));
+    }
+    let device_id = path.strip_prefix("/v1/devices/").unwrap_or_default();
+    if device_id.is_empty() || device_id.contains('/') {
+        return json_response(404, json!({"error":"not_found"}));
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return json_response(400, json!({"error":"invalid_request","field":"body"}));
+    };
+    let Some(object) = value.as_object() else {
+        return json_response(400, json!({"error":"invalid_request","field":"body"}));
+    };
+    if object.is_empty() || object.keys().any(|key| key != "name" && key != "labels") {
+        return json_response(400, json!({"error":"invalid_request","field":"body"}));
+    }
+    let name = if let Some(value) = object.get("name") {
+        let Some(name) = value.as_str().map(str::trim).filter(|name| {
+            !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control)
+        }) else {
+            return json_response(400, json!({"error":"invalid_request","field":"name"}));
+        };
+        Some(name.to_owned())
+    } else {
+        None
+    };
+    let labels = if let Some(value) = object.get("labels") {
+        let Some(labels) = normalize_mock_labels(value) else {
+            return json_response(400, json!({"error":"invalid_request","field":"labels"}));
+        };
+        Some(labels)
+    } else {
+        None
+    };
+
+    let mut devices = inner.devices.lock().await;
+    let Some(device) = devices.get_mut(device_id) else {
+        return json_response(404, json!({"error":"not_found"}));
+    };
+    if device.principal_id != rec.principal || device.revoked {
+        return json_response(404, json!({"error":"not_found"}));
+    }
+    if let Some(name) = name {
+        device.name = name;
+    }
+    if let Some(labels) = labels {
+        device.labels = labels;
+    }
+    json_response(
+        200,
+        json!({
+            "ok": true,
+            "device": {
+                "id": device.id,
+                "name": device.name,
+                "labels": device.labels,
+                "public_key": device.public_key,
+                "revoked": device.revoked,
+                "status": device.status,
+            }
+        }),
+    )
+}
+
+fn normalize_mock_labels(value: &Value) -> Option<Vec<String>> {
+    let values = value.as_array()?;
+    if values.len() > 16 {
+        return None;
+    }
+    let mut labels = Vec::new();
+    for value in values {
+        let label = value.as_str()?.trim();
+        if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) {
+            return None;
+        }
+        if !labels.iter().any(|existing| existing == label) {
+            labels.push(label.to_owned());
+        }
+    }
+    Some(labels)
 }
 
 async fn handle_revoke_device(

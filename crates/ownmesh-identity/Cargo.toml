@@ -23,14 +23,23 @@ serde_json = "1.0.135"
 sha2 = "0.10.8"
 zeroize = { version = "1.8.1", features = ["derive"] }
 
-# OS keychain (Windows Credential Manager / macOS Keychain / Linux Secret Service).
-keyring = "3.6.2"
+# keyring 3.x has no native store enabled by default; without these features it
+# silently selects its process-local mock backend. Enable one persistent native
+# store on every supported desktop OS so successful primary writes survive a
+# process restart. Headless Linux still fails over to the encrypted file store.
+keyring = { version = "3.6.2", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 # Headless encrypted keystore fallback (ChaCha20-Poly1305 + Argon2id).
 argon2 = "0.5.3"
 chacha20poly1305 = "0.10.1"
 base64 = "0.22.1"
 tracing = "0.1.41"
+
+# Linux release archives target musl and must not depend on a CI image's
+# libdbus development package. Feature unification makes keyring's Secret
+# Service backend use the crate's pinned vendored libdbus build.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = { version = "0.9.12", features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3.15.0"

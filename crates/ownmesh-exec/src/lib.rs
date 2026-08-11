@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::process::Command;
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command};
+use tokio::sync::watch;
 
 /// Stable crate name used by diagnostics and tests.
 #[must_use]
@@ -246,6 +248,49 @@ fn is_script_or_interpreter_in_dir(program: &str, cwd: Option<&Path>) -> bool {
     path_has_shebang(path)
 }
 
+/// Hard ceiling for structured executable pin/revalidation hashing.
+/// Prevents a remote full-access structured command from forcing unbounded
+/// `read()` of a huge regular file before policy execution.
+pub const MAX_EXECUTABLE_PIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Hard ceiling for the on-disk idempotency journal file.
+pub const MAX_JOURNAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Stream SHA-256 of a regular file up to `max_bytes` without unbounded allocation.
+fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResult<String> {
+    if expected_len > max_bytes {
+        return Err(ExecError::Journal(format!(
+            "executable exceeds {max_bytes} byte pin budget: {} ({expected_len} bytes)",
+            path.display()
+        )));
+    }
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > max_bytes {
+            return Err(ExecError::Journal(format!(
+                "executable exceeded {max_bytes} byte pin budget while hashing: {}",
+                path.display()
+            )));
+        }
+        hasher.update(&buf[..n]);
+    }
+    if total != expected_len {
+        return Err(ExecError::Journal(format!(
+            "executable length changed while hashing ({expected_len} -> {total})"
+        )));
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Capture device/inode/content digest for a structured executable path.
 ///
 /// # Errors
@@ -259,10 +304,7 @@ pub fn pin_executable(path: &Path, policy_kind: CommandKind) -> ExecResult<Execu
             path.display()
         )));
     }
-    let bytes = std::fs::read(path)?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let content_sha256 = hex::encode(hasher.finalize());
+    let content_sha256 = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES)?;
     let (device, inode) = file_identity(&meta);
     Ok(ExecutablePin {
         path: path.to_string_lossy().into_owned(),
@@ -307,15 +349,12 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
                 .into(),
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| {
+    let digest = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
         ExecError::Journal(format!(
             "executable content revalidation failed for {}: {e}",
             path.display()
         ))
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let digest = hex::encode(hasher.finalize());
     if digest != pin.content_sha256 {
         return Err(ExecError::Journal(
             "executable content digest drifted before execution; request must be re-authorized"
@@ -595,8 +634,13 @@ pub struct RunRequest {
 }
 
 fn default_max_output() -> usize {
-    1024 * 1024
+    256 * 1024
 }
+
+/// Absolute ceiling for captured stdout+stderr (bytes).
+pub const HARD_MAX_OUTPUT_BYTES: usize = 1_000_000;
+/// Absolute ceiling for wall-clock timeout (ms).
+pub const HARD_MAX_TIMEOUT_MS: u64 = 300_000;
 
 /// Captured command result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -651,7 +695,29 @@ impl IdempotencyJournal {
     pub fn open(path: impl Into<PathBuf>) -> ExecResult<Self> {
         let path = path.into();
         let entries = if path.exists() {
-            let raw = std::fs::read_to_string(&path)?;
+            let meta = std::fs::metadata(&path)?;
+            if meta.len() > MAX_JOURNAL_FILE_BYTES {
+                return Err(ExecError::Journal(format!(
+                    "idempotency journal exceeds {MAX_JOURNAL_FILE_BYTES} byte budget ({})",
+                    meta.len()
+                )));
+            }
+            // Cap allocation to the pre-checked size (never unbounded read_to_string).
+            use std::io::Read;
+            let file = std::fs::File::open(&path)?;
+            let mut raw = String::new();
+            let limit = usize::try_from(meta.len().saturating_add(1))
+                .unwrap_or(usize::MAX)
+                .min(
+                    usize::try_from(MAX_JOURNAL_FILE_BYTES.saturating_add(1)).unwrap_or(usize::MAX),
+                );
+            let mut take = file.take(u64::try_from(limit).unwrap_or(u64::MAX));
+            take.read_to_string(&mut raw)?;
+            if raw.len() as u64 > MAX_JOURNAL_FILE_BYTES {
+                return Err(ExecError::Journal(format!(
+                    "idempotency journal exceeds {MAX_JOURNAL_FILE_BYTES} byte budget"
+                )));
+            }
             serde_json::from_str(&raw).map_err(|e| ExecError::Journal(e.to_string()))?
         } else {
             HashMap::new()
@@ -695,6 +761,19 @@ impl IdempotencyJournal {
     pub fn put(&mut self, key: String, result: RunResult) -> ExecResult<()> {
         let mut updated = self.entries.clone();
         updated.insert(key, JournalEntry::Complete(result));
+        self.flush(&updated)?;
+        self.entries = updated;
+        Ok(())
+    }
+
+    /// Drop an in-progress reservation after cancel so a later authorized retry
+    /// may re-run. Completed entries are never removed.
+    pub fn clear_in_progress(&mut self, key: &str) -> ExecResult<()> {
+        if !matches!(self.entries.get(key), Some(JournalEntry::InProgress(_))) {
+            return Ok(());
+        }
+        let mut updated = self.entries.clone();
+        updated.remove(key);
         self.flush(&updated)?;
         self.entries = updated;
         Ok(())
@@ -775,6 +854,12 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     for (k, v) in &req.env {
         cmd.env(k, v);
     }
+    // Put the child in its own process group (Unix) so cancel/timeout can kill
+    // the whole tree, including backgrounded descendants of shells.
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -782,24 +867,243 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     Ok(cmd)
 }
 
-fn truncate_bytes(mut data: Vec<u8>, max: usize) -> (String, bool) {
-    let truncated = data.len() > max;
-    if truncated {
-        data.truncate(max);
+fn bytes_to_text(data: &[u8]) -> String {
+    String::from_utf8_lossy(data).into_owned()
+}
+
+/// Kill a process tree. Unix uses process-group signal; Windows uses taskkill /T.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    let text = String::from_utf8_lossy(&data).into_owned();
-    (text, truncated)
+    #[cfg(unix)]
+    {
+        // `kill(2)` with a negative PID targets the process group created by
+        // `process_group(0)`.  Do not shell out to a `kill` utility: its
+        // option parsing can treat a negative group id as another signal and
+        // silently leave descendants alive.
+        if let Some(pid) = rustix::process::Pid::from_raw(pid.cast_signed()) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Best-effort process-tree containment after timeout/cancel/limit.
+/// Returns the exit code when `wait` completes within the grace period.
+async fn kill_child(child: &mut Child) -> Option<i32> {
+    if let Some(pid) = child.id() {
+        kill_process_tree(pid);
+    }
+    let _ = child.start_kill();
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(status)) => status.code(),
+        _ => None,
+    }
+}
+
+/// Stream stdout/stderr into independently capped rings. Never `read_to_end`
+/// an attacker-controlled pipe. Apply backpressure by stopping reads and killing
+/// the process when the aggregate byte budget is exhausted.
+#[allow(unused_assignments)] // terminal branches assign flags then break.
+#[allow(clippy::too_many_lines)]
+async fn collect_bounded_output(
+    child: &mut Child,
+    max_output_bytes: usize,
+    timeout: Option<Duration>,
+    mut cancel: Option<watch::Receiver<bool>>,
+) -> ExecResult<(Option<i32>, Vec<u8>, Vec<u8>, bool, bool, bool)> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let mut stdout_done = stdout.is_none();
+    let mut stderr_done = stderr.is_none();
+    let mut truncated = false;
+    let mut cancelled = false;
+    let mut timed_out = false;
+    let mut exit_code: Option<i32> = None;
+    let mut status_done = false;
+    let mut stdout_chunk = [0_u8; 8192];
+    let mut stderr_chunk = [0_u8; 8192];
+    let deadline = timeout.map(|d| tokio::time::Instant::now() + d);
+
+    loop {
+        if cancelled || timed_out {
+            break;
+        }
+        if status_done && stdout_done && stderr_done {
+            break;
+        }
+
+        let budget_left = max_output_bytes
+            .saturating_sub(stdout_buf.len())
+            .saturating_sub(stderr_buf.len());
+        if budget_left == 0 && !(stdout_done && stderr_done) {
+            truncated = true;
+            // Drop pipes before kill so producers unblock, then contain the tree.
+            stdout = None;
+            stderr = None;
+            stdout_done = true;
+            stderr_done = true;
+            if !status_done {
+                exit_code = kill_child(child).await;
+                status_done = true;
+            }
+            break;
+        }
+
+        tokio::select! {
+            biased;
+
+            changed = async {
+                if let Some(rx) = cancel.as_mut() {
+                    if *rx.borrow() {
+                        return true;
+                    }
+                    let _ = rx.changed().await;
+                    *rx.borrow()
+                } else {
+                    std::future::pending::<bool>().await
+                }
+            } => {
+                if changed {
+                    cancelled = true;
+                    stdout = None;
+                    stderr = None;
+                    stdout_done = true;
+                    stderr_done = true;
+                    if !status_done {
+                        exit_code = kill_child(child).await;
+                        status_done = true;
+                    }
+                }
+            }
+
+            () = async {
+                if let Some(deadline) = deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }, if deadline.is_some() && !timed_out => {
+                timed_out = true;
+                stdout = None;
+                stderr = None;
+                stdout_done = true;
+                stderr_done = true;
+                if !status_done {
+                    exit_code = kill_child(child).await;
+                    status_done = true;
+                }
+            }
+
+            read = async {
+                match stdout.as_mut() {
+                    Some(pipe) => pipe.read(&mut stdout_chunk).await,
+                    None => std::future::pending().await,
+                }
+            }, if !stdout_done => {
+                match read {
+                    Ok(0) | Err(_) => stdout_done = true,
+                    Ok(n) => {
+                        let take = n.min(budget_left);
+                        stdout_buf.extend_from_slice(&stdout_chunk[..take]);
+                        if take < n || stdout_buf.len() + stderr_buf.len() >= max_output_bytes {
+                            truncated = true;
+                            stdout = None;
+                            stderr = None;
+                            stdout_done = true;
+                            stderr_done = true;
+                            if !status_done {
+                                exit_code = kill_child(child).await;
+                                status_done = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            read = async {
+                match stderr.as_mut() {
+                    Some(pipe) => pipe.read(&mut stderr_chunk).await,
+                    None => std::future::pending().await,
+                }
+            }, if !stderr_done => {
+                match read {
+                    Ok(0) | Err(_) => stderr_done = true,
+                    Ok(n) => {
+                        let take = n.min(budget_left);
+                        stderr_buf.extend_from_slice(&stderr_chunk[..take]);
+                        if take < n || stdout_buf.len() + stderr_buf.len() >= max_output_bytes {
+                            truncated = true;
+                            stdout = None;
+                            stderr = None;
+                            stdout_done = true;
+                            stderr_done = true;
+                            if !status_done {
+                                exit_code = kill_child(child).await;
+                                status_done = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            status = child.wait(), if !status_done => {
+                match status {
+                    Ok(st) => {
+                        exit_code = st.code();
+                        status_done = true;
+                    }
+                    Err(err) => return Err(ExecError::Io(err)),
+                }
+            }
+        }
+    }
+
+    Ok((
+        exit_code, stdout_buf, stderr_buf, truncated, timed_out, cancelled,
+    ))
 }
 
 /// Run a command, optionally consulting/updating an idempotency journal.
 pub async fn run_command(
     req: &RunRequest,
-    mut journal: Option<&mut IdempotencyJournal>,
+    journal: Option<&mut IdempotencyJournal>,
 ) -> ExecResult<RunResult> {
+    Box::pin(run_command_cancellable(req, journal, None)).await
+}
+
+/// Like [`run_command`], but observes an external cancel signal and kills the
+/// process tree without waiting for natural exit.
+pub async fn run_command_cancellable(
+    req: &RunRequest,
+    mut journal: Option<&mut IdempotencyJournal>,
+    cancel: Option<watch::Receiver<bool>>,
+) -> ExecResult<RunResult> {
+    // Clamp untrusted ceilings before any allocation or spawn.
+    let max_output_bytes = req.max_output_bytes.clamp(1, HARD_MAX_OUTPUT_BYTES);
+    let timeout_ms = req.timeout_ms.map(|ms| ms.clamp(1, HARD_MAX_TIMEOUT_MS));
+    let mut capped = req.clone();
+    capped.max_output_bytes = max_output_bytes;
+    capped.timeout_ms = timeout_ms;
+
     // Request validation/building has no external side effect and happens before
     // reserving the key. Spawn remains strictly after the durable marker.
-    let mut cmd = build_command(req)?;
-    if let (Some(key), Some(j)) = (req.idempotency_key.as_deref(), journal.as_deref_mut()) {
+    let mut cmd = build_command(&capped)?;
+    if let (Some(key), Some(j)) = (capped.idempotency_key.as_deref(), journal.as_deref_mut()) {
         if let Some(prev) = j.get(key) {
             let mut replayed = prev.clone();
             replayed.replayed = true;
@@ -816,50 +1120,59 @@ pub async fn run_command(
     let start = Instant::now();
     let mut child = cmd.spawn()?;
 
-    if let Some(input) = &req.stdin {
+    if let Some(input) = &capped.stdin {
         if let Some(mut stdin) = child.stdin.take() {
             use tokio::io::AsyncWriteExt;
-            stdin.write_all(input.as_bytes()).await?;
+            let _ = stdin.write_all(input.as_bytes()).await;
+            drop(stdin);
         }
     }
 
-    let timeout = req.timeout_ms.map(Duration::from_millis);
-    let wait_fut = child.wait_with_output();
-    let output = if let Some(dur) = timeout {
-        match tokio::time::timeout(dur, wait_fut).await {
-            Ok(res) => Some(res?),
-            // Best-effort kill; kill_on_drop also helps. The timeout result is
-            // still journaled so retry cannot start a second process.
-            Err(_) => None,
-        }
-    } else {
-        Some(wait_fut.await?)
-    };
+    let timeout = capped.timeout_ms.map(Duration::from_millis);
+    // Box the select-heavy collector so callers stay under clippy large_futures.
+    let (exit_code, stdout_raw, stderr_raw, truncated, timed_out, cancelled) = Box::pin(
+        collect_bounded_output(&mut child, max_output_bytes, timeout, cancel),
+    )
+    .await?;
 
-    let result = if let Some(output) = output {
-        let (stdout, t1) = truncate_bytes(output.stdout, req.max_output_bytes);
-        let remain = req.max_output_bytes.saturating_sub(stdout.len());
-        let (stderr, t2) = truncate_bytes(output.stderr, remain);
+    if cancelled {
+        // Do not journal a cancelled attempt as a successful side effect; a
+        // retry with the same key may legitimately re-run after cancel.
+        if let (Some(key), Some(j)) = (req.idempotency_key.as_deref(), journal.as_mut()) {
+            let _ = j.clear_in_progress(key);
+        }
+        return Err(ExecError::Cancelled);
+    }
+
+    let result = if timed_out {
         RunResult {
-            exit_code: output.status.code(),
-            stdout,
-            stderr,
-            timed_out: false,
+            exit_code: None,
+            stdout: bytes_to_text(&stdout_raw),
+            stderr: {
+                let mut msg = format!(
+                    "command timed out after {:?}",
+                    timeout.expect("timeout result requires configured duration")
+                );
+                let err = bytes_to_text(&stderr_raw);
+                if !err.is_empty() {
+                    msg.push('\n');
+                    msg.push_str(&err);
+                }
+                msg
+            },
+            timed_out: true,
             duration_ms: start.elapsed().as_millis() as u64,
-            truncated: t1 || t2,
+            truncated,
             replayed: false,
         }
     } else {
         RunResult {
-            exit_code: None,
-            stdout: String::new(),
-            stderr: format!(
-                "command timed out after {:?}",
-                timeout.expect("timeout result requires configured duration")
-            ),
-            timed_out: true,
+            exit_code,
+            stdout: bytes_to_text(&stdout_raw),
+            stderr: bytes_to_text(&stderr_raw),
+            timed_out: false,
             duration_ms: start.elapsed().as_millis() as u64,
-            truncated: false,
+            truncated,
             replayed: false,
         }
     };
@@ -925,6 +1238,39 @@ mod tests {
         assert!(!res.timed_out);
     }
 
+    #[test]
+    fn pin_executable_rejects_oversized_before_allocation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            // Sparse when the FS supports it — still reports large len() for the ceiling.
+            f.set_len(MAX_EXECUTABLE_PIN_BYTES + 1).unwrap();
+        }
+        let err = pin_executable(&path, CommandKind::Structured).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pin budget") || msg.contains("byte"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn journal_open_rejects_oversized_file_before_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(MAX_JOURNAL_FILE_BYTES + 1).unwrap();
+        }
+        let err = IdempotencyJournal::open(&path).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("journal exceeds") || msg.contains("byte budget"),
+            "unexpected error: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn idempotency_prevents_rerun() {
         let dir = tempdir().unwrap();
@@ -959,6 +1305,169 @@ mod tests {
         let second = run_command(&req, Some(&mut j)).await.unwrap();
         assert!(second.replayed);
         assert_eq!(first.stdout, second.stdout);
+    }
+
+    #[tokio::test]
+    async fn infinite_output_is_byte_capped_without_read_to_end() {
+        // A writer that would fill memory if collected unbounded.
+        #[cfg(windows)]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "cmd.exe".into(),
+            // Keep producing lines without waiting for the full command script to end.
+            args: vec![
+                "/C".into(),
+                "for /L %i in (1,1,1000000) do @echo xxxxxxxxxxxxxxxx".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(10_000),
+            max_output_bytes: 8 * 1024,
+            idempotency_key: None,
+        };
+        #[cfg(not(windows))]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "while true; do printf '%s\\n' 'xxxxxxxx'; done".into(),
+            ],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(10_000),
+            max_output_bytes: 8 * 1024,
+            idempotency_key: None,
+        };
+        let res = tokio::time::timeout(Duration::from_secs(12), run_command(&req, None))
+            .await
+            .expect("bounded output collection must finish promptly")
+            .unwrap();
+        assert!(
+            res.truncated || res.timed_out,
+            "expected truncation or timeout, got {res:?}"
+        );
+        assert!(res.stdout.len() + res.stderr.len() <= 8 * 1024 + 1024);
+    }
+
+    #[tokio::test]
+    async fn cancel_kills_long_running_command() {
+        let (tx, rx) = watch::channel(false);
+        #[cfg(windows)]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "cmd.exe".into(),
+            args: vec!["/C".into(), "ping -n 30 127.0.0.1 >NUL".into()],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(60_000),
+            max_output_bytes: 4096,
+            idempotency_key: None,
+        };
+        #[cfg(not(windows))]
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(60_000),
+            max_output_bytes: 4096,
+            idempotency_key: None,
+        };
+        let join = tokio::spawn(async move { run_command_cancellable(&req, None, Some(rx)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tx.send(true);
+        let err = tokio::time::timeout(Duration::from_secs(5), join)
+            .await
+            .expect("cancel should finish promptly")
+            .expect("join")
+            .expect_err("expected Cancelled");
+        assert!(matches!(err, ExecError::Cancelled));
+    }
+
+    /// Prove cancel kills descendants, not only the direct shell child.
+    #[tokio::test]
+    async fn cancel_kills_process_tree_descendants() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join(format!(
+            "child-alive-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let marker_s = marker.to_string_lossy().replace('"', "");
+
+        #[cfg(windows)]
+        let req = {
+            // Nested cmd is a real child process of the outer cmd (not `start /b`
+            // which can detach). Child rewrites the marker every second.
+            let inner = format!(
+                "for /l %i in (1,1,60) do @((echo alive)>{marker_s} & ping -n 2 127.0.0.1 >NUL)"
+            );
+            RunRequest {
+                kind: CommandKind::Structured,
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), format!("cmd.exe /C {inner}")],
+                cwd: Some(dir.path().to_path_buf()),
+                env: HashMap::new(),
+                stdin: None,
+                timeout_ms: Some(60_000),
+                max_output_bytes: 4096,
+                idempotency_key: None,
+            }
+        };
+        #[cfg(not(windows))]
+        let req = {
+            let script =
+                format!("(while true; do echo alive > '{marker_s}'; sleep 0.2; done) & sleep 30");
+            RunRequest {
+                kind: CommandKind::RawShell,
+                program: script,
+                args: vec![],
+                cwd: Some(dir.path().to_path_buf()),
+                env: HashMap::new(),
+                stdin: None,
+                timeout_ms: Some(60_000),
+                max_output_bytes: 4096,
+                idempotency_key: None,
+            }
+        };
+
+        let (tx, rx) = watch::channel(false);
+        let join = tokio::spawn(async move { run_command_cancellable(&req, None, Some(rx)).await });
+        // Wait until the descendant has written the marker at least once.
+        let mut saw = false;
+        for _ in 0..80 {
+            if marker.exists() {
+                saw = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(saw, "descendant never wrote marker before cancel");
+        let before = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        let _ = tx.send(true);
+        let err = tokio::time::timeout(Duration::from_secs(8), join)
+            .await
+            .expect("tree cancel should finish")
+            .expect("join")
+            .expect_err("expected Cancelled");
+        assert!(matches!(err, ExecError::Cancelled));
+        // After cancel, the background writer must stop updating the marker.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let after = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+        assert_eq!(
+            before, after,
+            "descendant kept writing after cancel — process tree not contained"
+        );
     }
 
     #[test]

@@ -1,0 +1,19 @@
+{
+  "protocol": "ownmesh.device/1.0",
+  "message_id": "msg_01OPEVENT",
+  "type": "operation.event",
+  "device_id": "dev_windows-01",
+  "correlation_id": "op_01REMOTE",
+  "seq": 126,
+  "sent_at": "2026-08-06T00:00:01Z",
+  "payload": {
+    "operation_contract": "ownmesh.operation/1.0",
+    "operation_id": "op_01REMOTE",
+    "event_seq": 1,
+    "event_type": "fs.read.chunk",
+    "data": {
+      "offset": 0,
+      "bytes": 64
+    }
+  }
+}

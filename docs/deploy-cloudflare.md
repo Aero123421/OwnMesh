@@ -9,6 +9,7 @@ Standard deploy creates **only**:
 | Worker | — | OAuth, MCP `/mcp`, device APIs |
 | D1 | `DB` | tenants, principals, OAuth clients/tokens, devices, grants, audit metadata |
 | Durable Object | `DEVICE_ROOM` | per-device WebSocket room (hibernation) |
+| Durable Object | `TRANSFER_ROOM` | transient encrypted transfer coordination |
 
 **Not** created (fail-closed): R2 buckets, Cloudflare TURN, relay queues.
 
@@ -28,26 +29,25 @@ Docs: [Deploy to Cloudflare buttons](https://developers.cloudflare.com/workers/p
 - Node 22+ and pnpm 9+
 - Logged in: `pnpm exec wrangler login`
 
-## Wrangler deploy (recommended for developers)
+## Guided deploy (recommended)
 
 ```bash
 cd packages/control-plane
-pnpm install
-
-# 1) Create D1 (once per account)
-pnpm exec wrangler d1 create ownmesh
-# Copy the printed database_id into wrangler.jsonc → d1_databases[0].database_id
-
-# 2) Apply SQL migrations (remote)
-# Use the binding name DB so renames stay correct:
-# https://developers.cloudflare.com/workers/platform/deploy-buttons/
-pnpm exec wrangler d1 migrations apply DB --remote
-
-# 3) Deploy Worker + Durable Object
-pnpm run deploy
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run deploy:guided
 ```
 
-`package.json` `deploy` script runs migrations against binding `DB` then `wrangler deploy`.
+The guided command opens Cloudflare sign-in when needed, creates or reuses the
+single D1 database named `ownmesh`, applies migrations, deploys the Worker and
+Durable Objects, and provisions secrets without writing a plaintext secret
+file. It finishes by printing the owner sign-in URL, the one-time owner code,
+and the ChatGPT MCP URL.
+Re-running it is idempotent: existing owner/signing secrets are not rotated.
+
+For CI or an already-provisioned account, `pnpm run deploy` only applies
+migrations and deploys. `pnpm run owner:init` rotates the one-time owner
+bootstrap separately.
 
 ### Local dev
 
@@ -63,16 +63,44 @@ curl http://127.0.0.1:8787/health
 | Name | Required | Notes |
 |---|---|---|
 | `OAUTH_ISSUER` | optional | Defaults to request origin. Set to your canonical `https://<worker>.workers.dev` if behind a custom domain. |
-| `AUTH_PROVIDER` | **required for production browser OAuth** | Cloudflare service binding. `POST /authenticate` must return `{ principal_id, tenant_id, display_name? }` for the current Authorization/cookie context. Browser authorization/device verification returns 503 if the binding is absent. |
+| `OWNER_TOKEN_HASH` | **required by default** | SHA-256 of the high-entropy, one-time passkey bootstrap code. `pnpm run owner:init` creates it without storing the plaintext code in D1. |
+| `AUTH_PROVIDER` | optional | External identity service for multi-user deployments. When omitted, the built-in single-owner passkey login is used. |
 | `OWNMESH_DEV_AUTH_BYPASS` | optional, default `false` | Local/test-only escape hatch for `login_hint`. Never enable against production data. |
-| `ALLOW_DYNAMIC_CLIENT_REGISTRATION` | optional, default `false` | Opt-in DCR. Prefer statically provisioned clients. Unknown clients are never auto-registered by `/oauth/authorize`. |
+| `ALLOW_DYNAMIC_CLIENT_REGISTRATION` | optional, default `true` | Enables one-URL ChatGPT setup. Exact ChatGPT public callbacks register statelessly; all other DCR requires a tenant `ownmesh.device` token. Set `false` to require manual client provisioning. |
 | `OWNMESH_ALLOWED_ORIGINS` | optional | Comma-separated additional exact origins accepted by device WebSockets. The issuer origin is accepted automatically. |
-| `SESSION_SECRET` | optional | Reserved for signed cookies; generate with `openssl rand -hex 32`. **Do not commit secrets.** |
+| `SESSION_SECRET` | **required** | Signs owner sessions and internal Worker→DO contexts. `owner:init` creates it if absent. **Do not commit secrets.** |
 
-Example (do not commit values):
+`owner:init` sends values directly to Wrangler over stdin and prints only the
+one-time bootstrap code. Open `/login`, enter it once, and register a passkey;
+subsequent sign-ins do not accept the bootstrap code. If all passkeys are lost,
+run `pnpm run owner:init -- --reset-passkey`. Recovery rotates the browser-session
+secret, revokes the owner's OAuth tokens, advances the credential generation,
+and removes only the owner passkey records before issuing a new bootstrap code.
+
+### Cloudflare Access email OTP
+
+Cloudflare Access email OTP is an optional **outer gate for a separate operator
+dashboard**, not a replacement for OwnMesh OAuth, passkeys, or device policy.
+Do not put an interactive Access challenge in front of the OwnMesh MCP hostname:
+ChatGPT and enrolled Agents must reach `/.well-known/*`, `/oauth/*`, `/mcp`,
+`/agent/connect`, and `/v1/devices/*` without an Access login page in the middle.
+Protecting those routes would break OAuth discovery/token exchange or the Agent
+WebSocket rather than add useful security.
+
+OwnMesh does not currently ship a separate admin dashboard, so the recommended
+single-owner setup is the built-in `/login` passkey flow. If a future deployment
+adds an operator-only UI, place it on a distinct hostname or narrowly scoped
+path, allow only the owner's exact email, and keep all protocol endpoints on the
+unmodified OwnMesh hostname. Access OTPs are single-use and expire after ten
+minutes; see Cloudflare's [One-time PIN login](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/one-time-pin/)
+and [Access policy](https://developers.cloudflare.com/cloudflare-one/access-controls/policies/)
+documentation.
+
+Manual example (do not commit values):
 
 ```bash
 pnpm exec wrangler secret put SESSION_SECRET
+pnpm exec wrangler secret put OWNER_TOKEN_HASH
 ```
 
 Reference `.dev.vars.example` in this package for local-only vars.
@@ -82,8 +110,42 @@ Reference `.dev.vars.example` in this package for local-only vars.
 ```jsonc
 d1_databases: [{ binding: "DB", database_name: "ownmesh", migrations_dir: "migrations" }]
 durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
+ratelimits: [{ name: "AUTH_RATE_LIMITER", ... }, { name: "MCP_RATE_LIMITER", ... }]
 // no r2_buckets, no turn
 ```
+
+The rate-limit bindings are coarse abuse/cost guards. They run before D1 access,
+use hashed credentials (or a hashed connecting IP fallback), and never replace
+OAuth scopes, device policy, operation binding, or replay protection.
+
+## Capacity and cost guardrails
+
+OwnMesh is tuned for a personal or small-team control plane, not a public file
+hosting service:
+
+- Cloudflare currently includes 100,000 Worker requests/day and 10 ms CPU per
+  request on Workers Free; D1 Free includes 5 million rows read/day and 100,000
+  rows written/day. Check the live [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+  and [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/) before
+  a larger deployment.
+- Device and transfer rooms use the Durable Objects WebSocket Hibernation API,
+  so an idle connected Agent does not keep a JavaScript isolate billed as active.
+  Cloudflare bills incoming WebSocket messages at a 20:1 ratio for DO request
+  billing; see [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/).
+- Transfer payloads are end-to-end encrypted and relayed as bounded WebSocket
+  frames; they are not written to D1 or Durable Object storage. A 5 GiB transfer
+  uses about 81,920 64-KiB data frames plus acknowledgements (roughly 8,200 DO
+  billable requests at Cloudflare's current 20:1 message ratio, before retries).
+  Repeated multi-gigabyte transfers should use Workers Paid and be monitored.
+- `AUTH_RATE_LIMITER` (60/minute) and `MCP_RATE_LIMITER` (120/minute) protect D1
+  and operator budgets from coarse abuse. Cloudflare counters are intentionally
+  approximate, so OAuth, local device policy, exact action binding, and replay
+  fencing remain the security boundary.
+
+Monitor Worker errors/CPU, Durable Object requests/duration, and D1 row reads
+and writes in the Cloudflare dashboard. A `429` from OwnMesh means the caller
+should honor `Retry-After`; a Cloudflare 1027/1102 means the account or CPU limit
+was reached.
 
 - **D1 Worker API**: https://developers.cloudflare.com/d1/worker-api/
 - **DO WebSocket hibernation**: https://developers.cloudflare.com/durable-objects/best-practices/websockets/
@@ -96,7 +158,7 @@ durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
 |---|---|
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata (includes `device_authorization_endpoint`) |
 | `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata |
-| `POST /oauth/register` | Opt-in Dynamic Client Registration; disabled by default; `redirect_uri` **exact match** policy |
+| `POST /oauth/register` | Dynamic Client Registration; exact ChatGPT public callbacks are stateless, all other clients require tenant authentication; `redirect_uri` **exact match** policy |
 | `GET\|POST /oauth/authorize` | Authenticated principal + explicit consent + auth code + PKCE S256 |
 | `POST /oauth/token` | `authorization_code`, `refresh_token` (rotation + reuse detection), `urn:ietf:params:oauth:grant-type:device_code` |
 | `POST /oauth/revoke` | Token revoke |
@@ -108,7 +170,7 @@ durable_objects.bindings: [{ name: "DEVICE_ROOM", class_name: "DeviceRoom" }]
 | `POST /v1/devices/revoke` or `DELETE /v1/devices?id=` | Revoke device |
 | `GET /agent/connect?device_id=&role=agent\|client` | WebSocket → `DeviceRoom` DO |
 | `POST /mcp` | Streamable HTTP MCP |
-| `GET\|POST /approve` | Authenticated but currently unimplemented; returns 501 fail-closed |
+| `GET\|POST /approve` | Optional recovery/admin approval (human browser auth + one-time CSRF). Binds exact action hash, original `expires_at`, and approver principal into a device-routed `approval.decision` frame. Not required for normal ChatGPT use when device policy allows. |
 
 ### Enrollment response shape (for CLI)
 
@@ -134,9 +196,9 @@ Proof body: `{ "device_id", "challenge_id", "signature": "<64-byte ed25519 hex>"
 ## ChatGPT Personal Plugin / MCP
 
 1. Deploy control plane and note `https://<worker>/mcp`
-2. Configure a static OAuth client with **exact** redirect URIs (or deliberately enable `ALLOW_DYNAMIC_CLIENT_REGISTRATION`)
-3. In ChatGPT, add the MCP connector / Personal Plugin pointing at your `/mcp` URL
-4. Complete OAuth; scopes: `ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access`
+2. In ChatGPT, create a custom MCP app with that `/mcp` URL and choose OAuth. Leave the advanced client fields empty.
+3. Click Create. ChatGPT discovers/registers OAuth and opens OwnMesh sign-in automatically.
+4. Sign in with the owner passkey and approve scopes: `ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device offline_access`
 5. Enroll a device with `ownmesh device enroll` / `ownmesh login` against your issuer URL (CLI ticket **cli-auth-09**)
 
 **Policy note:** ChatGPT tool calls are **not** the authorization boundary. The local `ownmeshd` policy engine is final.

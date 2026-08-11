@@ -155,7 +155,7 @@ pub struct OperationFacts {
 }
 
 /// Single policy rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub id: String,
     pub decision: Decision,
@@ -306,7 +306,10 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
     match preset {
         AccessPreset::WorkspaceOnly => PolicyDocument {
             preset,
-            note: Some("Only workspace-relative non-elevated ops; everything else deny".into()),
+            note: Some(
+                "Workspace-relative FS only; command.run denied until OS process confinement exists"
+                    .into(),
+            ),
             rules: vec![
                 PolicyRule {
                     id: "ws-deny-elevated".into(),
@@ -319,16 +322,37 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     program_equals: None,
                     description: Some("elevated ops denied in Workspace Only".into()),
                 },
+                // Arbitrary structured/raw commands can open absolute paths and escape
+                // registered workspace roots. Fail closed until OS-level confinement exists.
                 PolicyRule {
-                    id: "ws-deny-raw-shell".into(),
+                    id: "ws-deny-command-until-confinement".into(),
                     decision: Decision::Deny,
-                    priority: 90,
+                    priority: 95,
                     capability: "command.run".into(),
                     when_elevated: None,
-                    when_kind: Some("raw_shell".into()),
+                    when_kind: None,
                     path_prefix: None,
                     program_equals: None,
-                    description: Some("raw shell denied".into()),
+                    description: Some(
+                        "command.run denied in workspace_only until OS process confinement"
+                            .into(),
+                    ),
+                },
+                // Interactive PTY/shell sessions are command execution: stdin can run
+                // arbitrary commands outside workspace custody. Deny until confinement.
+                PolicyRule {
+                    id: "ws-deny-session-open-until-confinement".into(),
+                    decision: Decision::Deny,
+                    priority: 95,
+                    capability: "session.open".into(),
+                    when_elevated: None,
+                    when_kind: None,
+                    path_prefix: None,
+                    program_equals: None,
+                    description: Some(
+                        "session.open denied in workspace_only until OS process confinement"
+                            .into(),
+                    ),
                 },
                 PolicyRule {
                     id: "ws-ask-write".into(),
@@ -341,22 +365,14 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     program_equals: None,
                     description: Some("confirm writes".into()),
                 },
-                PolicyRule {
-                    id: "ws-ask-command".into(),
-                    decision: Decision::Ask,
-                    priority: 50,
-                    capability: "command.run".into(),
-                    when_elevated: None,
-                    when_kind: None,
-                    path_prefix: None,
-                    program_equals: None,
-                    description: Some("confirm commands".into()),
-                },
             ],
         },
         AccessPreset::Recommended => PolicyDocument {
             preset,
-            note: Some("Balanced defaults: ask on write/exec, allow reads".into()),
+            note: Some(
+                "Balanced defaults: ask on write, allow reads; command.run denied until OS confinement"
+                    .into(),
+            ),
             rules: vec![
                 PolicyRule {
                     id: "rec-ask-elevated".into(),
@@ -369,16 +385,33 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     program_equals: None,
                     description: Some("confirm elevated".into()),
                 },
+                // Same confinement gap as workspace_only: cwd binding alone cannot stop
+                // interpreter/absolute-path escapes. Fail closed until a real sandbox exists.
                 PolicyRule {
-                    id: "rec-ask-raw-shell".into(),
-                    decision: Decision::Ask,
-                    priority: 90,
+                    id: "rec-deny-command-until-confinement".into(),
+                    decision: Decision::Deny,
+                    priority: 95,
                     capability: "command.run".into(),
                     when_elevated: None,
-                    when_kind: Some("raw_shell".into()),
+                    when_kind: None,
                     path_prefix: None,
                     program_equals: None,
-                    description: Some("confirm raw shell".into()),
+                    description: Some(
+                        "command.run denied in recommended until OS process confinement".into(),
+                    ),
+                },
+                PolicyRule {
+                    id: "rec-deny-session-open-until-confinement".into(),
+                    decision: Decision::Deny,
+                    priority: 95,
+                    capability: "session.open".into(),
+                    when_elevated: None,
+                    when_kind: None,
+                    path_prefix: None,
+                    program_equals: None,
+                    description: Some(
+                        "session.open denied in recommended until OS process confinement".into(),
+                    ),
                 },
                 PolicyRule {
                     id: "rec-ask-write".into(),
@@ -390,17 +423,6 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     path_prefix: None,
                     program_equals: None,
                     description: Some("confirm writes".into()),
-                },
-                PolicyRule {
-                    id: "rec-ask-command".into(),
-                    decision: Decision::Ask,
-                    priority: 40,
-                    capability: "command.run".into(),
-                    when_elevated: None,
-                    when_kind: None,
-                    path_prefix: None,
-                    program_equals: None,
-                    description: Some("confirm commands".into()),
                 },
                 PolicyRule {
                     id: "rec-allow-read".into(),
@@ -638,15 +660,37 @@ mod tests {
     }
 
     #[test]
-    fn recommended_asks_on_command() {
-        let doc = preset_document(AccessPreset::Recommended);
-        let facts = OperationFacts {
-            capability: "command.run".into(),
-            kind: "structured".into(),
-            program: Some("cargo".into()),
-            ..Default::default()
-        };
-        assert_eq!(evaluate(&doc, &facts).decision, Decision::Ask);
+    fn restricted_presets_deny_command_until_os_confinement() {
+        for preset in [AccessPreset::WorkspaceOnly, AccessPreset::Recommended] {
+            let doc = preset_document(preset);
+            let session_facts = OperationFacts {
+                capability: "session.open".into(),
+                kind: "session".into(),
+                ..Default::default()
+            };
+            let session_v = evaluate(&doc, &session_facts);
+            assert_eq!(
+                session_v.decision,
+                Decision::Deny,
+                "{preset:?} must deny session.open until confinement"
+            );
+            for kind in ["structured", "raw_shell"] {
+                let facts = OperationFacts {
+                    capability: "command.run".into(),
+                    kind: kind.into(),
+                    program: Some("python".into()),
+                    path: Some("/tmp".into()),
+                    workspace_relative: false,
+                    ..Default::default()
+                };
+                let v = evaluate(&doc, &facts);
+                assert_eq!(
+                    v.decision,
+                    Decision::Deny,
+                    "{preset:?}/{kind} must fail closed: {v:?}"
+                );
+            }
+        }
     }
 
     #[test]

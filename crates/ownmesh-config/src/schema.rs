@@ -1,6 +1,7 @@
 //! Typed configuration schema and validation.
 
 use crate::error::{ConfigError, ConfigResult};
+use ownmesh_policy::PolicyRule;
 use serde::{Deserialize, Serialize};
 
 /// Current on-disk schema version for `config.toml`.
@@ -462,6 +463,15 @@ pub struct PolicyFile {
     /// Selected preset name when using a built-in preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    /// When deliberately enabled during local setup, an authenticated and
+    /// exact-bound remote MCP invocation is the user's requested action.  This
+    /// is not (and must never be represented as) a ChatGPT attestation.
+    #[serde(default)]
+    pub delegate_remote_mcp: bool,
+    /// Bounded user-authored rules. Built-in preset rules are reconstructed by
+    /// the daemon and these rules are appended as an explicit local overlay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<PolicyRule>,
 }
 
 impl Default for PolicyFile {
@@ -469,6 +479,8 @@ impl Default for PolicyFile {
         Self {
             schema_version: 1,
             preset: Some("recommended".into()),
+            delegate_remote_mcp: false,
+            rules: Vec::new(),
         }
     }
 }
@@ -485,8 +497,104 @@ impl PolicyFile {
                 message: "policy schema_version must be >= 1".into(),
             });
         }
+        let preset = self
+            .preset
+            .as_deref()
+            .unwrap_or("recommended")
+            .to_ascii_lowercase()
+            .replace('-', "_");
+        if preset == "full_access" && !self.rules.is_empty() {
+            return Err(ConfigError::Validation {
+                message: "full_access policy cannot contain custom rules".into(),
+            });
+        }
+        validate_policy_rules(&self.rules)?;
         Ok(())
     }
+}
+
+fn validate_policy_rules(rules: &[PolicyRule]) -> ConfigResult<()> {
+    const MAX_RULES: usize = 64;
+    if rules.len() > MAX_RULES {
+        return Err(ConfigError::Validation {
+            message: format!("policy rules exceed {MAX_RULES} entry limit"),
+        });
+    }
+    let mut ids = std::collections::HashSet::with_capacity(rules.len());
+    for rule in rules {
+        let id = rule.id.trim();
+        if id.is_empty()
+            || id.len() > 64
+            || !id.starts_with("rule_")
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            return Err(ConfigError::Validation {
+                message: format!(
+                    "invalid policy rule id: {:?} (expected rule_..., max 64)",
+                    rule.id
+                ),
+            });
+        }
+        if !ids.insert(id) {
+            return Err(ConfigError::Validation {
+                message: format!("duplicate policy rule id: {id}"),
+            });
+        }
+        if !(-1_000..=1_000).contains(&rule.priority) {
+            return Err(ConfigError::Validation {
+                message: format!("policy rule {id} priority must be between -1000 and 1000"),
+            });
+        }
+        validate_policy_token(id, "capability", &rule.capability, 64, true)?;
+        if let Some(kind) = rule.when_kind.as_deref() {
+            validate_policy_token(id, "when_kind", kind, 32, false)?;
+        }
+        for (field, value, max) in [
+            ("path_prefix", rule.path_prefix.as_deref(), 1_024_usize),
+            ("program_equals", rule.program_equals.as_deref(), 512_usize),
+            ("description", rule.description.as_deref(), 512_usize),
+        ] {
+            if let Some(value) = value {
+                if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+                    return Err(ConfigError::Validation {
+                        message: format!(
+                            "policy rule {id} {field} must be non-empty, control-free, and at most {max} bytes"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_token(
+    id: &str,
+    field: &str,
+    value: &str,
+    max: usize,
+    wildcard: bool,
+) -> ConfigResult<()> {
+    let valid_wildcard = wildcard
+        && (value == "*"
+            || value
+                .strip_suffix(".*")
+                .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains('*')));
+    let plain = !value.contains('*');
+    if value.is_empty()
+        || value.len() > max
+        || !(plain || valid_wildcard)
+        || !value.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '*')
+        })
+    {
+        return Err(ConfigError::Validation {
+            message: format!("policy rule {id} has invalid {field}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -499,6 +607,30 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
         assert!(!cfg.telemetry.project);
+    }
+
+    #[test]
+    fn full_access_rejects_hidden_custom_rules() {
+        let policy = PolicyFile {
+            schema_version: 1,
+            preset: Some("full_access".into()),
+            delegate_remote_mcp: false,
+            rules: vec![PolicyRule {
+                id: "rule_hidden_ask".into(),
+                decision: ownmesh_policy::Decision::Ask,
+                priority: 1,
+                capability: "filesystem.write".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: None,
+                program_equals: None,
+                description: None,
+            }],
+        };
+        let error = policy
+            .validate()
+            .expect_err("hidden Full Access rule must fail");
+        assert!(error.to_string().contains("full_access"));
     }
 
     #[test]

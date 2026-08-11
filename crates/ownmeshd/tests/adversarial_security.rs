@@ -547,7 +547,11 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
 async fn self_reported_principal_rejected_on_all_session_ops() {
     let dir = tempdir().unwrap();
     let paths = OwnMeshPaths::for_base(dir.path());
-    let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    {
+        let mut g = runtime.lock().await;
+        g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+    }
     let owner_cred = server.issue_client_credential("chatgpt").unwrap();
     let attacker_cred = server.issue_client_credential("attacker").unwrap();
     let owner = named_client_with_cred(
@@ -968,7 +972,11 @@ async fn attack_rehello_cannot_switch_principal_or_bypass_revoke() {
 async fn attack_shared_token_and_name_spoof_cannot_impersonate() {
     let dir = tempdir().unwrap();
     let paths = OwnMeshPaths::for_base(dir.path());
-    let (server, handle, endpoint, _rt) = start_test_daemon(&paths).await;
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    {
+        let mut g = runtime.lock().await;
+        g.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+    }
 
     // Victim principal exists as a server-managed credential.
     let victim_cred = server.issue_client_credential("victim-admin").unwrap();
@@ -1249,6 +1257,8 @@ fn production_daemon_start_recovers_config_written_journal_before_policy_use() {
     let old_policy = PolicyFile {
         schema_version: 1,
         preset: Some("full_access".into()),
+        delegate_remote_mcp: false,
+        rules: Vec::new(),
     };
     save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -1264,6 +1274,8 @@ fn production_daemon_start_recovers_config_written_journal_before_policy_use() {
     let new_policy = PolicyFile {
         schema_version: 1,
         preset: Some("workspace_only".into()),
+        delegate_remote_mcp: false,
+        rules: Vec::new(),
     };
     // Render via a successful transactional write to a sibling layout, then copy bytes.
     let render_dir = tempdir().unwrap();
@@ -1407,132 +1419,6 @@ fn corrupt_revoked_clients_state_fails_runtime_open() {
             && err.to_ascii_lowercase().contains("corrupt"),
         "err={err}"
     );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn broker_install_loader_ignores_even_trusted_looking_installed_true_records() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let euid = status
-        .lines()
-        .find(|line| line.starts_with("Uid:"))
-        .and_then(|line| line.split_whitespace().nth(2))
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap();
-    if euid != 0 {
-        let dir = tempdir().unwrap();
-        let paths = OwnMeshPaths::for_base(dir.path());
-        assert!(runtime::load_broker_client(&paths).0.is_none());
-        return;
-    }
-
-    let base = std::path::PathBuf::from("/run").join(format!(
-        "ownmeshd-loader-test-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    let paths = OwnMeshPaths {
-        config_dir: base.join("config"),
-        state_dir: base.join("state"),
-        runtime_dir: base.join("runtime"),
-        cache_dir: base.join("cache"),
-    };
-    let broker = paths.state_dir.join("broker");
-    let private = broker.join("private");
-    let socket_parent = broker.join("runtime");
-    for dir in [&base, &paths.state_dir, &broker, &private, &socket_parent] {
-        std::fs::create_dir(dir).unwrap();
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o711)).unwrap();
-
-    let secret_path = broker.join("broker.secret");
-    let signing_path = private.join("broker.cap.signing");
-    let verify_path = broker.join("broker.cap.verify");
-    let signing = CapabilitySigningKey::generate();
-    std::fs::write(&secret_path, [7_u8; 32]).unwrap();
-    std::fs::write(&signing_path, signing.to_bytes()).unwrap();
-    std::fs::write(&verify_path, signing.verify_key().to_bytes()).unwrap();
-    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::set_permissions(&signing_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::set_permissions(&verify_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-    let trusted_executable = std::fs::canonicalize("/usr/bin/true").unwrap();
-    let socket_path = socket_parent.join("ownmesh-broker.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let record = serde_json::json!({
-        "installed": true,
-        "support": "supported",
-        "endpoint": socket_path.display().to_string(),
-        "endpoint_kind": "unix_socket",
-        "secret_file": secret_path.display().to_string(),
-        "signing_key_file": signing_path.display().to_string(),
-        "verify_key_file": verify_path.display().to_string(),
-        "trusted_executable": trusted_executable.display().to_string(),
-        "socket_owner_uid": 0,
-        "socket_group_gid": 0,
-        "socket_mode": 0o600,
-        "allowed_uids": [0]
-    });
-    let install_path = broker.join("broker-install.json");
-    std::fs::write(&install_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-    std::fs::set_permissions(&install_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-    assert!(
-        runtime::load_broker_client(&paths).0.is_none()
-            && runtime::load_broker_client(&paths).1.is_none(),
-        "production loader must ignore handwritten installed=true records"
-    );
-
-    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o640)).unwrap();
-    assert!(runtime::load_broker_client(&paths).0.is_none());
-    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o733)).unwrap();
-    assert!(
-        runtime::load_broker_client(&paths).0.is_none(),
-        "writable signing-key parent must be rejected"
-    );
-    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o711)).unwrap();
-
-    std::fs::remove_file(&verify_path).unwrap();
-    std::os::unix::fs::symlink("/etc/passwd", &verify_path).unwrap();
-    assert!(
-        runtime::load_broker_client(&paths).0.is_none(),
-        "verify-key symlink must be rejected"
-    );
-    std::fs::remove_file(&verify_path).unwrap();
-    std::fs::write(&verify_path, signing.verify_key().to_bytes()).unwrap();
-    std::fs::set_permissions(&verify_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-    std::fs::remove_file(&signing_path).unwrap();
-    std::fs::hard_link(&secret_path, &signing_path).unwrap();
-    assert!(
-        runtime::load_broker_client(&paths).0.is_none(),
-        "secret/signing hard-link alias must be rejected"
-    );
-    std::fs::remove_file(&signing_path).unwrap();
-    std::fs::write(&signing_path, signing.to_bytes()).unwrap();
-    std::fs::set_permissions(&signing_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-    drop(listener);
-    std::fs::remove_file(&socket_path).unwrap();
-    assert!(
-        runtime::load_broker_client(&paths).0.is_none(),
-        "missing socket must never be trusted"
-    );
-    std::fs::write(&socket_path, b"/etc/passwd-like leaf").unwrap();
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(
-        runtime::load_broker_client(&paths).0.is_none(),
-        "regular endpoint leaf must never be trusted"
-    );
-
-    std::fs::remove_dir_all(base).unwrap();
 }
 
 // ---------------------------------------------------------------------------

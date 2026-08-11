@@ -33,10 +33,16 @@ mod client;
 mod endpoint;
 mod error;
 mod frame;
+#[cfg(target_os = "macos")]
+mod macos_peer;
 mod registry;
 mod rpc;
 mod server;
 mod transport;
+#[cfg(windows)]
+mod windows_job;
+#[cfg(windows)]
+mod windows_service;
 
 pub use auth::{
     canonicalize_principal_key, constant_time_eq, current_os_user_id, generate_token,
@@ -49,8 +55,13 @@ pub use client::{ClientIdentity, ClientOptions, IpcClient};
 pub use endpoint::{Endpoint, IpcBus};
 pub use error::{IpcError, IpcResult};
 pub use frame::{read_frame, write_frame, FrameDecoder, MAX_FRAME_BYTES};
+#[cfg(target_os = "macos")]
+pub use macos_peer::{macos_unix_peer_facts, MacOsUnixPeerFacts};
 pub use registry::{
-    read_management_credential, BootstrapStatus, CLIENT_CREDENTIAL_ENV,
+    atomic_write_owner_only, create_owner_only_file_new, open_owner_only_file_append,
+    open_owner_only_file_append_linkable, open_owner_only_file_read, prepare_owner_only_state_dir,
+    publish_owner_only_file_no_replace, read_management_credential, read_owner_only_file_bounded,
+    remove_owner_only_file, BootstrapStatus, CLIENT_CREDENTIAL_ENV,
     MANAGEMENT_CREDENTIAL_FILE_NAME,
 };
 pub use rpc::{
@@ -60,6 +71,18 @@ pub use rpc::{
 };
 pub use server::{reject_unknown_handler, IpcServer, MethodHandler, RevokedClients, ServerConfig};
 pub use transport::{connect, ClientConnection, LocalListener, ServerConnection};
+#[cfg(windows)]
+pub use transport::{
+    windows_process_facts, windows_running_service_facts, WindowsPipePeerFacts,
+    WindowsProcessFacts, WindowsServiceFacts,
+};
+#[cfg(windows)]
+pub use windows_job::{spawn_suspended_windows_job, WindowsJobProcess};
+#[cfg(windows)]
+pub use windows_service::{
+    run_ownmesh_daemon_service_dispatcher, windows_daemon_service_stop_requested,
+    WindowsServiceDispatcherOutcome, OWN_MESH_DAEMON_SERVICE_NAME,
+};
 
 /// Stable crate name used by diagnostics and tests.
 #[must_use]

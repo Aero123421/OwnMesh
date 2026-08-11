@@ -14,6 +14,11 @@ import {
   generateUserCode,
 } from "./util.ts";
 
+/** Short-lived bearer used for API requests. */
+export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
+/** Rolling inactivity limit for a rotated refresh-token family. */
+export const REFRESH_TOKEN_IDLE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+
 export type TokenRecord = {
   access_token: string;
   refresh_token: string;
@@ -21,6 +26,7 @@ export type TokenRecord = {
   scope: string;
   principal: string;
   expires_at: number;
+  refresh_expires_at: number;
   revoked: boolean;
   refresh_family: string;
   refresh_used: boolean;
@@ -39,6 +45,8 @@ export type DeviceRecord = {
   tenant_id: string;
   principal_id: string;
   name: string;
+  /** Display-only metadata. Labels are never an authorization input. */
+  labels?: string[];
   hostname: string;
   os: string;
   arch: string;
@@ -155,7 +163,49 @@ export type PrincipalRecord = {
   tenant_id: string;
   kind: string;
   display_name: string;
+  /** Server-owned, positive, monotonic OAuth credential epoch. */
+  credential_generation: number;
   created_at: string;
+};
+
+export type OwnerPasskeyRecord = {
+  credential_id: string;
+  principal_id: string;
+  webauthn_user_id: string;
+  public_key: Uint8Array;
+  counter: number;
+  transports: string[];
+  device_type: "singleDevice" | "multiDevice";
+  backed_up: boolean;
+  created_at: string;
+  last_used_at?: string;
+};
+
+export type OwnerAuthChallenge = {
+  id: string;
+  kind: "register" | "authenticate";
+  challenge: string;
+  webauthn_user_id?: string;
+  return_to: string;
+  expires_at: number;
+  created_at: string;
+};
+
+/** Cloud authority for a device-local workspace registration (E4).
+ *
+ * The path itself deliberately remains on the device.  The control plane owns
+ * only the tenancy, device binding, owner and monotonically increasing version
+ * that must be included in every exact-action binding.
+ */
+export type WorkspaceRecord = {
+  workspace_id: string;
+  tenant_id: string;
+  device_id: string;
+  owner_principal_id: string;
+  version: number;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
 };
 
 /** Authoritative MCP operation row (D1 / Memory). Isolate Maps are cache only. */
@@ -176,6 +226,17 @@ export type McpOperationRecord = {
   session_id?: string | null;
   warnings: string[];
   correlation_id?: string;
+  /** Server-computed SHA-256 of the canonical authorized action (E3). */
+  payload_hash?: string | null;
+  /** Client/server idempotency key bound to payload_hash. */
+  idempotency_key?: string | null;
+  workspace_id?: string | null;
+  /** ISO expiry bound into the authorized action. */
+  expires_at?: string | null;
+  /** Monotonic claim generation for prepare/claim/dispatch. */
+  claim_version?: number;
+  /** Canonical action JSON used to compute payload_hash. */
+  action?: Record<string, unknown> | null;
   policy_authority: "ownmesh_device";
   created_at: string;
   updated_at: string;
@@ -202,6 +263,216 @@ export type McpApprovalTransaction = {
  * may be reclaimed for retry after a crashed/hung delivery attempt.
  */
 export const MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS = 30_000;
+
+/** Per-tenant durable MCP operation budgets (D1 / Memory). */
+export const MCP_OPS_MAX_PER_TENANT = 2_000;
+/** Hard cap on serialized client-visible operation data_json (results / metadata). */
+export const MCP_OPS_MAX_DATA_JSON_BYTES = 256_000;
+/**
+ * Separate ceiling for the crash-safe dispatch outbox body embedded under
+ * `__ownmesh_dispatch_outbox`. Must fit under the public MCP request body cap
+ * (~1 MiB) with headroom for JSON framing. Never silently drop a pending body.
+ */
+export const MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES = 900_000;
+/** Terminal ops older than this may be compacted to idempotency tombstones. */
+export const MCP_OPS_RESULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Tombstones older than this may be hard-deleted (idempotency window closed). */
+export const MCP_OPS_TOMBSTONE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Internal durable-outbox key — must match mcp.ts DISPATCH_OUTBOX_KEY. */
+const DISPATCH_OUTBOX_DATA_KEY = "__ownmesh_dispatch_outbox";
+
+/** Result / list / command cursor facts that must survive durable truncation. */
+const DURABLE_RESULT_PRESERVE_KEYS = [
+  "path",
+  "encoding",
+  "offset",
+  "bytes",
+  "returned_bytes",
+  "total_bytes",
+  "truncated",
+  "sha256",
+  "next_offset",
+  "next_cursor",
+  "exit_code",
+  "timed_out",
+  "duration_ms",
+  "replayed",
+  "cancelled",
+  "signal_delivered",
+  "target_operation_id",
+  "stdout_truncated",
+  "stderr_truncated",
+  "stdout_bytes",
+  "stderr_bytes",
+  "total_matched",
+  "entries_returned",
+  "program",
+  "command",
+  "cwd",
+  "status",
+  "error",
+  "code",
+  "message",
+  "retryable",
+  "tool",
+  "op",
+  "capability",
+  "payload_hash",
+  "oauth_client_id",
+  "claim_version",
+  "expires_at",
+  "route",
+  "dispatch",
+  "next",
+] as const;
+
+const MCP_OPS_TERMINAL = new Set([
+  "completed",
+  "failed",
+  "denied",
+  "cancelled",
+  "device_offline",
+  "tombstone",
+]);
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function previewText(value: unknown, maxChars: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}…`;
+}
+
+/**
+ * Build a bounded, cursor-preserving stand-in when result data exceeds the
+ * durable store budget. Never invent success; never drop next_offset / sha256 /
+ * exit_code / list cursors when they were present.
+ */
+export function boundClientVisibleOperationData(
+  data: Record<string, unknown>,
+  originalBytes: number,
+): Record<string, unknown> {
+  const preserved: Record<string, unknown> = {
+    truncated: true,
+    durable_truncated: true,
+    returned_bytes: 0,
+    total_bytes: originalBytes,
+    message:
+      "operation result exceeded durable store budget; use range/pagination or smaller max_bytes/max_output_bytes — cursors and integrity facts are preserved when known",
+  };
+  for (const key of DURABLE_RESULT_PRESERVE_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(data, key) && data[key] !== undefined) {
+      preserved[key] = data[key];
+    }
+  }
+  // Keep short previews so operators can see *that* content existed without
+  // re-running, while staying well under the durable budget.
+  const contentPreview = previewText(data.content, 256);
+  if (contentPreview !== undefined) preserved.content_preview = contentPreview;
+  const stdoutPreview = previewText(data.stdout, 256);
+  if (stdoutPreview !== undefined) preserved.stdout_preview = stdoutPreview;
+  const stderrPreview = previewText(data.stderr, 256);
+  if (stderrPreview !== undefined) preserved.stderr_preview = stderrPreview;
+  if (Array.isArray(data.entries)) {
+    preserved.entries_returned = data.entries.length;
+    // Do not embed the oversized page; caller must re-list with a smaller limit.
+  }
+  // Prefer explicit next_cursor on the record when present in data.
+  if (typeof data.next_cursor === "string") {
+    preserved.next_cursor = data.next_cursor;
+  }
+  return preserved;
+}
+
+/**
+ * Bound operation data/action JSON and mark visible truncation.
+ *
+ * Critical E3 invariant: a pending `__ownmesh_dispatch_outbox` body is never
+ * replaced by a generic truncation object. Client-visible result bytes are
+ * bounded separately; the outbox is validated against its own ceiling and
+ * re-attached. Oversized outbox bodies fail closed (throw) rather than claim
+ * without a redeliverable body.
+ */
+export function boundMcpOperationRecord(op: McpOperationRecord): McpOperationRecord {
+  const next: McpOperationRecord = {
+    ...op,
+    data: { ...(op.data || {}) },
+    warnings: [...(op.warnings || [])],
+    action: op.action ? { ...op.action } : op.action,
+    policy_authority: "ownmesh_device",
+  };
+
+  const outbox = Object.prototype.hasOwnProperty.call(next.data, DISPATCH_OUTBOX_DATA_KEY)
+    ? next.data[DISPATCH_OUTBOX_DATA_KEY]
+    : undefined;
+  const clientData: Record<string, unknown> = { ...next.data };
+  delete clientData[DISPATCH_OUTBOX_DATA_KEY];
+
+  let clientJson = JSON.stringify(clientData || {});
+  if (utf8Bytes(clientJson) > MCP_OPS_MAX_DATA_JSON_BYTES) {
+    const originalBytes = utf8Bytes(clientJson);
+    next.data = boundClientVisibleOperationData(clientData, originalBytes);
+    next.truncated = true;
+    if (!next.warnings.includes("durable_result_truncated")) {
+      next.warnings.push("durable_result_truncated");
+    }
+    // Surface list/file continuation on the row when the bounded payload carries it.
+    if (typeof next.data.next_cursor === "string" && !next.next_cursor) {
+      next.next_cursor = next.data.next_cursor;
+    }
+    if (
+      next.data.next_offset !== undefined &&
+      next.data.next_offset !== null &&
+      !next.next_cursor
+    ) {
+      next.next_cursor = `off_${String(next.data.next_offset)}`;
+    }
+    clientJson = JSON.stringify(next.data);
+  } else {
+    next.data = clientData;
+  }
+
+  if (outbox !== undefined) {
+    const outboxJson = JSON.stringify(outbox);
+    const outboxBytes = utf8Bytes(outboxJson);
+    if (outboxBytes > MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES) {
+      throw new Error(
+        `mcp_dispatch_outbox_too_large:bytes=${outboxBytes}:max=${MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES}`,
+      );
+    }
+    // Re-attach after client-data bounding so crash recovery always has the body.
+    next.data = { ...next.data, [DISPATCH_OUTBOX_DATA_KEY]: outbox };
+  }
+
+  if (next.action) {
+    const actionJson = JSON.stringify(next.action);
+    if (utf8Bytes(actionJson) > MCP_OPS_MAX_DATA_JSON_BYTES) {
+      // Action binding must stay small; drop oversized client residue rather than store it.
+      next.action = {
+        truncated: true,
+        message: "canonical action exceeded durable store budget",
+      };
+    }
+  }
+  // Keep summary bounded too.
+  if (typeof next.summary === "string" && next.summary.length > 2_000) {
+    next.summary = `${next.summary.slice(0, 2_000)}…`;
+  }
+  return next;
+}
+
+function isTerminalMcpStatus(status: string): boolean {
+  return MCP_OPS_TERMINAL.has(status);
+}
+
+function mcpOpAgeMs(op: Pick<McpOperationRecord, "updated_at" | "created_at">, now = Date.now()): number {
+  const stamp = Date.parse(op.updated_at || op.created_at || "");
+  if (!Number.isFinite(stamp)) return 0;
+  return Math.max(0, now - stamp);
+}
 
 export type McpApprovalOutbox = {
   id: string;
@@ -245,6 +516,22 @@ export interface ControlPlaneStore {
   putClient(client: OAuthClientRecord): Promise<void>;
   getClient(clientId: string): Promise<OAuthClientRecord | null>;
 
+  listOwnerPasskeys(): Promise<OwnerPasskeyRecord[]>;
+  getOwnerPasskey(credentialId: string): Promise<OwnerPasskeyRecord | null>;
+  putInitialOwnerPasskey(passkey: OwnerPasskeyRecord): Promise<boolean>;
+  updateOwnerPasskeyUsage(
+    credentialId: string,
+    expectedCounter: number,
+    nextCounter: number,
+    deviceType: "singleDevice" | "multiDevice",
+    backedUp: boolean,
+  ): Promise<boolean>;
+  putOwnerAuthChallenge(challenge: OwnerAuthChallenge): Promise<boolean>;
+  takeOwnerAuthChallenge(
+    id: string,
+    kind: OwnerAuthChallenge["kind"],
+  ): Promise<OwnerAuthChallenge | null>;
+
   ensurePrincipal(
     id: string,
     displayName: string,
@@ -252,6 +539,8 @@ export interface ControlPlaneStore {
     tenantId?: string,
   ): Promise<PrincipalRecord>;
   getPrincipal(id: string): Promise<PrincipalRecord | null>;
+  /** Advance the server-owned OAuth credential epoch. Never caller supplied. */
+  advancePrincipalCredentialGeneration(id: string): Promise<number | null>;
 
   putAuthCode(code: AuthCodeRecord): Promise<void>;
   takeAuthCode(code: string): Promise<AuthCodeRecord | null>;
@@ -262,6 +551,7 @@ export interface ControlPlaneStore {
     scope: string,
     family?: string,
     ttlMs?: number,
+    refreshTtlMs?: number,
   ): Promise<TokenRecord>;
   getAccess(token: string): Promise<TokenRecord | null>;
   rotateRefresh(refreshToken: string): Promise<
@@ -299,6 +589,16 @@ export interface ControlPlaneStore {
   putDevice(device: DeviceRecord): Promise<void>;
   getDevice(id: string): Promise<DeviceRecord | null>;
   listDevices(principalId: string): Promise<DeviceRecord[]>;
+  /**
+   * Atomically update display metadata only when the device belongs to the
+   * principal and is not revoked. A null result deliberately does not reveal
+   * whether the id is missing, foreign-owned, or revoked.
+   */
+  updateDeviceMetadata(
+    id: string,
+    principalId: string,
+    patch: { name?: string; labels?: string[] },
+  ): Promise<DeviceRecord | null>;
   revokeDevice(id: string, principalId: string): Promise<boolean>;
   activateDeviceWithChallenge(deviceId: string, challengeId: string): Promise<boolean>;
   activateDeviceAndIssueCredential(deviceId: string, challengeId: string, ttlMs?: number): Promise<{ token: string; expires_at: number } | null>;
@@ -325,6 +625,34 @@ export interface ControlPlaneStore {
   putMcpOperation(op: McpOperationRecord): Promise<void>;
   getMcpOperation(operationId: string): Promise<McpOperationRecord | null>;
   getMcpOperationByCorrelation(correlationId: string): Promise<McpOperationRecord | null>;
+  /** Bounded newest-first lookup with all ownership facts fixed by the caller. */
+  listMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]>;
+  /**
+   * Lookup by principal/tenant/device/idempotency_key for exact-action reuse.
+   * Newest row wins when multiple historical rows exist.
+   */
+  getMcpOperationByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }): Promise<McpOperationRecord | null>;
+  /**
+   * Atomic create-or-return for an idempotency-bound MCP operation.
+   * Exactly one caller wins the insert for a given
+   * (principal, tenant, device, idempotency_key). Losers reload the winner
+   * and must compare action binding before any device route.
+   * When `idempotency_key` is null/empty, behaves as create-only putMcpOperation.
+   */
+  claimMcpOperationByIdempotency(op: McpOperationRecord): Promise<
+    | { outcome: "created"; op: McpOperationRecord }
+    | { outcome: "existing"; op: McpOperationRecord }
+  >;
   /**
    * Patch MCP operation. When `fromStatuses` is set, CAS: only updates if current
    * status is in that set (returns null on miss / CAS loss).
@@ -333,6 +661,8 @@ export interface ControlPlaneStore {
     operationId: string,
     patch: Partial<McpOperationRecord>,
     fromStatuses?: string[],
+    /** Exact durable data snapshot required for a compare-and-swap update. */
+    expectedData?: Record<string, unknown>,
   ): Promise<McpOperationRecord | null>;
 
   putMcpApprovalTransaction(tx: McpApprovalTransaction): Promise<void>;
@@ -389,8 +719,9 @@ export interface ControlPlaneStore {
   recordMcpApprovalOutboxAttempt(id: string, error?: string): Promise<void>;
 
   /**
-   * After successful device delivery: CAS operation out of approval_required
-   * (never overwrite fast terminal results) and mark outbox delivered.
+   * After successful device delivery: record the delivered decision while the
+   * operation remains approval_required until the authoritative device result,
+   * and mark the outbox delivered (never overwrite a fast terminal result).
    * Requires delivery_status=delivering and claim owner (token+version match).
    * Exactly-once transition.
    */
@@ -402,8 +733,8 @@ export interface ControlPlaneStore {
 
   /**
    * Fail-closed device gate for MCP create/poll/cancel.
-   * Rejects when device missing/inactive/revoked, owner mismatch, or when the
-   * device has credentials and none remain valid (all revoked/expired).
+   * Rejects when device missing/inactive/revoked, caller is neither owner nor
+   * tenant member, or when the device has credentials and none remain valid.
    * Credential schema/query failures fail closed (never treated as no credentials).
    */
   assertDeviceOperableForMcp(
@@ -411,6 +742,45 @@ export interface ControlPlaneStore {
     principalId: string,
     tenantId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }>;
+
+  /** True when principal is the device owner or an explicit tenant member. */
+  canOperateDevice(
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean>;
+
+  /** Upsert a tenant membership row (owner/admin/member). */
+  putTenantMember(
+    tenantId: string,
+    principalId: string,
+    role: "owner" | "admin" | "member",
+  ): Promise<void>;
+
+  isTenantMember(tenantId: string, principalId: string): Promise<boolean>;
+
+  /** Returns the effective tenant role, if any.  Missing schema fails closed. */
+  getTenantMemberRole(
+    tenantId: string,
+    principalId: string,
+  ): Promise<"owner" | "admin" | "member" | null>;
+
+  /** Create or update cloud workspace custody.  Only admin paths call this. */
+  putWorkspace(workspace: WorkspaceRecord): Promise<void>;
+  getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null>;
+  putWorkspaceMember(workspaceId: string, principalId: string): Promise<void>;
+  isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean>;
+  /**
+   * Fail-closed workspace ACL/version gate.  Device owners and tenant
+   * owners/admins administer workspaces; ordinary members require ownership
+   * (future explicit per-workspace grants can be added without weakening this).
+   */
+  assertWorkspaceOperableForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }>;
 
   appliedMigrations(): Promise<string[]>;
   markMigration(id: string): Promise<void>;
@@ -422,7 +792,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0007). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0015). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -432,17 +802,24 @@ export type SchemaReadiness = {
     used_refresh_tokens: boolean;
     enrollment_challenges: boolean;
     schema_migrations: boolean;
-    /** 0003 P0 hardening */
+    /** 0003 lifecycle state + 0015 display-only labels */
     devices_status: boolean;
     revoked_refresh_families: boolean;
     device_credentials: boolean;
     device_verification_transactions: boolean;
     /** 0004 authorize consent transactions */
     authorize_transactions: boolean;
-    /** 0005 MCP ops + 0006 claimed_at + 0007 claim ownership */
+    /** 0005 MCP ops + 0006 claimed_at + 0007 claim ownership + 0008 action binding */
     mcp_operations: boolean;
     mcp_approval_transactions: boolean;
     mcp_approval_outbox: boolean;
+    /** 0012 server-owned principal OAuth credential generation */
+    principals_credential_generation: boolean;
+    /** 0013 built-in owner passkeys + one-time WebAuthn challenges */
+    owner_passkeys: boolean;
+    owner_auth_challenges: boolean;
+    /** 0014 independent rolling refresh-token inactivity deadline */
+    oauth_tokens_refresh_lifetime: boolean;
   };
 };
 
@@ -451,6 +828,10 @@ const SCHEMA_READINESS_OBJECTS: Record<
   keyof SchemaReadiness["checks"],
   { table: string; columns: string[]; indexes?: string[] }
 > = {
+  oauth_tokens_refresh_lifetime: {
+    table: "oauth_tokens",
+    columns: ["refresh_expires_at"],
+  },
   oauth_auth_codes: {
     table: "oauth_auth_codes",
     columns: [
@@ -506,7 +887,7 @@ const SCHEMA_READINESS_OBJECTS: Record<
     table: "schema_migrations",
     columns: ["id", "applied_at"],
   },
-  devices_status: { table: "devices", columns: ["status"] },
+  devices_status: { table: "devices", columns: ["status", "labels_json"] },
   revoked_refresh_families: {
     table: "revoked_refresh_families",
     columns: ["refresh_family", "detected_at"],
@@ -578,6 +959,12 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "session_id",
       "warnings_json",
       "correlation_id",
+      "payload_hash",
+      "idempotency_key",
+      "workspace_id",
+      "expires_at",
+      "claim_version",
+      "action_json",
       "created_at",
       "updated_at",
     ],
@@ -586,6 +973,9 @@ const SCHEMA_READINESS_OBJECTS: Record<
       "idx_mcp_ops_device",
       "idx_mcp_ops_correlation",
       "idx_mcp_ops_updated",
+      "idx_mcp_ops_idempotency",
+      "idx_mcp_ops_payload_hash",
+      "uq_mcp_ops_idempotency",
     ],
   },
   mcp_approval_transactions: {
@@ -625,6 +1015,39 @@ const SCHEMA_READINESS_OBJECTS: Record<
     ],
     indexes: ["idx_mcp_outbox_op", "idx_mcp_outbox_status"],
   },
+  principals_credential_generation: {
+    table: "principals",
+    columns: ["id", "credential_generation"],
+  },
+  owner_passkeys: {
+    table: "owner_passkeys",
+    columns: [
+      "credential_id",
+      "principal_id",
+      "webauthn_user_id",
+      "public_key",
+      "counter",
+      "transports_json",
+      "device_type",
+      "backed_up",
+      "created_at",
+      "last_used_at",
+    ],
+    indexes: ["idx_owner_passkeys_principal"],
+  },
+  owner_auth_challenges: {
+    table: "owner_auth_challenges",
+    columns: [
+      "id",
+      "kind",
+      "challenge",
+      "webauthn_user_id",
+      "return_to",
+      "expires_at",
+      "created_at",
+    ],
+    indexes: ["idx_owner_auth_challenges_expiry"],
+  },
 };
 
 const DEFAULT_TENANT = "ten_default";
@@ -636,6 +1059,8 @@ const DEFAULT_TENANT = "ten_default";
 export class MemoryStore implements ControlPlaneStore {
   readonly kind = "memory" as const;
   clients = new Map<string, OAuthClientRecord>();
+  ownerPasskeys = new Map<string, OwnerPasskeyRecord>();
+  ownerAuthChallenges = new Map<string, OwnerAuthChallenge>();
   principals = new Map<string, PrincipalRecord>();
   tokensByAccess = new Map<string, TokenRecord>();
   accessByRefresh = new Map<string, string>();
@@ -653,6 +1078,10 @@ export class MemoryStore implements ControlPlaneStore {
   mcpApprovalTransactions = new Map<string, McpApprovalTransaction>();
   mcpApprovalOutbox = new Map<string, McpApprovalOutbox>();
   grants = new Map<string, GrantRecord>();
+  /** key = `${tenant_id}\0${principal_id}` */
+  tenantMembers = new Map<string, { tenant_id: string; principal_id: string; role: "owner" | "admin" | "member"; created_at: string }>();
+  workspaces = new Map<string, WorkspaceRecord>();
+  workspaceMembers = new Set<string>();
   audits: AuditEvent[] = [];
   migrations = new Set<string>();
 
@@ -663,6 +1092,7 @@ export class MemoryStore implements ControlPlaneStore {
         tenant_id: DEFAULT_TENANT,
         kind: "human",
         display_name: "Dev User",
+        credential_generation: 1,
         created_at: nowIso(),
       });
     }
@@ -689,6 +1119,69 @@ export class MemoryStore implements ControlPlaneStore {
     return this.clients.get(clientId) || null;
   }
 
+  async listOwnerPasskeys(): Promise<OwnerPasskeyRecord[]> {
+    return [...this.ownerPasskeys.values()].map((passkey) => ({
+      ...passkey,
+      public_key: passkey.public_key.slice(),
+      transports: [...passkey.transports],
+    }));
+  }
+
+  async getOwnerPasskey(credentialId: string): Promise<OwnerPasskeyRecord | null> {
+    const passkey = this.ownerPasskeys.get(credentialId);
+    return passkey
+      ? { ...passkey, public_key: passkey.public_key.slice(), transports: [...passkey.transports] }
+      : null;
+  }
+
+  async putInitialOwnerPasskey(passkey: OwnerPasskeyRecord): Promise<boolean> {
+    if (this.ownerPasskeys.size !== 0 || this.ownerPasskeys.has(passkey.credential_id)) return false;
+    this.ownerPasskeys.set(passkey.credential_id, {
+      ...passkey,
+      public_key: passkey.public_key.slice(),
+      transports: [...passkey.transports],
+    });
+    return true;
+  }
+
+  async updateOwnerPasskeyUsage(
+    credentialId: string,
+    expectedCounter: number,
+    nextCounter: number,
+    deviceType: "singleDevice" | "multiDevice",
+    backedUp: boolean,
+  ): Promise<boolean> {
+    const passkey = this.ownerPasskeys.get(credentialId);
+    if (!passkey || passkey.counter !== expectedCounter) return false;
+    passkey.counter = nextCounter;
+    passkey.device_type = deviceType;
+    passkey.backed_up = backedUp;
+    passkey.last_used_at = nowIso();
+    return true;
+  }
+
+  async putOwnerAuthChallenge(challenge: OwnerAuthChallenge): Promise<boolean> {
+    const now = Date.now();
+    for (const [id, item] of this.ownerAuthChallenges) {
+      if (item.expires_at <= now) this.ownerAuthChallenges.delete(id);
+    }
+    const existing = this.ownerAuthChallenges.get(challenge.id);
+    if (existing && existing.expires_at > now) return false;
+    if (this.ownerAuthChallenges.size >= 64) return false;
+    this.ownerAuthChallenges.set(challenge.id, { ...challenge });
+    return true;
+  }
+
+  async takeOwnerAuthChallenge(
+    id: string,
+    kind: OwnerAuthChallenge["kind"],
+  ): Promise<OwnerAuthChallenge | null> {
+    const challenge = this.ownerAuthChallenges.get(id);
+    if (!challenge || challenge.kind !== kind || challenge.expires_at <= Date.now()) return null;
+    this.ownerAuthChallenges.delete(id);
+    return { ...challenge };
+  }
+
   async ensurePrincipal(
     id: string,
     displayName: string,
@@ -705,6 +1198,7 @@ export class MemoryStore implements ControlPlaneStore {
       tenant_id: tenantId,
       kind,
       display_name: displayName,
+      credential_generation: 1,
       created_at: nowIso(),
     };
     this.principals.set(id, p);
@@ -712,6 +1206,15 @@ export class MemoryStore implements ControlPlaneStore {
   }
   async getPrincipal(id: string): Promise<PrincipalRecord | null> {
     return this.principals.get(id) || null;
+  }
+  async advancePrincipalCredentialGeneration(id: string): Promise<number | null> {
+    const principal = this.principals.get(id);
+    if (!principal) return null;
+    const next = principal.credential_generation + 1;
+    if (!Number.isSafeInteger(next) || next < 1) throw new Error("principal credential generation overflow");
+    principal.credential_generation = next;
+    this.principals.set(id, principal);
+    return next;
   }
 
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
@@ -731,7 +1234,8 @@ export class MemoryStore implements ControlPlaneStore {
     principal: string,
     scope: string,
     family?: string,
-    ttlMs = 15 * 60 * 1000,
+    ttlMs = ACCESS_TOKEN_TTL_MS,
+    refreshTtlMs = REFRESH_TOKEN_IDLE_TTL_MS,
   ): Promise<TokenRecord> {
     const principalRecord = (await this.getPrincipal(principal)) || await this.ensurePrincipal(principal, principal);
     const access = randomToken("atk_");
@@ -743,6 +1247,7 @@ export class MemoryStore implements ControlPlaneStore {
       scope,
       principal,
       expires_at: Date.now() + ttlMs,
+      refresh_expires_at: Date.now() + refreshTtlMs,
       revoked: family ? this.compromisedRefreshFamilies.has(family) : false,
       refresh_family: family || randomToken("fam_"),
       refresh_used: false,
@@ -774,14 +1279,14 @@ export class MemoryStore implements ControlPlaneStore {
       }
     }
     // Expired refresh is always invalid_grant (reuse detection is in-window only).
-    if (prior && now > prior.expires_at) {
+    if (prior && now > prior.refresh_expires_at) {
       return { ok: false, error: "invalid_grant" };
     }
 
     const usedFamily = this.usedRefresh.get(refreshToken);
     if (usedFamily) {
-      // Reuse only when the prior record is still within expires_at.
-      if (!prior || now > prior.expires_at) {
+      // Reuse only while the prior refresh credential is still within its inactivity window.
+      if (!prior || now > prior.refresh_expires_at) {
         return { ok: false, error: "invalid_grant" };
       }
       this.compromisedRefreshFamilies.add(usedFamily);
@@ -791,6 +1296,7 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
+      await this.advancePrincipalCredentialGeneration(prior.principal);
       return {
         ok: false,
         error: "reuse",
@@ -802,7 +1308,7 @@ export class MemoryStore implements ControlPlaneStore {
     if (!access) return { ok: false, error: "invalid_grant" };
     const old = this.tokensByAccess.get(access);
     if (!old || old.revoked) return { ok: false, error: "invalid_grant" };
-    if (now > old.expires_at) return { ok: false, error: "invalid_grant" };
+    if (now > old.refresh_expires_at) return { ok: false, error: "invalid_grant" };
     if (old.refresh_used) {
       this.compromisedRefreshFamilies.add(old.refresh_family);
       for (const [k, v] of this.tokensByAccess) {
@@ -811,6 +1317,7 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
+      await this.advancePrincipalCredentialGeneration(old.principal);
       return {
         ok: false,
         error: "reuse",
@@ -822,6 +1329,7 @@ export class MemoryStore implements ControlPlaneStore {
     this.tokensByAccess.set(access, old);
     this.accessByRefresh.delete(refreshToken);
     this.usedRefresh.set(refreshToken, old.refresh_family);
+    await this.advancePrincipalCredentialGeneration(old.principal);
     const next = await this.issueTokens(
       old.client_id,
       old.principal,
@@ -836,19 +1344,21 @@ export class MemoryStore implements ControlPlaneStore {
       const access = this.accessByRefresh.get(token);
       if (access) {
         const rec = this.tokensByAccess.get(access);
-        if (rec) {
+        if (rec && !rec.revoked) {
           rec.revoked = true;
           this.tokensByAccess.set(access, rec);
+          await this.advancePrincipalCredentialGeneration(rec.principal);
         }
         this.accessByRefresh.delete(token);
       }
       return;
     }
     const rec = this.tokensByAccess.get(token);
-    if (rec) {
+    if (rec && !rec.revoked) {
       rec.revoked = true;
       this.tokensByAccess.set(token, rec);
       this.accessByRefresh.delete(rec.refresh_token);
+      await this.advancePrincipalCredentialGeneration(rec.principal);
     }
   }
 
@@ -948,7 +1458,10 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async putDevice(device: DeviceRecord): Promise<void> {
-    this.devices.set(device.id, { ...device });
+    this.devices.set(device.id, {
+      ...device,
+      labels: [...(device.labels ?? [])],
+    });
   }
   async getDevice(id: string): Promise<DeviceRecord | null> {
     const d = this.devices.get(id);
@@ -959,6 +1472,21 @@ export class MemoryStore implements ControlPlaneStore {
     return [...this.devices.values()]
       .filter((d) => d.principal_id === principalId && !d.revoked)
       .map(hydrateDevice);
+  }
+  async updateDeviceMetadata(
+    id: string,
+    principalId: string,
+    patch: { name?: string; labels?: string[] },
+  ): Promise<DeviceRecord | null> {
+    const device = this.devices.get(id);
+    if (!device || device.principal_id !== principalId || device.revoked) return null;
+    const updated: DeviceRecord = {
+      ...device,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.labels !== undefined ? { labels: [...patch.labels] } : {}),
+    };
+    this.devices.set(id, updated);
+    return hydrateDevice(updated);
   }
   async revokeDevice(id: string, principalId: string): Promise<boolean> {
     const d = this.devices.get(id);
@@ -1051,17 +1579,62 @@ export class MemoryStore implements ControlPlaneStore {
       .reverse();
   }
 
-  /** Create-only: refuses to overwrite an existing operation_id. */
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private enforceMcpOperationQuota(tenantId: string): void {
+    const now = Date.now();
+    const tenantOps = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
+    for (const op of tenantOps) {
+      const age = mcpOpAgeMs(op, now);
+      // Only hard-delete tombstones past the full idempotency window (30d).
+      if (op.status === "tombstone" && age > MCP_OPS_TOMBSTONE_TTL_MS) {
+        this.mcpOperations.delete(op.operation_id);
+        continue;
+      }
+      if (isTerminalMcpStatus(op.status) && op.status !== "tombstone" && age > MCP_OPS_RESULT_TTL_MS) {
+        this.mcpOperations.set(op.operation_id, {
+          ...op,
+          status: "tombstone",
+          summary: "tombstone: result TTL expired; idempotency retained",
+          data: {
+            tombstone: true,
+            prior_status: op.status,
+            payload_hash: op.payload_hash ?? null,
+            // Preserve compact action binding for same-key retry within 30d window.
+            idempotency_key: op.idempotency_key ?? null,
+          },
+          truncated: true,
+          warnings: ["durable_result_tombstoned"],
+          updated_at: nowIso(),
+        });
+      }
+    }
+    const remaining = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
+    if (remaining.length < MCP_OPS_MAX_PER_TENANT) return;
+    // E3: never evict unexpired idempotency receipts under quota pressure.
+    // Only hard-expired tombstones (already removed above) free capacity; otherwise
+    // reject new distinct operations fail-closed.
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+  }
+
+  /** Create-only: refuses to overwrite an existing operation_id or idempotency binding. */
   async putMcpOperation(op: McpOperationRecord): Promise<void> {
     if (this.mcpOperations.has(op.operation_id)) {
       throw new Error(`mcp_operation_exists:${op.operation_id}`);
     }
-    this.mcpOperations.set(op.operation_id, {
-      ...op,
-      data: { ...(op.data || {}) },
-      warnings: [...(op.warnings || [])],
-      policy_authority: "ownmesh_device",
-    });
+    if (op.idempotency_key) {
+      const existing = await this.getMcpOperationByIdempotency({
+        principalId: op.principal_id,
+        tenantId: op.tenant_id,
+        deviceId: op.device_id || "",
+        idempotencyKey: op.idempotency_key,
+      });
+      if (existing) {
+        throw new Error(`mcp_operation_idempotency_exists:${op.idempotency_key}`);
+      }
+    }
+    this.enforceMcpOperationQuota(op.tenant_id);
+    const bounded = boundMcpOperationRecord(op);
+    this.mcpOperations.set(op.operation_id, bounded);
   }
   async getMcpOperation(operationId: string): Promise<McpOperationRecord | null> {
     const op = this.mcpOperations.get(operationId);
@@ -1075,15 +1648,109 @@ export class MemoryStore implements ControlPlaneStore {
     }
     return null;
   }
+  async listMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    return [...this.mcpOperations.values()]
+      .filter((op) => op.tenant_id === opts.tenantId && op.principal_id === opts.principalId && op.tool === opts.tool)
+      .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id))
+      .slice(0, limit)
+      .map((op) => ({
+        ...op,
+        data: { ...op.data },
+        warnings: [...op.warnings],
+        action: op.action ? { ...op.action } : op.action,
+      }));
+  }
+  async getMcpOperationByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }): Promise<McpOperationRecord | null> {
+    let best: McpOperationRecord | null = null;
+    for (const op of this.mcpOperations.values()) {
+      if (
+        op.principal_id === opts.principalId &&
+        op.tenant_id === opts.tenantId &&
+        (op.device_id || "") === opts.deviceId &&
+        (op.idempotency_key || "") === opts.idempotencyKey
+      ) {
+        if (!best || op.created_at > best.created_at) best = op;
+      }
+    }
+    return best
+      ? {
+          ...best,
+          data: { ...best.data },
+          warnings: [...best.warnings],
+          action: best.action ? { ...best.action } : best.action,
+        }
+      : null;
+  }
+  async claimMcpOperationByIdempotency(
+    op: McpOperationRecord,
+  ): Promise<
+    | { outcome: "created"; op: McpOperationRecord }
+    | { outcome: "existing"; op: McpOperationRecord }
+  > {
+    // Synchronous check+insert window (no await) so concurrent MemoryStore
+    // callers cannot both observe absence and both insert.
+    if (op.idempotency_key) {
+      let best: McpOperationRecord | null = null;
+      for (const existing of this.mcpOperations.values()) {
+        if (
+          existing.principal_id === op.principal_id &&
+          existing.tenant_id === op.tenant_id &&
+          (existing.device_id || "") === (op.device_id || "") &&
+          (existing.idempotency_key || "") === op.idempotency_key
+        ) {
+          if (!best || existing.created_at > best.created_at) best = existing;
+        }
+      }
+      if (best) {
+        return {
+          outcome: "existing",
+          op: {
+            ...best,
+            data: { ...best.data },
+            warnings: [...best.warnings],
+            action: best.action ? { ...best.action } : best.action,
+          },
+        };
+      }
+    }
+    if (this.mcpOperations.has(op.operation_id)) {
+      throw new Error(`mcp_operation_exists:${op.operation_id}`);
+    }
+    this.enforceMcpOperationQuota(op.tenant_id);
+    const stored = boundMcpOperationRecord(op);
+    this.mcpOperations.set(op.operation_id, stored);
+    return {
+      outcome: "created",
+      op: {
+        ...stored,
+        data: { ...stored.data },
+        warnings: [...stored.warnings],
+        action: stored.action ? { ...stored.action } : stored.action,
+      },
+    };
+  }
   async updateMcpOperation(
     operationId: string,
     patch: Partial<McpOperationRecord>,
     fromStatuses?: string[],
+    expectedData?: Record<string, unknown>,
   ): Promise<McpOperationRecord | null> {
     const cur = this.mcpOperations.get(operationId);
     if (!cur) return null;
     if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
-    const next: McpOperationRecord = {
+    if (expectedData !== undefined && JSON.stringify(cur.data || {}) !== JSON.stringify(expectedData)) return null;
+    const next: McpOperationRecord = boundMcpOperationRecord({
       ...cur,
       ...patch,
       operation_id: cur.operation_id,
@@ -1091,11 +1758,23 @@ export class MemoryStore implements ControlPlaneStore {
       tenant_id: patch.tenant_id ?? cur.tenant_id,
       data: patch.data ? { ...patch.data } : { ...cur.data },
       warnings: patch.warnings ? [...patch.warnings] : [...cur.warnings],
+      action: patch.action !== undefined
+        ? patch.action
+          ? { ...patch.action }
+          : patch.action
+        : cur.action
+          ? { ...cur.action }
+          : cur.action,
       policy_authority: "ownmesh_device",
       updated_at: patch.updated_at || nowIso(),
-    };
+    });
     this.mcpOperations.set(operationId, next);
-    return { ...next, data: { ...next.data }, warnings: [...next.warnings] };
+    return {
+      ...next,
+      data: { ...next.data },
+      warnings: [...next.warnings],
+      action: next.action ? { ...next.action } : next.action,
+    };
   }
 
   async putMcpApprovalTransaction(tx: McpApprovalTransaction): Promise<void> {
@@ -1273,7 +1952,6 @@ export class MemoryStore implements ControlPlaneStore {
     if (Number(outbox.claim_version) !== Number(claimVersion)) return null;
     if (!isValidOutboxDecision(outbox.decision)) return null;
 
-    const nextStatus = outbox.decision === "approve" ? "pending" : "denied";
     const op = this.mcpOperations.get(outbox.operation_id);
     if (!op) return null;
 
@@ -1283,18 +1961,12 @@ export class MemoryStore implements ControlPlaneStore {
       updated = await this.updateMcpOperation(
         outbox.operation_id,
         {
-          status: nextStatus,
-          approval_required: false,
-          summary:
-            outbox.decision === "approve"
-              ? "human approved; routing decision to device"
-              : "human denied",
+          summary: "human decision delivered; awaiting authoritative device result",
           data: {
             ...(op.data || {}),
             approval_decision: outbox.decision,
             approval_transaction_id: outbox.id,
           },
-          approval_id: outbox.id,
         },
         ["approval_required"],
       );
@@ -1318,13 +1990,97 @@ export class MemoryStore implements ControlPlaneStore {
     return updated;
   }
 
+  async putTenantMember(
+    tenantId: string,
+    principalId: string,
+    role: "owner" | "admin" | "member",
+  ): Promise<void> {
+    const key = `${tenantId}\0${principalId}`;
+    this.tenantMembers.set(key, {
+      tenant_id: tenantId,
+      principal_id: principalId,
+      role,
+      created_at: nowIso(),
+    });
+  }
+
+  async isTenantMember(tenantId: string, principalId: string): Promise<boolean> {
+    return this.tenantMembers.has(`${tenantId}\0${principalId}`);
+  }
+
+  async getTenantMemberRole(
+    tenantId: string,
+    principalId: string,
+  ): Promise<"owner" | "admin" | "member" | null> {
+    return this.tenantMembers.get(`${tenantId}\0${principalId}`)?.role ?? null;
+  }
+
+  async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
+    this.workspaces.set(workspace.workspace_id, { ...workspace });
+  }
+
+  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
+    const row = this.workspaces.get(workspaceId);
+    return row ? { ...row } : null;
+  }
+
+  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
+    this.workspaceMembers.add(`${workspaceId}\0${principalId}`);
+  }
+
+  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
+    return this.workspaceMembers.has(`${workspaceId}\0${principalId}`);
+  }
+
+  async assertWorkspaceOperableForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
+    const workspace = await this.getWorkspace(workspaceId);
+    if (
+      !workspace ||
+      !workspace.active ||
+      workspace.tenant_id !== tenantId ||
+      workspace.device_id !== deviceId
+    ) {
+      return { ok: false, error: "workspace_not_available" };
+    }
+    const device = await this.getDevice(deviceId);
+    const role = await this.getTenantMemberRole(tenantId, principalId);
+    const allowed =
+      workspace.owner_principal_id === principalId ||
+      device?.principal_id === principalId ||
+      role === "owner" ||
+      role === "admin" ||
+      (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
+    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
+  }
+
+  async canOperateDevice(
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.tenant_id !== tenantId) return false;
+    if (device.principal_id === principalId) return true;
+    return this.isTenantMember(tenantId, principalId);
+  }
+
   async assertDeviceOperableForMcp(
     deviceId: string,
     principalId: string,
     tenantId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const device = await this.getDevice(deviceId);
-    if (!device || device.principal_id !== principalId || device.tenant_id !== tenantId) {
+    if (!device || device.tenant_id !== tenantId) {
+      return { ok: false, error: "device_not_available" };
+    }
+    const allowed =
+      device.principal_id === principalId || (await this.isTenantMember(tenantId, principalId));
+    if (!allowed) {
       return { ok: false, error: "device_not_available" };
     }
     if (device.revoked || device.status !== "active") {
@@ -1348,7 +2104,7 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async schemaReadiness(): Promise<SchemaReadiness> {
-    // In-memory store always carries the full logical 0002–0007 schema.
+    // In-memory store always carries the full logical 0002–0008 schema.
     const checks = Object.fromEntries(
       Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, true]),
     ) as SchemaReadiness["checks"];
@@ -1485,7 +2241,7 @@ export class SqlStore implements ControlPlaneStore {
   ): Promise<PrincipalRecord> {
     const existing = await this.db
       .prepare(
-        `SELECT id, tenant_id, kind, display_name, created_at FROM principals WHERE id = ?`,
+        `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
       )
       .bind(id)
       .first<PrincipalRecord>();
@@ -1505,14 +2261,197 @@ export class SqlStore implements ControlPlaneStore {
       tenant_id: tenantId,
       kind,
       display_name: displayName,
+      credential_generation: 1,
       created_at: created,
     };
   }
 
   async getPrincipal(id: string): Promise<PrincipalRecord | null> {
     return this.db.prepare(
-      `SELECT id, tenant_id, kind, display_name, created_at FROM principals WHERE id = ?`,
+      `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
     ).bind(id).first<PrincipalRecord>();
+  }
+
+  private ownerPasskeyFromRow(row: {
+    credential_id: string;
+    principal_id: string;
+    webauthn_user_id: string;
+    public_key: ArrayBuffer | Uint8Array;
+    counter: number;
+    transports_json: string;
+    device_type: "singleDevice" | "multiDevice";
+    backed_up: number;
+    created_at: string;
+    last_used_at: string | null;
+  }): OwnerPasskeyRecord {
+    let transports: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(row.transports_json);
+      if (Array.isArray(parsed)) transports = parsed.filter((item): item is string => typeof item === "string");
+    } catch {
+      transports = [];
+    }
+    const publicKey = row.public_key instanceof Uint8Array
+      ? row.public_key.slice()
+      : new Uint8Array(row.public_key);
+    return {
+      credential_id: row.credential_id,
+      principal_id: row.principal_id,
+      webauthn_user_id: row.webauthn_user_id,
+      public_key: publicKey,
+      counter: row.counter,
+      transports,
+      device_type: row.device_type,
+      backed_up: Boolean(row.backed_up),
+      created_at: row.created_at,
+      last_used_at: row.last_used_at ?? undefined,
+    };
+  }
+
+  async listOwnerPasskeys(): Promise<OwnerPasskeyRecord[]> {
+    const result = await this.db.prepare(
+      `SELECT credential_id, principal_id, webauthn_user_id, public_key, counter,
+              transports_json, device_type, backed_up, created_at, last_used_at
+       FROM owner_passkeys ORDER BY created_at, credential_id LIMIT 8`,
+    ).all<{
+      credential_id: string; principal_id: string; webauthn_user_id: string;
+      public_key: ArrayBuffer | Uint8Array; counter: number; transports_json: string;
+      device_type: "singleDevice" | "multiDevice"; backed_up: number;
+      created_at: string; last_used_at: string | null;
+    }>();
+    return (result.results || []).map((row) => this.ownerPasskeyFromRow(row));
+  }
+
+  async getOwnerPasskey(credentialId: string): Promise<OwnerPasskeyRecord | null> {
+    const row = await this.db.prepare(
+      `SELECT credential_id, principal_id, webauthn_user_id, public_key, counter,
+              transports_json, device_type, backed_up, created_at, last_used_at
+       FROM owner_passkeys WHERE credential_id = ?`,
+    ).bind(credentialId).first<{
+      credential_id: string; principal_id: string; webauthn_user_id: string;
+      public_key: ArrayBuffer | Uint8Array; counter: number; transports_json: string;
+      device_type: "singleDevice" | "multiDevice"; backed_up: number;
+      created_at: string; last_used_at: string | null;
+    }>();
+    return row ? this.ownerPasskeyFromRow(row) : null;
+  }
+
+  async putInitialOwnerPasskey(passkey: OwnerPasskeyRecord): Promise<boolean> {
+    const publicKey = passkey.public_key.slice().buffer;
+    const inserted = await this.db.prepare(
+      `INSERT INTO owner_passkeys
+       (credential_id, principal_id, webauthn_user_id, public_key, counter,
+        transports_json, device_type, backed_up, created_at, last_used_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL
+       WHERE NOT EXISTS (SELECT 1 FROM owner_passkeys)
+       RETURNING credential_id`,
+    ).bind(
+      passkey.credential_id,
+      passkey.principal_id,
+      passkey.webauthn_user_id,
+      publicKey,
+      passkey.counter,
+      JSON.stringify(passkey.transports),
+      passkey.device_type,
+      passkey.backed_up ? 1 : 0,
+      passkey.created_at,
+    ).first<{ credential_id: string }>();
+    return inserted?.credential_id === passkey.credential_id;
+  }
+
+  async updateOwnerPasskeyUsage(
+    credentialId: string,
+    expectedCounter: number,
+    nextCounter: number,
+    deviceType: "singleDevice" | "multiDevice",
+    backedUp: boolean,
+  ): Promise<boolean> {
+    const updated = await this.db.prepare(
+      `UPDATE owner_passkeys
+       SET counter = ?, device_type = ?, backed_up = ?, last_used_at = ?
+       WHERE credential_id = ? AND counter = ?
+       RETURNING credential_id`,
+    ).bind(
+      nextCounter,
+      deviceType,
+      backedUp ? 1 : 0,
+      nowIso(),
+      credentialId,
+      expectedCounter,
+    ).first<{ credential_id: string }>();
+    return updated?.credential_id === credentialId;
+  }
+
+  async putOwnerAuthChallenge(challenge: OwnerAuthChallenge): Promise<boolean> {
+    const now = nowIso();
+    await this.db.prepare(`DELETE FROM owner_auth_challenges WHERE expires_at <= ?`).bind(now).run();
+    const inserted = await this.db.prepare(
+      `INSERT INTO owner_auth_challenges
+       (id, kind, challenge, webauthn_user_id, return_to, expires_at, created_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?
+       WHERE (SELECT COUNT(*) FROM owner_auth_challenges WHERE expires_at > ?) < 64
+       ON CONFLICT(id) DO UPDATE SET
+         kind = excluded.kind,
+         challenge = excluded.challenge,
+         webauthn_user_id = excluded.webauthn_user_id,
+         return_to = excluded.return_to,
+         expires_at = excluded.expires_at,
+         created_at = excluded.created_at
+       WHERE owner_auth_challenges.expires_at <= ?
+       RETURNING id`,
+    ).bind(
+      challenge.id,
+      challenge.kind,
+      challenge.challenge,
+      challenge.webauthn_user_id ?? null,
+      challenge.return_to,
+      nowIso(challenge.expires_at),
+      challenge.created_at,
+      now,
+      now,
+    ).first<{ id: string }>();
+    return inserted?.id === challenge.id;
+  }
+
+  async takeOwnerAuthChallenge(
+    id: string,
+    kind: OwnerAuthChallenge["kind"],
+  ): Promise<OwnerAuthChallenge | null> {
+    const row = await this.db.prepare(
+      `DELETE FROM owner_auth_challenges
+       WHERE id = ? AND kind = ? AND expires_at > ?
+       RETURNING challenge, webauthn_user_id, return_to, expires_at, created_at`,
+    ).bind(id, kind, nowIso()).first<{
+      challenge: string;
+      webauthn_user_id: string | null;
+      return_to: string;
+      expires_at: string;
+      created_at: string;
+    }>();
+    if (!row) return null;
+    return {
+      id,
+      kind,
+      challenge: row.challenge,
+      webauthn_user_id: row.webauthn_user_id ?? undefined,
+      return_to: row.return_to,
+      expires_at: Date.parse(row.expires_at),
+      created_at: row.created_at,
+    };
+  }
+
+  async advancePrincipalCredentialGeneration(id: string): Promise<number | null> {
+    const updated = await this.db
+      .prepare(
+        `UPDATE principals
+         SET credential_generation = credential_generation + 1
+         WHERE id = ? AND credential_generation >= 1
+         RETURNING credential_generation`,
+      )
+      .bind(id)
+      .first<{ credential_generation: number }>();
+    const generation = Number(updated?.credential_generation);
+    return Number.isSafeInteger(generation) && generation >= 1 ? generation : null;
   }
 
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
@@ -1561,7 +2500,8 @@ export class SqlStore implements ControlPlaneStore {
     principal: string,
     scope: string,
     family?: string,
-    ttlMs = 15 * 60 * 1000,
+    ttlMs = ACCESS_TOKEN_TTL_MS,
+    refreshTtlMs = REFRESH_TOKEN_IDLE_TTL_MS,
   ): Promise<TokenRecord> {
     const principalRecord = (await this.getPrincipal(principal)) || await this.ensurePrincipal(principal, principal);
     // Never turn token issuance into implicit client registration.
@@ -1572,15 +2512,16 @@ export class SqlStore implements ControlPlaneStore {
     const refresh = randomToken("rtk_");
     const fam = family || randomToken("fam_");
     const expiresAt = Date.now() + ttlMs;
+    const refreshExpiresAt = Date.now() + refreshTtlMs;
     const accessHash = await sha256Hex(access);
     const refreshHash = await sha256Hex(refresh);
     await this.db
       .prepare(
         `INSERT INTO oauth_tokens
-         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, created_at)
+         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, 0,
            CASE WHEN EXISTS (SELECT 1 FROM revoked_refresh_families WHERE refresh_family = ?) THEN 1 ELSE 0 END,
-           ?, ?)`,
+           ?, ?, ?)`,
       )
       .bind(
         accessHash,
@@ -1591,6 +2532,7 @@ export class SqlStore implements ControlPlaneStore {
         fam,
         fam,
         nowIso(expiresAt),
+        nowIso(refreshExpiresAt),
         nowIso(),
       )
       .run();
@@ -1601,6 +2543,7 @@ export class SqlStore implements ControlPlaneStore {
       scope,
       principal,
       expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAt,
       revoked: Boolean(await this.db.prepare(
         `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
       ).bind(fam).first("revoked")),
@@ -1615,7 +2558,7 @@ export class SqlStore implements ControlPlaneStore {
     const row = await this.db
       .prepare(
         `SELECT t.access_token_hash, t.refresh_token_hash, t.client_id, t.principal_id, t.scope,
-                t.refresh_family, t.refresh_used, t.revoked, t.expires_at, p.tenant_id
+                t.refresh_family, t.refresh_used, t.revoked, t.expires_at, t.refresh_expires_at, p.tenant_id
          FROM oauth_tokens t JOIN principals p ON p.id = t.principal_id
          WHERE t.access_token_hash = ?`,
       )
@@ -1628,6 +2571,7 @@ export class SqlStore implements ControlPlaneStore {
         refresh_used: number;
         revoked: number;
         expires_at: string;
+        refresh_expires_at: string;
         tenant_id: string;
       }>();
     if (!row || row.revoked) return null;
@@ -1640,6 +2584,7 @@ export class SqlStore implements ControlPlaneStore {
       scope: row.scope,
       principal: row.principal_id,
       expires_at: exp,
+      refresh_expires_at: Date.parse(row.refresh_expires_at),
       revoked: false,
       refresh_family: row.refresh_family,
       refresh_used: Boolean(row.refresh_used),
@@ -1661,11 +2606,11 @@ export class SqlStore implements ControlPlaneStore {
 
     // Authoritative pre-read for metadata + expiry. CAS in the batch is the claim.
     const row = await this.db.prepare(
-      `SELECT client_id, principal_id, scope, refresh_family, revoked, refresh_used, expires_at
+      `SELECT client_id, principal_id, scope, refresh_family, revoked, refresh_used, refresh_expires_at
        FROM oauth_tokens WHERE refresh_token_hash = ?`,
     ).bind(refreshHash).first<{
       client_id: string; principal_id: string; scope: string;
-      refresh_family: string; revoked: number; refresh_used: number; expires_at: string;
+      refresh_family: string; revoked: number; refresh_used: number; refresh_expires_at: string;
     }>();
 
     if (!row) {
@@ -1673,7 +2618,7 @@ export class SqlStore implements ControlPlaneStore {
       return { ok: false, error: "invalid_grant" };
     }
 
-    const exp = Date.parse(row.expires_at);
+    const exp = Date.parse(row.refresh_expires_at);
     // Expired refresh is always invalid_grant; reuse detection is in-window only.
     if (!Number.isFinite(exp) || nowMs > exp) {
       return { ok: false, error: "invalid_grant" };
@@ -1692,18 +2637,21 @@ export class SqlStore implements ControlPlaneStore {
       return { ok: false, error: "invalid_grant" };
     }
 
-    // Real reuse: ledger hit and/or refresh_used=1 within the expires_at window.
+    // Real reuse: ledger hit and/or refresh_used=1 within the refresh inactivity window.
     if (used || row.refresh_used) {
       const fam = used?.refresh_family || row.refresh_family;
-      await this.db.prepare(
-        `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-      ).bind(fam, now).run();
-      await this.db
-        .prepare(
+      await this.db.batch([
+        this.db.prepare(
+          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+        ).bind(fam, now),
+        this.db.prepare(
           `UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`,
-        )
-        .bind(fam)
-        .run();
+        ).bind(fam),
+        this.db.prepare(
+          `UPDATE principals SET credential_generation = credential_generation + 1
+           WHERE id = ? AND credential_generation >= 1`,
+        ).bind(row.principal_id),
+      ]);
       if (!used) {
         await this.db.prepare(
           `INSERT OR IGNORE INTO used_refresh_tokens (refresh_token_hash, refresh_family, used_at) VALUES (?, ?, ?)`,
@@ -1719,12 +2667,13 @@ export class SqlStore implements ControlPlaneStore {
     // Precompute successor material before the batch (same defaults as issueTokens).
     const access = randomToken("atk_");
     const refresh = randomToken("rtk_");
-    const ttlMs = 15 * 60 * 1000;
-    const expiresAt = nowMs + ttlMs;
+    const expiresAt = nowMs + ACCESS_TOKEN_TTL_MS;
+    const refreshExpiresAt = nowMs + REFRESH_TOKEN_IDLE_TTL_MS;
     const accessHash = await sha256Hex(access);
     const newRefreshHash = await sha256Hex(refresh);
     const ts = now;
     const expiresAtIso = nowIso(expiresAt);
+    const refreshExpiresAtIso = nowIso(refreshExpiresAt);
     const fam = row.refresh_family;
 
     type BatchResult = { meta?: { changes?: number }; success?: boolean };
@@ -1740,26 +2689,26 @@ export class SqlStore implements ControlPlaneStore {
          WHERE refresh_token_hash = ?
            AND revoked = 0
            AND refresh_used = 0
-           AND expires_at > ?`,
+           AND refresh_expires_at > ?`,
       ).bind(ts, refreshHash, now),
       this.db.prepare(
         `UPDATE oauth_tokens SET revoked = 1, refresh_used = 1
          WHERE refresh_token_hash = ?
            AND revoked = 0
            AND refresh_used = 0
-           AND expires_at > ?
+           AND refresh_expires_at > ?
            AND EXISTS (
              SELECT 1 FROM used_refresh_tokens WHERE refresh_token_hash = ?
            )`,
       ).bind(refreshHash, now, refreshHash),
       this.db.prepare(
         `INSERT INTO oauth_tokens
-         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, created_at)
+         (access_token_hash, refresh_token_hash, client_id, principal_id, scope, refresh_family, refresh_used, revoked, expires_at, refresh_expires_at, created_at)
          SELECT ?, ?, ot.client_id, ot.principal_id, ot.scope, ot.refresh_family, 0,
            CASE WHEN EXISTS (
              SELECT 1 FROM revoked_refresh_families r WHERE r.refresh_family = ot.refresh_family
            ) THEN 1 ELSE 0 END,
-           ?, ?
+           ?, ?, ?
          FROM oauth_tokens ot
          WHERE ot.refresh_token_hash = ?
            AND ot.refresh_used = 1 AND ot.revoked = 1
@@ -1773,33 +2722,51 @@ export class SqlStore implements ControlPlaneStore {
                AND cur.refresh_used = 0
                AND cur.revoked = 0
            )`,
-      ).bind(accessHash, newRefreshHash, expiresAtIso, ts, refreshHash),
+      ).bind(accessHash, newRefreshHash, expiresAtIso, refreshExpiresAtIso, ts, refreshHash),
+      this.db.prepare(
+        `UPDATE principals SET credential_generation = credential_generation + 1
+         WHERE id = ? AND credential_generation >= 1
+           AND EXISTS (SELECT 1 FROM oauth_tokens WHERE access_token_hash = ? AND revoked = 0)`,
+      ).bind(row.principal_id, accessHash),
     ]);
 
     // Winner is determined from this statement's own meta.changes (not SQL changes()).
     const casWon = Number(batchResults[0]?.meta?.changes ?? 0) > 0;
     const successorInserted = Number(batchResults[2]?.meta?.changes ?? 0) > 0;
-    if (!casWon || !successorInserted) {
+    const generationAdvanced = Number(batchResults[3]?.meta?.changes ?? 0) > 0;
+    if (!casWon || !successorInserted || !generationAdvanced) {
       const raced = await this.db.prepare(
         `SELECT refresh_family FROM oauth_tokens WHERE refresh_token_hash = ? AND refresh_used = 1`,
       ).bind(refreshHash).first<{ refresh_family: string }>();
       if (raced) {
-        await this.db.prepare(
-          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-        ).bind(raced.refresh_family, nowIso()).run();
-        await this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
-          .bind(raced.refresh_family).run();
+        await this.db.batch([
+          this.db.prepare(
+            `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+          ).bind(raced.refresh_family, nowIso()),
+          this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
+            .bind(raced.refresh_family),
+          this.db.prepare(
+            `UPDATE principals SET credential_generation = credential_generation + 1
+             WHERE id = ? AND credential_generation >= 1`,
+          ).bind(row.principal_id),
+        ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
       }
       const ledger = await this.db.prepare(
         `SELECT refresh_family FROM used_refresh_tokens WHERE refresh_token_hash = ?`,
       ).bind(refreshHash).first<{ refresh_family: string }>();
       if (ledger) {
-        await this.db.prepare(
-          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-        ).bind(ledger.refresh_family, nowIso()).run();
-        await this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
-          .bind(ledger.refresh_family).run();
+        await this.db.batch([
+          this.db.prepare(
+            `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+          ).bind(ledger.refresh_family, nowIso()),
+          this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
+            .bind(ledger.refresh_family),
+          this.db.prepare(
+            `UPDATE principals SET credential_generation = credential_generation + 1
+             WHERE id = ? AND credential_generation >= 1`,
+          ).bind(row.principal_id),
+        ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
       }
       return { ok: false, error: "invalid_grant" };
@@ -1813,11 +2780,17 @@ export class SqlStore implements ControlPlaneStore {
       `SELECT 1 AS revoked FROM revoked_refresh_families WHERE refresh_family = ?`,
     ).bind(fam).first("revoked");
     if (!successor || successor.revoked || familyRevoked) {
-      await this.db.prepare(
-        `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
-      ).bind(fam, nowIso()).run();
-      await this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
-        .bind(fam).run();
+      await this.db.batch([
+        this.db.prepare(
+          `INSERT OR IGNORE INTO revoked_refresh_families (refresh_family, detected_at) VALUES (?, ?)`,
+        ).bind(fam, nowIso()),
+        this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
+          .bind(fam),
+        this.db.prepare(
+          `UPDATE principals SET credential_generation = credential_generation + 1
+           WHERE id = ? AND credential_generation >= 1`,
+        ).bind(row.principal_id),
+      ]);
       return { ok: false, error: "reuse", description: "refresh token reuse detected" };
     }
 
@@ -1831,6 +2804,7 @@ export class SqlStore implements ControlPlaneStore {
         scope: row.scope,
         principal: row.principal_id,
         expires_at: expiresAt,
+        refresh_expires_at: refreshExpiresAt,
         revoked: false,
         refresh_family: fam,
         refresh_used: false,
@@ -1841,21 +2815,22 @@ export class SqlStore implements ControlPlaneStore {
 
   async revokeToken(token: string): Promise<void> {
     const hash = await sha256Hex(token);
-    if (token.startsWith("rtk_")) {
-      await this.db
-        .prepare(
-          `UPDATE oauth_tokens SET revoked = 1 WHERE refresh_token_hash = ?`,
-        )
-        .bind(hash)
-        .run();
-      return;
-    }
-    await this.db
-      .prepare(
-        `UPDATE oauth_tokens SET revoked = 1 WHERE access_token_hash = ?`,
-      )
-      .bind(hash)
-      .run();
+    const column = token.startsWith("rtk_") ? "refresh_token_hash" : "access_token_hash";
+    const row = await this.db.prepare(
+      `SELECT principal_id, revoked FROM oauth_tokens WHERE ${column} = ?`,
+    ).bind(hash).first<{ principal_id: string; revoked: number }>();
+    if (!row || row.revoked) return;
+    if (!this.db.batch) throw new Error("SqlStore.revokeToken requires db.batch");
+    await this.db.batch([
+      this.db.prepare(
+        `UPDATE principals SET credential_generation = credential_generation + 1
+         WHERE id = ? AND credential_generation >= 1
+           AND EXISTS (SELECT 1 FROM oauth_tokens WHERE ${column} = ? AND revoked = 0)`,
+      ).bind(row.principal_id, hash),
+      this.db.prepare(
+        `UPDATE oauth_tokens SET revoked = 1 WHERE ${column} = ? AND revoked = 0`,
+      ).bind(hash),
+    ]);
   }
 
   async lookupRevocableToken(token: string): Promise<RevocableTokenMeta | null> {
@@ -2139,14 +3114,15 @@ export class SqlStore implements ControlPlaneStore {
     await this.db
       .prepare(
         `INSERT OR REPLACE INTO devices
-         (id, tenant_id, principal_id, name, public_key, revoked, created_at, last_seen_at, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, tenant_id, principal_id, name, labels_json, public_key, revoked, created_at, last_seen_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         device.id,
         device.tenant_id,
         device.principal_id,
         device.name,
+        JSON.stringify(device.labels ?? []),
         device.public_key,
         device.revoked ? 1 : 0,
         device.created_at,
@@ -2167,7 +3143,7 @@ export class SqlStore implements ControlPlaneStore {
   async getDevice(id: string): Promise<DeviceRecord | null> {
     const row = await this.db
       .prepare(
-        `SELECT id, tenant_id, principal_id, name, public_key, revoked, created_at, last_seen_at, status FROM devices WHERE id = ?`,
+        `SELECT id, tenant_id, principal_id, name, labels_json, public_key, revoked, created_at, last_seen_at, status FROM devices WHERE id = ?`,
       )
       .bind(id)
       .first<{
@@ -2175,6 +3151,7 @@ export class SqlStore implements ControlPlaneStore {
         tenant_id: string;
         principal_id: string;
         name: string;
+        labels_json: string;
         public_key: string;
         revoked: number;
         created_at: string;
@@ -2188,6 +3165,7 @@ export class SqlStore implements ControlPlaneStore {
       tenant_id: row.tenant_id,
       principal_id: row.principal_id,
       name: row.name,
+      labels: parseDeviceLabels(row.labels_json),
       hostname: meta.hostname || row.name,
       os: meta.os || "unknown",
       arch: meta.arch || "unknown",
@@ -2204,7 +3182,7 @@ export class SqlStore implements ControlPlaneStore {
   async listDevices(principalId: string): Promise<DeviceRecord[]> {
     const res = await this.db
       .prepare(
-        `SELECT id, tenant_id, principal_id, name, public_key, revoked, created_at, last_seen_at, status
+        `SELECT id, tenant_id, principal_id, name, labels_json, public_key, revoked, created_at, last_seen_at, status
          FROM devices WHERE principal_id = ? AND revoked = 0`,
       )
       .bind(principalId)
@@ -2213,6 +3191,7 @@ export class SqlStore implements ControlPlaneStore {
         tenant_id: string;
         principal_id: string;
         name: string;
+        labels_json: string;
         public_key: string;
         revoked: number;
         created_at: string;
@@ -2226,6 +3205,7 @@ export class SqlStore implements ControlPlaneStore {
         tenant_id: row.tenant_id,
         principal_id: row.principal_id,
         name: row.name,
+        labels: parseDeviceLabels(row.labels_json),
         hostname: meta.hostname || row.name,
         os: meta.os || "unknown",
         arch: meta.arch || "unknown",
@@ -2238,6 +3218,41 @@ export class SqlStore implements ControlPlaneStore {
         status: row.status,
       };
     });
+  }
+
+  async updateDeviceMetadata(
+    id: string,
+    principalId: string,
+    patch: { name?: string; labels?: string[] },
+  ): Promise<DeviceRecord | null> {
+    let statement: SqlStatement;
+    if (patch.name !== undefined && patch.labels !== undefined) {
+      statement = this.db
+        .prepare(
+          `UPDATE devices SET name = ?, labels_json = ?
+           WHERE id = ? AND principal_id = ? AND revoked = 0`,
+        )
+        .bind(patch.name, JSON.stringify(patch.labels), id, principalId);
+    } else if (patch.name !== undefined) {
+      statement = this.db
+        .prepare(
+          `UPDATE devices SET name = ?
+           WHERE id = ? AND principal_id = ? AND revoked = 0`,
+        )
+        .bind(patch.name, id, principalId);
+    } else if (patch.labels !== undefined) {
+      statement = this.db
+        .prepare(
+          `UPDATE devices SET labels_json = ?
+           WHERE id = ? AND principal_id = ? AND revoked = 0`,
+        )
+        .bind(JSON.stringify(patch.labels), id, principalId);
+    } else {
+      return null;
+    }
+    const updated = await statement.run();
+    if (sqlChanges(updated) !== 1) return null;
+    return this.getDevice(id);
   }
 
   async revokeDevice(id: string, principalId: string): Promise<boolean> {
@@ -2455,36 +3470,91 @@ export class SqlStore implements ControlPlaneStore {
     return res.results || [];
   }
 
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private async enforceMcpOperationQuota(tenantId: string): Promise<void> {
+    const now = Date.now();
+    const resultCutoff = new Date(now - MCP_OPS_RESULT_TTL_MS).toISOString();
+    const tombstoneCutoff = new Date(now - MCP_OPS_TOMBSTONE_TTL_MS).toISOString();
+
+    // Hard-delete ancient tombstones first (idempotency window closed).
+    await this.db
+      .prepare(
+        `DELETE FROM mcp_operations
+         WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?`,
+      )
+      .bind(tenantId, tombstoneCutoff)
+      .run();
+
+    // Compact terminal results past TTL into idempotency tombstones.
+    // Keep payload_hash/idempotency_key columns; clear large result bodies only.
+    await this.db
+      .prepare(
+        `UPDATE mcp_operations
+         SET status = 'tombstone',
+             summary = 'tombstone: result TTL expired; idempotency retained',
+             data_json = '{"tombstone":true}',
+             truncated = 1,
+             warnings_json = '["durable_result_tombstoned"]',
+             updated_at = ?
+         WHERE tenant_id = ?
+           AND status IN ('completed','failed','denied','cancelled','device_offline')
+           AND updated_at < ?`,
+      )
+      .bind(new Date(now).toISOString(), tenantId, resultCutoff)
+      .run();
+
+    const countRow = await this.db
+      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
+      .bind(tenantId)
+      .first<{ c: number }>();
+    const count = Number(countRow?.c ?? 0);
+    if (count < MCP_OPS_MAX_PER_TENANT) return;
+
+    // E3: never evict unexpired idempotency receipts (including <30d tombstones)
+    // under quota pressure. Ancient tombstones were already hard-deleted above;
+    // remaining overflow must fail closed rather than enable side-effect replay.
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+  }
+
   /** Create-only INSERT. Conflict (existing operation_id) fails — never REPLACE. */
   async putMcpOperation(op: McpOperationRecord): Promise<void> {
+    await this.enforceMcpOperationQuota(op.tenant_id);
+    const bounded = boundMcpOperationRecord(op);
     const result = await this.db
       .prepare(
         `INSERT INTO mcp_operations
          (operation_id, tenant_id, principal_id, device_id, tool, status, summary,
           data_json, truncated, next_cursor, approval_required, approval_url, approval_id,
-          session_id, warnings_json, correlation_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          session_id, warnings_json, correlation_id, payload_hash, idempotency_key,
+          workspace_id, expires_at, claim_version, action_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(operation_id) DO NOTHING`,
       )
       .bind(
-        op.operation_id,
-        op.tenant_id,
-        op.principal_id,
-        op.device_id ?? null,
-        op.tool,
-        op.status,
-        op.summary,
-        JSON.stringify(op.data || {}),
-        op.truncated ? 1 : 0,
-        op.next_cursor ?? null,
-        op.approval_required ? 1 : 0,
-        op.approval_url ?? null,
-        op.approval_id ?? null,
-        op.session_id ?? null,
-        JSON.stringify(op.warnings || []),
-        op.correlation_id ?? null,
-        op.created_at,
-        op.updated_at,
+        bounded.operation_id,
+        bounded.tenant_id,
+        bounded.principal_id,
+        bounded.device_id ?? null,
+        bounded.tool,
+        bounded.status,
+        bounded.summary,
+        JSON.stringify(bounded.data || {}),
+        bounded.truncated ? 1 : 0,
+        bounded.next_cursor ?? null,
+        bounded.approval_required ? 1 : 0,
+        bounded.approval_url ?? null,
+        bounded.approval_id ?? null,
+        bounded.session_id ?? null,
+        JSON.stringify(bounded.warnings || []),
+        bounded.correlation_id ?? null,
+        bounded.payload_hash ?? null,
+        bounded.idempotency_key ?? null,
+        bounded.workspace_id ?? null,
+        bounded.expires_at ?? null,
+        Number(bounded.claim_version ?? 0),
+        JSON.stringify(bounded.action || {}),
+        bounded.created_at,
+        bounded.updated_at,
       )
       .run();
     const changes = Number(
@@ -2515,16 +3585,138 @@ export class SqlStore implements ControlPlaneStore {
     return row ? rowToMcpOperation(row) : null;
   }
 
+  async listMcpOperations(opts: {
+    tenantId: string;
+    principalId: string;
+    tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    const rows = await this.db
+      .prepare(
+        `SELECT * FROM mcp_operations
+         WHERE tenant_id = ? AND principal_id = ? AND tool = ?
+         ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
+      )
+      .bind(opts.tenantId, opts.principalId, opts.tool, limit)
+      .all<Record<string, unknown>>();
+    return (rows.results || []).map(rowToMcpOperation);
+  }
+
+  async getMcpOperationByIdempotency(opts: {
+    principalId: string;
+    tenantId: string;
+    deviceId: string;
+    idempotencyKey: string;
+  }): Promise<McpOperationRecord | null> {
+    const row = await this.db
+      .prepare(
+        `SELECT * FROM mcp_operations
+         WHERE principal_id = ? AND tenant_id = ? AND IFNULL(device_id, '') = ?
+           AND IFNULL(idempotency_key, '') = ?
+         ORDER BY created_at DESC LIMIT 1`,
+      )
+      .bind(opts.principalId, opts.tenantId, opts.deviceId, opts.idempotencyKey)
+      .first<Record<string, unknown>>();
+    return row ? rowToMcpOperation(row) : null;
+  }
+
+  async claimMcpOperationByIdempotency(
+    op: McpOperationRecord,
+  ): Promise<
+    | { outcome: "created"; op: McpOperationRecord }
+    | { outcome: "existing"; op: McpOperationRecord }
+  > {
+    // Idempotent reuse must not be blocked by quota pressure on other keys.
+    if (op.idempotency_key) {
+      const existing = await this.getMcpOperationByIdempotency({
+        principalId: op.principal_id,
+        tenantId: op.tenant_id,
+        deviceId: op.device_id || "",
+        idempotencyKey: op.idempotency_key,
+      });
+      if (existing) return { outcome: "existing", op: existing };
+    }
+    const byIdEarly = await this.getMcpOperation(op.operation_id);
+    if (byIdEarly) return { outcome: "existing", op: byIdEarly };
+
+    // INSERT OR IGNORE respects PK + partial unique idempotency index.
+    await this.enforceMcpOperationQuota(op.tenant_id);
+    const bounded = boundMcpOperationRecord(op);
+    const result = await this.db
+      .prepare(
+        `INSERT INTO mcp_operations
+         (operation_id, tenant_id, principal_id, device_id, tool, status, summary,
+          data_json, truncated, next_cursor, approval_required, approval_url, approval_id,
+          session_id, warnings_json, correlation_id, payload_hash, idempotency_key,
+          workspace_id, expires_at, claim_version, action_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT DO NOTHING`,
+      )
+      .bind(
+        bounded.operation_id,
+        bounded.tenant_id,
+        bounded.principal_id,
+        bounded.device_id ?? null,
+        bounded.tool,
+        bounded.status,
+        bounded.summary,
+        JSON.stringify(bounded.data || {}),
+        bounded.truncated ? 1 : 0,
+        bounded.next_cursor ?? null,
+        bounded.approval_required ? 1 : 0,
+        bounded.approval_url ?? null,
+        bounded.approval_id ?? null,
+        bounded.session_id ?? null,
+        JSON.stringify(bounded.warnings || []),
+        bounded.correlation_id ?? null,
+        bounded.payload_hash ?? null,
+        bounded.idempotency_key ?? null,
+        bounded.workspace_id ?? null,
+        bounded.expires_at ?? null,
+        Number(bounded.claim_version ?? 0),
+        JSON.stringify(bounded.action || {}),
+        bounded.created_at,
+        bounded.updated_at,
+      )
+      .run();
+    const changes = Number(
+      (result as { meta?: { changes?: number }; changes?: number }).meta?.changes
+        ?? (result as { changes?: number }).changes
+        ?? 0,
+    );
+    if (changes >= 1) {
+      const created = await this.getMcpOperation(op.operation_id);
+      if (!created) throw new Error(`mcp_operation_claim_missing:${op.operation_id}`);
+      return { outcome: "created", op: created };
+    }
+    // Conflict: prefer idempotency owner, then same operation_id.
+    if (op.idempotency_key) {
+      const existing = await this.getMcpOperationByIdempotency({
+        principalId: op.principal_id,
+        tenantId: op.tenant_id,
+        deviceId: op.device_id || "",
+        idempotencyKey: op.idempotency_key,
+      });
+      if (existing) return { outcome: "existing", op: existing };
+    }
+    const byId = await this.getMcpOperation(op.operation_id);
+    if (byId) return { outcome: "existing", op: byId };
+    throw new Error(`mcp_operation_claim_conflict:${op.operation_id}`);
+  }
+
   async updateMcpOperation(
     operationId: string,
     patch: Partial<McpOperationRecord>,
     fromStatuses?: string[],
+    expectedData?: Record<string, unknown>,
   ): Promise<McpOperationRecord | null> {
     const cur = await this.getMcpOperation(operationId);
     if (!cur) return null;
     if (fromStatuses && fromStatuses.length > 0 && !fromStatuses.includes(cur.status)) return null;
+    if (expectedData !== undefined && JSON.stringify(cur.data || {}) !== JSON.stringify(expectedData)) return null;
 
-    const next: McpOperationRecord = {
+    const next: McpOperationRecord = boundMcpOperationRecord({
       ...cur,
       ...patch,
       operation_id: cur.operation_id,
@@ -2532,21 +3724,29 @@ export class SqlStore implements ControlPlaneStore {
       tenant_id: patch.tenant_id ?? cur.tenant_id,
       data: patch.data ?? cur.data,
       warnings: patch.warnings ?? cur.warnings,
+      action: patch.action !== undefined ? patch.action : cur.action,
       policy_authority: "ownmesh_device",
       updated_at: patch.updated_at || nowIso(),
-    };
+    });
 
-    // CAS via conditional UPDATE when fromStatuses provided.
-    if (fromStatuses && fromStatuses.length > 0) {
-      const placeholders = fromStatuses.map(() => "?").join(",");
+    // CAS via conditional UPDATE.  `expectedData` is used by coordinators
+    // whose durable data contains a generation/version marker; status alone
+    // is not sufficient to protect concurrent metadata transitions.
+    if ((fromStatuses && fromStatuses.length > 0) || expectedData !== undefined) {
+      const placeholders = fromStatuses?.map(() => "?").join(",") || "";
+      const statusClause = fromStatuses && fromStatuses.length > 0
+        ? ` AND status IN (${placeholders})`
+        : "";
+      const dataClause = expectedData !== undefined ? " AND data_json = ?" : "";
       const result = await this.db
         .prepare(
           `UPDATE mcp_operations SET
              tenant_id = ?, principal_id = ?, device_id = ?, tool = ?, status = ?, summary = ?,
              data_json = ?, truncated = ?, next_cursor = ?, approval_required = ?,
              approval_url = ?, approval_id = ?, session_id = ?, warnings_json = ?,
-             correlation_id = ?, updated_at = ?
-           WHERE operation_id = ? AND status IN (${placeholders})`,
+             correlation_id = ?, payload_hash = ?, idempotency_key = ?, workspace_id = ?,
+             expires_at = ?, claim_version = ?, action_json = ?, updated_at = ?
+           WHERE operation_id = ?${statusClause}${dataClause}`,
         )
         .bind(
           next.tenant_id,
@@ -2564,9 +3764,16 @@ export class SqlStore implements ControlPlaneStore {
           next.session_id ?? null,
           JSON.stringify(next.warnings || []),
           next.correlation_id ?? null,
+          next.payload_hash ?? null,
+          next.idempotency_key ?? null,
+          next.workspace_id ?? null,
+          next.expires_at ?? null,
+          Number(next.claim_version ?? 0),
+          JSON.stringify(next.action || {}),
           next.updated_at,
           operationId,
-          ...fromStatuses,
+          ...(fromStatuses || []),
+          ...(expectedData !== undefined ? [JSON.stringify(expectedData)] : []),
         )
         .run();
       const changes = Number((result as { meta?: { changes?: number }; changes?: number }).meta?.changes
@@ -2583,7 +3790,8 @@ export class SqlStore implements ControlPlaneStore {
            tenant_id = ?, principal_id = ?, device_id = ?, tool = ?, status = ?, summary = ?,
            data_json = ?, truncated = ?, next_cursor = ?, approval_required = ?,
            approval_url = ?, approval_id = ?, session_id = ?, warnings_json = ?,
-           correlation_id = ?, updated_at = ?
+           correlation_id = ?, payload_hash = ?, idempotency_key = ?, workspace_id = ?,
+           expires_at = ?, claim_version = ?, action_json = ?, updated_at = ?
          WHERE operation_id = ?`,
       )
       .bind(
@@ -2602,6 +3810,12 @@ export class SqlStore implements ControlPlaneStore {
         next.session_id ?? null,
         JSON.stringify(next.warnings || []),
         next.correlation_id ?? null,
+        next.payload_hash ?? null,
+        next.idempotency_key ?? null,
+        next.workspace_id ?? null,
+        next.expires_at ?? null,
+        Number(next.claim_version ?? 0),
+        JSON.stringify(next.action || {}),
         next.updated_at,
         operationId,
       )
@@ -2954,15 +4168,11 @@ export class SqlStore implements ControlPlaneStore {
     if (outbox.claim_token !== claimToken) return null;
     if (Number(outbox.claim_version) !== Number(claimVersion)) return null;
 
-    const nextStatus = outbox.decision === "approve" ? "pending" : "denied";
     const op = await this.getMcpOperation(outbox.operation_id);
     if (!op) return null;
 
     const ts = nowIso();
-    const summary =
-      outbox.decision === "approve"
-        ? "human approved; routing decision to device"
-        : "human denied";
+    const summary = "human decision delivered; awaiting authoritative device result";
     const nextData = {
       ...(op.data || {}),
       approval_decision: outbox.decision,
@@ -2981,8 +4191,7 @@ export class SqlStore implements ControlPlaneStore {
       this.db
         .prepare(
           `UPDATE mcp_operations SET
-             status = ?, summary = ?, data_json = ?, approval_required = 0,
-             approval_id = ?, updated_at = ?
+             summary = ?, data_json = ?, updated_at = ?
            WHERE operation_id = ? AND status = 'approval_required'
              AND EXISTS (
                SELECT 1 FROM mcp_approval_outbox o
@@ -2991,10 +4200,8 @@ export class SqlStore implements ControlPlaneStore {
              )`,
         )
         .bind(
-          nextStatus,
           summary,
           JSON.stringify(nextData),
-          outbox.id,
           ts,
           outbox.operation_id,
           id,
@@ -3022,13 +4229,147 @@ export class SqlStore implements ControlPlaneStore {
     return this.getMcpOperation(outbox.operation_id);
   }
 
+  async putTenantMember(
+    tenantId: string,
+    principalId: string,
+    role: "owner" | "admin" | "member",
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO tenant_members (tenant_id, principal_id, role, created_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(tenant_id, principal_id) DO UPDATE SET role = excluded.role`,
+      )
+      .bind(tenantId, principalId, role, nowIso())
+      .run();
+  }
+
+  async isTenantMember(tenantId: string, principalId: string): Promise<boolean> {
+    try {
+      const row = await this.db
+        .prepare(
+          `SELECT 1 AS ok FROM tenant_members WHERE tenant_id = ? AND principal_id = ? LIMIT 1`,
+        )
+        .bind(tenantId, principalId)
+        .first<{ ok: number }>();
+      return !!row;
+    } catch {
+      // Missing table/schema fails closed (not a member).
+      return false;
+    }
+  }
+
+  async getTenantMemberRole(
+    tenantId: string,
+    principalId: string,
+  ): Promise<"owner" | "admin" | "member" | null> {
+    try {
+      const row = await this.db
+        .prepare(`SELECT role FROM tenant_members WHERE tenant_id = ? AND principal_id = ? LIMIT 1`)
+        .bind(tenantId, principalId)
+        .first<{ role: string }>();
+      return row?.role === "owner" || row?.role === "admin" || row?.role === "member"
+        ? row.role
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO workspaces
+           (workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(workspace_id) DO UPDATE SET
+           tenant_id = excluded.tenant_id, device_id = excluded.device_id,
+           owner_principal_id = excluded.owner_principal_id, version = excluded.version,
+           active = excluded.active, updated_at = excluded.updated_at`,
+      )
+      .bind(workspace.workspace_id, workspace.tenant_id, workspace.device_id,
+        workspace.owner_principal_id, workspace.version, workspace.active ? 1 : 0,
+        workspace.created_at, workspace.updated_at)
+      .run();
+  }
+
+  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
+    try {
+      const row = await this.db
+        .prepare(`SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at FROM workspaces WHERE workspace_id = ? LIMIT 1`)
+        .bind(workspaceId)
+        .first<{
+          workspace_id: string;
+          tenant_id: string;
+          device_id: string;
+          owner_principal_id: string;
+          version: number;
+          active: number;
+          created_at: string;
+          updated_at: string;
+        }>();
+      if (!row) return null;
+      return { ...row, version: Number(row.version), active: Boolean(row.active) };
+    } catch {
+      return null;
+    }
+  }
+
+  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
+    await this.db
+      .prepare(`INSERT OR IGNORE INTO workspace_members (workspace_id, principal_id, created_at) VALUES (?, ?, ?)`)
+      .bind(workspaceId, principalId, nowIso())
+      .run();
+  }
+
+  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
+    try {
+      const row = await this.db
+        .prepare(`SELECT 1 AS ok FROM workspace_members WHERE workspace_id = ? AND principal_id = ? LIMIT 1`)
+        .bind(workspaceId, principalId)
+        .first<{ ok: number }>();
+      return !!row;
+    } catch {
+      return false;
+    }
+  }
+
+  async assertWorkspaceOperableForMcp(
+    workspaceId: string, deviceId: string, principalId: string, tenantId: string,
+  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
+    const workspace = await this.getWorkspace(workspaceId);
+    if (!workspace || !workspace.active || workspace.tenant_id !== tenantId || workspace.device_id !== deviceId) {
+      return { ok: false, error: "workspace_not_available" };
+    }
+    const device = await this.getDevice(deviceId);
+    const role = await this.getTenantMemberRole(tenantId, principalId);
+    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin" || (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
+    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
+  }
+
+  async canOperateDevice(
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.tenant_id !== tenantId) return false;
+    if (device.principal_id === principalId) return true;
+    return this.isTenantMember(tenantId, principalId);
+  }
+
   async assertDeviceOperableForMcp(
     deviceId: string,
     principalId: string,
     tenantId: string,
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const device = await this.getDevice(deviceId);
-    if (!device || device.principal_id !== principalId || device.tenant_id !== tenantId) {
+    if (!device || device.tenant_id !== tenantId) {
+      return { ok: false, error: "device_not_available" };
+    }
+    const allowed =
+      device.principal_id === principalId || (await this.isTenantMember(tenantId, principalId));
+    if (!allowed) {
       return { ok: false, error: "device_not_available" };
     }
     if (device.revoked || device.status !== "active") {
@@ -3078,7 +4419,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Probe 0002–0007 tables, required columns (SELECT projections), and indexes
+   * Probe 0002–0008 tables, required columns (SELECT projections), and indexes
    * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {
@@ -3187,6 +4528,7 @@ function rowToMcpApprovalOutbox(row: Record<string, unknown>): McpApprovalOutbox
 function rowToMcpOperation(row: Record<string, unknown>): McpOperationRecord {
   let data: Record<string, unknown> = {};
   let warnings: string[] = [];
+  let action: Record<string, unknown> | null = null;
   try {
     data = JSON.parse(String(row.data_json || "{}")) as Record<string, unknown>;
   } catch {
@@ -3197,6 +4539,12 @@ function rowToMcpOperation(row: Record<string, unknown>): McpOperationRecord {
     if (!Array.isArray(warnings)) warnings = [];
   } catch {
     warnings = [];
+  }
+  try {
+    const parsed = JSON.parse(String(row.action_json || "{}")) as Record<string, unknown>;
+    action = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    action = null;
   }
   return {
     operation_id: String(row.operation_id),
@@ -3215,6 +4563,12 @@ function rowToMcpOperation(row: Record<string, unknown>): McpOperationRecord {
     session_id: row.session_id == null ? null : String(row.session_id),
     warnings,
     correlation_id: row.correlation_id ? String(row.correlation_id) : undefined,
+    payload_hash: row.payload_hash == null ? null : String(row.payload_hash),
+    idempotency_key: row.idempotency_key == null ? null : String(row.idempotency_key),
+    workspace_id: row.workspace_id == null ? null : String(row.workspace_id),
+    expires_at: row.expires_at == null ? null : String(row.expires_at),
+    claim_version: Number(row.claim_version || 0),
+    action,
     policy_authority: "ownmesh_device",
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
@@ -3267,10 +4621,21 @@ function parseDeviceMeta(raw: string): {
   return { public_key: raw };
 }
 
+function parseDeviceLabels(raw: string): string[] {
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!Array.isArray(value) || !value.every((label) => typeof label === "string")) return [];
+    return [...value];
+  } catch {
+    return [];
+  }
+}
+
 function hydrateDevice(d: DeviceRecord): DeviceRecord {
   const meta = parseDeviceMeta(d.public_key);
   return {
     ...d,
+    labels: [...(d.labels ?? [])],
     hostname: d.hostname || meta.hostname || d.name,
     os: d.os && d.os !== "unknown" ? d.os : meta.os || "unknown",
     arch: d.arch && d.arch !== "unknown" ? d.arch : meta.arch || "unknown",

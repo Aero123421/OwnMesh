@@ -6,11 +6,9 @@
 #   2. Verify the archive SHA-256 from the trusted sums.
 #   3. Extract only required binaries. Never evaluate remote script text in-process.
 #
-# Installer integrity: download this script, inspect it, then execute from a local path
-# (powershell -File .\ownmesh-installer.ps1). Prefer verifying the script digest against
-# the signed release SHA256SUMS. Do not pipe remote installer text into the shell.
-#
-# Minisign: provide minisign.exe on PATH, or set OWNMESH_MINISIGN to a full path.
+# The one-line bootstrap downloads this script to a local temporary path. Release
+# binaries still require the independent OwnMesh signature below. Minisign itself
+# is bootstrapped from a pinned archive hash when it is not already installed.
 
 & {
     Set-StrictMode -Version Latest
@@ -38,6 +36,8 @@
     # Pinned OwnMesh minisign trust root (docs/release-keys/minisign.pub).
     $PinnedMinisignPubComment = "untrusted comment: minisign public key C596813EFB0946A4"
     $PinnedMinisignPubKey = "RWSkRgn7PoGWxQVPfPTcZzF3P8Wi5JMb+EOydWtYYosHDIEsLUnGl8eI"
+    $PinnedMinisignUrl = "https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-win64.zip"
+    $PinnedMinisignSha256 = "b9c31c2c3034f81f0e5f5d92cbcc20e67a9671b6e5455661588638848dc58031"
 
     function Test-Injection {
         param([Parameter(Mandatory)][string]$Label, [Parameter(Mandatory)][string]$Value)
@@ -123,6 +123,7 @@
     }
 
     function Resolve-Minisign {
+        param([Parameter(Mandatory)][string]$BootstrapDir)
         if ($MinisignBin) {
             if (-not (Test-Path -LiteralPath $MinisignBin -PathType Leaf)) {
                 throw "OWNMESH_MINISIGN is not a file: $MinisignBin"
@@ -133,7 +134,45 @@
         if ($cmd) { return $cmd.Source }
         $cmd = Get-Command minisign.exe -ErrorAction SilentlyContinue
         if ($cmd) { return $cmd.Source }
-        throw "minisign is required to verify SHA256SUMS.minisig (install minisign or set OWNMESH_MINISIGN)"
+
+        Write-Host "Bootstrapping pinned minisign verifier..."
+        Assert-SafeUrl $PinnedMinisignUrl
+        $archive = Join-Path $BootstrapDir "minisign-0.11-win64.zip"
+        Invoke-WebRequest -Uri $PinnedMinisignUrl -OutFile $archive -UseBasicParsing
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+        if ($actual -ne $PinnedMinisignSha256) {
+            throw "pinned minisign bootstrap SHA-256 mismatch"
+        }
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $verified = Join-Path $BootstrapDir "minisign.exe"
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($archive)
+        try {
+            $entry = $zip.GetEntry("minisign-win64/minisign.exe")
+            if (-not $entry -or $entry.Length -le 0 -or $entry.Length -gt 33554432) {
+                throw "pinned minisign.exe is missing or oversized"
+            }
+            $input = $entry.Open()
+            try {
+                $output = [System.IO.File]::Create($verified)
+                try {
+                    $buffer = New-Object byte[] 8192
+                    $written = [uint64]0
+                    while (($count = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        $written += [uint64]$count
+                        if ($written -gt 33554432) { throw "pinned minisign.exe is oversized" }
+                        $output.Write($buffer, 0, $count)
+                    }
+                } finally {
+                    $output.Dispose()
+                }
+            } finally {
+                $input.Dispose()
+            }
+        } finally {
+            $zip.Dispose()
+        }
+        return $verified
     }
 
     function Assert-MinisignSums {
@@ -356,7 +395,7 @@
 
     # Force TLS 1.2+
     [Net.ServicePointManager]::SecurityProtocol = [
-        Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+        Net.SecurityProtocolType]::Tls12
 
     $tempDir = Join-Path ([IO.Path]::GetTempPath()) "ownmesh-install-$([Guid]::NewGuid().ToString('N'))"
     $archive = Join-Path $tempDir $asset
@@ -371,7 +410,7 @@
 
     try {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
-        $minisignPath = Resolve-Minisign
+        $minisignPath = Resolve-Minisign -BootstrapDir $tempDir
 
         Write-Host "Downloading $asset..."
         Copy-ReleaseAsset $asset $archive

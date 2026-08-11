@@ -96,6 +96,7 @@ function openSqlStore(): SqlStore {
 function authProvider(
   principalId = PRINCIPAL_ID,
   tenantId = TENANT_ID,
+  fresh = false,
 ): Fetcher {
   return {
     fetch: async () =>
@@ -103,6 +104,7 @@ function authProvider(
         principal_id: principalId,
         tenant_id: tenantId,
         display_name: principalId,
+        fresh,
       }),
   } as unknown as Fetcher;
 }
@@ -422,7 +424,12 @@ async function connectAgentReady(opts: {
 
   await room.webSocketMessage(
     agentWs as unknown as WebSocket,
-    JSON.stringify(frame("ready", { capabilities: ["fs", "exec"] })),
+    JSON.stringify(
+      frame("ready", {
+        capabilities: ["filesystem.read", "filesystem.write", "command.run"],
+        remote_routing_enabled: true,
+      }),
+    ),
   );
   assert.equal(drainSocket(agentWs)[0]?.type, "ready.ack");
   // Phase ready only via handshake above — never assigned in the test.
@@ -1454,10 +1461,14 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       deviceCredential,
       privateKey,
     });
-    const wenv = workerEnv(adapter, room);
+    const wenv = workerEnv(adapter, room, {
+      AUTH_PROVIDER: authProvider(PRINCIPAL_ID, TENANT_ID, true),
+    });
 
     const opId = randomId("op_");
     const corr = randomId("cor_");
+    const targetExpires = new Date(Date.now() + 5 * 60_000).toISOString();
+    const targetHash = "c".repeat(64);
     await store.putMcpOperation({
       operation_id: opId,
       tenant_id: TENANT_ID,
@@ -1474,6 +1485,15 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       warnings: [],
       correlation_id: corr,
       policy_authority: "ownmesh_device",
+      payload_hash: targetHash,
+      expires_at: targetExpires,
+      claim_version: 1,
+      action: {
+        capability: "filesystem.write",
+        action: "fs.write",
+        tool: "ownmesh_fs_write",
+        path: "secret.txt",
+      },
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     });
@@ -1497,7 +1517,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     await store.ensurePrincipal("prin_other", "Other", "human", TENANT_ID);
     const wrongPrin = await worker.fetch(
       new Request(`${ISSUER}/approve?operation_id=${opId}`),
-      { ...wenv, AUTH_PROVIDER: authProvider("prin_other", TENANT_ID) },
+      { ...wenv, AUTH_PROVIDER: authProvider("prin_other", TENANT_ID, true) },
       ctx,
     );
     assert.ok(
@@ -1509,7 +1529,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     await store.ensurePrincipal("prin_service", "Svc", "service", TENANT_ID);
     const servicePrin = await worker.fetch(
       new Request(`${ISSUER}/approve?operation_id=${opId}`),
-      { ...wenv, AUTH_PROVIDER: authProvider("prin_service", TENANT_ID) },
+      { ...wenv, AUTH_PROVIDER: authProvider("prin_service", TENANT_ID, true) },
       ctx,
     );
     assert.equal(servicePrin.status, 403, await servicePrin.clone().text());
@@ -1521,7 +1541,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     // Tenant mismatch fail-closed: AUTH_PROVIDER claims owner id but wrong tenant.
     const tenantMismatch = await worker.fetch(
       new Request(`${ISSUER}/approve?operation_id=${opId}`),
-      { ...wenv, AUTH_PROVIDER: authProvider(PRINCIPAL_ID, "ten_other") },
+      { ...wenv, AUTH_PROVIDER: authProvider(PRINCIPAL_ID, "ten_other", true) },
       ctx,
     );
     assert.equal(tenantMismatch.status, 403, await tenantMismatch.clone().text());
@@ -1598,23 +1618,55 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     };
     assert.equal(firstBody.ok, true);
     assert.equal(firstBody.decision, "approve");
-    assert.equal(firstBody.status, "pending");
+    assert.equal(firstBody.status, "approval_required");
     assert.equal(firstBody.route?.status, "routed_to_device");
 
-    // Real DeviceRoom delivered approval.decision to the agent frame.
+    // Real DeviceRoom delivered bound approval.decision to the agent frame.
     const agentInbox = drainSocket(agentWs);
+    const decisionFrame = agentInbox.find(
+      (m) =>
+        m.type === "operation.request" &&
+        (m.payload.capability === "approval.decision" ||
+          (m.payload.arguments as { action?: string } | undefined)?.action ===
+            "approval.decision"),
+    );
     assert.ok(
-      agentInbox.some(
-        (m) =>
-          m.type === "operation.request" &&
-          (m.payload.op === "approval.decision" || m.payload.decision === "approve"),
-      ),
-      `agent must receive approval.decision, got ${JSON.stringify(agentInbox.map((m) => m.type + ":" + m.payload.op))}`,
+      decisionFrame,
+      `agent must receive approval.decision, got ${JSON.stringify(
+        agentInbox.map(
+          (m) =>
+            m.type +
+            ":" +
+            String(m.payload.capability || m.payload.op || m.payload.decision || ""),
+        ),
+      )}`,
+    );
+    assert.equal(
+      (decisionFrame!.payload.arguments as { decision?: string } | undefined)?.decision,
+      "approve",
+    );
+    assert.ok(
+      typeof decisionFrame!.payload.payload_hash === "string" &&
+        String(decisionFrame!.payload.payload_hash).length === 64,
+      "decision frame must carry server payload_hash",
+    );
+    const bound = (
+      decisionFrame!.payload.authorization as
+        | { bound_action?: Record<string, unknown> }
+        | undefined
+    )?.bound_action;
+    assert.ok(bound && typeof bound === "object", "decision must carry bound_action");
+    assert.equal(bound!.action, "approval.decision");
+    assert.equal(bound!.principal_id, PRINCIPAL_ID);
+    assert.equal(
+      (bound!.facts as { target_payload_hash?: string } | undefined)?.target_payload_hash,
+      targetHash,
     );
 
-    // Authoritative transition only after successful delivery.
-    assert.equal((await store.getMcpOperation(opId))?.status, "pending");
-    assert.equal((await store.getMcpOperation(opId))?.approval_required, false);
+    // Delivery alone is not execution. The operation remains nonterminal until
+    // the Agent returns the authoritative result for this exact decision.
+    assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
+    assert.equal((await store.getMcpOperation(opId))?.approval_required, true);
 
     // One-time: same transaction rejected (replay/TOCTOU).
     const second = await postOnce();
@@ -1678,7 +1730,9 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       OAUTH_ISSUER: ISSUER,
     });
     await offlineRoom.ready;
-    const offlineEnv = workerEnv(adapter, offlineRoom);
+    const offlineEnv = workerEnv(adapter, offlineRoom, {
+      AUTH_PROVIDER: authProvider(PRINCIPAL_ID, TENANT_ID, true),
+    });
     const opId3 = randomId("op_");
     await store.putMcpOperation({
       operation_id: opId3,

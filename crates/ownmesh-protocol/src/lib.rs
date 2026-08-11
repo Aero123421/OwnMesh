@@ -13,9 +13,15 @@
 )]
 
 mod envelope;
+mod operation;
 mod version;
 
 pub use envelope::{fuzz_parse_envelope, Envelope, PROTOCOL_DEVICE_V1};
+pub use operation::{
+    OperationAuthorizationBinding, OperationContract, OperationEnvelope, OperationError,
+    OperationEventPayload, OperationPayload, OperationProgressPayload, OperationProgressStatus,
+    OperationRequestPayload, OperationResultPayload, OperationResultStatus, OPERATION_CONTRACT_V1,
+};
 pub use version::{
     assert_current_wire_constant, default_supported_versions, negotiate, NegotiatedProtocol,
     ProtocolVersion,
@@ -88,6 +94,34 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(fixture_path).unwrap()).unwrap();
         if let Err(err) = validator.validate(&data) {
             panic!("envelope fixture failed schema validation: {err}");
+        }
+    }
+
+    #[test]
+    fn operation_fixtures_roundtrip_and_validate_schema() {
+        let schema_path = Path::new(SHARED_SCHEMAS_DIR).join("operation-envelope.schema.json");
+        let schema_raw = fs::read_to_string(&schema_path).expect("operation schema");
+        let schema_json: serde_json::Value = serde_json::from_str(&schema_raw).unwrap();
+        let validator = jsonschema::validator_for(&schema_json).expect("compile operation schema");
+
+        for name in [
+            "operation_request_envelope.json",
+            "operation_progress_envelope.json",
+            "operation_event_envelope.json",
+            "operation_result_envelope.json",
+        ] {
+            let path = Path::new(SHARED_FIXTURES_DIR).join(name);
+            let raw = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let original: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            validator
+                .validate(&original)
+                .unwrap_or_else(|error| panic!("{name} failed schema validation: {error}"));
+            let typed = OperationEnvelope::parse_str(&raw)
+                .unwrap_or_else(|error| panic!("{name} failed typed parse: {error}"));
+            let encoded: serde_json::Value =
+                serde_json::from_slice(&typed.to_vec().unwrap()).unwrap();
+            assert_eq!(encoded, original, "{name} typed roundtrip");
         }
     }
 

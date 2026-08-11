@@ -1,5 +1,176 @@
 # Changelog
 
+## v1.2.0 — Stable supported surface
+
+- **Complete shipped CLI:** the machine-checked supported-surface registry has
+  no intentionally unimplemented entries. Device rename/labels, remote
+  exec/session creation, profile flows, approval watch/decisions, typed policy
+  and recovery administration, transfer, and bounded MCP stdio are wired.
+- **Security administration:** approval, policy, unlock, and token mutations
+  require a fresh passkey decision bound to the exact operation and execute
+  exactly once; remote routes never fall back locally.
+- **Self-hosted UX:** signed one-line installers, desktop/headless quickstart,
+  guided Cloudflare deployment, rotating OAuth refresh tokens, and ChatGPT MCP
+  linking form one supported onboarding path.
+- **Evidence disclosure:** the networkless broker lifecycle is implemented on
+  Linux/macOS/Windows and has a Linux native receipt. macOS/Windows native and
+  full public E8 receipts, plus automated external ChatGPT E10 evidence, remain
+  tracked separately and are not claimed as live-proven.
+
+## v1.2.0-beta.12 — E5 process-tree/replay integrity + E6 detect + E7 unified diff
+
+- **Self-hosting UX:** portable `wrangler.jsonc`, guided D1/migration/deploy/owner
+  bootstrap, one-command machine `setup --quickstart`, and a headless device-code
+  variant. Re-running guided deploy does not rotate existing secrets.
+- **ChatGPT OAuth:** built-in single-owner passkey login, public-client DCR for
+  exact ChatGPT callbacks, rotating refresh tokens, browser consent, and one-URL
+  MCP setup. RFC 8628 polling errors parse correctly without an access token.
+- **Cloud cost guardrails:** pre-D1 auth/MCP rate-limit bindings keyed only by
+  hashed credentials (IP fallback for unauthenticated bootstrap), plus documented
+  Workers/D1/DO limits. Authorization remains OAuth + device policy.
+- **Transfer:** public authenticated CLI plan/send/status/list/cancel and the E9
+  two-Agent encrypted resume/cancel artifact path are implemented and evidenced.
+- **Privileged boundary:** networkless native broker lifecycle is implemented on
+  Linux, macOS, and Windows; Linux has a root receipt. macOS/Windows native
+  release receipts and the full public-route E8 acceptance remain open evidence.
+
+- **E5 process tree:** live PTY terminate kills the OS process tree (Windows
+  `taskkill /T`, Unix session/`pkill -s` + process-group) so background
+  descendants of interactive shells cannot survive `session.terminate`.
+- **E5 resize:** `session.resize` fails closed before sequence reserve when no
+  live PTY host exists (daemon recovery / non-PTY kind) — no phantom success.
+- **E5 replay:** live-ring drain reports remaining bytes; multi-page drain loops
+  under budget; `session.replay` surfaces `live_pending_bytes` and forces
+  `truncated`/`next_seq` when unread live output remains.
+- **Bounds:** executable pin/revalidation, idempotency journal open, git diff
+  spool load, and agent transport state all ceiling **before** allocation.
+- **E7:** bounded single-file unified-diff apply (`patch_format=unified` or
+  hash-checked unified body) on `fs.patch` / `ops.fs.write`.
+- **E6:** device `profile.list`/`show`/`scan` IPC + MCP `ownmesh_list_profiles`
+  with `device_id` runs real PATH detection; `session.open` with `profile_id`
+  builds an official launch plan and owns a live PTY fallback. CLI profile
+  surfaces remain explicit unsupported.
+- Aggregate E2–E9 acceptance remains fail-closed only on the independent E8
+  public-route evidence; E4–E7 and E9 have real-path receipts.
+
+## v1.2.0-beta.11 — handle-held dir list, PTY at-most-once, workspace CRUD
+
+- **E4 custody:** restricted `list_dir` holds the validated directory handle and
+  enumerates through handle-rooted APIs (Windows `GetFileInformationByHandleEx`,
+  Linux `/proc/self/fd`, other Unix `fdopendir`). Rename-to-outside-symlink/junction
+  races fail closed and never return outside entries.
+- **E5 exact-once:** `session.write` / `session.resize` treat `RetryPending` as
+  **at-most-once** — never re-deliver PTY input/resize; surface an explicit
+  uncertain/conflict outcome for reconciliation.
+- **E4 workspace CRUD:** device-local `ops.workspace.{list,show,add,update,remove}`
+  IPC, CLI `ownmesh workspace …`, and public MCP tools
+  `ownmesh_workspace_*` route through Agent → ownmeshd. `ws_default` cannot be
+  removed or relocated.
+- Gate remains intentionally red until E6–E9 production rows are complete.
+
+
+## v1.2.0-beta.10 — session policy authority + PTY exact-once + dir spool bind
+
+- E3: MCP per-tool argument allowlist strips hidden session `command`/`cwd` and client authority keys before hash/route
+- E3/E5: `session.open` denied under `workspace_only`/`recommended` (same confinement posture as `command.run`); public MCP regression under recommended creates no external marker
+- E5: controller `input_seq`/`resize_seq` reserve payload digest **before** PTY mutation; durable exact-once receipt; stale/gap/conflict never reach the process
+- E4: directory v2 spool cursors bound to root/recursive request identity; aggregate name/path byte budget checked before append
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
+## v1.2.0-beta.9 — E3 principal bind + E4 session workspace + E5 ordered input
+
+- E3: ownmeshd derives runtime principal from verified `bound_action` (`client:remote:<tenant>:<principal>`); local idempotency journal namespaced per principal
+- E3/E5: minimal `tenant_members` table + `canOperateDevice` so same-tenant members can operate devices; `session.give` normalizes bare principal ids into the remote runtime namespace; public two-principal handoff proof
+- E4: `ownmesh_session_list` requires `workspace_id`; list/show filter/reject cross-workspace session metadata
+- E5: MCP `input_seq` / `resize_seq` required on write/resize; ownmeshd persists last-applied and rejects gaps/stale through the real workerd path
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
+## v1.2.0-beta.8 — E5 live PTY + E3 crash outbox + large dir spool + session lifecycle
+
+- E3: Agent transport durable pending dispatch outbox; crash/reconnect resumes or emits terminal `OWNMESH_E_DISPATCH_LOST` (no stranded seen-without-completion); capacity rejects without live eviction
+- E2/E4: directory listings >25k spill to private durable spool with integrity hash + `v2:` cursors so Full Access can retrieve every entry in chunks
+- E5: live PTY host in ownmeshd; public MCP session list/show/claim/release/give/terminate; `workspace_id` required on close/claim/release/give/terminate
+- E5: pipe fallback uses concurrent capped readers + timeout kill (no unbounded `Command::output`)
+- E7: git diff spool TTL/count/byte quota cleanup on private state dir
+- Restricted write parents component-wise with held directory handle across temp+rename (Linux `renameat`)
+- Release notes document 32 explicit unsupported CLI surfaces / 39 total via `release/SUPPORTED_SURFACES.json`
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
+## v1.2.0-beta.7 — E4 workspace selection + custody hardlinks + E2 surface proof
+
+- Directory `list_dir_page` is cursor-resumable: after-cursor collection + sort + page; >4_000-entry regression asserts every name once (no silent drop after former 4k scan window)
+- Restricted custody rejects multi-link hardlinks and cross-volume mounts after handle final-path revalidation (Unix nlink/dev + Windows links/volume serial)
+- Device-local `workspaces.json` registry (`ws_default` + additional `ws_...` roots); MCP `workspace_id` selects the root at ownmeshd side-effect boundary
+- E2 workerd proof extended: `ownmesh_fs_patch`, `ownmesh_command_shell`, workspace cross-denial, `ownmesh_session_open`
+- Agent remote maps session.* and git.status/diff; MCP adds session write/resize/replay/close + git status/diff tools
+- Git status/diff stream stdout/stderr with hard byte caps (no unbounded `Command::output`)
+- Gate remains RED (exit 2): E4/E5/E7 partial; E6/E8/E9 open; CLI workspace/profile/transfer/broker install still unsupported
+
+## v1.2.0-beta.6 — E2/E3 durable bounds + fail-closed E2–E9 gate
+
+- Pending dispatch outbox is never wiped by client-data truncation; separate 900 KiB outbox ceiling; oversized claims fail closed before side effects
+- Durable result bounding preserves `next_offset` / `sha256` / `exit_code` / list cursors and short previews
+- Per-hop read (160 KiB) and command output (200 KiB) budgets aligned with durable store + Agent envelope; 512 KiB+ files page via offset
+- Directory list UTF-8 page-byte budget (~200 KiB) keeps stable `(name,path)` cursors
+- Cancel uses durable target-bound claim+outbox (`cancel:<op>`); `cancel_requested` only after confirmed route
+- E2 workerd proof: multi-chunk 512 KiB binary read + list/stat/delete
+- `test_v12_e2_e9_workerd_loopback.py` exits non-zero while E4–E9 rows remain open (no green incomplete gate)
+- E4–E9 and E10 remain open
+
+## v1.2.0-beta.5+ — E2/E3 dispatch integrity + bounded Agent completions
+
+- Post-send DeviceRoom route timeout/throw is `dispatch_uncertain` (not terminal `failed`): MCP ops stay pending, dispatch outbox stays redeliverable, delayed Agent results can still CAS-finalize; DeviceRoom correlation dedup prevents double send
+- Agent remote completion path: bounded mpsc completion queue (8) + in-flight semaphore (32); slow WSS consumers backpressure instead of unbounded RSS; `OWNMESH_E_AGENT_BACKPRESSURE` when saturated
+- Durable MCP dispatch outbox: claim stores exact route body; retries redeliver when Worker dies after claim and before DeviceRoom inject; clients never see the outbox
+- Idempotency tombstones are never evicted under quota pressure before the 30-day window; overflow fails closed
+- Agent transport completed-reply aggregate byte budget + compact durable receipts; transport state file size cap
+- ownmeshd op-journal entry/file/value budgets with fail-closed capacity (no unbounded `read_to_string`)
+- Directory list cursors bind full `(name, path)` sort tuple so recursive duplicate basenames are not skipped
+- Docs honesty: ChatGPT connection guide no longer implies cloud PTY sessions are production-ready (E5 open)
+- Gate entrypoint: `scripts/tests/test_v12_e2_e9_workerd_loopback.py` (runs real E2/E3 binary×workerd proof)
+- E4–E9 remain open (workspace CRUD/TOCTOU, cloud PTY, profiles, patch/Git, broker, transfer)
+
+## v1.2.0-beta.4 — E3 action binding + bounded I/O (integrity hardening)
+
+- Server-computed `payload_hash` binds action facts + operation_id + expires_at + claim_version + OAuth client
+- Atomic `claimMcpOperationByIdempotency` + partial unique D1 index (one owner per idempotency key)
+- Concurrent same-key differing actions fail closed; identical actions replay without re-route
+- DeviceRoom stamps control-plane `expires_at` onto the operation.request envelope; agents reject expiry
+- Server-side clamp of timeout/output/list/read budgets at MCP and ownmeshd/exec
+- Cancel kills process trees (Unix process group / Windows taskkill /T); exclusive randomized write temps
+- E2 workerd loopback: byte-identical idempotent replay + separate mismatch assertion
+- Honest docs: E4–E9 and E10 remain open
+
+## v1.2.0-beta.3 — E2 remote routing candidate
+
+- Wire public Streamable HTTP `/mcp` through DeviceRoom to the real ownmeshd Agent and shared policy-gated `DaemonRuntime`.
+- Emit `ownmesh.operation/1.0` requests with matching `correlation_id`/`operation_id`, `expires_at`, capability, idempotency key, and nested arguments; strip client-supplied authorization fields.
+- Advertise `remote_routing_enabled: true` with filesystem/command/cancel capabilities; DeviceRoom only injects to routing-ready Agents.
+- Execute direct fs list/stat/read-range/write/delete and structured/raw command paths with bounded read windows (`offset`/`max_bytes`, encoding, SHA-256, visible truncation).
+- Persist Agent terminal replies before send; runtime idempotency journals prevent completed side-effect reruns across process restart.
+- ChatGPT-primary action model: authenticated MCP invocation is the requested action; no invented ChatGPT confirmation attestation; optional local approval only when device policy asks.
+- Real binary × local Wrangler/workerd proof: `scripts/tests/test_e2_workerd_loopback.py`.
+- Routing notes: [`docs/V1.2_E2_REMOTE_ROUTING.md`](./docs/V1.2_E2_REMOTE_ROUTING.md).
+- Does not promote CLI `exec --device`, cloud PTY, profiles, broker mint, transfer, or live-account E10 surfaces.
+
+## v1.2.0-beta.2 — E1 Agent transport candidate
+
+- Connect enrolled `ownmeshd` instances to the active control plane at `/agent/connect` over `wss://` (or loopback-only `ws://`) using the existing issuer/device-bound credential.
+- Complete hello/challenge/Ed25519 proof/accepted/ready authentication without logging or persisting plaintext credentials outside the existing secret store.
+- Persist outbound/inbound sequence state before side effects, reconnect with bounded backoff, advertise resume state, and deduplicate message IDs and operation correlations across reconnects.
+- Keep pre-E2 remote routing fail-closed until the runtime handle is wired.
+- A real local WebSocket test covers two authenticated connections, resume, and fresh-sequence cached-result replay. A real debug `ownmeshd` binary additionally authenticates twice against local Wrangler/workerd with temporary D1 state and an isolated native keychain namespace, proving process-restart resume.
+- Enable the native `keyring` 3.x backends explicitly so production credentials persist in Windows Credential Manager, macOS Keychain, or Unix Secret Service instead of the crate's process-local mock. Live-account E2E remains open, so no supported surface is promoted.
+- Transport notes: [`docs/V1.2_E1_AGENT_TRANSPORT.md`](./docs/V1.2_E1_AGENT_TRANSPORT.md).
+
+## v1.2.0-beta.1 — E0 operation contract freeze
+
+- Add the independent `ownmesh.operation/1.0` request/progress/event/result payload contract while retaining the `ownmesh.device/1.0` outer envelope.
+- Require operation/correlation binding, request expiry and idempotency, exact payload fields, safe cross-runtime sequence integers, and fail-closed terminal result shapes.
+- Add Rust/TypeScript typed parsers, a JSON Schema, and four shared golden fixtures with cross-language round-trip coverage.
+- Reserve `workspace_id` for E4 without promoting workspace or remote-execution surfaces; the existing 39 hard-error unsupported surfaces remain unchanged.
+- Contract notes: [`docs/V1.2_E0_OPERATION_CONTRACT.md`](./docs/V1.2_E0_OPERATION_CONTRACT.md).
+
 ## v1.1.3 — deterministic release gate
 
 - Carry forward the v1.1.2 portable-installer repair without changing its security or compatibility scope.

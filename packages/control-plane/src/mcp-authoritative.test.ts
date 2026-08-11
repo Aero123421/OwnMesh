@@ -181,6 +181,48 @@ test("schemaReadiness tracks 0005 MCP objects for both store kinds", async () =>
   assert.equal(sqlR.checks.mcp_approval_outbox, true);
 });
 
+test("public MCP workspace custody denies a tenant member and binds owner action version", async () => {
+  const store = new MemoryStore();
+  const owner = await seedAuthed(store);
+  await store.ensurePrincipal("prin_member", "Member", "human", "ten_default");
+  const member = await seedAuthed(store, "prin_member");
+  const deviceId = "dev_workspace_acl_01abcdef";
+  await putActiveDevice(store, deviceId);
+  await store.putTenantMember("ten_default", "prin_member", "member");
+  await store.putWorkspace({
+    workspace_id: "owner-root",
+    tenant_id: "ten_default",
+    device_id: deviceId,
+    owner_principal_id: "prin_dev",
+    version: 7,
+    active: true,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  let memberRoutes = 0;
+  const denied = await handleMcp(
+    rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: "owner-root", idempotency_key: "member-read" }, member.access_token),
+    store, new URL("https://cp.test/mcp"),
+    { routeToDevice: async () => { memberRoutes += 1; return { status: "routed_to_device" }; } },
+    { tracker: new OperationTracker() },
+  );
+  assert.equal(denied.status, 200);
+  assert.equal(memberRoutes, 0, "ACL denial must happen before DeviceRoom routing");
+  assert.match(await denied.text(), /workspace_not_available/);
+
+  let bound: Record<string, unknown> | undefined;
+  const ownerResult = await handleMcp(
+    rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: "owner-root", idempotency_key: "owner-read" }, owner.access_token),
+    store, new URL("https://cp.test/mcp"),
+    { routeToDevice: async (_id, op) => { bound = ((op.payload.authorization as { bound_action?: Record<string, unknown> })?.bound_action); return { status: "routed_to_device" }; } },
+    { tracker: new OperationTracker() },
+  );
+  assert.equal(ownerResult.status, 200);
+  assert.equal(bound?.workspace_id, "owner-root");
+  assert.equal(bound?.workspace_version, 7);
+});
+
 test("store is authoritative: empty tracker still polls after isolate restart", async () => {
   const store = new MemoryStore();
   const tok = await seedAuthed(store);
@@ -190,6 +232,7 @@ test("store is authoritative: empty tracker still polls after isolate restart", 
   const room = new DeviceRoomHarness(deviceId);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
 
   const tracker1 = new OperationTracker();
   const router = createHarnessRouter({
@@ -207,7 +250,7 @@ test("store is authoritative: empty tracker still polls after isolate restart", 
   });
 
   const createRes = await handleMcp(
-    rpc("ownmesh_command_run", { device_id: deviceId, program: "echo", args: ["hi"], async: true }, tok.access_token),
+    rpc("ownmesh_command_run", { device_id: deviceId, program: "echo", args: ["hi"], async: true, idempotency_key: "idem_auth_cmd" }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
     router,
@@ -275,6 +318,77 @@ test("SqlStore put/get/update MCP operation + result apply", async () => {
   assert.deepEqual(applied.ok && applied.record?.data, { entries: ["a"] });
 });
 
+test("approval decision result cannot substitute its exact-bound target or decision", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const deviceId = "dev_decision_binding_01abcdef";
+  const now = new Date().toISOString();
+  const putTarget = async (operationId: string, transactionId: string, approvalId: string) =>
+    store.putMcpOperation({
+      operation_id: operationId,
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      device_id: deviceId,
+      tool: "ownmesh_fs_write",
+      status: "approval_required",
+      summary: "awaiting exact decision",
+      data: {
+        approval_decision: "approve",
+        approval_transaction_id: transactionId,
+        approval_device_id: approvalId,
+      },
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_id: approvalId,
+      warnings: [],
+      correlation_id: operationId,
+      policy_authority: "ownmesh_device",
+      created_at: now,
+      updated_at: now,
+    });
+  await putTarget("op_bound_target_a", "apr_TxA", "apr_DeviceA");
+  await putTarget("op_bound_target_b", "apr_TxB", "apr_DeviceB");
+  const expected = {
+    target_operation_id: "op_bound_target_a",
+    decision: "approve" as const,
+    approval_id: "apr_DeviceA",
+    transaction_id: "apr_TxA",
+  };
+  const applyDecision = (target: string, decision: "approve" | "deny") =>
+    applyMcpOperationResult(store, {
+      operationId: "op_decision_control",
+      correlationId: "op_decision_control",
+      deviceId,
+      expectedApprovalDecision: expected,
+      payload: {
+        status: "completed",
+        operation_id: "op_decision_control",
+        result: {
+          approval_decision_applied: true,
+          target_operation_id: target,
+          approval_id: "apr_DeviceA",
+          decision,
+          result: { ok: true },
+        },
+      },
+    });
+
+  const swappedTarget = await applyDecision("op_bound_target_b", "approve");
+  assert.equal(swappedTarget.ok, false);
+  assert.equal(!swappedTarget.ok && swappedTarget.error, "approval_decision_binding_mismatch");
+  const swappedDecision = await applyDecision("op_bound_target_a", "deny");
+  assert.equal(swappedDecision.ok, false);
+  assert.equal(!swappedDecision.ok && swappedDecision.error, "approval_decision_binding_mismatch");
+  assert.equal((await store.getMcpOperation("op_bound_target_a"))?.status, "approval_required");
+  assert.equal((await store.getMcpOperation("op_bound_target_b"))?.status, "approval_required");
+
+  const exact = await applyDecision("op_bound_target_a", "approve");
+  assert.equal(exact.ok, true);
+  assert.equal((await store.getMcpOperation("op_bound_target_a"))?.status, "completed");
+  assert.equal((await store.getMcpOperation("op_bound_target_b"))?.status, "approval_required");
+});
+
 test("poll/cancel reject foreign principal (owner check)", async () => {
   const store = new MemoryStore();
   await store.ensureBootstrap();
@@ -332,6 +446,7 @@ test("revoked/expired device credential fails create/poll/cancel (MCP path)", as
   const room = new DeviceRoomHarness(deviceId);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const router = createHarnessRouter({
     inject: (_id, op) => room.router.injectOperation(op),
   });
@@ -412,6 +527,8 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
 
   const opId = randomId("op_");
   const corr = randomId("cor_");
+  const targetExpires = new Date(Date.now() + 5 * 60_000).toISOString();
+  const targetHash = "a".repeat(64);
   await store.putMcpOperation({
     operation_id: opId,
     tenant_id: "ten_default",
@@ -428,16 +545,38 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     warnings: [],
     correlation_id: corr,
     policy_authority: "ownmesh_device",
+    payload_hash: targetHash,
+    expires_at: targetExpires,
+    claim_version: 1,
+    action: {
+      capability: "filesystem.write",
+      action: "fs.write",
+      tool: "ownmesh_fs_write",
+      path: "secret.txt",
+    },
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
 
-  const deliveries: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  const deliveries: Array<{
+    type: string;
+    payload: Record<string, unknown>;
+    expires_at?: string;
+  }> = [];
   const routeToDevice = async (
     _deviceId: string,
-    operation: { type: string; payload: Record<string, unknown>; correlation_id: string },
+    operation: {
+      type: string;
+      payload: Record<string, unknown>;
+      correlation_id: string;
+      expires_at?: string;
+    },
   ) => {
-    deliveries.push({ type: operation.type, payload: operation.payload });
+    deliveries.push({
+      type: operation.type,
+      payload: operation.payload,
+      expires_at: operation.expires_at,
+    });
     return { status: "routed_to_device", detail: { recipients: 1 } };
   };
 
@@ -526,11 +665,47 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
   const firstBody = (await first.json()) as { ok: boolean; decision: string; status: string };
   assert.equal(firstBody.ok, true);
   assert.equal(firstBody.decision, "approve");
-  assert.equal(firstBody.status, "pending");
+  assert.equal(firstBody.status, "approval_required");
   assert.equal(deliveries.length, 1);
   assert.equal(deliveries[0]!.type, "approval.decision");
-  assert.equal(deliveries[0]!.payload.decision, "approve");
-  assert.equal(deliveries[0]!.payload.operation_id, opId);
+  // Strict ownmesh.operation/1.0 nests decision under arguments (not flat payload).
+  const decisionArgs = deliveries[0]!.payload.arguments as
+    | {
+        decision?: string;
+        target_operation_id?: string;
+        action?: string;
+        approval_id?: string;
+      }
+    | undefined;
+  assert.equal(decisionArgs?.decision, "approve");
+  assert.equal(decisionArgs?.action, "approval.decision");
+  // Decision frame has its own operation_id; original op is target_operation_id.
+  assert.equal(
+    deliveries[0]!.payload.target_operation_id || decisionArgs?.target_operation_id,
+    opId,
+  );
+  // E3: recovery decision must carry server-bound exact-action authorization.
+  assert.equal(deliveries[0]!.payload.capability, "approval.decision");
+  assert.ok(
+    typeof deliveries[0]!.payload.payload_hash === "string" &&
+      String(deliveries[0]!.payload.payload_hash).length === 64,
+    "approval.decision must include server payload_hash",
+  );
+  const auth = deliveries[0]!.payload.authorization as
+    | { bound_action?: Record<string, unknown> }
+    | undefined;
+  assert.ok(auth?.bound_action && typeof auth.bound_action === "object");
+  assert.equal(auth!.bound_action!.action, "approval.decision");
+  assert.equal(auth!.bound_action!.principal_id, "prin_dev");
+  assert.equal(
+    (auth!.bound_action!.facts as { decision?: string } | undefined)?.decision,
+    "approve",
+  );
+  assert.ok(
+    typeof deliveries[0]!.expires_at === "string" ||
+      typeof auth!.bound_action!.expires_at === "string",
+    "decision must bind expires_at",
+  );
 
   // Double approve with same tx rejected (already delivered)
   const second = await postOnce();
@@ -547,6 +722,170 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     },
   );
   assert.equal(get2.status, 409);
+});
+
+test("admin approval renders only safe local preview and rechecks role before delivery", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  await store.ensurePrincipal("prin_admin_review", "Admin", "human", "ten_default");
+  await store.putTenantMember("ten_default", "prin_admin_review", "admin");
+  const deviceId = "dev_admin_review_01abcdef";
+  await putActiveDevice(store, deviceId, "prin_device_owner");
+  const opId = randomId("op_");
+  await store.putMcpOperation({
+    operation_id: opId,
+    tenant_id: "ten_default",
+    principal_id: "prin_admin_review",
+    device_id: deviceId,
+    tool: "ownmesh_request_approval",
+    status: "approval_required",
+    summary: "local approval bridge",
+    data: {
+      error: {
+        details: {
+          target_preview: {
+            approval_id: "apr_Local1",
+            operation_id: "op_local_write_1",
+            capability: "filesystem.write",
+            reason: "write requested",
+            path: "<img src=x onerror=alert(1)>",
+            secret: "TOP_SECRET_MUST_NOT_RENDER",
+          },
+        },
+      },
+    },
+    truncated: false,
+    next_cursor: null,
+    approval_required: true,
+    approval_id: "apr_BridgeOuter1",
+    approval_url: `https://cp.test/approve?operation_id=${opId}`,
+    warnings: [],
+    correlation_id: opId,
+    policy_authority: "ownmesh_device",
+    payload_hash: "c".repeat(64),
+    expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+    claim_version: 1,
+    action: {
+      capability: "admin.approval.bridge",
+      approval_id: "apr_Local1",
+      requested_decision: "approve",
+      temporary_grant: false,
+    },
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const getRes = await handleApprove(
+    new Request(`https://cp.test/approve?operation_id=${opId}`),
+    store,
+    {
+      issuer: "https://cp.test",
+      principal: { id: "prin_admin_review", tenant_id: "ten_default" },
+      authSource: "browser",
+    },
+  );
+  assert.equal(getRes.status, 200);
+  const html = await getRes.text();
+  assert.match(html, /Local target/);
+  assert.match(html, /filesystem\.write/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.ok(!html.includes("<img src=x onerror=alert(1)>"));
+  assert.ok(!html.includes("TOP_SECRET_MUST_NOT_RENDER"));
+  const tx = /name="transaction_id" value="([^"]+)"/.exec(html)?.[1];
+  const csrf = /name="csrf_token" value="([^"]+)"/.exec(html)?.[1];
+  assert.ok(tx && csrf);
+
+  // A principal demoted after GET may remain a tenant member, but must lose
+  // administrative mutation authority before the exact decision is routed.
+  await store.putTenantMember("ten_default", "prin_admin_review", "member");
+  let routes = 0;
+  const post = await handleApprove(
+    new Request(`https://cp.test/approve?operation_id=${opId}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        origin: "https://cp.test",
+      },
+      body: JSON.stringify({
+        decision: "approve",
+        transaction_id: tx,
+        csrf_token: csrf,
+        operation_id: opId,
+      }),
+    }),
+    store,
+    {
+      issuer: "https://cp.test",
+      principal: { id: "prin_admin_review", tenant_id: "ten_default" },
+      authSource: "browser",
+      originAllowed: true,
+      routeToDevice: async () => {
+        routes += 1;
+        return { status: "routed_to_device" };
+      },
+    },
+  );
+  assert.equal(post.status, 403);
+  assert.match(await post.text(), /device_admin_required/);
+  assert.equal(routes, 0);
+  assert.equal((await store.getMcpApprovalOutbox(tx!))?.delivery_status, "pending");
+  const unchanged = await store.getMcpOperation(opId);
+  assert.equal(unchanged?.status, "approval_required");
+  assert.equal(unchanged?.data.approval_transaction_id, undefined);
+});
+
+test("/approve rejects expired target operation (no decision delivery)", async () => {
+  const store = new MemoryStore();
+  await seedAuthed(store);
+  const deviceId = "dev_approve_expired_01ab";
+  await putActiveDevice(store, deviceId);
+  const opId = randomId("op_");
+  const past = new Date(Date.now() - 60_000).toISOString();
+  await store.putMcpOperation({
+    operation_id: opId,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "approval_required",
+    summary: "stale",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: true,
+    approval_url: `https://cp.test/approve?operation_id=${opId}`,
+    warnings: [],
+    correlation_id: randomId("cor_"),
+    policy_authority: "ownmesh_device",
+    payload_hash: "b".repeat(64),
+    expires_at: past,
+    claim_version: 1,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+
+  const deliveries: unknown[] = [];
+  const getRes = await handleApprove(
+    new Request(`https://cp.test/approve?operation_id=${opId}`),
+    store,
+    {
+      issuer: "https://cp.test",
+      principal: { id: "prin_dev", tenant_id: "ten_default" },
+      authSource: "browser",
+      routeToDevice: async () => {
+        deliveries.push("should_not_run");
+        return { status: "routed_to_device" };
+      },
+    },
+  );
+  assert.equal(getRes.status, 409, await getRes.clone().text());
+  assert.equal(
+    ((await getRes.json()) as { error?: string }).error,
+    "expired",
+  );
+  assert.equal(deliveries.length, 0);
+  assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
 });
 
 test("/approve delivery failure is retryable non-success; retry delivers exactly once", async () => {
@@ -665,13 +1004,18 @@ test("/approve delivery failure is retryable non-success; retry delivers exactly
     assert.equal(retry.status, 200, await retry.clone().text());
     const retryBody = (await retry.json()) as { ok: boolean; status: string };
     assert.equal(retryBody.ok, true);
-    assert.equal(retryBody.status, "pending");
+    assert.equal(retryBody.status, "approval_required");
     assert.equal(deliveries.length, 1);
-    assert.equal(deliveries[0]!.payload.operation_id, opId);
+    assert.equal(
+      deliveries[0]!.payload.target_operation_id ||
+        (deliveries[0]!.payload.arguments as { target_operation_id?: string } | undefined)
+          ?.target_operation_id,
+      opId,
+    );
 
     const after = await store.getMcpOperation(opId);
-    assert.equal(after?.status, "pending");
-    assert.equal(after?.approval_required, false);
+    assert.equal(after?.status, "approval_required");
+    assert.equal(after?.approval_required, true);
 
     const delivered = await store.getMcpApprovalOutbox(tx!);
     assert.equal(delivered?.delivery_status, "delivered");
@@ -863,16 +1207,29 @@ test("cancel owner path updates store and is CAS-safe", async () => {
   // Device-bound cancel only advances to cancel_requested after successful route.
   assert.equal(body.result.structuredContent.status, "cancel_requested");
   assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
-  assert.ok(routed[0]?.includes("ownmesh_cancel_operation"));
+  assert.ok(
+    routed[0]?.includes("cancel") || routed[0]?.includes("ownmesh_cancel_operation"),
+    `cancel route type should be cancel action, got ${routed[0]}`,
+  );
 
-  // Second cancel: not cancellable
+  // Second cancel: durable claim replay — no second device route, target stays cancel_requested.
+  let secondRoutes = 0;
   const res2 = await handleMcp(
     rpc("ownmesh_cancel_operation", { operation_id: opId }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
-    { routeToDevice: async () => ({ status: "should_not" }) },
+    {
+      routeToDevice: async () => {
+        secondRoutes += 1;
+        return { status: "should_not" };
+      },
+    },
     { tracker: new OperationTracker() },
   );
-  const body2 = (await res2.json()) as { result: { structuredContent: { summary: string } } };
-  assert.match(body2.result.structuredContent.summary, /not cancellable/i);
+  const body2 = (await res2.json()) as {
+    result: { structuredContent: { status: string; summary: string } };
+  };
+  assert.equal(body2.result.structuredContent.status, "cancel_requested");
+  assert.equal(secondRoutes, 0, "idempotent cancel claim must not re-route");
+  assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
 });

@@ -248,6 +248,7 @@ test("router operation.request stages pending and returns deferred_dispatch with
     session_id: "ags_r1",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   router.registerSession({
     role: "client",
@@ -336,6 +337,7 @@ test("DeviceRoomHarness still dispatches deferred operation.request immediately"
   const agent = room.connect("agent");
   const client = room.connect("client");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
 
   const corr = randomId("op_");
   const result = await room.send(
@@ -377,6 +379,7 @@ test("webSocketMessage: no agent send before persist; send after durable pending
     session_id: "ags_defer_ok",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: agentAuthHash,
     lastSeq: 0,
   };
@@ -466,6 +469,7 @@ test("webSocketMessage: persist failure fail-closed with zero agent frames", asy
     session_id: "ags_defer_fail",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     auth_hash: agentAuthHash,
     lastSeq: 0,
   };

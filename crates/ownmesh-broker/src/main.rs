@@ -1,8 +1,7 @@
 //! `OwnMesh` networkless privileged broker binary.
 //!
-//! Production elevated broker entry points are fixed as **unsupported** until a
-//! secure mint authority is established. CLI never binds a serve endpoint or
-//! executes elevated processes.
+//! Linux uses a root systemd service, macOS a root LaunchDaemon, and Windows a
+//! protected SCM service. All production transports are local and networkless.
 
 #![allow(
     clippy::doc_markdown,
@@ -15,16 +14,26 @@
 )]
 
 use clap::{Parser, Subcommand};
-use ownmesh_broker::{broker_status, production_elevated_broker_unsupported};
+#[cfg(windows)]
+use ownmesh_broker::run_windows_service_dispatcher;
+use ownmesh_broker::{
+    broker_status, install_broker_with_config, uninstall_broker, BrokerInstallConfig,
+    UnixSocketSecurity,
+};
+#[cfg(target_os = "linux")]
+use ownmesh_broker::{load_linux_run_config, run_broker};
+#[cfg(target_os = "macos")]
+use ownmesh_broker::{load_macos_run_config, run_broker};
+use ownmesh_broker_client::BrokerEndpoint;
 use ownmesh_broker_client::DEFAULT_BROKER_ENDPOINT;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI.
 #[derive(Debug, Parser)]
 #[command(
     name = "ownmesh-broker",
     version,
-    about = "OwnMesh privileged broker (networkless; production elevated unsupported)",
+    about = "OwnMesh privileged broker (native networkless service)",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -38,73 +47,50 @@ enum Commands {
     Help,
     /// Show version.
     Version,
-    /// Production serve — always unsupported (no bind / no exec).
+    /// Production serve from the root-owned native service configuration.
     Run {
-        /// Endpoint override (ignored; production serve is unsupported).
+        /// Exact root-owned configuration installed by `install`.
         #[arg(long)]
-        endpoint: Option<String>,
-        /// Legacy bind address (ignored).
-        #[arg(long)]
-        bind: Option<String>,
-        /// Path to request-MAC secret file (ignored).
-        #[arg(long)]
-        secret_file: Option<PathBuf>,
-        /// Path to capability Ed25519 signing key (ignored).
-        #[arg(long)]
-        signing_key_file: Option<PathBuf>,
-        /// Addr file (ignored).
-        #[arg(long)]
-        addr_file: Option<PathBuf>,
-        /// Runtime dir (ignored).
-        #[arg(long)]
-        runtime_dir: Option<PathBuf>,
-        /// Trusted executable (ignored).
-        #[arg(long)]
-        trusted_executable: Option<PathBuf>,
-        /// Socket owner UID (ignored).
-        #[arg(long)]
-        socket_owner_uid: Option<u32>,
-        /// Socket group GID (ignored).
-        #[arg(long)]
-        socket_group_gid: Option<u32>,
-        /// Socket mode (ignored).
-        #[arg(long, value_parser = parse_octal_mode)]
-        socket_mode: Option<u32>,
-        /// Allowed UIDs (ignored).
-        #[arg(long = "allowed-uid")]
-        allowed_uids: Vec<u32>,
+        config: PathBuf,
     },
-    /// Status (always local; always unsupported / installed=false).
+    /// Status of the Linux native service.
     Status {
         /// State base directory (defaults to ./ownmesh-broker-state for bare binary).
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
-    /// Install — always unsupported / installed=false.
+    /// Install the Linux native service (requires root).
     Install {
-        /// Legacy state directory (ignored).
+        /// Legacy state directory (ignored; Linux state is fixed under /var/lib).
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Legacy endpoint (ignored).
+        /// Endpoint must be the fixed Linux UDS if supplied.
         #[arg(long)]
         endpoint: Option<String>,
-        /// Legacy trusted executable (ignored).
+        /// Source ownmeshd image to install beside the broker.
         #[arg(long)]
         trusted_executable: Option<PathBuf>,
-        /// Legacy socket owner UID (ignored).
+        /// Unprivileged ownmeshd UID. Required for direct root invocation;
+        /// defaults only from a validated sudo caller identity.
+        #[arg(long)]
+        daemon_uid: Option<u32>,
+        /// Unprivileged ownmeshd primary GID. Required with --daemon-uid.
+        #[arg(long)]
+        daemon_gid: Option<u32>,
+        /// Must equal --daemon-uid when supplied.
         #[arg(long)]
         socket_owner_uid: Option<u32>,
-        /// Legacy socket group GID (ignored).
+        /// Must equal --daemon-gid when supplied.
         #[arg(long)]
         socket_group_gid: Option<u32>,
-        /// Legacy socket mode (ignored).
+        /// Must be 0600 on the Linux native service.
         #[arg(long, value_parser = parse_octal_mode)]
         socket_mode: Option<u32>,
-        /// Legacy allowed UIDs (ignored).
+        /// Must contain exactly --daemon-uid on the Linux native service.
         #[arg(long = "allowed-uid")]
         allowed_uids: Vec<u32>,
     },
-    /// Uninstall — unsupported and side-effect-free.
+    /// Uninstall the Linux native service (requires root).
     Uninstall {
         /// Legacy state directory (ignored).
         #[arg(long)]
@@ -152,7 +138,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 "ownmesh-broker — networkless privileged broker\n\
                  endpoint basename: {DEFAULT_BROKER_ENDPOINT}\n\
                  commands: help, version, run, status, install, uninstall, exec\n\
-                 PRODUCTION: elevated install/status/serve/exec are unsupported until secure mint authority"
+                 Linux: root systemd service; macOS: root LaunchDaemon; Windows: protected SCM service"
             );
             Ok(())
         }
@@ -164,7 +150,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             let base = state_dir.unwrap_or_else(|| PathBuf::from("."));
             let st = broker_status(&base)?;
             println!(
-                "status=unsupported support={} network={} endpoint={} kind={} secret={} signing={} verify={}",
+                "status={} support={} network={} endpoint={} kind={} secret={} signing={} verify={}",
+                if st.installed { "installed" } else { "absent" },
                 st.support,
                 st.network,
                 st.endpoint.as_deref().unwrap_or("-"),
@@ -176,39 +163,53 @@ async fn run(cli: Cli) -> Result<(), String> {
             for n in &st.notes {
                 println!("note: {n}");
             }
-            Err(format!(
-                "unsupported: privileged broker not available ({})",
-                st.notes
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| st.support.clone())
-            ))
+            if st.installed { Ok(()) } else { Err(st.notes.first().cloned().unwrap_or_else(|| "broker is not installed".into())) }
         }
-        Commands::Install {
-            state_dir: _,
-            endpoint: _,
-            trusted_executable: _,
-            socket_owner_uid: _,
-            socket_group_gid: _,
-            socket_mode: _,
-            allowed_uids: _,
-        } => Err("unsupported: elevated broker production install is disabled until a secure mint authority is established; no native service was activated or verified; no filesystem changes were made (fail-closed)".into()),
-        Commands::Uninstall { state_dir: _ } => Err(
-            "unsupported: elevated broker production uninstall is disabled; native service absence cannot be verified; no filesystem changes were made (fail-closed)".into(),
-        ),
-        Commands::Run {
-            endpoint: _,
-            bind: _,
-            secret_file: _,
-            signing_key_file: _,
-            addr_file: _,
-            runtime_dir: _,
-            trusted_executable: _,
-            socket_owner_uid: _,
-            socket_group_gid: _,
-            socket_mode: _,
-            allowed_uids: _,
-        } => Err(production_elevated_broker_unsupported()),
+        Commands::Install { state_dir, endpoint, trusted_executable, daemon_uid, daemon_gid, socket_owner_uid, socket_group_gid, socket_mode, allowed_uids } => {
+            let endpoint = endpoint.map(|raw| raw.strip_prefix("unix:").map(PathBuf::from).map(BrokerEndpoint::UnixSocket).ok_or_else(|| "install endpoint must use unix:/run/ownmesh/broker.sock".to_string())).transpose()?;
+            #[cfg(windows)]
+            {
+                let _ = (trusted_executable, daemon_uid, daemon_gid, socket_owner_uid, socket_group_gid, socket_mode, allowed_uids);
+                if endpoint.is_some() { return Err("Windows broker endpoint is fixed and may not be overridden".into()); }
+                let rec = install_broker_with_config(state_dir.as_deref().unwrap_or_else(|| Path::new(".")), BrokerInstallConfig {
+                    endpoint: None, trusted_executable: PathBuf::new(), daemon_uid: 0, daemon_gid: 0,
+                    socket_security: UnixSocketSecurity { owner_uid: 0, group_gid: 0, mode: 0 }, allowed_uids: vec![],
+                })?;
+                println!("installed=true support={} endpoint={}", rec.support, rec.endpoint);
+                Ok(())
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+            let broker = std::env::current_exe().map_err(|e| format!("resolve broker executable: {e}"))?;
+            let trusted = trusted_executable.unwrap_or_else(|| broker.with_file_name("ownmeshd"));
+            let (daemon_uid, daemon_group_gid) = resolve_daemon_identity(daemon_uid, daemon_gid)?;
+            let rec = install_broker_with_config(state_dir.as_deref().unwrap_or_else(|| Path::new(".")), BrokerInstallConfig {
+                endpoint, trusted_executable: trusted, daemon_uid, daemon_gid: daemon_group_gid,
+                socket_security: UnixSocketSecurity { owner_uid: socket_owner_uid.unwrap_or(daemon_uid), group_gid: socket_group_gid.unwrap_or(daemon_group_gid), mode: socket_mode.unwrap_or(0o600) },
+                allowed_uids: if allowed_uids.is_empty() { vec![daemon_uid] } else { allowed_uids },
+            })?;
+            println!("installed=true support={} endpoint={}", rec.support, rec.endpoint); Ok(())
+            }
+        }
+        Commands::Uninstall { state_dir } => { uninstall_broker(state_dir.as_deref().unwrap_or_else(|| Path::new(".")))?; println!("installed=false"); Ok(()) }
+        Commands::Run { config } => {
+            #[cfg(windows)]
+            {
+                // SCM owns the fixed configuration path.  Retain the required
+                // argument to avoid silently accepting a legacy interactive
+                // invocation, then reject any mutable path before dispatch.
+                let _ = config;
+                run_windows_service_dispatcher()
+            }
+            #[cfg(target_os = "linux")]
+            {
+                run_broker(load_linux_run_config(&config)?).await
+            }
+            #[cfg(target_os = "macos")]
+            {
+                run_broker(load_macos_run_config(&config)?).await
+            }
+        }
         Commands::Exec {
             secret_file: _,
             signing_key_file: _,
@@ -224,18 +225,36 @@ async fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_daemon_identity(uid: Option<u32>, gid: Option<u32>) -> Result<(u32, u32), String> {
+    let (uid, gid) = match (uid, gid) {
+        (Some(uid), Some(gid)) => (uid, gid),
+        (None, None) => {
+            let uid = std::env::var("SUDO_UID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            let gid = std::env::var("SUDO_GID")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            match (uid, gid) {
+                (Some(uid), Some(gid)) => (uid, gid),
+                _ => return Err("direct root install requires --daemon-uid <nonzero> --daemon-gid <nonzero>; sudo defaults require both SUDO_UID and SUDO_GID".into()),
+            }
+        }
+        _ => return Err("--daemon-uid and --daemon-gid must be supplied together".into()),
+    };
+    if uid == 0 || gid == 0 {
+        return Err("native Unix broker refuses root ownmeshd identity; choose an explicit non-root daemon UID/GID".into());
+    }
+    Ok((uid, gid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn unsupported_commands_accept_no_legacy_arguments() {
-        for command in ["run", "install", "exec", "uninstall"] {
-            let cli = Cli::try_parse_from(["ownmesh-broker", command]).unwrap();
-            let err = run(cli)
-                .await
-                .expect_err("production path must be unsupported");
-            assert!(err.contains("unsupported"), "{command}: {err}");
-        }
+    async fn run_requires_strict_config_argument() {
+        assert!(Cli::try_parse_from(["ownmesh-broker", "run"]).is_err());
     }
 }

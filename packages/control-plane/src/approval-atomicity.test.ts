@@ -347,7 +347,7 @@ test("pending→delivering claim: only one concurrent route; loser gets authorit
       winner.claim_version!,
     );
     assert.ok(updated);
-    assert.equal(updated!.status, "pending");
+    assert.equal(updated!.status, "approval_required");
     const box = await store.getMcpApprovalOutbox(txId);
     assert.equal(box!.delivery_status, "delivered");
   }
@@ -366,11 +366,17 @@ test("concurrent /approve: exactly one delivery; duplicate returns authoritative
     let routes = 0;
     const routeToDevice = async (
       _d: string,
-      op: { correlation_id: string },
+      op: { type: string; correlation_id: string; payload: Record<string, unknown> },
     ) => {
       routes += 1;
-      // Stable correlation from outbox id.
-      assert.equal(op.correlation_id, `cor_${txId}`);
+      // Decision notification uses a fresh op_* identity; target binds the original op.
+      assert.equal(op.type, "approval.decision");
+      assert.match(op.correlation_id, /^op_/);
+      assert.equal(
+        op.payload.target_operation_id ||
+          (op.payload.arguments as { target_operation_id?: string } | undefined)?.target_operation_id,
+        opId,
+      );
       return { status: "routed_to_device" as const, detail: { recipients: 1 } };
     };
 
@@ -410,8 +416,8 @@ test("concurrent /approve: exactly one delivery; duplicate returns authoritative
     assert.equal(routes, 1, "exactly one device delivery");
 
     const op = await store.getMcpOperation(opId);
-    assert.equal(op?.status, "pending");
-    assert.equal(op?.approval_required, false);
+    assert.equal(op?.status, "approval_required");
+    assert.equal(op?.approval_required, true);
     const box = await store.getMcpApprovalOutbox(txId);
     assert.equal(box?.delivery_status, "delivered");
 
@@ -483,7 +489,7 @@ test("delivery failure releases claim to pending; retry delivers once", async ()
   assert.equal(ok.status, 200);
   assert.equal(routes, 1);
   assert.equal((await store.getMcpApprovalOutbox(txId))?.delivery_status, "delivered");
-  assert.equal((await store.getMcpOperation(opId))?.status, "pending");
+  assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
 });
 
 test("finalize does not overwrite fast terminal op result", async () => {
@@ -583,6 +589,7 @@ test("/approve rejects creator bearer; independent human browser session may dec
         principal_id: "prin_dev",
         tenant_id: "ten_default",
         display_name: "Dev",
+        fresh: true,
       }),
   } as unknown as Fetcher;
 
@@ -662,7 +669,7 @@ test("/approve rejects creator bearer; independent human browser session may dec
       },
     );
     assert.equal(humanOk.status, 200, await humanOk.clone().text());
-    assert.equal((await store.getMcpOperation(opId))?.status, "denied");
+    assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
 
     // Worker browser path (AUTH_PROVIDER) is live; may 503 without DEVICE_ROOM on approve.
     const opId3 = randomId("op_");

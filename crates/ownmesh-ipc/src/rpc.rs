@@ -32,6 +32,22 @@ pub mod methods {
     /// Log query.
     pub const OPS_LOGS_QUERY: &str = "ops.logs.query";
 
+    /// Authenticated bounded transfer state-machine operations.
+    pub const TRANSFER_PLAN: &str = "transfer.plan";
+    /// Internal Agent-only source custody/hash preflight. Never an IPC client surface.
+    pub const TRANSFER_PREFLIGHT_SOURCE: &str = "transfer.preflight_source";
+    /// Internal Agent-only destination no-replace/custody preflight.
+    pub const TRANSFER_PREFLIGHT_DESTINATION: &str = "transfer.preflight_destination";
+    pub const TRANSFER_SOURCE_OPEN: &str = "transfer.source_open";
+    pub const TRANSFER_SOURCE_CHUNK: &str = "transfer.source_chunk";
+    pub const TRANSFER_DESTINATION_PREPARE: &str = "transfer.destination_prepare";
+    pub const TRANSFER_DESTINATION_CHUNK: &str = "transfer.destination_chunk";
+    pub const TRANSFER_FINALIZE: &str = "transfer.finalize";
+    pub const TRANSFER_STATUS: &str = "transfer.status";
+    pub const TRANSFER_LIST: &str = "transfer.list";
+    pub const TRANSFER_CANCEL: &str = "transfer.cancel";
+    pub const TRANSFER_ARTIFACT_GET: &str = "transfer.artifact_get";
+
     /// List pending / recent approvals.
     pub const APPROVAL_LIST: &str = "approval.list";
     /// Show one approval.
@@ -57,12 +73,29 @@ pub mod methods {
     /// Revoke a principal / client credential mapping.
     pub const TOKEN_REVOKE: &str = "token.revoke";
 
+    // Agent-only, exact-bound admin request admission. These methods enqueue a
+    // durable approval; they never perform the mutation directly. Ordinary IPC
+    // clients are denied by `human_operator_method`, including same-UID peers.
+    pub const ADMIN_POLICY_PRESET_REQUEST: &str = "admin.policy_preset.request";
+    pub const ADMIN_POLICY_RULE_ADD_REQUEST: &str = "admin.policy_rule_add.request";
+    pub const ADMIN_POLICY_RULE_REMOVE_REQUEST: &str = "admin.policy_rule_remove.request";
+    pub const ADMIN_DAEMON_UNLOCK_REQUEST: &str = "admin.daemon_unlock.request";
+    pub const ADMIN_TOKEN_REVOKE_REQUEST: &str = "admin.token_revoke.request";
+    pub const ADMIN_APPROVAL_BRIDGE_REQUEST: &str = "admin.approval_bridge.request";
+
     /// Daemon-managed credential lifecycle (fixed management client only).
     pub const CREDENTIAL_PROVISION: &str = "credential.provision";
     /// Rotate a per-client credential secret (denied for uncredentialed IPC).
     pub const CREDENTIAL_ROTATE: &str = "credential.rotate";
     /// Revoke a per-client credential (denied for uncredentialed IPC).
     pub const CREDENTIAL_REVOKE: &str = "credential.revoke";
+
+    /// List official + custom CLI profiles with local detection status.
+    pub const PROFILE_LIST: &str = "profile.list";
+    /// Show one profile definition + detection status.
+    pub const PROFILE_SHOW: &str = "profile.show";
+    /// Rescan PATH for official profile binaries (same as list; explicit intent).
+    pub const PROFILE_SCAN: &str = "profile.scan";
 }
 
 /// Correlation identifier for a single request/response pair.
@@ -371,4 +404,7 @@ pub mod app_error {
     pub const TOKEN_REVOKED: i64 = -32_012;
     /// Conflict (e.g. approval already decided).
     pub const CONFLICT: i64 = -32_013;
+    /// A requested operation is intentionally unavailable on this OS because
+    /// its required custody primitive is not implemented there.
+    pub const PLATFORM_UNSUPPORTED: i64 = -32_014;
 }

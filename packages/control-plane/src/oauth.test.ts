@@ -162,6 +162,55 @@ test("authorization_code + PKCE S256 exchange", async () => {
   assert.ok(tok.refresh_token.startsWith("rtk_"));
 });
 
+test("ChatGPT authorization receives a rotating refresh token without offline_access", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const verifier = "chatgpt-pkce-verifier-012345678901234567890123456789";
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
+  const challenge = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const clientId = "client_chatgpt_b6nceskp3dnc";
+  const redirectUri = "https://chatgpt.com/connector/oauth/b6NcEskp3DnC";
+  await store.putClient({
+    client_id: clientId,
+    tenant_id: "ten_default",
+    client_name: "ChatGPT",
+    redirect_uris: [redirectUri],
+    created_at: new Date().toISOString(),
+  });
+  await store.putAuthCode({
+    code: "code_chatgpt_refresh",
+    client_id: clientId,
+    principal_id: "prin_dev",
+    redirect_uri: redirectUri,
+    scope: "ownmesh.read",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    expires_at: Date.now() + 60_000,
+    used: false,
+  });
+
+  const response = await handleToken(
+    new Request("https://cp.test/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: "code_chatgpt_refresh",
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        code_verifier: verifier,
+      }),
+    }),
+    store,
+  );
+  assert.equal(response.status, 200);
+  const token = (await response.json()) as { access_token: string; refresh_token?: string };
+  assert.ok(token.access_token.startsWith("atk_"));
+  assert.ok(token.refresh_token?.startsWith("rtk_"));
+});
+
 test("device authorization grant end-to-end", async () => {
   const store = new MemoryStore();
   await store.ensureBootstrap();
@@ -237,8 +286,8 @@ test("dynamic client registration returns policy", async () => {
         authorization: `Bearer ${tok.access_token}`,
       },
       body: JSON.stringify({
-        client_name: "ChatGPT",
-        redirect_uris: ["https://chatgpt.com/connector/oauth/callback"],
+        client_name: "Tenant App",
+        redirect_uris: ["https://client.example/callback"],
       }),
     }),
     store,
@@ -253,24 +302,40 @@ test("dynamic client registration returns policy", async () => {
     policy: { redirect_uri_match: string; dynamic_client_registration: string };
   };
   assert.ok(body.client_id);
-  assert.equal(body.client_name, "ChatGPT");
-  assert.deepEqual(body.redirect_uris, ["https://chatgpt.com/connector/oauth/callback"]);
+  assert.equal(body.client_name, "Tenant App");
+  assert.deepEqual(body.redirect_uris, ["https://client.example/callback"]);
   assert.equal(body.token_endpoint_auth_method, "none");
   assert.equal(body.policy.redirect_uri_match, "exact");
   assert.equal(body.policy.dynamic_client_registration, "supported");
   const stored = await store.getClient(body.client_id);
   assert.ok(stored);
   assert.equal(stored!.tenant_id, "ten_default");
-  assert.equal(stored!.client_name, "ChatGPT");
+  assert.equal(stored!.client_name, "Tenant App");
 });
 
 test("AS metadata does not advertise client_secret_post", () => {
-  const meta = oauthMetadata("https://cp.test");
+  const meta = oauthMetadata("https://cp.test") as {
+    token_endpoint_auth_methods_supported: string[];
+    registration_endpoint?: string;
+  };
   assert.deepEqual(meta.token_endpoint_auth_methods_supported, ["none"]);
   assert.equal(
     meta.token_endpoint_auth_methods_supported.includes("client_secret_post"),
     false,
   );
+  // Production default: DCR disabled → endpoint omitted from metadata.
+  assert.equal(meta.registration_endpoint, undefined);
+});
+
+test("AS metadata advertises registration_endpoint only when DCR enabled", () => {
+  const off = oauthMetadata("https://cp.test", { allowDynamicRegistration: false }) as {
+    registration_endpoint?: string;
+  };
+  const on = oauthMetadata("https://cp.test", { allowDynamicRegistration: true }) as {
+    registration_endpoint?: string;
+  };
+  assert.equal(off.registration_endpoint, undefined);
+  assert.equal(on.registration_endpoint, "https://cp.test/oauth/register");
 });
 
 test("register rejects token_endpoint_auth_method=client_secret_post", async () => {
@@ -425,7 +490,9 @@ test("token endpoint rejects token_endpoint_auth_method=client_secret_post", asy
 });
 
 test("AS metadata advertises only token_endpoint_auth_method none", () => {
-  const meta = oauthMetadata("https://cp.test");
+  const meta = oauthMetadata("https://cp.test") as {
+    token_endpoint_auth_methods_supported: string[];
+  };
   assert.deepEqual(meta.token_endpoint_auth_methods_supported, ["none"]);
   assert.equal(meta.token_endpoint_auth_methods_supported.length, 1);
   for (const method of [

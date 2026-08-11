@@ -215,6 +215,51 @@ async fn enroll_challenge_proof_revoke_and_key_rotation() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, enrolled.device_id);
 
+    let renamed = update_device_metadata(
+        &http,
+        &issuer,
+        &tokens.access_token,
+        &enrolled.device_id,
+        Some("  test workstation  "),
+        None,
+    )
+    .await
+    .expect("rename device");
+    assert_eq!(renamed.name.as_deref(), Some("test workstation"));
+
+    let labels = vec![" dev ".to_owned(), "dev".to_owned(), "gpu".to_owned()];
+    let relabeled = update_device_metadata(
+        &http,
+        &issuer,
+        &tokens.access_token,
+        &enrolled.device_id,
+        None,
+        Some(&labels),
+    )
+    .await
+    .expect("label device");
+    assert_eq!(relabeled.labels, ["dev", "gpu"]);
+    let listed = list_devices(&http, &issuer, &tokens.access_token)
+        .await
+        .unwrap();
+    assert_eq!(listed[0].name.as_deref(), Some("test workstation"));
+    assert_eq!(listed[0].labels, ["dev", "gpu"]);
+
+    let invalid = vec!["bad\0label".to_owned()];
+    let error = update_device_metadata(
+        &http,
+        &issuer,
+        &tokens.access_token,
+        &enrolled.device_id,
+        None,
+        Some(&invalid),
+    )
+    .await
+    .expect_err("control label must be rejected")
+    .to_string();
+    assert!(error.contains("labels"));
+    assert!(!error.contains(&tokens.access_token));
+
     // Key rotation changes the local key material.
     let (new_pub, old_pub) = rotate_local_device_key(&store).unwrap();
     assert_eq!(old_pub.unwrap().fingerprint, fp_before);

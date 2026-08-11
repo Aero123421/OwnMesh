@@ -1,0 +1,359 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/operation-envelope.schema.json",
+  "title": "OwnMesh versioned operation envelope",
+  "description": "Typed operation.request/progress/event/result payloads carried by ownmesh.device/1.0. correlation_id and payload.operation_id are additionally required to match by the Rust and TypeScript parsers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol",
+    "message_id",
+    "type",
+    "device_id",
+    "correlation_id",
+    "seq",
+    "sent_at",
+    "payload"
+  ],
+  "properties": {
+    "protocol": {
+      "const": "ownmesh.device/1.0"
+    },
+    "message_id": {
+      "type": "string",
+      "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "minLength": 5,
+      "maxLength": 128
+    },
+    "type": {
+      "enum": [
+        "operation.request",
+        "operation.progress",
+        "operation.event",
+        "operation.result"
+      ]
+    },
+    "device_id": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "maxLength": 128
+    },
+    "correlation_id": {
+      "$ref": "#/$defs/operationId"
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "operation.request"
+          }
+        },
+        "required": ["type"]
+      },
+      "then": {
+        "required": ["expires_at"],
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/requestPayload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "operation.progress"
+          }
+        },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/progressPayload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "operation.event"
+          }
+        },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/eventPayload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "operation.result"
+          }
+        },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/resultPayload"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "operationContract": {
+      "const": "ownmesh.operation/1.0"
+    },
+    "operationId": {
+      "type": "string",
+      "pattern": "^op_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "minLength": 4,
+      "maxLength": 128
+    },
+    "workspaceId": {
+      "type": "string",
+      "pattern": "^ws_[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "minLength": 4,
+      "maxLength": 128
+    },
+    "requestPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_contract",
+        "operation_id",
+        "capability",
+        "idempotency_key",
+        "arguments"
+      ],
+      "properties": {
+        "operation_contract": {
+          "$ref": "#/$defs/operationContract"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/operationId"
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/workspaceId"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "payload_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "description": "Server-computed SHA-256 hex of the canonical authorized action"
+        },
+        "authorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bound_action"],
+          "description": "Server-issued exact-action binding verified by the Agent before side effects",
+          "properties": {
+            "bound_action": {
+              "type": "object",
+              "description": "Full bound canonical action object hashed into payload_hash"
+            }
+          }
+        },
+        "arguments": {
+          "type": "object"
+        }
+      }
+    },
+    "progressPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_contract",
+        "operation_id",
+        "status",
+        "progress_seq"
+      ],
+      "properties": {
+        "operation_contract": {
+          "$ref": "#/$defs/operationContract"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/operationId"
+        },
+        "status": {
+          "enum": ["queued", "pending_approval", "running"]
+        },
+        "progress_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "details": {
+          "type": "object"
+        }
+      }
+    },
+    "eventPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_contract",
+        "operation_id",
+        "event_seq",
+        "event_type",
+        "data"
+      ],
+      "properties": {
+        "operation_contract": {
+          "$ref": "#/$defs/operationContract"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/operationId"
+        },
+        "event_seq": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "event_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "data": {
+          "type": "object"
+        }
+      }
+    },
+    "operationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "details": {}
+      }
+    },
+    "resultPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation_contract", "operation_id", "status"],
+      "properties": {
+        "operation_contract": {
+          "$ref": "#/$defs/operationContract"
+        },
+        "operation_id": {
+          "$ref": "#/$defs/operationId"
+        },
+        "status": {
+          "enum": ["completed", "failed", "cancelled", "timed_out", "device_offline"]
+        },
+        "result": {
+          "type": "object"
+        },
+        "error": {
+          "$ref": "#/$defs/operationError"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "completed"
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "required": ["result"],
+            "not": {
+              "required": ["error"]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": ["failed", "timed_out", "device_offline"]
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "required": ["error"],
+            "not": {
+              "required": ["result"]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "cancelled"
+              }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "not": {
+              "required": ["result"]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

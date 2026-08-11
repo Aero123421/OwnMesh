@@ -21,6 +21,7 @@ function makeAtt(sessionId: string, lastSeq = 0): SessionAttachment {
     session_id: sessionId,
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
     lastSeq,
   };
 }

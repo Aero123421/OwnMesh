@@ -30,7 +30,7 @@ mod ui;
 mod width;
 mod wizard;
 
-use app::{App, Overlay, Screen};
+use app::{App, ApprovalDecision, Overlay, PendingApproval, Screen};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use i18n::Lang;
@@ -38,9 +38,10 @@ use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::{methods, ClientIdentity, ClientOptions, DaemonStatus, Endpoint, IpcClient};
 use palette::filter_commands;
-use serde_json::json;
-use std::process::ExitCode as StdExitCode;
-use std::time::Duration;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode as StdExitCode, Stdio};
+use std::time::{Duration, Instant};
 use terminal::{create_ratatui, TerminalGuard};
 use wizard::WizardStep;
 
@@ -71,6 +72,16 @@ struct Cli {
     /// Run translation completeness check and exit (CI helper).
     #[arg(long)]
     pub check_i18n: bool,
+}
+
+const APPROVAL_CLI_TIMEOUT: Duration = Duration::from_secs(6 * 60 + 30);
+const APPROVAL_CHILD_POLL: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalCliOutcome {
+    Applied,
+    Failed,
+    TimedOut,
 }
 
 fn main() -> StdExitCode {
@@ -253,6 +264,43 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                 Event::Resize(_, _) => {}
                 _ => {}
             }
+
+            let Some(pending) = app.take_pending_approval() else {
+                continue;
+            };
+
+            // The sibling CLI owns the browser/passkey wait. Leave raw mode and
+            // the alternate screen first so its bounded, human-facing output is
+            // readable (including the URL fallback on headless systems).
+            terminal
+                .draw(|frame| ui::draw(frame, &app))
+                .map_err(|_| ExitCode::Internal)?;
+            drop(terminal);
+            guard.restore().map_err(|_| ExitCode::Internal)?;
+            let outcome = run_approval_cli(&pending, APPROVAL_CLI_TIMEOUT);
+
+            guard = TerminalGuard::enter().map_err(|err| {
+                eprintln!("failed to restore raw terminal mode: {err}");
+                ExitCode::Internal
+            })?;
+            terminal = create_ratatui().map_err(|_| ExitCode::Internal)?;
+            terminal.clear().map_err(|_| ExitCode::Internal)?;
+            drain_pending_events();
+
+            let refreshed = refresh_approvals(&mut app, rt);
+            if refreshed {
+                app.status_line = match outcome {
+                    ApprovalCliOutcome::Applied => {
+                        i18n::t(app.lang, i18n::Msg::ApprovalsApplied).to_owned()
+                    }
+                    ApprovalCliOutcome::Failed => {
+                        i18n::t(app.lang, i18n::Msg::ApprovalsFailed).to_owned()
+                    }
+                    ApprovalCliOutcome::TimedOut => {
+                        i18n::t(app.lang, i18n::Msg::ApprovalsTimedOut).to_owned()
+                    }
+                };
+            }
         }
         Ok(())
     })();
@@ -291,6 +339,12 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
     match key.code {
         KeyCode::Char('q' | 'Q') => app.should_quit = true,
         KeyCode::F(1) | KeyCode::Char('?') => app.overlay = Overlay::Help,
+        KeyCode::Char('/' | ':') => app.open_palette(),
+        KeyCode::Esc if app.screen != Screen::Dashboard => {
+            app.screen = Screen::Dashboard;
+            app.list_cursor = 0;
+        }
+        KeyCode::Tab if app.screen == Screen::Dashboard => app.move_overview_action(1),
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l')
             if !key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -319,6 +373,8 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         KeyCode::Up | KeyCode::Char('k') => {
             if app.screen == Screen::Approvals {
                 app.approval_cursor = app.approval_cursor.saturating_sub(1);
+            } else if app.screen == Screen::Dashboard {
+                app.move_overview_action(-1);
             } else {
                 app.list_cursor = app.list_cursor.saturating_sub(1);
             }
@@ -328,15 +384,18 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
                 if !app.approvals.is_empty() {
                     app.approval_cursor = (app.approval_cursor + 1).min(app.approvals.len() - 1);
                 }
+            } else if app.screen == Screen::Dashboard {
+                app.move_overview_action(1);
             } else {
                 app.list_cursor = app.list_cursor.saturating_add(1);
             }
         }
+        KeyCode::Enter if app.screen == Screen::Dashboard => app.run_overview_action(),
         KeyCode::Char('a') if app.screen == Screen::Approvals => {
-            approve_selected(app, rt, true);
+            app.queue_selected_approval(ApprovalDecision::Approve);
         }
         KeyCode::Char('d') if app.screen == Screen::Approvals => {
-            approve_selected(app, rt, false);
+            app.queue_selected_approval(ApprovalDecision::Deny);
         }
         KeyCode::Char('r') if app.screen == Screen::Approvals => {
             refresh_approvals(app, rt);
@@ -424,43 +483,87 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) {
+fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
     match rt.block_on(ipc_call(methods::APPROVAL_LIST, None)) {
         Ok(v) => {
             app.set_approvals_from_json(&v);
             app.status_line = format!("approvals: {}", app.approvals.len());
+            true
         }
         Err(e) => {
             app.status_line = actionable_ipc_error(&e);
+            false
         }
     }
 }
 
-fn approve_selected(app: &mut App, rt: &tokio::runtime::Runtime, approve: bool) {
-    let Some(item) = app.approvals.get(app.approval_cursor) else {
-        app.status_line = i18n::t(app.lang, i18n::Msg::ApprovalsEmpty).to_owned();
-        return;
+fn run_approval_cli(pending: &PendingApproval, timeout: Duration) -> ApprovalCliOutcome {
+    let Ok(current) = std::env::current_exe() else {
+        return ApprovalCliOutcome::Failed;
     };
-    if item.state != "pending" {
-        app.status_line = format!("already {}", item.state);
-        return;
+    let ownmesh = sibling_ownmesh_path(&current);
+    if !ownmesh.is_file() {
+        return ApprovalCliOutcome::Failed;
     }
-    let method = if approve {
-        methods::APPROVAL_APPROVE
-    } else {
-        methods::APPROVAL_DENY
+
+    let Ok(mut child) = Command::new(ownmesh)
+        .args(approval_cli_args(pending))
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    else {
+        return ApprovalCliOutcome::Failed;
     };
-    let id = item.id.clone();
-    match rt.block_on(ipc_call(method, Some(json!({ "id": id })))) {
-        Ok(_) => {
-            refresh_approvals(app, rt);
-            app.status_line = if approve {
-                i18n::t(app.lang, i18n::Msg::ApprovalsApprove).to_owned()
-            } else {
-                i18n::t(app.lang, i18n::Msg::ApprovalsDeny).to_owned()
-            };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    ApprovalCliOutcome::Applied
+                } else {
+                    ApprovalCliOutcome::Failed
+                };
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(APPROVAL_CHILD_POLL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ApprovalCliOutcome::TimedOut;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ApprovalCliOutcome::Failed;
+            }
         }
-        Err(e) => app.status_line = actionable_ipc_error(&e),
+    }
+}
+
+fn sibling_ownmesh_path(current_exe: &Path) -> PathBuf {
+    current_exe.with_file_name(format!("ownmesh{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn approval_cli_args(pending: &PendingApproval) -> Vec<OsString> {
+    vec![
+        OsString::from("approval"),
+        OsString::from(pending.decision.cli_verb()),
+        // Prevent an untrusted approval id beginning with '-' from becoming a
+        // CLI option. Idempotency is generated by the sibling CLI when omitted.
+        OsString::from("--"),
+        OsString::from(&pending.id),
+    ]
+}
+
+fn drain_pending_events() {
+    for _ in 0..64 {
+        if !event::poll(Duration::ZERO).unwrap_or(false) {
+            break;
+        }
+        let _ = event::read();
     }
 }
 
@@ -580,5 +683,65 @@ mod tests {
     #[test]
     fn i18n_cli_completeness_clean() {
         assert!(i18n::completeness_report().is_empty());
+    }
+
+    #[test]
+    fn approval_cli_delegation_uses_exact_positional_id_and_auto_idempotency() {
+        let pending = PendingApproval {
+            id: "--idempotency-key=attacker-value".into(),
+            decision: ApprovalDecision::Approve,
+        };
+        assert_eq!(
+            approval_cli_args(&pending),
+            vec![
+                OsString::from("approval"),
+                OsString::from("approve"),
+                OsString::from("--"),
+                OsString::from("--idempotency-key=attacker-value"),
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_palette_queues_the_selected_pending_request() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(OwnMeshPaths::for_base(dir.path()), None);
+        app.set_approvals_from_json(&serde_json::json!({
+            "approvals": [
+                { "id": "approval-1", "state": "pending", "capability": "fs.read" },
+                { "id": "approval-2", "state": "pending", "capability": "fs.write" }
+            ]
+        }));
+        app.approval_cursor = 1;
+
+        app.dispatch_palette(palette::PaletteAction::DenySelected);
+
+        assert_eq!(
+            app.take_pending_approval(),
+            Some(PendingApproval {
+                id: "approval-2".into(),
+                decision: ApprovalDecision::Deny,
+            })
+        );
+        assert_eq!(app.screen, Screen::Approvals);
+    }
+
+    #[test]
+    fn decided_approval_is_never_queued_for_delegation() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(OwnMeshPaths::for_base(dir.path()), None);
+        app.set_approvals_from_json(&serde_json::json!({
+            "approvals": [
+                { "id": "approval-1", "state": "approved", "capability": "fs.read" }
+            ]
+        }));
+
+        app.queue_selected_approval(ApprovalDecision::Approve);
+
+        assert_eq!(app.take_pending_approval(), None);
+        assert_eq!(
+            app.status_line,
+            i18n::t(app.lang, i18n::Msg::ApprovalsAlreadyDecided)
+        );
     }
 }

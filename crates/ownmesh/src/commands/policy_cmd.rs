@@ -1,8 +1,9 @@
 //! `ownmesh policy` — inspect and select local policy via ownmeshd / files.
 
-use crate::cli::{Cli, PolicyCmd};
+use crate::cli::{Cli, PolicyCmd, PolicyRuleCmd};
+use crate::commands::admin_flow::run_admin_operation;
 use crate::commands::ipc_util::{call_daemon, print_value};
-use ownmesh_config::{load_policy, OwnMeshPaths};
+use ownmesh_config::{load_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::methods;
 use ownmesh_policy::{
@@ -35,44 +36,26 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
             Err(ExitCode::DeviceOffline) => show_offline(cli),
             Err(e) => Err(e),
         },
-        PolicyCmd::Preset { name } => {
-            let _ = name;
-            // Policy preset mutation is a human-operator method. Ordinary IPC has no
-            // distinct OS/UI presence proof; fail closed (use setup --force offline).
-            let message = ownmesh_ipc::human_operator_disabled_message();
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({
-                        "schema_version": 1,
-                        "ok": false,
-                        "command": "policy preset",
-                        "error": "human_presence_unavailable",
-                        "message": message,
-                    })
-                );
-            } else {
-                eprintln!("policy preset: {message}");
-                eprintln!("hint: re-run `ownmesh setup --force --policy-preset …` to rewrite local policy offline");
-            }
-            Err(ExitCode::UsageConfig)
+        PolicyCmd::Preset {
+            name,
+            delegate_remote_mcp,
+            idempotency_key,
+        } => {
+            let mut payload = json!({
+                "name": name,
+                "delegate_remote_mcp": delegate_remote_mcp,
+                "idempotency_key": idempotency_key,
+            });
+            remove_null_fields(&mut payload);
+            run_admin_operation(
+                cli,
+                "ownmesh_policy_preset",
+                payload,
+                "policy preset changed",
+                false,
+            )
         }
-        PolicyCmd::Rule { spec } => {
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({
-                        "schema_version": 1,
-                        "status": "not_implemented",
-                        "command": "policy rule mutation",
-                        "message": "policy rule mutation via DSL is unsupported",
-                    })
-                );
-            } else {
-                eprintln!("policy rule mutation via DSL is not implemented yet ({spec})");
-            }
-            Err(super::unsupported_exit("policy rule mutation"))
-        }
+        PolicyCmd::Rule(command) => dispatch_policy_rule(cli, command),
         PolicyCmd::Validate => match call_daemon(methods::POLICY_VALIDATE, None) {
             Ok(value) => {
                 print_value(cli.json, &value, |v| {
@@ -121,7 +104,7 @@ fn show_offline(cli: &Cli) -> Result<(), ExitCode> {
         ExitCode::UsageConfig
     })?;
     let preset = file.preset.as_deref().unwrap_or("recommended");
-    let doc = preset_document(parse_preset_name(preset));
+    let doc = document_from_file(&file);
     if cli.json {
         println!(
             "{}",
@@ -152,7 +135,7 @@ fn validate_offline(cli: &Cli) -> Result<(), ExitCode> {
         ExitCode::UsageConfig
     })?;
     let preset = file.preset.as_deref().unwrap_or("recommended");
-    let doc = preset_document(parse_preset_name(preset));
+    let doc = document_from_file(&file);
     let ok = if doc.preset == AccessPreset::FullAccess {
         full_access_has_no_hidden_restrictive_rules(&doc)
     } else {
@@ -175,9 +158,7 @@ fn validate_offline(cli: &Cli) -> Result<(), ExitCode> {
 fn explain_offline(cli: &Cli, query: &str) -> Result<(), ExitCode> {
     let paths = OwnMeshPaths::discover().map_err(|_| ExitCode::UsageConfig)?;
     let file = load_policy(&paths).unwrap_or_default();
-    let doc = preset_document(parse_preset_name(
-        file.preset.as_deref().unwrap_or("recommended"),
-    ));
+    let doc = document_from_file(&file);
     let ql = query.to_ascii_lowercase();
     let facts = if ql.contains("write") {
         OperationFacts {
@@ -207,6 +188,68 @@ fn explain_offline(cli: &Cli, query: &str) -> Result<(), ExitCode> {
         println!("decision={:?} reason={}", v.decision, v.reason);
     }
     Ok(())
+}
+
+fn dispatch_policy_rule(cli: &Cli, command: &PolicyRuleCmd) -> Result<(), ExitCode> {
+    match command {
+        PolicyRuleCmd::Add {
+            id,
+            decision,
+            capability,
+            priority,
+            when_elevated,
+            when_kind,
+            path_prefix,
+            program_equals,
+            description,
+            idempotency_key,
+        } => {
+            let mut payload = json!({
+                "id": id,
+                "rule_decision": decision,
+                "capability": capability,
+                "priority": priority,
+                "when_elevated": when_elevated,
+                "when_kind": when_kind,
+                "path_prefix": path_prefix,
+                "program_equals": program_equals,
+                "description": description,
+                "idempotency_key": idempotency_key,
+            });
+            remove_null_fields(&mut payload);
+            run_admin_operation(
+                cli,
+                "ownmesh_policy_rule_add",
+                payload,
+                "policy rule added",
+                false,
+            )
+        }
+        PolicyRuleCmd::Remove {
+            id,
+            idempotency_key,
+        } => run_admin_operation(
+            cli,
+            "ownmesh_policy_rule_remove",
+            json!({ "id": id, "idempotency_key": idempotency_key }),
+            "policy rule removed",
+            false,
+        ),
+    }
+}
+
+fn remove_null_fields(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+}
+
+fn document_from_file(file: &PolicyFile) -> ownmesh_policy::PolicyDocument {
+    let mut document = preset_document(parse_preset_name(
+        file.preset.as_deref().unwrap_or("recommended"),
+    ));
+    document.rules.extend(file.rules.iter().cloned());
+    document
 }
 
 fn parse_preset_name(name: &str) -> AccessPreset {

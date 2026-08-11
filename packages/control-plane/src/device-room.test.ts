@@ -93,7 +93,13 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
     "accepted",
   );
 
-  await room.send(agent, envFor(agent, "ready", deviceId, { capabilities: ["fs", "exec"] }));
+  await room.send(
+    agent,
+    envFor(agent, "ready", deviceId, {
+      capabilities: ["filesystem.read", "filesystem.write", "command.run"],
+      remote_routing_enabled: true,
+    }),
+  );
   assert.equal((JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope).type, "ready.ack");
 
   // client operation -> agent
@@ -112,7 +118,14 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
   assert.equal(agentInbox.length, 1);
   assert.equal(agentInbox[0]!.type, "operation.request");
   assert.equal(agentInbox[0]!.correlation_id, corr);
-  assert.equal(agentInbox[0]!.payload.op, "ownmesh_fs_list");
+  assert.equal(agentInbox[0]!.payload.operation_contract, "ownmesh.operation/1.0");
+  assert.equal(agentInbox[0]!.payload.operation_id, corr);
+  assert.equal(agentInbox[0]!.payload.capability, "filesystem.read");
+  assert.equal(
+    (agentInbox[0]!.payload.arguments as { action?: string } | undefined)?.action,
+    "fs.list",
+  );
+  assert.ok(agentInbox[0]!.expires_at, "operation.request requires expires_at");
 
   // agent result -> client
   await room.send(
@@ -143,6 +156,7 @@ test("DeviceRoom fails closed on unknown types and unmatched agent results", asy
   const room = new DeviceRoomHarness("dev_fail_closed", () => true);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const unknown = await room.send(agent, envFor(agent, "accepted", "dev_fail_closed", {}));
   assert.equal(unknown.error, "unsupported_message_type");
   const unmatched = await room.send(
@@ -178,6 +192,7 @@ test("injectOperation routes to connected agent", () => {
   const room = new DeviceRoomHarness(deviceId);
   const agent = room.connect("agent");
   room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
   const corr = randomId("op_");
   const r = room.router.injectOperation({
     type: "ownmesh_fs_list",
@@ -334,4 +349,70 @@ test("injectOperation clears pending when no ready agent", () => {
   assert.equal(r.status, "device_offline");
   assert.equal(room.router.pending.has(corr), false);
   assert.equal(room.router.status().pending, 0);
+});
+
+test("router redelivers durable pending operation.request with fresh seq after DO-authorized ready", async () => {
+  const deviceId = "dev_ready_redeliv_01ab";
+  const room = new DeviceRoomHarness(deviceId, () => true);
+  const agent1 = room.connect("agent");
+
+  room.router.sessions.get(agent1)!.phase = "ready";
+  room.router.sessions.get(agent1)!.remote_routing_enabled = true;
+
+  const corr = randomId("op_");
+  const payload = {
+    operation_contract: "ownmesh.operation/1.0",
+    operation_id: corr,
+    capability: "filesystem.write",
+    idempotency_key: "idem_redeliv",
+    payload_hash: "a".repeat(64),
+    arguments: { action: "fs.write", path: "x.txt", content: "v1" },
+  };
+  const prep = room.router.prepareInjectOperation({
+    type: "fs.write",
+    payload,
+    correlation_id: corr,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+  });
+  assert.equal(prep.ok, true);
+  if (!prep.ok) return;
+  const first = room.router.dispatchPreparedInject(prep.prepared);
+  assert.equal(first.status, "routed_to_device");
+  const firstFrames = room.drain(agent1);
+  assert.equal(firstFrames.length, 1);
+  const firstEnv = JSON.parse(firstFrames[0]!) as DeviceEnvelope;
+  assert.equal(firstEnv.type, "operation.request");
+  assert.equal(firstEnv.correlation_id, corr);
+  const firstSeq = firstEnv.seq;
+
+  // Simulate agent disconnect without result; pending remains durable.
+  room.router.unregisterSession(agent1);
+
+  // New agent reconnects and becomes ready. Production DeviceRoom first
+  // revalidates the durable principal credential generation, then calls this
+  // pure-router delivery primitive; the harness performs that final primitive.
+  const agent2 = room.connect("agent");
+  room.router.sessions.get(agent2)!.phase = "proven";
+  await room.send(
+    agent2,
+    envFor(agent2, "ready", deviceId, {
+      remote_routing_enabled: true,
+      capabilities: ["filesystem.write"],
+    }),
+  );
+  const afterReady = room.drain(agent2).map((s) => JSON.parse(s) as DeviceEnvelope);
+  const ack = afterReady.find((e) => e.type === "ready.ack");
+  assert.ok(ack, "expected ready.ack");
+  assert.equal(afterReady.filter((e) => e.type === "operation.request").length, 0);
+  assert.equal(room.router.redeliverPendingToAgent(agent2), 1);
+  const redelivered = room.drain(agent2).map((s) => JSON.parse(s) as DeviceEnvelope)
+    .filter((e) => e.type === "operation.request");
+  assert.equal(redelivered.length, 1);
+  assert.equal(redelivered[0]!.correlation_id, corr);
+  assert.ok(
+    Number(redelivered[0]!.seq) > Number(firstSeq),
+    "redelivery must use a fresh advancing seq",
+  );
+  assert.equal(redelivered[0]!.payload.operation_id, corr);
+  assert.ok(room.router.pending.has(corr), "pending stays until terminal result");
 });

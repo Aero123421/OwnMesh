@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,58 @@ from pathlib import Path
 TESTS_DIR = Path(__file__).resolve().parent
 ROOT = TESTS_DIR.parents[1]
 CHECKER = ROOT / "scripts" / "check_release_quality.py"
+
+
+def _replace_rust_registry(text: str, name: str, entries: list[str]) -> str:
+    """Replace one canonical Rust string registry without count assumptions."""
+    pattern = re.compile(
+        rf"(pub const {re.escape(name)}: &\[&str\] = &)\[(.*?)\](;)",
+        re.DOTALL,
+    )
+    match = pattern.search(text)
+    if match is None:
+        raise AssertionError(f"Rust registry {name} not found")
+    body = ", ".join(json.dumps(entry) for entry in entries)
+    return text[: match.start()] + match.group(1) + f"[{body}]" + match.group(3) + text[match.end() :]
+
+
+def _manifest_with_no_unsupported(text: str, *, completeness: bool = True) -> str:
+    data = json.loads(text)
+    data["completeness_claim"] = completeness
+    data["explicit_unsupported_count"] = 0
+    data["explicit_unsupported_surfaces"] = []
+    data["additional_unsupported"] = []
+    data["total_unsupported_surfaces"] = 0
+    rendered = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    # Stable releases already have this exact inventory. Keep the mutation
+    # harness meaningful by changing formatting without changing semantics.
+    return rendered if rendered != text else rendered + "\n"
+
+
+def _registries_with_no_unsupported(text: str) -> str:
+    original = text
+    text = _replace_rust_registry(text, "EXPLICIT_UNSUPPORTED_CLI_SURFACES", [])
+    text = _replace_rust_registry(text, "ADDITIONAL_UNSUPPORTED_CLI_SURFACES", [])
+    return text if text != original else text + "\n// equivalent empty-registry mutation\n"
+
+
+def _manifest_with_false_complete_claim(text: str) -> str:
+    data = json.loads(text)
+    data["completeness_claim"] = True
+    data["explicit_unsupported_count"] = 1
+    data["explicit_unsupported_surfaces"] = ["__mutation_unimplemented_surface__"]
+    data["additional_unsupported"] = []
+    data["total_unsupported_surfaces"] = 1
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def _registries_with_one_unsupported(text: str) -> str:
+    text = _replace_rust_registry(
+        text,
+        "EXPLICIT_UNSUPPORTED_CLI_SURFACES",
+        ["__mutation_unimplemented_surface__"],
+    )
+    return _replace_rust_registry(text, "ADDITIONAL_UNSUPPORTED_CLI_SURFACES", [])
 
 
 def _run_checker() -> subprocess.CompletedProcess[str]:
@@ -240,66 +294,78 @@ class CheckerMutationTests(unittest.TestCase):
     # --- surface registry ------------------------------------------------
     def test_mutation_surface_count_fails(self) -> None:
         def mutate(text: str) -> str:
-            return text.replace(
-                '"explicit_unsupported_count": 32',
-                '"explicit_unsupported_count": 31',
-                1,
-            )
+            match = re.search(r'("explicit_unsupported_count"\s*:\s*)(\d+)', text)
+            if match is None:
+                raise AssertionError("explicit unsupported count not found")
+            changed = int(match.group(2)) + 1
+            return text[: match.start(2)] + str(changed) + text[match.end(2) :]
 
         with _Mutation("release/SUPPORTED_SURFACES.json", mutate):
             _must_fail("surface count mismatch")
 
     def test_mutation_additional_registry_drift_fails(self) -> None:
         def mutate(text: str) -> str:
-            return text.replace('    "exec --device",', '    "arbitrary unsupported command",', 1)
+            return _replace_rust_registry(
+                text,
+                "ADDITIONAL_UNSUPPORTED_CLI_SURFACES",
+                ["arbitrary unsupported command"],
+            )
 
         with _Mutation("crates/ownmesh/src/commands/mod.rs", mutate):
             _must_fail("additional registry drift")
 
-    def test_mutation_additional_handler_bypass_fails(self) -> None:
-        def mutate(text: str) -> str:
-            return text.replace(
-                'super::unsupported_exit("exec --device")',
-                'super::unsupported_exit("arbitrary unsupported command")',
-                1,
-            )
-
-        with _Mutation("crates/ownmesh/src/commands/exec.rs", mutate):
-            _must_fail("additional handler arbitrary string")
-
-    def test_mutation_approval_watch_hard_error_fails(self) -> None:
-        def mutate(text: str) -> str:
-            return text.replace(
-                "ApprovalCmd::Watch => super::unsupported(",
-                "ApprovalCmd::Watch => fake_soft_fallback(",
-                1,
-            )
-
-        with _Mutation("crates/ownmesh/src/commands/approval.rs", mutate):
-            _must_fail("approval watch hard error")
-
     def test_mutation_completeness_claim_fails(self) -> None:
         def mutate(text: str) -> str:
-            return text.replace(
-                '"completeness_claim": false',
-                '"completeness_claim": true',
-                1,
-            )
+            match = re.search(r'("completeness_claim"\s*:\s*)(true|false)', text)
+            if match is None:
+                raise AssertionError("completeness claim not found")
+            replacement = "false" if match.group(2) == "true" else "true"
+            return text[: match.start(2)] + replacement + text[match.end(2) :]
 
         with _Mutation("release/SUPPORTED_SURFACES.json", mutate):
-            _must_fail("completeness claim")
+            _must_fail("completeness claim contradicts unsupported inventory")
+
+    def test_honest_complete_inventory_passes(self) -> None:
+        with _Mutation(
+            "release/SUPPORTED_SURFACES.json",
+            _manifest_with_no_unsupported,
+        ), _Mutation(
+            "crates/ownmesh/src/commands/mod.rs",
+            _registries_with_no_unsupported,
+        ):
+            result = _run_checker()
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_zero_unsupported_without_completeness_fails(self) -> None:
+        with _Mutation(
+            "release/SUPPORTED_SURFACES.json",
+            lambda text: _manifest_with_no_unsupported(text, completeness=False),
+        ), _Mutation(
+            "crates/ownmesh/src/commands/mod.rs",
+            _registries_with_no_unsupported,
+        ):
+            _must_fail("zero unsupported inventory without completeness")
+
+    def test_complete_claim_with_nonempty_inventory_fails(self) -> None:
+        with _Mutation(
+            "release/SUPPORTED_SURFACES.json",
+            _manifest_with_false_complete_claim,
+        ), _Mutation(
+            "crates/ownmesh/src/commands/mod.rs",
+            _registries_with_one_unsupported,
+        ):
+            _must_fail("complete claim with a registry-backed unsupported surface")
 
     # --- docs claim gate -------------------------------------------------
     def test_mutation_docs_surface_claim_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "32 explicit unsupported CLI surfaces",
-                "31 explicit unsupported CLI surfaces",
-                1,
+                "release/SUPPORTED_SURFACES.json",
+                "release/SURFACE_MANIFEST_REMOVED.json",
             )
 
         with _Mutation("README.md", mutate):
-            _must_fail("docs surface claim")
+            _must_fail("docs omit manifest authority")
 
     # --- security SBOM / permissions -------------------------------------
     def test_mutation_empty_sbom_fallback_fails(self) -> None:

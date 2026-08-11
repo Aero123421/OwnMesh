@@ -17,8 +17,6 @@
     clippy::needless_pass_by_value
 )]
 
-mod pty_host;
-
 use clap::{Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ownmesh_config::{load_config, OwnMeshPaths};
@@ -27,6 +25,7 @@ use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use ownmesh_session::{
     load_manager, save_manager, PtyCommand, PtySize, SessionError, SessionManager, SessionResult,
 };
+use ownmesh_session_host::{read_until, spawn_pty, PtySession, SupervisorIpcServer};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode as StdExitCode;
@@ -51,6 +50,18 @@ struct Cli {
 enum Commands {
     /// Probe local daemon connectivity and print status.
     Status,
+    /// Run the persistent local-only PTY supervisor sidecar.
+    ///
+    /// This creates no network listener: it binds only OwnMesh IPC's per-user
+    /// Unix socket or Windows named pipe endpoint.
+    Supervise {
+        /// Custody-attested owner-only sidecar state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Runtime directory used to derive the local endpoint.
+        #[arg(long)]
+        runtime_dir: PathBuf,
+    },
     /// Serve a session with a real PTY/ConPTY (or pipe fallback).
     Serve {
         /// Session id to host.
@@ -98,6 +109,10 @@ fn main() -> StdExitCode {
 fn run(cli: Cli) -> Result<(), ExitCode> {
     match cli.command.unwrap_or(Commands::Status) {
         Commands::Status => run_status(),
+        Commands::Supervise {
+            state_dir,
+            runtime_dir,
+        } => run_supervise(state_dir, runtime_dir),
         Commands::Serve {
             session_id,
             program,
@@ -119,6 +134,23 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
             stdin_line,
         ),
     }
+}
+
+fn run_supervise(state_dir: PathBuf, runtime_dir: PathBuf) -> Result<(), ExitCode> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| ExitCode::Internal)?;
+    rt.block_on(async move {
+        let (server, _) = SupervisorIpcServer::new(state_dir, runtime_dir).map_err(|err| {
+            eprintln!("session supervisor setup: {err}");
+            ExitCode::UsageConfig
+        })?;
+        server.serve().await.map_err(|err| {
+            eprintln!("session supervisor stopped: {err}");
+            ExitCode::Internal
+        })
+    })
 }
 
 fn run_status() -> Result<(), ExitCode> {
@@ -241,7 +273,7 @@ fn run_serve(
         }
     };
 
-    let handle = match pty_host::spawn_pty(&cmd, size) {
+    let handle = match spawn_pty(&cmd, size) {
         Ok(h) => h,
         Err(err) => {
             eprintln!("pty spawn failed: {err}");
@@ -278,7 +310,7 @@ fn run_serve(
     }
 
     // read_until always terminates and waits for the child, including on read errors.
-    let output = pty_host::read_until(&handle, max_ms).map_err(|err| {
+    let output = read_until(&handle, max_ms).map_err(|err| {
         eprintln!("pty read: {err}");
         ExitCode::Internal
     })?;
@@ -335,7 +367,8 @@ fn register_spawned_session(
                     ),
                     cmd.cwd.clone(),
                     Some(size),
-                )
+                    None,
+                )?
                 .id
         };
         manager.set_host_pid(&persist_id, pid)?;
@@ -343,7 +376,7 @@ fn register_spawned_session(
     })
 }
 
-fn report_cleanup_error(handle: &pty_host::PtySession) {
+fn report_cleanup_error(handle: &PtySession) {
     if let Err(err) = handle.terminate_and_wait() {
         eprintln!("pty cleanup: {err}");
     }
@@ -475,12 +508,12 @@ mod tests {
                 env: vec![],
             }
         };
-        let handle = pty_host::spawn_pty(&cmd, PtySize::default()).expect("spawn");
+        let handle = spawn_pty(&cmd, PtySize::default()).expect("spawn");
         assert!(matches!(
             handle.handle.backend,
             PtyBackend::ConPty | PtyBackend::PosixPty | PtyBackend::PipeFallback
         ));
-        let out = pty_host::read_until(&handle, 3_000).expect("read");
+        let out = read_until(&handle, 3_000).expect("read");
         // ConPTY may wrap output; accept backend success even if echo text is delayed.
         let ok = out.to_ascii_lowercase().contains("pty-host-ok")
             || handle.handle.backend == PtyBackend::PipeFallback
@@ -488,13 +521,15 @@ mod tests {
         assert!(ok, "output={out:?} backend={:?}", handle.handle.backend);
 
         let mut mgr = SessionManager::new();
-        let ses = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "t",
-            "host",
-            now_unix(),
-            None,
-        );
+        let ses = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "t",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         let data = if out.is_empty() {
             "pty-host-ok\n".into()
         } else {
@@ -591,13 +626,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sessions.json");
         let mut mgr = SessionManager::new();
-        let target = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "target",
-            "host",
-            now_unix(),
-            None,
-        );
+        let target = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "target",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         mgr.attach_observer(&target.id, "reader", now_unix())
             .unwrap();
         mgr.set_host_pid(&target.id, Some(42)).unwrap();
@@ -623,21 +660,25 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         let mut mgr = SessionManager::new();
-        let target = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "target",
-            "host",
-            now_unix(),
-            None,
-        );
+        let target = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "target",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         mgr.set_host_pid(&target.id, Some(42)).unwrap();
-        let unrelated = mgr.open(
-            ownmesh_session::SessionKind::Process,
-            "unrelated",
-            "other",
-            now_unix(),
-            None,
-        );
+        let unrelated = mgr
+            .open(
+                ownmesh_session::SessionKind::Process,
+                "unrelated",
+                "other",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         mgr.push_output(
             &unrelated.id,
             "existing output",
@@ -659,13 +700,15 @@ mod tests {
     #[test]
     fn mutation_failure_also_restores_complete_manager() {
         let mut mgr = SessionManager::new();
-        let target = mgr.open(
-            ownmesh_session::SessionKind::Pty,
-            "target",
-            "host",
-            now_unix(),
-            None,
-        );
+        let target = mgr
+            .open(
+                ownmesh_session::SessionKind::Pty,
+                "target",
+                "host",
+                now_unix(),
+                None,
+            )
+            .unwrap();
         let before = serde_json::to_value(&mgr).unwrap();
 
         let err = mutate_and_persist(&mut mgr, None, |manager| {

@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-persist = { path = "../ownmesh-persist" }
+ownmesh-policy = { path = "../ownmesh-policy" }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 toml = "0.8.19"

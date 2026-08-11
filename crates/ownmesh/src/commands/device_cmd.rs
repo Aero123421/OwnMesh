@@ -2,7 +2,8 @@
 
 use crate::auth::{
     enroll_device, list_devices, load_access_token, open_secret_store, resolve_issuer,
-    revoke_device, rotate_local_device_key, AuthSession, SessionPaths,
+    revoke_device, rotate_local_device_key, update_device_metadata, AuthSession, DeviceInfo,
+    SessionPaths,
 };
 use crate::cli::{Cli, DeviceCmd};
 use ownmesh_domain::ExitCode;
@@ -16,20 +17,8 @@ pub fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {
         DeviceCmd::Enroll => run_enroll(cli),
         DeviceCmd::List => run_list(cli),
         DeviceCmd::Show { id } => run_show(cli, id),
-        DeviceCmd::Rename { id, name } => super::unsupported(
-            cli,
-            "device rename",
-            &format!(
-                "device_rename_not_supported: rename of {id} -> {name} is not exposed by the control plane yet"
-            ),
-        ),
-        DeviceCmd::Labels { id, labels } => super::unsupported(
-            cli,
-            "device labels",
-            &format!(
-                "device_labels_not_supported: labels for {id}: {labels:?} not exposed by control plane yet"
-            ),
-        ),
+        DeviceCmd::Rename { id, name } => run_metadata_update(cli, id, Some(name), None),
+        DeviceCmd::Labels { id, labels } => run_metadata_update(cli, id, None, Some(labels)),
         DeviceCmd::RotateKey => run_rotate_key(cli),
         DeviceCmd::Revoke { id } => run_revoke(cli, id),
     }
@@ -105,6 +94,7 @@ fn run_list(cli: &Cli) -> Result<(), ExitCode> {
                     "devices": devices.iter().map(|d| json!({
                         "id": d.id,
                         "name": d.name,
+                        "labels": d.labels,
                         "hostname": d.hostname,
                         "os": d.os,
                         "arch": d.arch,
@@ -146,6 +136,7 @@ fn run_show(cli: &Cli, id: &str) -> Result<(), ExitCode> {
                     "device": {
                         "id": d.id,
                         "name": d.name,
+                        "labels": d.labels,
                         "hostname": d.hostname,
                         "os": d.os,
                         "arch": d.arch,
@@ -157,6 +148,14 @@ fn run_show(cli: &Cli, id: &str) -> Result<(), ExitCode> {
         } else {
             println!("id:         {}", d.id);
             println!("name:       {}", d.name.as_deref().unwrap_or("-"));
+            println!(
+                "labels:     {}",
+                if d.labels.is_empty() {
+                    "-".to_owned()
+                } else {
+                    d.labels.join(", ")
+                }
+            );
             println!("hostname:   {}", d.hostname.as_deref().unwrap_or("-"));
             println!(
                 "os/arch:    {} / {}",
@@ -167,6 +166,95 @@ fn run_show(cli: &Cli, id: &str) -> Result<(), ExitCode> {
         }
         Ok(())
     })
+}
+
+fn run_metadata_update(
+    cli: &Cli,
+    id: &str,
+    name: Option<&str>,
+    labels: Option<&[String]>,
+) -> Result<(), ExitCode> {
+    let rt = runtime()?;
+    rt.block_on(async {
+        let ctx = authed_context().await?;
+        let device = update_device_metadata(
+            &ctx.http,
+            &ctx.session.issuer,
+            &ctx.access,
+            id,
+            name,
+            labels,
+        )
+        .await
+        .map_err(|error| emit_metadata_error(cli, id, &error))?;
+
+        if cli.json {
+            println!(
+                "{}",
+                json!({
+                    "schema_version": 1,
+                    "ok": true,
+                    "device": device_json(&device),
+                })
+            );
+        } else if name.is_some() {
+            println!(
+                "Device renamed: {} -> {}",
+                device.id,
+                device.name.as_deref().unwrap_or("-")
+            );
+        } else if device.labels.is_empty() {
+            println!("Device labels cleared: {}", device.id);
+        } else {
+            println!(
+                "Device labels updated: {}  {}",
+                device.id,
+                device.labels.join(", ")
+            );
+        }
+        Ok(())
+    })
+}
+
+fn device_json(device: &DeviceInfo) -> serde_json::Value {
+    json!({
+        "id": device.id,
+        "name": device.name,
+        "labels": device.labels,
+        "hostname": device.hostname,
+        "os": device.os,
+        "arch": device.arch,
+        "public_key": device.public_key,
+        "revoked": device.revoked,
+        "status": device.status,
+    })
+}
+
+fn metadata_error_payload(id: &str, error: &anyhow::Error) -> serde_json::Value {
+    json!({
+        "schema_version": 1,
+        "ok": false,
+        "error": {
+            "code": "device_metadata_update_failed",
+            "message": ownmesh_diagnostics::redact_text(&error.to_string()),
+            "device_id": ownmesh_diagnostics::redact_text(id),
+        }
+    })
+}
+
+fn emit_metadata_error(cli: &Cli, id: &str, error: &anyhow::Error) -> ExitCode {
+    let payload = metadata_error_payload(id, error);
+    if cli.json {
+        println!("{payload}");
+    } else {
+        eprintln!(
+            "device update failed: {}",
+            payload["error"]["message"]
+                .as_str()
+                .unwrap_or("request failed")
+        );
+    }
+    ExitCode::Conflict
 }
 
 fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
@@ -320,4 +408,17 @@ fn runtime() -> Result<tokio::runtime::Runtime, ExitCode> {
             eprintln!("failed to start async runtime: {err}");
             ExitCode::Internal
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_update_errors_are_redacted() {
+        let error = anyhow::anyhow!("request failed with Bearer atk_super_secret");
+        let payload = metadata_error_payload("dev_test", &error).to_string();
+        assert!(!payload.contains("atk_super_secret"));
+        assert!(payload.contains("device_metadata_update_failed"));
+    }
 }

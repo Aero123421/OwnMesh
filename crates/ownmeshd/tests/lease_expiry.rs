@@ -28,6 +28,7 @@ mod runtime;
 
 use ownmesh_config::OwnMeshPaths;
 use ownmesh_ipc::{app_error, ClientIdentity, IpcError};
+use ownmesh_policy::{preset_document, AccessPreset};
 use ownmesh_session::SessionManager;
 use runtime::{session_methods, DaemonRuntime};
 use serde_json::{json, Value};
@@ -59,6 +60,8 @@ fn block_atomic_write(path: &Path) {
 }
 
 async fn open_session(rt: &mut DaemonRuntime, who: &str, title: &str) -> String {
+    // Sessions require unrestricted access modes until OS confinement exists.
+    rt.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
     let v = rt
         .dispatch(
             session_methods::OPEN,
@@ -215,6 +218,69 @@ async fn expired_controller_loses_write_give_release_resize_and_close() {
         claim.pointer("/lease/principal_id").and_then(Value::as_str),
         Some("obs")
     );
+}
+
+#[tokio::test]
+async fn renew_and_explicit_detach_are_exact_lease_bound_and_persisted() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let id = open_session(&mut rt, "owner", "renew-detach").await;
+    let shown = rt
+        .dispatch(
+            session_methods::SHOW,
+            Some(json!({ "id": id })),
+            &client("owner"),
+        )
+        .await
+        .expect("show");
+    let lease_id = shown
+        .pointer("/controller/lease_id")
+        .and_then(Value::as_str)
+        .expect("lease id")
+        .to_owned();
+    let epoch = shown
+        .pointer("/controller/epoch")
+        .and_then(Value::as_u64)
+        .expect("lease epoch");
+
+    let renewed = rt
+        .dispatch(
+            session_methods::RENEW,
+            Some(json!({ "id": id, "lease_id": lease_id, "controller_epoch": epoch, "ttl_secs": 60 })),
+            &client("owner"),
+        )
+        .await
+        .expect("renew exact active lease");
+    assert_eq!(
+        renewed.pointer("/lease/epoch").and_then(Value::as_u64),
+        Some(epoch)
+    );
+
+    let stale = rt
+        .dispatch(
+            session_methods::RENEW,
+            Some(json!({ "id": id, "lease_id": "old", "controller_epoch": epoch, "ttl_secs": 60 })),
+            &client("owner"),
+        )
+        .await
+        .expect_err("wrong lease must not renew");
+    assert_denied(stale);
+
+    rt.dispatch(
+        session_methods::DETACH,
+        Some(json!({ "id": id, "lease_id": lease_id, "controller_epoch": epoch })),
+        &client("owner"),
+    )
+    .await
+    .expect("explicit detach");
+    assert_eq!(rt.session_controller_for_test(&id), None);
+    let sessions_path = paths.state_dir.join("sessions").join("sessions.json");
+    let loaded = SessionManager::load_from_path(&sessions_path).expect("reload sessions");
+    let info = loaded.get(&id).expect("persisted session");
+    assert!(info.controller.is_none());
+    assert!(info.observers.iter().any(|principal| principal == "owner"));
 }
 
 #[tokio::test]

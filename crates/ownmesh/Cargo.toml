@@ -20,6 +20,7 @@ workspace = true
 [dependencies]
 anyhow = "1.0.95"
 clap = { version = "4.5.27", features = ["derive", "env", "wrap_help", "string"] }
+clap_complete = "4.6.9"
 ownmesh-config = { path = "../ownmesh-config" }
 ownmesh-diagnostics = { path = "../ownmesh-diagnostics" }
 ownmesh-domain = { path = "../ownmesh-domain" }

@@ -31,6 +31,28 @@ import {
 import { handleApprove, handleMcp, MCP_TOOLS } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
 import {
+  handleChatGptConnector,
+  handleOwnerLogin,
+  handleOwnerLogout,
+  handleOwnerPasskeyOptions,
+  handleOwnerPasskeyRegistrationOptions,
+  handleOwnerPasskeyRegistrationVerify,
+  handleOwnerPasskeyVerify,
+  ownerAuthConfigured,
+  ownerLoginRedirect,
+  ownerPresenceForOperation,
+  ownerPresenceRedirect,
+  ownerPasskeyScript,
+  ownerPrincipalFromRequest,
+  sameOriginBrowserPost,
+} from "./owner-auth.ts";
+import {
+  TransferRoom,
+  issueTransferTerminalControl,
+  verifyTransferEphemeralProof,
+  verifyTransferTicket,
+} from "./transfer-room.ts";
+import {
   internalContextHeaderName,
   internalDoHeaders,
   json,
@@ -44,16 +66,87 @@ import {
 export interface Env {
   DB?: D1Database;
   DEVICE_ROOM?: DurableObjectNamespace;
+  TRANSFER_ROOM?: DurableObjectNamespace;
   OAUTH_ISSUER?: string;
   SESSION_SECRET?: string;
+  OWNER_TOKEN_HASH?: string;
   AUTH_PROVIDER?: Fetcher;
   OWNMESH_DEV_AUTH_BYPASS?: string;
   ALLOW_DYNAMIC_CLIENT_REGISTRATION?: string;
   OWNMESH_ALLOWED_ORIGINS?: string;
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
+  AUTH_RATE_LIMITER?: RateLimitBinding;
+  MCP_RATE_LIMITER?: RateLimitBinding;
 }
 
-export { DeviceRoom, MCP_TOOLS };
+type RateLimitBinding = {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+};
+
+type RateLimitClass = "auth" | "mcp";
+
+function rateLimitClass(pathname: string, method: string): RateLimitClass | null {
+  if (pathname === "/mcp") return "mcp";
+  if (method !== "POST") return null;
+  if (
+    pathname === "/login" ||
+    pathname === "/logout" ||
+    pathname === "/approve" ||
+    pathname === "/oauth/register" ||
+    pathname === "/oauth/authorize" ||
+    pathname === "/oauth/token" ||
+    pathname === "/oauth/revoke" ||
+    pathname === "/oauth/device_authorization" ||
+    pathname === "/oauth/device" ||
+    pathname.startsWith("/auth/passkey/")
+  ) {
+    return "auth";
+  }
+  return null;
+}
+
+async function enforceRateLimit(
+  request: Request,
+  env: Env,
+  issuer: string,
+  pathname: string,
+): Promise<Response | null> {
+  const category = rateLimitClass(pathname, request.method.toUpperCase());
+  if (!category) return null;
+  const limiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;
+  if (!limiter) return null;
+
+  // Never send bearer/cookie material to the counter service. Authenticated
+  // callers are keyed by a digest of their stable credential; unauthenticated
+  // bootstrap traffic falls back to Cloudflare's connection address.
+  const actor =
+    request.headers.get("authorization") ||
+    request.headers.get("cookie") ||
+    request.headers.get("cf-connecting-ip") ||
+    "anonymous";
+  const actorDigest = await sha256Hex(actor);
+  const issuerHost = new URL(issuer).host;
+  try {
+    const result = await limiter.limit({
+      key: `${issuerHost}:${category}:${actorDigest}`,
+    });
+    if (result.success) return null;
+  } catch {
+    // This is an abuse/cost guard, not an authorization boundary. Preserve
+    // availability if Cloudflare's approximate counter is temporarily absent.
+    return null;
+  }
+  return json(
+    { error: "rate_limited", retry_after: 60 },
+    {
+      status: 429,
+      noStore: true,
+      headers: { "retry-after": "60" },
+    },
+  );
+}
+
+export { DeviceRoom, TransferRoom, MCP_TOOLS };
 export type { ControlPlaneStore };
 
 /** Optional injected store for unit tests (avoids global mutable singleton). */
@@ -101,24 +194,61 @@ function devBypass(env: Env, request: Request): boolean {
 }
 
 async function browserPrincipal(request: Request, env: Env): Promise<AuthenticatedPrincipal | null> {
+  return (await browserAuthentication(request, env)).principal;
+}
+
+type BrowserAuthentication = {
+  principal: AuthenticatedPrincipal | null;
+  fresh: boolean;
+};
+
+async function browserAuthentication(
+  request: Request,
+  env: Env,
+  freshOperationId?: string,
+): Promise<BrowserAuthentication> {
   if (devBypass(env, request)) {
     const url = new URL(request.url);
     const id = request.headers.get("x-ownmesh-dev-principal") || url.searchParams.get("login_hint") || "prin_dev";
-    return { id, tenant_id: "ten_default", display_name: id };
+    return { principal: { id, tenant_id: "ten_default", display_name: id }, fresh: true };
   }
-  if (!env.AUTH_PROVIDER) return null;
-  const response = await env.AUTH_PROVIDER.fetch(new Request("https://auth-provider/authenticate", {
-    method: "POST",
-    headers: {
+  if (env.AUTH_PROVIDER) {
+    const headers = new Headers({
       authorization: request.headers.get("authorization") || "",
       cookie: request.headers.get("cookie") || "",
       "x-ownmesh-request-url": request.url,
-    },
-  }));
-  if (!response.ok) return null;
-  const body = await response.json() as { principal_id?: string; tenant_id?: string; display_name?: string };
-  if (!body.principal_id || !body.tenant_id) return null;
-  return { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name };
+    });
+    if (freshOperationId) {
+      headers.set("x-ownmesh-auth-purpose", "approve");
+      headers.set("x-ownmesh-operation-id", freshOperationId);
+      headers.set("x-ownmesh-require-fresh", "true");
+    }
+    const response = await env.AUTH_PROVIDER.fetch(new Request("https://auth-provider/authenticate", {
+      method: "POST",
+      headers,
+    }));
+    if (response.ok) {
+      const body = await response.json() as {
+        principal_id?: string;
+        tenant_id?: string;
+        display_name?: string;
+        fresh?: boolean;
+      };
+      if (body.principal_id && body.tenant_id) {
+        return {
+          principal: { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name },
+          fresh: !freshOperationId || body.fresh === true,
+        };
+      }
+    }
+  }
+  const issuer = env.OAUTH_ISSUER || new URL(request.url).origin;
+  const owner = await ownerPrincipalFromRequest(request, env, issuer);
+  if (!owner) return { principal: null, fresh: false };
+  const fresh = freshOperationId
+    ? await ownerPresenceForOperation(request, env, issuer, owner, freshOperationId)
+    : true;
+  return { principal: owner, fresh };
 }
 
 function originAllowed(request: Request, env: Env, issuer: string): boolean {
@@ -135,8 +265,12 @@ async function routeToDeviceRoom(
     type: string;
     payload: Record<string, unknown>;
     correlation_id: string;
+    expires_at?: string;
+    claim_version?: number;
+    oauth_client_id?: string | null;
   },
   bind?: { principal_id?: string; tenant_id?: string },
+  liveOnly = false,
 ): Promise<{ status: string; detail?: unknown }> {
   if (!env.DEVICE_ROOM) {
     // Fail closed: never pretends routing succeeded without a DO binding.
@@ -183,9 +317,9 @@ async function routeToDeviceRoom(
   const body = JSON.stringify(operation);
   const bodySha256 = await sha256Hex(body);
   const method = "POST";
-  const path = "/operation";
+  const path = liveOnly ? "/live-operation" : "/operation";
   const headers = await internalDoHeaders(env.SESSION_SECRET, {
-    op: "operation",
+    op: liveOnly ? "live_operation" : "operation",
     device_id: deviceId,
     principal_id: principalId,
     tenant_id: tenantId,
@@ -204,7 +338,7 @@ async function routeToDeviceRoom(
   try {
     const outcome = await Promise.race<Response | typeof timedOut>([
       stub.fetch(
-        new Request(`https://device-room/operation?device_id=${encodeURIComponent(deviceId)}`, {
+        new Request(`https://device-room${path}?device_id=${encodeURIComponent(deviceId)}`, {
           method,
           headers,
           body,
@@ -215,22 +349,32 @@ async function routeToDeviceRoom(
       }),
     ]);
     if (outcome === timedOut) {
+      // Post-send timeout is not proof of rejection: DeviceRoom may already have
+      // durably accepted and dispatched the body. Leave the operation non-terminal
+      // so a delayed result can still CAS-finalize (E2/E3 exact-once).
       return {
-        status: "unavailable",
+        status: "dispatch_uncertain",
         detail: {
           error: "device_room_fetch_timeout",
           timeout_ms: timeoutMs,
+          note: liveOnly
+            ? "live ticket delivery is uncertain; never replay its bearer, advance to a fresh proof generation"
+            : "request may already be durable in DeviceRoom; keep pending and await result or redeliver identical body",
         },
       };
     }
     res = outcome;
   } catch (err) {
-    // Fail closed: never let DO stub/network throws leave MCP ops stuck in running.
+    // Post-send throw is also uncertain: the DO may have accepted before the
+    // Worker observed failure. Do not terminal-fail the MCP operation.
     return {
-      status: "unavailable",
+      status: "dispatch_uncertain",
       detail: {
         error: "device_room_fetch_failed",
         message: err instanceof Error ? err.message : String(err),
+          note: liveOnly
+            ? "live ticket delivery is uncertain; never replay its bearer, advance to a fresh proof generation"
+            : "post-send failure is not proof of rejection; keep pending for redelivery/dedup",
       },
     };
   } finally {
@@ -303,6 +447,9 @@ export default {
       return json({ error: "cors_not_enabled" }, { status: 405 });
     }
 
+    const rateLimited = await enforceRateLimit(request, env, issuer, url.pathname);
+    if (rateLimited) return rateLimited;
+
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       const base = {
         service: SERVICE_NAME,
@@ -324,9 +471,10 @@ export default {
         const readiness = await store.schemaReadiness();
         const storage = env.DB ? "d1" : store.kind;
         const sessionSecretBound = Boolean(env.SESSION_SECRET);
-        // Ready only when schema is migrated, DeviceRoom DO is bound, and SESSION_SECRET is set.
+        const browserAuthBound = Boolean(env.AUTH_PROVIDER) || ownerAuthConfigured(env);
+        // Browser OAuth must be usable before the instance is declared ready.
         const ready =
-          readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound;
+          readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound && browserAuthBound;
         return json({
           ...base,
           status: ready ? "ok" : "not_ready",
@@ -334,6 +482,7 @@ export default {
           schema_ready: readiness.schema_ready,
           schema_checks: readiness.checks,
           session_secret_bound: sessionSecretBound,
+          browser_auth_bound: browserAuthBound,
           durable_objects: Boolean(env.DEVICE_ROOM),
         }, { status: ready ? 200 : 503 });
       } catch (error) {
@@ -344,6 +493,7 @@ export default {
             storage: "unavailable",
             schema_ready: false,
             session_secret_bound: Boolean(env.SESSION_SECRET),
+            browser_auth_bound: Boolean(env.AUTH_PROVIDER) || ownerAuthConfigured(env),
             durable_objects: Boolean(env.DEVICE_ROOM),
           }, { status: 503 });
         }
@@ -352,7 +502,9 @@ export default {
     }
 
     if (url.pathname === "/.well-known/oauth-authorization-server") {
-      return json(oauthMetadata(issuer));
+      return json(oauthMetadata(issuer, {
+        allowDynamicRegistration: env.ALLOW_DYNAMIC_CLIENT_REGISTRATION === "true",
+      }));
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") {
       return json(protectedResourceMetadata(issuer));
@@ -366,8 +518,45 @@ export default {
       throw error;
     }
 
+    if (url.pathname === "/login") {
+      return handleOwnerLogin(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey.js" && request.method === "GET") {
+      return ownerPasskeyScript();
+    }
+    if (url.pathname === "/auth/passkey/register/options" && request.method === "POST") {
+      return handleOwnerPasskeyRegistrationOptions(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey/register/verify" && request.method === "POST") {
+      return handleOwnerPasskeyRegistrationVerify(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey/options" && request.method === "POST") {
+      return handleOwnerPasskeyOptions(request, store, issuer, env);
+    }
+    if (url.pathname === "/auth/passkey/verify" && request.method === "POST") {
+      return handleOwnerPasskeyVerify(request, store, issuer, env);
+    }
+    if (url.pathname === "/logout") {
+      return handleOwnerLogout(request, issuer);
+    }
+    if (url.pathname === "/connect/chatgpt") {
+      const principal = await browserPrincipal(request, env);
+      if (!principal) {
+        if (request.method === "GET" && ownerAuthConfigured(env)) {
+          return ownerLoginRedirect(request, issuer);
+        }
+        return json({ error: "unauthorized" }, { status: 401, noStore: true });
+      }
+      return handleChatGptConnector(request, store, issuer, {
+        id: principal.id,
+        tenant_id: principal.tenant_id,
+        display_name: principal.display_name || principal.id,
+      });
+    }
+
     if (url.pathname === "/oauth/register" && request.method === "POST") {
-      // DCR requires explicit flag + authenticated Bearer (ownmesh.device); never enable via devBypass.
+      // Exact ChatGPT public callbacks may register statelessly. All other DCR
+      // remains tenant-authenticated with ownmesh.device; devBypass never applies.
       return handleRegister(request, store, {
         allowDynamicRegistration: env.ALLOW_DYNAMIC_CLIENT_REGISTRATION === "true",
       });
@@ -376,7 +565,7 @@ export default {
       // Consent expiry begins on GET receipt, before any form parsing or external
       // AUTH_PROVIDER round trip; POST only consumes an existing transaction.
       if (request.method === "GET") captureAuthorizeRequestReceipt(request);
-      if (request.method === "POST" && request.headers.get("origin") !== new URL(issuer).origin) {
+      if (request.method === "POST" && !sameOriginBrowserPost(request, issuer)) {
         return json({ error: "origin_not_allowed" }, { status: 403 });
       }
       let authRequest = request;
@@ -388,7 +577,10 @@ export default {
       }
       const principal = await browserPrincipal(authRequest, env);
       const bypass = devBypass(env, request);
-      if (!principal && !env.AUTH_PROVIDER && !bypass) {
+      if (!principal && request.method === "GET" && ownerAuthConfigured(env)) {
+        return ownerLoginRedirect(request, issuer);
+      }
+      if (!principal && !env.AUTH_PROVIDER && !ownerAuthConfigured(env) && !bypass) {
         return json({ error: "auth_provider_unavailable" }, { status: 503 });
       }
       return handleAuthorize(authRequest, store, issuer, { principal: principal || undefined, allowDevBypass: bypass });
@@ -403,12 +595,15 @@ export default {
       return handleDeviceAuthorization(request, store, issuer);
     }
     if (url.pathname === "/oauth/device") {
-      if (request.method === "POST" && request.headers.get("origin") !== new URL(issuer).origin) {
+      if (request.method === "POST" && !sameOriginBrowserPost(request, issuer)) {
         return json({ error: "origin_not_allowed" }, { status: 403 });
       }
       const principal = await browserPrincipal(request, env);
       const bypass = devBypass(env, request);
-      if (!principal && !env.AUTH_PROVIDER && !bypass) {
+      if (!principal && request.method === "GET" && ownerAuthConfigured(env)) {
+        return ownerLoginRedirect(request, issuer);
+      }
+      if (!principal && !env.AUTH_PROVIDER && !ownerAuthConfigured(env) && !bypass) {
         return json({ error: "auth_provider_unavailable" }, { status: 503 });
       }
       return handleDeviceVerification(request, store, { principal: principal || undefined, allowDevBypass: bypass });
@@ -417,7 +612,8 @@ export default {
     // Human approval for MCP approval_required ops: independent human auth +
     // CSRF + one-time tx, then deliver decision into DeviceRoom (never a stub).
     // OAuth/MCP/device bearer tokens must NOT approve — that enables creator
-    // self-approval of write/exec ops. Only AUTH_PROVIDER browser principal.
+    // self-approval of write/exec ops. A browser principal also needs recent,
+    // operation-bound user verification below.
     if (url.pathname === "/approve") {
       const bearerToken =
         request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
@@ -435,11 +631,32 @@ export default {
         );
       }
 
-      const principal = await browserPrincipal(request, env);
-      if (!principal) return json({ error: "unauthorized" }, { status: 401 });
+      const operationId = url.searchParams.get("operation_id") || "";
+      // The fresh-auth proof is bound to the URL operation. Do not let a POST
+      // move authority into an unverified body-only operation_id.
+      if (request.method === "POST" && !operationId) {
+        return json(
+          { error: "invalid_request", error_description: "operation_id required in approval URL" },
+          { status: 400, noStore: true },
+        );
+      }
+      const authentication = await browserAuthentication(request, env, operationId || undefined);
+      const principal = authentication.principal;
+      if (!principal || !authentication.fresh) {
+        if (request.method === "GET" && ownerAuthConfigured(env)) {
+          return ownerPresenceRedirect(request, issuer);
+        }
+        return json(
+          {
+            error: authentication.principal ? "fresh_authentication_required" : "unauthorized",
+            error_description: "approval requires recent user verification for this exact operation",
+          },
+          { status: 401, noStore: true },
+        );
+      }
 
       const postOriginOk =
-        request.method !== "POST" || originAllowed(request, env, issuer);
+        request.method !== "POST" || sameOriginBrowserPost(request, issuer);
 
       return handleApprove(request, store, {
         issuer,
@@ -473,9 +690,48 @@ export default {
             routeToDeviceRoom(env, deviceId, operation, mcpAccess
               ? { principal_id: mcpAccess.principal, tenant_id: mcpAccess.tenant_id }
               : undefined),
+          routeLiveToDevice: (deviceId, operation) =>
+            routeToDeviceRoom(env, deviceId, operation, mcpAccess
+              ? { principal_id: mcpAccess.principal, tenant_id: mcpAccess.tenant_id }
+              : undefined, true),
         },
-        { issuer },
+        {
+          issuer,
+          transferTicketSecret: env.SESSION_SECRET,
+          terminalizeTransferRoom: env.TRANSFER_ROOM && env.SESSION_SECRET ? async (control) => {
+            const signed = await issueTransferTerminalControl(env.SESSION_SECRET!, { v: 1, ...control });
+            const stub = env.TRANSFER_ROOM!.get(env.TRANSFER_ROOM!.idFromName(control.transfer_id));
+            const response = await stub.fetch(new Request("https://transfer-room/terminal", {
+              method: "POST",
+              headers: { "content-type": "application/json", "content-length": String(new TextEncoder().encode(signed.body).byteLength), "x-ownmesh-transfer-control": signed.signature },
+              body: signed.body,
+            }));
+            return response.ok;
+          } : undefined,
+        },
       );
+    }
+
+    // Transfer data plane: a short-lived ticket is the sole transfer authority.
+    // Query strings and client-selected role/device values are rejected; the
+    // agent credential and ticket must agree with the live D1 device record.
+    if (url.pathname === "/transfer/connect") {
+      if (request.method !== "GET" || request.headers.get("Upgrade")?.toLowerCase() !== "websocket") return json({ error: "expected_websocket" }, { status: 426 });
+      if (url.search) return json({ error: "query_authority_forbidden" }, { status: 400 });
+      if (!originAllowed(request, env, issuer)) return json({ error: "origin_not_allowed" }, { status: 403 });
+      if (!env.TRANSFER_ROOM || !env.SESSION_SECRET) return json({ error: "transfer_room_unavailable" }, { status: 503 });
+      const ticket = await verifyTransferTicket(env.SESSION_SECRET, request.headers.get("x-ownmesh-transfer-ticket"));
+      const bearerToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") || "";
+      const credential = bearerToken ? await store.getDeviceCredential(bearerToken) : null;
+      if (!ticket || !credential || ticket.ticket_exp <= Date.now() || ticket.transfer_expires_at <= Date.now() || credential.device_id !== ticket.device_id || credential.tenant_id !== ticket.tenant_id || credential.principal_id !== ticket.principal_id) return json({ error: "invalid_transfer_identity" }, { status: 401 });
+      const device = await store.getDevice(ticket.device_id);
+      const sourceDevice = await store.getDevice(ticket.source_device_id);
+      const destinationDevice = await store.getDevice(ticket.destination_device_id);
+      if (!device || !sourceDevice || !destinationDevice || device.revoked || sourceDevice.revoked || destinationDevice.revoked || device.status !== "active" || sourceDevice.status !== "active" || destinationDevice.status !== "active" || device.tenant_id !== ticket.tenant_id || sourceDevice.tenant_id !== ticket.tenant_id || destinationDevice.tenant_id !== ticket.tenant_id) return json({ error: "device_not_active" }, { status: 403 });
+      if (ticket.source_device_public_key !== sourceDevice.public_key || ticket.destination_device_public_key !== destinationDevice.public_key || !(await verifyTransferEphemeralProof(ticket, "source", sourceDevice.public_key)) || !(await verifyTransferEphemeralProof(ticket, "destination", destinationDevice.public_key))) return json({ error: "invalid_transfer_key_proof" }, { status: 403 });
+      if (!(await store.canOperateDevice(ticket.source_device_id, ticket.principal_id, ticket.tenant_id)) || !(await store.canOperateDevice(ticket.destination_device_id, ticket.principal_id, ticket.tenant_id))) return json({ error: "transfer_member_denied" }, { status: 403 });
+      const stub = env.TRANSFER_ROOM.get(env.TRANSFER_ROOM.idFromName(ticket.transfer_id));
+      return stub.fetch(new Request("https://transfer-room/ws", { method: "GET", headers: request.headers }));
     }
 
     // Agent / client WebSocket connect → DeviceRoom DO

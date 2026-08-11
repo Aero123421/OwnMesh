@@ -221,6 +221,7 @@ test("persist failure before dispatch: zero sends, no pending mutation, 503", as
     session_id: "ags_race_pf",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   } satisfies SessionAttachment);
 
   let sendCount = 0;
@@ -234,7 +235,11 @@ test("persist failure before dispatch: zero sends, no pending mutation, 503", as
   const seqBefore = room.router.seqOut;
 
   failPut = true;
-  const payload = { type: "ownmesh_fs_list", correlation_id: corr, payload: { path: "/" } };
+  const payload = { type: "ownmesh_fs_list", correlation_id: corr, payload: {
+    operation_id: corr, capability: "fs.list",
+    authorization: { bound_action: { principal_id: "prin_dev", tenant_id: DEFAULT_TENANT, principal_credential_generation: 1 } },
+    arguments: { path: "/" },
+  } };
   const { headers, bodyText } = await operationHeaders(deviceId, payload, { correlation_id: corr });
   const res = await room.fetch(
     new Request("https://device-room/operation?device_id=" + deviceId, {
@@ -281,6 +286,7 @@ test("prepare+dispatch: successful path persists pending+nonce before send", asy
     session_id: "ags_race_ok",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
 
   const events: string[] = [];
@@ -298,7 +304,11 @@ test("prepare+dispatch: successful path persists pending+nonce before send", asy
   };
 
   const corr = "op_race_ok_01";
-  const payload = { type: "ownmesh_fs_list", correlation_id: corr, payload: { path: "/" } };
+  const payload = { type: "ownmesh_fs_list", correlation_id: corr, payload: {
+    operation_id: corr, capability: "fs.list",
+    authorization: { bound_action: { principal_id: "prin_dev", tenant_id: DEFAULT_TENANT, principal_credential_generation: 1 } },
+    arguments: { path: "/" },
+  } };
   const { headers, bodyText, nonce } = await operationHeaders(deviceId, payload, {
     correlation_id: corr,
   });
@@ -335,12 +345,17 @@ test("hibernation restore: same internal-context nonce rejected (room-level, uti
     session_id: "ags_nonce_h1",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   room1.router.sendToSession = () => true;
 
   const fixedNonce = "n_fixed_hibernate_replay_001";
   const corr = "op_nonce_hiber_01";
-  const payload = { type: "ownmesh_fs_list", correlation_id: corr, payload: { path: "/" } };
+  const payload = { type: "ownmesh_fs_list", correlation_id: corr, payload: {
+    operation_id: corr, capability: "fs.list",
+    authorization: { bound_action: { principal_id: "prin_dev", tenant_id: DEFAULT_TENANT, principal_credential_generation: 1 } },
+    arguments: { path: "/" },
+  } };
   const { headers, bodyText } = await operationHeaders(deviceId, payload, {
     correlation_id: corr,
     nonce: fixedNonce,
@@ -379,6 +394,7 @@ test("hibernation restore: same internal-context nonce rejected (room-level, uti
     session_id: "ags_nonce_h2",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
   let sendsAfterRestore = 0;
   room2.router.sendToSession = () => {
@@ -427,6 +443,7 @@ test("router prepare rolls back without dispatch; injectOperation still prepare+
     session_id: "ags_r",
     connected_at: Date.now(),
     phase: "ready",
+    remote_routing_enabled: true,
   });
 
   let sends = 0;
