@@ -19,9 +19,10 @@
     clippy::unnested_or_patterns
 )]
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use ownmesh_broker::install_broker;
 use ownmesh_broker::{
-    broker_status, endpoint_supports_peer_cred_enforcement, install_broker, run_broker,
-    BrokerServeConfig,
+    broker_status, endpoint_supports_peer_cred_enforcement, run_broker, BrokerServeConfig,
 };
 use ownmesh_broker_client::BrokerEndpoint;
 use std::time::Duration;
@@ -29,7 +30,9 @@ use tempfile::tempdir;
 
 #[test]
 fn named_pipe_and_windows_install_never_returns_installed_true() {
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let dir = tempdir().unwrap();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let base = dir.path();
 
     #[cfg(windows)]
@@ -53,15 +56,18 @@ fn named_pipe_and_windows_install_never_returns_installed_true() {
     // fixed SCM-owned broker pipe selected by the lifecycle module.
     let pipe = BrokerEndpoint::NamedPipe(r"\\.\pipe\ownmesh-fix4-test".into());
     assert!(!endpoint_supports_peer_cred_enforcement(&pipe));
-    let err = install_broker(base, Some(pipe)).expect_err("named pipe install");
-    assert!(
-        err.to_ascii_lowercase().contains("unsupported")
-            || err.to_ascii_lowercase().contains("fixed"),
-        "{err}"
-    );
-    let st = broker_status(base).unwrap();
-    assert!(!st.installed);
-    assert_eq!(st.support, "unsupported");
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let err = install_broker(base, Some(pipe)).expect_err("named pipe install");
+        assert!(
+            err.to_ascii_lowercase().contains("unsupported")
+                || err.to_ascii_lowercase().contains("fixed"),
+            "{err}"
+        );
+        let st = broker_status(base).unwrap();
+        assert!(!st.installed);
+        assert_eq!(st.support, "unsupported");
+    }
 }
 
 #[test]
@@ -126,26 +132,27 @@ async fn run_broker_named_pipe_is_failed_not_success() {
 
 #[test]
 fn loopback_tcp_install_is_unsupported() {
-    let dir = tempdir().unwrap();
     let ep = BrokerEndpoint::LoopbackTcp("127.0.0.1:0".parse().unwrap());
     assert!(!endpoint_supports_peer_cred_enforcement(&ep));
-    let err = install_broker(dir.path(), Some(ep)).expect_err("tcp install");
-    assert!(
-        err.to_ascii_lowercase().contains("unsupported")
-            || err.to_ascii_lowercase().contains("fixed"),
-        "{err}"
-    );
-    let st = broker_status(dir.path()).unwrap();
-    assert!(!st.installed);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let dir = tempdir().unwrap();
+        let err = install_broker(dir.path(), Some(ep)).expect_err("tcp install");
+        assert!(
+            err.to_ascii_lowercase().contains("unsupported")
+                || err.to_ascii_lowercase().contains("fixed"),
+            "{err}"
+        );
+        let st = broker_status(dir.path()).unwrap();
+        assert!(!st.installed);
+    }
 }
 
 #[test]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn install_without_legacy_arguments_is_explicitly_unsupported_and_side_effect_free() {
-    #[cfg(not(windows))]
-    {
-        let dir = tempdir().unwrap();
-        let err = install_broker(dir.path(), None).expect_err("production install is unsupported");
-        assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
-        assert!(!dir.path().join("broker").exists());
-    }
+    let dir = tempdir().unwrap();
+    let err = install_broker(dir.path(), None).expect_err("production install is unsupported");
+    assert!(err.to_ascii_lowercase().contains("unsupported"), "{err}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }

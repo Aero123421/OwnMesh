@@ -123,7 +123,7 @@ mod tests {
         ElevatedCommand, PeerBind, ReplayCache, ELEVATED_CAPABILITY_SCOPE,
     };
     use std::net::SocketAddr;
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn production_install_is_canonical_unsupported() {
         let dir = tempdir().unwrap();
         let base = dir.path();
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn unsupported_install_and_uninstall_are_side_effect_free() {
         let dir = tempdir().unwrap();
         let install_base = dir.path().join("new-state");
@@ -350,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn windows_or_named_pipe_never_reports_installed_true() {
         let dir = tempdir().unwrap();
         let base = dir.path();
