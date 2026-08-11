@@ -10020,6 +10020,7 @@ mod transfer_runtime_tests {
         let temp = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(temp.path());
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
         let destination_root = temp.path().join("destination");
         runtime
             .upsert_workspace(WorkspaceEntry {
@@ -10119,6 +10120,7 @@ mod transfer_runtime_tests {
         drop(runtime);
 
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
         bind_remote_transfer(&mut runtime);
         runtime
             .handle_transfer_destination_prepare(
