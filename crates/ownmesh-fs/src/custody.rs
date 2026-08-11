@@ -162,7 +162,7 @@ fn final_path_unix_fcntl(file: &File) -> std::io::Result<PathBuf> {
     }
     let bytes = buf
         .iter()
-        .map(|&c| c as u8)
+        .map(|&c| c.cast_unsigned())
         .take_while(|&b| b != 0)
         .collect::<Vec<_>>();
     let path = std::str::from_utf8(&bytes)
@@ -453,9 +453,9 @@ fn root_identity(ws: &WorkspaceRoot) -> FsResult<RootIdentity> {
             path: Some(ws.root().to_path_buf()),
             source,
         })?;
-        return Ok(RootIdentity {
+        Ok(RootIdentity {
             dev: root_meta.dev(),
-        });
+        })
     }
     #[cfg(windows)]
     {
@@ -1204,9 +1204,10 @@ fn rename_nofollow_under_parent(
         // renameat(dirfd, tmp, dirfd, dest)
         let rc = unsafe { libc_renameat(dirfd, tmp_c.as_ptr(), dirfd, dest_c.as_ptr()) };
         if rc == 0 {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-        return Err(std::io::Error::last_os_error());
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1219,23 +1220,23 @@ fn rename_nofollow_under_parent(
 #[cfg(target_os = "linux")]
 unsafe fn libc_renameat(
     olddirfd: i32,
-    oldpath: *const libc_char,
+    oldpath: *const LibcChar,
     newdirfd: i32,
-    newpath: *const libc_char,
+    newpath: *const LibcChar,
 ) -> i32 {
     extern "C" {
         fn renameat(
             olddirfd: i32,
-            oldpath: *const libc_char,
+            oldpath: *const LibcChar,
             newdirfd: i32,
-            newpath: *const libc_char,
+            newpath: *const LibcChar,
         ) -> i32;
     }
     renameat(olddirfd, oldpath, newdirfd, newpath)
 }
 
 #[cfg(target_os = "linux")]
-type libc_char = i8;
+type LibcChar = i8;
 
 /// Delete a path after handle identity revalidation in restricted mode.
 pub(crate) fn delete_enforced(ws: &WorkspaceRoot, rel: &Path, recursive: bool) -> FsResult<()> {
@@ -1469,7 +1470,7 @@ fn read_dir_held_platform(dir: &File, path: &Path) -> FsResult<Vec<HeldDirChild>
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(any(target_os = "linux", not(any(unix, windows))))]
 fn read_dir_path_children(enum_path: &Path, display_path: &Path) -> FsResult<Vec<HeldDirChild>> {
     let rd = fs::read_dir(enum_path).map_err(|source| FsError::Io {
         path: Some(display_path.to_path_buf()),
