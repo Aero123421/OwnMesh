@@ -56,6 +56,10 @@ fn workspace(dir: &std::path::Path) -> WorkspaceRoot {
     WorkspaceRoot::new(dir, true).unwrap()
 }
 
+fn full_access_workspace(dir: &std::path::Path) -> WorkspaceRoot {
+    WorkspaceRoot::new(dir, false).unwrap()
+}
+
 fn write_owner_only_for_test(path: &std::path::Path, bytes: &[u8]) {
     if path.exists() {
         ownmesh_ipc::remove_owner_only_file(path).unwrap();
@@ -85,7 +89,7 @@ fn persist_published_receipt(
     store.save(&lease, &receiver.journal_snapshot()).unwrap();
     drop(sink);
     store
-        .publish_completed_no_replace(&plan, &workspace(root))
+        .publish_completed_no_replace(&plan, &full_access_workspace(root))
         .unwrap();
     let mut receipt = store.load_for_fence(&plan, epoch, epoch).unwrap();
     receipt.mark_published(&plan).unwrap();
@@ -256,7 +260,7 @@ fn part_cancel_only_deletes_its_own_private_part_and_publish_refuses_overwrite()
     let destination = dir.path().join("output.bin");
     std::fs::write(&destination, b"do not replace").unwrap();
     let publish_error = store
-        .publish_completed_no_replace(&plan, &workspace(dir.path()))
+        .publish_completed_no_replace(&plan, &full_access_workspace(dir.path()))
         .unwrap_err();
     assert_eq!(publish_error, TransferError::DestinationExists);
     assert_eq!(std::fs::read(&destination).unwrap(), b"do not replace");
@@ -1517,7 +1521,7 @@ fn source_symlink_is_rejected_without_following_it() {
     std::fs::write(&target, b"private target").unwrap();
     symlink(&target, &link).unwrap();
     let ws = workspace(dir.path());
-    assert!(matches!(ws.open_verified_read("source.bin"), Err(_)));
+    assert!(ws.open_verified_read("source.bin").is_err());
 }
 
 #[test]

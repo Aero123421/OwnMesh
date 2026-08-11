@@ -338,6 +338,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loader_authority_paths_are_fixed_system_locations() {
+        let paths = UnixBrokerInstallPaths::production_linux();
+        assert_eq!(paths.record, Path::new(LINUX_RECORD));
+        assert_eq!(paths.broker, Path::new(LINUX_BROKER));
+        assert_eq!(paths.daemon, Path::new(LINUX_DAEMON));
+        assert_eq!(paths.config, Path::new(LINUX_CONFIG));
+        assert_eq!(paths.unit, Path::new(LINUX_UNIT));
+        assert_eq!(paths.secret, Path::new(LINUX_SECRET));
+        assert_eq!(paths.verify, Path::new(LINUX_VERIFY));
+        assert_eq!(paths.socket, Path::new(LINUX_SOCKET));
+    }
+
+    #[test]
     fn malformed_or_authority_substituted_record_is_refused_before_connect() {
         let paths = UnixBrokerInstallPaths::production_linux();
         let record = InstallRecord {

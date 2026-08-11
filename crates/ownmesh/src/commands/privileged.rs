@@ -104,11 +104,13 @@ fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), Exi
 
 #[cfg(target_os = "linux")]
 fn effective_uid_is_root() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| status.lines().find(|line| line.starts_with("Uid:")))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .is_some_and(|uid| uid == "0")
+    std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+        status
+            .lines()
+            .find(|line| line.starts_with("Uid:"))
+            .and_then(|line| line.split_whitespace().nth(2))
+            .is_some_and(|uid| uid == "0")
+    })
 }
 
 #[cfg(target_os = "macos")]
