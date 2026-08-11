@@ -11014,6 +11014,17 @@ mod broker_intent_tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn fixture_executable() -> PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from("/bin/true")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::env::current_exe().unwrap()
+        }
+    }
+
     fn bound_runtime() -> (tempfile::TempDir, DaemonRuntime, ExecParams) {
         let temp = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(temp.path());
@@ -11024,7 +11035,7 @@ mod broker_intent_tests {
         runtime.active_remote_principal = Some("client:remote:tenant_e8:principal_e8".into());
         runtime.active_remote_principal_credential_generation = Some(7);
         runtime.active_remote_expires_at_unix = Some(DaemonRuntime::now() + 300);
-        let executable = std::env::current_exe().unwrap();
+        let executable = fixture_executable();
         let pin = pin_executable(&executable, CommandKind::Structured).unwrap();
         (
             temp,
@@ -11130,7 +11141,7 @@ mod broker_intent_tests {
         let paths = OwnMeshPaths::for_base(temp.path());
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
         runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
-        let program = std::env::current_exe().unwrap().display().to_string();
+        let program = fixture_executable().display().to_string();
         let client = ClientIdentity::new("local-elevation-test", "test");
         let params = json!({
             "program": program,
