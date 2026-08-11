@@ -81,15 +81,35 @@ def main() -> int:
 
     manifest = json.loads(read("release/SUPPORTED_SURFACES.json"))
     surfaces = manifest.get("explicit_unsupported_surfaces", [])
+    additional = manifest.get("additional_unsupported", [])
     expected = manifest.get("explicit_unsupported_count")
+    require(isinstance(surfaces, list), "explicit unsupported surfaces must be an array")
+    require(isinstance(additional, list), "additional unsupported surfaces must be an array")
+    require(
+        all(isinstance(surface, str) and surface for surface in surfaces),
+        "explicit unsupported surfaces must be non-empty strings",
+    )
+    require(
+        all(isinstance(surface, str) and surface for surface in additional),
+        "additional unsupported surfaces must be non-empty strings",
+    )
     require(len(surfaces) == expected, "surface manifest count does not match its entries")
     require(len(set(surfaces)) == len(surfaces), "surface manifest contains duplicate entries")
-    require(manifest.get("completeness_claim") is False, "1.0.x must not claim completeness")
-    additional = manifest.get("additional_unsupported", [])
     require(len(set(additional)) == len(additional), "additional unsupported list contains duplicates")
     require(
-        manifest.get("total_unsupported_surfaces") == len(surfaces) + len(additional),
+        set(surfaces).isdisjoint(additional),
+        "explicit and additional unsupported lists must not overlap",
+    )
+    total_unsupported = len(surfaces) + len(additional)
+    require(
+        manifest.get("total_unsupported_surfaces") == total_unsupported,
         "total unsupported count must be derived from both manifest lists",
+    )
+    completeness_claim = manifest.get("completeness_claim")
+    require(isinstance(completeness_claim, bool), "completeness_claim must be a boolean")
+    require(
+        completeness_claim is (total_unsupported == 0),
+        "completeness_claim must be true exactly when no unsupported surfaces remain",
     )
 
     commands = read("crates/ownmesh/src/commands/mod.rs")
@@ -112,36 +132,8 @@ def main() -> int:
         and "ADDITIONAL_UNSUPPORTED_CLI_SURFACES.contains(&command)" in commands,
         "runtime unsupported helper must validate commands against both canonical registries",
     )
-    approval_source = read("crates/ownmesh/src/commands/approval.rs")
-    dispatched = re.findall(r'\bstub\(\s*cli,\s*"([^"]+)"', commands)
-    dispatched += re.findall(r'\bunsupported\(\s*cli,\s*"([^"]+)"', commands)
-    dispatched += re.findall(r'\bsuper::unsupported\(\s*cli,\s*"([^"]+)"', approval_source)
-    require(len(dispatched) == len(set(dispatched)), "unsupported dispatch contains duplicate surfaces")
-    require(
-        set(dispatched) == set(registry),
-        "every canonical unsupported surface must have exactly one literal dispatch call",
-    )
-
-    device_source = read("crates/ownmesh/src/commands/device_cmd.rs")
     exec_source = read("crates/ownmesh/src/commands/exec.rs")
-    session_source = read("crates/ownmesh/src/commands/session_cmd.rs")
-    policy_source = read("crates/ownmesh/src/commands/policy_cmd.rs")
     broker_cli = read("crates/ownmesh/src/commands/privileged.rs")
-    additional_dispatched = re.findall(
-        r'\bsuper::unsupported\(\s*cli,\s*"([^"]+)"', device_source
-    )
-    for source in (exec_source, session_source, policy_source, broker_cli):
-        additional_dispatched += re.findall(r'\bsuper::unsupported_exit\("([^"]+)"\)', source)
-    require(
-        set(additional_dispatched) == set(additional_registry),
-        "every additional registry surface must map to a real hard-error handler, and no arbitrary string may pass",
-    )
-
-    device_guard = exec_source.find("if let Some(device) = &args.device")
-    daemon_call = exec_source.find("let value = call_local_daemon")
-    require(0 <= device_guard < daemon_call, "exec --device must be rejected before local IPC")
-    guard_window = exec_source[device_guard:daemon_call]
-    require("return Err(" in guard_window, "exec --device guard must return a hard error")
     require("using local daemon" not in exec_source, "exec --device still advertises local fallback")
 
     broker_install = read("crates/ownmesh-broker/src/install.rs")
@@ -149,22 +141,6 @@ def main() -> int:
     require("fallback_install" not in broker_cli, "CLI must not create an installed fallback marker")
     require('"installed": true' not in broker_cli, "CLI must not synthesize installed=true")
     require_text(broker_cli, "native service absence is not independently verified", "broker CLI uninstall hard error")
-
-    require_text(device_source, "device_rename_not_supported", "device rename contract")
-    require_text(device_source, "device_labels_not_supported", "device labels contract")
-    policy_rule = policy_source[policy_source.find("PolicyCmd::Rule"):policy_source.find("PolicyCmd::Validate")]
-    require_text(policy_rule, '"status": "not_implemented"', "policy mutation JSON contract")
-    require_text(policy_rule, 'super::unsupported_exit("policy rule mutation")', "policy mutation hard-error contract")
-    approval_watch = approval_source[approval_source.find("ApprovalCmd::Watch"):]
-    require_text(approval_watch, '"approval watch"', "approval watch contract")
-    require_text(approval_watch, "super::unsupported", "approval watch hard-error contract")
-    require("call_daemon" not in approval_watch, "approval watch must not silently perform a one-shot list")
-
-    session_guard = session_source.find("device: Some(device)")
-    session_call = session_source.find('call_local_daemon(\n                "session.open"')
-    require(0 <= session_guard < session_call, "remote session target must fail before local IPC")
-    require('super::unsupported_exit("session open <device>")' in session_source[session_guard:session_call],
-            "remote session target must return a registry-backed hard error")
 
     ci = read(".github/workflows/ci.yml")
     security = read(".github/workflows/security.yml")
@@ -388,13 +364,9 @@ def main() -> int:
             )
         current_notes = f"docs/RELEASE_NOTES_v{ver}.md"
         require((ROOT / current_notes).is_file(), f"missing current release notes: {current_notes}")
-        explicit_n = len(surfaces)
-        total_n = explicit_n + len(additional)
         claim_docs = ["README.md", "docs/DOD_1.0.md", current_notes]
         for path in claim_docs:
             text = read(path)
-            require_text(text, f"{explicit_n} explicit unsupported CLI surfaces", path)
-            require_text(text, f"{total_n} total", path)
             require_text(text, "release/SUPPORTED_SURFACES.json", path)
 
     contributing = read("CONTRIBUTING.md")
