@@ -614,7 +614,7 @@ pub(crate) fn publish_retained_file_no_replace(
 /// Commit through an already-attested parent directory handle. Kept separate
 /// from path admission so adversarial tests can rename the lexical parent
 /// after the handle is retained and prove the side effect remains pinned.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, all(test, target_os = "linux")))]
 fn publish_retained_file_to_parent_no_replace(
     parent: &File,
     parent_final: &Path,
