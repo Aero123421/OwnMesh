@@ -122,16 +122,19 @@ const COMMANDS: [PaletteCommand; 15] = [
 ];
 
 /// Filter commands by query (case-insensitive substring on label + keywords + id).
+///
+/// Case folding is Unicode-aware: `to_ascii_lowercase` left Cyrillic labels
+/// (`Устройства`) untouched, so a lowercase query never matched them.
 #[must_use]
 pub fn filter_commands(lang: Lang, query: &str) -> Vec<&'static PaletteCommand> {
-    let q = query.trim().to_ascii_lowercase();
+    let q = query.trim().to_lowercase();
     all_commands()
         .iter()
         .filter(|c| {
             if q.is_empty() {
                 return true;
             }
-            let label = t(lang, c.label_msg).to_ascii_lowercase();
+            let label = t(lang, c.label_msg).to_lowercase();
             label.contains(&q) || c.keywords.contains(q.as_str()) || c.id.contains(q.as_str())
         })
         .collect()

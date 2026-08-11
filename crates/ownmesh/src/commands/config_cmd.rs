@@ -117,28 +117,43 @@ fn dispatch_config_with_paths(
 }
 
 fn emit_error(cli: &Cli, error: ConfigCommandError) -> ExitCode {
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "error": "config_error",
-                "message": error.message(),
-            })
-        );
-    } else {
-        eprintln!("ownmesh config: {}", error.message());
-    }
-    error.exit_code()
+    crate::commands::fail::fail(
+        cli,
+        "OWNMESH_E_CONFIG",
+        format!("ownmesh config: {}", error.message()),
+        None,
+        error.exit_code(),
+    )
 }
 
 fn load(paths: &OwnMeshPaths) -> Result<OwnMeshConfig, ConfigCommandError> {
-    load_config(paths).map_err(|_| {
-        ConfigCommandError::Usage(
-            "configuration could not be loaded; run `ownmesh config validate`",
-        )
-    })
+    load_config(paths).map_err(load_failure_message)
+}
+
+/// Map a load failure onto an actionable, value-free message.
+///
+/// Distinguishing "cannot parse" from "parsed but invalid" matters: the
+/// remedies differ, and a single catch-all message previously told the user to
+/// run the very command that had just failed.
+fn load_failure_message(error: ownmesh_config::ConfigError) -> ConfigCommandError {
+    use ownmesh_config::ConfigError;
+    match error {
+        ConfigError::Io { .. } => ConfigCommandError::Usage(
+            "config.toml could not be read; check file permissions, \
+             or start over with `ownmesh setup --force`",
+        ),
+        ConfigError::Parse { .. } => ConfigCommandError::Usage(
+            "config.toml is not valid TOML; fix it with `ownmesh config edit`, \
+             or start over with `ownmesh setup --force`",
+        ),
+        ConfigError::Validation { .. } | ConfigError::Migration { .. } => {
+            ConfigCommandError::Usage(
+                "config.toml parsed but failed validation; fix it with `ownmesh config edit`, \
+                 or start over with `ownmesh setup --force`",
+            )
+        }
+        ConfigError::Other(_) => ConfigCommandError::Usage("config.toml could not be loaded"),
+    }
 }
 
 fn get_config(paths: &OwnMeshPaths, key: &str) -> Result<Value, ConfigCommandError> {
@@ -323,19 +338,7 @@ fn valid_language_tag(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-fn valid_instance_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value != "."
-        && value != ".."
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
+use ownmesh_config::valid_instance_id;
 
 fn contains_secret_marker(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
@@ -354,8 +357,9 @@ fn contains_secret_marker(value: &str) -> bool {
 
 fn validate_config(paths: &OwnMeshPaths) -> Result<(), ConfigCommandError> {
     let cfg = load(paths)?;
-    cfg.validate()
-        .map_err(|_| ConfigCommandError::Usage("configuration is invalid"))?;
+    // The same gate `config edit` applies, so `config validate` can never
+    // approve a file that `instance list` / `instance use` subsequently reject.
+    validate_full_config(&cfg)?;
     load_policy(paths)
         .and_then(|policy| policy.validate())
         .map_err(|_| ConfigCommandError::Usage("policy is invalid"))?;
@@ -543,29 +547,60 @@ fn validate_known_keys(value: &toml::Value) -> Result<(), ConfigCommandError> {
     Ok(())
 }
 
-fn validate_edited_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
+/// The single, complete configuration gate.
+///
+/// `config validate`, `config edit`, and `config set` all route through this so
+/// no command can approve a file another command rejects. Messages name the
+/// failing field without echoing any value.
+fn validate_full_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
     cfg.validate()
-        .map_err(|_| ConfigCommandError::Usage("edited configuration is invalid"))?;
-    if !valid_language_tag(&cfg.lang) || cfg.instances.len() > 64 {
-        return Err(ConfigCommandError::Usage("edited configuration is invalid"));
+        .map_err(|_| ConfigCommandError::Usage("configuration failed schema validation"))?;
+    if !valid_language_tag(&cfg.lang) {
+        return Err(ConfigCommandError::Usage(
+            "lang must be a BCP-47 tag such as en-US or ja-JP",
+        ));
+    }
+    if cfg.instances.len() > 64 {
+        return Err(ConfigCommandError::Usage(
+            "at most 64 control-plane instances are supported",
+        ));
     }
 
     let mut ids = HashSet::with_capacity(cfg.instances.len());
     for instance in &cfg.instances {
-        if !valid_instance_id(&instance.id)
-            || instance.base_url.len() > 2048
+        if !valid_instance_id(&instance.id) {
+            return Err(ConfigCommandError::Usage(
+                "every instance id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+            ));
+        }
+        if !ids.insert(instance.id.as_str()) {
+            return Err(ConfigCommandError::Usage("instance ids must be unique"));
+        }
+        if instance.base_url.len() > 2048
             || validate_control_plane_base_url(&instance.base_url).is_err()
-            || !ids.insert(instance.id.as_str())
         {
-            return Err(ConfigCommandError::Usage("edited configuration is invalid"));
+            return Err(ConfigCommandError::Usage(
+                "every instance base_url must be a valid https:// control-plane URL",
+            ));
         }
     }
     if let Some(active) = cfg.active_instance.as_deref() {
-        if !valid_instance_id(active) || !ids.contains(active) {
-            return Err(ConfigCommandError::Usage("edited configuration is invalid"));
+        if !valid_instance_id(active) {
+            return Err(ConfigCommandError::Usage(
+                "active_instance must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+            ));
+        }
+        if !ids.contains(active) {
+            return Err(ConfigCommandError::Usage(
+                "active_instance does not name any configured instance",
+            ));
         }
     }
     Ok(())
+}
+
+fn validate_edited_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
+    validate_full_config(cfg)
 }
 
 fn validate_session_issuer_binding(

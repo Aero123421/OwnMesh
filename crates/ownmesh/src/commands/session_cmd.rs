@@ -7,9 +7,14 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 pub fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
-    dispatch_session_with(cli, cmd, call_daemon, |tool, device, payload, wait| {
-        super::exec::call_remote_operation(cli, tool, device, payload, wait)
-    })
+    dispatch_session_with(
+        cli,
+        cmd,
+        |method, params| call_daemon(cli, method, params),
+        |tool, device, payload, wait| {
+            super::exec::call_remote_operation(cli, tool, device, payload, wait)
+        },
+    )
 }
 
 // Each match arm directly mirrors one session IPC operation; keeping them together makes
@@ -77,8 +82,19 @@ where
                 if cli.json {
                     println!(
                         "{}",
-                        json!({ "schema_version": 1, "ok": false, "tool": "ownmesh_session_open", "result": value })
+                        json!({
+                            "schema_version": 1,
+                            "ok": false,
+                            "exit_code": ExitCode::Authorization.code(),
+                            "error": {
+                                "code": "OWNMESH_E_APPROVAL_REQUIRED",
+                                "message": "the session is queued and needs an approval decision",
+                            },
+                            "tool": "ownmesh_session_open",
+                            "result": value,
+                        })
                     );
+                    crate::commands::fail::note_envelope_emitted();
                 } else {
                     eprintln!(
                         "approval required: {}",

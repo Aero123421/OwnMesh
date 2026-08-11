@@ -2,7 +2,9 @@
 
 use crate::cli::{Cli, PolicyCmd, PolicyRuleCmd};
 use crate::commands::admin_flow::run_admin_operation;
-use crate::commands::ipc_util::{call_daemon, print_value};
+use crate::commands::ipc_util::{
+    call_daemon_recoverable, emit_ipc_err, ipc_exit_code, print_value,
+};
 use ownmesh_config::{load_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::methods;
@@ -14,7 +16,7 @@ use serde_json::json;
 
 pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
     match cmd {
-        PolicyCmd::Show => match call_daemon(methods::POLICY_SHOW, None) {
+        PolicyCmd::Show => match call_daemon_recoverable(cli, methods::POLICY_SHOW, None) {
             Ok(value) => {
                 print_value(cli.json, &value, |v| {
                     println!("preset: {}", v["preset"].as_str().unwrap_or("?"));
@@ -33,8 +35,8 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                 });
                 Ok(())
             }
-            Err(ExitCode::DeviceOffline) => show_offline(cli),
-            Err(e) => Err(e),
+            Err(err) if ipc_exit_code(&err) == ExitCode::DeviceOffline => show_offline(cli),
+            Err(err) => Err(emit_ipc_err(cli, &err)),
         },
         PolicyCmd::Preset {
             name,
@@ -56,7 +58,7 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
             )
         }
         PolicyCmd::Rule(command) => dispatch_policy_rule(cli, command),
-        PolicyCmd::Validate => match call_daemon(methods::POLICY_VALIDATE, None) {
+        PolicyCmd::Validate => match call_daemon_recoverable(cli, methods::POLICY_VALIDATE, None) {
             Ok(value) => {
                 print_value(cli.json, &value, |v| {
                     if v["ok"].as_bool() == Some(true) {
@@ -75,11 +77,15 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                     Err(ExitCode::UsageConfig)
                 }
             }
-            Err(ExitCode::DeviceOffline) => validate_offline(cli),
-            Err(e) => Err(e),
+            Err(err) if ipc_exit_code(&err) == ExitCode::DeviceOffline => validate_offline(cli),
+            Err(err) => Err(emit_ipc_err(cli, &err)),
         },
         PolicyCmd::Explain { query } => {
-            match call_daemon(methods::POLICY_EXPLAIN, Some(json!({ "query": query }))) {
+            match call_daemon_recoverable(
+                cli,
+                methods::POLICY_EXPLAIN,
+                Some(json!({ "query": query })),
+            ) {
                 Ok(value) => {
                     print_value(cli.json, &value, |v| {
                         println!(
@@ -90,8 +96,10 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                     });
                     Ok(())
                 }
-                Err(ExitCode::DeviceOffline) => explain_offline(cli, query),
-                Err(e) => Err(e),
+                Err(err) if ipc_exit_code(&err) == ExitCode::DeviceOffline => {
+                    explain_offline(cli, query)
+                }
+                Err(err) => Err(emit_ipc_err(cli, &err)),
             }
         }
     }
@@ -144,7 +152,12 @@ fn validate_offline(cli: &Cli) -> Result<(), ExitCode> {
     if cli.json {
         println!(
             "{}",
-            json!({"ok": ok, "preset": preset, "source": "local_file"})
+            json!({
+                "schema_version": 1,
+                "ok": ok,
+                "preset": preset,
+                "source": "local_file",
+            })
         );
     } else if ok {
         println!("policy ok (local file, preset={preset})");
@@ -178,6 +191,7 @@ fn explain_offline(cli: &Cli, query: &str) -> Result<(), ExitCode> {
         println!(
             "{}",
             json!({
+                "schema_version": 1,
                 "decision": format!("{:?}", v.decision).to_ascii_lowercase(),
                 "reason": v.reason,
                 "matched_rule_id": v.matched_rule_id,

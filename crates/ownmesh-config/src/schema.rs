@@ -286,11 +286,39 @@ pub struct InstanceConfig {
     pub display_name: Option<String>,
 }
 
+/// Canonical instance-id syntax shared by every writer and validator.
+///
+/// This is the single source of truth. `setup`, `instance add/use`, `config
+/// edit`, and `config validate` all route through it, so no command can write
+/// an id that another command later refuses.
+pub const INSTANCE_ID_SYNTAX: &str = "[A-Za-z0-9][A-Za-z0-9._-]{0,63}";
+
+/// Whether `value` is a legal control-plane instance id.
+#[must_use]
+pub fn valid_instance_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value != "."
+        && value != ".."
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 impl InstanceConfig {
     fn validate(&self) -> ConfigResult<()> {
         if self.id.trim().is_empty() {
             return Err(ConfigError::Validation {
                 message: "instance.id must not be empty".into(),
+            });
+        }
+        if !valid_instance_id(&self.id) {
+            return Err(ConfigError::Validation {
+                message: format!("instance.id must match {INSTANCE_ID_SYNTAX}"),
             });
         }
         let _normalized = validate_control_plane_base_url(&self.base_url).map_err(|err| {

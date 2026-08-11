@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 const PROFILE_PAGE_LIMIT: usize = 64;
 
 pub fn dispatch_profile(cli: &Cli, cmd: &ProfileCmd) -> Result<(), ExitCode> {
-    dispatch_profile_with(cli, cmd, &call_daemon)
+    dispatch_profile_with(cli, cmd, &|method, params| call_daemon(cli, method, params))
 }
 
 fn dispatch_profile_with(

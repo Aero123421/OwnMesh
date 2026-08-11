@@ -137,20 +137,13 @@ fn dispatch_instance_with_paths(
 }
 
 fn emit_error(cli: &Cli, error: InstanceCommandError) -> ExitCode {
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "error": "instance_error",
-                "message": error.message(),
-            })
-        );
-    } else {
-        eprintln!("ownmesh instance: {}", error.message());
-    }
-    error.exit_code()
+    crate::commands::fail::fail(
+        cli,
+        "OWNMESH_E_INSTANCE",
+        format!("ownmesh instance: {}", error.message()),
+        None,
+        error.exit_code(),
+    )
 }
 
 fn load(paths: &OwnMeshPaths) -> Result<OwnMeshConfig, InstanceCommandError> {
@@ -261,15 +254,7 @@ fn remove_instance(paths: &OwnMeshPaths, id: &str) -> Result<Option<String>, Ins
 }
 
 fn validate_instance_id(id: &str) -> Result<(), InstanceCommandError> {
-    let valid = !id.is_empty()
-        && id.len() <= 64
-        && id != "."
-        && id != ".."
-        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
-    if valid {
+    if ownmesh_config::valid_instance_id(id) {
         Ok(())
     } else {
         Err(InstanceCommandError::Usage(

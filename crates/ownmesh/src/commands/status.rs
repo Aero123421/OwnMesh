@@ -1,6 +1,8 @@
 //! `ownmesh status` — fetch daemon status over local IPC.
 
 use crate::cli::Cli;
+use crate::commands::fail::fail;
+use crate::commands::ipc_util::DAEMON_OFFLINE_HINT;
 use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
@@ -14,8 +16,13 @@ pub fn run_status(cli: &Cli) -> Result<(), ExitCode> {
         .enable_all()
         .build()
         .map_err(|err| {
-            eprintln!("failed to start async runtime: {err}");
-            ExitCode::Internal
+            fail(
+                cli,
+                "OWNMESH_E_INTERNAL",
+                format!("failed to start async runtime: {err}"),
+                None,
+                ExitCode::Internal,
+            )
         })?;
 
     rt.block_on(async { status_async(cli).await })
@@ -23,19 +30,34 @@ pub fn run_status(cli: &Cli) -> Result<(), ExitCode> {
 
 async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
     let paths = OwnMeshPaths::discover().map_err(|err| {
-        eprintln!("config path error: {err}");
-        ExitCode::UsageConfig
+        fail(
+            cli,
+            "OWNMESH_E_CONFIG_PATH",
+            format!("config path error: {err}"),
+            None,
+            ExitCode::UsageConfig,
+        )
     })?;
     let _ = paths.ensure_layout();
     let cfg = load_config(&paths).map_err(|err| {
-        eprintln!("config load error: {err}");
-        ExitCode::UsageConfig
+        fail(
+            cli,
+            "OWNMESH_E_CONFIG_LOAD",
+            format!("config load error: {err}"),
+            Some("run `ownmesh config validate` to see what is wrong"),
+            ExitCode::UsageConfig,
+        )
     })?;
     let endpoint =
         Endpoint::configured_daemon(&paths.runtime_dir, cfg.service_socket.path.as_deref())
             .map_err(|err| {
-                eprintln!("service endpoint configuration error: {err}");
-                ExitCode::UsageConfig
+                fail(
+                    cli,
+                    "OWNMESH_E_SERVICE_ENDPOINT",
+                    format!("service endpoint configuration error: {err}"),
+                    None,
+                    ExitCode::UsageConfig,
+                )
             })?;
     let client = IpcClient::new(
         endpoint,
@@ -49,8 +71,13 @@ async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
     )
     .with_client_credential_from_env()
     .map_err(|err| {
-        eprintln!("client credential configuration error: {err}");
-        ExitCode::UsageConfig
+        fail(
+            cli,
+            "OWNMESH_E_CLIENT_CREDENTIAL",
+            format!("client credential configuration error: {err}"),
+            None,
+            ExitCode::UsageConfig,
+        )
     })?;
 
     match client.status().await {
@@ -72,24 +99,13 @@ async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
             }
             Ok(())
         }
-        Err(err) => {
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({
-                        "schema_version": 1,
-                        "error": {
-                            "code": err.code(),
-                            "message": err.to_string(),
-                        }
-                    })
-                );
-            } else {
-                eprintln!("failed to reach ownmeshd: {err}");
-                eprintln!("hint: start the daemon with `ownmeshd run`");
-            }
-            Err(ExitCode::DeviceOffline)
-        }
+        Err(err) => Err(fail(
+            cli,
+            "OWNMESH_E_DEVICE_OFFLINE",
+            format!("failed to reach ownmeshd: {err}"),
+            Some(DAEMON_OFFLINE_HINT),
+            ExitCode::DeviceOffline,
+        )),
     }
 }
 

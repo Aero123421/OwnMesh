@@ -6,6 +6,7 @@ mod config_cmd;
 pub(crate) mod device_cmd;
 mod doctor;
 mod exec;
+pub(crate) mod fail;
 mod instance_cmd;
 mod ipc_util;
 mod lockdown;
@@ -31,9 +32,9 @@ use crate::cli::{
 use clap::CommandFactory;
 use clap_complete::{generate, shells};
 use ownmesh_domain::ExitCode;
-use serde_json::json;
 use std::io::IsTerminal;
 
+pub use fail::emit_fallback_envelope;
 pub use status::run_status;
 
 /// Canonical registry for CLI surfaces that hard-fail as unsupported.
@@ -86,45 +87,55 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
 
 fn run_tui_launch(cli: &Cli) -> Result<(), ExitCode> {
     if cli.json || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        if cli.json {
-            println!(
-                "{}",
-                json!({
-                    "schema_version": 1,
-                    "ok": false,
-                    "error": "interactive_terminal_required",
-                    "message": "run an explicit subcommand when stdin/stdout is not an interactive terminal",
-                })
-            );
-        } else {
-            eprintln!(
-                "ownmesh: no subcommand; an interactive terminal is required to launch the TUI"
-            );
-        }
-        return Err(ExitCode::UsageConfig);
+        return Err(fail::fail(
+            cli,
+            "OWNMESH_E_INTERACTIVE_TERMINAL_REQUIRED",
+            "no subcommand: launching the TUI needs an interactive terminal",
+            Some("run an explicit subcommand, e.g. `ownmesh status`"),
+            ExitCode::UsageConfig,
+        ));
     }
 
     let current = std::env::current_exe().map_err(|err| {
-        eprintln!("ownmesh: cannot locate the installed executable: {err}");
-        ExitCode::Internal
+        fail::fail_with(
+            cli,
+            format!("ownmesh: cannot locate the installed executable: {err}"),
+            None,
+            ExitCode::Internal,
+        )
     })?;
     let tui = current.with_file_name(format!("ownmesh-tui{}", std::env::consts::EXE_SUFFIX));
     if !tui.is_file() {
-        eprintln!(
-            "ownmesh: bundled TUI not found at {}; reinstall OwnMesh or run an explicit subcommand",
-            tui.display()
-        );
-        return Err(ExitCode::ProfileUnavailable);
+        return Err(fail::fail_with(
+            cli,
+            format!("ownmesh: bundled TUI not found at {}", tui.display()),
+            Some("reinstall OwnMesh, or run an explicit subcommand"),
+            ExitCode::ProfileUnavailable,
+        ));
     }
-    let status = std::process::Command::new(&tui).status().map_err(|err| {
-        eprintln!("ownmesh: failed to launch {}: {err}", tui.display());
-        ExitCode::Internal
+    // The TUI renders its own chrome, so `--lang` has to reach it as an
+    // argument: it is not otherwise propagated to the child process.
+    let mut command = std::process::Command::new(&tui);
+    if let Some(lang) = &cli.lang {
+        command.arg("--lang").arg(lang);
+    }
+    let status = command.status().map_err(|err| {
+        fail::fail_with(
+            cli,
+            format!("ownmesh: failed to launch {}: {err}", tui.display()),
+            None,
+            ExitCode::Internal,
+        )
     })?;
     if status.success() {
         Ok(())
     } else {
-        eprintln!("ownmesh: TUI exited unsuccessfully ({status})");
-        Err(ExitCode::Internal)
+        Err(fail::fail_with(
+            cli,
+            format!("ownmesh: TUI exited unsuccessfully ({status})"),
+            None,
+            ExitCode::Internal,
+        ))
     }
 }
 

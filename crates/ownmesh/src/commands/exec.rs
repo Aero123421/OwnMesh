@@ -13,9 +13,12 @@ const MAX_REMOTE_ARGS: usize = 64;
 const MAX_REMOTE_TIMEOUT_MS: u64 = 300_000;
 
 pub fn run_exec(cli: &Cli, args: &ExecArgs) -> Result<(), ExitCode> {
-    run_exec_with(cli, args, call_daemon, |tool, device, payload, wait| {
-        call_remote_operation(cli, tool, device, payload, wait)
-    })
+    run_exec_with(
+        cli,
+        args,
+        |method, params| call_daemon(cli, method, params),
+        |tool, device, payload, wait| call_remote_operation(cli, tool, device, payload, wait),
+    )
 }
 
 fn run_exec_with<Local, Remote>(
@@ -200,8 +203,19 @@ fn render_remote_exec(cli: &Cli, tool: &str, value: &Value) -> Result<(), ExitCo
         if cli.json {
             println!(
                 "{}",
-                json!({ "schema_version": 1, "ok": false, "tool": tool, "result": value })
+                json!({
+                    "schema_version": 1,
+                    "ok": false,
+                    "exit_code": ExitCode::Authorization.code(),
+                    "error": {
+                        "code": "OWNMESH_E_APPROVAL_REQUIRED",
+                        "message": "the operation is queued and needs an approval decision",
+                    },
+                    "tool": tool,
+                    "result": value,
+                })
             );
+            crate::commands::fail::note_envelope_emitted();
         } else {
             eprintln!(
                 "approval required for operation {}",
@@ -290,15 +304,17 @@ pub(super) fn emit_validation_code(cli: &Cli, message: &str) -> ExitCode {
 pub(super) fn emit_mcp_error(cli: &Cli, error: &McpClientError) -> ExitCode {
     let message = ownmesh_diagnostics::redact_text(&error.message);
     if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "exit_code": error.code.exit_code().code(),
-                "error": { "code": error.code.as_str(), "message": message },
-            })
-        );
+        let mut payload = json!({
+            "schema_version": 1,
+            "ok": false,
+            "exit_code": error.code.exit_code().code(),
+            "error": { "code": error.code.as_str(), "message": message },
+        });
+        if let Some(hint) = error.hint {
+            payload["error"]["hint"] = json!(ownmesh_diagnostics::redact_text(hint));
+        }
+        println!("{payload}");
+        crate::commands::fail::note_envelope_emitted();
     } else {
         eprintln!("{}: {message}", error.code.as_str());
         if let Some(hint) = error.hint {

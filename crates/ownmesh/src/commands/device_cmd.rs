@@ -28,7 +28,7 @@ pub fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {
 pub fn run_enroll(cli: &Cli) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
-        let ctx = authed_context().await?;
+        let ctx = authed_context(cli).await?;
         let issuer = if ctx.session.issuer.is_empty() {
             resolve_issuer(&ctx.session).map_err(|err| {
                 eprintln!("{err}");
@@ -79,7 +79,7 @@ pub fn run_enroll(cli: &Cli) -> Result<(), ExitCode> {
 fn run_list(cli: &Cli) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
-        let ctx = authed_context().await?;
+        let ctx = authed_context(cli).await?;
         let devices = list_devices(&ctx.http, &ctx.session.issuer, &ctx.access)
             .await
             .map_err(|err| {
@@ -117,7 +117,7 @@ fn run_list(cli: &Cli) -> Result<(), ExitCode> {
 fn run_show(cli: &Cli, id: &str) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
-        let ctx = authed_context().await?;
+        let ctx = authed_context(cli).await?;
         let devices = list_devices(&ctx.http, &ctx.session.issuer, &ctx.access)
             .await
             .map_err(|err| {
@@ -176,7 +176,7 @@ fn run_metadata_update(
 ) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
-        let ctx = authed_context().await?;
+        let ctx = authed_context(cli).await?;
         let device = update_device_metadata(
             &ctx.http,
             &ctx.session.issuer,
@@ -234,8 +234,9 @@ fn metadata_error_payload(id: &str, error: &anyhow::Error) -> serde_json::Value 
     json!({
         "schema_version": 1,
         "ok": false,
+        "exit_code": ExitCode::Conflict.code(),
         "error": {
-            "code": "device_metadata_update_failed",
+            "code": "OWNMESH_E_DEVICE_METADATA_UPDATE_FAILED",
             "message": ownmesh_diagnostics::redact_text(&error.to_string()),
             "device_id": ownmesh_diagnostics::redact_text(id),
         }
@@ -246,6 +247,7 @@ fn emit_metadata_error(cli: &Cli, id: &str, error: &anyhow::Error) -> ExitCode {
     let payload = metadata_error_payload(id, error);
     if cli.json {
         println!("{payload}");
+        crate::commands::fail::note_envelope_emitted();
     } else {
         eprintln!(
             "device update failed: {}",
@@ -260,7 +262,7 @@ fn emit_metadata_error(cli: &Cli, id: &str, error: &anyhow::Error) -> ExitCode {
 fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
     let rt = runtime()?;
     rt.block_on(async {
-        let ctx = authed_context().await?;
+        let ctx = authed_context(cli).await?;
         let ok = revoke_device(
             &ctx.http,
             &ctx.session.issuer,
@@ -304,7 +306,7 @@ fn run_rotate_key(cli: &Cli) -> Result<(), ExitCode> {
     })?;
 
     // Best-effort re-enroll so the control plane learns the new public key.
-    let reenrolled = try_reenroll_after_rotate();
+    let reenrolled = try_reenroll_after_rotate(cli);
 
     if cli.json {
         println!(
@@ -333,10 +335,10 @@ fn run_rotate_key(cli: &Cli) -> Result<(), ExitCode> {
     Ok(())
 }
 
-fn try_reenroll_after_rotate() -> Option<String> {
+fn try_reenroll_after_rotate(cli: &Cli) -> Option<String> {
     let rt = runtime().ok()?;
     rt.block_on(async {
-        let ctx = authed_context().await.ok()?;
+        let ctx = authed_context(cli).await.ok()?;
         if ctx.session.issuer.is_empty() {
             return None;
         }
@@ -367,29 +369,49 @@ struct AuthCtx {
     session: AuthSession,
 }
 
-async fn authed_context() -> Result<AuthCtx, ExitCode> {
+async fn authed_context(cli: &Cli) -> Result<AuthCtx, ExitCode> {
+    use crate::commands::fail::fail;
     let session_paths = SessionPaths::discover().map_err(|err| {
-        eprintln!("path error: {err}");
-        ExitCode::UsageConfig
+        fail(
+            cli,
+            "OWNMESH_E_CONFIG_PATH",
+            format!("path error: {err}"),
+            None,
+            ExitCode::UsageConfig,
+        )
     })?;
     let store = open_secret_store(&session_paths.paths).map_err(|err| {
-        eprintln!("keychain error: {err}");
-        ExitCode::Internal
+        fail(
+            cli,
+            "OWNMESH_E_KEYCHAIN",
+            format!("keychain error: {err}"),
+            None,
+            ExitCode::Internal,
+        )
     })?;
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|err| {
-            eprintln!("http client error: {err}");
-            ExitCode::Internal
+            fail(
+                cli,
+                "OWNMESH_E_INTERNAL",
+                format!("http client error: {err}"),
+                None,
+                ExitCode::Internal,
+            )
         })?;
     let (access, session) = load_access_token(&session_paths, &store, &http)
         .await
         .map_err(|err| {
-            eprintln!("{err}");
-            eprintln!("hint: run `ownmesh login` first");
-            ExitCode::Authentication
+            fail(
+                cli,
+                "OWNMESH_E_AUTHENTICATION",
+                err.to_string(),
+                Some("run `ownmesh login` first"),
+                ExitCode::Authentication,
+            )
         })?;
     Ok(AuthCtx {
         http,
@@ -419,6 +441,21 @@ mod tests {
         let error = anyhow::anyhow!("request failed with Bearer atk_super_secret");
         let payload = metadata_error_payload("dev_test", &error).to_string();
         assert!(!payload.contains("atk_super_secret"));
-        assert!(payload.contains("device_metadata_update_failed"));
+        assert!(payload.contains("OWNMESH_E_DEVICE_METADATA_UPDATE_FAILED"));
+    }
+
+    /// The device metadata failure must satisfy the shared `--json` contract.
+    #[test]
+    fn json_update_errors_use_the_canonical_envelope() {
+        let error = anyhow::anyhow!("conflict");
+        let payload = metadata_error_payload("dev_test", &error);
+        assert_eq!(payload["ok"].as_bool(), Some(false));
+        assert_eq!(payload["schema_version"].as_u64(), Some(1));
+        assert_eq!(
+            payload["exit_code"].as_i64(),
+            Some(i64::from(ExitCode::Conflict.code()))
+        );
+        let code = payload["error"]["code"].as_str().unwrap_or_default();
+        assert!(code.starts_with("OWNMESH_E_"), "{code}");
     }
 }
