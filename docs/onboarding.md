@@ -1,6 +1,6 @@
 # OwnMesh onboarding
 
-This document covers the supported v1.2.0 first-run, ChatGPT connection, and
+This document covers the supported v1.2.1 first-run, ChatGPT connection, and
 user-level service flow. The machine-checked command contract is
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
@@ -263,7 +263,7 @@ public MCP-to-broker E8 receipt remain separate open evidence.
 
 ## Distribution scope
 
-v1.2.0 supports signed portable archives and the verified shell/PowerShell
+v1.2.1 supports signed portable archives and the verified shell/PowerShell
 one-line installers. Windows MSI/NSIS, native/universal macOS packages,
 Authenticode, and Apple notarization are outside this release's distribution
 contract.

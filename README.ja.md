@@ -13,7 +13,7 @@ OwnMesh は AI オーケストレータでも、ベンダー管理の中央 SaaS
 
 ## ステータス
 
-**v1.2.0 正式安定版** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
+**v1.2.1 正式安定版** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
 
 公開する CLI サーフェスに、意図的な未実装項目は残っていません。機械検査される
 正本は [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json)
@@ -130,7 +130,7 @@ minisign 署名、GitHub build provenance を生成します。
 実装済みです。Linux は root 実機 receipt 取得済みですが、macOS/Windows の
 native release receipt と、公開 MCP → installed Agent → broker の E8 receipt は
 未取得です。これらの経路を実機証明済みとは表現しません。Authenticode、Apple
-notarization、MSI/NSIS、macOS native package は v1.2.0 の対象外です。
+notarization、MSI/NSIS、macOS native package は v1.2.1 の対象外です。
 
 ChatGPT の動的登録、OAuth、passkey return、refresh、MCP link は手動の live
 互換 receipt があります。local workerd suite は再現可能ですが、外部 ChatGPT を
@@ -157,7 +157,7 @@ pnpm -r lint
 - [Cloudflare deployment](./docs/deploy-cloudflare.md)
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
-- [v1.2.0 release notes](./docs/RELEASE_NOTES_v1.2.0.md)
+- [v1.2.1 release notes](./docs/RELEASE_NOTES_v1.2.1.md)
 - [目標仕様](./OWNMESH_SPECIFICATION.ja.md) — 将来ロードマップの正本
 
 ## ライセンス
