@@ -148,9 +148,13 @@ pub struct SetupArgs {
 /// `ownmesh doctor` arguments.
 #[derive(Debug, Clone, Parser)]
 pub struct DoctorArgs {
-    /// Opt in to network probes (control-plane /health). Also runs when a control-plane URL is already configured.
-    #[arg(long)]
+    /// Probe the configured control plane over the network (off by default).
+    #[arg(long, conflicts_with = "offline")]
     pub check_network: bool,
+
+    /// Never touch the network, even with --check-network in a shell alias.
+    #[arg(long)]
+    pub offline: bool,
 }
 
 /// `ownmesh login` arguments.

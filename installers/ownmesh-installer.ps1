@@ -582,6 +582,18 @@
         foreach ($bin in $RequiredBinaries) {
             Write-Host "  - $(Join-Path $InstallDir $bin)"
         }
+
+        Write-Host ""
+        Write-Host "Open a new PowerShell window so 'ownmesh' resolves on PATH."
+        Write-Host "Next steps:"
+        Write-Host "  1. Deploy your own control plane, if you have not already:"
+        Write-Host "       git clone https://github.com/Aero123421/OwnMesh"
+        Write-Host "       cd OwnMesh\packages\control-plane"
+        Write-Host "       corepack enable; pnpm install --frozen-lockfile; pnpm run deploy:guided"
+        Write-Host "  2. Connect this machine to it:"
+        Write-Host "       ownmesh setup --control-plane-url <your-worker-url> --quickstart"
+        Write-Host "  3. Check the result without changing anything:"
+        Write-Host "       ownmesh doctor"
     } finally {
         foreach ($staged in $stagedFiles) {
             if ($staged -and (Test-Path -LiteralPath $staged)) {

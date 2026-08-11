@@ -39,8 +39,13 @@ pub fn collect_doctor_report(
                 input.control_plane.configured = true;
                 // Never surface raw URL material that could carry userinfo/query.
                 input.control_plane.url = Some(redact_control_plane_url(&url));
-                let should_probe = args.check_network || input.control_plane.configured;
-                if should_probe {
+                // Opt-in only. This used to read `args.check_network ||
+                // input.control_plane.configured`, and `configured` had just
+                // been set to `true` on the line above — so the condition was
+                // a tautology, `--check-network` changed nothing, and any
+                // machine with a configured control plane made a network call
+                // on every `doctor` run.
+                if args.check_network && !args.offline {
                     input.control_plane.probed = true;
                     match probe_control_plane_health(&url) {
                         Ok(status) if (200..300).contains(&status) => {
@@ -483,6 +488,85 @@ mod tests {
     use ownmesh_config::{save_config, save_policy, InstanceConfig, OwnMeshConfig, PolicyFile};
     use tempfile::tempdir;
 
+    /// `--check-network` must be the only thing that reaches the network.
+    ///
+    /// The probe condition was `args.check_network || configured`, evaluated
+    /// right after `configured` was set to `true`, so it was a tautology: the
+    /// flag changed nothing and every configured machine probed on every run.
+    #[test]
+    fn network_probe_is_opt_in_and_offline_wins() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let cfg = OwnMeshConfig {
+            active_instance: Some("home".into()),
+            instances: vec![InstanceConfig {
+                id: "home".into(),
+                // Unroutable by RFC 6761, so a probe would have to be skipped
+                // rather than merely fail fast.
+                base_url: "https://cp.invalid".into(),
+                display_name: None,
+            }],
+            ..OwnMeshConfig::default()
+        };
+        save_config(&paths, &cfg).unwrap();
+        save_policy(&paths, &PolicyFile::default()).unwrap();
+
+        let default_run = collect_doctor_report(
+            &paths,
+            &DoctorArgs {
+                check_network: false,
+                offline: false,
+            },
+            "test",
+        );
+        let health = default_run
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.health")
+            .expect("health check row");
+        assert_eq!(
+            health.status,
+            ownmesh_diagnostics::CheckStatus::Pass,
+            "without --check-network the probe must be skipped: {health:?}"
+        );
+        assert!(health.message.contains("skipped"), "{health:?}");
+
+        // --offline is a hard override for aliases that already pass the flag.
+        let offline_run = collect_doctor_report(
+            &paths,
+            &DoctorArgs {
+                check_network: true,
+                offline: true,
+            },
+            "test",
+        );
+        let offline_health = offline_run
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.health")
+            .expect("health check row");
+        assert!(
+            offline_health.message.contains("skipped"),
+            "{offline_health:?}"
+        );
+    }
+
+    /// An unreachable control plane is not a fault in the machine being
+    /// inspected, so a read-only diagnostic must not exit non-zero for it.
+    #[test]
+    fn unreachable_control_plane_warns_rather_than_failing() {
+        let mut input = ownmesh_diagnostics::DoctorInput::default();
+        input.binary.cli_version = "test".into();
+        input.control_plane.configured = true;
+        input.control_plane.probed = true;
+        input.control_plane.reachable = Some(false);
+        input.control_plane.message = Some("control plane unreachable".into());
+        let report = ownmesh_diagnostics::run_doctor(&input);
+        assert_ne!(report.outcome, DoctorOutcome::Error, "{report:?}");
+        assert_eq!(exit_for_report(&report), ExitCode::Success);
+    }
+
     #[test]
     fn doctor_is_read_only_on_missing_layout() {
         let dir = tempdir().unwrap();
@@ -491,6 +575,7 @@ mod tests {
             &paths,
             &DoctorArgs {
                 check_network: false,
+                offline: false,
             },
             "test",
         );
@@ -547,6 +632,7 @@ mod tests {
             &paths,
             &DoctorArgs {
                 check_network: false,
+                offline: false,
             },
             "test",
         );
@@ -582,6 +668,7 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &paths,
             &DoctorArgs {
                 check_network: false,
+                offline: false,
             },
             "test",
         );
@@ -626,6 +713,7 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &paths,
             &DoctorArgs {
                 check_network: false,
+                offline: false,
             },
             "1.2.3",
         );
@@ -664,6 +752,7 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &paths,
             &DoctorArgs {
                 check_network: false,
+                offline: false,
             },
             "test",
         );

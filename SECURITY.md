@@ -4,8 +4,9 @@
 
 | Version | Supported |
 | --- | --- |
-| `main` (pre-1.0 development) | Yes — security fixes land here first |
-| Released `1.x` tags (once published) | Yes — until superseded per release notes |
+| `main` | Yes — security fixes land here first |
+| Latest released `1.x` tag | Yes |
+| Older `1.x` tags | Until superseded per release notes |
 | Pre-release / experimental branches | Best effort only |
 
 OwnMesh grants high capability to connected clients (optional Full Access and elevated broker operations). Treat supply-chain integrity, auth, and local IPC boundaries as part of the security surface.

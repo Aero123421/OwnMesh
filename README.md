@@ -68,6 +68,22 @@ and reject traversal, links, devices, and duplicate members.
 
 ## First run
 
+### 1. Deploy your control plane
+
+Every later step needs its URL, so this comes first. From a clone:
+
+```bash
+cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
+```
+
+The guided deploy creates or reuses D1, applies migrations, deploys the Worker,
+provisions required secrets, and prints the owner-login URL, the ChatGPT MCP
+URL, and the exact `ownmesh setup` command for step 2. See
+[`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) and
+[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md).
+
+### 2. Connect a machine
+
 Desktop (opens browser login, enrolls this PC, and installs user autostart):
 
 ```bash
@@ -81,22 +97,14 @@ device):
 ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force
 ```
 
-Then verify the machine without changing it:
+### 3. Verify
+
+Read-only; changes nothing. Add `--check-network` to also probe the control
+plane's `/health`:
 
 ```bash
 ownmesh doctor --json
 ```
-
-Deploy the control plane from a clone:
-
-```bash
-cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
-```
-
-The guided deploy creates or reuses D1, applies migrations, deploys the Worker,
-provisions required secrets, and prints the owner-login and ChatGPT MCP URLs.
-See [`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) and
-[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md).
 
 ## Security model
 

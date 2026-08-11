@@ -62,6 +62,22 @@ checksum を検証してから実行してください。installer 本体も、�
 
 ## 初回セットアップ
 
+### 1. コントロールプレーンを導入する
+
+以降のすべての手順でその URL が必要になるため、ここから始めます。クローンから:
+
+```bash
+cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
+```
+
+guided deploy は D1 を作成または再利用し、migration、Worker deploy、必要な
+secret 設定を行い、オーナーログイン URL、ChatGPT MCP URL、そして手順 2 で
+そのまま使える `ownmesh setup` コマンドを表示します。詳細は
+[`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) と
+[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md) を参照してください。
+
+### 2. マシンを接続する
+
 デスクトップ（ブラウザ認証、PC登録、ユーザー自動起動まで）:
 
 ```bash
@@ -74,22 +90,14 @@ SSH / Ubuntu Server（URL と短いコードを表示し、別端末から承認
 ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force
 ```
 
-副作用なしで確認:
+### 3. 確認する
+
+読み取り専用で、状態を変更しません。`--check-network` を付けると
+コントロールプレーンの `/health` も確認します:
 
 ```bash
 ownmesh doctor --json
 ```
-
-自分の Cloudflare にコントロールプレーンを導入:
-
-```bash
-cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
-```
-
-guided deploy は D1 を作成または再利用し、migration、Worker deploy、必要な
-secret 設定を行い、オーナーログイン URL と ChatGPT MCP URL を表示します。
-詳細は [`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) と
-[`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md) を参照してください。
 
 ## セキュリティ設計
 

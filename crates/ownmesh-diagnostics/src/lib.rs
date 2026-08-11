@@ -466,7 +466,11 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                     )
                     .with_detail(input.control_plane.url.clone().unwrap_or_default()),
                 ),
-                Some(false) => checks.push(DoctorCheck::fail(
+                // A control plane the machine cannot currently reach is not a
+                // fault in the machine doctor is inspecting: a laptop off the
+                // network, or a plane that has not been deployed yet, would
+                // otherwise make this read-only diagnostic exit non-zero.
+                Some(false) => checks.push(DoctorCheck::warn(
                     "control_plane.health",
                     input
                         .control_plane
@@ -486,7 +490,7 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         } else {
             checks.push(DoctorCheck::pass(
                 "control_plane.health",
-                "network probe skipped (not opted in and no probe requested)",
+                "network probe skipped (pass --check-network to probe /health)",
             ));
         }
     }

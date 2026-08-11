@@ -32,6 +32,8 @@ ASSET_DIR="${OWNMESH_ASSET_DIR:-}"
 BASE_URL_OVERRIDE="${OWNMESH_BASE_URL:-}"
 MINISIGN_BIN="${OWNMESH_MINISIGN:-}"
 BOOTSTRAP_MINISIGN="${OWNMESH_BOOTSTRAP_MINISIGN:-auto}"
+PATH_PROFILE_UPDATED=0
+PATH_PROFILE=""
 
 REQUIRED_BINARIES="ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker"
 
@@ -517,6 +519,8 @@ maybe_add_to_path() {
       printf '\n# Added by the ownmesh installer\n'
       printf '%s\n' "$path_line"
     } >>"$profile"
+    PATH_PROFILE_UPDATED=1
+    PATH_PROFILE="$profile"
     say "Added $DEFAULT_INSTALL_DIR to PATH in $profile."
   fi
 }
@@ -684,3 +688,16 @@ say "Installed $INSTALLED_VERSION to $INSTALL_DIR/ownmesh"
 for bin in $REQUIRED_BINARIES; do
   say "  - $INSTALL_DIR/$bin"
 done
+
+say ""
+if [ "$PATH_PROFILE_UPDATED" = "1" ]; then
+  say "Open a new shell (or 'source $PATH_PROFILE') so 'ownmesh' resolves."
+fi
+say "Next steps:"
+say "  1. Deploy your own control plane, if you have not already:"
+say "       git clone https://github.com/$REPOSITORY && cd OwnMesh/packages/control-plane"
+say "       corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided"
+say "  2. Connect this machine to it:"
+say "       ownmesh setup --control-plane-url <your-worker-url> --quickstart"
+say "  3. Check the result without changing anything:"
+say "       ownmesh doctor"
