@@ -35,5 +35,11 @@ chacha20poly1305 = "0.10.1"
 base64 = "0.22.1"
 tracing = "0.1.41"
 
+# Linux release archives target musl and must not depend on a CI image's
+# libdbus development package. Feature unification makes keyring's Secret
+# Service backend use the crate's pinned vendored libdbus build.
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = { version = "0.9.12", features = ["vendored"] }
+
 [dev-dependencies]
 tempfile = "3.15.0"
