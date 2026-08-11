@@ -17,24 +17,42 @@ use sha2::{Digest, Sha256};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
+#[cfg(target_os = "linux")]
 const LINUX_BROKER: &str = "/usr/lib/ownmesh/ownmesh-broker";
+#[cfg(target_os = "linux")]
 const LINUX_DAEMON: &str = "/usr/lib/ownmesh/ownmeshd";
+#[cfg(target_os = "linux")]
 const LINUX_STATE: &str = "/var/lib/ownmesh/broker";
+#[cfg(target_os = "linux")]
 const LINUX_RECORD: &str = "/var/lib/ownmesh/broker/broker-install.json";
+#[cfg(target_os = "linux")]
 const LINUX_SECRET: &str = "/var/lib/ownmesh/broker/broker.secret";
+#[cfg(target_os = "linux")]
 const LINUX_VERIFY: &str = "/var/lib/ownmesh/broker/broker.cap.verify";
+#[cfg(target_os = "linux")]
 const LINUX_CONFIG: &str = "/etc/ownmesh/ownmesh-broker.json";
+#[cfg(target_os = "linux")]
 const LINUX_UNIT: &str = "/etc/systemd/system/ownmesh-broker.service";
+#[cfg(target_os = "linux")]
 const LINUX_SOCKET: &str = "/run/ownmesh/broker.sock";
 
+#[cfg(target_os = "macos")]
 const MAC_BROKER: &str = "/Library/PrivilegedHelperTools/dev.ownmesh.privileged-broker";
+#[cfg(target_os = "macos")]
 const MAC_DAEMON: &str = "/Library/Application Support/OwnMesh/bin/ownmeshd";
+#[cfg(target_os = "macos")]
 const MAC_STATE: &str = "/Library/Application Support/OwnMesh/broker";
+#[cfg(target_os = "macos")]
 const MAC_RECORD: &str = "/Library/Application Support/OwnMesh/broker/broker-install.json";
+#[cfg(target_os = "macos")]
 const MAC_SECRET: &str = "/Library/Application Support/OwnMesh/broker/broker.secret";
+#[cfg(target_os = "macos")]
 const MAC_VERIFY: &str = "/Library/Application Support/OwnMesh/broker/broker.cap.verify";
+#[cfg(target_os = "macos")]
 const MAC_CONFIG: &str = "/Library/Application Support/OwnMesh/broker/ownmesh-broker.json";
+#[cfg(target_os = "macos")]
 const MAC_PLIST: &str = "/Library/LaunchDaemons/dev.ownmesh.privileged-broker.plist";
+#[cfg(target_os = "macos")]
 const MAC_SOCKET: &str = "/private/var/run/ownmesh/broker.sock";
 
 /// The only local broker inputs the unprivileged daemon may use.
@@ -87,6 +105,7 @@ pub(crate) struct UnixBrokerInstallPaths {
 }
 
 impl UnixBrokerInstallPaths {
+    #[cfg(target_os = "linux")]
     pub(crate) fn production_linux() -> Self {
         Self {
             record: PathBuf::from(LINUX_RECORD),
@@ -100,6 +119,7 @@ impl UnixBrokerInstallPaths {
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn production_macos() -> Self {
         Self {
             record: PathBuf::from(MAC_RECORD),
@@ -141,13 +161,15 @@ struct InstallRecord {
     support: String,
     // Keep deserialization closed over the authority-bearing schema. These
     // audit-only values are intentionally retained only for schema parity.
-    installed_at_unix: i64,
-    #[serde(default)]
-    notes: Vec<String>,
+    #[serde(rename = "installed_at_unix")]
+    _installed_at_unix: i64,
+    #[serde(default, rename = "notes")]
+    _notes: Vec<String>,
 }
 
 /// Load the fixed Linux installation. Any custody, identity, endpoint, or
 /// daemon-image mismatch is an error; callers must leave elevation unavailable.
+#[cfg(target_os = "linux")]
 pub(crate) fn load_linux_broker_client(current_exe: &Path) -> Result<UnixBrokerClient, String> {
     load_unix_broker_client_at(
         current_exe,
@@ -156,6 +178,7 @@ pub(crate) fn load_linux_broker_client(current_exe: &Path) -> Result<UnixBrokerC
     )
 }
 
+#[cfg(target_os = "macos")]
 pub(crate) fn load_macos_broker_client(current_exe: &Path) -> Result<UnixBrokerClient, String> {
     load_unix_broker_client_at(
         current_exe,
@@ -310,47 +333,38 @@ fn verify_socket(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), Strin
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
     #[test]
     fn malformed_or_authority_substituted_record_is_refused_before_connect() {
-        #[cfg(target_os = "linux")]
-        {
-            let paths = UnixBrokerInstallPaths::production_linux();
-            let record = InstallRecord {
-                installed: true,
-                endpoint: "/tmp/attacker.sock".into(),
-                endpoint_kind: "unix_socket".into(),
-                unit_path: Some(LINUX_UNIT.into()),
-                secret_file: LINUX_SECRET.into(),
-                signing_key_file: format!("{LINUX_STATE}/private/broker.cap.signing"),
-                verify_key_file: LINUX_VERIFY.into(),
-                trusted_executable: LINUX_DAEMON.into(),
-                socket_owner_uid: 1000,
-                socket_group_gid: 1000,
-                socket_mode: 0o600,
-                allowed_uids: vec![1000],
-                daemon_uid: 1000,
-                daemon_gid: 1000,
-                broker_binary: LINUX_BROKER.into(),
-                config_path: LINUX_CONFIG.into(),
-                broker_sha256: "0".repeat(64),
-                trusted_executable_sha256: "0".repeat(64),
-                config_sha256: "0".repeat(64),
-                unit_sha256: "0".repeat(64),
-                support: "supported".into(),
-                installed_at_unix: 1,
-                notes: Vec::new(),
-            };
-            assert!(validate_record(&record, &paths, LINUX_STATE, 1000, 1000).is_err());
-        }
-    }
-
-    #[test]
-    fn non_linux_loader_is_explicitly_unsupported() {
-        #[cfg(not(target_os = "linux"))]
-        assert!(load_linux_broker_client(Path::new("ignored")).is_err());
+        let paths = UnixBrokerInstallPaths::production_linux();
+        let record = InstallRecord {
+            installed: true,
+            endpoint: "/tmp/attacker.sock".into(),
+            endpoint_kind: "unix_socket".into(),
+            unit_path: Some(LINUX_UNIT.into()),
+            secret_file: LINUX_SECRET.into(),
+            signing_key_file: format!("{LINUX_STATE}/private/broker.cap.signing"),
+            verify_key_file: LINUX_VERIFY.into(),
+            trusted_executable: LINUX_DAEMON.into(),
+            socket_owner_uid: 1000,
+            socket_group_gid: 1000,
+            socket_mode: 0o600,
+            allowed_uids: vec![1000],
+            daemon_uid: 1000,
+            daemon_gid: 1000,
+            broker_binary: LINUX_BROKER.into(),
+            config_path: LINUX_CONFIG.into(),
+            broker_sha256: "0".repeat(64),
+            trusted_executable_sha256: "0".repeat(64),
+            config_sha256: "0".repeat(64),
+            unit_sha256: "0".repeat(64),
+            support: "supported".into(),
+            _installed_at_unix: 1,
+            _notes: Vec::new(),
+        };
+        assert!(validate_record(&record, &paths, LINUX_STATE, 1000, 1000).is_err());
     }
 }

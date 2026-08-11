@@ -618,7 +618,7 @@ fn copy_new_root_file(source: &Path, destination: &Path, mode: u32) -> Result<()
         .map_err(|error| format!("create {}: {error}", destination.display()))?;
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let count = input.read(&mut buffer).map_err(|error| error.to_string())?;
         if count == 0 {
@@ -763,7 +763,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         return Err(format!("{} exceeds bounded hash size", path.display()));
     }
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut total = 0_u64;
     loop {
         let count = file.read(&mut buffer).map_err(|error| error.to_string())?;

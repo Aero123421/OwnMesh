@@ -171,7 +171,7 @@ pub fn install_broker(
     #[cfg(target_os = "macos")]
     {
         let _ = base;
-        let daemon_uid = std::env::var("SUDO_UID")
+        let invoking_user = std::env::var("SUDO_UID")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|uid| *uid != 0)
@@ -179,7 +179,7 @@ pub fn install_broker(
                 "macOS install requires an explicit non-root daemon identity; invoke through `sudo ownmesh privileged install`"
                     .to_string()
             })?;
-        let daemon_gid = std::env::var("SUDO_GID")
+        let invoking_group = std::env::var("SUDO_GID")
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|gid| *gid != 0)
@@ -190,14 +190,14 @@ pub fn install_broker(
         let config = BrokerInstallConfig {
             endpoint: endpoint_override,
             trusted_executable: daemon,
-            daemon_uid,
-            daemon_gid,
+            daemon_uid: invoking_user,
+            daemon_gid: invoking_group,
             socket_security: UnixSocketSecurity {
-                owner_uid: daemon_uid,
-                group_gid: daemon_gid,
+                owner_uid: invoking_user,
+                group_gid: invoking_group,
                 mode: 0o600,
             },
-            allowed_uids: vec![daemon_uid],
+            allowed_uids: vec![invoking_user],
         };
         return crate::macos_lifecycle::install_macos_broker(&broker, &config);
     }
