@@ -17,7 +17,7 @@ workspace = true
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "zeroize"] }
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-persist = { path = "../ownmesh-persist" }
-rand = "0.8.5"
+rand = "0.10.2"
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.135"
 sha2 = "0.10.8"
