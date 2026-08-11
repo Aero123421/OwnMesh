@@ -165,6 +165,9 @@ fn test_profile(
                 "details": status,
             })
         );
+        if !passed {
+            crate::commands::fail::note_envelope_emitted();
+        }
     } else if passed {
         println!("PASS  {profile_id}  state={state}");
     } else {

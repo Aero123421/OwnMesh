@@ -153,6 +153,7 @@ fn run_apply(cli: &Cli) -> Result<(), ExitCode> {
                         "message": "run `brew upgrade ownmesh`",
                     })
                 );
+                crate::commands::fail::note_envelope_emitted();
             } else {
                 eprintln!(
                     "ownmesh update apply: this install is managed by Homebrew; run `brew upgrade ownmesh`"
@@ -317,6 +318,7 @@ fn fail(cli: &Cli, err: UpdateError) -> Result<(), ExitCode> {
                 "error": message,
             }))
         );
+        crate::commands::fail::note_envelope_emitted();
     } else {
         eprintln!("ownmesh update: {message}");
     }

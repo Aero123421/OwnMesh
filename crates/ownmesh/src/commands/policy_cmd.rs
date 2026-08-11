@@ -71,6 +71,9 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                         println!("policy invalid: {v}");
                     }
                 });
+                if cli.json && value["ok"].as_bool() != Some(true) {
+                    crate::commands::fail::note_envelope_emitted();
+                }
                 if value["ok"].as_bool() == Some(true) {
                     Ok(())
                 } else {
@@ -159,13 +162,19 @@ fn validate_offline(cli: &Cli) -> Result<(), ExitCode> {
                 "source": "local_file",
             })
         );
+        if !ok {
+            crate::commands::fail::note_envelope_emitted();
+        }
     } else if ok {
         println!("policy ok (local file, preset={preset})");
     } else {
         println!("full access hidden deny detected");
-        return Err(ExitCode::UsageConfig);
     }
-    Ok(())
+    if ok {
+        Ok(())
+    } else {
+        Err(ExitCode::UsageConfig)
+    }
 }
 
 fn explain_offline(cli: &Cli, query: &str) -> Result<(), ExitCode> {

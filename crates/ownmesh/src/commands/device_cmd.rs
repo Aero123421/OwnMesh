@@ -277,6 +277,7 @@ fn run_revoke(cli: &Cli, id: &str) -> Result<(), ExitCode> {
         })?;
         if cli.json {
             println!("{}", json!({"schema_version": 1, "ok": ok, "id": id}));
+            crate::commands::fail::note_envelope_emitted();
         } else if ok {
             println!("Device revoked: {id}");
         } else {

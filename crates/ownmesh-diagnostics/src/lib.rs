@@ -466,11 +466,9 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                     )
                     .with_detail(input.control_plane.url.clone().unwrap_or_default()),
                 ),
-                // A control plane the machine cannot currently reach is not a
-                // fault in the machine doctor is inspecting: a laptop off the
-                // network, or a plane that has not been deployed yet, would
-                // otherwise make this read-only diagnostic exit non-zero.
-                Some(false) => checks.push(DoctorCheck::warn(
+                // A failed opt-in probe must be observable through the process
+                // exit status. The default doctor run does not probe at all.
+                Some(false) => checks.push(DoctorCheck::fail(
                     "control_plane.health",
                     input
                         .control_plane

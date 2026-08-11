@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Envelope version emitted on stdout. Bump only on a breaking shape change.
 pub const ERROR_SCHEMA_VERSION: u32 = 1;
 
-/// Set once any canonical failure envelope reaches stdout.
+/// Set once any terminal JSON envelope reaches stdout.
 static ENVELOPE_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Stable machine-readable code for an exit status.
@@ -57,6 +57,9 @@ pub fn fail(
 ) -> ExitCode {
     let message = message.to_string();
     if cli.json {
+        if ENVELOPE_EMITTED.swap(true, Ordering::SeqCst) {
+            return exit;
+        }
         let mut error = json!({ "code": code, "message": message });
         if let Some(hint) = hint {
             error["hint"] = json!(hint);
@@ -70,7 +73,6 @@ pub fn fail(
                 "exit_code": exit.code(),
             })
         );
-        ENVELOPE_EMITTED.store(true, Ordering::SeqCst);
     } else {
         eprintln!("{message}");
         if let Some(hint) = hint {

@@ -193,7 +193,7 @@ files, or services and does not load credential values from keychain APIs.
 ```bash
 ownmesh doctor
 ownmesh doctor --json
-ownmesh doctor --check-network   # additionally probes the control plane
+ownmesh doctor --check-network   # probes the control plane; failure exits non-zero
 ownmesh doctor --offline         # never touches the network
 ```
 

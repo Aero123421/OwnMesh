@@ -49,6 +49,7 @@ fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), Exi
             let message = "native privileged lifecycle requires root; re-run with sudo";
             if cli.json {
                 println!("{}", lifecycle_failure_json(command, message));
+                crate::commands::fail::note_envelope_emitted();
             } else {
                 eprintln!("{message}");
             }
@@ -67,6 +68,9 @@ fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), Exi
         if output.status.success() {
             Ok(())
         } else {
+            if cli.json {
+                crate::commands::fail::note_envelope_emitted();
+            }
             Err(ExitCode::UsageConfig)
         }
     }
@@ -86,6 +90,9 @@ fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), Exi
         if output.status.success() {
             Ok(())
         } else {
+            if cli.json {
+                crate::commands::fail::note_envelope_emitted();
+            }
             Err(ExitCode::UsageConfig)
         }
     }
@@ -95,6 +102,7 @@ fn run_native_backend(cli: &Cli, command: &str, args: &[&str]) -> Result<(), Exi
             "unsupported: native privileged broker lifecycle is unavailable on this platform";
         if cli.json {
             println!("{}", lifecycle_failure_json(command, message));
+            crate::commands::fail::note_envelope_emitted();
         } else {
             eprintln!("{message}");
         }

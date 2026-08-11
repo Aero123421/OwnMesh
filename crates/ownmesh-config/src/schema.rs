@@ -286,11 +286,11 @@ pub struct InstanceConfig {
     pub display_name: Option<String>,
 }
 
-/// Canonical instance-id syntax shared by every writer and validator.
+/// Canonical instance-id syntax shared by writers that create new aliases.
 ///
-/// This is the single source of truth. `setup`, `instance add/use`, `config
-/// edit`, and `config validate` all route through it, so no command can write
-/// an id that another command later refuses.
+/// Existing v1.2 configuration may contain older aliases outside this syntax;
+/// readers preserve those while `setup`, `instance add`, and `config edit`
+/// apply this rule to newly introduced aliases.
 pub const INSTANCE_ID_SYNTAX: &str = "[A-Za-z0-9][A-Za-z0-9._-]{0,63}";
 
 /// Whether `value` is a legal control-plane instance id.
@@ -316,11 +316,9 @@ impl InstanceConfig {
                 message: "instance.id must not be empty".into(),
             });
         }
-        if !valid_instance_id(&self.id) {
-            return Err(ConfigError::Validation {
-                message: format!("instance.id must match {INSTANCE_ID_SYNTAX}"),
-            });
-        }
+        // v1.2.0 setup accepted non-ASCII and space-containing aliases. Keep
+        // those existing files readable; commands that create a new instance
+        // apply `valid_instance_id` before writing it.
         let _normalized = validate_control_plane_base_url(&self.base_url).map_err(|err| {
             // Re-scope generic issuer errors to the instance id without echoing secrets.
             match err {

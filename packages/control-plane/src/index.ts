@@ -77,6 +77,8 @@ export interface Env {
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
   AUTH_RATE_LIMITER?: RateLimitBinding;
   MCP_RATE_LIMITER?: RateLimitBinding;
+  AUTH_IP_RATE_LIMITER?: RateLimitBinding;
+  MCP_IP_RATE_LIMITER?: RateLimitBinding;
 }
 
 type RateLimitBinding = {
@@ -113,30 +115,43 @@ async function enforceRateLimit(
 ): Promise<Response | null> {
   const category = rateLimitClass(pathname, request.method.toUpperCase());
   if (!category) return null;
-  const limiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;
-  if (!limiter) return null;
+  const credentialLimiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;
+  const addressLimiter =
+    category === "mcp" ? env.MCP_IP_RATE_LIMITER : env.AUTH_IP_RATE_LIMITER;
 
   const issuerHost = new URL(issuer).host;
   try {
-    // Count against the connection address first. The address is assigned by
-    // Cloudflare and the client cannot vary it, so this bound holds even when
-    // every other input is attacker-chosen.
-    //
-    // Keying on the `Authorization` header first (as this did) let anyone defeat
-    // the guard outright: an unauthenticated caller who randomises that header
-    // on each request lands in a fresh bucket every time and never reaches the
-    // threshold. Credential material is still never forwarded to the counter —
-    // only a digest — and it is now an *additional* bucket, not a replacement,
-    // so a shared NAT egress cannot starve a legitimate authenticated client.
     const address = request.headers.get("cf-connecting-ip") || "anonymous";
-    const buckets = [`${issuerHost}:${category}:addr:${await sha256Hex(address)}`];
-
     const credential = request.headers.get("authorization") || request.headers.get("cookie");
+    const checks: Array<{ limiter: RateLimitBinding; key: string }> = [];
     if (credential) {
-      buckets.push(`${issuerHost}:${category}:cred:${await sha256Hex(credential)}`);
+      // Authenticated traffic gets a tight per-credential budget and a separate,
+      // deliberately coarser address ceiling. Random credentials therefore
+      // cannot bypass abuse protection, while ordinary unauthenticated traffic
+      // cannot consume a valid credential's budget behind shared NAT egress.
+      if (addressLimiter) {
+        checks.push({
+          limiter: addressLimiter,
+          key: `${issuerHost}:${category}:addr:${await sha256Hex(address)}`,
+        });
+      }
+      if (credentialLimiter) {
+        checks.push({
+          limiter: credentialLimiter,
+          key: `${issuerHost}:${category}:cred:${await sha256Hex(credential)}`,
+        });
+      }
+    } else if (credentialLimiter) {
+      // Bootstrap traffic has no stable credential, so retain the tighter
+      // address-keyed budget on the primary limiter.
+      checks.push({
+        limiter: credentialLimiter,
+        key: `${issuerHost}:${category}:addr:${await sha256Hex(address)}`,
+      });
     }
+    if (checks.length === 0) return null;
 
-    const results = await Promise.all(buckets.map((key) => limiter.limit({ key })));
+    const results = await Promise.all(checks.map(({ limiter, key }) => limiter.limit({ key })));
     if (results.every((result) => result.success)) return null;
   } catch {
     // This is an abuse/cost guard, not an authorization boundary. Preserve

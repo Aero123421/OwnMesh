@@ -426,10 +426,20 @@ pub fn probe_control_plane_health(base_url: &str) -> Result<u16, String> {
 
 fn emit_report(cli: &Cli, report: &DoctorReport) {
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(report).unwrap_or_else(|_| "{\"ok\":false}".into())
-        );
+        let mut value = serde_json::to_value(report).unwrap_or_else(|_| {
+            serde_json::json!({
+                "schema_version": 1,
+                "ok": false,
+            })
+        });
+        if report.outcome == DoctorOutcome::Error {
+            value["exit_code"] = serde_json::json!(ExitCode::UsageConfig.code());
+            value["error"] = serde_json::json!({
+                "code": crate::commands::fail::code_for(ExitCode::UsageConfig),
+                "message": "one or more doctor checks failed",
+            });
+        }
+        println!("{value}");
     } else {
         println!(
             "ownmesh doctor — {} ({})",
@@ -474,6 +484,9 @@ pub fn run_doctor_cmd(cli: &Cli, args: &DoctorArgs) -> Result<(), ExitCode> {
     }
 
     emit_report(cli, &report);
+    if cli.json {
+        crate::commands::fail::note_envelope_emitted();
+    }
     let code = exit_for_report(&report);
     if code == ExitCode::Success {
         Ok(())
@@ -485,6 +498,7 @@ pub fn run_doctor_cmd(cli: &Cli, args: &DoctorArgs) -> Result<(), ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use ownmesh_config::{save_config, save_policy, InstanceConfig, OwnMeshConfig, PolicyFile};
     use tempfile::tempdir;
 
@@ -552,10 +566,9 @@ mod tests {
         );
     }
 
-    /// An unreachable control plane is not a fault in the machine being
-    /// inspected, so a read-only diagnostic must not exit non-zero for it.
+    /// An explicitly requested network probe must be useful in automation.
     #[test]
-    fn unreachable_control_plane_warns_rather_than_failing() {
+    fn unreachable_control_plane_fails_an_explicit_probe() {
         let mut input = ownmesh_diagnostics::DoctorInput::default();
         input.binary.cli_version = "test".into();
         input.control_plane.configured = true;
@@ -563,8 +576,19 @@ mod tests {
         input.control_plane.reachable = Some(false);
         input.control_plane.message = Some("control plane unreachable".into());
         let report = ownmesh_diagnostics::run_doctor(&input);
-        assert_ne!(report.outcome, DoctorOutcome::Error, "{report:?}");
-        assert_eq!(exit_for_report(&report), ExitCode::Success);
+        assert_eq!(report.outcome, DoctorOutcome::Error, "{report:?}");
+        assert_eq!(exit_for_report(&report), ExitCode::UsageConfig);
+    }
+
+    #[test]
+    fn offline_can_override_an_aliased_network_probe() {
+        let cli = Cli::try_parse_from(["ownmesh", "doctor", "--check-network", "--offline"])
+            .expect("offline override must be accepted by clap");
+        let crate::cli::Commands::Doctor(args) = cli.command.expect("doctor command") else {
+            panic!("expected doctor command");
+        };
+        assert!(args.check_network);
+        assert!(args.offline);
     }
 
     #[test]

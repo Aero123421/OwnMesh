@@ -149,7 +149,7 @@ pub struct SetupArgs {
 #[derive(Debug, Clone, Parser)]
 pub struct DoctorArgs {
     /// Probe the configured control plane over the network (off by default).
-    #[arg(long, conflicts_with = "offline")]
+    #[arg(long)]
     pub check_network: bool,
 
     /// Never touch the network, even with --check-network in a shell alias.

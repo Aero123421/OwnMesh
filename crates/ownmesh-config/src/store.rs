@@ -794,6 +794,28 @@ mod tests {
     }
 
     #[test]
+    fn loads_legacy_unicode_instance_aliases() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        fs::write(
+            paths.config_file(),
+            r#"schema_version = 1
+lang = "en-US"
+active_instance = "家の PC"
+
+[[instances]]
+id = "家の PC"
+base_url = "https://example.test"
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&paths).expect("v1.2 aliases must remain readable");
+        assert_eq!(config.active_instance.as_deref(), Some("家の PC"));
+    }
+
+    #[test]
     fn load_policy_does_not_create_the_file() {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());

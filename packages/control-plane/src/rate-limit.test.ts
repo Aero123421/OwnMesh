@@ -2,17 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import worker, { type Env } from "./index.ts";
 
-function denyingLimiter(captured: string[]): NonNullable<Env["MCP_RATE_LIMITER"]> {
+function limiter(
+  captured: string[],
+  success: boolean,
+): NonNullable<Env["MCP_RATE_LIMITER"]> {
   return {
     async limit({ key }) {
       captured.push(key);
-      return { success: false };
+      return { success };
     },
   };
 }
 
 test("MCP limiter rejects before storage and never exposes the bearer", async () => {
-  const captured: string[] = [];
+  const credentialKeys: string[] = [];
+  const addressKeys: string[] = [];
   const response = await worker.fetch(
     new Request("https://cp.test/mcp", {
       method: "POST",
@@ -22,20 +26,22 @@ test("MCP limiter rejects before storage and never exposes the bearer", async ()
       },
       body: "{}",
     }),
-    { MCP_RATE_LIMITER: denyingLimiter(captured) },
+    {
+      MCP_RATE_LIMITER: limiter(credentialKeys, false),
+      MCP_IP_RATE_LIMITER: limiter(addressKeys, true),
+    },
     {} as ExecutionContext,
   );
   assert.equal(response.status, 429);
   assert.equal(response.headers.get("retry-after"), "60");
-  // Address and credential are counted as separate buckets, so a caller
-  // cannot escape the limit by varying either one alone.
-  assert.equal(captured.length, 2);
-  for (const key of captured) {
+  assert.equal(credentialKeys.length, 1);
+  assert.equal(addressKeys.length, 1);
+  for (const key of [...credentialKeys, ...addressKeys]) {
     assert.equal(key.includes("at_distinctive_secret"), false);
     assert.equal(key.includes("192.0.2.20"), false);
   }
-  assert.ok(captured.some((key) => key.includes(":addr:")));
-  assert.ok(captured.some((key) => key.includes(":cred:")));
+  assert.ok(addressKeys[0]!.includes(":addr:"));
+  assert.ok(credentialKeys[0]!.includes(":cred:"));
 });
 
 /**
@@ -47,20 +53,24 @@ test("MCP limiter rejects before storage and never exposes the bearer", async ()
  * assigned by Cloudflare, so the address bucket has to stay constant across
  * varying credentials.
  */
-test("varying the Authorization header cannot escape the address bucket", async () => {
+test("varying Authorization cannot escape the coarse address bucket", async () => {
   const addressKeys = new Set<string>();
   for (const credential of ["Bearer aaa", "Bearer bbb", "Bearer ccc"]) {
-    const captured: string[] = [];
+    const capturedAddress: string[] = [];
+    const capturedCredential: string[] = [];
     await worker.fetch(
       new Request("https://cp.test/mcp", {
         method: "POST",
         headers: { authorization: credential, "cf-connecting-ip": "198.51.100.7" },
         body: "{}",
       }),
-      { MCP_RATE_LIMITER: denyingLimiter(captured) },
+      {
+        MCP_RATE_LIMITER: limiter(capturedCredential, true),
+        MCP_IP_RATE_LIMITER: limiter(capturedAddress, false),
+      },
       {} as ExecutionContext,
     );
-    const addressKey = captured.find((key) => key.includes(":addr:"));
+    const addressKey = capturedAddress.find((key) => key.includes(":addr:"));
     assert.ok(addressKey, "an address-keyed bucket must always be counted");
     addressKeys.add(addressKey!);
   }
@@ -79,7 +89,7 @@ test("unauthenticated bootstrap traffic is counted by address alone", async () =
       headers: { "cf-connecting-ip": "203.0.113.5" },
       body: "{}",
     }),
-    { AUTH_RATE_LIMITER: denyingLimiter(captured) },
+    { AUTH_RATE_LIMITER: limiter(captured, false) },
     {} as ExecutionContext,
   );
   assert.equal(response.status, 429);
@@ -96,7 +106,7 @@ test("OAuth mutation limiter returns a no-store 429", async () => {
       headers: { "cf-connecting-ip": "192.0.2.10" },
       body: "grant_type=refresh_token",
     }),
-    { AUTH_RATE_LIMITER: denyingLimiter(captured) },
+    { AUTH_RATE_LIMITER: limiter(captured, false) },
     {} as ExecutionContext,
   );
   assert.equal(response.status, 429);

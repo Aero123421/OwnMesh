@@ -213,12 +213,14 @@ fn set_config(paths: &OwnMeshPaths, key: &str, value: &str) -> Result<(), Config
         "active_instance" => {
             if value == "none" {
                 cfg.active_instance = None;
-            } else if valid_instance_id(value) && cfg.instances.iter().any(|item| item.id == value)
-            {
+            } else if cfg.instances.iter().any(|item| item.id == value) {
+                // Existing v1.2.0 setup files may contain a legacy alias that
+                // predates the strict writer syntax. Selecting an existing
+                // exact id is safe; creating a new id remains strict.
                 cfg.active_instance = Some(value.to_owned());
             } else {
                 return Err(ConfigCommandError::Usage(
-                    "active_instance must name an existing valid instance",
+                    "active_instance must name an existing instance",
                 ));
             }
         }
@@ -422,7 +424,7 @@ fn edit_config_with(
     let edited: OwnMeshConfig = value
         .try_into()
         .map_err(|_| ConfigCommandError::Usage("edited configuration is invalid"))?;
-    validate_edited_config(&edited)?;
+    validate_edited_config(&cfg, &edited)?;
     if active_issuer(&cfg) != active_issuer(&edited) {
         validate_session_issuer_binding(paths, &edited)?;
     }
@@ -547,11 +549,10 @@ fn validate_known_keys(value: &toml::Value) -> Result<(), ConfigCommandError> {
     Ok(())
 }
 
-/// The single, complete configuration gate.
+/// The complete gate for an on-disk configuration.
 ///
-/// `config validate`, `config edit`, and `config set` all route through this so
-/// no command can approve a file another command rejects. Messages name the
-/// failing field without echoing any value.
+/// Legacy aliases written by v1.2.0 setup remain valid on read. Writers that
+/// introduce a new alias apply the stricter `valid_instance_id` syntax.
 fn validate_full_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
     cfg.validate()
         .map_err(|_| ConfigCommandError::Usage("configuration failed schema validation"))?;
@@ -568,11 +569,6 @@ fn validate_full_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
 
     let mut ids = HashSet::with_capacity(cfg.instances.len());
     for instance in &cfg.instances {
-        if !valid_instance_id(&instance.id) {
-            return Err(ConfigCommandError::Usage(
-                "every instance id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
-            ));
-        }
         if !ids.insert(instance.id.as_str()) {
             return Err(ConfigCommandError::Usage("instance ids must be unique"));
         }
@@ -585,11 +581,6 @@ fn validate_full_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
         }
     }
     if let Some(active) = cfg.active_instance.as_deref() {
-        if !valid_instance_id(active) {
-            return Err(ConfigCommandError::Usage(
-                "active_instance must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
-            ));
-        }
         if !ids.contains(active) {
             return Err(ConfigCommandError::Usage(
                 "active_instance does not name any configured instance",
@@ -599,8 +590,23 @@ fn validate_full_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
     Ok(())
 }
 
-fn validate_edited_config(cfg: &OwnMeshConfig) -> Result<(), ConfigCommandError> {
-    validate_full_config(cfg)
+fn validate_edited_config(
+    original: &OwnMeshConfig,
+    edited: &OwnMeshConfig,
+) -> Result<(), ConfigCommandError> {
+    validate_full_config(edited)?;
+    for instance in &edited.instances {
+        let preserves_existing = original
+            .instances
+            .iter()
+            .any(|existing| existing.id == instance.id);
+        if !preserves_existing && !valid_instance_id(&instance.id) {
+            return Err(ConfigCommandError::Usage(
+                "new instance ids must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_session_issuer_binding(

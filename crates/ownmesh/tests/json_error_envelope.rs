@@ -149,6 +149,29 @@ fn json_failures_do_not_print_two_envelopes() {
     );
 }
 
+#[test]
+fn doctor_failure_is_one_conforming_report() {
+    let root = isolated_root();
+    let config_dir = root.path().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), "not = [valid").unwrap();
+
+    let (code, stdout, stderr) = run_json(&root, &["doctor"]);
+    assert_ne!(code, 0, "doctor unexpectedly succeeded: {stderr}");
+    let value: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+        panic!("doctor emitted multiple/invalid JSON values ({error}): {stdout}")
+    });
+    assert_eq!(value.get("ok").and_then(Value::as_bool), Some(false));
+    assert_eq!(
+        value.get("exit_code").and_then(Value::as_i64),
+        Some(i64::from(code))
+    );
+    assert!(value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .is_some());
+}
+
 /// A command with a documented offline fallback must not emit a failure
 /// envelope before succeeding.
 ///

@@ -68,7 +68,11 @@ test("wrangler.jsonc has D1 + DeviceRoom and no R2/TURN bindings", () => {
   }[];
   assert.deepEqual(
     rateLimits.map((entry) => entry.name).sort(),
-    ["AUTH_RATE_LIMITER", "MCP_RATE_LIMITER"],
+    ["AUTH_IP_RATE_LIMITER", "AUTH_RATE_LIMITER", "MCP_IP_RATE_LIMITER", "MCP_RATE_LIMITER"],
   );
   assert.ok(rateLimits.every((entry) => entry.simple.period === 60));
+  assert.equal(rateLimits.find((entry) => entry.name === "AUTH_RATE_LIMITER")?.simple.limit, 60);
+  assert.equal(rateLimits.find((entry) => entry.name === "MCP_RATE_LIMITER")?.simple.limit, 120);
+  assert.equal(rateLimits.find((entry) => entry.name === "AUTH_IP_RATE_LIMITER")?.simple.limit, 600);
+  assert.equal(rateLimits.find((entry) => entry.name === "MCP_IP_RATE_LIMITER")?.simple.limit, 1200);
 });
