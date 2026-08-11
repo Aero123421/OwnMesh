@@ -1618,7 +1618,7 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
     };
     assert.equal(firstBody.ok, true);
     assert.equal(firstBody.decision, "approve");
-    assert.equal(firstBody.status, "pending");
+    assert.equal(firstBody.status, "approval_required");
     assert.equal(firstBody.route?.status, "routed_to_device");
 
     // Real DeviceRoom delivered bound approval.decision to the agent frame.
@@ -1663,9 +1663,10 @@ test("production-path: /approve auth+CSRF+one-time delivers decision via real De
       targetHash,
     );
 
-    // Authoritative transition only after successful delivery.
-    assert.equal((await store.getMcpOperation(opId))?.status, "pending");
-    assert.equal((await store.getMcpOperation(opId))?.approval_required, false);
+    // Delivery alone is not execution. The operation remains nonterminal until
+    // the Agent returns the authoritative result for this exact decision.
+    assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
+    assert.equal((await store.getMcpOperation(opId))?.approval_required, true);
 
     // One-time: same transaction rejected (replay/TOCTOU).
     const second = await postOnce();
