@@ -66,14 +66,21 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets --locked ${{ matrix.workspace_test_args }}
 
-      # These crates exercise OS-global PTY/process teardown and duplicate the
-      # daemon runtime tests across integration binaries. Keep only this narrow
-      # stateful slice serial; the rest of the workspace stays parallel.
-      - name: Linux stateful daemon tests (serialized)
+      # The daemon integration targets path-include runtime.rs, which would run
+      # the same unit tests once per target. Run the units once, then each
+      # target's own tests. Keep PTY teardown serial on Linux.
+      - name: Linux daemon and PTY tests
         if: matrix.os == 'ubuntu-latest'
-        run: >-
-          cargo test -p ownmeshd -p ownmesh-session-host
-          --all-targets --locked -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p ownmeshd --bin ownmeshd --locked
+          cargo test -p ownmeshd --test adversarial_security --locked -- --skip 'runtime::'
+          cargo test -p ownmeshd --test lease_expiry --locked -- --skip 'runtime::'
+          cargo test -p ownmeshd --test persist_rollback --locked -- --skip 'runtime::'
+          cargo test -p ownmeshd --test broker_capability_forgery --locked
+          cargo test -p ownmeshd --test platform_endpoint_security --locked
+          cargo test -p ownmesh-session-host --all-targets --locked -- --test-threads=1
 
       - name: Enforce Windows foreign-owner custody regression
         if: matrix.os == 'windows-latest'
