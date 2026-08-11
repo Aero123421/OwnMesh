@@ -1236,7 +1236,7 @@ unsafe fn libc_renameat(
 }
 
 #[cfg(target_os = "linux")]
-type LibcChar = i8;
+type LibcChar = libc::c_char;
 
 /// Delete a path after handle identity revalidation in restricted mode.
 pub(crate) fn delete_enforced(ws: &WorkspaceRoot, rel: &Path, recursive: bool) -> FsResult<()> {
