@@ -1,71 +1,95 @@
-# OwnMesh 1.0 Definition of Done — Release-quality audit
+# OwnMesh 1.x Definition of Done — release-quality audit
 
-**Release train:** v1.1.0
+**Release train:** v1.2.0
 
-**Audit date:** 2026-08-06
+**Audit date:** 2026-08-11
 
-**Authority:** `OWNMESH_SPECIFICATION.ja.md` §33 and the shipped-surface registry below
+**Authority:** `OWNMESH_SPECIFICATION.ja.md` §33 and the shipped-surface registry
 
-**Scope authority:** [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json)
+**Shipped-surface authority:**
+[`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json)
 
 ## Conclusion
 
-OwnMesh 1.x is **not complete against the specification DoD**. The parsed CLI contains **22 explicit unsupported CLI surfaces** from the authoritative Rust registry plus 5 additional hard-error unsupported surfaces (**27 total**), recorded in `release/SUPPORTED_SURFACES.json`; these surfaces are excluded from the completeness claim and return explicit errors. Remote routing hard-fails rather than falling back locally, and `approval watch` does not degrade to a one-shot list.
+OwnMesh v1.2.0 is a stable release for the product surface admitted by the
+machine-checked registry. The Rust unsupported registries and the manifest both
+contain zero intentionally unimplemented CLI surfaces. Parser acceptance alone
+does not count: the admitted commands have fail-closed handlers and the relevant
+local or authenticated control-plane route.
 
-The v1.0.2 remediation made build/security/release evidence fail-closed. v1.1.0 adds onboarding (setup/doctor/user-level service) and signed distribution/update without claiming full specification completeness. “Library exists”, “parser accepts a command”, and “workflow exists” are not counted as end-to-end completion.
+This scoped completeness claim is deliberately narrower than §33 of the full
+target specification. Native code signing/notarization, some cross-platform
+privileged-route receipts, a fully automated external ChatGPT receipt, and an
+independent security review remain separate evidence or packaging work. Those
+items do not make implemented v1.2.0 commands “beta”, but they also must not be
+reported as completed proof.
 
-Legend: **done** = current shipped behavior is covered · **partial** = useful implementation exists but the specification item is not complete · **unsupported** = excluded from 1.0.x.
+Legend: **done** = shipped behavior and repository evidence cover the item ·
+**partial** = useful shipped behavior exists, but the broader specification or
+external evidence is incomplete · **out of scope** = explicitly not part of the
+v1.2.0 stable product surface.
 
 ## §33 DoD (18 items)
 
 | # | DoD item | Honest status | Evidence / remaining gap |
 |---|---|---|---|
-| 1 | Signed release Win/macOS/Linux | **partial** | Five portable archives (Win x64, macOS arm64/x64, Linux musl arm64/x64) with LICENSE/NOTICE/README/notes, checksums, enrolled minisign trust root, strict SBOMs, and GitHub provenance are gated. Shell/PowerShell installers and Homebrew formula rendering ship. Universal macOS package and Authenticode/Apple notarization remain W-SIGN. |
-| 2 | Deploy to own Cloudflare | **partial** | Wrangler config/docs and CI dry-run exist; live-account certification remains W-LIVE-E2E. |
-| 3 | D1/DO/Worker auto provision | **partial** | Migrations and bindings exist; deployment still requires account-specific setup. |
-| 4 | OAuth ChatGPT Personal Plugin | **partial** | Server/CLI automated flows exist; live ChatGPT account E2E remains W-LIVE-E2E. |
-| 5 | Normal Chat read/write/command/session tools | **partial** | MCP harness covers routing; CLI `mcp serve` is explicitly unsupported and live integration is not certified. |
-| 6 | CLI/TUI set Full User / Full Access | **partial** | Policy presets, `setup`, and TUI implementation exist; the CLI no-argument TUI handoff remains unsupported. |
-| 7 | Privileged Broker per OS | **partial** | Security boundaries and transport implementations are tested. Native service activation/removal and verification are unsupported; templates/markers are never reported as installed service state. |
-| 8 | Generic command + arbitrary CLI PTY | **partial** | Local structured/shell execution and session foundations exist. Remote `exec --device` is unsupported. |
-| 9 | Official 9 profiles conformance | **partial** | Definitions/fixtures exist; all CLI profile commands are among the explicit unsupported surfaces. |
-| 10 | Session observer/controller handoff | **partial** | Session library and CLI lifecycle paths exist; broad production restart/PTY certification remains. |
-| 11 | TUI en/ja/zh-Hans/ru | **partial** | Separate TUI binary has completeness/snapshot tests; the combined CLI launch and all target UX depth are not complete. |
-| 12 | R2/TURN relay default disabled | **done** | Fail-closed invariant is tested; LAN/P2P feature depth is unsupported under W-§12. |
-| 13 | Central telemetry default disabled | **done** | Default-off invariant is tested; doctor/update ship with network-off defaults and opt-in probes. |
-| 14 | Local file/log not cloud-persisted by default | **done** | No R2/TURN binding and local-first defaults are regression-tested. |
-| 15 | Policy allow/ask/deny + temporary grant | **partial** | Library/daemon paths exist; policy rule mutation CLI is unsupported. |
-| 16 | Device revoke, lockdown, token revoke | **partial** | Automated local/control-plane paths exist; live deployment behavior is not certified. |
-| 17 | Security tests, fuzz, audit, SBOM, signed update | **partial** | CI/security are blocking, SBOM fallback is forbidden, and portable minisign-signed update is production-wired. External review is W-EXT-SEC; Authenticode/Apple notarization remain W-SIGN. |
-| 18 | Apache-2.0, SECURITY, CONTRIBUTING, threat model | **done** | Repository documentation exists; it no longer asserts full product completeness. |
+| 1 | Signed release Win/macOS/Linux | **partial** | Five portable archives (Windows x64, macOS arm64/x64, Linux musl arm64/x64) are gated with LICENSE/NOTICE/README/notes, non-empty CycloneDX SBOMs, SHA-256 checksums, mandatory minisign signature, and GitHub provenance. Authenticode, Apple notarization, universal/native installers remain out of scope. |
+| 2 | Deploy to own Cloudflare | **done** | Guided deployment creates/reuses account resources, applies D1 migrations, deploys the Worker, provisions required secrets, and reports connection URLs. |
+| 3 | D1/DO/Worker auto provision | **done** | Wrangler configuration, migrations, Durable Object binding, and guided resource provisioning are shipped; the user still supplies and owns the Cloudflare account. |
+| 4 | OAuth ChatGPT Personal Plugin | **partial** | DCR, authorization-code/PKCE, rotating refresh, passkey owner login, and exact callbacks are implemented. A manual live ChatGPT compatibility receipt exists; reproducible automated external E10 evidence remains open. |
+| 5 | Normal Chat read/write/command/session tools | **done** | Public MCP routing and bounded `ownmesh mcp serve --stdio` are implemented with authenticated issuer binding, bounded messages, and no local-routing fallback. |
+| 6 | CLI/TUI set Full User / Full Access | **done** | No-argument TUI launch, setup policy selection, typed presets, and structured policy mutation are supported. Sensitive mutation uses fresh passkey approval. |
+| 7 | Privileged Broker per OS | **partial** | Networkless native lifecycle is implemented on Linux, macOS, and Windows while `ownmeshd` remains unprivileged. Linux has a native root receipt; macOS/Windows native release receipts and the full public E8 route remain open evidence. |
+| 8 | Generic command + arbitrary CLI PTY | **done** | Local exact-argv execution, authenticated remote exec/session creation, PTY lifecycle, bounded replay, process-tree termination, and explicit idempotency are supported. Raw shell is an explicit mode and never silently replaces structured execution. |
+| 9 | Official 9 profiles conformance | **done** | Nine structured adapters, device detection, persistent profile sessions, public MCP routing, and CLI scan/list/show/login/test/start/resume are implemented. |
+| 10 | Session observer/controller handoff | **done** | Session list/show/attach/claim/release/give/close/terminate, observer ACLs, expiring controller leases, durable handoff, and bounded replay are shipped and regression-tested. |
+| 11 | TUI en/ja/zh-Hans/ru | **done** | The Ratatui UI and no-argument CLI handoff ship with en-US, ja-JP, zh-Hans, and ru-RU resources plus locale/snapshot coverage. |
+| 12 | R2/TURN relay default disabled | **done** | Relay is absent/disabled by default and the fail-closed invariant is tested. LAN/P2P discovery depth is not required for the v1.2.0 transfer route. |
+| 13 | Central telemetry default disabled | **done** | Setup defaults telemetry off; doctor and update keep network access off unless configured or explicitly requested. |
+| 14 | Local file/log not cloud-persisted by default | **done** | Local-first defaults are regression-tested. Transfer persists only explicitly requested bounded artifact pages and excludes credentials/private key material. |
+| 15 | Policy allow/ask/deny + temporary grant | **done** | Typed policy show/validate/explain/preset/rule mutation, exact approval decisions, and bounded temporary grants are shipped. Unsafe generic command/shell grants are deliberately refused while one-shot approval remains available. |
+| 16 | Device revoke, lockdown, token revoke | **done** | Device lifecycle, lockdown/unlock, and typed token revoke are implemented. Security-sensitive recovery/mutation requires fresh operation-bound passkey approval. |
+| 17 | Security tests, fuzz, audit, SBOM, signed update | **partial** | Blocking CI/security gates, fuzz targets, strict SBOM generation, signed update, and fail-closed release dependencies ship. Independent external review and native platform signing remain open. |
+| 18 | Apache-2.0, SECURITY, CONTRIBUTING, threat model | **done** | Repository policy and security documentation exist and distinguish stable product scope from aspirational specification scope. |
 
-## Release-quality gates implemented for v1.0.2
+## Release-quality gates
 
-- Rust is pinned to 1.92.0 in Cargo metadata, `rust-toolchain.toml`, CI, Security, Release, README, and CONTRIBUTING.
-- CI requires `fmt`, `clippy -D warnings`, build, and tests with lockfile enforcement on Windows, Linux, and macOS.
-- CI requires frozen pnpm install plus recursive test/typecheck/lint and a blocking Wrangler dry-run.
-- Release calls CI and Security as reusable prerequisite jobs. Normal `needs` semantics prohibit build/publish after any prerequisite failure.
-- Release requires all three portable platform archives, mandatory LICENSE/NOTICE/README/current notes in each archive, and both non-empty CycloneDX SBOMs; no empty SBOM fallback exists.
-- Portable shell/PowerShell installers ship; universal macOS packaging remains unimplemented and is not a release-coverage claim.
-- Release notes are selected from the current tag. Provenance is attested. Missing minisign credentials **fail** formal release publish (no degraded unsigned formal release).
-- `scripts/check_release_quality.py` mechanically checks the publish dependency graph, fail-closed workflow patterns, toolchain pins, release-note scope, and the registry-backed unsupported surface manifest (currently 32 explicit / 39 total).
+- Rust 1.92.0, Node 22, and pnpm 9.15.0 are pinned.
+- CI requires Rust format, strict Clippy, build, and tests with lockfile
+  enforcement, plus frozen TypeScript install/test/typecheck/lint and Wrangler
+  dry-run.
+- Release publication depends on both reusable CI and Security workflows. A
+  failed prerequisite prevents build and publish.
+- Every platform archive must contain the current LICENSE, NOTICE, README, and
+  tag-selected release notes. Empty SBOM fallback is forbidden.
+- Formal publication requires the enrolled minisign key; unsigned degraded
+  release is forbidden. Provenance is attested by GitHub.
+- `scripts/check_release_quality.py` checks the publish graph, fail-closed
+  workflow patterns, toolchain/version alignment, release-note selection, and
+  the registry-backed surface manifest. For v1.2.0 the unsupported counts are
+  zero and `completeness_claim` is true.
 
-## Explicit waivers and non-goals
+## Explicit caveats and non-goals
 
-| ID | Scope | What the waiver does **not** mean |
+| ID | Scope | What it means |
 |---|---|---|
-| W-SIGN | Missing native platform signing/notarization (Authenticode / Apple) | Portable minisign is enrolled and required; checksums alone are not signatures. Native code-signing remains out of scope. |
-| W-LIVE-E2E | Live Cloudflare/ChatGPT account exercise | Automated harnesses do not prove live-account operation. |
-| W-EXT-SEC | External security review | Internal tests do not constitute an independent audit. |
-| W-§12 | LAN discovery/direct encrypted transfer depth | Relay-off behavior is done; transfer completeness is not. |
-| W-§14 | Residual update/doctor/support-bundle depth | Privacy defaults, doctor, and signed update ship; support-bundle depth and live multi-OS certification remain. |
+| W-SIGN | Authenticode / Apple signing and notarization | Portable minisign is enrolled and mandatory; native platform signing is not claimed. |
+| W-E8-RECEIPTS | macOS/Windows native broker receipt and full public privileged route | Implementation and unit/loopback evidence do not substitute for the missing opt-in native/public receipts. |
+| W-E10-AUTO | Automated external ChatGPT exercise | Manual live compatibility plus local reproducible suites do not equal a fully automated third-party receipt. |
+| W-EXT-SEC | Independent external security review | Internal tests and review do not constitute an independent audit. |
+| W-PACKAGING | MSI/NSIS and native/universal macOS package | Portable signed archives and verified one-line installers are the v1.2.0 distribution contract. |
 
-Waivers disclose risk or defer scope. They do not convert a **partial** or **unsupported** item into **done**.
+These caveats disclose evidence and scope. They do not reclassify implemented,
+registry-admitted v1.2.0 commands as unsupported, and they do not convert a
+broader §33 **partial** row into **done**.
 
 ## Required regression invariants
 
 - Full Access has no hidden hard denies.
-- Broker remains networkless.
-- Relay and telemetry remain off by default.
-- Unsupported routing fails explicitly; it never silently changes the requested target.
-- Apache-2.0 remains the repository license and secrets/private signing keys are never committed.
+- The privileged broker remains networkless and `ownmeshd` remains user-level.
+- Relay, telemetry, and automatic update network access remain off by default.
+- A requested remote target never falls back to a local action.
+- Security mutations require a typed operation and fresh, operation-bound human
+  approval; arbitrary method/parameter passthrough is forbidden.
+- Apache-2.0 remains the repository license and secrets/private signing keys are
+  never committed.

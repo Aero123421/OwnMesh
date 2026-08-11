@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.2.0 — Stable supported surface
+
+- **Complete shipped CLI:** the machine-checked supported-surface registry has
+  no intentionally unimplemented entries. Device rename/labels, remote
+  exec/session creation, profile flows, approval watch/decisions, typed policy
+  and recovery administration, transfer, and bounded MCP stdio are wired.
+- **Security administration:** approval, policy, unlock, and token mutations
+  require a fresh passkey decision bound to the exact operation and execute
+  exactly once; remote routes never fall back locally.
+- **Self-hosted UX:** signed one-line installers, desktop/headless quickstart,
+  guided Cloudflare deployment, rotating OAuth refresh tokens, and ChatGPT MCP
+  linking form one supported onboarding path.
+- **Evidence disclosure:** the networkless broker lifecycle is implemented on
+  Linux/macOS/Windows and has a Linux native receipt. macOS/Windows native and
+  full public E8 receipts, plus automated external ChatGPT E10 evidence, remain
+  tracked separately and are not claimed as live-proven.
+
 ## v1.2.0-beta.12 — E5 process-tree/replay integrity + E6 detect + E7 unified diff
 
 - **Self-hosting UX:** portable `wrangler.jsonc`, guided D1/migration/deploy/owner

@@ -1,34 +1,30 @@
 # OwnMesh onboarding
 
-This document describes the supported first-run and user-level service flow.
+This document covers the supported v1.2.0 first-run, ChatGPT connection, and
+user-level service flow. The machine-checked command contract is
+[`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
-Machine-checked surface list: [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
+## Install
 
-## Supported commands
+Linux or macOS:
 
-| Command | Role |
-|---|---|
-| `ownmesh setup` | Create config root, control-plane URL, policy preset, privacy defaults |
-| `ownmesh doctor` | Read-only diagnostics (`--json`, stable exit codes) |
-| `ownmesh service install\|start\|stop\|restart\|status\|uninstall` | Current-user `ownmeshd` autostart |
-| `ownmesh privileged install\|status\|uninstall` | Optional networkless root/admin broker |
+```bash
+curl -fsSL https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.sh | sh
+```
 
-The normal user service never becomes privileged. When explicitly installed,
-the separate broker uses systemd (Linux), launchd (macOS), or SCM (Windows).
+Windows PowerShell:
 
-## Privacy defaults (setup)
+```powershell
+$p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
+```
 
-`ownmesh setup` always writes:
+Both installers verify the mandatory minisign signature and SHA-256 checksum
+before installing. They extract into private staging with entry/size ceilings,
+an exact allowlist, and rejection of traversal, links, devices, and duplicate
+members. For a high-assurance bootstrap, download and inspect the installer and
+verify it against `SHA256SUMS`/`SHA256SUMS.minisig` before execution.
 
-- telemetry: **OFF** (`project`, `crash_upload`, `usage_analytics`)
-- cloud file relay: **OFF** (no relay enablement surface)
-- update network: **OFF** (`update.mode = "off"`)
-
-Secrets never appear in `config.toml`, setup JSON input, logs, or doctor output.
-
-## `ownmesh setup`
-
-### Recommended: finish the machine in one command
+## Recommended first run
 
 Desktop (opens the owner sign-in in the browser):
 
@@ -37,28 +33,45 @@ ownmesh setup --control-plane-url https://<worker>.workers.dev --quickstart
 ```
 
 SSH, Ubuntu Server, or another headless machine (prints a verification URL and
-short code that can be approved from a phone):
+short code that can be approved on a phone or another computer):
 
 ```bash
 ownmesh setup --control-plane-url https://<worker>.workers.dev \
   --quickstart --device-login --non-interactive --force
 ```
 
-`--quickstart` is only shorthand for the existing secure sequence: write local
-config and policy, OAuth login, enroll this device, then install the current-user
-`ownmeshd` autostart. It does not install the optional privileged broker.
+`--quickstart` performs the secure sequence already available as individual
+commands: write local config and policy, complete OAuth login, enroll this
+device, and install current-user `ownmeshd` autostart. It never installs the
+optional privileged broker.
 
-### Interactive (TTY)
+Verify the resulting machine without changing it:
 
 ```bash
-ownmesh setup
+ownmesh doctor --json
 ```
 
-Prompts for control-plane URL, instance id, policy preset, and language. Confirms before overwriting an existing config.
+## What setup stores
 
-### Non-interactive / automation
+`ownmesh setup` writes non-secret configuration and policy only. OAuth and
+device credentials are stored in the operating-system credential store.
+
+Privacy defaults are:
+
+- telemetry: **OFF** (`project`, `crash_upload`, `usage_analytics`)
+- cloud file relay: **OFF**
+- update network: **OFF** (`update.mode = "off"`)
+
+Secrets are rejected from setup JSON and never appear in `config.toml`, logs, or
+doctor output.
+
+### Interactive and automation modes
 
 ```bash
+# Interactive TTY
+ownmesh setup
+
+# Non-interactive
 ownmesh setup \
   --control-plane-url https://cp.example.workers.dev \
   --policy-preset recommended \
@@ -66,7 +79,7 @@ ownmesh setup \
   --force \
   --non-interactive
 
-# JSON object (path or "-")
+# JSON object from a file or stdin ("-")
 ownmesh setup --from-json setup.json --non-interactive
 ```
 
@@ -82,28 +95,95 @@ JSON shape:
 }
 ```
 
-Fail-closed rules:
+Setup fails closed when a non-interactive run lacks a control-plane URL, an
+existing config would be replaced without confirmation/`--force`, secret fields
+appear in JSON, or the URL is unsafe. Non-loopback HTTP, URL userinfo, query,
+fragment, and control characters are rejected; error messages redact the URL.
 
-- Non-TTY (or `--non-interactive`) without `control_plane_url` → error exit
-- Existing config without `--force` / confirmation → error exit
-- Secret markers in JSON (`refresh_token`, `access_token`, …) → refused
-- Non-loopback `http://` control-plane URLs → refused
-- Control-plane URLs with userinfo, query, fragment, or control characters → refused (errors redact the URL)
+Config and policy are committed as a journaled, locked two-file transaction.
+Every production reader performs recovery before consuming the live pair. If a
+write or rollback cannot be completed safely, the journal is preserved and the
+operation fails instead of exposing a mismatched config/policy pair.
 
-Config and policy writes use a **journaled two-file transaction** under an exclusive lock file in the config directory (temp + replace, with `.bak` on replace, durable recovery journal). Concurrent setup/recovery is serialized. A policy write failure rolls back so a new config is never left paired with an old strong policy. If rollback itself fails, the journal is **preserved** and the operation fails closed.
+## Deploy the user-owned control plane
 
-Every production path that loads config or policy (including `ownmeshd` startup and CLI reads that could act on policy) runs recovery under that lock **before** consuming the live pair. A leftover `config_written` journal is never ignored.
+From a repository clone:
 
-### Next steps printed by setup
+```bash
+cd packages/control-plane
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run deploy:guided
+```
 
-1. `ownmesh login`
-2. `ownmesh device enroll`
-3. `ownmesh service install`
-4. `ownmesh doctor`
+The guided deployment creates or reuses D1, applies migrations, deploys the
+Worker and Durable Object, provisions required secrets, and prints the owner
+login and MCP URLs. Re-running it does not silently rotate existing secrets.
+See [`deploy-cloudflare.md`](./deploy-cloudflare.md) for account prerequisites.
+
+## Connect ChatGPT
+
+1. Add the printed `https://<worker>/mcp` URL as a custom MCP connector in
+   ChatGPT and select OAuth.
+2. ChatGPT dynamically registers its public client and starts authorization
+   code + PKCE.
+3. OwnMesh shows the owner consent page. Sign in with the registered passkey.
+4. OwnMesh returns only to the exact ChatGPT callback registered for that
+   transaction and issues a short-lived access token plus a rotating refresh
+   token.
+5. ChatGPT uses the MCP URL until access is revoked. It refreshes access without
+   asking for the passkey on every normal tool call.
+
+The passkey protects owner identity; it is not copied to ChatGPT. A sensitive
+approval or admin mutation requests a fresh passkey assertion bound to that
+exact operation. A long-lived browser session alone is insufficient. See
+[`chatgpt-connection.md`](./chatgpt-connection.md) for connector fields and
+recovery details.
+
+## Day-to-day command areas
+
+| Area | Examples |
+|---|---|
+| Machine health | `ownmesh status`, `ownmesh doctor --json` |
+| Device metadata | `device list/show/rename/labels/rotate-key/revoke` |
+| Remote work | `exec --device … --idempotency-key …`, `session open <device> --idempotency-key …` |
+| AI CLI profiles | `profile scan/list/show/login/test/start/resume` |
+| Approvals | `approval list/show/watch/approve/deny` |
+| Policy/admin | `policy show/validate/explain/preset/rule`, `lockdown`, `unlock`, `tokens revoke` |
+| Transfer | `transfer plan/send/list/status/cancel` |
+| Local MCP bridge | `mcp serve --stdio` |
+
+Remote mutation keys are caller-selected and mandatory so a retry cannot create
+a second operation. A remote target that is unavailable fails as remote; it is
+never executed on the machine running the CLI.
+
+Device labels are replaced by the supplied bounded label set. Rename and label
+updates are owner-scoped and reject revoked devices. Transfer paths are
+workspace-relative; no overwrite/force mode exists.
+
+`ownmesh mcp serve --stdio` speaks bounded JSONL on stdin/stdout and forwards to
+the configured authenticated MCP issuer. Protocol replies are the only stdout
+content, so editor/agent integrations can parse the stream safely.
+
+## Fresh-passkey admin flow
+
+Approval decisions, policy changes, unlock, and token revocation are security
+mutations. They use typed requests rather than a generic local RPC escape hatch:
+
+1. OwnMesh validates and records the exact requested action.
+2. The browser approval page requires a fresh passkey assertion for that action.
+3. The control plane delivers a decision bound to the operation ID, payload
+   hash, owner/tenant, and expiry.
+4. The device validates the decision and executes the recorded mutation once.
+
+A forged same-user local socket request, stale browser cookie, replayed decision,
+different payload, or expired operation fails closed. Denial has no mutation
+side effect.
 
 ## `ownmesh doctor`
 
-Fully **read-only**: does not create config roots, keystores, unlock files, or services. Does **not** call OS credential store `load` / keychain APIs; credential checks use non-secret metadata (e.g. encrypted blob filenames) only.
+Doctor is fully read-only: it does not create config roots, keystores, unlock
+files, or services and does not load credential values from keychain APIs.
 
 ```bash
 ownmesh doctor
@@ -111,28 +191,14 @@ ownmesh doctor --json
 ownmesh doctor --check-network
 ```
 
-Checks (structured `id` / `pass|warn|fail`):
+It checks binary/config/service state, non-secret credential presence, daemon
+IPC reachability, policy/privacy defaults, and the configured control plane.
+Network is contacted only with `--check-network` or when a control-plane URL is
+already configured. Healthy/warn-only returns `0`; any fail check returns `2`.
 
-- binary version / path / `ownmeshd` location
-- config present / parse / validate / permissions
-- credential **presence** only (values never shown)
-- daemon local IPC reachability
-- control-plane URL configuration
-- control-plane `/health` **only** when `--check-network` is set **or** a control-plane URL is already configured
-- policy preset validity
-- privacy defaults (telemetry / relay / update network)
-- user-level service install state
+## User-level service
 
-### Exit codes
-
-| Outcome | Exit |
-|---|---|
-| healthy or warn only | `0` (Success) |
-| any `fail` check | `2` (Usage/config) |
-
-## `ownmesh service` (user-level only)
-
-Installs **current-user** autostart for `ownmeshd`. Never creates admin/root/LocalSystem services.
+`ownmesh service` manages only current-user `ownmeshd` autostart:
 
 | Platform | Mechanism | Unit / task |
 |---|---|---|
@@ -143,7 +209,6 @@ Installs **current-user** autostart for `ownmeshd`. Never creates admin/root/Loc
 ```bash
 ownmesh service install
 ownmesh service install --dry-run --json
-ownmesh service install --executable /path/to/ownmeshd
 ownmesh service start
 ownmesh service stop
 ownmesh service restart
@@ -151,45 +216,43 @@ ownmesh service status --json
 ownmesh service uninstall
 ```
 
-Security controls:
+Paths are canonicalized; unsafe links, writable locations, and descriptor
+injection are rejected. Descriptor writes are atomic and success is reported
+only after an OS probe confirms the state.
 
-- canonicalize executable and config/state/runtime paths
-- reject symlinks, world-writable paths, injection characters
-- quote / escape descriptors (Windows CommandLineToArgvW rules, systemd escaping, XML escaping)
-- atomic descriptor write
-- idempotent install/uninstall
-- success only after OS probe confirms state
+## Optional privileged broker
 
-### Official references
+Install the separate, networkless broker only when privileged commands are
+needed:
 
-- Windows tasks: [Task Scheduler schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-schema), [schtasks](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/schtasks)
-- macOS: [Creating Launchd Jobs](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
-- systemd user units: [systemd.unit](https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html)
+```bash
+sudo ownmesh privileged install
+ownmesh privileged status
+```
+
+Linux uses root systemd, macOS uses a root LaunchDaemon and
+audit-token-authenticated Unix socket, and Windows uses a LocalSystem SCM service
+with a SID-bound protected Named Pipe. `ownmeshd`, enrollment, configuration, and
+device keys remain in the normal user account.
+
+The lifecycle implementation exists on all three OS families. Linux has a
+native root receipt; macOS/Windows native release receipts and the complete
+public MCP-to-broker E8 receipt remain separate open evidence.
 
 ## Rollback
 
 | Action | Rollback |
 |---|---|
-| `setup` overwrite | Restore `config.toml.bak` / previous policy if present; or re-run setup with prior values |
-| `service install` | `ownmesh service uninstall` |
-| Wrong control-plane URL | `ownmesh setup --force --control-plane-url …` then `login` / `device enroll` again |
-| Doctor findings only | No mutation — fix underlying config/service/login |
+| Setup overwrite | Restore `config.toml.bak`/previous policy, or rerun setup with prior values and `--force` |
+| User service | `ownmesh service uninstall` |
+| Privileged broker | Run `ownmesh privileged uninstall` with administrator/root authority |
+| Wrong control-plane URL | Rerun setup with `--force`, then login/enroll again |
+| Failed update apply | Client restores the staged backup automatically |
+| Doctor findings | No rollback required; doctor performs no mutation |
 
-The privileged broker is separate and opt-in. Install it only when elevated
-commands are required: `sudo ownmesh privileged install` on Linux/macOS or an
-Administrator PowerShell on Windows. Normal OwnMesh operation remains in the
-user account.
+## Distribution scope
 
-## Installer archive handling
-
-Portable installers (`installers/ownmesh-installer.sh`, `installers/ownmesh-installer.ps1`) verify minisign → checksums, then enforce the updater archive contract **before** any member payload is written: entry-count and uncompressed-size caps, exact required binaries + declared docs only, no duplicates/symlinks/devices/traversal/unexpected members. Extraction is member-by-member into a private staging directory, then atomic install with backup/rollback.
-
-- Shell installer requires a `tar` that supports verbose listing (`tar -tvzf`) and single-member stdout extract (`tar -xOf` / `tar -xOzf`). If listing/parsing is unavailable, install **fails closed** (no full-archive fallback).
-- PowerShell installer uses `System.IO.Compression.ZipFile` only (never `Expand-Archive`).
-
-## Out of scope (still unsupported)
-
-- no-argument TUI handoff (`ownmesh` with no subcommand)
-- `mcp serve`, profile/process/multi-instance management, and `approval watch`
-- direct remote `exec --device` and `session open <device>` (use the public MCP tools)
-- Windows MSI/NSIS installers / macOS packages / notarization / Authenticode
+v1.2.0 supports signed portable archives and the verified shell/PowerShell
+one-line installers. Windows MSI/NSIS, native/universal macOS packages,
+Authenticode, and Apple notarization are outside this release's distribution
+contract.

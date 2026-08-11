@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
-  "release_train": "1.2.0-beta.12",
-  "completeness_claim": false,
+  "release_train": "1.2.0",
+  "completeness_claim": true,
   "supported": [
     "status",
     "setup (TTY wizard + non-interactive flags/JSON; privacy defaults OFF)",
     "login/logout",
     "doctor (read-only structured diagnostics; --json; network opt-in or when configured)",
-    "lockdown",
+    "lockdown (immediate local containment); unlock and token revoke (typed admin actions; fresh browser passkey approval)",
     "no-argument TUI launch and completion generation (bash/zsh/fish/powershell/elvish)",
     "config get/set/edit/validate (typed keys, atomic save, no secret fields)",
     "instance add/list/use/remove (validated control-plane URLs)",
@@ -16,8 +16,8 @@
     "process start/status/logs/stop (bounded daemon-owned sessions, exact argv)",
     "session list/show/open/attach/claim/release/give/close/terminate (local IPC; authenticated remote creation)",
     "profile scan/list/show/login/test/start/resume (credential-isolated daemon profile/session contract)",
-    "approval list/show/watch",
-    "policy show/validate/explain",
+    "approval list/show/watch/approve/deny (typed decisions; fresh browser passkey approval for mutations)",
+    "policy show/validate/explain/preset/rule mutation (typed admin actions; fresh browser passkey approval)",
     "transfer plan/send/list/status/cancel (authenticated control-plane MCP; immutable no-overwrite plans; idempotency keys required for mutations)",
     "mcp serve --stdio (authenticated configured issuer; bounded JSONL bridge)",
     "service install/start/stop/restart/status/uninstall (user-level ownmeshd autostart only)",
@@ -25,17 +25,9 @@
     "update check/download/apply/channel (signed GitHub releases; network off by default)",
     "workspace list/show/add/update/remove (device-local registry via ownmeshd IPC)"
   ],
-  "explicit_unsupported_count": 5,
-  "explicit_unsupported_surfaces": [
-    "approval approve",
-    "approval deny",
-    "policy preset",
-    "unlock",
-    "tokens revoke"
-  ],
-  "additional_unsupported": [
-    "policy rule mutation"
-  ],
-  "total_unsupported_surfaces": 6,
-  "notes": "v1.2.0-beta.12 integrity visit: E5 process-tree terminate (taskkill/T + Unix session kill), resize fail-closed without live host, live-ring remaining/continuation visibility, bounded pin/journal/spool/state reads; E6 public real-path nine-adapter structured events/replay/resume and safe auth status (CLI profile surfaces remain unsupported); E7 public real-path nested-repository review runs pinned argv-only git apply, bounded status/diff and typed result pages, pass/fail tests, exact-once/payload conflict, stale HEAD, workspace ACL rejection, and cancellation/process-tree termination without implicit ref/index mutation; E9 public real-path two-Agent transfer proves bounded binary/zero-byte artifacts, 32 MiB durable-cursor restart/resume, partial cancel cleanup, ownership denials and stopped D1/DO at-rest inspection. Transfer CLI uses only the authenticated public MCP transfer contract, keeps idempotency explicit, and has no LAN relay or overwrite/force fallback. E8 implements networkless native broker lifecycle on Linux, macOS, and Windows while leaving ownmeshd in the user account; Windows binds a protected Named Pipe to the exact user SID and immutable Program Files daemon image. Linux has a native root receipt; macOS/Windows native release receipts and the E8 public-route receipt remain open. Live ChatGPT DCR/OAuth/passkey return has a manual compatibility receipt, while automated E10 evidence remains open. completeness_claim stays false for explicit unsupported surfaces. SERVICE_VERSION 1.2.0-beta.12."
+  "explicit_unsupported_count": 0,
+  "explicit_unsupported_surfaces": [],
+  "additional_unsupported": [],
+  "total_unsupported_surfaces": 0,
+  "notes": "v1.2.0 stable surface contract. Completeness means every CLI surface admitted by this shipped registry has an implemented, fail-closed handler; it is not a claim that the aspirational specification, every optional packaging format, or every external platform receipt is complete. E5 provides bounded PTY/process-tree and replay behavior. E6 provides nine structured profile adapters plus CLI profile flows. E7 provides bounded unified-diff review execution. E9 provides authenticated resumable transfer and the public transfer CLI. Device metadata mutation, authenticated remote exec/session creation, approval watch, profile management, bounded MCP stdio, and typed security-admin actions are supported. Sensitive approval, policy, unlock, and token mutations require an operation-bound fresh passkey decision and execute exactly once. E8's networkless broker lifecycle is implemented on Linux, macOS, and Windows; Linux has a native root receipt, while macOS/Windows native release receipts and the full E8 public-route receipt remain open evidence. Live ChatGPT DCR/OAuth/passkey return has a manual compatibility receipt; reproducible automated E10 evidence remains open. SERVICE_VERSION 1.2.0."
 }
