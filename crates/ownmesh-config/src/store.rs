@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 /// Returns IO / parse / validation / migration / recovery errors.
 pub fn load_config(paths: &OwnMeshPaths) -> ConfigResult<OwnMeshConfig> {
     paths.ensure_layout()?;
-    ensure_config_policy_consistent(paths)?;
+    let _lock = acquire_config_policy_tx_lock(paths)?;
+    recover_config_policy_transaction_locked(paths)?;
     load_config_after_recovery(paths)
 }
 
@@ -63,7 +64,8 @@ fn load_config_after_recovery(paths: &OwnMeshPaths) -> ConfigResult<OwnMeshConfi
 pub fn save_config(paths: &OwnMeshPaths, cfg: &OwnMeshConfig) -> ConfigResult<()> {
     // Single-file writers also recover first so they never clobber a half-applied pair.
     paths.ensure_layout()?;
-    ensure_config_policy_consistent(paths)?;
+    let _lock = acquire_config_policy_tx_lock(paths)?;
+    recover_config_policy_transaction_locked(paths)?;
     save_config_unlocked(paths, cfg)
 }
 
@@ -90,7 +92,8 @@ fn save_config_unlocked(paths: &OwnMeshPaths, cfg: &OwnMeshConfig) -> ConfigResu
 /// Returns IO / parse / validation / recovery errors.
 pub fn load_policy(paths: &OwnMeshPaths) -> ConfigResult<PolicyFile> {
     paths.ensure_layout()?;
-    ensure_config_policy_consistent(paths)?;
+    let _lock = acquire_config_policy_tx_lock(paths)?;
+    recover_config_policy_transaction_locked(paths)?;
     load_policy_after_recovery(paths)
 }
 
@@ -120,7 +123,8 @@ fn load_policy_after_recovery(paths: &OwnMeshPaths) -> ConfigResult<PolicyFile> 
 /// Returns validation or IO errors.
 pub fn save_policy(paths: &OwnMeshPaths, policy: &PolicyFile) -> ConfigResult<()> {
     paths.ensure_layout()?;
-    ensure_config_policy_consistent(paths)?;
+    let _lock = acquire_config_policy_tx_lock(paths)?;
+    recover_config_policy_transaction_locked(paths)?;
     save_policy_unlocked(paths, policy)
 }
 
@@ -916,6 +920,7 @@ mod tests {
             schema_version: 1,
             preset: Some("recommended".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
         save_config_and_policy_transactional(&paths, &cfg, &policy).unwrap();
         assert!(!transaction_path(&paths).exists());
@@ -942,6 +947,7 @@ mod tests {
             schema_version: 1,
             preset: Some("full_access".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
         save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -958,6 +964,7 @@ mod tests {
             schema_version: 1,
             preset: Some("workspace_only".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
 
         // Simulate crash after config stage: journal left in config_written with new config
@@ -1007,6 +1014,7 @@ mod tests {
             schema_version: 1,
             preset: Some("full_access".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
         save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -1023,6 +1031,7 @@ mod tests {
             schema_version: 1,
             preset: Some("workspace_only".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
         let new_config = toml::to_string_pretty(&new_cfg).unwrap();
         let new_policy_text = toml::to_string_pretty(&new_policy).unwrap();
@@ -1123,6 +1132,7 @@ mod tests {
             schema_version: 1,
             preset: Some("recommended".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
         save_config_and_policy_transactional(&paths, &initial, &policy).unwrap();
 
@@ -1151,6 +1161,7 @@ mod tests {
                         "workspace_only".into()
                     }),
                     delegate_remote_mcp: false,
+                    rules: Vec::new(),
                 };
                 barrier.wait();
                 save_config_and_policy_transactional(&paths, &cfg, &pol).expect("serialized setup");
@@ -1186,6 +1197,7 @@ mod tests {
             schema_version: 1,
             preset: Some("recommended".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
         save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -1202,6 +1214,7 @@ mod tests {
             schema_version: 1,
             preset: Some("workspace_only".into()),
             delegate_remote_mcp: false,
+            rules: Vec::new(),
         };
 
         // Fault-inject policy destination as a non-empty directory so atomic_write fails.

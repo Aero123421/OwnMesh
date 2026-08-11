@@ -147,6 +147,7 @@ pub fn apply_setup(paths: &OwnMeshPaths, lang: Lang, preset: AccessPreset) -> Re
         schema_version: 1,
         preset: Some(preset_wire_name(preset).into()),
         delegate_remote_mcp: false,
+        rules: Vec::new(),
     };
     policy.validate().map_err(|e| e.to_string())?;
     save_policy(paths, &policy).map_err(|e| e.to_string())?;

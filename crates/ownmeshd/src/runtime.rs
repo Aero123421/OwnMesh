@@ -67,7 +67,7 @@ use ownmesh_logs::{
 use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
     temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
-    ExecutableIdentityBinding, OperationFacts, PolicyDocument, TemporaryGrant,
+    ExecutableIdentityBinding, OperationFacts, PolicyDocument, PolicyRule, TemporaryGrant,
 };
 use ownmesh_profiles::{
     official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
@@ -262,6 +262,90 @@ pub enum PendingRequest {
     LogsQuery(LogsQueryParams),
     GitStatus(GitStatusParams),
     GitDiff(GitDiffParams),
+    AdminPolicyPreset(AdminPolicyPresetParams),
+    AdminPolicyRuleAdd(AdminPolicyRuleAddParams),
+    AdminPolicyRuleRemove(AdminPolicyRuleRemoveParams),
+    AdminDaemonUnlock(AdminDaemonUnlockParams),
+    AdminTokenRevoke(AdminTokenRevokeParams),
+    AdminApprovalBridge(AdminApprovalBridgeParams),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminPolicyPresetParams {
+    pub name: String,
+    #[serde(default)]
+    pub delegate_remote_mcp: Option<bool>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminPolicyRuleAddParams {
+    pub id: String,
+    pub decision: Decision,
+    pub capability: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub when_elevated: Option<bool>,
+    #[serde(default)]
+    pub when_kind: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub program_equals: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub idempotency_key: String,
+}
+
+impl AdminPolicyRuleAddParams {
+    fn rule(&self) -> PolicyRule {
+        PolicyRule {
+            id: self.id.clone(),
+            decision: self.decision,
+            priority: self.priority,
+            capability: self.capability.clone(),
+            when_elevated: self.when_elevated,
+            when_kind: self.when_kind.clone(),
+            path_prefix: self.path_prefix.clone(),
+            program_equals: self.program_equals.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminPolicyRuleRemoveParams {
+    pub id: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminDaemonUnlockParams {
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminTokenRevokeParams {
+    pub principal: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminApprovalBridgeParams {
+    pub approval_id: String,
+    pub decision: String,
+    #[serde(default)]
+    pub temporary_grant: bool,
+    #[serde(default)]
+    pub grant_seconds: Option<i64>,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +555,9 @@ struct WorkspaceRegistryFile {
 pub struct DaemonRuntime {
     paths: OwnMeshPaths,
     policy: PolicyDocument,
+    /// User-authored bounded overlay persisted in policy.toml. Kept separate
+    /// from built-in preset rules so preset replacement and rule removal are exact.
+    custom_policy_rules: Vec<PolicyRule>,
     /// Explicit local setup choice: authenticated, exact-bound remote MCP
     /// invocation may satisfy a policy Ask. Defaults fail-closed to false.
     delegate_remote_mcp: bool,
@@ -575,6 +662,7 @@ impl DaemonRuntime {
             format!("policy load failed (refusing startup; config+policy journal preserved on recovery failure): {e}")
         })?;
         let policy = policy_from_file(&policy_file);
+        let custom_policy_rules = policy_file.rules.clone();
         let delegate_remote_mcp = policy_file.delegate_remote_mcp;
         let enforce_workspace = matches!(
             policy.preset,
@@ -629,6 +717,7 @@ impl DaemonRuntime {
         Ok(Self {
             paths: paths.clone(),
             policy,
+            custom_policy_rules,
             delegate_remote_mcp,
             grants,
             approvals,
@@ -1101,6 +1190,7 @@ impl DaemonRuntime {
         // Local recovery methods remain available during lockdown.
         const ALLOWED: &[&str] = &[
             methods::DAEMON_UNLOCK,
+            methods::ADMIN_DAEMON_UNLOCK_REQUEST,
             methods::DAEMON_LOCKDOWN,
             methods::APPROVAL_LIST,
             methods::APPROVAL_SHOW,
@@ -1118,6 +1208,162 @@ impl DaemonRuntime {
             });
         }
         Ok(())
+    }
+
+    fn check_pending_request_lockdown(&self, request: &PendingRequest) -> IpcResult<()> {
+        if matches!(request, PendingRequest::AdminDaemonUnlock(_)) && !self.lockdown {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "device is not in emergency lockdown".into(),
+            });
+        }
+        if self.lockdown && !matches!(request, PendingRequest::AdminDaemonUnlock(_)) {
+            return Err(IpcError::Remote {
+                code: app_error::LOCKDOWN,
+                message: "emergency lockdown active; only a bound admin unlock may execute".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn enqueue_bound_admin_request(
+        &mut self,
+        capability: &str,
+        reason: &str,
+        request: PendingRequest,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let operation_id = self
+            .active_remote_operation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "admin request requires an exact-bound control-plane operation".into(),
+            })?
+            .to_owned();
+        let payload_hash = self
+            .active_remote_payload_hash
+            .as_deref()
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "admin request requires a verified payload hash".into(),
+            })?
+            .to_ascii_lowercase();
+        let expires_at = self
+            .active_remote_expires_at_unix
+            .filter(|expiry| *expiry >= Self::now())
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "admin request authorization is missing or expired".into(),
+            })?;
+        if self
+            .active_remote_device_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+            || self.active_remote_principal_credential_generation.is_none()
+        {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "admin request lacks verified device or credential-generation binding"
+                    .into(),
+            });
+        }
+        let requester_principal = canonicalize_principal_key(client.principal_key());
+        if requester_principal.is_empty()
+            || self.active_remote_principal.as_deref() != Some(requester_principal.as_str())
+        {
+            return Err(IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "admin requester does not match the verified remote principal".into(),
+            });
+        }
+        if let Some(existing) = self
+            .approvals
+            .values()
+            .find(|record| record.operation_id == operation_id)
+        {
+            if existing.state == "pending"
+                && existing.target_payload_hash.as_deref() == Some(&payload_hash)
+            {
+                return Ok(json!({
+                    "approval_required": true,
+                    "operation_id": operation_id,
+                    "approval_id": existing.id,
+                    "reason": existing.reason,
+                    "replayed": true,
+                }));
+            }
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "admin operation already exists with different or terminal state".into(),
+            });
+        }
+
+        let approval_id = Self::new_id("apr_");
+        let facts = OperationFacts {
+            capability: capability.to_owned(),
+            kind: "admin".into(),
+            ..Default::default()
+        };
+        let record = ApprovalRecord {
+            id: approval_id.clone(),
+            operation_id: operation_id.clone(),
+            capability: capability.to_owned(),
+            state: "pending".into(),
+            reason: reason.to_owned(),
+            created_at_unix: Self::now(),
+            decided_at_unix: None,
+            expires_at_unix: Some(expires_at),
+            target_payload_hash: Some(payload_hash),
+            matched_rule_id: None,
+            requester_principal,
+            facts: Some(facts),
+            request,
+            result: None,
+            decided_by_principal: None,
+        };
+        let snapshot = self.approvals.clone();
+        self.approvals.insert(approval_id.clone(), record);
+        if let Err(error) = self.persist_approvals() {
+            self.approvals = snapshot;
+            return Err(error);
+        }
+        self.append_audit(
+            "admin.approval_enqueued",
+            Some(capability),
+            Some(&operation_id),
+            Some("ask"),
+            format!("approval {approval_id}"),
+        );
+        Ok(json!({
+            "approval_required": true,
+            "operation_id": operation_id,
+            "approval_id": approval_id,
+            "reason": reason,
+            "replayed": false,
+        }))
+    }
+
+    fn approval_target_preview(target: &ApprovalRecord) -> Value {
+        fn bounded(value: &str, max_chars: usize) -> String {
+            value.chars().take(max_chars).collect()
+        }
+
+        let facts = target.facts.as_ref();
+        json!({
+            "approval_id": bounded(&target.id, 128),
+            "operation_id": bounded(&target.operation_id, 256),
+            "capability": bounded(&target.capability, 128),
+            "reason": bounded(&target.reason, 512),
+            "kind": facts.map(|value| bounded(&value.kind, 128)).unwrap_or_default(),
+            "program": facts.and_then(|value| value.program.as_deref()).map(|value| bounded(value, 512)),
+            "path": facts.and_then(|value| value.path.as_deref()).map(|value| bounded(value, 1_024)),
+            "elevated": facts.is_some_and(|value| value.elevated),
+            "workspace_relative": facts.is_some_and(|value| value.workspace_relative),
+        })
     }
 
     fn evaluate(
@@ -1356,6 +1602,25 @@ impl DaemonRuntime {
             PendingRequest::LogsQuery(p) => self.execute_logs_query(p),
             PendingRequest::GitStatus(p) => self.execute_git_status(p),
             PendingRequest::GitDiff(p) => self.execute_git_diff(p),
+            PendingRequest::AdminPolicyPreset(p) => self.execute_admin_policy_preset(p),
+            PendingRequest::AdminPolicyRuleAdd(p) => self.execute_admin_policy_rule_add(p),
+            PendingRequest::AdminPolicyRuleRemove(p) => self.execute_admin_policy_rule_remove(p),
+            PendingRequest::AdminDaemonUnlock(_) => {
+                if !self.lockdown {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: "device is not in emergency lockdown".into(),
+                    });
+                }
+                self.handle_unlock()
+            }
+            PendingRequest::AdminTokenRevoke(p) => {
+                self.handle_token_revoke(Some(json!({ "principal": p.principal })))
+            }
+            PendingRequest::AdminApprovalBridge(_) => Err(IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "approval bridge requires the authenticated approval executor".into(),
+            }),
         }
     }
 
@@ -4281,6 +4546,14 @@ full_user_access/full_access for arbitrary commands",
         let capability = rec.capability.clone();
         let operation_id = rec.operation_id.clone();
         let requester_principal = rec.requester_principal.clone();
+        if let PendingRequest::AdminTokenRevoke(target) = &request {
+            if canonicalize_principal_key(&target.principal) == requester_principal {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "cannot revoke the principal that authorized this request".into(),
+                });
+            }
+        }
         // Server-captured policy facts only — never trust client-supplied grant scope.
         let approved_facts = rec.facts.clone();
         let raw_idem_key = match &request {
@@ -4293,6 +4566,12 @@ full_user_access/full_access for arbitrary commands",
             PendingRequest::LogsQuery(x) => x.idempotency_key.clone(),
             PendingRequest::GitStatus(x) => x.idempotency_key.clone(),
             PendingRequest::GitDiff(x) => x.idempotency_key.clone(),
+            PendingRequest::AdminPolicyPreset(x) => Some(x.idempotency_key.clone()),
+            PendingRequest::AdminPolicyRuleAdd(x) => Some(x.idempotency_key.clone()),
+            PendingRequest::AdminPolicyRuleRemove(x) => Some(x.idempotency_key.clone()),
+            PendingRequest::AdminDaemonUnlock(x) => Some(x.idempotency_key.clone()),
+            PendingRequest::AdminTokenRevoke(x) => Some(x.idempotency_key.clone()),
+            PendingRequest::AdminApprovalBridge(x) => Some(x.idempotency_key.clone()),
         };
         // Same principal namespace as gate_and_run so approve + direct retry share one slot.
         let idem_key = raw_idem_key
@@ -4300,6 +4579,14 @@ full_user_access/full_access for arbitrary commands",
             .map(|k| principal_journal_key(&requester_principal, k));
 
         // Build (or refuse) the temporary grant before mutating durable approval state.
+        if p.temporary_grant && pending_request_is_admin(&request) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "temporary grants are not supported for admin or approval-bridge actions"
+                    .into(),
+            });
+        }
+        self.check_pending_request_lockdown(&request)?;
         let pending_grant = if p.temporary_grant {
             let secs = p.grant_seconds.unwrap_or(DEFAULT_GRANT_SECS);
             // Bind the grant to the requester that was approved — never a global prin_local.
@@ -4400,10 +4687,17 @@ full_user_access/full_access for arbitrary commands",
         // failure.
         let executing_approvals = self.approvals.clone();
         let executing_op_journal = self.op_journal.clone();
+        let is_approval_bridge = matches!(&request, PendingRequest::AdminApprovalBridge(_));
         let result = match &request {
             PendingRequest::Exec(p) => self.execute_exec(p, false).await,
+            PendingRequest::AdminApprovalBridge(p) => {
+                self.execute_approval_bridge(p, &approver).await
+            }
             other => self.execute_request(other).await,
         }?;
+        // A bridge may have durably completed its target approval. Preserve that
+        // terminal target state if finalizing the outer bridge later fails.
+        let post_execution_approvals = is_approval_bridge.then(|| self.approvals.clone());
         let body = json!({
             "approval_required": false,
             "operation_id": operation_id,
@@ -4415,8 +4709,10 @@ full_user_access/full_access for arbitrary commands",
         });
 
         if let Err(e) = self.store_idempotent(idem_key.as_ref(), &body) {
-            self.op_journal = executing_op_journal;
-            self.approvals = executing_approvals;
+            if !is_approval_bridge {
+                self.op_journal = executing_op_journal;
+                self.approvals = executing_approvals;
+            }
             return Err(e);
         }
 
@@ -4429,7 +4725,7 @@ full_user_access/full_access for arbitrary commands",
             // The operation ran. Keep the durable and in-memory non-retriable
             // marker rather than pretending this approval is pending again. A
             // successfully persisted op-journal completion remains usable.
-            self.approvals = executing_approvals;
+            self.approvals = post_execution_approvals.unwrap_or(executing_approvals);
             return Err(e);
         }
 
@@ -4441,6 +4737,106 @@ full_user_access/full_access for arbitrary commands",
             format!("approved {}", p.id),
         );
         Ok(body)
+    }
+
+    async fn execute_approval_bridge(
+        &mut self,
+        params: &AdminApprovalBridgeParams,
+        approver: &str,
+    ) -> IpcResult<Value> {
+        let target = self
+            .approvals
+            .get(&params.approval_id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("local approval not found: {}", params.approval_id),
+            })?
+            .clone();
+        if target.state != "pending"
+            || target
+                .expires_at_unix
+                .is_some_and(|expiry| expiry < Self::now())
+            || target.target_payload_hash.is_some()
+            || pending_request_is_admin(&target.request)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "target local approval is no longer pending and eligible".into(),
+            });
+        }
+        ensure_independent_human_approver(approver, &target.requester_principal)?;
+        self.check_pending_request_lockdown(&target.request)?;
+        let recovery = ClientIdentity::new(approver, env!("CARGO_PKG_VERSION"));
+        // Box the call because an approval bridge is itself executed from the
+        // approval handler. Admission above forbids targeting another admin
+        // request, so this indirection cannot form a runtime approval cycle.
+        Box::pin(self.handle_approval_approve(
+            Some(json!({
+                "id": params.approval_id,
+                "temporary_grant": params.temporary_grant,
+                "grant_seconds": params.grant_seconds,
+            })),
+            &recovery,
+        ))
+        .await
+    }
+
+    fn deny_approval_bridge(
+        &mut self,
+        bridge_id: &str,
+        params: &AdminApprovalBridgeParams,
+        approver: &str,
+    ) -> IpcResult<Value> {
+        let bridge = self
+            .approvals
+            .get(bridge_id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("approval not found: {bridge_id}"),
+            })?
+            .clone();
+        let target = self
+            .approvals
+            .get(&params.approval_id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("local approval not found: {}", params.approval_id),
+            })?
+            .clone();
+        if bridge.state != "pending" || target.state != "pending" {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "approval bridge or target was already decided".into(),
+            });
+        }
+        ensure_independent_human_approver(approver, &bridge.requester_principal)?;
+        ensure_independent_human_approver(approver, &target.requester_principal)?;
+        let snapshot = self.approvals.clone();
+        let now = Self::now();
+        for id in [bridge_id, params.approval_id.as_str()] {
+            if let Some(record) = self.approvals.get_mut(id) {
+                record.state = "denied".into();
+                record.decided_at_unix = Some(now);
+                record.decided_by_principal = Some(approver.to_owned());
+            }
+        }
+        if let Err(error) = self.persist_approvals() {
+            self.approvals = snapshot;
+            return Err(error);
+        }
+        self.append_audit(
+            "approval.bridge_denied",
+            Some(&target.capability),
+            Some(&target.operation_id),
+            Some("deny"),
+            format!("denied local request {}", target.id),
+        );
+        Ok(json!({
+            "approval_id": bridge_id,
+            "target_approval_id": target.id,
+            "target_operation_id": target.operation_id,
+            "state": "denied",
+        }))
     }
 
     fn handle_approval_deny(
@@ -4527,12 +4923,14 @@ full_user_access/full_access for arbitrary commands",
             schema_version: 1,
             preset: Some(preset_name(preset).into()),
             delegate_remote_mcp: p.delegate_remote_mcp.unwrap_or(self.delegate_remote_mcp),
+            rules: Vec::new(),
         };
         save_policy(&self.paths, &file).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
         })?;
         self.policy = policy;
+        self.custom_policy_rules.clear();
         self.delegate_remote_mcp = file.delegate_remote_mcp;
         self.enforce_workspace = enforce_workspace;
         self.append_audit(
@@ -4543,6 +4941,325 @@ full_user_access/full_access for arbitrary commands",
             format!("preset set to {}", preset_name(preset)),
         );
         self.handle_policy_show()
+    }
+
+    fn execute_admin_policy_preset(
+        &mut self,
+        params: &AdminPolicyPresetParams,
+    ) -> IpcResult<Value> {
+        self.handle_policy_preset(Some(json!({
+            "name": params.name,
+            "delegate_remote_mcp": params.delegate_remote_mcp,
+        })))
+    }
+
+    fn execute_admin_policy_rule_add(
+        &mut self,
+        params: &AdminPolicyRuleAddParams,
+    ) -> IpcResult<Value> {
+        if self.policy.preset == AccessPreset::FullAccess {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "full_access cannot contain hidden rules; select preset custom first"
+                    .into(),
+            });
+        }
+        if self
+            .custom_policy_rules
+            .iter()
+            .any(|rule| rule.id == params.id)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!("policy rule already exists: {}", params.id),
+            });
+        }
+        let mut custom = self.custom_policy_rules.clone();
+        custom.push(params.rule());
+        let file = PolicyFile {
+            schema_version: 1,
+            preset: Some(preset_name(self.policy.preset).into()),
+            delegate_remote_mcp: self.delegate_remote_mcp,
+            rules: custom.clone(),
+        };
+        save_policy(&self.paths, &file).map_err(|error| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: error.to_string(),
+        })?;
+        self.custom_policy_rules = custom;
+        self.policy = policy_from_file(&file);
+        self.append_audit(
+            "policy.rule_add",
+            None,
+            None,
+            Some("allow"),
+            format!("added policy rule {}", params.id),
+        );
+        self.handle_policy_show()
+    }
+
+    fn execute_admin_policy_rule_remove(
+        &mut self,
+        params: &AdminPolicyRuleRemoveParams,
+    ) -> IpcResult<Value> {
+        let mut custom = self.custom_policy_rules.clone();
+        let before = custom.len();
+        custom.retain(|rule| rule.id != params.id);
+        if custom.len() == before {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("custom policy rule not found: {}", params.id),
+            });
+        }
+        let file = PolicyFile {
+            schema_version: 1,
+            preset: Some(preset_name(self.policy.preset).into()),
+            delegate_remote_mcp: self.delegate_remote_mcp,
+            rules: custom.clone(),
+        };
+        save_policy(&self.paths, &file).map_err(|error| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: error.to_string(),
+        })?;
+        self.custom_policy_rules = custom;
+        self.policy = policy_from_file(&file);
+        self.append_audit(
+            "policy.rule_remove",
+            None,
+            None,
+            Some("allow"),
+            format!("removed policy rule {}", params.id),
+        );
+        self.handle_policy_show()
+    }
+
+    fn handle_admin_policy_preset_request(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let params: AdminPolicyPresetParams = parse_params(params)?;
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        let preset = parse_preset(&params.name).ok_or_else(|| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: format!("unknown preset: {}", params.name),
+        })?;
+        if params.name != preset_name(preset) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("preset must use canonical name {}", preset_name(preset)),
+            });
+        }
+        self.enqueue_bound_admin_request(
+            "admin.policy.preset",
+            "Fresh passkey approval is required to replace the device policy preset.",
+            PendingRequest::AdminPolicyPreset(params),
+            client,
+        )
+    }
+
+    fn handle_admin_policy_rule_add_request(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let params: AdminPolicyRuleAddParams = parse_params(params)?;
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        let candidate = PolicyFile {
+            schema_version: 1,
+            preset: Some(preset_name(self.policy.preset).into()),
+            delegate_remote_mcp: self.delegate_remote_mcp,
+            rules: vec![params.rule()],
+        };
+        candidate.validate().map_err(|error| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: error.to_string(),
+        })?;
+        if self.policy.preset == AccessPreset::FullAccess {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "full_access cannot contain hidden rules; select preset custom first"
+                    .into(),
+            });
+        }
+        if self
+            .custom_policy_rules
+            .iter()
+            .any(|rule| rule.id == params.id)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!("policy rule already exists: {}", params.id),
+            });
+        }
+        self.enqueue_bound_admin_request(
+            "admin.policy.rule_add",
+            "Fresh passkey approval is required to add this exact policy rule.",
+            PendingRequest::AdminPolicyRuleAdd(params),
+            client,
+        )
+    }
+
+    fn handle_admin_policy_rule_remove_request(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let params: AdminPolicyRuleRemoveParams = parse_params(params)?;
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        if !self
+            .custom_policy_rules
+            .iter()
+            .any(|rule| rule.id == params.id)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("custom policy rule not found: {}", params.id),
+            });
+        }
+        self.enqueue_bound_admin_request(
+            "admin.policy.rule_remove",
+            "Fresh passkey approval is required to remove this exact policy rule.",
+            PendingRequest::AdminPolicyRuleRemove(params),
+            client,
+        )
+    }
+
+    fn handle_admin_unlock_request(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let params: AdminDaemonUnlockParams = parse_params(params)?;
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        if !self.lockdown {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "device is not in emergency lockdown".into(),
+            });
+        }
+        self.enqueue_bound_admin_request(
+            "admin.daemon.unlock",
+            "Fresh passkey approval is required to lift emergency lockdown.",
+            PendingRequest::AdminDaemonUnlock(params),
+            client,
+        )
+    }
+
+    fn handle_admin_token_revoke_request(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let params: AdminTokenRevokeParams = parse_params(params)?;
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        let canonical = canonicalize_principal_key(&params.principal);
+        if canonical.is_empty() || canonical != params.principal || params.principal.len() > 512 {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "principal must be a canonical server-assigned principal key".into(),
+            });
+        }
+        if canonical == canonicalize_principal_key(client.principal_key()) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "cannot revoke the principal authorizing this request; enroll or use a different administrator"
+                    .into(),
+            });
+        }
+        self.enqueue_bound_admin_request(
+            "admin.token.revoke",
+            "Fresh passkey approval is required to revoke this principal.",
+            PendingRequest::AdminTokenRevoke(params),
+            client,
+        )
+    }
+
+    fn handle_admin_approval_bridge_request(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let params: AdminApprovalBridgeParams = parse_params(params)?;
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        if !matches!(params.decision.as_str(), "approve" | "deny") {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "decision must be approve or deny".into(),
+            });
+        }
+        match (
+            params.decision.as_str(),
+            params.temporary_grant,
+            params.grant_seconds,
+        ) {
+            ("approve", true, Some(seconds)) if (1..=86_400).contains(&seconds) => {}
+            ("approve", false, None) | ("deny", false, None) => {}
+            ("approve", true, _) => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "temporary_grant requires grant_seconds between 1 and 86400".into(),
+                });
+            }
+            ("approve", false, Some(_)) => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "grant_seconds requires temporary_grant=true".into(),
+                });
+            }
+            ("deny", _, Some(_)) | ("deny", true, None) => {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "deny intent cannot include a temporary grant".into(),
+                });
+            }
+            _ => unreachable!("decision validated above"),
+        }
+        let target = self
+            .approvals
+            .get(&params.approval_id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("local approval not found: {}", params.approval_id),
+            })?;
+        if target.state != "pending"
+            || target
+                .expires_at_unix
+                .is_some_and(|expiry| expiry < Self::now())
+            || target.target_payload_hash.is_some()
+            || pending_request_is_admin(&target.request)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "target must be a pending, unexpired, local non-admin approval".into(),
+            });
+        }
+        if params.temporary_grant && temporary_grant_requires_operation_binding(&target.capability)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!(
+                    "temporary grants are not supported for {} approvals",
+                    target.capability
+                ),
+            });
+        }
+        let target_preview = Self::approval_target_preview(target);
+        let reason = format!(
+            "Fresh passkey confirmation is required to {} local {} request {}.",
+            params.decision, target.capability, target.id
+        );
+        let mut response = self.enqueue_bound_admin_request(
+            "admin.approval.bridge",
+            &reason,
+            PendingRequest::AdminApprovalBridge(params),
+            client,
+        )?;
+        response
+            .as_object_mut()
+            .expect("admin enqueue response is an object")
+            .insert("target_preview".into(), target_preview);
+        Ok(response)
     }
 
     fn handle_policy_validate(&self) -> IpcResult<Value> {
@@ -4792,6 +5509,7 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
     ) -> IpcResult<Value> {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct P {
             #[serde(default)]
             approval_id: Option<String>,
@@ -4911,6 +5629,17 @@ full_user_access/full_access for arbitrary commands",
                 message: format!("approval not found: {resolved_id}"),
             })?
             .clone();
+        if let PendingRequest::AdminApprovalBridge(bridge) = &rec.request {
+            if bridge.decision != decision {
+                return Err(IpcError::Remote {
+                    code: app_error::UNAUTHORIZED,
+                    message: format!(
+                        "approval decision does not match bound bridge intent ({})",
+                        bridge.decision
+                    ),
+                });
+            }
+        }
         if let Some(target) = target_operation_id.as_ref() {
             if &rec.operation_id != target {
                 return Err(IpcError::Remote {
@@ -4934,7 +5663,6 @@ full_user_access/full_access for arbitrary commands",
                 "result": rec.result.clone(),
             }));
         }
-
         // E3: fail closed when the original remote action window has elapsed.
         if let Some(exp) = rec.expires_at_unix {
             if Self::now() > exp {
@@ -4992,6 +5720,22 @@ full_user_access/full_access for arbitrary commands",
         let recovery = ClientIdentity::new(&recovery_key, env!("CARGO_PKG_VERSION"));
 
         if decision == "deny" {
+            if let PendingRequest::AdminApprovalBridge(bridge) = &rec.request {
+                let body = self.deny_approval_bridge(
+                    &resolved_id,
+                    bridge,
+                    &canonicalize_principal_key(recovery.principal_key()),
+                )?;
+                return Ok(json!({
+                    "approval_decision_applied": true,
+                    "replayed": false,
+                    "approval_id": resolved_id,
+                    "target_operation_id": rec.operation_id,
+                    "decision": "deny",
+                    "state": "denied",
+                    "result": body,
+                }));
+            }
             let body = self.handle_approval_deny(Some(json!({ "id": resolved_id })), &recovery)?;
             return Ok(json!({
                 "approval_decision_applied": true,
@@ -5102,6 +5846,24 @@ full_user_access/full_access for arbitrary commands",
             methods::DAEMON_LOCKDOWN => self.handle_lockdown(),
             methods::DAEMON_UNLOCK => self.handle_unlock(),
             methods::TOKEN_REVOKE => self.handle_token_revoke(params),
+            methods::ADMIN_POLICY_PRESET_REQUEST => {
+                self.handle_admin_policy_preset_request(params, client)
+            }
+            methods::ADMIN_POLICY_RULE_ADD_REQUEST => {
+                self.handle_admin_policy_rule_add_request(params, client)
+            }
+            methods::ADMIN_POLICY_RULE_REMOVE_REQUEST => {
+                self.handle_admin_policy_rule_remove_request(params, client)
+            }
+            methods::ADMIN_DAEMON_UNLOCK_REQUEST => {
+                self.handle_admin_unlock_request(params, client)
+            }
+            methods::ADMIN_TOKEN_REVOKE_REQUEST => {
+                self.handle_admin_token_revoke_request(params, client)
+            }
+            methods::ADMIN_APPROVAL_BRIDGE_REQUEST => {
+                self.handle_admin_approval_bridge_request(params, client)
+            }
             session_methods::OPEN => self.handle_session_open(params, client).await,
             session_methods::LIST => self.handle_session_list(params, client),
             session_methods::SHOW => self.handle_session_show(params, client),
@@ -8529,6 +9291,34 @@ fn principal_journal_key(principal: &str, idempotency_key: &str) -> String {
     )
 }
 
+fn pending_request_is_admin(request: &PendingRequest) -> bool {
+    matches!(
+        request,
+        PendingRequest::AdminPolicyPreset(_)
+            | PendingRequest::AdminPolicyRuleAdd(_)
+            | PendingRequest::AdminPolicyRuleRemove(_)
+            | PendingRequest::AdminDaemonUnlock(_)
+            | PendingRequest::AdminTokenRevoke(_)
+            | PendingRequest::AdminApprovalBridge(_)
+    )
+}
+
+fn validate_admin_idempotency_key(value: &str) -> IpcResult<()> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.len() > 256
+        || value.chars().any(char::is_control)
+    {
+        return Err(IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message:
+                "idempotency_key must be 1-256 control-free characters without edge whitespace"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
 fn broker_binding_error(message: &str) -> IpcError {
     IpcError::Remote {
         code: app_error::UNAUTHORIZED,
@@ -9908,7 +10698,9 @@ fn policy_from_file(file: &PolicyFile) -> PolicyDocument {
         .as_deref()
         .and_then(parse_preset)
         .unwrap_or(AccessPreset::Recommended);
-    preset_document(preset)
+    let mut policy = preset_document(preset);
+    policy.rules.extend(file.rules.iter().cloned());
+    policy
 }
 
 /// Hard ceilings for durable op-journal state (count + file bytes).

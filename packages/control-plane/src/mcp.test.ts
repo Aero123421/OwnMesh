@@ -223,6 +223,55 @@ test("exec scope required for shell tool", async () => {
   assert.equal(body.error?.code, -32003);
 });
 
+test("typed admin rule route is exact-bound and rejects unknown authority fields", async () => {
+  const { store, token } = await authed();
+  let routed: { payload?: Record<string, unknown> } | undefined;
+  let routeCount = 0;
+  const router = {
+    routeToDevice: async (_deviceId: string, operation: { payload: Record<string, unknown> }) => {
+      routeCount += 1;
+      routed = operation;
+      return {
+        status: "approval_required" as const,
+        detail: {
+          status: "approval_required",
+          operation_id: operation.payload.operation_id,
+          approval_id: "apr_AdminRule1",
+          reason: "fresh passkey required",
+        },
+      };
+    },
+  };
+  const args = {
+    device_id: "dev_admin_rule_route",
+    id: "rule_workspace_write",
+    rule_decision: "ask",
+    capability: "filesystem.write",
+    priority: 25,
+    idempotency_key: "idem_admin_rule_route",
+  };
+  const accepted = await callTool(store, token, "ownmesh_policy_rule_add", args, router);
+  assert.equal(accepted.body.result?.structuredContent?.status, "approval_required");
+  assert.equal(routeCount, 1);
+  assert.equal(routed?.payload?.capability, "admin.policy.rule_add");
+  assert.equal((routed?.payload?.arguments as Record<string, unknown>)?.rule_decision, "ask");
+  const bound = (routed?.payload?.authorization as { bound_action?: Record<string, unknown> })
+    ?.bound_action;
+  assert.equal(bound?.action, "admin.policy.rule_add");
+  assert.equal((bound?.facts as Record<string, unknown>)?.rule_decision, "ask");
+
+  const rejected = await callTool(
+    store,
+    token,
+    "ownmesh_policy_rule_add",
+    { ...args, idempotency_key: "idem_admin_rule_unknown", allow: true },
+    router,
+  );
+  assert.equal(rejected.body.error?.code, -32602);
+  assert.match(rejected.body.error?.message || "", /unknown admin argument/);
+  assert.equal(routeCount, 1, "unknown fields must be rejected before DeviceRoom routing");
+});
+
 // ---------------------------------------------------------------------------
 // Pagination / truncation
 // ---------------------------------------------------------------------------

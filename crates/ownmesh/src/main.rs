@@ -260,6 +260,7 @@ mod tests {
             lang: None,
             command: Some(cli::Commands::Tokens(cli::TokensCmd::Revoke {
                 principal: " ChatGPT ".into(),
+                idempotency_key: Some("revoke-test".into()),
             })),
         };
         assert_eq!(commands::dispatch(&cli), Err(ExitCode::UsageConfig));

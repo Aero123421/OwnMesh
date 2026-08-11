@@ -114,6 +114,116 @@ async fn enqueue_write(rt: &mut DaemonRuntime, key: Option<&str>) -> String {
     queued["approval_id"].as_str().unwrap().to_owned()
 }
 
+async fn enqueue_approval_bridge(
+    rt: &mut DaemonRuntime,
+    target_approval_id: &str,
+    operation_id: &str,
+    key: &str,
+) -> Result<Value, IpcError> {
+    let remote = ClientIdentity::new("client:remote:ten_test:owner_test", "1.0");
+    rt.dispatch_cancellable_bound_with_generation(
+        methods::ADMIN_APPROVAL_BRIDGE_REQUEST,
+        Some(json!({
+            "approval_id": target_approval_id,
+            "decision": "approve",
+            "temporary_grant": false,
+            "idempotency_key": key,
+        })),
+        &remote,
+        None,
+        Some(operation_id.into()),
+        Some(i64::MAX),
+        Some("a".repeat(64)),
+        Some("dev_testbridge".into()),
+        Some(1),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn bridge_outer_receipt_failure_never_reopens_completed_target() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let target_id = enqueue_write(&mut rt, Some("local-write-bridge-1")).await;
+    let bridge = enqueue_approval_bridge(
+        &mut rt,
+        &target_id,
+        "op_bridge_receipt_failure_1",
+        "bridge-outer-1",
+    )
+    .await
+    .expect("bridge queued");
+    let bridge_id = bridge["approval_id"].as_str().unwrap().to_owned();
+
+    // outer begin, target begin, target completion, then outer completion.
+    rt.fail_op_journal_persist_on_nth_call_for_test(4);
+    let err = rt
+        .apply_control_plane_approval_decision(Some(json!({
+            "approval_id": bridge_id,
+            "target_operation_id": "op_bridge_receipt_failure_1",
+            "decision": "approve",
+            "target_payload_hash": "a".repeat(64),
+            "approver_principal": "owner_test",
+        })))
+        .await
+        .expect_err("outer receipt persist must fail");
+    assert_internal(err, "op journal");
+    assert_eq!(
+        fs::read_to_string(paths.state_dir.join("workspace/approval.txt")).unwrap(),
+        "approved"
+    );
+
+    let listed = rt
+        .dispatch(methods::APPROVAL_LIST, None, &client("local"))
+        .await
+        .unwrap();
+    let approvals = listed["approvals"].as_array().unwrap();
+    assert_eq!(
+        approvals
+            .iter()
+            .find(|record| record["id"] == target_id)
+            .and_then(|record| record["state"].as_str()),
+        Some("approved"),
+        "completed target must remain terminal in memory"
+    );
+
+    let retry = enqueue_approval_bridge(
+        &mut rt,
+        &target_id,
+        "op_bridge_receipt_failure_2",
+        "bridge-outer-2",
+    )
+    .await
+    .expect_err("a second bridge must not re-enter the completed target");
+    assert!(matches!(
+        retry,
+        IpcError::Remote {
+            code: app_error::CONFLICT,
+            ..
+        }
+    ));
+
+    drop(rt);
+    let mut reopened = DaemonRuntime::open(&paths).expect("restart runtime");
+    let retry_after_restart = enqueue_approval_bridge(
+        &mut reopened,
+        &target_id,
+        "op_bridge_receipt_failure_3",
+        "bridge-outer-3",
+    )
+    .await
+    .expect_err("durable target state must stay terminal after restart");
+    assert!(matches!(
+        retry_after_restart,
+        IpcError::Remote {
+            code: app_error::CONFLICT,
+            ..
+        }
+    ));
+}
+
 #[tokio::test]
 async fn delegated_remote_mcp_executes_exact_bound_ask_without_local_approval() {
     let dir = tempdir().unwrap();
@@ -124,6 +234,7 @@ async fn delegated_remote_mcp_executes_exact_bound_ask_without_local_approval() 
             schema_version: 1,
             preset: Some("recommended".into()),
             delegate_remote_mcp: true,
+            rules: Vec::new(),
         },
     )
     .unwrap();

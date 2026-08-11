@@ -719,8 +719,9 @@ export interface ControlPlaneStore {
   recordMcpApprovalOutboxAttempt(id: string, error?: string): Promise<void>;
 
   /**
-   * After successful device delivery: CAS operation out of approval_required
-   * (never overwrite fast terminal results) and mark outbox delivered.
+   * After successful device delivery: record the delivered decision while the
+   * operation remains approval_required until the authoritative device result,
+   * and mark the outbox delivered (never overwrite a fast terminal result).
    * Requires delivery_status=delivering and claim owner (token+version match).
    * Exactly-once transition.
    */
@@ -1951,7 +1952,6 @@ export class MemoryStore implements ControlPlaneStore {
     if (Number(outbox.claim_version) !== Number(claimVersion)) return null;
     if (!isValidOutboxDecision(outbox.decision)) return null;
 
-    const nextStatus = outbox.decision === "approve" ? "pending" : "denied";
     const op = this.mcpOperations.get(outbox.operation_id);
     if (!op) return null;
 
@@ -1961,18 +1961,12 @@ export class MemoryStore implements ControlPlaneStore {
       updated = await this.updateMcpOperation(
         outbox.operation_id,
         {
-          status: nextStatus,
-          approval_required: false,
-          summary:
-            outbox.decision === "approve"
-              ? "human approved; routing decision to device"
-              : "human denied",
+          summary: "human decision delivered; awaiting authoritative device result",
           data: {
             ...(op.data || {}),
             approval_decision: outbox.decision,
             approval_transaction_id: outbox.id,
           },
-          approval_id: outbox.id,
         },
         ["approval_required"],
       );
@@ -4174,15 +4168,11 @@ export class SqlStore implements ControlPlaneStore {
     if (outbox.claim_token !== claimToken) return null;
     if (Number(outbox.claim_version) !== Number(claimVersion)) return null;
 
-    const nextStatus = outbox.decision === "approve" ? "pending" : "denied";
     const op = await this.getMcpOperation(outbox.operation_id);
     if (!op) return null;
 
     const ts = nowIso();
-    const summary =
-      outbox.decision === "approve"
-        ? "human approved; routing decision to device"
-        : "human denied";
+    const summary = "human decision delivered; awaiting authoritative device result";
     const nextData = {
       ...(op.data || {}),
       approval_decision: outbox.decision,
@@ -4201,8 +4191,7 @@ export class SqlStore implements ControlPlaneStore {
       this.db
         .prepare(
           `UPDATE mcp_operations SET
-             status = ?, summary = ?, data_json = ?, approval_required = 0,
-             approval_id = ?, updated_at = ?
+             summary = ?, data_json = ?, updated_at = ?
            WHERE operation_id = ? AND status = 'approval_required'
              AND EXISTS (
                SELECT 1 FROM mcp_approval_outbox o
@@ -4211,10 +4200,8 @@ export class SqlStore implements ControlPlaneStore {
              )`,
         )
         .bind(
-          nextStatus,
           summary,
           JSON.stringify(nextData),
-          outbox.id,
           ts,
           outbox.operation_id,
           id,

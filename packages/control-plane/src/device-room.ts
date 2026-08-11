@@ -288,6 +288,49 @@ export type PendingOperation = {
   live_only?: boolean;
 };
 
+type ApprovalDecisionBinding = {
+  target_operation_id: string;
+  decision: "approve" | "deny";
+  approval_id: string;
+  transaction_id: string;
+};
+
+function approvalDecisionBindingFromPayload(
+  payload: Record<string, unknown> | undefined,
+): ApprovalDecisionBinding | null {
+  if (!payload || payload.capability !== "approval.decision") return null;
+  const args =
+    payload.arguments && typeof payload.arguments === "object"
+      ? (payload.arguments as Record<string, unknown>)
+      : null;
+  const authorization =
+    payload.authorization && typeof payload.authorization === "object"
+      ? (payload.authorization as Record<string, unknown>)
+      : null;
+  const boundAction =
+    authorization?.bound_action && typeof authorization.bound_action === "object"
+      ? (authorization.bound_action as Record<string, unknown>)
+      : null;
+  const targetOperationId = String(args?.target_operation_id || "").trim();
+  const decision = String(args?.decision || "").toLowerCase();
+  const approvalId = String(args?.approval_id || "").trim();
+  const transactionId = String(boundAction?.outbox_id || "").trim();
+  if (
+    !targetOperationId ||
+    !approvalId ||
+    !transactionId ||
+    (decision !== "approve" && decision !== "deny")
+  ) {
+    return null;
+  }
+  return {
+    target_operation_id: targetOperationId,
+    decision,
+    approval_id: approvalId,
+    transaction_id: transactionId,
+  };
+}
+
 /** Announced in accepted.session_parameters and enforced on inbound frames. */
 export const MAX_PAYLOAD_BYTES = 1_000_000;
 
@@ -2612,14 +2655,25 @@ export class DeviceRoom {
             expired.payload?.operation_id != null
               ? String(expired.payload.operation_id)
               : expired.correlation_id;
+          const expectedApprovalDecision = approvalDecisionBindingFromPayload(expired.payload);
+          const approvalDecisionResult = expectedApprovalDecision
+              ? {
+                  approval_decision_applied: false,
+                  target_operation_id: expectedApprovalDecision.target_operation_id,
+                  approval_id: expectedApprovalDecision.approval_id,
+                  decision: expectedApprovalDecision.decision,
+                }
+              : null;
           await applyMcpOperationResult(store, {
             operationId: opId,
             correlationId: expired.correlation_id,
             deviceId: this.deviceId,
+            expectedApprovalDecision,
             payload: {
               operation_contract: OPERATION_CONTRACT_V1,
               operation_id: opId,
               status: "failed",
+              ...(approvalDecisionResult ? { result: approvalDecisionResult } : {}),
               error: {
                 code: "OWNMESH_E_OPERATION_EXPIRED",
                 message:
@@ -2646,11 +2700,14 @@ export class DeviceRoom {
       }
       try {
         const store = createStore(this.env);
+        const pending = corr ? this.router.pending.get(corr) : undefined;
+        const expectedApprovalDecision = approvalDecisionBindingFromPayload(pending?.payload);
         const applied = await applyMcpOperationResult(store, {
           operationId: result.mcp_result.operation_id,
           correlationId: corr,
           payload: result.mcp_result.payload,
           deviceId: this.deviceId,
+          expectedApprovalDecision,
         });
         if (!applied.ok) {
           // Unknown/mismatched/CAS loss — do not forward or drop pending.
@@ -3070,6 +3127,7 @@ export async function applyMcpOperationResult(
     correlationId?: string;
     payload: Record<string, unknown>;
     deviceId?: string;
+    expectedApprovalDecision?: ApprovalDecisionBinding | null;
   },
 ): Promise<ApplyMcpOperationResultOutcome> {
   const payloadOpId = opts.payload.operation_id != null ? String(opts.payload.operation_id) : undefined;
@@ -3107,13 +3165,27 @@ export async function applyMcpOperationResult(
         looksLikeCancelControl &&
         (incomingStatus === "completed" || incomingStatus === "failed" || incomingStatus === "denied")
       ) {
-        // Approval decision: fold execution onto the original MCP operation.
+        // Approval decision: fold only an exact-bound Agent result onto the
+        // original MCP operation. A device-side rejection/failure is terminal
+        // too; leaving the target pending would make a delivered decision hang.
+        const approvalDecisionApplied = resultObj?.approval_decision_applied;
+        const approvalDecision = String(resultObj?.decision || "").toLowerCase();
         if (
           resultObj &&
-          resultObj.approval_decision_applied === true &&
+          typeof approvalDecisionApplied === "boolean" &&
+          (approvalDecision === "approve" || approvalDecision === "deny") &&
           resultObj.target_operation_id != null &&
           String(resultObj.target_operation_id).trim() !== ""
         ) {
+          const expected = opts.expectedApprovalDecision;
+          if (
+            !expected ||
+            expected.target_operation_id !== String(resultObj.target_operation_id) ||
+            expected.decision !== approvalDecision ||
+            expected.approval_id !== String(resultObj.approval_id || "")
+          ) {
+            return { ok: false, error: "approval_decision_binding_mismatch" };
+          }
           const targetId = String(resultObj.target_operation_id);
           const target = await store.getMcpOperation(targetId);
           if (!target) {
@@ -3122,13 +3194,28 @@ export async function applyMcpOperationResult(
           if (opts.deviceId && target.device_id && opts.deviceId !== target.device_id) {
             return { ok: false, error: "device_mismatch" };
           }
-          const decision = String(resultObj.decision || "").toLowerCase();
+          const targetData = target.data || {};
+          if (
+            targetData.approval_decision !== expected.decision ||
+            targetData.approval_transaction_id !== expected.transaction_id ||
+            targetData.approval_device_id !== expected.approval_id
+          ) {
+            return { ok: false, error: "approval_decision_target_binding_mismatch" };
+          }
+          const decision = approvalDecision;
           let targetStatus = "completed";
-          if (decision === "deny") targetStatus = "denied";
-          else if (String(incoming.status || "") === "failed") targetStatus = "failed";
+          if (approvalDecisionApplied === false || incomingStatus === "failed") {
+            targetStatus = "failed";
+          } else if (decision === "deny") targetStatus = "denied";
           else if (resultObj.state === "denied") targetStatus = "denied";
-          const execData =
-            resultObj.result && typeof resultObj.result === "object"
+          const execData = targetStatus === "failed"
+            ? {
+                error:
+                  incoming.error && typeof incoming.error === "object"
+                    ? incoming.error
+                    : { code: "OWNMESH_E_APPROVAL_DECISION_FAILED", message: "device rejected the approval decision" },
+              }
+            : resultObj.result && typeof resultObj.result === "object"
               ? (resultObj.result as Record<string, unknown>)
               : { ...(resultObj as Record<string, unknown>) };
           const updatedTarget = await store.updateMcpOperation(
@@ -3147,7 +3234,7 @@ export async function applyMcpOperationResult(
               data: {
                 ...(target.data || {}),
                 approval_decision: decision || targetStatus,
-                approval_decision_applied: true,
+                approval_decision_applied: approvalDecisionApplied,
                 approval_id:
                   resultObj.approval_id != null
                     ? String(resultObj.approval_id)

@@ -375,6 +375,7 @@ pub fn apply_setup(
         schema_version: 1,
         preset: Some(preset_slug(preset).to_string()),
         delegate_remote_mcp: false,
+        rules: Vec::new(),
     };
     policy
         .validate()

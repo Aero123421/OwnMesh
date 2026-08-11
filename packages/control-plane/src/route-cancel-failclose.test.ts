@@ -536,12 +536,16 @@ test("applyMcpOperationResult: approval_decision_applied folds onto target opera
     principal_id: "prin_dev",
     device_id: deviceId,
     tool: "ownmesh_fs_write",
-    status: "pending",
+    status: "approval_required",
     summary: "human approved; routing decision to device",
-    data: { approval_decision: "approve" },
+    data: {
+      approval_decision: "approve",
+      approval_transaction_id: "apr_tx_device_1",
+      approval_device_id: "apr_device_1",
+    },
     truncated: false,
     next_cursor: null,
-    approval_required: false,
+    approval_required: true,
     approval_id: "apr_device_1",
     warnings: [],
     correlation_id: targetOpId,
@@ -565,6 +569,12 @@ test("applyMcpOperationResult: approval_decision_applied folds onto target opera
         approval_id: "apr_device_1",
         result: { written: true, path: "ask.txt" },
       },
+    },
+    expectedApprovalDecision: {
+      target_operation_id: targetOpId,
+      decision: "approve",
+      approval_id: "apr_device_1",
+      transaction_id: "apr_tx_device_1",
     },
   });
   assert.equal(applied.ok, true);
@@ -590,7 +600,11 @@ test("applyMcpOperationResult: approval_decision deny folds onto target", async 
     tool: "ownmesh_fs_write",
     status: "approval_required",
     summary: "waiting",
-    data: {},
+    data: {
+      approval_decision: "deny",
+      approval_transaction_id: "apr_tx_device_2",
+      approval_device_id: "apr_device_2",
+    },
     truncated: false,
     next_cursor: null,
     approval_required: true,
@@ -617,7 +631,72 @@ test("applyMcpOperationResult: approval_decision deny folds onto target", async 
         state: "denied",
       },
     },
+    expectedApprovalDecision: {
+      target_operation_id: targetOpId,
+      decision: "deny",
+      approval_id: "apr_device_2",
+      transaction_id: "apr_tx_device_2",
+    },
   });
   assert.equal(applied.ok, true);
   assert.equal((await store.getMcpOperation(targetOpId))?.status, "denied");
+});
+
+test("authoritative device failure terminal-fails both approve and deny decisions", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const deviceId = "dev_apr_failure_01abcdef";
+  for (const decision of ["approve", "deny"] as const) {
+    const targetOpId = `op_failure_target_${decision}`;
+    const transactionId = `apr_failure_tx_${decision}`;
+    const approvalId = `apr_failure_device_${decision}`;
+    await store.putMcpOperation({
+      operation_id: targetOpId,
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      device_id: deviceId,
+      tool: "ownmesh_fs_write",
+      status: "approval_required",
+      summary: "awaiting device decision result",
+      data: {
+        approval_decision: decision,
+        approval_transaction_id: transactionId,
+        approval_device_id: approvalId,
+      },
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_id: approvalId,
+      warnings: [],
+      correlation_id: targetOpId,
+      policy_authority: "ownmesh_device",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    const decisionOpId = `op_failure_control_${decision}`;
+    const applied = await applyMcpOperationResult(store, {
+      operationId: decisionOpId,
+      correlationId: decisionOpId,
+      deviceId,
+      expectedApprovalDecision: {
+        target_operation_id: targetOpId,
+        decision,
+        approval_id: approvalId,
+        transaction_id: transactionId,
+      },
+      payload: {
+        status: "failed",
+        operation_id: decisionOpId,
+        error: { code: "OWNMESH_E_DECISION_APPLY", message: "device rejected decision" },
+        result: {
+          approval_decision_applied: false,
+          decision,
+          target_operation_id: targetOpId,
+          approval_id: approvalId,
+        },
+      },
+    });
+    assert.equal(applied.ok, true);
+    assert.equal((await store.getMcpOperation(targetOpId))?.status, "failed");
+  }
 });

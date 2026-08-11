@@ -73,6 +73,16 @@ pub mod methods {
     /// Revoke a principal / client credential mapping.
     pub const TOKEN_REVOKE: &str = "token.revoke";
 
+    // Agent-only, exact-bound admin request admission. These methods enqueue a
+    // durable approval; they never perform the mutation directly. Ordinary IPC
+    // clients are denied by `human_operator_method`, including same-UID peers.
+    pub const ADMIN_POLICY_PRESET_REQUEST: &str = "admin.policy_preset.request";
+    pub const ADMIN_POLICY_RULE_ADD_REQUEST: &str = "admin.policy_rule_add.request";
+    pub const ADMIN_POLICY_RULE_REMOVE_REQUEST: &str = "admin.policy_rule_remove.request";
+    pub const ADMIN_DAEMON_UNLOCK_REQUEST: &str = "admin.daemon_unlock.request";
+    pub const ADMIN_TOKEN_REVOKE_REQUEST: &str = "admin.token_revoke.request";
+    pub const ADMIN_APPROVAL_BRIDGE_REQUEST: &str = "admin.approval_bridge.request";
+
     /// Daemon-managed credential lifecycle (fixed management client only).
     pub const CREDENTIAL_PROVISION: &str = "credential.provision";
     /// Rotate a per-client credential secret (denied for uncredentialed IPC).

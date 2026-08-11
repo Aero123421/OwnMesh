@@ -2532,6 +2532,29 @@ fn map_request_to_method(
 
     let capability = request.capability.as_str();
     let method = match (capability, action.as_str()) {
+        ("admin.policy.preset", "admin.policy.preset") => methods::ADMIN_POLICY_PRESET_REQUEST,
+        ("admin.policy.rule_add", "admin.policy.rule_add") => {
+            if let Some(decision) = args.remove("rule_decision") {
+                args.insert("decision".into(), decision);
+            }
+            methods::ADMIN_POLICY_RULE_ADD_REQUEST
+        }
+        ("admin.policy.rule_remove", "admin.policy.rule_remove") => {
+            methods::ADMIN_POLICY_RULE_REMOVE_REQUEST
+        }
+        ("admin.daemon.unlock", "admin.daemon.unlock") => methods::ADMIN_DAEMON_UNLOCK_REQUEST,
+        ("admin.token.revoke", "admin.token.revoke") => {
+            if let Some(principal) = args.remove("target_principal") {
+                args.insert("principal".into(), principal);
+            }
+            methods::ADMIN_TOKEN_REVOKE_REQUEST
+        }
+        ("admin.approval.bridge", "admin.approval.bridge") => {
+            if let Some(decision) = args.remove("requested_decision") {
+                args.insert("decision".into(), decision);
+            }
+            methods::ADMIN_APPROVAL_BRIDGE_REQUEST
+        }
         ("filesystem.read", "fs.list" | "ownmesh_fs_list" | "ownmesh_list_files") => {
             methods::OPS_FS_LIST
         }
@@ -2890,6 +2913,10 @@ fn bound_result_object(value: Value) -> Value {
             "replayed",
             "cancelled",
             "signal_delivered",
+            "approval_decision_applied",
+            "approval_id",
+            "local_approval_id",
+            "decision",
             "target_operation_id",
             "total_matched",
             "entries_returned",
@@ -3179,6 +3206,13 @@ async fn dispatch_remote_operation(
         // execute/deny exactly once. Binding was already verified above.
         // ChatGPT confirmation is not an OwnMesh attestation; this path runs
         // only after control-plane OAuth+CSRF claim + exact-action binding.
+        let decision_target_operation_id = mapped
+            .1
+            .get("target_operation_id")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let decision_approval_id = mapped.1.get("approval_id").cloned().unwrap_or(Value::Null);
+        let decision_value = mapped.1.get("decision").cloned().unwrap_or(Value::Null);
         let mut decision_params = mapped.1.clone();
         if let Some(obj) = decision_params.as_object_mut() {
             // Inject verified approver identity from bound_action (never client free-form).
@@ -3200,10 +3234,18 @@ async fn dispatch_remote_operation(
                 .await
         };
         return match outcome {
-            Ok(body) => {
+            Ok(mut body) => {
                 // decisionOpId stays on the envelope so DeviceRoom pending matches;
                 // target_operation_id + execution live in result for store apply.
-                let _ = body.get("decision");
+                if let Some(object) = body.as_object_mut() {
+                    if let Some(actual) =
+                        object.insert("approval_id".into(), decision_approval_id.clone())
+                    {
+                        if actual != decision_approval_id {
+                            object.insert("local_approval_id".into(), actual);
+                        }
+                    }
+                }
                 json!({
                     "operation_contract": OPERATION_CONTRACT_V1,
                     "operation_id": operation_id,
@@ -3231,6 +3273,12 @@ async fn dispatch_remote_operation(
                     "operation_contract": OPERATION_CONTRACT_V1,
                     "operation_id": operation_id,
                     "status": "failed",
+                    "result": {
+                        "approval_decision_applied": false,
+                        "target_operation_id": decision_target_operation_id,
+                        "approval_id": decision_approval_id,
+                        "decision": decision_value,
+                    },
                     "error": {
                         "code": code,
                         "message": message,
@@ -3445,6 +3493,7 @@ async fn dispatch_remote_operation(
                             "approval_id": body.get("approval_id").cloned(),
                             "operation_id": operation_id,
                             "reason": body.get("reason").cloned(),
+                            "target_preview": body.get("target_preview").cloned(),
                             "note": "ChatGPT confirmation is not an OwnMesh cryptographic attestation; local policy still requires an approved device grant when configured to ask. Browser/CLI recovery approval remains available."
                         }
                     }
@@ -4193,6 +4242,65 @@ mod tests {
             .bound_action
             .clone();
         request.payload_hash = Some(sha256_hex_str(&stable_stringify(&bound)));
+    }
+
+    #[test]
+    fn admin_rule_request_is_exact_bound_then_typed_for_private_ipc() {
+        let device = DeviceId::parse("dev_admin_rule").unwrap();
+        let (mut request, expires) =
+            sample_bound_request(device.as_str(), "unused.txt", Some("unused"));
+        request.capability = "admin.policy.rule_add".into();
+        request.arguments = json!({
+            "action": "admin.policy.rule_add",
+            "id": "rule_workspace_write",
+            "rule_decision": "ask",
+            "capability": "filesystem.write",
+            "priority": 25
+        });
+        let facts = recompute_action_facts(request.arguments.as_object().unwrap()).unwrap();
+        let bound = request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap();
+        bound.insert("capability".into(), json!("admin.policy.rule_add"));
+        bound.insert("action".into(), json!("admin.policy.rule_add"));
+        bound.insert("tool".into(), json!("ownmesh_policy_rule_add"));
+        bound.insert("facts".into(), Value::Object(facts));
+        refresh_bound_hash(&mut request);
+
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+        let (method, params) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, methods::ADMIN_POLICY_RULE_ADD_REQUEST);
+        assert_eq!(params["decision"], "ask");
+        assert!(params.get("rule_decision").is_none());
+
+        request.arguments["rule_decision"] = json!("deny");
+        assert!(
+            verify_exact_action_binding(&device, &request, Some(&expires))
+                .unwrap_err()
+                .contains("facts")
+        );
+    }
+
+    #[test]
+    fn oversized_approval_result_keeps_exact_decision_binding() {
+        let bounded = bound_result_object(json!({
+            "content": "x".repeat(800_000),
+            "approval_decision_applied": true,
+            "approval_id": "apr_cp_fallback",
+            "local_approval_id": "apr_local_actual",
+            "decision": "approve",
+            "target_operation_id": "op_target"
+        }));
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["approval_decision_applied"], true);
+        assert_eq!(bounded["approval_id"], "apr_cp_fallback");
+        assert_eq!(bounded["local_approval_id"], "apr_local_actual");
+        assert_eq!(bounded["decision"], "approve");
+        assert_eq!(bounded["target_operation_id"], "op_target");
     }
 
     #[test]

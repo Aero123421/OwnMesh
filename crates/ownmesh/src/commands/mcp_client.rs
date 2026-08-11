@@ -231,6 +231,66 @@ impl McpHttpClient {
         }
     }
 
+    /// Poll an operation that is waiting on the browser approval flow. Unlike
+    /// ordinary tool polling, `approval_required` remains a wait state here.
+    pub(crate) async fn poll_after_approval(
+        &mut self,
+        operation_id: &str,
+        device_id: &str,
+        max_wait: Duration,
+    ) -> Result<Value, McpClientError> {
+        let started = Instant::now();
+        let mut request_id = 10_000_u64;
+        loop {
+            if started.elapsed() >= max_wait {
+                return Err(McpClientError::new(
+                    ErrorCode::Timeout,
+                    format!(
+                        "operation {operation_id} was not decided within {} seconds",
+                        max_wait.as_secs()
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let value = self
+                .call_tool_value(
+                    serde_json::json!(request_id),
+                    "ownmesh_get_operation",
+                    serde_json::json!({
+                        "operation_id": operation_id,
+                        "device_id": device_id,
+                    }),
+                )
+                .await?;
+            if value.get("operation_id").and_then(Value::as_str) != Some(operation_id) {
+                return Err(McpClientError::new(
+                    ErrorCode::BadEnvelope,
+                    "polled operation id does not match the approval operation",
+                ));
+            }
+            match value.get("status").and_then(Value::as_str) {
+                Some("approval_required" | "pending" | "running" | "cancel_requested") => {}
+                Some(
+                    "completed" | "failed" | "denied" | "cancelled" | "device_offline"
+                    | "tombstone",
+                ) => return Ok(value),
+                Some(status) => {
+                    return Err(McpClientError::new(
+                        ErrorCode::BadEnvelope,
+                        format!("control-plane returned unknown operation status {status}"),
+                    ));
+                }
+                None => {
+                    return Err(McpClientError::new(
+                        ErrorCode::BadEnvelope,
+                        "control-plane operation response omitted status",
+                    ));
+                }
+            }
+            request_id = request_id.saturating_add(1);
+        }
+    }
+
     async fn send_once(&self, payload: &[u8]) -> Result<reqwest::Response, McpClientError> {
         self.http
             .post(&self.endpoint)

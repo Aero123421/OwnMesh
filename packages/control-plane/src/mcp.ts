@@ -166,6 +166,126 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "discovery",
   },
   {
+    name: "ownmesh_policy_preset",
+    description:
+      "Request a fresh-passkey-approved change to a device policy preset. The device queues the exact typed action; this call never changes policy directly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        name: {
+          type: "string",
+          enum: ["workspace_only", "recommended", "full_user_access", "full_access", "custom"],
+        },
+        delegate_remote_mcp: { type: "boolean" },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["device_id", "name", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_policy_rule_add",
+    description:
+      "Request a fresh-passkey-approved bounded policy rule addition. Free-form policy DSL is not accepted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        id: { type: "string", pattern: "^rule_[A-Za-z0-9_.-]{1,59}$", maxLength: 64 },
+        rule_decision: { type: "string", enum: ["allow", "ask", "deny"] },
+        capability: { type: "string", minLength: 1, maxLength: 64 },
+        priority: { type: "integer", minimum: -1000, maximum: 1000 },
+        when_elevated: { type: "boolean" },
+        when_kind: { type: "string", minLength: 1, maxLength: 32 },
+        path_prefix: { type: "string", minLength: 1, maxLength: 1024 },
+        program_equals: { type: "string", minLength: 1, maxLength: 512 },
+        description: { type: "string", minLength: 1, maxLength: 512 },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["device_id", "id", "rule_decision", "capability", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_policy_rule_remove",
+    description: "Request fresh-passkey-approved removal of one user-authored policy rule by id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        id: { type: "string", pattern: "^rule_[A-Za-z0-9_.-]{1,59}$", maxLength: 64 },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["device_id", "id", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_daemon_unlock",
+    description:
+      "Request a fresh-passkey-approved emergency-lockdown lift. This is the only admin request admitted while lockdown is active.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["device_id", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_token_revoke",
+    description: "Request fresh-passkey-approved revocation of an exact canonical device principal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        target_principal: { type: "string", minLength: 1, maxLength: 512 },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["device_id", "target_principal", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_request_approval",
+    description:
+      "Bridge an existing device-local pending approval into the fresh-passkey browser flow. Only approval_id and exact approve/deny intent are accepted; local facts are read from the device.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        approval_id: { type: "string", pattern: "^apr_[A-Za-z0-9]+$", maxLength: 128 },
+        requested_decision: { type: "string", enum: ["approve", "deny"] },
+        temporary_grant: { type: "boolean" },
+        grant_seconds: { type: "integer", minimum: 1, maximum: 86400 },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["device_id", "approval_id", "requested_decision", "temporary_grant", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
     name: "ownmesh_list_profiles",
     description:
       "List official CLI profiles. Without device_id returns catalog metadata; with device_id runs live PATH detection on that PC (credentials never leave the device).",
@@ -1334,6 +1454,94 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
 ] as const;
 
+const ADMIN_MCP_TOOL_NAMES = new Set([
+  "ownmesh_policy_preset",
+  "ownmesh_policy_rule_add",
+  "ownmesh_policy_rule_remove",
+  "ownmesh_daemon_unlock",
+  "ownmesh_token_revoke",
+  "ownmesh_request_approval",
+]);
+
+async function mayAdministerDevice(
+  store: ControlPlaneStore,
+  deviceId: string,
+  tenantId: string,
+  principalId: string,
+): Promise<boolean> {
+  const device = await store.getDevice(deviceId);
+  const role = await store.getTenantMemberRole(tenantId, principalId);
+  return device?.principal_id === principalId || role === "owner" || role === "admin";
+}
+
+function validateAdminToolArgs(
+  name: string,
+  args: Record<string, unknown>,
+): string | null {
+  const boundedText = (value: unknown, maxBytes: number): value is string =>
+    typeof value === "string" &&
+    value.length > 0 &&
+    new TextEncoder().encode(value).byteLength <= maxBytes &&
+    !/[\u0000-\u001f\u007f]/.test(value);
+  if (!boundedText(args.idempotency_key, 256) || String(args.idempotency_key).trim() !== args.idempotency_key) {
+    return "idempotency_key must be 1-256 control-free bytes without edge whitespace";
+  }
+  if (name === "ownmesh_policy_preset") {
+    if (!["workspace_only", "recommended", "full_user_access", "full_access", "custom"].includes(String(args.name))) {
+      return "invalid policy preset";
+    }
+    if (args.delegate_remote_mcp !== undefined && typeof args.delegate_remote_mcp !== "boolean") {
+      return "delegate_remote_mcp must be boolean";
+    }
+    return null;
+  }
+  if (name === "ownmesh_policy_rule_add") {
+    if (!boundedText(args.id, 64) || !/^rule_[A-Za-z0-9_.-]{1,59}$/.test(args.id)) return "invalid policy rule id";
+    if (!["allow", "ask", "deny"].includes(String(args.rule_decision))) return "invalid rule_decision";
+    if (!boundedText(args.capability, 64)) return "invalid policy capability";
+    const capability = String(args.capability);
+    if (!(capability === "*" || /^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*(?:\.\*)?$/.test(capability))) {
+      return "invalid policy capability pattern";
+    }
+    if (args.priority !== undefined && (!Number.isSafeInteger(args.priority) || Number(args.priority) < -1000 || Number(args.priority) > 1000)) {
+      return "priority must be an integer between -1000 and 1000";
+    }
+    if (args.when_elevated !== undefined && typeof args.when_elevated !== "boolean") return "when_elevated must be boolean";
+    if (args.when_kind !== undefined && (!boundedText(args.when_kind, 32) || !/^[a-z0-9._-]+$/.test(String(args.when_kind)))) return "invalid when_kind";
+    for (const [field, max] of [["path_prefix", 1024], ["program_equals", 512], ["description", 512]] as const) {
+      if (args[field] !== undefined && !boundedText(args[field], max)) return `invalid ${field}`;
+    }
+    return null;
+  }
+  if (name === "ownmesh_policy_rule_remove") {
+    return boundedText(args.id, 64) && /^rule_[A-Za-z0-9_.-]{1,59}$/.test(args.id)
+      ? null
+      : "invalid policy rule id";
+  }
+  if (name === "ownmesh_daemon_unlock") return null;
+  if (name === "ownmesh_token_revoke") {
+    return boundedText(args.target_principal, 512) && String(args.target_principal).trim() === args.target_principal
+      ? null
+      : "invalid target_principal";
+  }
+  if (name === "ownmesh_request_approval") {
+    if (!boundedText(args.approval_id, 128) || !/^apr_[A-Za-z0-9]+$/.test(args.approval_id)) return "invalid approval_id";
+    const decision = String(args.requested_decision);
+    if (decision !== "approve" && decision !== "deny") return "requested_decision must be approve or deny";
+    if (typeof args.temporary_grant !== "boolean") return "temporary_grant must be boolean";
+    if (decision === "deny" && (args.temporary_grant || args.grant_seconds !== undefined)) return "deny cannot include a temporary grant";
+    if (decision === "approve" && args.temporary_grant) {
+      if (!Number.isSafeInteger(args.grant_seconds) || Number(args.grant_seconds) < 1 || Number(args.grant_seconds) > 86400) {
+        return "temporary_grant requires grant_seconds between 1 and 86400";
+      }
+    } else if (args.grant_seconds !== undefined) {
+      return "grant_seconds requires requested_decision=approve and temporary_grant=true";
+    }
+    return null;
+  }
+  return "unknown admin tool";
+}
+
 export const MCP_PROTOCOL_VERSION = "2025-03-26";
 
 // ---------------------------------------------------------------------------
@@ -2065,6 +2273,18 @@ function toolCapability(toolName: string): string {
       return "workspace.update";
     case "ownmesh_workspace_remove":
       return "workspace.remove";
+    case "ownmesh_policy_preset":
+      return "admin.policy.preset";
+    case "ownmesh_policy_rule_add":
+      return "admin.policy.rule_add";
+    case "ownmesh_policy_rule_remove":
+      return "admin.policy.rule_remove";
+    case "ownmesh_daemon_unlock":
+      return "admin.daemon.unlock";
+    case "ownmesh_token_revoke":
+      return "admin.token.revoke";
+    case "ownmesh_request_approval":
+      return "admin.approval.bridge";
     case "ownmesh_cancel_operation":
       return "operation.cancel";
     case "__transfer_artifact_get":
@@ -2143,6 +2363,18 @@ function toolAction(toolName: string): string {
       return "workspace.update";
     case "ownmesh_workspace_remove":
       return "workspace.remove";
+    case "ownmesh_policy_preset":
+      return "admin.policy.preset";
+    case "ownmesh_policy_rule_add":
+      return "admin.policy.rule_add";
+    case "ownmesh_policy_rule_remove":
+      return "admin.policy.rule_remove";
+    case "ownmesh_daemon_unlock":
+      return "admin.daemon.unlock";
+    case "ownmesh_token_revoke":
+      return "admin.token.revoke";
+    case "ownmesh_request_approval":
+      return "admin.approval.bridge";
     case "ownmesh_list_profiles":
     case "ownmesh_profile_list":
       return "profile.list";
@@ -2533,7 +2765,9 @@ export function approvalRequiredEnvelope(opts: {
   approvalId?: string;
   correlationId?: string;
   warnings?: string[];
+  targetPreview?: unknown;
 }): OwnMeshResultEnvelope {
+  const targetPreview = normalizeApprovalTargetPreview(opts.targetPreview);
   return makeEnvelope({
     operation_id: opts.operationId,
     status: "approval_required",
@@ -2547,6 +2781,7 @@ export function approvalRequiredEnvelope(opts: {
         "When setup delegates interactive confirmation to ChatGPT, the authenticated MCP invocation is the requested action. " +
         "OwnMesh does not receive a cryptographic ChatGPT confirmation attestation. " +
         "Local recovery approval (CLI/TUI/browser) remains available only when device policy is configured to ask or as an admin path.",
+      ...(targetPreview ? { target_preview: targetPreview } : {}),
     },
     approval_required: true,
     approval_url: approvalUrl(opts.issuer, opts.operationId),
@@ -3333,6 +3568,18 @@ export async function handleMcp(
         required: tool.scope,
         tool: name,
       });
+    }
+
+    if (ADMIN_MCP_TOOL_NAMES.has(name)) {
+      if (!args || typeof args !== "object" || Array.isArray(args)) {
+        return mcpError(id, -32602, "admin arguments must be an object");
+      }
+      const properties = tool.inputSchema.properties as Record<string, unknown> | undefined;
+      const allowed = new Set(Object.keys(properties || {}));
+      const unknown = Object.keys(args).find((key) => !allowed.has(key));
+      if (unknown) {
+        return mcpError(id, -32602, "unknown admin argument", { tool: name, field: unknown });
+      }
     }
 
     // Transfer arguments are a public authority boundary. Unlike historical
@@ -4253,6 +4500,28 @@ export async function handleMcp(
     }
 
     const safeArgs = sanitizeMcpArgs(args, name);
+    if (ADMIN_MCP_TOOL_NAMES.has(name)) {
+      const validationError = validateAdminToolArgs(name, safeArgs);
+      if (validationError) {
+        return mcpError(id, -32602, validationError, {
+          tool: name,
+          code: "OWNMESH_E_ADMIN_ARGUMENT_INVALID",
+        });
+      }
+      // Device operability is insufficient for policy/credential administration:
+      // require the enrolled owner or a durable tenant owner/admin role.
+      const mayAdminister = await mayAdministerDevice(
+        store,
+        deviceId,
+        rec.tenant_id,
+        rec.principal,
+      );
+      if (!mayAdminister) {
+        return mcpError(id, -32004, "device_admin_required", {
+          code: "OWNMESH_E_DEVICE_ADMIN_REQUIRED",
+        });
+      }
+    }
     // E4: a device being operable never grants a tenant member control over all
     // of its registered roots.  Resolve the cloud custody record before a
     // canonical action is built or anything is handed to DeviceRoom.  The
@@ -4849,6 +5118,7 @@ export async function handleMcp(
         correlationId: correlation,
         approvalId: detail.approval_id ? String(detail.approval_id) : undefined,
         reason: detail.reason ? String(detail.reason) : undefined,
+        targetPreview: detail.target_preview,
         warnings: injectWarnings,
       });
       const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
@@ -5362,6 +5632,28 @@ export async function handleApprove(
             { status: 403 },
           );
         }
+        if (
+          ADMIN_MCP_TOOL_NAMES.has(op.tool) &&
+          !(await mayAdministerDevice(store, deviceId, principal.tenant_id, principal.id))
+        ) {
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            claimToken,
+            claimVersion,
+            "device_admin_required",
+          );
+          claimSettled = true;
+          return json(
+            {
+              error: "device_admin_required",
+              error_description: "administrator role changed before approval delivery",
+              retryable: true,
+              operation_id: op.operation_id,
+              delivery_status: "pending",
+            },
+            { status: 403 },
+          );
+        }
         // Fresh operation identity for the decision notification so it cannot collide
         // with the original operation's correlation tombstone after approval_required.
         // Prefer the device-issued approval_id (from OWNMESH_E_APPROVAL_REQUIRED) so
@@ -5374,6 +5666,64 @@ export async function handleApprove(
             ? String((op.data as { approval_id: unknown }).approval_id)
             : "") ||
           claimed.id;
+        const existingDecision = op.data?.approval_decision;
+        const existingTransaction = op.data?.approval_transaction_id;
+        if (
+          (existingDecision !== undefined && existingDecision !== decision) ||
+          (existingTransaction !== undefined && existingTransaction !== claimed.id)
+        ) {
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            claimToken,
+            claimVersion,
+            "approval_decision_binding_conflict",
+          );
+          claimSettled = true;
+          return json(
+            {
+              error: "conflict",
+              error_description: "a different approval decision is already bound to this operation",
+              operation_id: op.operation_id,
+              delivery_status: "pending",
+            },
+            { status: 409 },
+          );
+        }
+        const prepared = await patchOp(
+          store,
+          defaultOpTracker,
+          op.operation_id,
+          {
+            summary: "human decision bound; delivering to device",
+            data: {
+              ...(op.data || {}),
+              approval_decision: decision,
+              approval_transaction_id: claimed.id,
+              approval_device_id: deviceApprovalId,
+            },
+          },
+          ["approval_required"],
+          op.data || {},
+        );
+        if (!prepared) {
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            claimToken,
+            claimVersion,
+            "approval_decision_binding_cas_failed",
+          );
+          claimSettled = true;
+          return json(
+            {
+              error: "conflict",
+              error_description: "operation changed before approval delivery",
+              authoritative: true,
+              operation_id: op.operation_id,
+              delivery_status: "pending",
+            },
+            { status: 409 },
+          );
+        }
 
         // E3: bind the recovery decision to the original exact action + expiry.
         // A newly minted browser tx must not resurrect a stale deferred request.
@@ -5579,11 +5929,11 @@ export async function handleApprove(
         });
       }
       return html(authPage({
-        title: `${decision === "approve" ? "Approved" : "Denied"} — OwnMesh`,
+        title: "Decision delivered — OwnMesh",
         eyebrow: "Operation approval",
-        heading: decision === "approve" ? "Operation approved" : "Operation denied",
-        intro: "The decision was recorded against the exact operation and action hash.",
-        body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(updated.operation_id)}</code></dd><dt>Status</dt><dd>${escapeHtml(updated.status)}</dd></dl><p class="note">Local device policy remains the final authority.</p>`,
+        heading: decision === "approve" ? "Approval sent to device" : "Denial sent to device",
+        intro: "The exact-bound decision was delivered. The device result is authoritative.",
+        body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(updated.operation_id)}</code></dd><dt>Status</dt><dd>${escapeHtml(updated.status)}</dd></dl><p class="note">Keep the CLI open while OwnMesh waits for the device result. Local device policy remains the final authority.</p>`,
         footer: "You can close this tab",
       }), {
         noStore: true,
@@ -5645,6 +5995,20 @@ export async function handleApprove(
       { status: 409 },
     );
   }
+  if (
+    typeof op.data?.approval_transaction_id === "string" &&
+    op.data.approval_transaction_id.trim() !== ""
+  ) {
+    return json(
+      {
+        error: "conflict",
+        error_description: "approval decision already delivered; awaiting device result",
+        status: op.status,
+        operation_id: op.operation_id,
+      },
+      { status: 409 },
+    );
+  }
 
   if (op.device_id) {
     const gate = await store.assertDeviceOperableForMcp(op.device_id, principal.id, principal.tenant_id);
@@ -5693,12 +6057,27 @@ export async function handleApprove(
   const actionPreview = op.action
     ? escapeHtml(JSON.stringify(op.action, null, 2))
     : escapeHtml(op.summary || "");
+  const errorData =
+    op.data?.error && typeof op.data.error === "object"
+      ? (op.data.error as Record<string, unknown>)
+      : null;
+  const errorDetails =
+    errorData?.details && typeof errorData.details === "object"
+      ? (errorData.details as Record<string, unknown>)
+      : null;
+  const targetPreview =
+    op.tool === "ownmesh_request_approval"
+      ? normalizeApprovalTargetPreview(errorDetails?.target_preview)
+      : null;
+  const targetPreviewHtml = targetPreview
+    ? `<h2>Local target</h2><pre>${escapeHtml(JSON.stringify(targetPreview, null, 2))}</pre>`
+    : "";
   const page = authPage({
     title: "Approve operation — OwnMesh",
     eyebrow: "Local policy escalation",
     heading: "Review the exact operation",
     intro: "This action needs an explicit decision from the authenticated OwnMesh owner.",
-    body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(op.operation_id)}</code></dd><dt>Tool</dt><dd><code>${escapeHtml(op.tool || "")}</code></dd><dt>Device</dt><dd><code>${escapeHtml(op.device_id || "")}</code></dd><dt>Expires</dt><dd><code>${escapeHtml(op.expires_at || nowIso(txExpiresMs))}</code></dd><dt>Payload hash</dt><dd><code>${escapeHtml(op.payload_hash || "(none)")}</code></dd></dl><pre>${actionPreview}</pre><p class="note">ChatGPT confirmation is not a cryptographic attestation. OwnMesh binds this decision to the exact action hash and expiry before device execution.</p><form method="post" action="/approve?operation_id=${encodeURIComponent(op.operation_id)}"><input type="hidden" name="transaction_id" value="${escapeHtml(txId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><input type="hidden" name="operation_id" value="${escapeHtml(op.operation_id)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">Approve operation</button><button class="danger" name="decision" value="deny" type="submit">Deny</button></div></form>`,
+    body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(op.operation_id)}</code></dd><dt>Tool</dt><dd><code>${escapeHtml(op.tool || "")}</code></dd><dt>Device</dt><dd><code>${escapeHtml(op.device_id || "")}</code></dd><dt>Expires</dt><dd><code>${escapeHtml(op.expires_at || nowIso(txExpiresMs))}</code></dd><dt>Payload hash</dt><dd><code>${escapeHtml(op.payload_hash || "(none)")}</code></dd></dl><pre>${actionPreview}</pre>${targetPreviewHtml}<p class="note">ChatGPT confirmation is not a cryptographic attestation. OwnMesh binds this decision to the exact action hash and expiry before device execution.</p><form method="post" action="/approve?operation_id=${encodeURIComponent(op.operation_id)}"><input type="hidden" name="transaction_id" value="${escapeHtml(txId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><input type="hidden" name="operation_id" value="${escapeHtml(op.operation_id)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">Approve operation</button><button class="danger" name="decision" value="deny" type="submit">Deny</button></div></form>`,
     footer: new URL(issuer).host,
   });
   return html(page, {
@@ -5706,6 +6085,37 @@ export async function handleApprove(
     noStore: true,
     headers: { "content-security-policy": AUTH_PAGE_CSP },
   });
+}
+
+function normalizeApprovalTargetPreview(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  const textBounds: Record<string, number> = {
+    approval_id: 128,
+    operation_id: 256,
+    capability: 128,
+    reason: 512,
+    kind: 128,
+    program: 512,
+    path: 1024,
+  };
+  for (const [key, max] of Object.entries(textBounds)) {
+    const candidate = source[key];
+    if (
+      typeof candidate === "string" &&
+      candidate.length <= max &&
+      !/[\u0000-\u001f\u007f]/.test(candidate)
+    ) {
+      out[key] = candidate;
+    }
+  }
+  for (const key of ["elevated", "workspace_relative"]) {
+    if (typeof source[key] === "boolean") out[key] = source[key];
+  }
+  return typeof out.operation_id === "string" && typeof out.capability === "string"
+    ? out
+    : null;
 }
 
 /**

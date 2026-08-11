@@ -1,5 +1,6 @@
 //! Command dispatch.
 
+mod admin_flow;
 mod approval;
 mod config_cmd;
 pub(crate) mod device_cmd;
@@ -41,20 +42,16 @@ pub use status::run_status;
 /// Keep this registry authoritative instead of counting function-call text.
 ///
 /// v1.1.0 removed: setup, doctor, service lifecycle, and signed update surfaces.
-pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[
-    "approval approve",
-    "approval deny",
-    "policy preset",
-    "unlock",
-    "tokens revoke",
-];
+#[allow(dead_code)]
+pub const EXPLICIT_UNSUPPORTED_CLI_SURFACES: &[&str] = &[];
 
 /// Additional hard-error unsupported surfaces beyond the explicit stub registry.
 ///
 /// Each entry is paired with a real dispatch/handler hard-error path (not a
 /// soft fallback). Canonical names only — descriptive notes live in the
 /// release manifest.
-pub const ADDITIONAL_UNSUPPORTED_CLI_SURFACES: &[&str] = &["policy rule mutation"];
+#[allow(dead_code)]
+pub const ADDITIONAL_UNSUPPORTED_CLI_SURFACES: &[&str] = &[];
 
 /// Dispatch a parsed CLI invocation.
 pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
@@ -66,7 +63,7 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Logout) => login::run_logout(cli),
         Some(Commands::Doctor(args)) => doctor::run_doctor_cmd(cli, args),
         Some(Commands::Lockdown) => lockdown::run_lockdown(cli),
-        Some(Commands::Unlock) => lockdown::run_unlock(cli),
+        Some(Commands::Unlock(args)) => lockdown::run_unlock(cli, args),
         Some(Commands::Tokens(cmd)) => lockdown::dispatch_tokens(cli, cmd),
         Some(Commands::Config(cmd)) => config_cmd::dispatch_config(cli, cmd),
         Some(Commands::Instance(cmd)) => instance_cmd::dispatch_instance(cli, cmd),
@@ -182,51 +179,9 @@ fn dispatch_mcp(cli: &Cli, cmd: &McpCmd) -> Result<(), ExitCode> {
     mcp::dispatch_mcp(cli, cmd)
 }
 
-pub(crate) fn unsupported_exit(command: &str) -> ExitCode {
-    // Registry membership is enforced in every build (not debug_assert-only).
-    let registered = EXPLICIT_UNSUPPORTED_CLI_SURFACES.contains(&command)
-        || ADDITIONAL_UNSUPPORTED_CLI_SURFACES.contains(&command);
-    if registered {
-        ExitCode::ProfileUnavailable
-    } else {
-        eprintln!(
-            "internal error: unsupported CLI surface is absent from the canonical registry: {command}"
-        );
-        ExitCode::Internal
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn unsupported(cli: &Cli, command: &str, detail: &str) -> Result<(), ExitCode> {
-    let exit = unsupported_exit(command);
-    if exit == ExitCode::Internal {
-        return Err(exit);
-    }
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "status": "not_implemented",
-                "command": command,
-                "message": detail,
-            })
-        );
-    } else {
-        eprintln!("ownmesh {command}: not implemented yet — {detail}");
-    }
-    Err(exit)
-}
-
 #[cfg(test)]
 mod registry_tests {
-    use super::{
-        unsupported, unsupported_exit, ADDITIONAL_UNSUPPORTED_CLI_SURFACES,
-        EXPLICIT_UNSUPPORTED_CLI_SURFACES,
-    };
-    use crate::cli::Cli;
-    use clap::Parser;
-    use ownmesh_domain::ExitCode;
+    use super::{ADDITIONAL_UNSUPPORTED_CLI_SURFACES, EXPLICIT_UNSUPPORTED_CLI_SURFACES};
     use serde_json::Value;
     use std::collections::HashSet;
 
@@ -306,26 +261,5 @@ mod registry_tests {
             explicit_set.is_disjoint(&additional_set),
             "explicit and additional registries must not overlap"
         );
-    }
-
-    #[test]
-    fn unregistered_unsupported_command_is_hard_error() {
-        let cli = Cli::try_parse_from(["ownmesh", "status"]).expect("status parses");
-        let err = unsupported(&cli, "not a registered surface", "should fail")
-            .expect_err("unregistered surface must hard-error");
-        assert_eq!(err, ExitCode::Internal);
-        assert_eq!(
-            unsupported_exit("an arbitrary string"),
-            ExitCode::Internal,
-            "custom hard-error handlers must also reject unregistered strings"
-        );
-    }
-
-    #[test]
-    fn registered_additional_surface_is_not_internal_error() {
-        let cli = Cli::try_parse_from(["ownmesh", "status"]).expect("status parses");
-        let err = unsupported(&cli, "policy rule mutation", "rule mutation unavailable")
-            .expect_err("registered additional surface still returns not-implemented");
-        assert_eq!(err, ExitCode::ProfileUnavailable);
     }
 }

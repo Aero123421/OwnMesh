@@ -1258,6 +1258,7 @@ fn production_daemon_start_recovers_config_written_journal_before_policy_use() {
         schema_version: 1,
         preset: Some("full_access".into()),
         delegate_remote_mcp: false,
+        rules: Vec::new(),
     };
     save_config_and_policy_transactional(&paths, &old_cfg, &old_policy).unwrap();
 
@@ -1274,6 +1275,7 @@ fn production_daemon_start_recovers_config_written_journal_before_policy_use() {
         schema_version: 1,
         preset: Some("workspace_only".into()),
         delegate_remote_mcp: false,
+        rules: Vec::new(),
     };
     // Render via a successful transactional write to a sibling layout, then copy bytes.
     let render_dir = tempdir().unwrap();

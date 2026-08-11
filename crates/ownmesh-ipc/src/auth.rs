@@ -722,6 +722,12 @@ pub fn human_operator_method(method: &str) -> bool {
             | methods::POLICY_PRESET
             | methods::DAEMON_UNLOCK
             | methods::TOKEN_REVOKE
+            | methods::ADMIN_POLICY_PRESET_REQUEST
+            | methods::ADMIN_POLICY_RULE_ADD_REQUEST
+            | methods::ADMIN_POLICY_RULE_REMOVE_REQUEST
+            | methods::ADMIN_DAEMON_UNLOCK_REQUEST
+            | methods::ADMIN_TOKEN_REVOKE_REQUEST
+            | methods::ADMIN_APPROVAL_BRIDGE_REQUEST
     )
 }
 
@@ -1300,6 +1306,12 @@ mod tests {
             methods::POLICY_PRESET,
             methods::DAEMON_UNLOCK,
             methods::TOKEN_REVOKE,
+            methods::ADMIN_POLICY_PRESET_REQUEST,
+            methods::ADMIN_POLICY_RULE_ADD_REQUEST,
+            methods::ADMIN_POLICY_RULE_REMOVE_REQUEST,
+            methods::ADMIN_DAEMON_UNLOCK_REQUEST,
+            methods::ADMIN_TOKEN_REVOKE_REQUEST,
+            methods::ADMIN_APPROVAL_BRIDGE_REQUEST,
         ] {
             assert!(
                 gate.authorize_method(method, &uncred_id).is_err(),

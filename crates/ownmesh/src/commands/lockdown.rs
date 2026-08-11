@@ -1,6 +1,7 @@
 //! `ownmesh lockdown` / `unlock` / `tokens revoke`.
 
-use crate::cli::{Cli, TokensCmd};
+use crate::cli::{Cli, TokensCmd, UnlockArgs};
+use crate::commands::admin_flow::run_admin_operation;
 use crate::commands::ipc_util::{call_daemon, print_value};
 use ownmesh_domain::ExitCode;
 use ownmesh_ipc::{canonicalize_principal_key, methods};
@@ -15,31 +16,22 @@ pub fn run_lockdown(cli: &Cli) -> Result<(), ExitCode> {
     Ok(())
 }
 
-pub fn run_unlock(cli: &Cli) -> Result<(), ExitCode> {
-    let _ = cli;
-    // Unlock is a human-operator method. No distinct OS/UI presence proof is available
-    // on ordinary local IPC; fail closed rather than treating same-UID as human.
-    let message = ownmesh_ipc::human_operator_disabled_message();
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "command": "unlock",
-                "error": "human_presence_unavailable",
-                "message": message,
-            })
-        );
-    } else {
-        eprintln!("unlock: {message}");
-    }
-    Err(ExitCode::UsageConfig)
+pub fn run_unlock(cli: &Cli, args: &UnlockArgs) -> Result<(), ExitCode> {
+    run_admin_operation(
+        cli,
+        "ownmesh_daemon_unlock",
+        json!({ "idempotency_key": args.idempotency_key }),
+        "lockdown lifted",
+        false,
+    )
 }
 
 pub fn dispatch_tokens(cli: &Cli, cmd: &TokensCmd) -> Result<(), ExitCode> {
     match cmd {
-        TokensCmd::Revoke { principal } => {
+        TokensCmd::Revoke {
+            principal,
+            idempotency_key,
+        } => {
             let canonical = canonicalize_principal_key(principal);
             if canonical.is_empty() || canonical != principal.as_str() {
                 eprintln!(
@@ -47,23 +39,16 @@ pub fn dispatch_tokens(cli: &Cli, cmd: &TokensCmd) -> Result<(), ExitCode> {
                 );
                 return Err(ExitCode::UsageConfig);
             }
-            let _ = canonical;
-            let message = ownmesh_ipc::human_operator_disabled_message();
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({
-                        "schema_version": 1,
-                        "ok": false,
-                        "command": "tokens revoke",
-                        "error": "human_presence_unavailable",
-                        "message": message,
-                    })
-                );
-            } else {
-                eprintln!("tokens revoke: {message}");
-            }
-            Err(ExitCode::UsageConfig)
+            run_admin_operation(
+                cli,
+                "ownmesh_token_revoke",
+                json!({
+                    "target_principal": canonical,
+                    "idempotency_key": idempotency_key,
+                }),
+                "principal revoked",
+                false,
+            )
         }
     }
 }

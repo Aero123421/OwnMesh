@@ -1,32 +1,14 @@
 //! `ownmesh approval` — local approval queue via ownmeshd.
 
 use crate::cli::{ApprovalCmd, Cli};
+use crate::commands::admin_flow::run_admin_operation;
 use crate::commands::ipc_util::{call_daemon, print_value};
 use ownmesh_domain::ExitCode;
-use ownmesh_ipc::{human_operator_disabled_message, methods};
+use ownmesh_ipc::methods;
 use serde_json::{json, Value};
 use std::time::Duration;
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
-
-fn human_operator_unavailable(cli: &Cli, command: &str) -> Result<(), ExitCode> {
-    let message = human_operator_disabled_message();
-    if cli.json {
-        println!(
-            "{}",
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "command": command,
-                "error": "human_presence_unavailable",
-                "message": message,
-            })
-        );
-    } else {
-        eprintln!("{command}: {message}");
-    }
-    Err(ExitCode::UsageConfig)
-}
 
 pub fn dispatch_approval(cli: &Cli, cmd: &ApprovalCmd) -> Result<(), ExitCode> {
     dispatch_approval_with(cli, cmd, &call_daemon)
@@ -54,17 +36,40 @@ fn dispatch_approval_with(
             id,
             grant,
             grant_seconds,
+            idempotency_key,
         } => {
-            let _ = (id, grant, grant_seconds);
-            // No distinct OS/UI user-presence proof is bound to approve yet. Ordinary
-            // local IPC (including this CLI path) is fail-closed — same-UID sockets are
-            // forgeable and must not be treated as human presence.
-            human_operator_unavailable(cli, "approval approve")
+            let mut payload = json!({
+                "approval_id": id,
+                "requested_decision": "approve",
+                "temporary_grant": grant,
+                "idempotency_key": idempotency_key,
+            });
+            if *grant {
+                payload["grant_seconds"] = json!(grant_seconds.unwrap_or(3_600));
+            }
+            run_admin_operation(
+                cli,
+                "ownmesh_request_approval",
+                payload,
+                "approval applied",
+                false,
+            )
         }
-        ApprovalCmd::Deny { id } => {
-            let _ = id;
-            human_operator_unavailable(cli, "approval deny")
-        }
+        ApprovalCmd::Deny {
+            id,
+            idempotency_key,
+        } => run_admin_operation(
+            cli,
+            "ownmesh_request_approval",
+            json!({
+                "approval_id": id,
+                "requested_decision": "deny",
+                "temporary_grant": false,
+                "idempotency_key": idempotency_key,
+            }),
+            "approval denied",
+            true,
+        ),
         ApprovalCmd::Watch => {
             watch_approval_changes(call_local_daemon, None, &std::thread::sleep, |value| {
                 print_approval_snapshot(cli.json, value);

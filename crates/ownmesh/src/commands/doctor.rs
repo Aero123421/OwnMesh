@@ -617,6 +617,7 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
                 schema_version: 1,
                 preset: Some("recommended".into()),
                 delegate_remote_mcp: false,
+                rules: Vec::new(),
             },
         )
         .unwrap();

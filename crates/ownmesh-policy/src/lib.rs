@@ -155,7 +155,7 @@ pub struct OperationFacts {
 }
 
 /// Single policy rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub id: String,
     pub decision: Decision,

@@ -43,7 +43,7 @@ pub enum Commands {
     /// Emergency lockdown of the local agent.
     Lockdown,
     /// Lift emergency lockdown (local recovery).
-    Unlock,
+    Unlock(UnlockArgs),
     /// Local / control-plane token controls.
     #[command(subcommand)]
     Tokens(TokensCmd),
@@ -448,13 +448,19 @@ pub enum ApprovalCmd {
         #[arg(long)]
         grant: bool,
         /// Temporary grant lifetime in seconds (with `--grant`).
-        #[arg(long, default_value_t = 3600)]
-        grant_seconds: i64,
+        #[arg(long, requires = "grant", value_parser = clap::value_parser!(i64).range(1..=86_400))]
+        grant_seconds: Option<i64>,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Deny a request.
     Deny {
         /// Approval id.
         id: String,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Watch the approval queue.
     Watch,
@@ -469,12 +475,16 @@ pub enum PolicyCmd {
     Preset {
         /// Preset name.
         name: String,
+        /// Whether an exact-bound remote MCP invocation may satisfy ordinary policy Ask.
+        #[arg(long)]
+        delegate_remote_mcp: Option<bool>,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
-    /// Mutate a rule (stub).
-    Rule {
-        /// Rule expression / id.
-        spec: String,
-    },
+    /// Add or remove one bounded structured rule.
+    #[command(subcommand)]
+    Rule(PolicyRuleCmd),
     /// Validate policy files.
     Validate,
     /// Explain a decision.
@@ -542,6 +552,59 @@ pub enum TransferCmd {
         #[arg(long)]
         idempotency_key: String,
     },
+}
+
+/// Structured `ownmesh policy rule` mutations.
+#[derive(Debug, Subcommand)]
+pub enum PolicyRuleCmd {
+    /// Add one user-authored policy rule.
+    Add {
+        /// Stable rule id (`rule_...`).
+        id: String,
+        /// allow | ask | deny.
+        #[arg(long, value_parser = ["allow", "ask", "deny"])]
+        decision: String,
+        /// Exact capability, `*`, or a trailing wildcard such as `filesystem.*`.
+        #[arg(long)]
+        capability: String,
+        /// Priority within the same decision class.
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i32).range(-1_000..=1_000))]
+        priority: i32,
+        /// Match elevated/non-elevated operations only.
+        #[arg(long)]
+        when_elevated: Option<bool>,
+        /// Match an exact operation kind.
+        #[arg(long)]
+        when_kind: Option<String>,
+        /// Match an exact path prefix.
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Match an exact program value.
+        #[arg(long)]
+        program_equals: Option<String>,
+        /// Short human-readable rule description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Remove one user-authored policy rule.
+    Remove {
+        /// Stable rule id (`rule_...`).
+        id: String,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+}
+
+/// `ownmesh unlock` arguments.
+#[derive(Debug, Clone, Parser)]
+pub struct UnlockArgs {
+    /// Optional exact-once key for scripted retries (generated when omitted).
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Shared flags for `ownmesh service` mutating subcommands.
@@ -619,6 +682,9 @@ pub enum TokensCmd {
         /// Canonical principal returned by IPC HELLO (not a self-reported client label).
         #[arg(long, value_name = "CANONICAL_PRINCIPAL")]
         principal: String,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
 }
 
