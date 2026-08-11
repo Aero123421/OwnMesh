@@ -1596,10 +1596,14 @@ impl JournalStore {
             // do not fail merely because Windows delayed an owner-only ACL
             // metadata operation beyond the generic 20 ms lock window.
             let _store_lock = self.lock_store_with_attempts(2_000)?;
-            self.cleanup_expired_unlocked(now_unix())?;
-            if owner_only_file_present(&self.path(plan.id(), ".source-cleanup.json")?)? {
-                return Err(TransferError::Terminal);
-            }
+            let admission_now_unix = now_unix();
+            self.cleanup_expired_unlocked(admission_now_unix)?;
+            // A retained snapshot must always have the immutable plan record
+            // that owns it and supplies its cleanup deadline. Persist it in
+            // the same store-wide transaction as quota admission so another
+            // clone or process cannot sweep the completed snapshot as an
+            // orphan and immediately reuse its still-live quota slot.
+            self.save_plan_unlocked(&plan, admission_now_unix)?;
             if reservation.exists() {
                 let record = read_owner_only_file_bounded(&reservation, 512)
                     .map_err(|_| TransferError::CustodyUnavailable)?;
@@ -1965,8 +1969,14 @@ impl JournalStore {
     /// daemon can reopen only the exact authorized transfer id.
     pub fn save_plan(&self, plan: &TransferPlan) -> TransferResult<()> {
         let _store_lock = self.lock_store()?;
-        plan.validate_at(now_unix())?;
-        self.cleanup_expired_unlocked(now_unix())?;
+        let now_unix = now_unix();
+        plan.validate_at(now_unix)?;
+        self.cleanup_expired_unlocked(now_unix)?;
+        self.save_plan_unlocked(plan, now_unix)
+    }
+
+    fn save_plan_unlocked(&self, plan: &TransferPlan, now_unix: u64) -> TransferResult<()> {
+        plan.validate_at(now_unix)?;
         if owner_only_file_present(&self.path(plan.id(), ".source-cleanup.json")?)? {
             return Err(TransferError::Terminal);
         }
