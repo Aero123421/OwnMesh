@@ -82,9 +82,12 @@ jobs:
           test -s docs/release-keys/minisign.pub
       - name: Build release binaries (locked)
         shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
         run: |
           set -euo pipefail
-          cargo build --release --workspace --locked --target "${{ matrix.target }}"
+          cargo build --release --workspace --locked --target "${TARGET}"
       - name: Package portable archive (unix)
         if: runner.os != 'Windows'
         shell: bash
