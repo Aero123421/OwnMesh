@@ -9640,6 +9640,7 @@ mod transfer_runtime_tests {
 
     #[tokio::test]
     async fn cross_device_start_binds_each_runtime_to_its_own_transfer_role() {
+        let signed_expires_at_unix = DaemonRuntime::now() + 300;
         let source_temp = tempdir().unwrap();
         let source_paths = OwnMeshPaths::for_base(source_temp.path());
         let mut source = DaemonRuntime::open(&source_paths).unwrap();
@@ -9650,6 +9651,7 @@ mod transfer_runtime_tests {
         )
         .unwrap();
         bind_remote_transfer(&mut source);
+        source.active_remote_expires_at_unix = Some(signed_expires_at_unix);
         source.active_remote_device_id = Some("dev_source".into());
 
         let destination_temp = tempdir().unwrap();
@@ -9664,9 +9666,10 @@ mod transfer_runtime_tests {
             })
             .unwrap();
         bind_remote_transfer(&mut destination);
+        destination.active_remote_expires_at_unix = Some(signed_expires_at_unix);
         destination.active_remote_device_id = Some("dev_destination".into());
 
-        let expires_at = u64::try_from(source.active_remote_expires_at_unix.unwrap()).unwrap();
+        let expires_at = u64::try_from(signed_expires_at_unix).unwrap();
         assert_eq!(
             destination.active_remote_expires_at_unix,
             Some(expires_at as i64)
