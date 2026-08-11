@@ -95,6 +95,11 @@ pub enum Msg {
     ApprovalsDeny,
     ApprovalsHint,
     ApprovalsScopeOnce,
+    ApprovalsAlreadyDecided,
+    ApprovalsBrowserFlow,
+    ApprovalsApplied,
+    ApprovalsFailed,
+    ApprovalsTimedOut,
     // Transfers
     TransfersTitle,
     TransfersLocalPlan,
@@ -207,6 +212,11 @@ impl Msg {
         Self::ApprovalsDeny,
         Self::ApprovalsHint,
         Self::ApprovalsScopeOnce,
+        Self::ApprovalsAlreadyDecided,
+        Self::ApprovalsBrowserFlow,
+        Self::ApprovalsApplied,
+        Self::ApprovalsFailed,
+        Self::ApprovalsTimedOut,
         Self::TransfersTitle,
         Self::TransfersLocalPlan,
         Self::TransfersLocalCopy,
@@ -312,6 +322,11 @@ impl Msg {
             Self::ApprovalsDeny => "approvals.deny",
             Self::ApprovalsHint => "approvals.hint",
             Self::ApprovalsScopeOnce => "approvals.scope_once",
+            Self::ApprovalsAlreadyDecided => "approvals.already_decided",
+            Self::ApprovalsBrowserFlow => "approvals.browser_flow",
+            Self::ApprovalsApplied => "approvals.applied",
+            Self::ApprovalsFailed => "approvals.failed",
+            Self::ApprovalsTimedOut => "approvals.timed_out",
             Self::TransfersTitle => "transfers.title",
             Self::TransfersLocalPlan => "transfers.local_plan",
             Self::TransfersLocalCopy => "transfers.local_copy",
@@ -519,6 +534,27 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
         "a approve · d deny · r refresh · Enter details",
     );
     insert(&mut m, Msg::ApprovalsScopeOnce, "one-time");
+    insert(
+        &mut m,
+        Msg::ApprovalsAlreadyDecided,
+        "The selected request is no longer pending.",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsBrowserFlow,
+        "Complete the browser passkey check; waiting for the signed decision…",
+    );
+    insert(&mut m, Msg::ApprovalsApplied, "Approval decision applied.");
+    insert(
+        &mut m,
+        Msg::ApprovalsFailed,
+        "Approval was not applied; retry or use `ownmesh approval`.",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsTimedOut,
+        "Approval timed out; the request remains fail-closed.",
+    );
     insert(&mut m, Msg::TransfersTitle, "Transfers");
     insert(
         &mut m,
@@ -741,6 +777,27 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
         "a 許可 · d 拒否 · r 更新 · Enter 詳細",
     );
     insert(&mut m, Msg::ApprovalsScopeOnce, "一回限り");
+    insert(
+        &mut m,
+        Msg::ApprovalsAlreadyDecided,
+        "選択したリクエストはすでに保留中ではありません。",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsBrowserFlow,
+        "ブラウザでパスキー確認を完了してください。署名済みの判定を待っています…",
+    );
+    insert(&mut m, Msg::ApprovalsApplied, "承認の判定を適用しました。");
+    insert(
+        &mut m,
+        Msg::ApprovalsFailed,
+        "承認を適用できませんでした。再試行するか `ownmesh approval` を使ってください。",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsTimedOut,
+        "承認がタイムアウトしました。リクエストは安全側（未承認）のままです。",
+    );
     insert(&mut m, Msg::TransfersTitle, "転送");
     insert(
         &mut m,
@@ -947,6 +1004,27 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
         "a 批准 · d 拒绝 · r 刷新 · Enter 详情",
     );
     insert(&mut m, Msg::ApprovalsScopeOnce, "一次性");
+    insert(
+        &mut m,
+        Msg::ApprovalsAlreadyDecided,
+        "所选请求已不再处于待处理状态。",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsBrowserFlow,
+        "请在浏览器中完成通行密钥验证；正在等待签名决定…",
+    );
+    insert(&mut m, Msg::ApprovalsApplied, "已应用审批决定。");
+    insert(
+        &mut m,
+        Msg::ApprovalsFailed,
+        "未能应用审批；请重试或使用 `ownmesh approval`。",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsTimedOut,
+        "审批超时；请求保持安全拒绝状态。",
+    );
     insert(&mut m, Msg::TransfersTitle, "传输");
     insert(
         &mut m,
@@ -1157,6 +1235,31 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
         "a одобрить · d отклонить · r обновить · Enter подробности",
     );
     insert(&mut m, Msg::ApprovalsScopeOnce, "однократно");
+    insert(
+        &mut m,
+        Msg::ApprovalsAlreadyDecided,
+        "Выбранный запрос больше не ожидает решения.",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsBrowserFlow,
+        "Пройдите проверку passkey в браузере; ожидаем подписанное решение…",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsApplied,
+        "Решение по одобрению применено.",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsFailed,
+        "Одобрение не применено; повторите или используйте `ownmesh approval`.",
+    );
+    insert(
+        &mut m,
+        Msg::ApprovalsTimedOut,
+        "Время ожидания истекло; запрос остаётся безопасно закрыт.",
+    );
     insert(&mut m, Msg::TransfersTitle, "Передачи файлов");
     insert(
         &mut m,

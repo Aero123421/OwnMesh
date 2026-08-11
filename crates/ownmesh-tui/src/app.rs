@@ -127,6 +127,30 @@ pub struct ApprovalItem {
     pub reason: String,
 }
 
+/// Browser-confirmed decision requested from the approvals screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+impl ApprovalDecision {
+    #[must_use]
+    pub const fn cli_verb(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// Exact approval selected by the user before the TUI leaves the alternate screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApproval {
+    pub id: String,
+    pub decision: ApprovalDecision,
+}
+
 /// Overlay mode on top of a screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -148,6 +172,7 @@ pub struct App {
     pub daemon: Option<DaemonStatus>,
     pub approvals: Vec<ApprovalItem>,
     pub approval_cursor: usize,
+    pending_approval: Option<PendingApproval>,
     pub sessions: Vec<String>,
     pub activity: Vec<String>,
     pub doctor: DoctorReport,
@@ -200,6 +225,7 @@ impl App {
             daemon,
             approvals: Vec::new(),
             approval_cursor: 0,
+            pending_approval: None,
             sessions: Vec::new(),
             activity: Vec::new(),
             doctor,
@@ -309,6 +335,27 @@ impl App {
         self.palette.open();
     }
 
+    /// Queue the selected pending item for the browser/passkey approval flow.
+    pub fn queue_selected_approval(&mut self, decision: ApprovalDecision) {
+        let Some(item) = self.approvals.get(self.approval_cursor) else {
+            self.status_line = t(self.lang, Msg::ApprovalsEmpty).to_owned();
+            return;
+        };
+        if item.state != "pending" {
+            self.status_line = t(self.lang, Msg::ApprovalsAlreadyDecided).to_owned();
+            return;
+        }
+        self.pending_approval = Some(PendingApproval {
+            id: item.id.clone(),
+            decision,
+        });
+        self.status_line = t(self.lang, Msg::ApprovalsBrowserFlow).to_owned();
+    }
+
+    pub fn take_pending_approval(&mut self) -> Option<PendingApproval> {
+        self.pending_approval.take()
+    }
+
     /// Handle a palette action.
     pub fn dispatch_palette(&mut self, action: PaletteAction) {
         match action {
@@ -325,17 +372,11 @@ impl App {
             PaletteAction::Quit => self.should_quit = true,
             PaletteAction::ApproveSelected => {
                 self.screen = Screen::Approvals;
-                self.status_line = format!(
-                    "{} — IPC approve when daemon online",
-                    t(self.lang, Msg::ApprovalsApprove)
-                );
+                self.queue_selected_approval(ApprovalDecision::Approve);
             }
             PaletteAction::DenySelected => {
                 self.screen = Screen::Approvals;
-                self.status_line = format!(
-                    "{} — IPC deny when daemon online",
-                    t(self.lang, Msg::ApprovalsDeny)
-                );
+                self.queue_selected_approval(ApprovalDecision::Deny);
             }
         }
         self.palette.close();
