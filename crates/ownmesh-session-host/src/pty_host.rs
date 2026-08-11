@@ -376,19 +376,28 @@ impl LiveHost {
     pub fn drain_output_bytes(&self, max_bytes: usize) -> Result<RawDrainOutput, String> {
         // `remaining_bytes > 0` means more live-ring data is pending and must
         // be surfaced as a continuation (never a silent EOF).
-        // Opportunistically observe child exit without blocking.
-        if let Ok(mut child) = self.child.lock() {
-            if let Ok(Some(status)) = child.try_wait() {
-                if let Ok(mut ring) = self.output.lock() {
-                    ring.exited = true;
+        let mut ring = self.output.lock().map_err(|e| e.to_string())?;
+        let (bytes, truncated, remaining) = ring.drain(max_bytes.max(1));
+        // Reader EOF is the ordering barrier for process exit. Polling the
+        // child first can publish `exited` before the reader has transferred
+        // the PTY's final bytes into this ring, creating a false empty EOF.
+        let exited = ring.exited;
+        let mut exit_code = ring.exit_code;
+        drop(ring);
+
+        if exited && exit_code.is_none() {
+            if let Ok(mut child) = self.child.lock() {
+                if let Ok(Some(status)) = child.try_wait() {
                     // portable-pty ExitStatus exposes success(); keep code optional.
-                    ring.exit_code = if status.success() { Some(0) } else { Some(1) };
+                    exit_code = if status.success() { Some(0) } else { Some(1) };
+                    if let Ok(mut ring) = self.output.lock() {
+                        ring.exit_code = exit_code;
+                    }
                 }
             }
         }
-        let mut ring = self.output.lock().map_err(|e| e.to_string())?;
-        let (bytes, truncated, remaining) = ring.drain(max_bytes.max(1));
-        Ok((bytes, truncated, ring.exited, ring.exit_code, remaining))
+
+        Ok((bytes, truncated, exited, exit_code, remaining))
     }
 
     /// Drain up to `max_bytes` of pending output as explicitly lossy UTF-8.
