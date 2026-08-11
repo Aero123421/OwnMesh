@@ -722,7 +722,16 @@ mod tests {
         .await
         .expect("stopped server connections must release the registry lock");
 
-        let auth = attach_daemon_registry(&paths, AuthGate::for_user(&user_id)).unwrap();
+        let registry_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let auth = loop {
+            match attach_daemon_registry(&paths, AuthGate::for_user(&user_id)) {
+                Ok(auth) => break auth,
+                Err(_) if std::time::Instant::now() < registry_deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("stopped server must release the registry lock: {error}"),
+            }
+        };
         let restarted = Arc::new(IpcServer::new(
             ServerConfig::new(endpoint.clone(), auth, "ownmeshd", "2"),
             handler,

@@ -29,10 +29,13 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
+            workspace_test_args: ""
           - name: macOS
             os: macos-latest
+            workspace_test_args: ""
           - name: Linux
             os: ubuntu-latest
+            workspace_test_args: "--exclude ownmesh-session-host --exclude ownmeshd"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -61,7 +64,39 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: cargo test
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked ${{ matrix.workspace_test_args }}
+
+      # The daemon integration targets path-include runtime.rs, which would run
+      # the same unit tests once per target. Run the units once, then skip those
+      # duplicates in each integration target.
+      - name: Linux daemon unit tests
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        run: cargo test -p ownmeshd --bin ownmeshd --locked
+
+      - name: Linux daemon adversarial integration tests
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p ownmeshd --test adversarial_security --locked -- --skip 'runtime::'
+          cargo test -p ownmeshd --test lease_expiry --locked -- --skip 'runtime::'
+          cargo test -p ownmeshd --test persist_rollback --locked -- --skip 'runtime::'
+
+      - name: Linux daemon platform integration tests
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p ownmeshd --test broker_capability_forgery --locked
+          cargo test -p ownmeshd --test platform_endpoint_security --locked
+
+      - name: Linux PTY lifecycle tests (serialized)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        run: cargo test -p ownmesh-session-host --all-targets --locked -- --test-threads=1
 
       - name: Enforce Windows foreign-owner custody regression
         if: matrix.os == 'windows-latest'
