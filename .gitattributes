@@ -4,3 +4,4 @@
 *.py text eol=lf
 *.sh text eol=lf
 *.json text eol=lf
+crates/ownmesh-logs/tests/fixtures/mock-docker text eol=lf
