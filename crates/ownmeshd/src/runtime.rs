@@ -10004,8 +10004,19 @@ mod transfer_runtime_tests {
         drop(sink);
         runtime.transfer_store.save(&lease, &journal).unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        assert_eq!(runtime.cleanup_expired_transfers().unwrap(), 1);
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let removed = loop {
+            let removed = runtime.cleanup_expired_transfers().unwrap();
+            if removed != 0 {
+                break removed;
+            }
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "expired transfer was not cleaned within the bounded wait"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert_eq!(removed, 1);
         assert!(
             runtime
                 .handle_transfer_source_chunk(

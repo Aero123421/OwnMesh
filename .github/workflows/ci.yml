@@ -35,7 +35,7 @@ jobs:
             workspace_test_args: ""
           - name: Linux
             os: ubuntu-latest
-            workspace_test_args: "--exclude ownmesh-session-host"
+            workspace_test_args: "--exclude ownmesh-session-host --exclude ownmeshd"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -66,11 +66,14 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets --locked ${{ matrix.workspace_test_args }}
 
-      # These tests create and terminate real PTY process groups. Keep only
-      # this OS-global test binary serial; the rest of the workspace stays parallel.
-      - name: Linux session-host PTY tests (serialized)
+      # These crates exercise OS-global PTY/process teardown and duplicate the
+      # daemon runtime tests across integration binaries. Keep only this narrow
+      # stateful slice serial; the rest of the workspace stays parallel.
+      - name: Linux stateful daemon tests (serialized)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p ownmesh-session-host --all-targets --locked -- --test-threads=1
+        run: >-
+          cargo test -p ownmeshd -p ownmesh-session-host
+          --all-targets --locked -- --test-threads=1
 
       - name: Enforce Windows foreign-owner custody regression
         if: matrix.os == 'windows-latest'
