@@ -1015,6 +1015,7 @@ mod tests {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("deny all commands".into()),
                 }],
             });
@@ -1051,6 +1052,7 @@ mod tests {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("ask writes".into()),
                 }],
             });
@@ -1299,6 +1301,7 @@ mod tests {
                         when_kind: Some("raw_shell".into()),
                         path_prefix: None,
                         program_equals: None,
+                        when_tag: None,
                         description: Some("raw shell denied".into()),
                     },
                     PolicyRule {
@@ -1310,6 +1313,7 @@ mod tests {
                         when_kind: Some("structured".into()),
                         path_prefix: None,
                         program_equals: None,
+                        when_tag: None,
                         description: Some("structured allowed".into()),
                     },
                 ],
@@ -2128,6 +2132,7 @@ mod tests {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("deny exec regardless of payload text".into()),
                 }],
             });
