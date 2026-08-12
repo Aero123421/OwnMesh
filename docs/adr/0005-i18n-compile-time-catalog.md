@@ -28,10 +28,20 @@ rather than as choices.
 ### 1. The compile-time catalog is the accepted mechanism
 
 `enum Msg` plus per-locale tables replaces Fluent FTL. The deciding property is
-that **a missing translation is a compile error, not a runtime fallback**. Every
-`Msg` variant must be present in every locale table, and `ownmesh-tui
---check-i18n` plus a CI job enforce completeness across en-US, ja-JP, zh-Hans,
-and ru-RU.
+that **an incomplete locale fails the build pipeline rather than degrading
+silently at runtime**. Every `Msg` variant must be present in every locale
+table, enforced across en-US, ja-JP, zh-Hans, and ru-RU by three gates:
+`completeness_report()` asserted in `cargo test`, the `ownmesh-tui --check-i18n`
+subcommand, and a dedicated CI job that runs it.
+
+To be precise about the mechanism, because it matters when adding a locale: the
+tables are `BTreeMap`s built at run time, so `rustc` itself does not reject a
+missing key — the tests do, before the change can merge. `t()` returns the
+literal `[missing]` if one ever reached a shipped binary, which is a deliberate
+loud placeholder, not a fallback to another language. Making this a true
+compile error would mean replacing each table with an exhaustive `match` over
+`Msg`; that is a mechanical change the project can adopt later without
+invalidating this ADR.
 
 This keeps §18.3's substantive rules — no user-visible string literals inline,
 no sentence assembly by concatenation, CJK width awareness, no layout breakage

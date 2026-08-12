@@ -1,3 +1,6 @@
+# SPECIFICATION TARGET — not a loadable policy.toml.
+# The shipped engine uses a narrower rule model; see spec-bundle/README.md.
+# Generate a real policy with `ownmesh policy preset recommended`.
 # OwnMesh Recommended preset — general user operations allowed;
 # elevation, sensitive paths, external transfer, and major OS changes ask.
 
