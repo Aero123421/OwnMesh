@@ -373,6 +373,7 @@ async fn structured_shell_disguise_denied_by_raw_shell_policy() {
                     when_kind: Some("raw_shell".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("raw shell denied".into()),
                 },
                 PolicyRule {
@@ -384,6 +385,7 @@ async fn structured_shell_disguise_denied_by_raw_shell_policy() {
                     when_kind: Some("structured".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("structured allowed".into()),
                 },
             ],
@@ -492,6 +494,7 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
                     when_kind: Some("raw_shell".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
                 PolicyRule {
@@ -503,6 +506,7 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
                     when_kind: Some("structured".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
             ],
@@ -1561,6 +1565,7 @@ async fn production_agent_cannot_self_approve_or_use_management_for_human_ops() 
                 when_kind: None,
                 path_prefix: None,
                 program_equals: None,
+                when_tag: None,
                 description: None,
             }],
         });
@@ -1705,6 +1710,7 @@ async fn production_two_connection_presence_forgery_denied() {
                 when_kind: None,
                 path_prefix: None,
                 program_equals: None,
+                when_tag: None,
                 description: None,
             }],
         });
@@ -1823,6 +1829,7 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
                     when_kind: Some("raw_shell".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
                 PolicyRule {
@@ -1834,6 +1841,7 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
                     when_kind: Some("structured".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
             ],
@@ -1994,6 +2002,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
                     when_kind: Some("structured".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
                 PolicyRule {
@@ -2005,6 +2014,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
                     when_kind: Some("raw_shell".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
             ],
@@ -2374,6 +2384,7 @@ async fn production_filesystem_temporary_grant_still_works() {
                 when_kind: None,
                 path_prefix: None,
                 program_equals: None,
+                when_tag: None,
                 description: None,
             }],
         });

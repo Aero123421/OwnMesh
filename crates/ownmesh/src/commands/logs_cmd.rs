@@ -81,7 +81,14 @@ pub fn dispatch_logs(cli: &Cli, cmd: &LogsCmd) -> Result<(), ExitCode> {
             }
             let value = call_daemon(cli, "ops.logs.query", Some(params))?;
             print_value(cli.json, &value, |v| {
-                let (lines, next) = page_view(v);
+                if v["approval_required"].as_bool().unwrap_or(false) {
+                    println!(
+                        "approval required: {}",
+                        v["approval_id"].as_str().unwrap_or("(pending)")
+                    );
+                    return;
+                }
+                let (lines, next) = page_view(&v["result"]);
                 if lines.is_empty() {
                     println!("(no entries)");
                 }
@@ -114,6 +121,27 @@ mod tests {
         assert_eq!(
             page_view(&value),
             (vec!["first".into(), "second".into()], Some(2))
+        );
+    }
+
+    #[test]
+    fn daemon_envelope_wraps_the_page_under_result() {
+        let envelope = json!({
+            "approval_required": false,
+            "operation_id": "op_1",
+            "decision": "allow",
+            "result": {
+                "lines": [
+                    { "line_no": 1, "text": "first", "cursor_after": { "provider": "audit", "offset": 1 } }
+                ],
+                "next_cursor": { "provider": "audit", "offset": 1 },
+                "exhausted": false
+            }
+        });
+        assert_eq!(page_view(&envelope), (vec![], None));
+        assert_eq!(
+            page_view(&envelope["result"]),
+            (vec!["first".into()], Some(1))
         );
     }
 

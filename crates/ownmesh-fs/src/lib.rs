@@ -153,6 +153,20 @@ impl WorkspaceRoot {
         if rel.to_string_lossy().contains('\0') {
             return Err(FsError::InvalidPath(rel.display().to_string()));
         }
+        #[cfg(windows)]
+        if rel.components().any(|component| {
+            matches!(
+                component,
+                Component::Normal(name) if name.to_string_lossy().contains(':')
+            )
+        }) {
+            // A colon in a normal Windows path component selects an NTFS
+            // alternate data stream. Besides being non-portable, spellings such
+            // as `.env::$DATA` alias the default stream and can bypass policy
+            // classification based on the requested basename. Workspace paths
+            // never need ADS access, so reject it at the shared resolver.
+            return Err(FsError::InvalidPath(rel.display().to_string()));
+        }
 
         let candidate = if rel.is_absolute() {
             rel.to_path_buf()
@@ -1599,29 +1613,67 @@ fn empty_hash() -> &'static str {
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 }
 
-/// Detect common sensitive path basenames (UX hint only — never a hard deny).
+/// Detect common credential-like basenames.
+///
+/// This is a classification **hint** that restricted presets turn into an
+/// `Ask` (specification §7.1/§7.4 `reads_sensitive_location`). It is never a
+/// hard deny and the full-access presets ignore it entirely, so a false
+/// positive costs one confirmation rather than blocking work.
+///
+/// Matching is basename-only and deliberately conservative in the widening
+/// direction: missing a credential file is worse than confirming an ordinary
+/// one.
 #[must_use]
 pub fn looks_sensitive(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    matches!(
-        name.as_str(),
-        ".env"
-            | ".env.local"
-            | "id_rsa"
-            | "id_ed25519"
-            | "credentials"
-            | "credentials.json"
-            | "secret"
-            | "secrets.yaml"
-            | "secrets.yml"
-    ) || name == ".pem"
-        || name == ".key"
-        || Path::new(&name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("pem") || ext.eq_ignore_ascii_case("key"))
+    if name.is_empty() {
+        return false;
+    }
+    const EXACT: &[&str] = &[
+        ".env",
+        ".git-credentials",
+        ".htpasswd",
+        ".netrc",
+        ".npmrc",
+        ".pgpass",
+        ".pypirc",
+        "credentials",
+        "credentials.json",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        "id_rsa",
+        "secret",
+        "secrets.json",
+        "secrets.yaml",
+        "secrets.yml",
+        "service-account.json",
+    ];
+    const EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks", "keystore", "asc", "gpg"];
+    if EXACT.contains(&name.as_str()) {
+        return true;
+    }
+    // `.env.local`, `.env.production`, … but not an unrelated `.environment`.
+    if name.starts_with(".env.") {
+        return true;
+    }
+    // A leading-dot name has no extension of its own (`.pem` is the whole name).
+    if let Some(bare) = name.strip_prefix('.') {
+        if EXTENSIONS.contains(&bare) {
+            return true;
+        }
+    }
+    Path::new(&name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
 }
 
 #[cfg(test)]
@@ -1686,6 +1738,43 @@ mod tests {
         assert!(looks_sensitive(Path::new("/tmp/.key")));
         assert!(looks_sensitive(Path::new("/tmp/.pem")));
         assert!(!looks_sensitive(Path::new("/tmp/readme.md")));
+
+        for sensitive in [
+            "/tmp/.env.production",
+            "/srv/app/.env.local",
+            "/home/u/.ssh/id_ed25519",
+            "/home/u/.ssh/id_ecdsa",
+            "/home/u/.aws/credentials",
+            "/home/u/.netrc",
+            "/home/u/.npmrc",
+            "/home/u/.git-credentials",
+            "/opt/certs/client.p12",
+            "/opt/certs/store.jks",
+            "/opt/gcp/service-account.json",
+        ] {
+            assert!(looks_sensitive(Path::new(sensitive)), "{sensitive}");
+        }
+
+        for ordinary in [
+            "/tmp/.environment",
+            "/tmp/envelope.rs",
+            "/srv/app/keyboard.ts",
+            "/srv/app/monkey.md",
+            "/srv/app/",
+        ] {
+            assert!(!looks_sensitive(Path::new(ordinary)), "{ordinary}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_ntfs_alternate_data_stream_paths() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        fs::write(dir.path().join(".env"), b"API_TOKEN=secret\n").unwrap();
+
+        let err = read_file_range(&ws, ".env::$DATA", 0, 1024).unwrap_err();
+        assert!(matches!(err, FsError::InvalidPath(_)));
     }
 
     #[test]

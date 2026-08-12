@@ -189,7 +189,14 @@ pub struct CapabilityGrant {
     pub note: Option<String>,
 }
 
-/// Single policy rule (specification §7.3 / policy schema).
+/// Single policy rule in the **specification's** §7.3 shape.
+///
+/// This is the wire/schema model that `spec-bundle/schemas/policy.schema.json`
+/// and the shared fixtures describe. It is not the rule the engine evaluates:
+/// `ownmesh_policy::PolicyRule` is a deliberately narrower type carrying only
+/// the conditions the device can decide, and it is what `policy.toml` stores.
+/// The two are intentionally separate and must not be assumed interchangeable
+/// (see `spec-bundle/README.md` for which artifacts are shipped contracts).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyRule {
     pub id: PolicyRuleId,

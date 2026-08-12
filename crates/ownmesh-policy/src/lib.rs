@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -132,6 +132,14 @@ impl ExecutableIdentityBinding {
     }
 }
 
+/// Machine classification tag for reading a credential-like location
+/// (specification §7.4 `reads_sensitive_location`).
+pub const TAG_READS_SENSITIVE_LOCATION: &str = "reads_sensitive_location";
+
+/// Machine classification tag for writing a credential-like location
+/// (specification §7.4 `writes_sensitive_location`).
+pub const TAG_WRITES_SENSITIVE_LOCATION: &str = "writes_sensitive_location";
+
 /// Facts about an operation used for matching (machine facts, not AI opinion).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OperationFacts {
@@ -181,6 +189,13 @@ pub struct PolicyRule {
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub program_equals: Option<String>,
+    /// Match only when the server-computed facts carry this classification tag.
+    ///
+    /// Tags are machine facts derived by the daemon (specification §7.4
+    /// operation classes such as `reads_sensitive_location`), never client or
+    /// model assertions. A rule without a tag condition is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_tag: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -200,9 +215,14 @@ impl PolicyRule {
                 return false;
             }
         }
+        if let Some(tag) = &self.when_tag {
+            if !facts.tags.iter().any(|candidate| candidate == tag) {
+                return false;
+            }
+        }
         if let Some(prefix) = &self.path_prefix {
             match &facts.path {
-                Some(p) if path_scope_contains(prefix, p) => {}
+                Some(p) if rule_path_prefix_matches(prefix, p) => {}
                 _ => return false,
             }
         }
@@ -223,12 +243,13 @@ impl PolicyRule {
 /// preserved, preventing an absolute scope from matching a relative path.
 /// Returns `None` for empty values or `..` traversal.
 fn path_components(value: &str) -> Option<Vec<Component<'_>>> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+    // Whitespace is a real filename character. Trimming here would let a grant
+    // approved for ` proj` be reused for the different path `proj`.
+    if value.is_empty() {
         return None;
     }
     let mut out = Vec::new();
-    for component in Path::new(trimmed).components() {
+    for component in Path::new(value).components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => return None,
@@ -239,6 +260,54 @@ fn path_components(value: &str) -> Option<Vec<Component<'_>>> {
         return None;
     }
     Some(out)
+}
+
+/// Match the documented textual prefix against the path the filesystem walk
+/// will actually reach. Rules retain prefix compatibility (`.env` covers
+/// `.env.production`), while an interior `..` is collapsed before matching so
+/// it cannot escape an Allow prefix or dodge a Deny prefix.
+fn rule_path_prefix_matches(prefix: &str, candidate: &str) -> bool {
+    let has_parent = |value: &str| {
+        Path::new(value)
+            .components()
+            .any(|part| part == Component::ParentDir)
+    };
+    if !has_parent(prefix) && !has_parent(candidate) {
+        return candidate.starts_with(prefix);
+    }
+
+    let normalize = |value: &str| -> Option<String> {
+        let path = Path::new(value);
+        let mut normalized = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        return None;
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                    normalized.push(part.as_os_str());
+                }
+            }
+        }
+        let mut rendered = normalized.to_string_lossy().into_owned();
+        let trailing_separator =
+            value.ends_with(std::path::MAIN_SEPARATOR) || cfg!(windows) && value.ends_with('/');
+        if trailing_separator && !rendered.ends_with(std::path::MAIN_SEPARATOR) {
+            rendered.push(std::path::MAIN_SEPARATOR);
+        }
+        Some(rendered)
+    };
+
+    let Some(prefix) = normalize(prefix) else {
+        return false;
+    };
+    let Some(candidate) = normalize(candidate) else {
+        return false;
+    };
+    candidate.starts_with(&prefix)
 }
 
 /// True when `candidate` is `scope` itself or a descendant of it.
@@ -315,6 +384,11 @@ pub fn evaluate(doc: &PolicyDocument, facts: &OperationFacts) -> PolicyVerdict {
 }
 
 /// Combine cloud and local policies: evaluate both, take the tighter decision.
+///
+/// Reference implementation of specification §7.2. **The shipped runtime does
+/// not call this**: the control plane holds no policy document, so the device
+/// evaluates one document and is the only policy authority
+/// (ADR 0008). Its presence is not evidence that a cloud policy is fetched.
 #[must_use]
 pub fn evaluate_combined(
     cloud: &PolicyDocument,
@@ -346,6 +420,31 @@ pub fn evaluate_combined(
     }
 }
 
+/// Ask before a restricted preset reads a credential-like file.
+///
+/// Specification §7.1 promises that Recommended confirms access to credentials.
+/// Reads are otherwise allowed outright there, so without this rule a workspace
+/// `.env` or private key would reach a connected model with no human in the
+/// loop. The daemon supplies the tag from the resolved path; the rule never
+/// fires on a client- or model-supplied claim.
+///
+/// This is an `Ask`, never a `Deny`: the user can still approve the read, and
+/// the full-access presets do not carry this rule at all.
+fn sensitive_read_ask_rule(id: &str) -> PolicyRule {
+    PolicyRule {
+        id: id.to_owned(),
+        decision: Decision::Ask,
+        priority: 60,
+        capability: "filesystem.read".into(),
+        when_elevated: None,
+        when_kind: None,
+        path_prefix: None,
+        program_equals: None,
+        when_tag: Some(TAG_READS_SENSITIVE_LOCATION.into()),
+        description: Some("confirm reads of credential-like paths".into()),
+    }
+}
+
 /// Built-in presets.
 #[must_use]
 // Keeping each complete preset together makes its security rules auditable.
@@ -368,6 +467,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("elevated ops denied in Workspace Only".into()),
                 },
                 // Arbitrary structured/raw commands can open absolute paths and escape
@@ -381,6 +481,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some(
                         "command.run denied in workspace_only until OS process confinement"
                             .into(),
@@ -397,6 +498,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some(
                         "session.open denied in workspace_only until OS process confinement"
                             .into(),
@@ -411,8 +513,10 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("confirm writes".into()),
                 },
+                sensitive_read_ask_rule("ws-ask-sensitive-read"),
             ],
         },
         AccessPreset::Recommended => PolicyDocument {
@@ -431,6 +535,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("confirm elevated".into()),
                 },
                 // Same confinement gap as workspace_only: cwd binding alone cannot stop
@@ -444,6 +549,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some(
                         "command.run denied in recommended until OS process confinement".into(),
                     ),
@@ -457,6 +563,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some(
                         "session.open denied in recommended until OS process confinement".into(),
                     ),
@@ -470,6 +577,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("confirm writes".into()),
                 },
                 PolicyRule {
@@ -481,8 +589,10 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: Some("allow reads".into()),
                 },
+                sensitive_read_ask_rule("rec-ask-sensitive-read"),
             ],
         },
         AccessPreset::FullUserAccess => PolicyDocument {
@@ -497,6 +607,7 @@ pub fn preset_document(preset: AccessPreset) -> PolicyDocument {
                 when_kind: None,
                 path_prefix: None,
                 program_equals: None,
+                when_tag: None,
                 description: Some("confirm elevated only".into()),
             }],
         },
@@ -631,8 +742,7 @@ pub fn temporary_grant_from_facts(
     let path_prefix = facts
         .path
         .as_ref()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.trim().is_empty())
         .map(ToOwned::to_owned);
 
     if temporary_grant_requires_path_scope(capability) {
@@ -747,6 +857,11 @@ fn temporary_grant_matches(
 }
 
 /// Evaluate with temporary grants that force Allow when still valid.
+///
+/// A grant may only lift an `Ask`. An explicit `Deny` rule outranks every grant
+/// (specification §7.7: explicit deny precedes explicit ask and allow), so a
+/// deny added after a grant was issued takes effect immediately instead of
+/// waiting for the grant to expire.
 #[must_use]
 pub fn evaluate_with_grants(
     doc: &PolicyDocument,
@@ -755,6 +870,10 @@ pub fn evaluate_with_grants(
     now_unix: i64,
     principal_id: &str,
 ) -> PolicyVerdict {
+    let verdict = evaluate(doc, facts);
+    if verdict.decision == Decision::Deny {
+        return verdict;
+    }
     for g in grants {
         if !temporary_grant_matches(g, facts, principal_id, now_unix) {
             continue;
@@ -765,7 +884,7 @@ pub fn evaluate_with_grants(
             reason: format!("temporary grant {}", g.id),
         };
     }
-    evaluate(doc, facts)
+    verdict
 }
 
 /// Summarize rule counts by decision (for UI).
@@ -851,6 +970,7 @@ mod tests {
                     when_kind: None,
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
                 PolicyRule {
@@ -862,6 +982,7 @@ mod tests {
                     when_kind: Some("raw_shell".into()),
                     path_prefix: None,
                     program_equals: None,
+                    when_tag: None,
                     description: None,
                 },
             ],
@@ -1004,6 +1125,46 @@ mod tests {
                 "a Unix backslash is a filename byte, not a path separator"
             );
         }
+    }
+
+    #[test]
+    fn rule_prefix_uses_normalized_target_without_losing_prefix_compatibility() {
+        let rule = |decision, prefix: &str| PolicyRule {
+            id: "path-rule".into(),
+            decision,
+            priority: 1,
+            capability: "filesystem.read".into(),
+            when_elevated: None,
+            when_kind: None,
+            path_prefix: Some(prefix.into()),
+            program_equals: None,
+            when_tag: None,
+            description: None,
+        };
+        let facts = |path: &str| OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "file".into(),
+            path: Some(path.into()),
+            ..Default::default()
+        };
+
+        for (prefix, path) in [
+            (".env", ".env.production"),
+            ("secret", "secrets.txt"),
+            ("secrets", "secrets/../secrets/key.pem"),
+            ("secrets", "other/../secrets/key.pem"),
+            ("secrets/", "secrets/other/../key.pem"),
+        ] {
+            assert!(
+                rule(Decision::Deny, prefix).matches(&facts(path)),
+                "{prefix:?} must match the resolved target of {path:?}"
+            );
+        }
+
+        assert!(
+            !rule(Decision::Allow, "proj").matches(&facts("proj/../secrets/key.pem")),
+            "traversal must not escape an allow prefix"
+        );
     }
 
     /// Issuance refuses to mint a filesystem grant with no path, and matching
@@ -1261,6 +1422,118 @@ mod tests {
         }
     }
 
+    /// §7.7 puts explicit deny above every allow source. A grant issued before
+    /// the deny existed must not keep authorizing the operation until it expires.
+    #[test]
+    fn explicit_deny_outranks_a_matching_temporary_grant() {
+        let approved = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("proj".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            ..Default::default()
+        };
+        let grants = vec![temporary_grant_from_facts(
+            "g-deny".into(),
+            "user-1".into(),
+            9_999_999_999,
+            &approved,
+        )
+        .expect("scoped grant")];
+
+        let doc = PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: None,
+            rules: vec![PolicyRule {
+                id: "deny-proj-writes".into(),
+                decision: Decision::Deny,
+                priority: 0,
+                capability: "filesystem.write".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: Some("proj".into()),
+                program_equals: None,
+                when_tag: None,
+                description: Some("operator added this after the grant".into()),
+            }],
+        };
+
+        let v = evaluate_with_grants(&doc, &approved, &grants, 1_700_000_000, "user-1");
+        assert_eq!(v.decision, Decision::Deny, "{v:?}");
+        assert!(!v.reason.contains("temporary grant"), "{}", v.reason);
+
+        // A grant still lifts an Ask — that is the feature it exists for.
+        let ask_only = preset_document(AccessPreset::WorkspaceOnly);
+        assert_eq!(
+            evaluate_with_grants(&ask_only, &approved, &grants, 1_700_000_000, "user-1").decision,
+            Decision::Allow
+        );
+    }
+
+    /// Restricted presets confirm credential-like reads (§7.1); full access does not.
+    #[test]
+    fn restricted_presets_ask_before_reading_sensitive_paths() {
+        let sensitive = OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "file".into(),
+            path: Some(".env".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            tags: vec![TAG_READS_SENSITIVE_LOCATION.into()],
+            ..Default::default()
+        };
+        let ordinary = OperationFacts {
+            tags: Vec::new(),
+            path: Some("src/main.rs".into()),
+            ..sensitive.clone()
+        };
+
+        for preset in [AccessPreset::WorkspaceOnly, AccessPreset::Recommended] {
+            let doc = preset_document(preset);
+            assert_eq!(
+                evaluate(&doc, &sensitive).decision,
+                Decision::Ask,
+                "{preset:?} must confirm credential-like reads"
+            );
+            assert_eq!(
+                evaluate(&doc, &ordinary).decision,
+                Decision::Allow,
+                "{preset:?} must not disturb ordinary reads"
+            );
+        }
+
+        for preset in [AccessPreset::FullUserAccess, AccessPreset::FullAccess] {
+            let doc = preset_document(preset);
+            assert_eq!(
+                evaluate(&doc, &sensitive).decision,
+                Decision::Allow,
+                "{preset:?} keeps the user's explicit choice without hidden friction"
+            );
+        }
+    }
+
+    /// A tag condition is a machine fact filter, not a free-text match.
+    #[test]
+    fn tag_conditioned_rules_require_the_exact_tag() {
+        let doc = PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: None,
+            rules: vec![sensitive_read_ask_rule("t")],
+        };
+        let mut facts = OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "file".into(),
+            path: Some(".env".into()),
+            ..Default::default()
+        };
+        assert_eq!(evaluate(&doc, &facts).decision, Decision::Allow);
+        facts.tags = vec!["reads_sensitive".into()];
+        assert_eq!(evaluate(&doc, &facts).decision, Decision::Allow);
+        facts.tags = vec![TAG_READS_SENSITIVE_LOCATION.into()];
+        assert_eq!(evaluate(&doc, &facts).decision, Decision::Ask);
+    }
+
     #[test]
     fn non_command_temporary_grant_from_facts_still_works() {
         let grant = temporary_grant_from_facts(
@@ -1280,5 +1553,21 @@ mod tests {
         assert_eq!(grant.capability, "filesystem.write");
         assert_eq!(grant.path_prefix.as_deref(), Some("a"));
         assert_eq!(grant.workspace_id.as_deref(), Some("ws_default"));
+
+        let spaced = temporary_grant_from_facts(
+            "g-spaced".into(),
+            "agent-1".into(),
+            9_999_999_999,
+            &OperationFacts {
+                capability: "filesystem.write".into(),
+                kind: "file".into(),
+                path: Some(" proj".into()),
+                workspace_relative: true,
+                workspace_id: Some("ws_default".into()),
+                ..Default::default()
+            },
+        )
+        .expect("spaces are part of a valid filename");
+        assert_eq!(spaced.path_prefix.as_deref(), Some(" proj"));
     }
 }

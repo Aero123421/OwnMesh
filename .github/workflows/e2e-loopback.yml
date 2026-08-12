@@ -1,0 +1,58 @@
+name: E2E loopback (nightly)
+
+# The real-binary × local workerd suites exercise the agent → control-plane →
+# device path that unit tests stub out. They are slower and depend on workerd
+# starting locally, so they run on a schedule and on demand rather than gating
+# pull requests or releases. A failure here is a signal to investigate, not a
+# blocked merge.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-loopback-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  workerd-loopback:
+    name: Real binaries against local workerd
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust 1.92 toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.92.0"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: e2e-loopback
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Enable corepack (pnpm 9.15.0)
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+
+      - name: pnpm install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace binaries
+        run: cargo build --workspace --locked
+
+      - name: E1 + E2/E3 workerd loopback suite
+        run: python scripts/tests/run_e2e_loopback_tests.py
+
+      - name: E9 resumable transfer loopback
+        run: python scripts/tests/test_e9_workerd_transfer.py

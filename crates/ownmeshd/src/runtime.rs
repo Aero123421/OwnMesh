@@ -25,6 +25,8 @@
 mod broker_runtime;
 #[path = "review_manifest.rs"]
 mod review_manifest;
+#[path = "runtime_fs.rs"]
+mod runtime_fs;
 #[path = "runtime_session.rs"]
 mod runtime_session;
 #[path = "runtime_transfer.rs"]
@@ -58,9 +60,7 @@ use ownmesh_exec::{
     verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
 };
 use ownmesh_fs::{
-    apply_patch, apply_unified_diff, delete_path, git_diff, git_head_oid, git_status,
-    list_dir_page, looks_like_unified_diff, stat_path, write_file, GitDiffOpts, GitStatusOpts,
-    WorkspaceRoot,
+    git_diff, git_head_oid, git_status, looks_sensitive, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
 };
 use ownmesh_ipc::{
     app_error, canonicalize_principal_key, is_credentialed_client_principal, is_human_os_principal,
@@ -74,6 +74,7 @@ use ownmesh_policy::{
     evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
     temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
     ExecutableIdentityBinding, OperationFacts, PolicyDocument, PolicyRule, TemporaryGrant,
+    TAG_READS_SENSITIVE_LOCATION, TAG_WRITES_SENSITIVE_LOCATION,
 };
 use ownmesh_profiles::{
     official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
@@ -317,6 +318,7 @@ impl AdminPolicyRuleAddParams {
             when_kind: self.when_kind.clone(),
             path_prefix: self.path_prefix.clone(),
             program_equals: self.program_equals.clone(),
+            when_tag: None,
             description: self.description.clone(),
         }
     }
@@ -2124,129 +2126,6 @@ impl DaemonRuntime {
         }
     }
 
-    fn execute_fs_list(&self, p: &FsListParams) -> IpcResult<Value> {
-        let ws = self.workspace_for(p.workspace_id.as_deref())?;
-        let max_entries = p.max_entries.unwrap_or(200).clamp(1, 500);
-        let page = list_dir_page(&ws, &p.path, p.recursive, max_entries, p.cursor.as_deref())
-            .map_err(fs_err)?;
-        Ok(json!({
-            "entries": page.entries,
-            "next_cursor": page.next_cursor,
-            "truncated": page.truncated,
-            "total_matched": page.total_matched,
-            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
-        }))
-    }
-
-    fn execute_fs_stat(&self, p: &FsStatParams) -> IpcResult<Value> {
-        let ws = self.workspace_for(p.workspace_id.as_deref())?;
-        let st = stat_path(&ws, &p.path, p.hash).map_err(fs_err)?;
-        serde_json::to_value(st).map_err(|e| IpcError::Remote {
-            code: app_error::INTERNAL,
-            message: e.to_string(),
-        })
-    }
-
-    fn execute_fs_read(&self, p: &FsReadParams) -> IpcResult<Value> {
-        // Hard cap per hop so Base64(~4/3) + metadata fits:
-        // - Agent envelope 750 KiB JSON
-        // - Durable MCP data_json 256 KiB
-        // Larger files are retrieved by paging offset/max_bytes (next_offset).
-        const MAX_READ_BYTES: u64 = 160 * 1024;
-        let ws = self.workspace_for(p.workspace_id.as_deref())?;
-        let offset = p.offset.unwrap_or(0);
-        let want = p.max_bytes.unwrap_or(64 * 1024).min(MAX_READ_BYTES);
-        let (data, total, truncated) =
-            ownmesh_fs::read_file_range(&ws, &p.path, offset, want).map_err(fs_err)?;
-        let returned = data.len() as u64;
-        let next_offset = offset.saturating_add(returned);
-        // Prefer UTF-8 text; otherwise return standard Base64 (RFC 4648 with padding)
-        // so clients can decode without inventing a custom alphabet. Never lossy-decode
-        // arbitrary bytes as text.
-        let (encoding, content) = match String::from_utf8(data.clone()) {
-            Ok(text) => ("utf-8", Value::String(text)),
-            Err(_) => ("base64", Value::String(base64_standard(&data))),
-        };
-        let mut body = json!({
-            "path": p.path,
-            "content": content,
-            "encoding": encoding,
-            "offset": offset,
-            "bytes": returned,
-            "returned_bytes": returned,
-            "total_bytes": total,
-            "truncated": truncated,
-            "sha256": sha256_hex(&data),
-        });
-        if truncated {
-            body.as_object_mut()
-                .expect("object")
-                .insert("next_offset".into(), json!(next_offset));
-        }
-        Ok(body)
-    }
-
-    fn execute_fs_write(&self, p: &FsWriteParams) -> IpcResult<Value> {
-        let ws = self.workspace_for(p.workspace_id.as_deref())?;
-        let format = p
-            .patch_format
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("");
-        // Explicit replace always wins. Unified is selected by format or by a
-        // hash-checked patch whose body is a unified diff (E7).
-        let use_unified = match format {
-            "replace" | "whole" | "full" => false,
-            "unified" | "unified_diff" | "diff" => true,
-            _ if p.expected_sha256.is_some() && looks_like_unified_diff(&p.content) => true,
-            _ => false,
-        };
-
-        if use_unified {
-            let new_hash =
-                apply_unified_diff(&ws, &p.path, &p.content, p.expected_sha256.as_deref())
-                    .map_err(fs_err)?;
-            return Ok(json!({
-                "path": p.path,
-                "bytes_written": p.content.len(),
-                "sha256": new_hash,
-                "patched": true,
-                "patch_format": "unified",
-                "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
-            }));
-        }
-
-        if let Some(expected) = p.expected_sha256.as_deref() {
-            let new_hash =
-                apply_patch(&ws, &p.path, p.content.as_bytes(), Some(expected)).map_err(fs_err)?;
-            return Ok(json!({
-                "path": p.path,
-                "bytes_written": p.content.len(),
-                "sha256": new_hash,
-                "patched": true,
-                "patch_format": "replace",
-                "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
-            }));
-        }
-        write_file(&ws, &p.path, p.content.as_bytes()).map_err(fs_err)?;
-        Ok(json!({
-            "path": p.path,
-            "bytes_written": p.content.len(),
-            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
-        }))
-    }
-
-    fn execute_fs_delete(&self, p: &FsDeleteParams) -> IpcResult<Value> {
-        let ws = self.workspace_for(p.workspace_id.as_deref())?;
-        delete_path(&ws, &p.path, p.recursive).map_err(fs_err)?;
-        Ok(json!({
-            "path": p.path,
-            "deleted": true,
-            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
-        }))
-    }
-
     fn process_log_path(&self) -> PathBuf {
         self.paths.state_dir.join("logs").join("process.log")
     }
@@ -2609,107 +2488,6 @@ full_user_access/full_access for arbitrary commands",
         Ok(())
     }
 
-    async fn handle_fs_list(
-        &mut self,
-        params: Option<Value>,
-        client: &ClientIdentity,
-    ) -> IpcResult<Value> {
-        let mut p: FsListParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
-        let facts = OperationFacts {
-            capability: "filesystem.read".into(),
-            kind: "file".into(),
-            path: Some(p.path.clone()),
-            workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
-            ..Default::default()
-        };
-        let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsList(p), client)
-            .await
-    }
-
-    async fn handle_fs_stat(
-        &mut self,
-        params: Option<Value>,
-        client: &ClientIdentity,
-    ) -> IpcResult<Value> {
-        let mut p: FsStatParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
-        let facts = OperationFacts {
-            capability: "filesystem.read".into(),
-            kind: "file".into(),
-            path: Some(p.path.clone()),
-            workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
-            ..Default::default()
-        };
-        let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsStat(p), client)
-            .await
-    }
-
-    async fn handle_fs_read(
-        &mut self,
-        params: Option<Value>,
-        client: &ClientIdentity,
-    ) -> IpcResult<Value> {
-        let mut p: FsReadParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
-        let facts = OperationFacts {
-            capability: "filesystem.read".into(),
-            kind: "file".into(),
-            path: Some(p.path.clone()),
-            workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
-            ..Default::default()
-        };
-        let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsRead(p), client)
-            .await
-    }
-
-    async fn handle_fs_write(
-        &mut self,
-        params: Option<Value>,
-        client: &ClientIdentity,
-    ) -> IpcResult<Value> {
-        let mut p: FsWriteParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
-        let facts = OperationFacts {
-            capability: "filesystem.write".into(),
-            kind: "file".into(),
-            path: Some(p.path.clone()),
-            workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
-            ..Default::default()
-        };
-        let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsWrite(p), client)
-            .await
-    }
-
-    async fn handle_fs_delete(
-        &mut self,
-        params: Option<Value>,
-        client: &ClientIdentity,
-    ) -> IpcResult<Value> {
-        let mut p: FsDeleteParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
-        let facts = OperationFacts {
-            capability: "filesystem.write".into(),
-            kind: "file".into(),
-            path: Some(p.path.clone()),
-            workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
-            tags: vec!["delete".into()],
-            ..Default::default()
-        };
-        let key = p.idempotency_key.clone();
-        self.gate_and_run(facts, key, PendingRequest::FsDelete(p), client)
-            .await
-    }
-
     async fn handle_logs_query(
         &mut self,
         params: Option<Value>,
@@ -2766,7 +2544,15 @@ full_user_access/full_access for arbitrary commands",
             path: Some(p.path.clone()),
             workspace_relative: true,
             workspace_id: p.workspace_id.clone(),
-            tags: vec!["git".into(), "diff".into()],
+            // A diff returns repository file contents. Without enumerating and
+            // opening every changed path before the policy gate, it cannot prove
+            // that credential-like files are absent. Restricted presets therefore
+            // require confirmation; full-access presets ignore this tag.
+            tags: vec![
+                "git".into(),
+                "diff".into(),
+                TAG_READS_SENSITIVE_LOCATION.into(),
+            ],
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -4181,6 +3967,9 @@ full_user_access/full_access for arbitrary commands",
             /// Free-text query fallback (e.g. "exec", "write").
             #[serde(default)]
             query: Option<String>,
+            /// Workspace in which a workspace-relative path is resolved.
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         let mut capability = p.capability.unwrap_or_default();
@@ -4205,12 +3994,22 @@ full_user_access/full_access for arbitrary commands",
                 capability = "command.run".into();
             }
         }
+        let has_path = p.path.is_some();
+        let write = capability == "filesystem.write";
+        let tags = p
+            .path
+            .as_deref()
+            .map(|path| sensitive_path_tags(path, write))
+            .unwrap_or_default();
         let facts = OperationFacts {
             capability,
             kind,
             path: p.path,
             program: p.program,
             elevated: p.elevated,
+            workspace_relative: has_path,
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
+            tags,
             ..Default::default()
         };
         // Explain uses the local operator principal; grants are principal-scoped.
@@ -5980,6 +5779,24 @@ fn preset_name(p: AccessPreset) -> &'static str {
     }
 }
 
+/// Machine classification tags for a workspace-relative filesystem path.
+///
+/// Restricted presets turn `reads_sensitive_location` into an `Ask`
+/// (specification §7.1/§7.4). The tag is derived here, from the path the daemon
+/// resolved, so a client or model cannot suppress it by omitting a field — and
+/// cannot manufacture one either, because callers never supply `tags`.
+fn sensitive_path_tags(path: &str, write: bool) -> Vec<String> {
+    if !looks_sensitive(Path::new(path)) {
+        return Vec::new();
+    }
+    let tag = if write {
+        TAG_WRITES_SENSITIVE_LOCATION
+    } else {
+        TAG_READS_SENSITIVE_LOCATION
+    };
+    vec![tag.to_owned()]
+}
+
 fn parse_preset(name: &str) -> Option<AccessPreset> {
     match name.to_ascii_lowercase().replace('-', "_").as_str() {
         "workspace_only" | "workspaceonly" => Some(AccessPreset::WorkspaceOnly),
@@ -7736,6 +7553,103 @@ mod broker_intent_tests {
             _ = cancel.changed(), if channel_open => panic!("closed cancel watch must be disabled"),
             () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
         }
+    }
+
+    /// §7.1 promises Recommended confirms credential access. An ordinary file
+    /// still reads without friction, and full access keeps no hidden ask.
+    #[tokio::test]
+    async fn recommended_asks_before_reading_a_workspace_credential_file() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let workspace = paths.state_dir.join("workspace");
+        std::fs::write(workspace.join(".env"), b"API_TOKEN=super-secret\n").unwrap();
+        std::fs::write(workspace.join("main.rs"), b"fn main() {}\n").unwrap();
+        let client = ClientIdentity::new("sensitive-read-test", "test");
+        let read =
+            |path: &str| json!({ "path": path, "workspace_id": "ws_default", "max_bytes": 1024 });
+
+        runtime.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let gated = runtime
+            .dispatch(methods::OPS_FS_READ, Some(read(".env")), &client)
+            .await
+            .expect("an ask is a successful response carrying approval_required");
+        assert_eq!(
+            gated["approval_required"],
+            json!(true),
+            "credential read must reach a human first: {gated}"
+        );
+        assert!(
+            gated["result"].is_null(),
+            "no content may be returned with the approval request: {gated}"
+        );
+
+        let ordinary = runtime
+            .dispatch(methods::OPS_FS_READ, Some(read("main.rs")), &client)
+            .await
+            .expect("ordinary reads stay allowed under recommended");
+        assert_eq!(ordinary["approval_required"], json!(false), "{ordinary}");
+
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let full = runtime
+            .dispatch(methods::OPS_FS_READ, Some(read(".env")), &client)
+            .await
+            .expect("full access has no hidden ask");
+        assert_eq!(full["approval_required"], json!(false), "{full}");
+    }
+
+    #[tokio::test]
+    async fn recommended_asks_before_returning_git_diff_contents() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let client = ClientIdentity::new("sensitive-diff-test", "test");
+
+        let gated = runtime
+            .dispatch(
+                ops_methods::GIT_DIFF,
+                Some(json!({
+                    "path": "",
+                    "pathspec": ".env",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .expect("an ask is a successful response carrying approval_required");
+
+        assert_eq!(gated["approval_required"], json!(true), "{gated}");
+        assert!(gated["result"].is_null(), "{gated}");
+    }
+
+    #[tokio::test]
+    async fn policy_explain_uses_the_same_default_workspace_and_sensitive_facts() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let client = ClientIdentity::new("policy-explain-test", "test");
+
+        let explained = runtime
+            .dispatch(
+                methods::POLICY_EXPLAIN,
+                Some(json!({ "query": "read", "path": ".env" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(explained["decision"], json!("ask"), "{explained}");
+        assert_eq!(
+            explained["facts"]["workspace_id"],
+            json!("ws_default"),
+            "{explained}"
+        );
+        assert_eq!(
+            explained["facts"]["tags"],
+            json!([TAG_READS_SENSITIVE_LOCATION]),
+            "{explained}"
+        );
     }
 
     #[tokio::test]

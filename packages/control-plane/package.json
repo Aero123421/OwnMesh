@@ -1,13 +1,13 @@
 {
   "name": "@ownmesh/control-plane",
   "private": true,
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "OwnMesh Cloudflare Workers control plane",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit",
+    "lint": "node ../../scripts/lint-ts.mjs src",
     "test": "node --experimental-strip-types --experimental-sqlite --test src/**/*.test.ts",
     "dev": "wrangler dev",
     "db:migrations:apply": "wrangler d1 migrations apply DB --remote",

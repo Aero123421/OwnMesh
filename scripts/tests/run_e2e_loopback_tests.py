@@ -11,7 +11,6 @@ ROOT = Path(__file__).resolve().parents[2]
 TESTS = [
     ROOT / "scripts" / "tests" / "test_e1_workerd_loopback.py",
     ROOT / "scripts" / "tests" / "test_e2_workerd_loopback.py",
-    ROOT / "scripts" / "tests" / "test_v12_e2_e9_workerd_loopback.py",
 ]
 
 

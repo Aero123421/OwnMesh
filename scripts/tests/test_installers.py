@@ -77,10 +77,25 @@ def _asset_name() -> tuple[str, bool]:
 
 
 def _require_minisign() -> str:
+    """Locate minisign, or skip unless this run is required to have it.
+
+    The installers' whole point is signature verification, so CI must never
+    report green without exercising it: `OWNMESH_REQUIRE_MINISIGN=1` (set by the
+    workflows that install the pinned binary) turns a missing minisign into a
+    failure. A developer running the suite locally gets a skip instead, matching
+    how the PowerShell cases already behave when pwsh is absent.
+    """
     path = shutil.which("minisign")
-    if not path:
-        raise AssertionError("minisign is required for installer trust tests")
-    return path
+    if path:
+        return path
+    if os.environ.get("OWNMESH_REQUIRE_MINISIGN") == "1":
+        raise AssertionError(
+            "minisign is required for installer trust tests "
+            "(OWNMESH_REQUIRE_MINISIGN=1)"
+        )
+    raise unittest.SkipTest(
+        "minisign not found; install it or set OWNMESH_REQUIRE_MINISIGN=1 to require it"
+    )
 
 
 def _generate_trust(asset_dir: Path) -> tuple[Path, Path]:

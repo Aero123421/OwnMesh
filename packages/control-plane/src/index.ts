@@ -113,6 +113,7 @@ async function enforceRateLimit(
   issuer: string,
   pathname: string,
 ): Promise<Response | null> {
+  if (devBypass(env, request)) return null;
   const category = rateLimitClass(pathname, request.method.toUpperCase());
   if (!category) return null;
   const credentialLimiter = category === "mcp" ? env.MCP_RATE_LIMITER : env.AUTH_RATE_LIMITER;

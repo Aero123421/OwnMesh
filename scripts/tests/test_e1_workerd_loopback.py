@@ -149,6 +149,7 @@ def main() -> int:
     credential_hash = hashlib.sha256(credential.encode()).hexdigest()
     service = f"dev.ownmesh.loopback-test.{uuid.uuid4().hex}"
     session_secret = secrets.token_hex(32)
+    owner_token_hash = secrets.token_hex(32)
     password = secrets.token_urlsafe(32)
     wrangler_process: subprocess.Popen[bytes] | None = None
     daemon_process: subprocess.Popen[bytes] | None = None
@@ -257,6 +258,8 @@ def main() -> int:
                     "OWNMESH_DEV_AUTH_BYPASS:true",
                     "--var",
                     f"SESSION_SECRET:{session_secret}",
+                    "--var",
+                    f"OWNER_TOKEN_HASH:{owner_token_hash}",
                     "--var",
                     f"OWNMESH_ALLOWED_ORIGINS:{issuer}",
                     "--log-level",

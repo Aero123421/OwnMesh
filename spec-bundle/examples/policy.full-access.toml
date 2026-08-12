@@ -1,3 +1,6 @@
+# SPECIFICATION TARGET — not a loadable policy.toml.
+# The shipped engine uses a narrower rule model; see spec-bundle/README.md.
+# Generate a real policy with `ownmesh policy preset full_access`.
 # OwnMesh Full Access preset — no hidden hard deny for user-chosen capability.
 # Invalid signatures, expired tokens, protocol violations, and OS denials still fail.
 

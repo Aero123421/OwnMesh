@@ -60,7 +60,7 @@ pub enum Commands {
     #[command(subcommand)]
     Workspace(WorkspaceCmd),
 
-    /// Query device log providers (audit, journald, Windows Event Log, Docker, files).
+    /// Query device log providers (audit, journald, Docker, process; Windows Event Log on Windows).
     #[command(subcommand)]
     Logs(LogsCmd),
     /// Run a structured command on a device.
@@ -298,7 +298,8 @@ pub enum LogsCmd {
     Providers,
     /// Read one bounded page from a log provider.
     Query {
-        /// Provider id (`audit`, `journald`, `windows_event`, `docker`, `file`, `process`).
+        /// Provider id. All platforms register `audit`, `journald`, `docker`,
+        /// and `process`; Windows also registers `windows_event`.
         #[arg(long, default_value = "audit")]
         provider: String,
         /// Resume from a prior page's `next_cursor`.
@@ -535,6 +536,12 @@ pub enum PolicyCmd {
     Explain {
         /// Operation description.
         query: String,
+        /// Workspace-relative path targeted by the operation.
+        #[arg(long)]
+        path: Option<String>,
+        /// Workspace in which the path is resolved (default workspace when omitted).
+        #[arg(long)]
+        workspace_id: Option<String>,
     },
 }
 

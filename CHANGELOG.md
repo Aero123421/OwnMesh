@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+## v1.2.3 — Policy precedence and real-path evidence
+
+- An explicit `deny` policy rule now outranks a matching temporary grant. A deny
+  added after a grant was issued takes effect immediately instead of waiting for
+  the grant to expire (specification §7.7).
+- The `workspace_only` and `recommended` presets ask before reading
+  credential-like files (`.env*`, private keys, `credentials`, keystores) inside
+  a workspace. The classification is derived by the daemon from the resolved
+  path; clients cannot set or suppress it. Full-access presets are unchanged and
+  keep no hidden ask.
+- Policy rules accept an optional `when_tag` condition matched against
+  server-computed operation facts.
+- `docs/mcp-clients.md` now lists all six OAuth scopes with their real tool
+  membership. The previous table omitted `ownmesh.write` and `ownmesh.session`
+  and attributed session tools to `ownmesh.exec`.
+- New decision records: ADR 0007 (restricted presets deny command execution),
+  ADR 0008 (control-plane authorization is scopes plus action binding).
+- Added `docs/ROADMAP.md`; `pnpm -r lint` now runs a repository lint distinct
+  from `typecheck`.
+- Policy rule prefixes retain their documented textual behavior while resolving
+  interior traversal before matching; temporary grants remain component-bound.
+- `policy explain` now accepts a path and workspace and uses the same
+  daemon-derived sensitive tags as execution.
+- Log commands unwrap daemon results consistently and surface approval-required
+  responses instead of printing transport envelopes.
+- The nightly loopback workflow runs real ownmeshd binaries against local
+  Wrangler for E1, E2/E3, and resumable E9 transfer without weakening
+  production health or rate limits.
+
 ## v1.2.2 — Grant isolation and local log access
 
 - Filesystem temporary grants are bound to one canonical workspace and native
