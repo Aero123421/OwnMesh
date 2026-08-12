@@ -1,25 +1,45 @@
 # OwnMesh schemas and fixtures
 
-This directory is the source of truth for machine-readable schemas, shared
-fixtures, and example configuration used by the Rust and TypeScript packages.
+This directory holds machine-readable schemas, shared fixtures, and example
+configuration. Two kinds of artifact live here and they are **not**
+interchangeable: some are validated contracts that both implementations honor,
+and some describe the target specification and are not what the shipped code
+reads.
 
-## Expected layout
+Check which list an artifact is in before treating it as authoritative.
 
-```text
-spec-bundle/
-├── README.md                 (this file)
-├── schemas/
-│   ├── config.schema.json
-│   ├── policy.schema.json
-│   ├── profile.schema.json
-│   ├── protocol-envelope.schema.json
-│   └── mcp-tool-catalog.json
-├── examples/
-│   ├── ownmesh.example.toml
-│   ├── policy.recommended.toml
-│   ├── policy.full-access.toml
-│   └── profile.custom.toml
-```
+## Validated contracts
+
+These are exercised by tests in both languages. A change here must keep the Rust
+and TypeScript sides agreeing.
+
+| Artifact | Enforced by |
+| --- | --- |
+| `schemas/domain-ids.schema.json` | `packages/ownmesh-schema` `schema-files.test.ts` |
+| `schemas/domain-entities.schema.json` | `ownmesh-domain` `schema_validates_domain_fixtures`, `fixtures-roundtrip.test.ts` |
+| `schemas/common-types.schema.json` | `packages/ownmesh-schema` `schema-files.test.ts` |
+| `schemas/errors.schema.json` | `ownmesh-domain` error taxonomy tests, `errors.test.ts` |
+| `schemas/protocol-envelope.schema.json` | `ownmesh-protocol` envelope tests, `fixtures-roundtrip.test.ts` |
+| `schemas/operation-envelope.schema.json` | `ownmesh-protocol` operation contract tests |
+| `examples/fixtures/*.json` | Round-tripped by Rust and TypeScript against the schemas above |
+
+## Specification targets (not shipped contracts)
+
+These describe the design in `OWNMESH_SPECIFICATION.ja.md`. No shipped code
+loads them, no test validates them, and the shipped implementation deliberately
+differs. Do not derive a client, a config file, or a policy file from them.
+
+| Artifact | What actually ships |
+| --- | --- |
+| `schemas/policy.schema.json` | The engine evaluates `ownmesh_policy::PolicyRule` (capability, `when_elevated`, `when_kind`, `path_prefix`, `program_equals`, `when_tag`), persisted by `ownmesh-config` as `PolicyFile` in `policy.toml`. The schema's `operation_classes` / `path_globs` / `principal_ids` model is not implemented. |
+| `examples/policy.recommended.toml`, `examples/policy.full-access.toml` | Illustrations of the schema above. They are **not** loadable as a real `policy.toml`. Generate a real one with `ownmesh policy preset <name>`. |
+| `schemas/config.schema.json` | `ownmesh-config` `OwnMeshConfig` is the shipped shape and validates itself. |
+| `schemas/profile.schema.json`, `examples/profile.custom.toml` | `ownmesh-profiles` owns the shipped profile model. |
+| `schemas/mcp-tool-catalog.json` | The shipped catalog is `MCP_TOOLS` in `packages/control-plane/src/mcp.ts`; `tools/list` publishes `PUBLISHED_MCP_TOOLS`. See [ADR 0004](../docs/adr/0004-mcp-tool-naming-and-aliases.md). |
+| `examples/ownmesh.example.toml` | Illustrative only; `ownmesh setup` writes the authoritative file. |
+
+Moving an artifact from the second table to the first means adding a test that
+validates the shipped shape against it — not editing this README.
 
 Related prose documentation:
 

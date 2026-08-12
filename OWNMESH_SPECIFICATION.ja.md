@@ -260,7 +260,8 @@ flowchart TB
 ## 4.1 ローカル側
 
 - 言語: Rust。
-- Rust edition: 2024。
+- Rust edition: 2024（**実装は 2021**。toolchain は 1.92.0 に固定しており、
+  edition 移行は独立した破壊的変更として未実施）。
 - 非同期ランタイム: Tokio。
 - CLI: Clap。
 - TUI: Ratatui + Crossterm。
@@ -497,6 +498,24 @@ tenant:admin
 
 MCP server は OAuth scope に応じて tool を公開または拒否する。scope 変更後は再接続を要求してよい。
 
+> **実装状況（v1.2.2 / [ADR 0008](./docs/adr/0008-control-plane-authorization-scopes-and-binding.md)）**
+> 出荷している scope は 6 つである。
+>
+> ```text
+> ownmesh.read     読み取り・discovery（devices, fs read/list/stat, git, workspace, profile, review, transfer 状態, operation）
+> ownmesh.write    内容・資源の変更（fs write/patch/delete, workspace CRUD, review start, transfer plan/send/cancel）
+> ownmesh.exec     コマンド実行（command_run, command_shell, cancel_operation）
+> ownmesh.session  対話セッション（session_* 一式）
+> ownmesh.device   device 指定・DCR・型付き security 管理（policy_*, daemon_unlock, token_revoke, request_approval）
+> offline_access   ローテーションする refresh token
+> ```
+>
+> 上表の 14 scope と Observe/Develop/Full preset は未実装である。raw shell と
+> elevated は scope ではなく **tool の分離**（`ownmesh_command_shell`）と
+> **引数の action hash 束縛**（`elevated: true`）で分け、最終判定は device の
+> local policy が持つ。§7.2 のクラウド+ローカル合成も、クラウド側 policy
+> document を持たない形で実現している（詳細と理由は ADR 0008）。
+
 ## 6.7 Token 要件
 
 - Access token は短時間。
@@ -526,6 +545,24 @@ MCP server は OAuth scope に応じて tool を公開または拒否する。sc
 
 **Full Access は正式な完全許可モードであり、隠れた hard deny を持たない。** ただし、無効な署名、期限切れ token、改ざん、プロトコル違反、OS が拒否する操作は実行しない。
 
+> **実装状況（v1.2.2 / [ADR 0007](./docs/adr/0007-restricted-presets-deny-command-execution.md)）**
+> 上表は目標である。出荷している `workspace_only` / `recommended` は、
+> `command.run` と `session.open` を **確認ではなく deny** する。cwd 束縛だけでは
+> インタープリタや絶対パス経由の脱出を止められず、PTY の stdin は任意コマンド
+> 実行そのものであるため、OS レベルのプロセス封じ込めが無い状態で
+> workspace 境界を保証できないからである。したがって
+> 「Recommended = ユーザー権限の一般操作は許可」は未達であり、コマンド実行と
+> 対話セッションには `full_user_access` 以上が必要になる。
+>
+> 「認証情報は確認」の部分は v1.2.2 で実装した。`workspace_only` /
+> `recommended` は、daemon が解決したパスから導出する
+> `reads_sensitive_location` タグ（§7.4）を条件に `filesystem.read` を ask に
+> する。タグはサーバー側の機械的事実であり、クライアントやモデルは付与も抑止も
+> できない。full access 系プリセットはこの規則を持たない（隠れた ask を作らない）。
+>
+> 両者の中間段（execution を ask にする、専用プリセットを足す、OS 封じ込めを
+> 実装する等）は未決の製品判断として ADR 0007 に候補を記録している。
+
 ## 7.2 Policy decision
 
 各操作の結果は次の三値。
@@ -541,6 +578,14 @@ Cloud Policy と Local Policy の両方を評価し、最も制限的な結果�
 ```text
 deny > ask > allow
 ```
+
+> **実装状況（v1.2.2 / [ADR 0008](./docs/adr/0008-control-plane-authorization-scopes-and-binding.md)）**
+> クラウド側は policy document を持たない。control plane が判定するのは
+> 「誰が要求してよいか」（token・scope・所有権・payload hash 束縛・期限・
+> 一回限りの実行状態）であり、「その操作を許すか」は device が単独で決める。
+> これは §7.2 より厳しい側に倒れている（クラウドの allow だけでは何も許可されない）。
+> `evaluate_combined` は最も制限的な合成の参照実装として残っているが、
+> 出荷 runtime からは呼ばれない。
 
 Full Access でクラウド・ローカルの両方が allow の場合、OwnMesh は追加確認を行わない。
 
@@ -621,6 +666,10 @@ Pending approval を必要とする MCP call は長時間ブロックしない�
 7. preset default。
 
 Rule は `priority` を持ち、同じ priority では deny > ask > allow とする。
+
+一時 grant（§7.5）が持ち上げられるのは **ask だけ**であり、明示 deny を上書き
+しない。したがって grant 発行後に追加された deny rule は、grant の失効を待たず
+即座に有効になる。
 
 ## 7.8 Emergency controls
 
@@ -1705,10 +1754,14 @@ ru-RU   Русский
 
 - command 名、config key、JSON key、error code は英語固定。
 - user-visible string をコードへ直書きしない。
-- 翻訳カタログは compile-time で完全性を強制する（[ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）。
-  v1.2.2 の実装は Rust の `enum Msg` + locale 表であり、locale ごとの欠落は
-  ビルド失敗になる。`ownmesh-tui --check-i18n` と CI が 4 言語の網羅を検査する。
-  Fluent FTL は、runtime 読み込み可能な locale が必要になった時点で再検討する。
+- 翻訳カタログの完全性は、実行時フォールバックではなく **CI 到達前のゲート**で
+  強制する（[ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）。
+  実装は Rust の `enum Msg` + locale 表で、欠落は `cargo test`
+  （`completeness_report()` の assert）、`ownmesh-tui --check-i18n`、専用 CI job
+  の 3 箇所で失敗する。表は実行時に構築する `BTreeMap` なので rustc 自体は
+  欠落を検出しない。万一出荷物に混入した場合、`t()` は他言語へ退避せず
+  `[missing]` を明示表示する。Fluent FTL は、runtime 読み込み可能な locale が
+  必要になった時点で再検討する。
 - 文字列結合で文章を組み立てない。
 - placeholder の型と存在を CI で検証する。
 - CJK 表示幅を考慮する。
@@ -2031,6 +2084,12 @@ auto
 
 設定時に選べる。既定は `notify`。
 
+> **実装状況（v1.2.2）**
+> 出荷既定は `off` である。§25.1 のプライバシー既定（ネットワーク接続を勝手に
+> 行わない）を優先し、`notify` であっても発生する定期的な外向き通信を既定から
+> 外した。更新確認は `ownmesh update check` の明示実行、または `update.mode` の
+> 変更で有効になる。
+
 ## 24.2 Channel
 
 ```text
@@ -2246,6 +2305,28 @@ ownmesh/
 ├── scripts/
 └── .github/
 ```
+
+> **実装状況（v1.2.2）**
+> 上のツリーは設計時の想定であり、出荷リポジトリの構成とは名前も粒度も異なる。
+> 実際の構成は次のとおりで、依存方向（§28.1）は満たしている。
+>
+> ```text
+> crates/   ownmesh-domain, -protocol, -policy, -config, -identity, -persist,
+>           -ipc, -exec, -fs, -logs, -session, -session-host, -profiles,
+>           -transfer, -update, -diagnostics, -broker, -broker-client,
+>           ownmesh (CLI), ownmesh-tui, ownmeshd
+> packages/ control-plane (Cloudflare Worker), ownmesh-schema
+> spec-bundle/ schemas + fixtures + examples（正本の区別は spec-bundle/README.md）
+> docs/, installers/, packaging/, release/, scripts/, .github/
+> ```
+>
+> 主な対応: `ownmesh-core` は `-domain` に、`ownmesh-runtime` は `-exec` と
+> `ownmeshd` に、`ownmesh-filesystem` は `-fs` に、`ownmesh-auth` と
+> `ownmesh-keystore` は `-identity` に、`ownmesh-cli` は `ownmesh` に対応する。
+> `ownmesh-i18n` は独立クレートにせず `ownmesh-tui` 内のコンパイル時カタログと
+> した（[ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）。
+> `ownmesh-adapter-sdk` / `-testkit` / `skills/` / `locales/` は未実装、
+> `ownmesh-privileged` は `ownmesh-broker` として出荷している。
 
 ## 28.1 Dependency direction
 

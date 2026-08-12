@@ -1,3 +1,5 @@
+# ILLUSTRATIVE EXAMPLE — ownmesh-profiles owns the shipped profile model.
+# See spec-bundle/README.md for which artifacts are validated contracts.
 # Example custom CLI profile — optional helpers for detect/launch/resume.
 # Any CLI can still run via `ownmesh exec` / `ownmesh session open` without a profile.
 

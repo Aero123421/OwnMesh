@@ -1,3 +1,5 @@
+# ILLUSTRATIVE EXAMPLE — `ownmesh setup` writes the authoritative config.toml.
+# See spec-bundle/README.md for which artifacts are validated contracts.
 # OwnMesh local configuration example
 # Copy toward the OS-specific config path documented in the specification §23.1
 # and adjust for your control plane URL and workspaces.
