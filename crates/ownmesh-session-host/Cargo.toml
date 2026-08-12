@@ -23,7 +23,7 @@ workspace = true
 
 [dependencies]
 clap = { version = "4.5.27", features = ["derive"] }
-crossterm = "0.28.1"
+crossterm = "0.29.0"
 ownmesh-config = { path = "../ownmesh-config" }
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-ipc = { path = "../ownmesh-ipc" }
