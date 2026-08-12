@@ -14,7 +14,7 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
-ed25519-dalek = { version = "2.1.1", features = ["rand_core", "zeroize"] }
+ed25519-dalek = { version = "3.0.0", features = ["rand_core", "zeroize"] }
 ownmesh-domain = { path = "../ownmesh-domain" }
 ownmesh-persist = { path = "../ownmesh-persist" }
 rand = "0.8.5"
