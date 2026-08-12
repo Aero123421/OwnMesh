@@ -431,6 +431,7 @@ def main() -> int:
     member = f"atk_{secrets.token_urlsafe(24)}"
     foreign = f"atk_{secrets.token_urlsafe(24)}"
     session_secret = secrets.token_hex(32)
+    owner_token_hash = secrets.token_hex(32)
     password = secrets.token_urlsafe(32)
     wrangler_process: subprocess.Popen[bytes] | None = None
     source_process: subprocess.Popen[bytes] | None = None
@@ -478,7 +479,7 @@ def main() -> int:
             ])
             run_checked(wrangler(corepack, "d1", "execute", "DB", "--local", "--persist-to", str(persist), "--command", sql), cwd=CONTROL_PLANE, env=source_env)
             log = (temp / "wrangler.log").open("wb")
-            wrangler_process = subprocess.Popen(wrangler(corepack, "dev", "--local", "--ip", "127.0.0.1", "--port", str(port), "--persist-to", str(persist), "--var", f"OAUTH_ISSUER:{issuer}", "--var", "OWNMESH_DEV_AUTH_BYPASS:true", "--var", f"SESSION_SECRET:{session_secret}", "--var", f"OWNMESH_ALLOWED_ORIGINS:{issuer}", "--log-level", "info", "--show-interactive-dev-session", "false"), cwd=CONTROL_PLANE, env=source_env, stdout=log, stderr=subprocess.STDOUT)
+            wrangler_process = subprocess.Popen(wrangler(corepack, "dev", "--local", "--ip", "127.0.0.1", "--port", str(port), "--persist-to", str(persist), "--var", f"OAUTH_ISSUER:{issuer}", "--var", "OWNMESH_DEV_AUTH_BYPASS:true", "--var", f"SESSION_SECRET:{session_secret}", "--var", f"OWNER_TOKEN_HASH:{owner_token_hash}", "--var", f"OWNMESH_ALLOWED_ORIGINS:{issuer}", "--log-level", "info", "--show-interactive-dev-session", "false"), cwd=CONTROL_PLANE, env=source_env, stdout=log, stderr=subprocess.STDOUT)
             log.close(); wait_for_health(issuer, wrangler_process)
             binary = ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
             source_log, destination_log = temp / "source.log", temp / "destination.log"

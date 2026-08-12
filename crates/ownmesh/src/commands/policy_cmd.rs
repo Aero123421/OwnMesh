@@ -83,12 +83,19 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
             Err(err) if ipc_exit_code(&err) == ExitCode::DeviceOffline => validate_offline(cli),
             Err(err) => Err(emit_ipc_err(cli, &err)),
         },
-        PolicyCmd::Explain { query } => {
-            match call_daemon_recoverable(
-                cli,
-                methods::POLICY_EXPLAIN,
-                Some(json!({ "query": query })),
-            ) {
+        PolicyCmd::Explain {
+            query,
+            path,
+            workspace_id,
+        } => {
+            let mut params = json!({ "query": query });
+            if let Some(path) = path {
+                params["path"] = json!(path);
+            }
+            if let Some(workspace_id) = workspace_id {
+                params["workspace_id"] = json!(workspace_id);
+            }
+            match call_daemon_recoverable(cli, methods::POLICY_EXPLAIN, Some(params)) {
                 Ok(value) => {
                     print_value(cli.json, &value, |v| {
                         println!(
@@ -100,7 +107,7 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                     Ok(())
                 }
                 Err(err) if ipc_exit_code(&err) == ExitCode::DeviceOffline => {
-                    explain_offline(cli, query)
+                    explain_offline(cli, query, path.as_deref())
                 }
                 Err(err) => Err(emit_ipc_err(cli, &err)),
             }
@@ -177,7 +184,9 @@ fn validate_offline(cli: &Cli) -> Result<(), ExitCode> {
     }
 }
 
-fn explain_offline(cli: &Cli, query: &str) -> Result<(), ExitCode> {
+/// Offline fallback evaluates the policy file only; daemon-held grants and
+/// daemon-derived path classifications are intentionally not guessed here.
+fn explain_offline(cli: &Cli, query: &str, path: Option<&str>) -> Result<(), ExitCode> {
     let paths = OwnMeshPaths::discover().map_err(|_| ExitCode::UsageConfig)?;
     let file = load_policy(&paths).unwrap_or_default();
     let doc = document_from_file(&file);
@@ -186,12 +195,21 @@ fn explain_offline(cli: &Cli, query: &str) -> Result<(), ExitCode> {
         OperationFacts {
             capability: "filesystem.write".into(),
             kind: "file".into(),
+            path: path.map(ToOwned::to_owned),
+            ..Default::default()
+        }
+    } else if ql.contains("read") || ql.contains("list") {
+        OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "file".into(),
+            path: path.map(ToOwned::to_owned),
             ..Default::default()
         }
     } else {
         OperationFacts {
             capability: "command.run".into(),
             kind: "structured".into(),
+            path: path.map(ToOwned::to_owned),
             ..Default::default()
         }
     };

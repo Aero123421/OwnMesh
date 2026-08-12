@@ -9,8 +9,9 @@ discovers `/oauth/register` from OAuth metadata and registers itself before it
 holds any OwnMesh credential, so the control plane grants exactly one narrow
 exemption: a registration whose single `redirect_uri` is a literal
 `https://chatgpt.com/connector/oauth/<slug>` gets a deterministic client id
-without creating a database row. Everything else needs a client that you, the
-owner, provision. This page describes those routes.
+without creating a database row. ChatGPT also receives a rotating refresh token
+without requesting `offline_access`; other clients must request that scope.
+Everything else needs a client that you, the owner, provision.
 
 For ChatGPT itself see [`chatgpt-connection.md`](./chatgpt-connection.md).
 
@@ -20,7 +21,7 @@ For ChatGPT itself see [`chatgpt-connection.md`](./chatgpt-connection.md).
 | --- | --- |
 | Runs on your machine, has a loopback redirect (most desktop MCP clients) | [Owner-provisioned client](#route-1-owner-provisioned-client-recommended) |
 | You already have an enrolled device and a token with `ownmesh.device` | [Authenticated DCR](#route-2-authenticated-dynamic-client-registration) |
-| You want any client to self-register | [Open DCR](#route-3-open-dynamic-client-registration-not-recommended) |
+| You want to understand or disable DCR | [The DCR flag](#route-3-the-dynamic-registration-flag) |
 
 ## What the endpoint requires
 
@@ -32,9 +33,12 @@ are not configurable:
 - PKCE `S256` is mandatory. `plain` is refused.
 - `redirect_uri` must match a registered value **exactly** — no prefix or
   wildcard matching, and the value is re-checked at the token endpoint.
-- Redirect URIs must be `https://`, or `http://` on a loopback host
-  (`127.0.0.1`, `::1`, `localhost`) per RFC 8252 §7.3.
+- Redirect URIs registered through `/oauth/register` must be `https://`, or
+  `http://` on a loopback host (`127.0.0.1`, `::1`, `localhost`) per RFC 8252
+  §7.3. A row inserted directly into D1 bypasses registration validation, so
+  its redirect URI must be reviewed before insertion.
 - A refresh token is returned only when you request the `offline_access` scope.
+  The stateless ChatGPT client described above is the one exception.
 
 ## Scopes
 
@@ -96,8 +100,9 @@ client you are adding.
 5. Start the client's login. You will land on the OwnMesh consent page, which
    lists the requested scopes before anything is issued.
 
-To revoke it later, delete the row and run `ownmesh tokens revoke` for any
-tokens it obtained.
+To revoke an issued OAuth token, call `POST /oauth/revoke` before deleting the
+client row. Deleting the row alone does not invalidate existing tokens.
+`ownmesh tokens revoke` is unrelated: it revokes a device-local IPC principal.
 
 ## Route 2: authenticated dynamic client registration
 
@@ -116,23 +121,21 @@ curl -X POST https://<your-worker>/oauth/register \
       }'
 ```
 
-This still requires `ALLOW_DYNAMIC_CLIENT_REGISTRATION=true` on the Worker; the
-bearer token authorizes *which tenant* the client joins, and the flag authorizes
-*whether the endpoint exists at all*.
+This requires `ALLOW_DYNAMIC_CLIENT_REGISTRATION=true`, which is the shipped
+default. The bearer token authorizes *which tenant* the client joins, and the
+flag authorizes *whether the endpoint exists at all*.
 
 The response contains the generated `client_id`. Between 1 and 8 redirect URIs
 are accepted, each subject to the https/loopback rule above.
 
-## Route 3: open dynamic client registration (not recommended)
+## Route 3: the dynamic-registration flag
 
-```bash
-cd packages/control-plane
-pnpm exec wrangler secret put ALLOW_DYNAMIC_CLIENT_REGISTRATION
-# enter: true
-```
+`ALLOW_DYNAMIC_CLIENT_REGISTRATION` is set to `"true"` in
+`packages/control-plane/wrangler.jsonc`, because ChatGPT discovers and calls
+`/oauth/register` during zero-configuration onboarding. Route 2 therefore works
+on a stock deployment.
 
-With this set, `/oauth/register` is reachable. Note what it does and does not
-change:
+The flag does and does not change the following:
 
 - It does **not** let an anonymous caller create database rows for arbitrary
   clients — general registration still requires the `ownmesh.device` bearer
@@ -140,10 +143,11 @@ change:
 - It **does** advertise `registration_endpoint` in your OAuth metadata and
   enable the stateless ChatGPT callback form.
 
-Leave it off unless you need ChatGPT's automatic registration. Turning it on
-does not weaken authorization — every authorize still requires owner login and
-exact redirect matching — but it does expose one more unauthenticated endpoint
-to rate-limited abuse.
+To disable it, change that checked-in `vars` value to `"false"` and redeploy.
+Do not use `wrangler secret put` for this name: the checked-in plaintext var
+would take precedence on the next deployment. Disabling it breaks ChatGPT's
+automatic onboarding; the owner-authenticated `/connect/chatgpt` fallback is
+still available.
 
 ## Verifying the connection
 
@@ -171,4 +175,5 @@ between them.
 | `redirect_uri does not exactly match registration` | Byte-for-byte mismatch, often a trailing slash or a changed loopback port. |
 | `only token_endpoint_auth_method=none is supported` | The client is trying to be confidential. Disable its client secret. |
 | `PKCE S256 required` | The client sent `plain` or omitted `code_challenge`. |
-| `{"error":"insufficient_scope"}` | The token lacks the scope the tool declares. |
+| `{"error":"insufficient_scope"}` (HTTP 403) | A REST or registration request lacks `ownmesh.device`. |
+| JSON-RPC `-32003` `insufficient_scope` | A tool call lacks the scope named in `data.required`. |

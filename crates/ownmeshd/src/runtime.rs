@@ -3959,6 +3959,9 @@ full_user_access/full_access for arbitrary commands",
             /// Free-text query fallback (e.g. "exec", "write").
             #[serde(default)]
             query: Option<String>,
+            /// Workspace in which a workspace-relative path is resolved.
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         let mut capability = p.capability.unwrap_or_default();
@@ -3983,12 +3986,22 @@ full_user_access/full_access for arbitrary commands",
                 capability = "command.run".into();
             }
         }
+        let has_path = p.path.is_some();
+        let write = capability == "filesystem.write";
+        let tags = p
+            .path
+            .as_deref()
+            .map(|path| sensitive_path_tags(path, write))
+            .unwrap_or_default();
         let facts = OperationFacts {
             capability,
             kind,
             path: p.path,
             program: p.program,
             elevated: p.elevated,
+            workspace_relative: has_path,
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
+            tags,
             ..Default::default()
         };
         // Explain uses the local operator principal; grants are principal-scoped.
@@ -7575,6 +7588,35 @@ mod broker_intent_tests {
             .await
             .expect("full access has no hidden ask");
         assert_eq!(full["approval_required"], json!(false), "{full}");
+    }
+
+    #[tokio::test]
+    async fn policy_explain_uses_the_same_default_workspace_and_sensitive_facts() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let client = ClientIdentity::new("policy-explain-test", "test");
+
+        let explained = runtime
+            .dispatch(
+                methods::POLICY_EXPLAIN,
+                Some(json!({ "query": "read", "path": ".env" })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(explained["decision"], json!("ask"), "{explained}");
+        assert_eq!(
+            explained["facts"]["workspace_id"],
+            json!("ws_default"),
+            "{explained}"
+        );
+        assert_eq!(
+            explained["facts"]["tags"],
+            json!([TAG_READS_SENSITIVE_LOCATION]),
+            "{explained}"
+        );
     }
 
     #[tokio::test]

@@ -498,7 +498,7 @@ tenant:admin
 
 MCP server は OAuth scope に応じて tool を公開または拒否する。scope 変更後は再接続を要求してよい。
 
-> **実装状況（v1.2.2 / [ADR 0008](./docs/adr/0008-control-plane-authorization-scopes-and-binding.md)）**
+> **実装状況（v1.2.3 / [ADR 0008](./docs/adr/0008-control-plane-authorization-scopes-and-binding.md)）**
 > 出荷している scope は 6 つである。
 >
 > ```text
@@ -545,7 +545,7 @@ MCP server は OAuth scope に応じて tool を公開または拒否する。sc
 
 **Full Access は正式な完全許可モードであり、隠れた hard deny を持たない。** ただし、無効な署名、期限切れ token、改ざん、プロトコル違反、OS が拒否する操作は実行しない。
 
-> **実装状況（v1.2.2 / [ADR 0007](./docs/adr/0007-restricted-presets-deny-command-execution.md)）**
+> **実装状況（v1.2.3 / [ADR 0007](./docs/adr/0007-restricted-presets-deny-command-execution.md)）**
 > 上表は目標である。出荷している `workspace_only` / `recommended` は、
 > `command.run` と `session.open` を **確認ではなく deny** する。cwd 束縛だけでは
 > インタープリタや絶対パス経由の脱出を止められず、PTY の stdin は任意コマンド
@@ -554,7 +554,7 @@ MCP server は OAuth scope に応じて tool を公開または拒否する。sc
 > 「Recommended = ユーザー権限の一般操作は許可」は未達であり、コマンド実行と
 > 対話セッションには `full_user_access` 以上が必要になる。
 >
-> 「認証情報は確認」の部分は v1.2.2 で実装した。`workspace_only` /
+> 「認証情報は確認」の部分は v1.2.3 で実装した。`workspace_only` /
 > `recommended` は、daemon が解決したパスから導出する
 > `reads_sensitive_location` タグ（§7.4）を条件に `filesystem.read` を ask に
 > する。タグはサーバー側の機械的事実であり、クライアントやモデルは付与も抑止も
@@ -579,7 +579,7 @@ Cloud Policy と Local Policy の両方を評価し、最も制限的な結果�
 deny > ask > allow
 ```
 
-> **実装状況（v1.2.2 / [ADR 0008](./docs/adr/0008-control-plane-authorization-scopes-and-binding.md)）**
+> **実装状況（v1.2.3 / [ADR 0008](./docs/adr/0008-control-plane-authorization-scopes-and-binding.md)）**
 > クラウド側は policy document を持たない。control plane が判定するのは
 > 「誰が要求してよいか」（token・scope・所有権・payload hash 束縛・期限・
 > 一回限りの実行状態）であり、「その操作を許すか」は device が単独で決める。
@@ -1172,7 +1172,7 @@ acp = false
 
 実装名は衝突を避けるため `ownmesh_` prefix + snake_case とする。
 
-> **実装状況（v1.2.2 / [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md)）**
+> **実装状況（v1.2.3 / [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md)）**
 > 出荷カタログは `ownmesh_<family>_<verb>` の名詞先行形を正本とする
 > （`ownmesh_fs_read`、`ownmesh_session_open`、`ownmesh_transfer_plan`）。
 > capability ごとに整列し、`tools/list` を読むモデルが surface を辿りやすいため。
@@ -1237,13 +1237,13 @@ ownmesh_start_transfer
 ownmesh_cancel_transfer
 ```
 
-> **実装状況（v1.2.2）**
+> **実装状況（v1.2.3）**
 > 本節は目標カタログであり、出荷契約ではない。出荷契約は
 > `packages/control-plane/src/mcp.ts` の `MCP_TOOLS` と、`tools/list` に出る
 > `PUBLISHED_MCP_TOOLS` である。命名の対応は
 > [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md) を参照。
 >
-> v1.2.2 で **未実装** の項目:
+> v1.2.3 で **未実装** の項目:
 >
 > - `ownmesh_search_files` — ファイル検索 tool は未提供。
 > - `ownmesh_start_process` / `ownmesh_stop_process` — CLI の
@@ -1658,7 +1658,7 @@ fuzzy matching、最近使った操作、context-aware action を提供する。
 12. Final diagnostics
 ```
 
-> **実装状況（v1.2.2）**
+> **実装状況（v1.2.3）**
 > 12 段の完全 wizard は未実装。出荷しているのは 2 つの入口である。
 >
 > - `ownmesh setup`（CLI・TTY）: control plane URL、instance id、access preset、
@@ -1743,7 +1743,7 @@ ru-RU   Русский
 - diagnostics。
 - README quickstart を最低限 4 言語で用意することを推奨。
 
-> **実装状況（v1.2.2 / [ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）**
+> **実装状況（v1.2.3 / [ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）**
 > 出荷範囲は **TUI 全文のみ**。CLI help、setup 説明、error message、
 > diagnostics は英語固定であり、4 言語化は未実装の目標として残る。
 > CLI は 16.4 のとおり機械向け surface で、key・enum・error code・exit code を
@@ -2084,7 +2084,7 @@ auto
 
 設定時に選べる。既定は `notify`。
 
-> **実装状況（v1.2.2）**
+> **実装状況（v1.2.3）**
 > 出荷既定は `off` である。§25.1 のプライバシー既定（ネットワーク接続を勝手に
 > 行わない）を優先し、`notify` であっても発生する定期的な外向き通信を既定から
 > 外した。更新確認は `ownmesh update check` の明示実行、または `update.mode` の
@@ -2306,7 +2306,7 @@ ownmesh/
 └── .github/
 ```
 
-> **実装状況（v1.2.2）**
+> **実装状況（v1.2.3）**
 > 上のツリーは設計時の想定であり、出荷リポジトリの構成とは名前も粒度も異なる。
 > 実際の構成は次のとおりで、依存方向（§28.1）は満たしている。
 >

@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -222,7 +222,7 @@ impl PolicyRule {
         }
         if let Some(prefix) = &self.path_prefix {
             match &facts.path {
-                Some(p) if path_scope_contains(prefix, p) => {}
+                Some(p) if rule_path_prefix_matches(prefix, p) => {}
                 _ => return false,
             }
         }
@@ -243,12 +243,13 @@ impl PolicyRule {
 /// preserved, preventing an absolute scope from matching a relative path.
 /// Returns `None` for empty values or `..` traversal.
 fn path_components(value: &str) -> Option<Vec<Component<'_>>> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+    // Whitespace is a real filename character. Trimming here would let a grant
+    // approved for ` proj` be reused for the different path `proj`.
+    if value.is_empty() {
         return None;
     }
     let mut out = Vec::new();
-    for component in Path::new(trimmed).components() {
+    for component in Path::new(value).components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => return None,
@@ -259,6 +260,54 @@ fn path_components(value: &str) -> Option<Vec<Component<'_>>> {
         return None;
     }
     Some(out)
+}
+
+/// Match the documented textual prefix against the path the filesystem walk
+/// will actually reach. Rules retain prefix compatibility (`.env` covers
+/// `.env.production`), while an interior `..` is collapsed before matching so
+/// it cannot escape an Allow prefix or dodge a Deny prefix.
+fn rule_path_prefix_matches(prefix: &str, candidate: &str) -> bool {
+    let has_parent = |value: &str| {
+        Path::new(value)
+            .components()
+            .any(|part| part == Component::ParentDir)
+    };
+    if !has_parent(prefix) && !has_parent(candidate) {
+        return candidate.starts_with(prefix);
+    }
+
+    let normalize = |value: &str| -> Option<String> {
+        let path = Path::new(value);
+        let mut normalized = PathBuf::new();
+        for part in path.components() {
+            match part {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normalized.pop() {
+                        return None;
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                    normalized.push(part.as_os_str());
+                }
+            }
+        }
+        let mut rendered = normalized.to_string_lossy().into_owned();
+        let trailing_separator =
+            value.ends_with(std::path::MAIN_SEPARATOR) || cfg!(windows) && value.ends_with('/');
+        if trailing_separator && !rendered.ends_with(std::path::MAIN_SEPARATOR) {
+            rendered.push(std::path::MAIN_SEPARATOR);
+        }
+        Some(rendered)
+    };
+
+    let Some(prefix) = normalize(prefix) else {
+        return false;
+    };
+    let Some(candidate) = normalize(candidate) else {
+        return false;
+    };
+    candidate.starts_with(&prefix)
 }
 
 /// True when `candidate` is `scope` itself or a descendant of it.
@@ -693,8 +742,7 @@ pub fn temporary_grant_from_facts(
     let path_prefix = facts
         .path
         .as_ref()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.trim().is_empty())
         .map(ToOwned::to_owned);
 
     if temporary_grant_requires_path_scope(capability) {
@@ -1077,6 +1125,46 @@ mod tests {
                 "a Unix backslash is a filename byte, not a path separator"
             );
         }
+    }
+
+    #[test]
+    fn rule_prefix_uses_normalized_target_without_losing_prefix_compatibility() {
+        let rule = |decision, prefix: &str| PolicyRule {
+            id: "path-rule".into(),
+            decision,
+            priority: 1,
+            capability: "filesystem.read".into(),
+            when_elevated: None,
+            when_kind: None,
+            path_prefix: Some(prefix.into()),
+            program_equals: None,
+            when_tag: None,
+            description: None,
+        };
+        let facts = |path: &str| OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "file".into(),
+            path: Some(path.into()),
+            ..Default::default()
+        };
+
+        for (prefix, path) in [
+            (".env", ".env.production"),
+            ("secret", "secrets.txt"),
+            ("secrets", "secrets/../secrets/key.pem"),
+            ("secrets", "other/../secrets/key.pem"),
+            ("secrets/", "secrets/other/../key.pem"),
+        ] {
+            assert!(
+                rule(Decision::Deny, prefix).matches(&facts(path)),
+                "{prefix:?} must match the resolved target of {path:?}"
+            );
+        }
+
+        assert!(
+            !rule(Decision::Allow, "proj").matches(&facts("proj/../secrets/key.pem")),
+            "traversal must not escape an allow prefix"
+        );
     }
 
     /// Issuance refuses to mint a filesystem grant with no path, and matching
@@ -1465,5 +1553,21 @@ mod tests {
         assert_eq!(grant.capability, "filesystem.write");
         assert_eq!(grant.path_prefix.as_deref(), Some("a"));
         assert_eq!(grant.workspace_id.as_deref(), Some("ws_default"));
+
+        let spaced = temporary_grant_from_facts(
+            "g-spaced".into(),
+            "agent-1".into(),
+            9_999_999_999,
+            &OperationFacts {
+                capability: "filesystem.write".into(),
+                kind: "file".into(),
+                path: Some(" proj".into()),
+                workspace_relative: true,
+                workspace_id: Some("ws_default".into()),
+                ..Default::default()
+            },
+        )
+        .expect("spaces are part of a valid filename");
+        assert_eq!(spaced.path_prefix.as_deref(), Some(" proj"));
     }
 }

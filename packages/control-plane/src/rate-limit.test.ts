@@ -114,3 +114,31 @@ test("OAuth mutation limiter returns a no-store 429", async () => {
   assert.equal(captured.length, 1);
   assert.equal(captured[0]!.includes("192.0.2.10"), false);
 });
+
+test("only the explicit loopback dev bypass skips rate limiting", async () => {
+  const localKeys: string[] = [];
+  const local = await worker.fetch(
+    new Request("http://127.0.0.1:8787/mcp", { method: "POST", body: "{}" }),
+    {
+      MCP_RATE_LIMITER: limiter(localKeys, false),
+      OWNMESH_DEV_AUTH_BYPASS: "true",
+      OAUTH_ISSUER: "http://127.0.0.1:8787",
+    },
+    {} as ExecutionContext,
+  );
+  assert.notEqual(local.status, 429);
+  assert.deepEqual(localKeys, []);
+
+  const remoteKeys: string[] = [];
+  const remote = await worker.fetch(
+    new Request("https://cp.test/mcp", { method: "POST", body: "{}" }),
+    {
+      MCP_RATE_LIMITER: limiter(remoteKeys, false),
+      OWNMESH_DEV_AUTH_BYPASS: "true",
+      OAUTH_ISSUER: "https://cp.test",
+    },
+    {} as ExecutionContext,
+  );
+  assert.equal(remote.status, 429);
+  assert.equal(remoteKeys.length, 1);
+});

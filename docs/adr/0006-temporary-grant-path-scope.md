@@ -1,5 +1,8 @@
 # ADR 0006: Temporary grants carry a mandatory path scope
 
+Rule-prefix behavior is clarified by
+[ADR 0009](./0009-rule-and-grant-path-matching.md).
+
 - Status: Accepted
 - Date: 2026-08-12
 - Deciders: OwnMesh maintainers
