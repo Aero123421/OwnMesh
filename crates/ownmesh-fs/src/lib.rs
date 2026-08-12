@@ -153,6 +153,20 @@ impl WorkspaceRoot {
         if rel.to_string_lossy().contains('\0') {
             return Err(FsError::InvalidPath(rel.display().to_string()));
         }
+        #[cfg(windows)]
+        if rel.components().any(|component| {
+            matches!(
+                component,
+                Component::Normal(name) if name.to_string_lossy().contains(':')
+            )
+        }) {
+            // A colon in a normal Windows path component selects an NTFS
+            // alternate data stream. Besides being non-portable, spellings such
+            // as `.env::$DATA` alias the default stream and can bypass policy
+            // classification based on the requested basename. Workspace paths
+            // never need ADS access, so reject it at the shared resolver.
+            return Err(FsError::InvalidPath(rel.display().to_string()));
+        }
 
         let candidate = if rel.is_absolute() {
             rel.to_path_buf()
@@ -1750,6 +1764,17 @@ mod tests {
         ] {
             assert!(!looks_sensitive(Path::new(ordinary)), "{ordinary}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_ntfs_alternate_data_stream_paths() {
+        let dir = tempdir().unwrap();
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        fs::write(dir.path().join(".env"), b"API_TOKEN=secret\n").unwrap();
+
+        let err = read_file_range(&ws, ".env::$DATA", 0, 1024).unwrap_err();
+        assert!(matches!(err, FsError::InvalidPath(_)));
     }
 
     #[test]

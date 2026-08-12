@@ -2544,7 +2544,15 @@ full_user_access/full_access for arbitrary commands",
             path: Some(p.path.clone()),
             workspace_relative: true,
             workspace_id: p.workspace_id.clone(),
-            tags: vec!["git".into(), "diff".into()],
+            // A diff returns repository file contents. Without enumerating and
+            // opening every changed path before the policy gate, it cannot prove
+            // that credential-like files are absent. Restricted presets therefore
+            // require confirmation; full-access presets ignore this tag.
+            tags: vec![
+                "git".into(),
+                "diff".into(),
+                TAG_READS_SENSITIVE_LOCATION.into(),
+            ],
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -7588,6 +7596,31 @@ mod broker_intent_tests {
             .await
             .expect("full access has no hidden ask");
         assert_eq!(full["approval_required"], json!(false), "{full}");
+    }
+
+    #[tokio::test]
+    async fn recommended_asks_before_returning_git_diff_contents() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::Recommended));
+        let client = ClientIdentity::new("sensitive-diff-test", "test");
+
+        let gated = runtime
+            .dispatch(
+                ops_methods::GIT_DIFF,
+                Some(json!({
+                    "path": "",
+                    "pathspec": ".env",
+                    "workspace_id": "ws_default"
+                })),
+                &client,
+            )
+            .await
+            .expect("an ask is a successful response carrying approval_required");
+
+        assert_eq!(gated["approval_required"], json!(true), "{gated}");
+        assert!(gated["result"].is_null(), "{gated}");
     }
 
     #[tokio::test]

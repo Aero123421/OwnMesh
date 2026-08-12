@@ -37,6 +37,15 @@ pub(crate) fn relative_components(rel: &Path) -> FsResult<Vec<std::ffi::OsString
     if rel.to_string_lossy().contains('\0') {
         return Err(FsError::InvalidPath(rel.display().to_string()));
     }
+    #[cfg(windows)]
+    if rel.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(name) if name.to_string_lossy().contains(':')
+        )
+    }) {
+        return Err(FsError::InvalidPath(rel.display().to_string()));
+    }
     if rel.is_absolute() {
         return Err(FsError::InvalidPath(format!(
             "absolute path not permitted in restricted custody walk: {}",
