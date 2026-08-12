@@ -650,6 +650,7 @@ mod tests {
                 when_kind: None,
                 path_prefix: None,
                 program_equals: None,
+                when_tag: None,
                 description: None,
             }],
         };
