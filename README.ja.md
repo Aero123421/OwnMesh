@@ -13,7 +13,7 @@ OwnMesh は AI オーケストレータでも、ベンダー管理の中央 SaaS
 
 ## ステータス
 
-**v1.2.1 正式安定版** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
+**v1.2.2 正式安定版** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
 
 公開する CLI サーフェスに、意図的な未実装項目は残っていません。機械検査される
 正本は [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json)
@@ -55,10 +55,24 @@ Windows PowerShell:
 $p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
 ```
 
-より厳密に確認する場合は、installer と `SHA256SUMS`、
-`SHA256SUMS.minisig`、`minisign.pub` をダウンロードし、署名と installer の
-checksum を検証してから実行してください。installer 本体も、展開数/サイズ上限、
-許可ファイル一覧、path traversal・link・device・重複拒否を適用します。
+macOS の 1 行インストールは、署名検証用の `minisign` を入手するために
+[Homebrew](https://brew.sh) を必要とします。自分で `minisign` を導入するか、
+`OWNMESH_MINISIGN` で既存のバイナリを指定すれば不要です。Linux では、
+`minisign` が無い場合に hash 固定の版を installer が取得します。
+
+より厳密に確認する場合は、installer と `SHA256SUMS`、`SHA256SUMS.minisig`
+をダウンロードし、署名と installer の checksum を検証してから実行してください。
+
+公開鍵は、検証対象のリリースからではなく **帯域外** で入手してください。
+リリース資産は自分自身を保証できません。クローンした
+[`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub) を使い、
+key ID が `C596813EFB0946A4` であることを確認します。同じ鍵が installer と
+`ownmesh update` にも埋め込まれており、3 つの経路が同一の trust root を共有
+します。リリースに同梱される `minisign.pub` は、key ID を既に知っている人向けの
+補助にすぎません。
+
+installer 本体も、展開数/サイズ上限、許可ファイル一覧、path traversal・link・
+device・重複拒否を適用します。
 
 ## 初回セットアップ
 
@@ -130,7 +144,7 @@ minisign 署名、GitHub build provenance を生成します。
 実装済みです。Linux は root 実機 receipt 取得済みですが、macOS/Windows の
 native release receipt と、公開 MCP → installed Agent → broker の E8 receipt は
 未取得です。これらの経路を実機証明済みとは表現しません。Authenticode、Apple
-notarization、MSI/NSIS、macOS native package は v1.2.1 の対象外です。
+notarization、MSI/NSIS、macOS native package は v1.2.2 の対象外です。
 
 ChatGPT の動的登録、OAuth、passkey return、refresh、MCP link は手動の live
 互換 receipt があります。local workerd suite は再現可能ですが、外部 ChatGPT を
@@ -157,7 +171,7 @@ pnpm -r lint
 - [Cloudflare deployment](./docs/deploy-cloudflare.md)
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
-- [v1.2.1 release notes](./docs/RELEASE_NOTES_v1.2.1.md)
+- [v1.2.2 release notes](./docs/RELEASE_NOTES_v1.2.2.md)
 - [目標仕様](./OWNMESH_SPECIFICATION.ja.md) — 将来ロードマップの正本
 
 ## ライセンス

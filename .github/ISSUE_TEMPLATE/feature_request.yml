@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a capability or a change to an existing contract.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that OwnMesh makes hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+    validations:
+      required: true
+  - type: input
+    id: spec
+    attributes:
+      label: Related specification section
+      description: Section in OWNMESH_SPECIFICATION.ja.md, or an ADR, if one applies.
+      placeholder: "§14.3 MCP tool catalog"
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Impact
+      options:
+        - label: Changes a security, privilege, or policy boundary (needs an ADR)
+        - label: Changes the protocol, IPC surface, or an official profile (needs an ADR)
+        - label: Adds or changes a shipped CLI or MCP surface (needs a SUPPORTED_SURFACES.json update)

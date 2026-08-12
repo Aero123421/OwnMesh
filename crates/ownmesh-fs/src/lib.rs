@@ -194,9 +194,10 @@ impl WorkspaceRoot {
                 cursor = cursor
                     .parent()
                     .ok_or_else(|| FsError::InvalidPath(candidate.display().to_string()))?;
-                if self.enforce && !cursor.starts_with(&self.root) && cursor != self.root {
-                    // still building; continue until root
-                }
+                // No containment check here on purpose: the walk is still
+                // climbing toward an existing ancestor and may legitimately pass
+                // above the root. Containment is enforced once, on the fully
+                // rejoined `resolved` path below.
                 if suffix.len() > 64 {
                     return Err(FsError::InvalidPath(candidate.display().to_string()));
                 }

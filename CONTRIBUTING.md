@@ -57,6 +57,14 @@ python scripts/check_release_quality.py
 
 Workspace Rust lints forbid `unsafe_code` and enable Clippy `pedantic` (as warnings elevated to errors in CI via `-D warnings`).
 
+Three crates opt out of the `unsafe_code` forbid because they bind OS APIs
+directly: `ownmesh-ipc` (peer credentials), `ownmesh-fs` (handle-based path
+custody), and `ownmesh-broker` (Windows SCM and token APIs). Each re-declares
+the workspace Clippy configuration so no lint coverage is lost, and each keeps
+its `unsafe` confined to the platform module named in its `Cargo.toml` comment.
+New `unsafe` outside those three crates is rejected by the compiler; adding a
+fourth exception requires an ADR.
+
 ## Project layout
 
 | Path | Responsibility |
@@ -76,6 +84,26 @@ Prefer small, reviewable PRs that complete one clear behavior or boundary.
 - Avoid drive-by refactors unrelated to the change.
 - Identifiers, API names, config keys, and error codes use **English** as the source of truth.
 - Prefer tests or fixtures next to the behavior you change; schema changes should stay consistent across Rust, TypeScript, and `spec-bundle/schemas`.
+
+## Commit authorship
+
+Every commit must carry a real name and a reachable email address. Placeholder
+identities (`*.local`, `test@`, `example.com`, bare `root`) are not accepted:
+this project ships signed binaries that run privileged operations on other
+people's machines, so the history has to say who wrote what.
+
+```bash
+git config user.name  "Your Name"
+git config user.email "you@example.org"   # or your GitHub noreply address
+```
+
+Commits authored by an agent or automation must attribute the human who ran it
+via `Co-Authored-By:`, so the responsible party stays identifiable.
+
+Part of the history predating this rule was committed under a placeholder
+identity. That history is preserved rather than rewritten — rewriting it would
+invalidate every published release tag and the artifacts signed against those
+commits. The rule applies from here forward.
 
 ## Pull requests
 

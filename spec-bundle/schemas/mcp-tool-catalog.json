@@ -147,16 +147,6 @@
       }
     },
     {
-      "name": "ownmesh_query_logs",
-      "group": "discovery_read",
-      "annotations": {
-        "readOnlyHint": true,
-        "destructiveHint": false,
-        "openWorldHint": false,
-        "idempotentHint": true
-      }
-    },
-    {
       "name": "ownmesh_get_git_status",
       "group": "discovery_read",
       "annotations": {

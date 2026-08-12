@@ -40,7 +40,7 @@ use ownmesh_ipc::{
     IpcBus, IpcClient, IpcError, IpcServer, ServerConfig,
 };
 use ownmesh_policy::{preset_document, AccessPreset, Decision, PolicyDocument, PolicyRule};
-use runtime::{runtime_handler, session_methods, DaemonRuntime};
+use runtime::{runtime_handler, session_methods, DaemonRuntime, WorkspaceEntry};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2205,6 +2205,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
                 program_equals: None,
                 elevated: None,
                 executable_identity: None,
+                workspace_id: None,
             },
             TemporaryGrant {
                 id: "forged-python-bound".into(),
@@ -2216,6 +2217,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
                 program_equals: Some(py_canon.clone()),
                 elevated: Some(false),
                 executable_identity: Some(forged_identity(&py_canon, "structured")),
+                workspace_id: None,
             },
             TemporaryGrant {
                 id: "forged-gawk-bound".into(),
@@ -2227,6 +2229,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
                 program_equals: Some(gawk_canon.clone()),
                 elevated: Some(false),
                 executable_identity: Some(forged_identity(&gawk_canon, "structured")),
+                workspace_id: None,
             },
             TemporaryGrant {
                 id: "forged-raw-bound".into(),
@@ -2241,6 +2244,7 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
                     raw_script.to_string_lossy().as_ref(),
                     "raw_shell",
                 )),
+                workspace_id: None,
             },
         ] {
             guard.inject_grant_for_test(grant);
@@ -2349,6 +2353,15 @@ async fn production_filesystem_temporary_grant_still_works() {
 
     {
         let mut guard = runtime.lock().await;
+        let other_root = dir.path().join("other-workspace");
+        std::fs::create_dir_all(&other_root).unwrap();
+        guard
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_other".into(),
+                root: other_root,
+                label: None,
+            })
+            .unwrap();
         guard.set_policy_for_test(PolicyDocument {
             preset: AccessPreset::Custom,
             note: Some("ask filesystem.write".into()),
@@ -2387,22 +2400,72 @@ async fn production_filesystem_temporary_grant_still_works() {
     {
         let guard = runtime.lock().await;
         assert_eq!(guard.grants_for_test().len(), 1);
-        assert_eq!(guard.grants_for_test()[0].capability, "filesystem.write");
+        let grant = &guard.grants_for_test()[0];
+        assert_eq!(grant.capability, "filesystem.write");
+        // The grant records the approved path. Before it did, `path_prefix` was
+        // `None`, which the matcher reads as "every path".
+        assert_eq!(
+            grant.path_prefix.as_deref(),
+            Some("fs-grant-a.txt"),
+            "a filesystem grant must carry the approved path scope: {grant:?}"
+        );
+        assert_eq!(
+            grant.workspace_id.as_deref(),
+            Some("ws_default"),
+            "an omitted workspace must be canonicalized before grant issuance"
+        );
     }
 
-    let second = agent
+    // Reuse within scope: the approved path does not prompt again.
+    let same_path = agent
+        .call(
+            methods::OPS_FS_WRITE,
+            Some(json!({
+                "path": "fs-grant-a.txt",
+                "content": "two",
+                "idempotency_key": "fs-grant-reuse-in-scope",
+            })),
+        )
+        .await
+        .expect("fs grant reuse within scope");
+    assert_eq!(same_path["approval_required"], false);
+    assert_eq!(same_path["decision"], "allow");
+
+    // The same relative path in another registered workspace is a different
+    // resource and must not reuse the default-workspace grant.
+    let other_workspace = agent
+        .call(
+            methods::OPS_FS_WRITE,
+            Some(json!({
+                "path": "fs-grant-a.txt",
+                "workspace_id": "ws_other",
+                "content": "other",
+                "idempotency_key": "fs-grant-reuse-other-workspace",
+            })),
+        )
+        .await
+        .expect("cross-workspace write is queued, not rejected");
+    assert_eq!(
+        other_workspace["approval_required"], true,
+        "a default-workspace grant must not cover the same path in ws_other: {other_workspace}"
+    );
+
+    // Out of scope: a sibling file is a different resource and must re-ask.
+    let other_path = agent
         .call(
             methods::OPS_FS_WRITE,
             Some(json!({
                 "path": "fs-grant-b.txt",
                 "content": "two",
-                "idempotency_key": "fs-grant-reuse",
+                "idempotency_key": "fs-grant-reuse-out-of-scope",
             })),
         )
         .await
-        .expect("fs grant reuse");
-    assert_eq!(second["approval_required"], false);
-    assert_eq!(second["decision"], "allow");
+        .expect("out-of-scope write is queued, not rejected");
+    assert_eq!(
+        other_path["approval_required"], true,
+        "a grant scoped to fs-grant-a.txt must not cover fs-grant-b.txt: {other_path}"
+    );
 
     server.request_shutdown();
     let _ = handle.await;

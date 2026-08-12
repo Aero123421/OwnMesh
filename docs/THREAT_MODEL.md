@@ -1,6 +1,6 @@
-# OwnMesh Threat Model (v1.2.1)
+# OwnMesh Threat Model (v1.2.2)
 
-**Status:** Published for release train v1.2.1
+**Status:** Published for release train v1.2.2
 **Related:** [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md), [`SECURITY.md`](../SECURITY.md), ADR [`0001-release-signing-sbom-provenance.md`](./adr/0001-release-signing-sbom-provenance.md)  
 **Method:** STRIDE-oriented asset / adversary / control mapping. Full Access is an intentional product mode; the trust boundary is integrity of authenticated intent, not “block the AI.”
 
@@ -27,7 +27,9 @@
         |  Device WebSocket (envelope protocol, device key)
         v
 [ownmeshd — unprivileged user daemon]
-   |  local IPC (token)     |  broker client (MAC + nonce)
+   |  local IPC             |  broker client (MAC + nonce)
+   |  (OS peer cred +       |
+   |   per-client secret)   |
    v                        v
 [CLI / TUI]          [ownmesh-broker — elevated, networkless]
    |                        |
@@ -108,7 +110,7 @@ the release notes for the evidence split.
 
 See [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md) for per-checkbox deep links.
 
-## 6. Explicit non-goals / waivers (v1.2.1)
+## 6. Explicit non-goals / waivers (v1.2.2)
 
 | ID | Scope | Note |
 | --- | --- | --- |

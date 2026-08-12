@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -152,6 +153,14 @@ pub struct OperationFacts {
     /// Server-captured executable identity (structured `command.run` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_identity: Option<ExecutableIdentityBinding>,
+    /// Registered device workspace the path is resolved against.
+    ///
+    /// `path` for filesystem capabilities is workspace-relative, so the same
+    /// string denotes different files in different workspaces. Temporary grants
+    /// record this alongside the path scope and refuse to match across
+    /// workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
 }
 
 /// Single policy rule.
@@ -193,7 +202,7 @@ impl PolicyRule {
         }
         if let Some(prefix) = &self.path_prefix {
             match &facts.path {
-                Some(p) if p.starts_with(prefix) => {}
+                Some(p) if path_scope_contains(prefix, p) => {}
                 _ => return false,
             }
         }
@@ -205,6 +214,45 @@ impl PolicyRule {
         }
         true
     }
+}
+
+/// Split a path scope into comparable native path components.
+///
+/// Separator semantics follow the host OS so a backslash remains an ordinary
+/// filename byte on Unix and a separator on Windows. Root/prefix components are
+/// preserved, preventing an absolute scope from matching a relative path.
+/// Returns `None` for empty values or `..` traversal.
+fn path_components(value: &str) -> Option<Vec<Component<'_>>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            other => out.push(other),
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// True when `candidate` is `scope` itself or a descendant of it.
+///
+/// Compares whole path components, never raw string prefixes: a scope of
+/// `proj` must not capture `proj-secret`. Traversal (`..`) on either side fails
+/// closed. This is the only containment rule temporary grants may use.
+#[must_use]
+pub fn path_scope_contains(scope: &str, candidate: &str) -> bool {
+    let (Some(scope), Some(candidate)) = (path_components(scope), path_components(candidate))
+    else {
+        return false;
+    };
+    scope.len() <= candidate.len() && scope.iter().zip(&candidate).all(|(a, b)| a == b)
 }
 
 fn capability_match(pattern: &str, capability: &str) -> bool {
@@ -509,6 +557,23 @@ pub struct TemporaryGrant {
     /// Legacy field retained for serde compatibility with persisted rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_identity: Option<ExecutableIdentityBinding>,
+    /// Workspace the `path_prefix` is resolved against.
+    ///
+    /// Absent on rows persisted before grants carried a scope; such rows are
+    /// refused by [`temporary_grant_matches`] for path-scoped capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+
+/// Capabilities whose grants are meaningless without a path scope.
+///
+/// A `filesystem.*` grant with no recorded path would authorize every path the
+/// principal can reach for the whole grant lifetime, which is never what a
+/// single approved file operation asked for. Issuance requires a scope and
+/// matching refuses rows that lack one.
+#[must_use]
+pub fn temporary_grant_requires_path_scope(capability: &str) -> bool {
+    capability == "filesystem" || capability.starts_with("filesystem.")
 }
 
 /// Capabilities for which temporary grants are never safe (command execution).
@@ -530,11 +595,18 @@ pub fn temporary_grant_forbids_kind(kind: &str) -> bool {
 
 /// Build a temporary grant from **server-side** approval facts only.
 ///
+/// This is the *only* supported way to mint a grant: callers must not assemble
+/// [`TemporaryGrant`] literals, because doing so is how an unscoped
+/// (all-paths) filesystem grant gets created by accident.
+///
 /// Client-supplied facts must never be passed here. `command.run` / `command.*`
 /// temporary grants are always rejected fail-closed (structured, raw_shell,
 /// interpreter, or otherwise) — argv/content cannot be pinned safely for reuse.
 /// One-shot approval without `temporary_grant` remains the only command path.
-/// Non-command capabilities may still mint principal/time-bounded grants.
+///
+/// Path-scoped capabilities (see [`temporary_grant_requires_path_scope`]) must
+/// carry the approved path; the resulting grant covers that path and its
+/// descendants inside the same workspace, and nothing else.
 pub fn temporary_grant_from_facts(
     id: String,
     principal_id: String,
@@ -556,21 +628,67 @@ pub fn temporary_grant_from_facts(
         );
     }
 
+    let path_prefix = facts
+        .path
+        .as_ref()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(ToOwned::to_owned);
+
+    if temporary_grant_requires_path_scope(capability) {
+        // An unscoped filesystem grant is indistinguishable from "allow every
+        // path for the grant lifetime". Refuse rather than silently widen the
+        // single operation the human approved.
+        let scope = path_prefix
+            .as_deref()
+            .ok_or("temporary grant for a filesystem capability requires an approved path scope")?;
+        if path_components(scope).is_none() {
+            return Err(
+                "temporary grant path scope must be a normalized path without `..` traversal"
+                    .into(),
+            );
+        }
+        if !facts.workspace_relative {
+            return Err("temporary grant path scope must be workspace-relative".into());
+        }
+        let workspace_id = facts
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .ok_or("temporary grant for a filesystem capability requires an approved workspace")?;
+        if workspace_id.len() > 128
+            || !workspace_id.starts_with("ws_")
+            || !workspace_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err("temporary grant workspace must be a canonical ws_... id".into());
+        }
+        if matches!(
+            Path::new(scope).components().next(),
+            Some(Component::RootDir | Component::Prefix(_))
+        ) {
+            return Err("temporary grant path scope must be workspace-relative".into());
+        }
+    }
+
     Ok(TemporaryGrant {
         id,
         capability: capability.to_owned(),
         principal_id,
         expires_unix,
-        path_prefix: facts
-            .path
-            .as_ref()
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .map(ToOwned::to_owned),
+        path_prefix,
         kind: None,
         program_equals: None,
         elevated: None,
         executable_identity: None,
+        workspace_id: facts
+            .workspace_id
+            .as_ref()
+            .map(|w| w.trim())
+            .filter(|w| !w.is_empty())
+            .map(ToOwned::to_owned),
     })
 }
 
@@ -594,9 +712,34 @@ fn temporary_grant_matches(
     {
         return false;
     }
+    // Fail closed for path-scoped capabilities: a grant row with no recorded
+    // scope (legacy persisted row, or a forged row) must never stand in for
+    // "every path". Only an explicit scope can authorize reuse.
+    if temporary_grant_requires_path_scope(&grant.capability)
+        || temporary_grant_requires_path_scope(&facts.capability)
+    {
+        let (Some(scope), Some(path)) = (grant.path_prefix.as_deref(), facts.path.as_deref())
+        else {
+            return false;
+        };
+        if !path_scope_contains(scope, path) {
+            return false;
+        }
+        // A workspace-relative scope means nothing across workspaces. Legacy or
+        // forged rows without either side of this binding fail closed.
+        let (Some(grant_workspace), Some(facts_workspace)) =
+            (grant.workspace_id.as_deref(), facts.workspace_id.as_deref())
+        else {
+            return false;
+        };
+        if facts_workspace != grant_workspace {
+            return false;
+        }
+        return true;
+    }
     if let Some(prefix) = &grant.path_prefix {
         match &facts.path {
-            Some(p) if p.starts_with(prefix.as_str()) => {}
+            Some(p) if path_scope_contains(prefix, p) => {}
             _ => return false,
         }
     }
@@ -762,11 +905,138 @@ mod tests {
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
             kind: "file".into(),
-            path: Some("/workspace/out.txt".into()),
+            path: Some("out.txt".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
             ..Default::default()
         };
-        let grants = vec![TemporaryGrant {
-            id: "g-fs".into(),
+        let grants =
+            vec![
+                temporary_grant_from_facts("g-fs".into(), "user-1".into(), 9_999_999_999, &facts)
+                    .expect("scoped filesystem grant is issuable"),
+            ];
+        let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
+        assert_eq!(v.decision, Decision::Allow);
+        assert!(v.reason.contains("temporary grant"), "{}", v.reason);
+    }
+
+    /// A filesystem grant covers the approved path and its descendants — and
+    /// nothing else. The sibling case is the one that used to slip through when
+    /// matching compared raw string prefixes.
+    #[test]
+    fn filesystem_grant_scope_is_component_bounded() {
+        let doc = preset_document(AccessPreset::WorkspaceOnly);
+        let approved = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("proj".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            ..Default::default()
+        };
+        let grants = vec![temporary_grant_from_facts(
+            "g-scope".into(),
+            "user-1".into(),
+            9_999_999_999,
+            &approved,
+        )
+        .expect("scoped grant")];
+
+        let allowed = |path: &str, workspace: &str| OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some(path.into()),
+            workspace_relative: true,
+            workspace_id: Some(workspace.into()),
+            ..Default::default()
+        };
+
+        for inside in ["proj", "proj/src", "proj/src/deep/file.txt"] {
+            assert_eq!(
+                evaluate_with_grants(
+                    &doc,
+                    &allowed(inside, "ws_default"),
+                    &grants,
+                    1_700_000_000,
+                    "user-1"
+                )
+                .decision,
+                Decision::Allow,
+                "{inside} is inside the approved scope"
+            );
+        }
+
+        // Sibling directory sharing a string prefix, an unrelated path, a
+        // traversal attempt, and the same relative path in another workspace
+        // must all fall back to the preset (Ask for writes here).
+        for outside in ["proj-secret", "proj-secret/creds", "other", "proj/../other"] {
+            assert_ne!(
+                evaluate_with_grants(
+                    &doc,
+                    &allowed(outside, "ws_default"),
+                    &grants,
+                    1_700_000_000,
+                    "user-1"
+                )
+                .decision,
+                Decision::Allow,
+                "{outside} must not ride the `proj` grant"
+            );
+        }
+        assert_ne!(
+            evaluate_with_grants(
+                &doc,
+                &allowed("proj/src", "ws_other"),
+                &grants,
+                1_700_000_000,
+                "user-1"
+            )
+            .decision,
+            Decision::Allow,
+            "a workspace-relative scope must not cross workspaces"
+        );
+
+        #[cfg(unix)]
+        {
+            assert!(path_scope_contains(r"proj\secret", r"proj\secret/file"));
+            assert!(
+                !path_scope_contains(r"proj\secret", "proj/secret/file"),
+                "a Unix backslash is a filename byte, not a path separator"
+            );
+        }
+    }
+
+    /// Issuance refuses to mint a filesystem grant with no path, and matching
+    /// refuses any such row that reaches it anyway (legacy or forged).
+    #[test]
+    fn unscoped_filesystem_grants_are_refused() {
+        let no_path = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            ..Default::default()
+        };
+        let err = temporary_grant_from_facts("g".into(), "user-1".into(), 9_999_999_999, &no_path)
+            .expect_err("an unscoped filesystem grant must not be issuable");
+        assert!(err.contains("path scope"), "{err}");
+
+        let no_workspace = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("scoped.txt".into()),
+            workspace_relative: true,
+            ..Default::default()
+        };
+        let err = temporary_grant_from_facts(
+            "g-workspace".into(),
+            "user-1".into(),
+            9_999_999_999,
+            &no_workspace,
+        )
+        .expect_err("a workspace-relative grant must bind its workspace");
+        assert!(err.contains("workspace"), "{err}");
+
+        let forged = TemporaryGrant {
+            id: "legacy-unscoped-fs".into(),
             capability: "filesystem.write".into(),
             principal_id: "user-1".into(),
             expires_unix: 9_999_999_999,
@@ -775,10 +1045,21 @@ mod tests {
             program_equals: None,
             elevated: None,
             executable_identity: None,
-        }];
-        let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
-        assert_eq!(v.decision, Decision::Allow);
-        assert!(v.reason.contains("temporary grant"), "{}", v.reason);
+            workspace_id: None,
+        };
+        let doc = preset_document(AccessPreset::WorkspaceOnly);
+        let facts = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("anything/at/all".into()),
+            ..Default::default()
+        };
+        let v = evaluate_with_grants(&doc, &facts, &[forged], 1_700_000_000, "user-1");
+        assert_ne!(
+            v.decision,
+            Decision::Allow,
+            "an unscoped filesystem row must never stand in for every path: {v:?}"
+        );
     }
 
     #[test]
@@ -870,6 +1151,7 @@ mod tests {
                 program_equals: None,
                 elevated: None,
                 executable_identity: None,
+                workspace_id: None,
             },
             TemporaryGrant {
                 id: "forged-python-identity".into(),
@@ -881,6 +1163,7 @@ mod tests {
                 program_equals: Some(py.into()),
                 elevated: Some(false),
                 executable_identity: Some(py_id.clone()),
+                workspace_id: None,
             },
             TemporaryGrant {
                 id: "forged-gawk-identity".into(),
@@ -892,6 +1175,7 @@ mod tests {
                 program_equals: Some(gawk.into()),
                 elevated: Some(false),
                 executable_identity: Some(gawk_id.clone()),
+                workspace_id: None,
             },
             TemporaryGrant {
                 id: "forged-raw".into(),
@@ -910,6 +1194,7 @@ mod tests {
                     inode: None,
                     policy_kind: "raw_shell".into(),
                 }),
+                workspace_id: None,
             },
         ];
 
@@ -985,12 +1270,15 @@ mod tests {
             &OperationFacts {
                 capability: "filesystem.write".into(),
                 kind: "file".into(),
-                path: Some("/workspace/a".into()),
+                path: Some("a".into()),
+                workspace_relative: true,
+                workspace_id: Some("ws_default".into()),
                 ..Default::default()
             },
         )
         .expect("fs grant");
         assert_eq!(grant.capability, "filesystem.write");
-        assert_eq!(grant.path_prefix.as_deref(), Some("/workspace/a"));
+        assert_eq!(grant.path_prefix.as_deref(), Some("a"));
+        assert_eq!(grant.workspace_id.as_deref(), Some("ws_default"));
     }
 }

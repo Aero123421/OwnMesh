@@ -1,0 +1,64 @@
+name: Bug report
+description: Something behaves differently from the documented contract.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security issues here.** Follow [SECURITY.md](../blob/main/SECURITY.md)
+        so the details stay private until a fix ships.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `ownmesh --version`, or the commit you built.
+      placeholder: "1.2.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - CLI (ownmesh)
+        - TUI (ownmesh-tui)
+        - Agent (ownmeshd)
+        - Privileged broker
+        - Control plane (Cloudflare Worker)
+        - Installer / release artifacts
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Exact commands. Redact tokens, hostnames, and paths you consider sensitive.
+      placeholder: |
+        1. ownmesh setup --control-plane-url https://...
+        2. ownmesh doctor --json
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected versus actual
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`ownmesh doctor --json` output (optional)"
+      description: Read-only and redacted by design, but review it before pasting.
+      render: json

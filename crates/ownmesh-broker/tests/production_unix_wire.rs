@@ -170,6 +170,14 @@ async fn production_install_and_status_never_claim_success() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Budget for the timeout/descendant-kill probe.
+///
+/// Must exceed cold Python interpreter startup (~200ms on a loaded runner) by a
+/// wide margin: the fixture has to publish the grandchild pid *before* the
+/// broker's deadline fires, or the test races its own setup. A 100ms budget
+/// made the pid file frequently absent and the read panic with `NotFound`.
+const TIMEOUT_TREE_BUDGET_MS: u64 = 5_000;
+
 fn proof_root() -> PathBuf {
     PathBuf::from(format!(
         "/root/ownmesh-e8-proof-{}-{}",
@@ -424,7 +432,9 @@ async fn wsl_root_production_broker_receipt() {
     eprintln!("E8 phase=timeout-descendant-kill");
     let python = std::fs::canonicalize("/usr/bin/python3").unwrap();
     let child_pid = base.join("child.pid");
-    let python_code = format!("import pathlib,subprocess,time;p=subprocess.Popen(['/usr/bin/sleep','5']);pathlib.Path({child_pid:?}).write_text(str(p.pid));time.sleep(5)");
+    // Keep the child alive well past the deadline so the only thing under test
+    // is the broker killing the process tree, not the child exiting on its own.
+    let python_code = format!("import pathlib,subprocess,time;p=subprocess.Popen(['/usr/bin/sleep','120']);pathlib.Path({child_pid:?}).write_text(str(p.pid));time.sleep(120)");
     let timeout_tree = execute_intent(
         &secret,
         "timeout-tree",
@@ -432,7 +442,7 @@ async fn wsl_root_production_broker_receipt() {
         "timeout-tree-nonce",
         &python,
         vec!["-c".into(), python_code],
-        100,
+        TIMEOUT_TREE_BUDGET_MS,
         None,
         BTreeMap::new(),
     );
@@ -448,10 +458,19 @@ async fn wsl_root_production_broker_receipt() {
                 .contains("timed out"),
         "{timeout_response:?}"
     );
-    let pid: i32 = std::fs::read_to_string(&child_pid)
-        .unwrap()
+    // The write happens milliseconds into a multi-second budget, so by the time
+    // the timeout returns the file exists. Fail loudly if it does not: silently
+    // skipping would turn the descendant-kill assertion below into a no-op.
+    let recorded_pid = std::fs::read_to_string(&child_pid).unwrap_or_else(|err| {
+        panic!(
+            "fixture never published the grandchild pid at {} within the {TIMEOUT_TREE_BUDGET_MS}ms budget: {err}",
+            child_pid.display()
+        )
+    });
+    let pid: i32 = recorded_pid
+        .trim()
         .parse()
-        .unwrap();
+        .unwrap_or_else(|err| panic!("unparseable grandchild pid {recorded_pid:?}: {err}"));
     tokio::time::sleep(Duration::from_millis(150)).await;
     let proc_status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
     assert!(

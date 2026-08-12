@@ -11,6 +11,7 @@ mod instance_cmd;
 mod ipc_util;
 mod lockdown;
 pub(crate) mod login;
+mod logs_cmd;
 mod mcp;
 mod mcp_client;
 mod policy_cmd;
@@ -26,7 +27,7 @@ mod update_cmd;
 mod workspace_cmd;
 
 use crate::cli::{
-    Cli, Commands, DeviceCmd, McpCmd, PrivilegedCmd, ServiceCmd, SessionCmd, TransferCmd,
+    Cli, Commands, DeviceCmd, LogsCmd, McpCmd, PrivilegedCmd, ServiceCmd, SessionCmd, TransferCmd,
     WorkspaceCmd,
 };
 use clap::CommandFactory;
@@ -70,6 +71,7 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Instance(cmd)) => instance_cmd::dispatch_instance(cli, cmd),
         Some(Commands::Device(cmd)) => dispatch_device(cli, cmd),
         Some(Commands::Workspace(cmd)) => dispatch_workspace(cli, cmd),
+        Some(Commands::Logs(cmd)) => dispatch_logs(cli, cmd),
         Some(Commands::Exec(args)) => exec::run_exec(cli, args),
         Some(Commands::Process(cmd)) => process_cmd::dispatch_process(cli, cmd),
         Some(Commands::Session(cmd)) => dispatch_session(cli, cmd),
@@ -168,6 +170,10 @@ fn dispatch_device(cli: &Cli, cmd: &DeviceCmd) -> Result<(), ExitCode> {
 
 fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode> {
     workspace_cmd::dispatch_workspace(cli, cmd)
+}
+
+fn dispatch_logs(cli: &Cli, cmd: &LogsCmd) -> Result<(), ExitCode> {
+    logs_cmd::dispatch_logs(cli, cmd)
 }
 
 fn dispatch_session(cli: &Cli, cmd: &SessionCmd) -> Result<(), ExitCode> {
