@@ -28,6 +28,17 @@ fn page_view(value: &Value) -> (Vec<String>, Option<u64>) {
     (lines, next)
 }
 
+fn terminal_safe_log_line(line: &str) -> String {
+    line.chars().fold(String::new(), |mut rendered, ch| {
+        if ch.is_control() {
+            rendered.extend(ch.escape_default());
+        } else {
+            rendered.push(ch);
+        }
+        rendered
+    })
+}
+
 pub fn dispatch_logs(cli: &Cli, cmd: &LogsCmd) -> Result<(), ExitCode> {
     match cmd {
         LogsCmd::Providers => {
@@ -75,7 +86,7 @@ pub fn dispatch_logs(cli: &Cli, cmd: &LogsCmd) -> Result<(), ExitCode> {
                     println!("(no entries)");
                 }
                 for line in lines {
-                    println!("{line}");
+                    println!("{}", terminal_safe_log_line(&line));
                 }
                 if let Some(next) = next {
                     println!("(more entries; resume with --cursor {next})");
@@ -103,6 +114,14 @@ mod tests {
         assert_eq!(
             page_view(&value),
             (vec!["first".into(), "second".into()], Some(2))
+        );
+    }
+
+    #[test]
+    fn human_log_output_escapes_terminal_controls() {
+        assert_eq!(
+            terminal_safe_log_line("ok\u{1b}[31m\r\n日本語"),
+            "ok\\u{1b}[31m\\r\\n日本語"
         );
     }
 }
