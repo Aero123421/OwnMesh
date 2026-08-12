@@ -353,6 +353,11 @@ python scripts/tests/run_release_quality_tests.py           → 38/39 PASS
 
 ## 7. 指摘一覧(優先度順)
 
+> **対応状況(2026-08-12 追記)**
+> 本レビューで挙げた P1〜P3 は、同じ PR 内で以下のとおり対応済み。
+> 対応内容の詳細は §9 を参照。唯一 P1-4(プリセット中間段)は製品判断のため
+> 実装せず、ADR 0007 に決定と候補を記録した。
+
 ### P1 — 製品形状・実害あり
 
 | # | 指摘 | 場所 | 提案 |
@@ -399,3 +404,60 @@ ADR 0004–0006 の「乖離を決定に変える」実践は、そのまま OSS
 残りの乖離に適用するだけである。どちらも本レビューで示した範囲で対応可能であり、
 プロジェクトの基礎体力(テスト・リリース工学・脅威モデル)は、それを安全に行うのに
 十分すぎるほど整っている。
+
+---
+
+## 9. 対応内容(同 PR で実施)
+
+### 挙動変更(3 件)
+
+| 指摘 | 変更 | 回帰テスト |
+|---|---|---|
+| #2 grant が deny に優先 | `evaluate_with_grants` が policy を先に評価し、`Deny` なら grant を見ずに返す。grant が持ち上げるのは `Ask` のみ | `explicit_deny_outranks_a_matching_temporary_grant` |
+| #3 機微読み取りが無確認 | daemon が解決済みパスから `reads_sensitive_location` / `writes_sensitive_location` タグを生成し、`workspace_only` / `recommended` に条件付き ask ルールを追加。full access 系は不変 | `restricted_presets_ask_before_reading_sensitive_paths`、`recommended_asks_before_reading_a_workspace_credential_file` |
+| — | `PolicyRule` に `when_tag` 条件を追加(サーバー計算 facts のみを参照) | `tag_conditioned_rules_require_the_exact_tag` |
+
+`looks_sensitive` は `.env.*` 系、`id_ecdsa`/`id_dsa`、`.netrc`/`.npmrc`/
+`.git-credentials`、`p12`/`pfx`/`jks` 等へ拡張し、`.environment` のような
+非機微名を巻き込まないことをテストで固定した。タグはクライアントが渡す経路を
+持たないため、モデルによる抑止も捏造もできない。
+
+### 決定記録・仕様更新
+
+- **ADR 0007**: 制限プリセットが exec/session を deny する理由、機微読み取り
+  ask の復旧、プリセット改名を避ける判断、中間段の候補 4 案(未決として明記)。
+- **ADR 0008**: control plane は「誰が要求してよいか」だけを判定し device が
+  唯一の policy engine であること、6 scope の設計理由、`evaluate_combined` が
+  参照実装であること。
+- **仕様更新**: §7.1(プリセット実態)、§7.2(クラウド合成)、§7.7(grant の
+  位置づけ)、§6.6(出荷 scope 一覧)、§4.1(edition)、§18.3(i18n 強制の
+  実態)、§24.1(update 既定 off)、§28(実リポジトリ構成と対応表)。
+- **ADR 0005 修正**: 「コンパイルエラー」→ 実態(`cargo test` の assert +
+  `--check-i18n` + CI job の 3 段、`[missing]` は明示プレースホルダ)。
+- **spec-bundle/README.md**: 「検証済み契約」と「仕様目標(出荷実装と異なる)」
+  を表で分離。目標側の例 TOML 4 本に先頭バナーを追加。
+- **`ownmesh_domain::PolicyRule`** に、エンジンが評価する型ではない旨を明記。
+
+### 文書・基盤
+
+- `docs/mcp-clients.md`: 6 scope 全件とツール所属を修正(#1)。二層認可
+  (scope + device policy)と alias の扱いを明示。
+- `docs/ROADMAP.md` 新規(#16)。両 README から参照。
+- `docs/DOD_1.0.md`: リリースタグ署名の手順と、CI 未強制である旨(#15)。
+- `scripts/lint-ts.mjs` 新規(#12): typecheck と重複しない 2 規則
+  (相対 import の `.ts` 明示、非テスト source の `console.*` 禁止 = §26.6)。
+  依存追加なし。
+- `test_installers.py`: minisign 不在時は skip、`OWNMESH_REQUIRE_MINISIGN=1`
+  で必須化。CI の該当ジョブに同変数を設定(#11)。
+- `crates/ownmeshd/src/runtime_fs.rs` 新規(#13): fs ハンドラ 10 メソッドを
+  既存の `runtime_session` / `runtime_transfer` / `runtime_workspace` と同じ
+  パターンで分離。挙動不変。
+- `.github/workflows/e2e-loopback.yml` 新規(#14): workerd ループバック群を
+  nightly + 手動実行に。PR/リリースの gate には**しない**。
+
+### 未対応として残したもの
+
+- **#4 プリセット中間段**: 出荷済みプリセットのセキュリティ姿勢を変える製品判断
+  のため実装せず、ADR 0007 に候補と各案のコストを記録した。
+- **#5〜#10 の一部**: 仕様側の注記で解消。実装の統一(二重 `PolicyRule` の
+  片方削除等)は互換性影響があるため別 PR 向け。

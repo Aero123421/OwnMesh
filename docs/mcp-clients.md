@@ -40,15 +40,29 @@ are not configurable:
 
 | Scope | Grants |
 | --- | --- |
-| `ownmesh.read` | Discovery and read tools: devices, workspaces, sessions, files, git, logs |
-| `ownmesh.exec` | Command execution and interactive session tools |
-| `ownmesh.device` | Device registry mutation, and dynamic client registration |
+| `ownmesh.read` | Read and discovery: `ownmesh_list_devices`, `ownmesh_get_device`, `ownmesh_fs_list` / `_read` / `_stat`, `ownmesh_git_status` / `_diff`, `ownmesh_workspace_list` / `_show`, `ownmesh_list_profiles`, `ownmesh_profile_show`, `ownmesh_review_show` / `_page`, `ownmesh_transfer_get` / `_list` / `_status`, `ownmesh_get_operation` |
+| `ownmesh.write` | Content and resource mutation: `ownmesh_fs_write` / `_patch` / `_delete`, `ownmesh_workspace_add` / `_update` / `_remove`, `ownmesh_review_start`, `ownmesh_transfer_plan` / `_send` / `_cancel` |
+| `ownmesh.exec` | Command execution: `ownmesh_command_run`, `ownmesh_command_shell`, `ownmesh_cancel_operation` |
+| `ownmesh.session` | Interactive sessions: `ownmesh_session_open` / `_attach` / `_write` / `_resize` / `_replay` / `_list` / `_show` / `_claim` / `_renew` / `_detach` / `_release` / `_give` / `_close` / `_terminate` |
+| `ownmesh.device` | Device addressing, dynamic client registration, and typed security administration: `ownmesh_policy_preset`, `ownmesh_policy_rule_add` / `_remove`, `ownmesh_daemon_unlock`, `ownmesh_token_revoke`, `ownmesh_request_approval` |
 | `offline_access` | Rotating refresh tokens |
+
+Session tools require `ownmesh.session`, not `ownmesh.exec`; filesystem writes
+require `ownmesh.write`, not `ownmesh.read`. A client configured with too narrow
+a set gets an authorization failure rather than a silent downgrade.
 
 Request the narrowest set your client needs. Your device policy is still the
 final authority: a token with `ownmesh.exec` cannot run commands on a device
-whose preset denies `command.run` (see the access preset table in
-[`onboarding.md`](./onboarding.md)).
+whose preset denies `command.run`, and `ownmesh.session` cannot open a PTY on a
+device whose preset denies `session.open` (see
+[ADR 0007](./adr/0007-restricted-presets-deny-command-execution.md) and the
+access preset table in [`onboarding.md`](./onboarding.md)).
+
+The `ownmesh_<family>_<verb>` names above are the canonical catalog. Verb-first
+names from the specification (`ownmesh_read_file`, `ownmesh_run_command`,
+`ownmesh_open_session`, …) remain callable through `tools/call` as aliases but
+are withheld from `tools/list` — see
+[ADR 0004](./adr/0004-mcp-tool-naming-and-aliases.md).
 
 ## Route 1: owner-provisioned client (recommended)
 

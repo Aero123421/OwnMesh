@@ -171,6 +171,7 @@ pnpm -r lint
 - [Cloudflare deployment](./docs/deploy-cloudflare.md)
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
+- [ロードマップ](./docs/ROADMAP.md) — 次に何をやり、何をやらないか
 - [v1.2.2 release notes](./docs/RELEASE_NOTES_v1.2.2.md)
 - [目標仕様](./OWNMESH_SPECIFICATION.ja.md) — 将来ロードマップの正本
 

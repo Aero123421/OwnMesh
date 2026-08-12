@@ -68,6 +68,19 @@ v1.2.2 stable product surface.
   workflow patterns, toolchain/version alignment, release-note selection, and
   the registry-backed surface manifest. For v1.2.2 the unsupported counts are
   zero and `completeness_claim` is true.
+- Release tags are annotated. Per
+  [ADR 0001](./adr/0001-release-signing-sbom-provenance.md) they are also
+  **signed** (GPG or SSH) when the release operator has signing configured:
+
+  ```bash
+  git tag -s "v${VERSION}" -m "OwnMesh v${VERSION}"
+  git tag -v "v${VERSION}"   # verify before pushing
+  ```
+
+  Tag signing attests who cut the release; it complements and never replaces the
+  mandatory minisign signature over `SHA256SUMS`, which is what consumers verify.
+  Tag signatures are not yet enforced by CI and are therefore not claimed as a
+  guarantee — see [`ROADMAP.md`](./ROADMAP.md).
 
 ## Explicit caveats and non-goals
 
