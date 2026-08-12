@@ -81,7 +81,18 @@ pub fn dispatch_logs(cli: &Cli, cmd: &LogsCmd) -> Result<(), ExitCode> {
             }
             let value = call_daemon(cli, "ops.logs.query", Some(params))?;
             print_value(cli.json, &value, |v| {
-                let (lines, next) = page_view(v);
+                // Policy may queue this read instead of running it. Say so
+                // rather than rendering an empty page, which reads as "no logs".
+                if v["approval_required"].as_bool().unwrap_or(false) {
+                    println!(
+                        "approval required: {}",
+                        v["approval_id"].as_str().unwrap_or("(pending)")
+                    );
+                    return;
+                }
+                // `gate_and_run` wraps the provider page in a result envelope;
+                // `page_view` reads the page, so unwrap it first.
+                let (lines, next) = page_view(&v["result"]);
                 if lines.is_empty() {
                     println!("(no entries)");
                 }
@@ -114,6 +125,36 @@ mod tests {
         assert_eq!(
             page_view(&value),
             (vec!["first".into(), "second".into()], Some(2))
+        );
+    }
+
+    /// The daemon wraps every gated result in an envelope. Reading the page
+    /// fields off the envelope itself yields an empty page, so `ownmesh logs
+    /// query` printed `(no entries)` for every successful call. The sibling
+    /// test above feeds `page_view` a bare page and cannot catch that.
+    #[test]
+    fn daemon_envelope_wraps_the_page_under_result() {
+        let envelope = json!({
+            "approval_required": false,
+            "operation_id": "op_1",
+            "decision": "allow",
+            "result": {
+                "lines": [
+                    { "line_no": 1, "text": "first", "cursor_after": { "provider": "audit", "offset": 1 } }
+                ],
+                "next_cursor": { "provider": "audit", "offset": 1 },
+                "exhausted": false
+            }
+        });
+        assert_eq!(
+            page_view(&envelope),
+            (vec![], None),
+            "the envelope itself carries no page fields"
+        );
+        assert_eq!(
+            page_view(&envelope["result"]),
+            (vec!["first".into()], Some(1)),
+            "the page lives under `result`"
         );
     }
 

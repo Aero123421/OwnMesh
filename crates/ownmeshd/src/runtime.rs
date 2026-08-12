@@ -2621,7 +2621,7 @@ full_user_access/full_access for arbitrary commands",
             kind: "file".into(),
             path: Some(p.path.clone()),
             workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -2641,7 +2641,7 @@ full_user_access/full_access for arbitrary commands",
             kind: "file".into(),
             path: Some(p.path.clone()),
             workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -2661,7 +2661,7 @@ full_user_access/full_access for arbitrary commands",
             kind: "file".into(),
             path: Some(p.path.clone()),
             workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -2681,7 +2681,7 @@ full_user_access/full_access for arbitrary commands",
             kind: "file".into(),
             path: Some(p.path.clone()),
             workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -2701,7 +2701,7 @@ full_user_access/full_access for arbitrary commands",
             kind: "file".into(),
             path: Some(p.path.clone()),
             workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             tags: vec!["delete".into()],
             ..Default::default()
         };
@@ -2744,7 +2744,7 @@ full_user_access/full_access for arbitrary commands",
             kind: "git".into(),
             path: Some(p.path.clone()),
             workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             tags: vec!["git".into(), "status".into()],
             ..Default::default()
         };
@@ -2765,7 +2765,7 @@ full_user_access/full_access for arbitrary commands",
             kind: "git".into(),
             path: Some(p.path.clone()),
             workspace_relative: true,
-            workspace_id: p.workspace_id.clone(),
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             tags: vec!["git".into(), "diff".into()],
             ..Default::default()
         };
@@ -4181,6 +4181,9 @@ full_user_access/full_access for arbitrary commands",
             /// Free-text query fallback (e.g. "exec", "write").
             #[serde(default)]
             query: Option<String>,
+            /// Workspace the path resolves in; omitted means the default one.
+            #[serde(default)]
+            workspace_id: Option<String>,
         }
         let p: P = parse_params(params)?;
         let mut capability = p.capability.unwrap_or_default();
@@ -4211,6 +4214,10 @@ full_user_access/full_access for arbitrary commands",
             path: p.path,
             program: p.program,
             elevated: p.elevated,
+            // Resolve exactly as a real operation would. Leaving this `None`
+            // made explain miss every workspace-bound temporary grant and
+            // report `ask` where the operation itself gets `allow`.
+            workspace_id: Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?),
             ..Default::default()
         };
         // Explain uses the local operator principal; grants are principal-scoped.

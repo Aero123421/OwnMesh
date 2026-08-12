@@ -24,7 +24,7 @@
     "privileged broker install/status/uninstall (networkless native lifecycle: Linux systemd, macOS launchd, Windows SCM; native release receipts tracked separately)",
     "update check/download/apply/channel (signed GitHub releases; network off by default)",
     "workspace list/show/add/update/remove (device-local registry via ownmeshd IPC)",
-    "logs providers/query (authenticated local IPC; bounded, cursor-paged device log read across audit, journald, Windows Event Log, Docker/Podman, file, and process providers; no remote log-body persistence)"
+    "logs providers/query (authenticated local IPC; bounded, cursor-paged device log read across audit, journald, Docker/Podman, and process providers, plus Windows Event Log on Windows; no remote route and no remote log-body persistence)"
   ],
   "explicit_unsupported_count": 0,
   "explicit_unsupported_surfaces": [],

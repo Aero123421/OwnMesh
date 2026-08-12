@@ -200,9 +200,22 @@ impl PolicyRule {
                 return false;
             }
         }
+        // Deliberately a raw string prefix, not [`path_scope_contains`].
+        //
+        // A rule's `path_prefix` is a *prefix*, and deny rules depend on that:
+        // `.env` is expected to cover `.env.production`, and `secret` to cover
+        // `secrets.txt`. Component-wise containment silently narrows every such
+        // rule — a prefix of `/` or `.` normalizes to no components and matches
+        // nothing at all — and, because it fails closed on `..`, it lets
+        // `secrets/../secrets/key.pem` slip past a deny on `secrets` while the
+        // filesystem layer still resolves that path back to the guarded file.
+        //
+        // Grants use the stricter component rule because a grant *widens*
+        // authority and must not overreach. A rule can widen or narrow, so
+        // tightening its matcher is not automatically safe.
         if let Some(prefix) = &self.path_prefix {
             match &facts.path {
-                Some(p) if path_scope_contains(prefix, p) => {}
+                Some(p) if p.starts_with(prefix.as_str()) => {}
                 _ => return false,
             }
         }
@@ -223,12 +236,14 @@ impl PolicyRule {
 /// preserved, preventing an absolute scope from matching a relative path.
 /// Returns `None` for empty values or `..` traversal.
 fn path_components(value: &str) -> Option<Vec<Component<'_>>> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
+    // Whitespace is significant: ` proj` is a different directory from `proj`,
+    // and the filesystem layer does not trim. Normalizing here would let a
+    // grant on `proj` match a path that resolves somewhere else.
+    if value.is_empty() {
         return None;
     }
     let mut out = Vec::new();
-    for component in Path::new(trimmed).components() {
+    for component in Path::new(value).components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => return None,
@@ -628,11 +643,13 @@ pub fn temporary_grant_from_facts(
         );
     }
 
+    // Store the approved path verbatim. Trimming would scope the grant to a
+    // *different* path than the human approved: an approved ` proj` stored as
+    // `proj` would then match `proj/secret`, which resolves elsewhere on disk.
     let path_prefix = facts
         .path
         .as_ref()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.trim().is_empty())
         .map(ToOwned::to_owned);
 
     if temporary_grant_requires_path_scope(capability) {
@@ -755,6 +772,16 @@ pub fn evaluate_with_grants(
     now_unix: i64,
     principal_id: &str,
 ) -> PolicyVerdict {
+    // A grant records that a human already answered an `Ask`. It is not an
+    // answer to `Deny`: `deny > ask > allow` is the document's precedence, and
+    // a denied operation could never have raised an approval prompt to begin
+    // with. Evaluating the document first keeps an explicit deny authoritative
+    // inside a granted subtree — otherwise a grant on `proj` would silence a
+    // deny rule on `proj/.env`.
+    let verdict = evaluate(doc, facts);
+    if verdict.decision == Decision::Deny {
+        return verdict;
+    }
     for g in grants {
         if !temporary_grant_matches(g, facts, principal_id, now_unix) {
             continue;
@@ -765,7 +792,7 @@ pub fn evaluate_with_grants(
             reason: format!("temporary grant {}", g.id),
         };
     }
-    evaluate(doc, facts)
+    verdict
 }
 
 /// Summarize rule counts by decision (for UI).
@@ -1002,6 +1029,141 @@ mod tests {
             assert!(
                 !path_scope_contains(r"proj\secret", "proj/secret/file"),
                 "a Unix backslash is a filename byte, not a path separator"
+            );
+        }
+    }
+
+    /// A rule's `path_prefix` is a raw string prefix, and deny rules depend on
+    /// that. Component-wise containment silently narrowed every such rule:
+    /// `.env` stopped covering `.env.production`, prefixes of `/` or `.`
+    /// matched nothing at all, and `secrets/../secrets/key.pem` escaped a deny
+    /// on `secrets` while the filesystem layer still resolved it back to the
+    /// guarded file. Grants use the stricter rule; rules must not.
+    #[test]
+    fn rule_path_prefix_stays_a_string_prefix() {
+        let deny = |prefix: &str| PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: None,
+            rules: vec![PolicyRule {
+                id: "deny-path".into(),
+                decision: Decision::Deny,
+                priority: 100,
+                capability: "filesystem.read".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: Some(prefix.into()),
+                program_equals: None,
+                description: None,
+            }],
+        };
+        let read = |path: &str| OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "file".into(),
+            path: Some(path.into()),
+            ..Default::default()
+        };
+
+        for (prefix, path) in [
+            // Non-component-aligned prefixes must keep matching.
+            (".env", ".env.production"),
+            ("secret", "secrets.txt"),
+            ("id_", "id_rsa"),
+            ("/", "/etc/shadow"),
+            (".", ".ssh/id_ed25519"),
+            // Interior traversal must not dodge the rule: the filesystem layer
+            // normalizes `..` by popping, so the read lands on the guarded file.
+            ("secrets", "secrets/../secrets/key.pem"),
+            ("secrets", "secrets/missing/../key.pem"),
+            // Ordinary case.
+            ("secrets", "secrets/key.pem"),
+        ] {
+            assert_eq!(
+                evaluate(&deny(prefix), &read(path)).decision,
+                Decision::Deny,
+                "deny rule on {prefix:?} must match {path:?}"
+            );
+        }
+    }
+
+    /// A grant answers `Ask`, never `Deny`. An operation the policy denies could
+    /// not have raised an approval prompt, so a grant must not silence a deny
+    /// rule that sits inside the granted subtree.
+    #[test]
+    fn grants_do_not_override_an_explicit_deny() {
+        let doc = PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: None,
+            rules: vec![PolicyRule {
+                id: "deny-dotenv".into(),
+                decision: Decision::Deny,
+                priority: 1000,
+                capability: "filesystem.read".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: Some("proj/.env".into()),
+                program_equals: None,
+                description: None,
+            }],
+        };
+        let approved = OperationFacts {
+            capability: "filesystem.read".into(),
+            kind: "file".into(),
+            path: Some("proj".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            ..Default::default()
+        };
+        let grants =
+            vec![
+                temporary_grant_from_facts("g".into(), "user-1".into(), 9_999_999_999, &approved)
+                    .expect("scoped grant"),
+            ];
+
+        let denied = OperationFacts {
+            path: Some("proj/.env/secret".into()),
+            ..approved.clone()
+        };
+        assert_eq!(
+            evaluate_with_grants(&doc, &denied, &grants, 1_700_000_000, "user-1").decision,
+            Decision::Deny,
+            "a grant over `proj` must not silence an explicit deny inside it"
+        );
+        assert_eq!(
+            evaluate_with_grants(&doc, &approved, &grants, 1_700_000_000, "user-1").decision,
+            Decision::Allow,
+            "the rest of the granted subtree still rides the grant"
+        );
+    }
+
+    /// Scope matching must agree with what the filesystem will open. Trimming
+    /// whitespace would let a grant on `proj` match ` proj/x`, which resolves
+    /// to a different directory.
+    #[test]
+    fn grant_scope_does_not_normalize_away_real_path_differences() {
+        let doc = preset_document(AccessPreset::WorkspaceOnly);
+        let approved = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("proj".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            ..Default::default()
+        };
+        let grants =
+            vec![
+                temporary_grant_from_facts("g".into(), "user-1".into(), 9_999_999_999, &approved)
+                    .expect("scoped grant"),
+            ];
+
+        for path in [" proj/x", "\u{3000}proj/x", "proj /x"] {
+            let facts = OperationFacts {
+                path: Some(path.into()),
+                ..approved.clone()
+            };
+            assert_ne!(
+                evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1").decision,
+                Decision::Allow,
+                "{path:?} resolves outside the approved `proj` directory"
             );
         }
     }

@@ -60,7 +60,7 @@ pub enum Commands {
     #[command(subcommand)]
     Workspace(WorkspaceCmd),
 
-    /// Query device log providers (audit, journald, Windows Event Log, Docker, files).
+    /// Query device log providers (audit, journald, Docker, process; Windows Event Log on Windows).
     #[command(subcommand)]
     Logs(LogsCmd),
     /// Run a structured command on a device.
@@ -298,7 +298,10 @@ pub enum LogsCmd {
     Providers,
     /// Read one bounded page from a log provider.
     Query {
-        /// Provider id (`audit`, `journald`, `windows_event`, `docker`, `file`, `process`).
+        /// Provider id. Registered everywhere: `audit`, `journald`, `docker`,
+        /// `process`. Windows also registers `windows_event`. There is no
+        /// `file` provider — the on-disk audit log is served as `audit`.
+        /// Run `ownmesh logs providers` for this device's actual list.
         #[arg(long, default_value = "audit")]
         provider: String,
         /// Resume from a prior page's `next_cursor`.
@@ -535,6 +538,16 @@ pub enum PolicyCmd {
     Explain {
         /// Operation description.
         query: String,
+        /// Workspace-relative path the operation targets.
+        ///
+        /// Path-scoped temporary grants only match the path they were approved
+        /// for, so omitting this explains an unscoped operation rather than the
+        /// one you have in mind.
+        #[arg(long)]
+        path: Option<String>,
+        /// Workspace the path resolves in (default workspace when omitted).
+        #[arg(long)]
+        workspace_id: Option<String>,
     },
 }
 
