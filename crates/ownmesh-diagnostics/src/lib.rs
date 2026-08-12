@@ -270,6 +270,24 @@ pub struct DoctorInput {
     pub service: ServiceObservation,
 }
 
+/// True for built-in presets that deny `command.run` / `session.open`.
+///
+/// Mirrors the `ws-deny-*` / `rec-deny-*` rules in
+/// `ownmesh_policy::preset_document`. Kept as a name check so diagnostics stay
+/// free of a policy-engine dependency; the policy crate owns the real decision
+/// and a conformance test pins the two together.
+#[must_use]
+pub fn preset_denies_command_execution(preset: &str) -> bool {
+    matches!(
+        preset
+            .trim()
+            .to_ascii_lowercase()
+            .replace('-', "_")
+            .as_str(),
+        "workspace_only" | "recommended"
+    )
+}
+
 /// Run structured doctor checks from gathered observations (no I/O).
 #[must_use]
 pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
@@ -513,6 +531,33 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         ));
     } else {
         checks.push(DoctorCheck::warn("policy", "policy.toml not found"));
+    }
+
+    // Capability consequence of the selected preset.
+    //
+    // `workspace_only` and `recommended` deny command execution and interactive
+    // sessions until OS process confinement exists. That is the single most
+    // surprising thing about a default install — remote tools connect fine and
+    // then every exec is denied — so state it in the read-only report instead of
+    // leaving the user to infer it from a policy decision at call time.
+    if input.privacy_policy.policy_valid {
+        if let Some(preset) = input.privacy_policy.policy_preset.as_deref() {
+            if preset_denies_command_execution(preset) {
+                checks.push(DoctorCheck::warn(
+                    "policy.command_execution",
+                    format!(
+                        "preset `{preset}` denies command.run and session.open \
+                         (no OS process confinement yet); run \
+                         `ownmesh policy preset full_user_access` to enable them"
+                    ),
+                ));
+            } else {
+                checks.push(DoctorCheck::pass(
+                    "policy.command_execution",
+                    format!("preset `{preset}` permits command.run and session.open"),
+                ));
+            }
+        }
     }
 
     // Privacy defaults

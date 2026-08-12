@@ -1133,19 +1133,44 @@ mod tests {
         assert_eq!(approved["result"]["bytes_written"], 13);
         assert!(marker.exists(), "must execute after approval");
 
-        let second = client
+        // The grant is scoped to the path that was actually approved, and the
+        // response says so rather than leaving the caller to assume.
+        assert_eq!(approved["grant"]["capability"], "filesystem.write");
+        assert_eq!(approved["grant"]["scope"], "approved-only.txt");
+
+        // Re-writing the approved path rides the grant: no second prompt.
+        let same_path = client
+            .call(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "approved-only.txt",
+                    "content": "granted",
+                    "idempotency_key": "grant-write-same-path",
+                })),
+            )
+            .await
+            .expect("grant allow within scope");
+        assert_eq!(same_path["approval_required"], false);
+        assert_eq!(same_path["decision"], "allow");
+
+        // A different path does not. Before grants carried a scope this write
+        // was silently allowed, which turned one approved file write into
+        // filesystem-wide write access for the grant lifetime.
+        let other_path = client
             .call(
                 methods::OPS_FS_WRITE,
                 Some(json!({
                     "path": "granted.txt",
                     "content": "granted",
-                    "idempotency_key": "grant-write-1",
+                    "idempotency_key": "grant-write-other-path",
                 })),
             )
             .await
-            .expect("grant allow");
-        assert_eq!(second["approval_required"], false);
-        assert_eq!(second["decision"], "allow");
+            .expect("out-of-scope write is queued, not rejected");
+        assert_eq!(
+            other_path["approval_required"], true,
+            "a grant scoped to approved-only.txt must not cover granted.txt: {other_path}"
+        );
 
         server.request_shutdown();
         let _ = handle.await;

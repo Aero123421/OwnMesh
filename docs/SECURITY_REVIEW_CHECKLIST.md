@@ -118,9 +118,16 @@ Legend: ✅ covered by automated tests in v1.2.1 · ⚠ partial / best-effort ·
 - [x] Full Access preset に隠れた deny/ask がない  
   **Tests:** `full_access_has_no_hidden_restrictive_rules`; `ownmeshd` full access conformance; `security` invariant suite
 - [x] temporary grant は対象、principal、expiry を持つ  
-  **Tests:** policy grant evaluation tests
-- [x] broad grant 作成時に影響範囲を明示する ⚠  
-  **Tests:** TUI/wizard copy (UX); schema carries scope fields
+  **Tests:** `ownmesh-policy` `temporary_grant_from_facts` / `temporary_grant_matches` tests.
+  Path-scoped capabilities (`filesystem.*`) refuse issuance without an approved
+  path and refuse to match a row that carries no scope, so an unscoped grant
+  cannot stand in for "every path". Scope containment compares whole path
+  components and is additionally bound to the approving workspace.
+- [x] broad grant 作成時に影響範囲を明示する  
+  **Tests:** `ownmesh approval approve --grant` help states the exact scope, and the
+  approve result reports `grant.scope` / `grant.workspace_id` / `grant.expires_at`.
+  The TUI deliberately offers approve/deny only (scope: once) and never mints a
+  temporary grant.
 - [x] approval race、double approval、stale approval を test する  
   **Tests:** daemon approval queue paths
 - [x] AI の risk note と機械的 operation facts を混同しない  

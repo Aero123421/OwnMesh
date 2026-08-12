@@ -1,0 +1,24 @@
+# Default owner for everything not matched below.
+*                                   @Aero123421
+
+# Security boundaries. Changes here need an explicit security review and,
+# per CONTRIBUTING.md, usually an ADR.
+/crates/ownmesh-policy/             @Aero123421
+/crates/ownmesh-ipc/                @Aero123421
+/crates/ownmesh-identity/           @Aero123421
+/crates/ownmesh-broker/             @Aero123421
+/crates/ownmesh-fs/                 @Aero123421
+/crates/ownmesh-update/             @Aero123421
+/packages/control-plane/src/oauth.ts        @Aero123421
+/packages/control-plane/src/owner-auth.ts   @Aero123421
+
+# Release trust root and supply chain.
+/docs/release-keys/                 @Aero123421
+/installers/                        @Aero123421
+/.github/workflows/                 @Aero123421
+/scripts/check_release_quality.py   @Aero123421
+/release/SUPPORTED_SURFACES.json    @Aero123421
+
+# Decision records and the specification they revise.
+/docs/adr/                          @Aero123421
+/OWNMESH_SPECIFICATION.ja.md        @Aero123421

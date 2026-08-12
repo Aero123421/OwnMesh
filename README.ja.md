@@ -55,10 +55,24 @@ Windows PowerShell:
 $p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
 ```
 
-より厳密に確認する場合は、installer と `SHA256SUMS`、
-`SHA256SUMS.minisig`、`minisign.pub` をダウンロードし、署名と installer の
-checksum を検証してから実行してください。installer 本体も、展開数/サイズ上限、
-許可ファイル一覧、path traversal・link・device・重複拒否を適用します。
+macOS の 1 行インストールは、署名検証用の `minisign` を入手するために
+[Homebrew](https://brew.sh) を必要とします。自分で `minisign` を導入するか、
+`OWNMESH_MINISIGN` で既存のバイナリを指定すれば不要です。Linux では、
+`minisign` が無い場合に hash 固定の版を installer が取得します。
+
+より厳密に確認する場合は、installer と `SHA256SUMS`、`SHA256SUMS.minisig`
+をダウンロードし、署名と installer の checksum を検証してから実行してください。
+
+公開鍵は、検証対象のリリースからではなく **帯域外** で入手してください。
+リリース資産は自分自身を保証できません。クローンした
+[`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub) を使い、
+key ID が `C596813EFB0946A4` であることを確認します。同じ鍵が installer と
+`ownmesh update` にも埋め込まれており、3 つの経路が同一の trust root を共有
+します。リリースに同梱される `minisign.pub` は、key ID を既に知っている人向けの
+補助にすぎません。
+
+installer 本体も、展開数/サイズ上限、許可ファイル一覧、path traversal・link・
+device・重複拒否を適用します。
 
 ## 初回セットアップ
 

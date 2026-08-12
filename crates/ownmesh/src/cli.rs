@@ -59,6 +59,10 @@ pub enum Commands {
     /// Workspace management.
     #[command(subcommand)]
     Workspace(WorkspaceCmd),
+
+    /// Query device log providers (audit, journald, Windows Event Log, Docker, files).
+    #[command(subcommand)]
+    Logs(LogsCmd),
     /// Run a structured command on a device.
     Exec(ExecArgs),
     /// Background process control.
@@ -284,6 +288,37 @@ pub enum WorkspaceCmd {
     },
 }
 
+/// `ownmesh logs` subcommands.
+///
+/// Reads stay on the device: the daemon queries the platform provider locally
+/// and returns a bounded, cursor-paged page. Nothing is uploaded by querying.
+#[derive(Debug, Clone, Subcommand)]
+pub enum LogsCmd {
+    /// List log providers available on this device.
+    Providers,
+    /// Read one bounded page from a log provider.
+    Query {
+        /// Provider id (`audit`, `journald`, `windows_event`, `docker`, `file`, `process`).
+        #[arg(long, default_value = "audit")]
+        provider: String,
+        /// Resume from a prior page's `next_cursor`.
+        #[arg(long)]
+        cursor: Option<u64>,
+        /// Maximum entries in this page.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// journald unit filter (`--unit`).
+        #[arg(long)]
+        unit: Option<String>,
+        /// Windows Event Log channel (default Application).
+        #[arg(long)]
+        channel: Option<String>,
+        /// Docker/Podman container name or id.
+        #[arg(long)]
+        container: Option<String>,
+    },
+}
+
 /// `ownmesh exec` arguments.
 #[derive(Debug, Clone, Parser)]
 pub struct ExecArgs {
@@ -448,7 +483,12 @@ pub enum ApprovalCmd {
     Approve {
         /// Approval id.
         id: String,
-        /// Also issue a temporary capability grant.
+        /// Also issue a temporary capability grant, so later matching
+        /// operations by the same principal skip the approval prompt.
+        ///
+        /// The grant is limited to this approval's capability, this principal,
+        /// and the approved path and its descendants inside the same workspace.
+        /// It is never issued for `command.run` — commands always re-ask.
         #[arg(long)]
         grant: bool,
         /// Temporary grant lifetime in seconds (with `--grant`).

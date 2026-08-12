@@ -23,7 +23,8 @@
     "service install/start/stop/restart/status/uninstall (user-level ownmeshd autostart only)",
     "privileged broker install/status/uninstall (networkless native lifecycle: Linux systemd, macOS launchd, Windows SCM; native release receipts tracked separately)",
     "update check/download/apply/channel (signed GitHub releases; network off by default)",
-    "workspace list/show/add/update/remove (device-local registry via ownmeshd IPC)"
+    "workspace list/show/add/update/remove (device-local registry via ownmeshd IPC)",
+    "logs providers/query (bounded, cursor-paged device log read across audit, journald, Windows Event Log, Docker/Podman, file, and process providers; also exposed as MCP ownmesh_query_logs)"
   ],
   "explicit_unsupported_count": 0,
   "explicit_unsupported_surfaces": [],

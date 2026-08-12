@@ -2716,6 +2716,15 @@ fn map_request_to_method(
             }
             crate::runtime::session_methods::TERMINATE
         }
+        // Read-only device log query. Providers run on the device and return a
+        // bounded page; nothing is uploaded by querying.
+        ("logs.read" | "logs", "logs.read" | "logs.query" | "ownmesh_query_logs" | "query") => {
+            methods::OPS_LOGS_QUERY
+        }
+        (
+            "logs.list_providers" | "logs",
+            "logs.list_providers" | "ownmesh_list_log_providers" | "list_providers",
+        ) => crate::runtime::ops_methods::LOGS_LIST_PROVIDERS,
         // Read-only git review surfaces (E7 foundation).
         ("git.status" | "git", "git.status" | "ownmesh_git_status" | "status") => {
             crate::runtime::ops_methods::GIT_STATUS

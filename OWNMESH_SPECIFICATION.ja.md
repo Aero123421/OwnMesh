@@ -1123,7 +1123,15 @@ acp = false
 
 実装名は衝突を避けるため `ownmesh_` prefix + snake_case とする。
 
-例:
+> **実装状況（v1.2.1 / [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md)）**
+> 出荷カタログは `ownmesh_<family>_<verb>` の名詞先行形を正本とする
+> （`ownmesh_fs_read`、`ownmesh_session_open`、`ownmesh_transfer_plan`）。
+> capability ごとに整列し、`tools/list` を読むモデルが surface を辿りやすいため。
+> 下記の動詞先行名は互換 alias として `tools/call` で引き続き受理するが、
+> `tools/list` には出さない（同一 schema の重複は選択根拠を与えず context を
+> 二重に消費するため）。新規 alias は追加しない。
+
+例（alias として維持）:
 
 ```text
 ownmesh_list_devices
@@ -1179,6 +1187,24 @@ ownmesh_plan_transfer
 ownmesh_start_transfer
 ownmesh_cancel_transfer
 ```
+
+> **実装状況（v1.2.1）**
+> 本節は目標カタログであり、出荷契約ではない。出荷契約は
+> `packages/control-plane/src/mcp.ts` の `MCP_TOOLS` と、`tools/list` に出る
+> `PUBLISHED_MCP_TOOLS` である。命名の対応は
+> [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md) を参照。
+>
+> v1.2.1 で **未実装** の項目:
+>
+> - `ownmesh_search_files` — ファイル検索 tool は未提供。
+> - `ownmesh_start_process` / `ownmesh_stop_process` — CLI の
+>   `ownmesh process start/stop` はあるが MCP tool は未提供。
+> - `ownmesh_run_elevated_command` — 独立 tool ではなく
+>   `ownmesh_command_run` の `elevated: true` フラグとして実装している。
+>   14.4 の「elevated を明示 tool に分ける」との差異であり、raw shell は
+>   仕様どおり `ownmesh_command_shell` として分離済み。
+>
+> `ownmesh_query_logs` は v1.2.1 で実装済み（CLI は `ownmesh logs query`）。
 
 ## 14.4 Tool 設計原則
 
@@ -1582,6 +1608,20 @@ fuzzy matching、最近使った操作、context-aware action を提供する。
 12. Final diagnostics
 ```
 
+> **実装状況（v1.2.1）**
+> 12 段の完全 wizard は未実装。出荷しているのは 2 つの入口である。
+>
+> - `ownmesh setup`（CLI・TTY）: control plane URL、instance id、access preset、
+>   language を対話取得する。preset は下記の説明要件を満たす形で提示する
+>   （選択が command 実行を許可するかどうかを明示する）。
+> - `ownmesh-tui` の wizard: Welcome → Language → Preset → Confirm の 4 段。
+>
+> device 名、background service、privileged access、approval 挙動、workspace
+> label、profile scan、ChatGPT 接続案内、最終 diagnostics は、それぞれ独立した
+> コマンド（`device enroll`、`service install`、`privileged install`、
+> `profile scan`、`doctor`）として提供しており、単一 wizard には統合していない。
+> `setup --quickstart` が device 登録と autostart までを 1 コマンドで実行する。
+
 各画面は右側または下部に次を表示する。
 
 - これは何か。
@@ -1653,11 +1693,21 @@ ru-RU   Русский
 - diagnostics。
 - README quickstart を最低限 4 言語で用意することを推奨。
 
+> **実装状況（v1.2.1 / [ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）**
+> 出荷範囲は **TUI 全文のみ**。CLI help、setup 説明、error message、
+> diagnostics は英語固定であり、4 言語化は未実装の目標として残る。
+> CLI は 16.4 のとおり機械向け surface で、key・enum・error code・exit code を
+> locale 非依存に保つ設計のため、その周辺 prose の翻訳は後回しにしている。
+> `--lang` の CLI における効果は、TUI 言語の選択と config への保存のみ。
+
 ## 18.3 ルール
 
 - command 名、config key、JSON key、error code は英語固定。
 - user-visible string をコードへ直書きしない。
-- Fluent FTL を使用する。
+- 翻訳カタログは compile-time で完全性を強制する（[ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）。
+  v1.2.1 の実装は Rust の `enum Msg` + locale 表であり、locale ごとの欠落は
+  ビルド失敗になる。`ownmesh-tui --check-i18n` と CI が 4 言語の網羅を検査する。
+  Fluent FTL は、runtime 読み込み可能な locale が必要になった時点で再検討する。
 - 文字列結合で文章を組み立てない。
 - placeholder の型と存在を CI で検証する。
 - CJK 表示幅を考慮する。

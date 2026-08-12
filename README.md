@@ -60,9 +60,23 @@ Windows PowerShell:
 $p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
 ```
 
+On macOS the one-line install needs [Homebrew](https://brew.sh) so it can obtain
+`minisign` for signature verification. Install `minisign` yourself (or point
+`OWNMESH_MINISIGN` at an existing binary) to skip that dependency. On Linux the
+installer bootstraps a pinned, hash-checked `minisign` when none is present.
+
 For offline-verifiable bootstrap, download `ownmesh-installer.sh` or
-`ownmesh-installer.ps1` together with `SHA256SUMS`, `SHA256SUMS.minisig`, and
-`minisign.pub`; verify the signature and installer checksum before execution.
+`ownmesh-installer.ps1` together with `SHA256SUMS` and `SHA256SUMS.minisig`,
+then verify the signature and installer checksum before execution.
+
+Take the public key **out of band**, not from the release you are verifying —
+a release asset cannot vouch for itself. Use
+[`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub) from a
+repository clone, and confirm it is key ID `C596813EFB0946A4`. The same key is
+compiled into the installers and into `ownmesh update`, so all three agree on
+one trust root. `minisign.pub` is published alongside each release only as a
+convenience for readers who already know the key ID.
+
 The installers also enforce archive entry/size limits, an exact file allowlist,
 and reject traversal, links, devices, and duplicate members.
 

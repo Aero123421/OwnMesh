@@ -144,6 +144,35 @@ fn read_json_source(path: &str) -> Result<String, String> {
 /// stdin cannot grow the buffer without limit.
 const MAX_PROMPT_BYTES: usize = 4096;
 
+/// Explain the access presets before asking the user to pick one.
+///
+/// The decisive fact is which presets allow command execution: `workspace_only`
+/// and `recommended` deny `command.run` and `session.open` until OS process
+/// confinement exists, so choosing them means remote tools can read and write
+/// files but cannot run anything.
+fn write_preset_guidance(stdout: &mut impl Write) -> Result<(), String> {
+    const LINES: &[&str] = &[
+        "",
+        "Access preset — what this machine will allow.",
+        "  workspace_only     files inside registered workspaces; asks before writes.",
+        "                     Commands and interactive sessions are DENIED.",
+        "  recommended        reads allowed, writes ask, elevated asks.",
+        "                     Commands and interactive sessions are DENIED.",
+        "  full_user_access   everything your OS user can do; elevated still asks.",
+        "                     Commands and interactive sessions are allowed.",
+        "  full_access        allow everything, including elevated. No hidden denies.",
+        "",
+        "  Nothing leaves this machine because of this choice; it only decides what",
+        "  an authenticated caller may ask this machine to do. Change it any time",
+        "  with `ownmesh policy preset <name>`.",
+        "",
+    ];
+    for line in LINES {
+        writeln!(stdout, "{line}").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn prompt_line(
     stdout: &mut impl Write,
     stdin: &mut impl Read,
@@ -263,6 +292,13 @@ pub fn complete_request_interactive(
     }
 
     if req.policy_preset.as_deref().unwrap_or("").trim().is_empty() {
+        // Spec 17.7: every choice states what it is, what it enables, what
+        // leaves the machine, and whether it can be changed later. The
+        // command-execution consequence matters most here: the two restricted
+        // presets deny exec and interactive sessions outright, so a user who
+        // accepts the default and then connects ChatGPT would otherwise see
+        // every command denied with no explanation.
+        write_preset_guidance(stdout)?;
         let preset = prompt_line(
             stdout,
             stdin,

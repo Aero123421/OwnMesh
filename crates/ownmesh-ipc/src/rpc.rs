@@ -38,6 +38,8 @@ pub mod methods {
     pub const TRANSFER_PREFLIGHT_SOURCE: &str = "transfer.preflight_source";
     /// Internal Agent-only destination no-replace/custody preflight.
     pub const TRANSFER_PREFLIGHT_DESTINATION: &str = "transfer.preflight_destination";
+    /// Begin an authorized transfer from a signed plan.
+    pub const TRANSFER_START: &str = "transfer.start";
     pub const TRANSFER_SOURCE_OPEN: &str = "transfer.source_open";
     pub const TRANSFER_SOURCE_CHUNK: &str = "transfer.source_chunk";
     pub const TRANSFER_DESTINATION_PREPARE: &str = "transfer.destination_prepare";

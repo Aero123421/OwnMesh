@@ -27,7 +27,9 @@
         |  Device WebSocket (envelope protocol, device key)
         v
 [ownmeshd — unprivileged user daemon]
-   |  local IPC (token)     |  broker client (MAC + nonce)
+   |  local IPC             |  broker client (MAC + nonce)
+   |  (OS peer cred +       |
+   |   per-client secret)   |
    v                        v
 [CLI / TUI]          [ownmesh-broker — elevated, networkless]
    |                        |
