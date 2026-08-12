@@ -1135,46 +1135,6 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "session",
   },
   {
-    name: "ownmesh_query_logs",
-    description:
-      "Read one bounded page of device logs from a named provider (audit, journald, " +
-      "Windows Event Log, Docker/Podman, file, process). Reads run on the device; " +
-      "log bodies are not stored in the control plane.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        ...deviceProp,
-        provider: {
-          type: "string",
-          description:
-            "Provider id. Use ownmesh_list_devices/doctor output or omit for `audit`.",
-        },
-        cursor_offset: {
-          type: "integer",
-          minimum: 0,
-          description: "Resume offset from a prior page's next_cursor",
-        },
-        limit: { type: "integer", minimum: 1, maximum: 1000 },
-        unit: { type: "string", description: "journald --unit filter" },
-        channel: { type: "string", description: "Windows Event Log channel" },
-        container: { type: "string", description: "Docker/Podman container name or id" },
-        idempotency_key: {
-          type: "string",
-          description: "Required caller idempotency key",
-        },
-      },
-      required: ["device_id", "idempotency_key"],
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      openWorldHint: false,
-      idempotentHint: true,
-    },
-    scope: "ownmesh.read",
-    risk: "read",
-  },
-  {
     name: "ownmesh_git_status",
     description: "Bounded git status (porcelain) on a device workspace repository",
     inputSchema: {
@@ -2323,8 +2283,6 @@ function toolCapability(toolName: string): string {
       return "session.close";
     case "ownmesh_session_terminate":
       return "session.terminate";
-    case "ownmesh_query_logs":
-      return "logs.read";
     case "ownmesh_git_status":
       return "git.status";
     case "ownmesh_git_diff":
@@ -2415,8 +2373,6 @@ function toolAction(toolName: string): string {
       return "session.close";
     case "ownmesh_session_terminate":
       return "session.terminate";
-    case "ownmesh_query_logs":
-      return "logs.read";
     case "ownmesh_git_status":
       return "git.status";
     case "ownmesh_git_diff":

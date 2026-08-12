@@ -40,7 +40,7 @@ use ownmesh_ipc::{
     IpcBus, IpcClient, IpcError, IpcServer, ServerConfig,
 };
 use ownmesh_policy::{preset_document, AccessPreset, Decision, PolicyDocument, PolicyRule};
-use runtime::{runtime_handler, session_methods, DaemonRuntime};
+use runtime::{runtime_handler, session_methods, DaemonRuntime, WorkspaceEntry};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2353,6 +2353,15 @@ async fn production_filesystem_temporary_grant_still_works() {
 
     {
         let mut guard = runtime.lock().await;
+        let other_root = dir.path().join("other-workspace");
+        std::fs::create_dir_all(&other_root).unwrap();
+        guard
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_other".into(),
+                root: other_root,
+                label: None,
+            })
+            .unwrap();
         guard.set_policy_for_test(PolicyDocument {
             preset: AccessPreset::Custom,
             note: Some("ask filesystem.write".into()),
@@ -2400,6 +2409,11 @@ async fn production_filesystem_temporary_grant_still_works() {
             Some("fs-grant-a.txt"),
             "a filesystem grant must carry the approved path scope: {grant:?}"
         );
+        assert_eq!(
+            grant.workspace_id.as_deref(),
+            Some("ws_default"),
+            "an omitted workspace must be canonicalized before grant issuance"
+        );
     }
 
     // Reuse within scope: the approved path does not prompt again.
@@ -2416,6 +2430,25 @@ async fn production_filesystem_temporary_grant_still_works() {
         .expect("fs grant reuse within scope");
     assert_eq!(same_path["approval_required"], false);
     assert_eq!(same_path["decision"], "allow");
+
+    // The same relative path in another registered workspace is a different
+    // resource and must not reuse the default-workspace grant.
+    let other_workspace = agent
+        .call(
+            methods::OPS_FS_WRITE,
+            Some(json!({
+                "path": "fs-grant-a.txt",
+                "workspace_id": "ws_other",
+                "content": "other",
+                "idempotency_key": "fs-grant-reuse-other-workspace",
+            })),
+        )
+        .await
+        .expect("cross-workspace write is queued, not rejected");
+    assert_eq!(
+        other_workspace["approval_required"], true,
+        "a default-workspace grant must not cover the same path in ws_other: {other_workspace}"
+    );
 
     // Out of scope: a sibling file is a different resource and must re-ask.
     let other_path = agent

@@ -1199,13 +1199,14 @@ ownmesh_cancel_transfer
 > - `ownmesh_search_files` — ファイル検索 tool は未提供。
 > - `ownmesh_start_process` / `ownmesh_stop_process` — CLI の
 >   `ownmesh process start/stop` はあるが MCP tool は未提供。
+> - `ownmesh_query_logs` — CLI の `ownmesh logs query` は認証済みローカル
+>   IPC で提供するが、ログ本文を control plane の durable operation row に
+>   保存しないため remote MCP tool は未提供。
 > - `ownmesh_run_elevated_command` — 独立 tool ではなく
 >   `ownmesh_command_run` の `elevated: true` フラグとして実装している。
 >   14.4 の「elevated を明示 tool に分ける」との差異であり、raw shell は
 >   仕様どおり `ownmesh_command_shell` として分離済み。
 >
-> `ownmesh_query_logs` は v1.2.1 で実装済み（CLI は `ownmesh logs query`）。
-
 ## 14.4 Tool 設計原則
 
 - 目的ごとに focused tool を作る。

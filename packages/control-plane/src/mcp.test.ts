@@ -101,6 +101,11 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   assert.ok(names.includes("ownmesh_run_shell"));
   assert.ok(names.includes("ownmesh_get_operation"));
   assert.ok(names.includes("ownmesh_session_open"));
+  assert.equal(
+    names.includes("ownmesh_query_logs"),
+    false,
+    "device log bodies must not enter the durable remote MCP operation path",
+  );
 
   const run = MCP_TOOLS.find((t) => t.name === "ownmesh_command_run")!;
   const shell = MCP_TOOLS.find((t) => t.name === "ownmesh_command_shell")!;

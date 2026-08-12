@@ -490,6 +490,8 @@ pub struct LogsQueryParams {
     pub container: Option<String>,
 }
 
+const MAX_LOG_QUERY_LIMIT: usize = 200;
+
 fn default_log_provider() -> String {
     "audit".into()
 }
@@ -1079,7 +1081,7 @@ impl DaemonRuntime {
     /// Unknown ids fail closed (never fall back to another tenant/device root).
     /// Ids follow the domain `ws_...` shape so they round-trip through the
     /// operation envelope `WorkspaceId` type.
-    fn workspace_for(&self, workspace_id: Option<&str>) -> IpcResult<WorkspaceRoot> {
+    fn canonical_workspace_id(workspace_id: Option<&str>) -> IpcResult<String> {
         let raw = workspace_id
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -1097,6 +1099,11 @@ impl DaemonRuntime {
                 message: format!("invalid workspace_id: {id} (expected ws_... )"),
             });
         }
+        Ok(id.to_owned())
+    }
+
+    fn workspace_for(&self, workspace_id: Option<&str>) -> IpcResult<WorkspaceRoot> {
+        let id = Self::canonical_workspace_id(workspace_id)?;
         let entry = self
             .workspaces
             .iter()
@@ -2270,6 +2277,13 @@ impl DaemonRuntime {
     }
 
     fn execute_logs_query(&self, p: &LogsQueryParams) -> IpcResult<Value> {
+        let limit = p.limit.unwrap_or(100);
+        if !(1..=MAX_LOG_QUERY_LIMIT).contains(&limit) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("log query limit must be between 1 and {MAX_LOG_QUERY_LIMIT}"),
+            });
+        }
         let reg = self.build_log_registry(p);
         let provider = reg.get(&p.provider).map_err(|e| IpcError::Remote {
             code: app_error::INVALID_PARAMS,
@@ -2280,7 +2294,7 @@ impl DaemonRuntime {
             offset,
         });
         let page = provider
-            .query(cursor.as_ref(), p.limit.unwrap_or(100))
+            .query(cursor.as_ref(), limit)
             .map_err(|e| match e {
                 LogError::Unavailable(msg) => IpcError::Remote {
                     code: app_error::INVALID_PARAMS,
@@ -2600,7 +2614,8 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let p: FsListParams = parse_params(params)?;
+        let mut p: FsListParams = parse_params(params)?;
+        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "file".into(),
@@ -2619,7 +2634,8 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let p: FsStatParams = parse_params(params)?;
+        let mut p: FsStatParams = parse_params(params)?;
+        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "file".into(),
@@ -2638,7 +2654,8 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let p: FsReadParams = parse_params(params)?;
+        let mut p: FsReadParams = parse_params(params)?;
+        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "file".into(),
@@ -2657,7 +2674,8 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let p: FsWriteParams = parse_params(params)?;
+        let mut p: FsWriteParams = parse_params(params)?;
+        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
             kind: "file".into(),
@@ -2676,7 +2694,8 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let p: FsDeleteParams = parse_params(params)?;
+        let mut p: FsDeleteParams = parse_params(params)?;
+        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
             kind: "file".into(),
@@ -2718,7 +2737,8 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let p: GitStatusParams = parse_params(params)?;
+        let mut p: GitStatusParams = parse_params(params)?;
+        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "git".into(),
@@ -2738,7 +2758,8 @@ full_user_access/full_access for arbitrary commands",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let p: GitDiffParams = parse_params(params)?;
+        let mut p: GitDiffParams = parse_params(params)?;
+        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "git".into(),

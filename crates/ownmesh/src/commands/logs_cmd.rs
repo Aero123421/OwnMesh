@@ -3,16 +3,30 @@
 //! The daemon has always implemented log query across audit, journald, Windows
 //! Event Log, Docker/Podman, file, and process providers, but no public surface
 //! reached it — the capability was only callable by hand-crafting IPC. These
-//! commands expose it, and `ownmesh_query_logs` exposes the same contract over
-//! MCP.
+//! commands expose it over authenticated local IPC.
 //!
 //! Query is a read: the provider runs on the device and returns one bounded
-//! page. Log bodies are not uploaded anywhere by querying them.
+//! page. This command has no remote MCP route, so log bodies stay on the device.
 
 use crate::cli::{Cli, LogsCmd};
 use crate::commands::ipc_util::{call_daemon, print_value};
 use ownmesh_domain::ExitCode;
-use serde_json::json;
+use serde_json::{json, Value};
+
+fn page_view(value: &Value) -> (Vec<String>, Option<u64>) {
+    let lines = value["lines"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| line["text"].as_str().map(ToOwned::to_owned))
+        .collect();
+    let next = if value["exhausted"].as_bool() == Some(false) {
+        value["next_cursor"]["offset"].as_u64()
+    } else {
+        None
+    };
+    (lines, next)
+}
 
 pub fn dispatch_logs(cli: &Cli, cmd: &LogsCmd) -> Result<(), ExitCode> {
     match cmd {
@@ -56,31 +70,39 @@ pub fn dispatch_logs(cli: &Cli, cmd: &LogsCmd) -> Result<(), ExitCode> {
             }
             let value = call_daemon(cli, "ops.logs.query", Some(params))?;
             print_value(cli.json, &value, |v| {
-                let entries = v["entries"].as_array().cloned().unwrap_or_default();
-                if entries.is_empty() {
+                let (lines, next) = page_view(v);
+                if lines.is_empty() {
                     println!("(no entries)");
                 }
-                for entry in entries {
-                    // Providers agree on `message`; timestamp/level are best effort.
-                    let timestamp = entry["timestamp"].as_str().unwrap_or("");
-                    let level = entry["level"].as_str().unwrap_or("");
-                    let message = entry["message"].as_str().unwrap_or("");
-                    match (timestamp.is_empty(), level.is_empty()) {
-                        (true, true) => println!("{message}"),
-                        (true, false) => println!("[{level}] {message}"),
-                        (false, true) => println!("{timestamp}  {message}"),
-                        (false, false) => println!("{timestamp}  [{level}] {message}"),
-                    }
+                for line in lines {
+                    println!("{line}");
                 }
-                if v["truncated"].as_bool().unwrap_or(false) {
-                    if let Some(next) = v["next_cursor"].as_u64() {
-                        println!("(truncated; resume with --cursor {next})");
-                    } else {
-                        println!("(truncated)");
-                    }
+                if let Some(next) = next {
+                    println!("(more entries; resume with --cursor {next})");
                 }
             });
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_log_page_contract_renders_text_and_cursor() {
+        let value = json!({
+            "lines": [
+                { "line_no": 1, "text": "first", "cursor_after": { "provider": "audit", "offset": 1 } },
+                { "line_no": 2, "text": "second", "cursor_after": { "provider": "audit", "offset": 2 } }
+            ],
+            "next_cursor": { "provider": "audit", "offset": 2 },
+            "exhausted": false
+        });
+        assert_eq!(
+            page_view(&value),
+            (vec!["first".into(), "second".into()], Some(2))
+        );
     }
 }

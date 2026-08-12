@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -215,22 +216,22 @@ impl PolicyRule {
     }
 }
 
-/// Split a path scope into comparable components.
+/// Split a path scope into comparable native path components.
 ///
-/// Accepts both separators so a Windows-shaped workspace path and its POSIX
-/// spelling compare identically. Returns `None` when the value is empty or
-/// carries a `..` component — callers must fail closed rather than guess what
-/// an unnormalized traversal was meant to denote.
-fn path_components(value: &str) -> Option<Vec<&str>> {
+/// Separator semantics follow the host OS so a backslash remains an ordinary
+/// filename byte on Unix and a separator on Windows. Root/prefix components are
+/// preserved, preventing an absolute scope from matching a relative path.
+/// Returns `None` for empty values or `..` traversal.
+fn path_components(value: &str) -> Option<Vec<Component<'_>>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
     }
     let mut out = Vec::new();
-    for part in trimmed.split(['/', '\\']) {
-        match part {
-            "" | "." => {}
-            ".." => return None,
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => return None,
             other => out.push(other),
         }
     }
@@ -647,6 +648,29 @@ pub fn temporary_grant_from_facts(
                     .into(),
             );
         }
+        if !facts.workspace_relative {
+            return Err("temporary grant path scope must be workspace-relative".into());
+        }
+        let workspace_id = facts
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .ok_or("temporary grant for a filesystem capability requires an approved workspace")?;
+        if workspace_id.len() > 128
+            || !workspace_id.starts_with("ws_")
+            || !workspace_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err("temporary grant workspace must be a canonical ws_... id".into());
+        }
+        if matches!(
+            Path::new(scope).components().next(),
+            Some(Component::RootDir | Component::Prefix(_))
+        ) {
+            return Err("temporary grant path scope must be workspace-relative".into());
+        }
     }
 
     Ok(TemporaryGrant {
@@ -701,12 +725,15 @@ fn temporary_grant_matches(
         if !path_scope_contains(scope, path) {
             return false;
         }
-        // A workspace-relative scope means nothing across workspaces. When the
-        // grant recorded one, the operation must resolve in the same workspace.
-        if let Some(grant_workspace) = grant.workspace_id.as_deref() {
-            if facts.workspace_id.as_deref() != Some(grant_workspace) {
-                return false;
-            }
+        // A workspace-relative scope means nothing across workspaces. Legacy or
+        // forged rows without either side of this binding fail closed.
+        let (Some(grant_workspace), Some(facts_workspace)) =
+            (grant.workspace_id.as_deref(), facts.workspace_id.as_deref())
+        else {
+            return false;
+        };
+        if facts_workspace != grant_workspace {
+            return false;
         }
         return true;
     }
@@ -878,7 +905,9 @@ mod tests {
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
             kind: "file".into(),
-            path: Some("/workspace/out.txt".into()),
+            path: Some("out.txt".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
             ..Default::default()
         };
         let grants =
@@ -901,6 +930,7 @@ mod tests {
             capability: "filesystem.write".into(),
             kind: "file".into(),
             path: Some("proj".into()),
+            workspace_relative: true,
             workspace_id: Some("ws_default".into()),
             ..Default::default()
         };
@@ -916,6 +946,7 @@ mod tests {
             capability: "filesystem.write".into(),
             kind: "file".into(),
             path: Some(path.into()),
+            workspace_relative: true,
             workspace_id: Some(workspace.into()),
             ..Default::default()
         };
@@ -964,6 +995,15 @@ mod tests {
             Decision::Allow,
             "a workspace-relative scope must not cross workspaces"
         );
+
+        #[cfg(unix)]
+        {
+            assert!(path_scope_contains(r"proj\secret", r"proj\secret/file"));
+            assert!(
+                !path_scope_contains(r"proj\secret", "proj/secret/file"),
+                "a Unix backslash is a filename byte, not a path separator"
+            );
+        }
     }
 
     /// Issuance refuses to mint a filesystem grant with no path, and matching
@@ -978,6 +1018,22 @@ mod tests {
         let err = temporary_grant_from_facts("g".into(), "user-1".into(), 9_999_999_999, &no_path)
             .expect_err("an unscoped filesystem grant must not be issuable");
         assert!(err.contains("path scope"), "{err}");
+
+        let no_workspace = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("scoped.txt".into()),
+            workspace_relative: true,
+            ..Default::default()
+        };
+        let err = temporary_grant_from_facts(
+            "g-workspace".into(),
+            "user-1".into(),
+            9_999_999_999,
+            &no_workspace,
+        )
+        .expect_err("a workspace-relative grant must bind its workspace");
+        assert!(err.contains("workspace"), "{err}");
 
         let forged = TemporaryGrant {
             id: "legacy-unscoped-fs".into(),
@@ -1214,12 +1270,15 @@ mod tests {
             &OperationFacts {
                 capability: "filesystem.write".into(),
                 kind: "file".into(),
-                path: Some("/workspace/a".into()),
+                path: Some("a".into()),
+                workspace_relative: true,
+                workspace_id: Some("ws_default".into()),
                 ..Default::default()
             },
         )
         .expect("fs grant");
         assert_eq!(grant.capability, "filesystem.write");
-        assert_eq!(grant.path_prefix.as_deref(), Some("/workspace/a"));
+        assert_eq!(grant.path_prefix.as_deref(), Some("a"));
+        assert_eq!(grant.workspace_id.as_deref(), Some("ws_default"));
     }
 }

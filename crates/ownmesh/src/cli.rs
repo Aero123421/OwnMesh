@@ -291,7 +291,7 @@ pub enum WorkspaceCmd {
 /// `ownmesh logs` subcommands.
 ///
 /// Reads stay on the device: the daemon queries the platform provider locally
-/// and returns a bounded, cursor-paged page. Nothing is uploaded by querying.
+/// over authenticated local IPC and returns a bounded, cursor-paged page.
 #[derive(Debug, Clone, Subcommand)]
 pub enum LogsCmd {
     /// List log providers available on this device.
