@@ -94,6 +94,7 @@ jobs:
             throw "pinned minisign.exe missing"
           }
           $env:PATH = "$minisignDir;$env:PATH"
+          $env:OWNMESH_REQUIRE_MINISIGN = "1"
           python scripts/tests/test_installers.py
 
   linux-stateful:
@@ -169,6 +170,10 @@ jobs:
   release-truthfulness:
     name: Release claims and gate structure
     runs-on: ubuntu-latest
+    # Signature verification is the point of the installers: never let this job
+    # report green because minisign happened to be missing from the runner.
+    env:
+      OWNMESH_REQUIRE_MINISIGN: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Minisign for Unix installer integration

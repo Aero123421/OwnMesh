@@ -12,7 +12,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "tsc --noEmit",
+    "lint": "node ../../scripts/lint-ts.mjs src",
     "test": "tsc --noEmit && node --experimental-strip-types --test src/fixtures-roundtrip.test.ts src/errors.test.ts src/schema-files.test.ts"
   },
   "devDependencies": {
