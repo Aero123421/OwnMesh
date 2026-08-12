@@ -56,6 +56,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     match app.overlay {
         Overlay::Help => draw_help_modal(frame, app),
         Overlay::Wizard => draw_wizard(frame, app),
+        Overlay::Connector => draw_connector_modal(frame, app),
         Overlay::None => {}
     }
     if app.palette.open {
@@ -64,12 +65,30 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_brand(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
-    let state = if app.active_instance.is_none() {
-        "setup required"
-    } else if app.daemon.is_some() {
-        "private mesh online"
+    let state = if app.readiness.needs_onboarding() {
+        localized(
+            app.lang,
+            "setup required",
+            "セットアップが必要",
+            "需要设置",
+            "требуется настройка",
+        )
+    } else if app.readiness.ready() {
+        localized(
+            app.lang,
+            "this device ready",
+            "このPCは準備完了",
+            "此设备已就绪",
+            "устройство готово",
+        )
     } else {
-        "private mesh offline"
+        localized(
+            app.lang,
+            "agent needs attention",
+            "Agentの確認が必要",
+            "代理需要处理",
+            "агент требует внимания",
+        )
     };
     let raster_logo = matches!(app.theme.mode, ColorMode::TrueColor | ColorMode::Ansi256);
     if narrow || area.width < 106 || ascii_fallback() || !raster_logo {
@@ -116,10 +135,10 @@ fn draw_brand(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
             Span::styled("│  ", app.theme.muted),
             Span::styled(
                 "▪",
-                if app.daemon.is_some() {
+                if app.readiness.ready() {
                     app.theme.ok
                 } else {
-                    app.theme.muted
+                    app.theme.warn
                 },
             ),
             Span::styled(format!("  {state}{screen}"), app.theme.muted),
@@ -183,15 +202,50 @@ fn logo_color(mode: ColorMode, rgb @ [red, green, blue]: [u8; 3]) -> Color {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let device_count = usize::from(app.daemon.is_some());
-    let plane = if app.active_instance.is_some() {
-        "control plane connected"
+    let agent = if app.readiness.ready() {
+        localized(
+            app.lang,
+            "agent running",
+            "Agent実行中",
+            "代理运行中",
+            "агент запущен",
+        )
+    } else if app.readiness.agent_running {
+        localized(
+            app.lang,
+            "agent running · autostart missing",
+            "Agent実行中 · 自動起動未設定",
+            "代理运行中 · 未设置自启动",
+            "агент запущен · автозапуск не настроен",
+        )
     } else {
-        "control plane not configured"
+        localized(
+            app.lang,
+            "agent unavailable",
+            "Agent未接続",
+            "代理不可用",
+            "агент недоступен",
+        )
+    };
+    let server = if app.readiness.server_url.is_some() {
+        localized(
+            app.lang,
+            "server configured",
+            "サーバー設定済み",
+            "服务器已配置",
+            "сервер настроен",
+        )
+    } else {
+        localized(
+            app.lang,
+            "server not configured",
+            "サーバー未設定",
+            "服务器未配置",
+            "сервер не настроен",
+        )
     };
     let text = format!(
-        "{device_count} device{} online    |    {plane}    |    v{}",
-        if device_count == 1 { "" } else { "s" },
+        "{agent}    |    {server}    |    v{}",
         env!("CARGO_PKG_VERSION")
     );
     let block = Block::default()
@@ -212,11 +266,18 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let text = if app.status_line.is_empty() {
-        ">   Type a command…".to_owned()
+        localized(
+            app.lang,
+            "↑/↓ select · Enter open · Ctrl+K commands · ? help",
+            "↑/↓ 選択 · Enter 開く · Ctrl+K コマンド · ? ヘルプ",
+            "↑/↓ 选择 · Enter 打开 · Ctrl+K 命令 · ? 帮助",
+            "↑/↓ выбор · Enter открыть · Ctrl+K команды · ? помощь",
+        )
+        .to_owned()
     } else {
-        format!(">   {}", app.status_line)
+        app.status_line.clone()
     };
-    let area = centered_width(area, area.width.saturating_sub(8));
+    let area = centered_width(area, 110);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(app.border_set())
@@ -324,63 +385,277 @@ fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
 }
 
 fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let width = area.width.clamp(36, 64);
-    let height = area.height.min(9);
-    let menu = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 3,
-        width,
-        height,
-    };
-    if height < 9 {
-        let lines: Vec<Line> = OverviewAction::ALL
-            .iter()
-            .enumerate()
-            .map(|(index, action)| {
-                let marker = if index == app.overview_action_cursor {
-                    "> "
-                } else {
-                    "  "
-                };
-                Line::from(Span::styled(
-                    format!("{marker}{:<13} {}", action.command(), action.description()),
-                    if index == app.overview_action_cursor {
-                        app.theme.selection
-                    } else {
-                        app.theme.body
-                    },
-                ))
-            })
-            .collect();
-        frame.render_widget(Paragraph::new(lines), menu);
-        return;
-    }
-
-    let rows = Layout::default()
+    let content = centered_width(area, 78);
+    let actions = app.overview_actions();
+    let action_height = u16::try_from(actions.len()).unwrap_or(5).min(6);
+    let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(5),
+            Constraint::Length(1),
+            Constraint::Length(action_height),
+            Constraint::Min(0),
         ])
-        .split(menu);
-    for (index, action) in OverviewAction::ALL.iter().enumerate() {
-        let selected = index == app.overview_action_cursor;
-        let line = Line::from(vec![
-            Span::styled(if selected { ">   " } else { "    " }, app.theme.body),
-            Span::styled(format!("{:<15}", action.command()), app.theme.body),
-            Span::styled(action.description(), app.theme.muted),
-        ]);
-        if selected {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_set(app.border_set())
-                .border_style(app.theme.border);
-            frame.render_widget(Paragraph::new(line).block(block), rows[index]);
-        } else {
-            frame.render_widget(Paragraph::new(line), rows[index]);
-        }
+        .split(content);
+
+    let heading = if app.readiness.ready() {
+        localized(
+            app.lang,
+            "This machine is ready",
+            "このPCは準備完了です",
+            "此设备已准备就绪",
+            "Это устройство готово",
+        )
+    } else if app.readiness.needs_onboarding() {
+        localized(
+            app.lang,
+            "Finish setup",
+            "セットアップを完了してください",
+            "完成设置",
+            "Завершите настройку",
+        )
+    } else {
+        localized(
+            app.lang,
+            "Agent needs attention",
+            "Agentの修復が必要です",
+            "代理需要处理",
+            "Агент требует внимания",
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(heading).style(app.theme.title.add_modifier(Modifier::BOLD)),
+        sections[0],
+    );
+
+    let server_ok = app.readiness.server_url.is_some();
+    let rows = vec![
+        readiness_line(
+            app,
+            localized(app.lang, "Server", "サーバー", "服务器", "Сервер"),
+            server_ok,
+            localized(app.lang, "configured", "設定済み", "已配置", "настроен"),
+            localized(
+                app.lang,
+                "not configured",
+                "未設定",
+                "未配置",
+                "не настроен",
+            ),
+        ),
+        readiness_line(
+            app,
+            localized(app.lang, "Account", "アカウント", "账户", "Аккаунт"),
+            app.readiness.account_present,
+            localized(
+                app.lang,
+                "credentials saved",
+                "ログイン情報あり",
+                "凭据已保存",
+                "данные входа сохранены",
+            ),
+            localized(
+                app.lang,
+                "sign-in required",
+                "ログインが必要",
+                "需要登录",
+                "требуется вход",
+            ),
+        ),
+        readiness_line(
+            app,
+            localized(
+                app.lang,
+                "This device",
+                "このPC",
+                "此设备",
+                "Это устройство",
+            ),
+            app.readiness.device_id.is_some(),
+            localized(
+                app.lang,
+                "enrolled",
+                "登録済み",
+                "已注册",
+                "зарегистрировано",
+            ),
+            localized(
+                app.lang,
+                "not enrolled",
+                "未登録",
+                "未注册",
+                "не зарегистрировано",
+            ),
+        ),
+        readiness_line(
+            app,
+            "Agent",
+            app.readiness.agent_running && app.readiness.service_installed,
+            localized(app.lang, "running", "実行中", "运行中", "запущен"),
+            if app.readiness.agent_running {
+                localized(
+                    app.lang,
+                    "autostart not installed",
+                    "自動起動が未設定",
+                    "未安装自启动",
+                    "автозапуск не установлен",
+                )
+            } else if app.readiness.service_installed {
+                localized(
+                    app.lang,
+                    "not reachable",
+                    "応答なし",
+                    "无法连接",
+                    "не отвечает",
+                )
+            } else {
+                localized(
+                    app.lang,
+                    "not installed",
+                    "未設定",
+                    "未安装",
+                    "не установлен",
+                )
+            },
+        ),
+    ];
+    frame.render_widget(Paragraph::new(rows), sections[1]);
+
+    let action_items = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let (label, description) = overview_action_copy(app.lang, *action);
+            let mark = if index == app.overview_action_cursor {
+                ">"
+            } else {
+                " "
+            };
+            let text = format!("{mark}  {label:<20} {description}");
+            let style = if index == app.overview_action_cursor {
+                app.theme.selection
+            } else {
+                app.theme.body
+            };
+            ListItem::new(truncate_to_width(
+                &text,
+                sections[3].width.saturating_sub(1) as usize,
+            ))
+            .style(style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(action_items), sections[3]);
+}
+
+fn readiness_line(
+    app: &App,
+    label: &str,
+    ok: bool,
+    ok_text: &str,
+    missing_text: &str,
+) -> Line<'static> {
+    let marker = if ok { "[ok]" } else { "[--]" };
+    let value = if ok { ok_text } else { missing_text };
+    Line::from(vec![
+        Span::styled(
+            format!("{marker:<6}"),
+            if ok { app.theme.ok } else { app.theme.warn },
+        ),
+        Span::styled(format!("{label:<14}"), app.theme.body),
+        Span::styled(
+            value.to_owned(),
+            if ok { app.theme.body } else { app.theme.warn },
+        ),
+    ])
+}
+
+fn overview_action_copy(lang: Lang, action: OverviewAction) -> (&'static str, &'static str) {
+    match action {
+        OverviewAction::SetupRepair => (
+            localized(
+                lang,
+                "Finish setup",
+                "セットアップ",
+                "完成设置",
+                "Завершить настройку",
+            ),
+            localized(
+                lang,
+                "Configure, sign in, and enroll",
+                "設定・ログイン・PC登録",
+                "配置、登录并注册",
+                "Настроить, войти и зарегистрировать",
+            ),
+        ),
+        OverviewAction::RepairAgent => (
+            localized(
+                lang,
+                "Repair Agent",
+                "Agentを修復",
+                "修复代理",
+                "Исправить агент",
+            ),
+            localized(
+                lang,
+                "Install and start this device",
+                "自動起動を設定して開始",
+                "安装并启动此设备",
+                "Установить и запустить",
+            ),
+        ),
+        OverviewAction::Connector => (
+            localized(
+                lang,
+                "ChatGPT connector",
+                "ChatGPTコネクタ",
+                "ChatGPT 连接器",
+                "Коннектор ChatGPT",
+            ),
+            localized(
+                lang,
+                "Show MCP URL and instructions",
+                "MCP URLと手順を表示",
+                "显示 MCP URL 和说明",
+                "Показать MCP URL и инструкции",
+            ),
+        ),
+        OverviewAction::Devices => (
+            localized(lang, "Devices", "デバイス", "设备", "Устройства"),
+            localized(
+                lang,
+                "Registered computers",
+                "登録済みのPC",
+                "已注册的电脑",
+                "Зарегистрированные компьютеры",
+            ),
+        ),
+        OverviewAction::Workspace => (
+            localized(
+                lang,
+                "Workspaces",
+                "ワークスペース",
+                "工作区",
+                "Рабочие области",
+            ),
+            localized(
+                lang,
+                "Allowed folders",
+                "操作を許可したフォルダ",
+                "允许的文件夹",
+                "Разрешённые папки",
+            ),
+        ),
+        OverviewAction::Doctor => (
+            localized(lang, "Diagnostics", "診断", "诊断", "Диагностика"),
+            localized(
+                lang,
+                "Local system checks",
+                "ローカル状態を確認",
+                "本地系统检查",
+                "Локальные проверки",
+            ),
+        ),
     }
 }
 
@@ -551,6 +826,32 @@ fn centered(area: Rect, w_pct: u16, h_pct: u16) -> Rect {
     }
 }
 
+fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width).max(20);
+    let height = height.min(area.height).max(8);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn localized(
+    lang: Lang,
+    en: &'static str,
+    ja: &'static str,
+    zh: &'static str,
+    ru: &'static str,
+) -> &'static str {
+    match lang {
+        Lang::EnUs => en,
+        Lang::JaJp => ja,
+        Lang::ZhHans => zh,
+        Lang::RuRu => ru,
+    }
+}
+
 fn draw_help_modal(frame: &mut Frame<'_>, app: &App) {
     let area = centered(frame.area(), 70, 50);
     frame.render_widget(Clear, area);
@@ -566,27 +867,164 @@ fn draw_help_modal(frame: &mut Frame<'_>, app: &App) {
     frame.render_widget(p, area);
 }
 
+fn draw_connector_modal(frame: &mut Frame<'_>, app: &App) {
+    let area = centered_fixed(frame.area(), 76, 16);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(app.border_set())
+        .border_style(app.theme.accent)
+        .title(localized(
+            app.lang,
+            " ChatGPT connector ",
+            " ChatGPTコネクタ ",
+            " ChatGPT 连接器 ",
+            " Коннектор ChatGPT ",
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let connector_url = app.readiness.connector_url();
+    let url = connector_url.as_deref().unwrap_or(localized(
+        app.lang,
+        "Finish setup first",
+        "先にセットアップを完了してください",
+        "请先完成设置",
+        "Сначала завершите настройку",
+    ));
+    let lines = vec![
+        Line::from(localized(
+            app.lang,
+            "Add OwnMesh in ChatGPT. This is separate from enrolling this PC.",
+            "ChatGPT側にOwnMeshを追加します。このPCの登録とは別の設定です。",
+            "在 ChatGPT 中添加 OwnMesh；这与注册此设备不同。",
+            "Добавьте OwnMesh в ChatGPT; это не регистрация устройства.",
+        )),
+        Line::from(""),
+        Line::from(Span::styled("MCP URL", app.theme.muted)),
+        Line::from(Span::styled(url.to_owned(), app.theme.accent)),
+        Line::from(""),
+        Line::from(localized(
+            app.lang,
+            "1. ChatGPT Settings → Connectors → Add custom connector",
+            "1. ChatGPTの 設定 → コネクタ → カスタムコネクタを追加",
+            "1. ChatGPT 设置 → 连接器 → 添加自定义连接器",
+            "1. ChatGPT Настройки → Коннекторы → Добавить",
+        )),
+        Line::from(localized(
+            app.lang,
+            "2. Paste the MCP URL, choose OAuth, and sign in when prompted.",
+            "2. MCP URLを貼り、OAuthを選択。表示された画面でログインします。",
+            "2. 粘贴 MCP URL，选择 OAuth，然后登录。",
+            "2. Вставьте MCP URL, выберите OAuth и войдите.",
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            localized(
+                app.lang,
+                "Esc / Enter  close",
+                "Esc / Enter  閉じる",
+                "Esc / Enter  关闭",
+                "Esc / Enter  закрыть",
+            ),
+            app.theme.muted,
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
 fn draw_wizard(frame: &mut Frame<'_>, app: &App) {
-    let area = centered(frame.area(), 80, 70);
+    let wz = &app.wizard;
+    let height = match wz.step {
+        WizardStep::Welcome => 13,
+        WizardStep::Server => 14,
+        WizardStep::Language => 15,
+        WizardStep::Preset => 20,
+        WizardStep::Confirm => 19,
+        WizardStep::Done => 14,
+    };
+    let area = centered_fixed(frame.area(), 82, height);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(app.border_set())
         .border_style(app.theme.title)
-        .title(t(app.lang, Msg::WizardTitle));
+        .title(t(wz.lang, Msg::WizardTitle));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let wz = &app.wizard;
     let mut lines: Vec<Line> = Vec::new();
     match wz.step {
         WizardStep::Welcome => {
-            lines.push(Line::from(t(wz.lang, Msg::WizardWelcome)));
+            lines.push(Line::from(Span::styled(
+                localized(
+                    wz.lang,
+                    "Set up this machine for OwnMesh",
+                    "このPCでOwnMeshを使えるようにします",
+                    "为此设备设置 OwnMesh",
+                    "Настройка OwnMesh на этом устройстве",
+                ),
+                app.theme.accent,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(localized(
+                wz.lang,
+                "Choose a server and access policy. OwnMesh then signs in, enrolls",
+                "サーバーとアクセス範囲を選びます。その後、ログイン・PC登録・",
+                "选择服务器和访问策略，然后登录、注册并启动代理。",
+                "Выберите сервер и политику; затем вход, регистрация и запуск агента.",
+            )));
+            lines.push(Line::from(localized(
+                wz.lang,
+                "this device, and starts the local Agent when needed.",
+                "Agentの起動まで必要な処理を順番に行います。",
+                "",
+                "",
+            )));
             lines.push(Line::from(""));
             lines.push(Line::from(format!(
                 "[Enter] {} · [Esc] {}",
                 t(wz.lang, Msg::Next),
                 t(wz.lang, Msg::Cancel)
+            )));
+        }
+        WizardStep::Server => {
+            lines.push(Line::from(Span::styled(
+                localized(
+                    wz.lang,
+                    "OwnMesh server",
+                    "OwnMeshサーバー",
+                    "OwnMesh 服务器",
+                    "Сервер OwnMesh",
+                ),
+                app.theme.accent,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(
+                    &format!("> {}", wz.control_plane_url),
+                    inner.width.saturating_sub(2) as usize,
+                ),
+                app.theme.selection,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                localized(
+                    wz.lang,
+                    "Paste the HTTPS URL from your deployment. Changing it requires a new sign-in.",
+                    "デプロイしたHTTPS URLを入力します。変更時は再ログインが必要です。",
+                    "粘贴部署的 HTTPS URL。更改后需要重新登录。",
+                    "Вставьте HTTPS URL. При смене сервера потребуется новый вход.",
+                ),
+                app.theme.muted,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(localized(
+                wz.lang,
+                "Type or paste · Enter next · Esc back",
+                "入力/貼り付け · Enter 次へ · Esc 戻る",
+                "输入或粘贴 · Enter 下一步 · Esc 返回",
+                "Введите или вставьте · Enter далее · Esc назад",
             )));
         }
         WizardStep::Language => {
@@ -599,15 +1037,30 @@ fn draw_wizard(frame: &mut Frame<'_>, app: &App) {
                 lines.push(Line::from(format!("{mark} {}", lang.bcp47())));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from("↑/↓ select · Enter next · Esc cancel"));
+            lines.push(Line::from("↑/↓ select · Enter next · Esc back"));
         }
         WizardStep::Preset => {
             lines.push(Line::from(Span::styled(
                 t(wz.lang, Msg::WizardPresetStep),
                 app.theme.accent,
             )));
+            if wz.original_preset == AccessPreset::Custom && !wz.preset_changed {
+                lines.push(Line::from(localized(
+                    wz.lang,
+                    "> Custom (preserved; choose below only to replace it)",
+                    "> カスタム（保持。変更する場合だけ下から選択）",
+                    "> 自定义（保留；仅在需要替换时选择下方项目）",
+                    "> Своя политика (сохранена; ниже — только для замены)",
+                )));
+            }
             for (i, preset) in WIZARD_PRESETS.iter().enumerate() {
-                let mark = if i == wz.preset_idx { ">" } else { " " };
+                let mark = if (wz.preset_changed || wz.original_preset != AccessPreset::Custom)
+                    && i == wz.preset_idx
+                {
+                    ">"
+                } else {
+                    " "
+                };
                 let (name, desc) = preset_msgs(*preset);
                 lines.push(Line::from(format!("{mark} {}", t(wz.lang, name))));
                 lines.push(Line::from(Span::styled(
@@ -623,21 +1076,48 @@ fn draw_wizard(frame: &mut Frame<'_>, app: &App) {
             )));
             lines.push(Line::from(format!(
                 "{}: {}",
+                localized(wz.lang, "Server", "サーバー", "服务器", "Сервер"),
+                wz.control_plane_url
+            )));
+            lines.push(Line::from(format!(
+                "{}: {}",
                 t(wz.lang, Msg::SettingsLang),
                 wz.lang.bcp47()
             )));
-            let (name, _) = preset_msgs(wz.selected_preset());
+            let preset_label = if wz.selected_preset() == AccessPreset::Custom {
+                localized(
+                    wz.lang,
+                    "Custom (preserved)",
+                    "カスタム（保持）",
+                    "自定义（保留）",
+                    "Своя политика (сохранена)",
+                )
+            } else {
+                let (name, _) = preset_msgs(wz.selected_preset());
+                t(wz.lang, name)
+            };
             lines.push(Line::from(format!(
                 "{}: {}",
                 t(wz.lang, Msg::SettingsPreset),
-                t(wz.lang, name)
+                preset_label
             )));
             if wz.selected_preset() == AccessPreset::FullAccess {
                 lines.push(Line::from(Span::styled(
                     t(wz.lang, Msg::WizardFullAccessNote),
-                    app.theme.ok,
+                    app.theme.warn,
                 )));
             }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                localized(
+                    wz.lang,
+                    "Next: sign in (URL + code), enroll this device, install/start Agent as needed.",
+                    "次に、URL＋コードでログインし、PC登録とAgentの設定・起動を行います。",
+                    "接下来按需登录、注册此设备并安装/启动代理。",
+                    "Далее: вход, регистрация устройства и установка/запуск агента.",
+                ),
+                app.theme.muted,
+            )));
             lines.push(Line::from(""));
             lines.push(Line::from(format!(
                 "[Enter] {} · [Backspace] {}",
@@ -648,11 +1128,15 @@ fn draw_wizard(frame: &mut Frame<'_>, app: &App) {
         WizardStep::Done => {
             lines.push(Line::from(Span::styled(
                 t(wz.lang, Msg::WizardDone),
-                app.theme.ok,
+                if wz.error.is_some() {
+                    app.theme.warn
+                } else {
+                    app.theme.ok
+                },
             )));
             lines.push(Line::from(t(wz.lang, Msg::WizardSaveOk)));
             if let Some(err) = &wz.error {
-                lines.push(Line::from(Span::styled(err.as_str(), app.theme.err)));
+                lines.push(Line::from(Span::styled(err.as_str(), app.theme.warn)));
             }
             lines.push(Line::from(""));
             lines.push(Line::from("[Enter/Esc] close"));
@@ -683,7 +1167,9 @@ fn preset_msgs(preset: AccessPreset) -> (Msg, Msg) {
 }
 
 fn draw_palette(frame: &mut Frame<'_>, app: &App) {
-    let area = centered(frame.area(), 70, 60);
+    let items = filter_commands(app.lang, &app.palette.query);
+    let item_rows = u16::try_from(items.len().min(12)).unwrap_or(12);
+    let area = centered_fixed(frame.area(), 76, item_rows.saturating_add(4));
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -707,7 +1193,6 @@ fn draw_palette(frame: &mut Frame<'_>, app: &App) {
         chunks[0],
     );
 
-    let items = filter_commands(app.lang, &app.palette.query);
     let list_items: Vec<ListItem> = items
         .iter()
         .enumerate()
@@ -717,7 +1202,11 @@ fn draw_palette(frame: &mut Frame<'_>, app: &App) {
             } else {
                 app.theme.body
             };
-            ListItem::new(t(app.lang, c.label_msg)).style(style)
+            ListItem::new(truncate_to_width(
+                t(app.lang, c.label_msg),
+                chunks[1].width.saturating_sub(1) as usize,
+            ))
+            .style(style)
         })
         .collect();
     frame.render_widget(List::new(list_items), chunks[1]);
@@ -893,17 +1382,30 @@ mod tests {
         let snapshot = render_snapshot(&app, 120, 32).to_ascii_lowercase();
         for expected in [
             "setup required",
-            "/connect",
-            "/devices",
-            "/workspace",
-            "/doctor",
-            "type a command",
-            "control plane not configured",
+            "finish setup",
+            "server",
+            "account",
+            "this device",
+            "agent",
+            "ctrl+k commands",
+            "server not configured",
         ] {
             assert!(
                 snapshot.contains(expected),
                 "missing {expected}:\n{snapshot}"
             );
         }
+        assert!(!snapshot.contains("/connect"));
+        assert!(!snapshot.contains("control plane connected"));
+    }
+
+    #[test]
+    fn connector_modal_names_the_separate_chatgpt_step() {
+        let mut app = test_app(Lang::EnUs);
+        app.readiness.server_url = Some("https://mesh.example".into());
+        app.overlay = Overlay::Connector;
+        let snapshot = render_snapshot(&app, 120, 32).to_ascii_lowercase();
+        assert!(snapshot.contains("https://mesh.example/mcp"));
+        assert!(snapshot.contains("separate from enrolling this pc"));
     }
 }

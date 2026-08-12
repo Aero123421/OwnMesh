@@ -1,6 +1,6 @@
 # OwnMesh onboarding
 
-This document covers the supported v1.2.3 first-run, ChatGPT connection, and
+This document covers the supported v1.2.4 first-run, ChatGPT connection, and
 user-level service flow. The machine-checked command contract is
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
@@ -30,6 +30,16 @@ verify it against `SHA256SUMS`/`SHA256SUMS.minisig` before execution.
 [Deploy the user-owned control plane](#deploy-the-user-owned-control-plane).
 Run that section first — every command here needs its URL, and the guided
 deploy prints the exact `ownmesh setup` line to paste.
+
+On a desktop or an interactive SSH terminal, the shortest path is the TUI:
+
+```bash
+ownmesh
+```
+
+Choose **Finish setup**, paste the Worker URL, and select an access policy. The
+TUI delegates to the same audited CLI operations and temporarily returns to the
+normal terminal for the URL + short-code login flow.
 
 Desktop (opens the owner sign-in in the browser):
 
@@ -263,7 +273,7 @@ public MCP-to-broker E8 receipt remain separate open evidence.
 
 ## Distribution scope
 
-v1.2.3 supports signed portable archives and the verified shell/PowerShell
+v1.2.4 supports signed portable archives and the verified shell/PowerShell
 one-line installers. Windows MSI/NSIS, native/universal macOS packages,
 Authenticode, and Apple notarization are outside this release's distribution
 contract.

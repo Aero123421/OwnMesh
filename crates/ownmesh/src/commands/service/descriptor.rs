@@ -6,8 +6,12 @@ use super::security::{quote_windows_arg, systemd_escape_arg, xml_escape, Validat
 pub const SERVICE_UNIT_NAME: &str = "ownmesh-ownmeshd.service";
 /// macOS LaunchAgent label.
 pub const SERVICE_LABEL: &str = "dev.ownmesh.ownmeshd";
-/// Windows Scheduled Task folder/name.
-pub const SERVICE_TASK_NAME: &str = r"OwnMesh\ownmeshd";
+/// Windows current-user Scheduled Task name. A root-level name is deliberate:
+/// standard users cannot create Task Scheduler folders on a stock Windows install.
+pub const SERVICE_TASK_NAME: &str = "OwnMesh-ownmeshd";
+/// v1.2.3 and earlier used a task-folder path that often required elevation.
+#[cfg(windows)]
+pub const LEGACY_SERVICE_TASK_NAME: &str = r"OwnMesh\ownmeshd";
 
 /// Validated paths embedded into descriptors.
 #[derive(Debug, Clone)]
@@ -273,6 +277,11 @@ mod tests {
     fn scheduled_task_is_least_privilege_logon() {
         let (_dir, sp) = sample_paths();
         let xml = render_scheduled_task_xml(&sp);
+        assert!(
+            !SERVICE_TASK_NAME.contains('\\'),
+            "standard users cannot reliably create Task Scheduler folders"
+        );
+        assert!(xml.contains(r"<URI>\OwnMesh-ownmeshd</URI>"));
         assert!(xml.contains("LeastPrivilege"));
         assert!(xml.contains("LogonTrigger"));
         assert!(xml.contains("InteractiveToken"));

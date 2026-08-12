@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v1.2.4 — Guided TUI onboarding
+
+- The bundled dark TUI now guides first-run server setup, language and policy
+  selection, device-code sign-in, device enrollment, and Agent startup.
+- Dashboard status distinguishes configured, authenticated, enrolled, service
+  installed, and Agent-running states; ChatGPT connector setup is a separate,
+  clearly labelled step.
+- Setup and repair preserve unrelated instances, update preferences, and
+  custom policy rules unless the user explicitly selects a different preset.
+- Windows user autostart uses a root-level least-privilege task that standard
+  users can create. Existing legacy tasks are detected and removed during
+  migration, and task enumeration fails closed on query errors.
+
 ## v1.2.3 — Policy precedence and real-path evidence
 
 - An explicit `deny` policy rule now outranks a matching temporary grant. A deny

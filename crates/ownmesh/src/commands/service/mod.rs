@@ -185,14 +185,16 @@ fn run_install(
     }
 
     // Idempotent: if already installed with same exe, succeed after OS verify.
-    let existing = manager.probe().map_err(|e| {
-        eprintln!("service install: {e}");
+    let recorded = read_service_record(paths);
+    let existing = manager.probe().map_err(|error| {
+        eprintln!("service install: {error}");
         ExitCode::Internal
     })?;
-    let same_recorded_executable = read_service_record(paths).is_some_and(|record| {
+    let same_recorded_executable = recorded.is_some_and(|record| {
         record.executable == service_paths.executable.canonical.display().to_string()
     });
-    if existing.installed && same_recorded_executable {
+    let descriptor_is_current = existing.unit_path.as_deref() == Some(plan.unit_path.as_str());
+    if existing.installed && same_recorded_executable && descriptor_is_current {
         let record = UserServiceRecord {
             schema_version: 1,
             installed: true,

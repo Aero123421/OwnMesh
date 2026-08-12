@@ -1,6 +1,8 @@
 //! Terminal setup / restore. Panic and normal exit must always restore the terminal.
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -10,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static RAW_ENABLED: AtomicBool = AtomicBool::new(false);
 static ALTERNATE_ENABLED: AtomicBool = AtomicBool::new(false);
+static BRACKETED_PASTE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Guard that restores the terminal when dropped.
 pub struct TerminalGuard {
@@ -26,8 +29,19 @@ impl TerminalGuard {
         install_panic_hook();
         enable_raw_mode()?;
         RAW_ENABLED.store(true, Ordering::SeqCst);
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // Mark every potentially-partial terminal state before sending the
+        // sequence so an error at any point can still be rolled back.
         ALTERNATE_ENABLED.store(true, Ordering::SeqCst);
+        BRACKETED_PASTE_ENABLED.store(true, Ordering::SeqCst);
+        if let Err(error) = execute!(
+            stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
+            let _ = restore_terminal();
+            return Err(error);
+        }
         Ok(Self { restored: false })
     }
 
@@ -54,6 +68,9 @@ impl Drop for TerminalGuard {
 
 /// Best-effort terminal restoration used by panic hook and drop.
 pub fn restore_terminal() -> io::Result<()> {
+    if BRACKETED_PASTE_ENABLED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(stdout(), DisableBracketedPaste);
+    }
     if ALTERNATE_ENABLED.swap(false, Ordering::SeqCst) {
         let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
