@@ -98,14 +98,22 @@ URL, and the exact `ownmesh setup` command for step 2. See
 
 ### 2. Connect a machine
 
-Desktop (opens browser login, enrolls this PC, and installs user autostart):
+Desktop: launch the TUI and choose **Finish setup**. It asks for the Worker URL
+and policy, then performs sign-in, device enrollment, and Agent startup without
+making you assemble a long command:
+
+```bash
+ownmesh
+```
+
+The direct CLI equivalent is:
 
 ```bash
 ownmesh setup --control-plane-url https://your-worker.example --quickstart
 ```
 
 SSH or Ubuntu Server (prints a URL and short code for approval on another
-device):
+device). The same URL + code flow is also used by the TUI over SSH:
 
 ```bash
 ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force

@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode as StdExitCode, Stdio};
 use std::time::{Duration, Instant};
 use terminal::{create_ratatui, TerminalGuard};
-use wizard::WizardStep;
+use wizard::{apply_setup_request, SetupRequest, WizardStep};
 
 /// OwnMesh terminal UI.
 #[derive(Debug, Parser)]
@@ -78,6 +78,14 @@ struct Cli {
 
 const APPROVAL_CLI_TIMEOUT: Duration = Duration::from_secs(6 * 60 + 30);
 const APPROVAL_CHILD_POLL: Duration = Duration::from_millis(200);
+const SETUP_AGENT_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupCliOutcome {
+    Complete,
+    AgentUnavailable,
+    Failed,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalCliOutcome {
@@ -157,8 +165,8 @@ fn run(cli: Cli) -> Result<(), ExitCode> {
         if let Some(lang) = &cli.lang {
             app.lang = Lang::parse(lang);
         }
-        if cli.wizard {
-            app.overlay = Overlay::Wizard;
+        if cli.wizard || app.readiness.needs_onboarding() {
+            app.open_setup_wizard();
         }
         // Best-effort refresh of approvals / sessions while runtime is live.
         if app.daemon.is_some() {
@@ -264,7 +272,53 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                     }
                 }
                 Event::Resize(_, _) => {}
+                Event::Paste(text) if app.overlay == Overlay::Wizard => {
+                    append_wizard_server_text(&mut app, &text);
+                }
                 _ => {}
+            }
+
+            if let Some(request) = app.take_pending_setup() {
+                terminal
+                    .draw(|frame| ui::draw(frame, &app))
+                    .map_err(|_| ExitCode::Internal)?;
+                drop(terminal);
+                guard.restore().map_err(|_| ExitCode::Internal)?;
+                let outcome = run_setup_cli(&request);
+
+                guard = TerminalGuard::enter().map_err(|err| {
+                    eprintln!("failed to restore raw terminal mode: {err}");
+                    ExitCode::Internal
+                })?;
+                terminal = create_ratatui().map_err(|_| ExitCode::Internal)?;
+                terminal.clear().map_err(|_| ExitCode::Internal)?;
+                drain_pending_events();
+
+                let daemon = wait_for_daemon(rt, SETUP_AGENT_WAIT);
+                app.refresh_local_state(daemon);
+                app.overlay = Overlay::Wizard;
+                app.wizard.step = WizardStep::Done;
+                app.wizard.saved = outcome != SetupCliOutcome::Failed;
+                app.wizard.error = match outcome {
+                    SetupCliOutcome::Complete if app.readiness.agent_running => None,
+                    SetupCliOutcome::Complete | SetupCliOutcome::AgentUnavailable => Some(
+                        local_setup_message(
+                            app.lang,
+                            "Account and device are ready. Agent could not start; choose Repair Agent after fixing service permissions.",
+                            "アカウントとPC登録は完了しました。Agentを開始できません。権限を確認後「Agentを修復」を実行してください。",
+                        )
+                        .to_owned(),
+                    ),
+                    SetupCliOutcome::Failed => Some(
+                        local_setup_message(
+                            app.lang,
+                            "Setup stopped before completion. Review the message above and try again.",
+                            "セットアップは完了しませんでした。直前の表示を確認して、もう一度実行してください。",
+                        )
+                        .to_owned(),
+                    ),
+                };
+                continue;
             }
 
             let Some(pending) = app.take_pending_approval() else {
@@ -338,6 +392,13 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         return;
     }
 
+    if app.overlay == Overlay::Connector {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+            app.overlay = Overlay::None;
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Char('q' | 'Q') => app.should_quit = true,
         KeyCode::F(1) | KeyCode::Char('?') => app.overlay = Overlay::Help,
@@ -369,8 +430,7 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         KeyCode::Char('9') => app.screen = Screen::Diagnostics,
         KeyCode::Char('0') => app.screen = Screen::Settings,
         KeyCode::Char('w') => {
-            app.overlay = Overlay::Wizard;
-            app.wizard.step = WizardStep::Welcome;
+            app.open_setup_wizard();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if app.screen == Screen::Approvals {
@@ -447,6 +507,10 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent) {
                 app.wizard.step = app.wizard.step.back();
             }
         }
+        KeyCode::Backspace if app.wizard.step == WizardStep::Server => {
+            app.wizard.control_plane_url.pop();
+            app.wizard.error = None;
+        }
         KeyCode::Backspace => {
             app.wizard.step = app.wizard.step.back();
         }
@@ -467,22 +531,52 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent) {
                 }
                 app.wizard.step = app.wizard.step.next();
             }
-            WizardStep::Confirm => match app.wizard.save(&app.paths) {
-                Ok(()) => {
-                    app.lang = app.wizard.lang;
-                    app.policy_preset = app.wizard.selected_preset();
-                    app.status_line = i18n::t(app.lang, i18n::Msg::WizardSaveOk).to_owned();
+            WizardStep::Server => {
+                match ownmesh_config::validate_control_plane_base_url(
+                    app.wizard.control_plane_url.trim(),
+                ) {
+                    Ok(url) => {
+                        app.wizard.control_plane_url = url;
+                        app.wizard.error = None;
+                        app.wizard.step = app.wizard.step.next();
+                    }
+                    Err(error) => {
+                        app.wizard.error = Some(format!("control-plane URL: {error}"));
+                    }
                 }
-                Err(e) => {
-                    app.wizard.error = Some(e);
+            }
+            WizardStep::Confirm => {
+                if let Err(error) = app.queue_wizard_setup() {
+                    app.wizard.error = Some(error);
                 }
-            },
+            }
             WizardStep::Done => {
                 app.overlay = Overlay::None;
             }
         },
+        KeyCode::Char(c)
+            if app.wizard.step == WizardStep::Server
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && app.wizard.control_plane_url.len() < 2048 =>
+        {
+            app.wizard.control_plane_url.push(c);
+            app.wizard.error = None;
+        }
         _ => {}
     }
+}
+
+fn append_wizard_server_text(app: &mut App, text: &str) {
+    if app.wizard.step != WizardStep::Server {
+        return;
+    }
+    for ch in text.chars().filter(|ch| !ch.is_control()) {
+        if app.wizard.control_plane_url.len() + ch.len_utf8() > 2048 {
+            break;
+        }
+        app.wizard.control_plane_url.push(ch);
+    }
+    app.wizard.error = None;
 }
 
 fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
@@ -496,6 +590,90 @@ fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
             app.status_line = actionable_ipc_error(&e);
             false
         }
+    }
+}
+
+fn run_setup_cli(request: &SetupRequest) -> SetupCliOutcome {
+    let Ok(current) = std::env::current_exe() else {
+        return SetupCliOutcome::Failed;
+    };
+    let ownmesh = sibling_ownmesh_path(&current);
+    if !ownmesh.is_file() {
+        eprintln!("OwnMesh CLI was not found beside ownmesh-tui.");
+        return SetupCliOutcome::Failed;
+    }
+
+    if request.configure {
+        let Ok(paths) = OwnMeshPaths::discover() else {
+            return SetupCliOutcome::Failed;
+        };
+        if let Err(error) = apply_setup_request(&paths, request) {
+            eprintln!("OwnMesh setup: {error}");
+            return SetupCliOutcome::Failed;
+        }
+    }
+    println!("\nOwnMesh setup — follow the URL + code prompt if sign-in is required.\n");
+    if request.login
+        && !run_ownmesh_step(
+            &ownmesh,
+            vec![OsString::from("login"), OsString::from("--device")],
+        )
+    {
+        return SetupCliOutcome::Failed;
+    }
+    if request.enroll
+        && !run_ownmesh_step(
+            &ownmesh,
+            vec![OsString::from("device"), OsString::from("enroll")],
+        )
+    {
+        return SetupCliOutcome::Failed;
+    }
+    if request.install_agent {
+        let installed = run_ownmesh_step(
+            &ownmesh,
+            vec![OsString::from("service"), OsString::from("install")],
+        );
+        let started = installed
+            && run_ownmesh_step(
+                &ownmesh,
+                vec![OsString::from("service"), OsString::from("start")],
+            );
+        if !started {
+            return SetupCliOutcome::AgentUnavailable;
+        }
+    }
+    SetupCliOutcome::Complete
+}
+
+fn run_ownmesh_step(executable: &Path, args: Vec<OsString>) -> bool {
+    Command::new(executable)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn wait_for_daemon(rt: &tokio::runtime::Runtime, timeout: Duration) -> Option<DaemonStatus> {
+    let started = Instant::now();
+    loop {
+        if let Ok(status) = rt.block_on(fetch_status()) {
+            return Some(status);
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn local_setup_message(lang: Lang, en: &'static str, ja: &'static str) -> &'static str {
+    if lang == Lang::JaJp {
+        ja
+    } else {
+        en
     }
 }
 

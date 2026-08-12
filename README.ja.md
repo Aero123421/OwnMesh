@@ -92,13 +92,21 @@ secret 設定を行い、オーナーログイン URL、ChatGPT MCP URL、そし
 
 ### 2. マシンを接続する
 
-デスクトップ（ブラウザ認証、PC登録、ユーザー自動起動まで）:
+デスクトップでは TUI を起動し、**セットアップ**を選びます。Worker URL と
+アクセス範囲を選ぶと、ログイン・PC登録・Agentの自動起動まで順番に行います:
+
+```bash
+ownmesh
+```
+
+同じ処理を直接CLIで行う場合:
 
 ```bash
 ownmesh setup --control-plane-url https://your-worker.example --quickstart
 ```
 
-SSH / Ubuntu Server（URL と短いコードを表示し、別端末から承認）:
+SSH / Ubuntu Server（URL と短いコードを表示し、別端末から承認）。TUIでも
+同じURL＋コード方式を使えます:
 
 ```bash
 ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force

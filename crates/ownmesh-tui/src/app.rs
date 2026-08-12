@@ -4,7 +4,8 @@ use crate::i18n::{t, Lang, Msg};
 use crate::palette::{filter_commands, PaletteAction, PaletteState};
 use crate::theme::{ColorMode, Theme};
 use crate::wizard::{
-    apply_setup, preset_from_wire, preset_wire_name, WizardState, WizardStep, WIZARD_PRESETS,
+    apply_setup, preset_from_wire, preset_wire_name, SetupRequest, SetupStatus, WizardState,
+    WIZARD_PRESETS,
 };
 use ownmesh_config::{load_config, load_policy, OwnMeshPaths};
 use ownmesh_diagnostics::{
@@ -53,8 +54,8 @@ impl Screen {
     pub const PRIMARY: &'static [Screen] = &[
         Self::Dashboard,
         Self::Devices,
+        Self::Workspaces,
         Self::Approvals,
-        Self::Transfers,
         Self::Settings,
     ];
 
@@ -88,33 +89,41 @@ impl Screen {
 /// First-use actions kept intentionally small on the overview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverviewAction {
-    Connect,
+    SetupRepair,
+    RepairAgent,
+    Connector,
     Devices,
     Workspace,
     Doctor,
 }
 
-impl OverviewAction {
-    pub const ALL: &'static [Self] = &[Self::Connect, Self::Devices, Self::Workspace, Self::Doctor];
+/// Honest local readiness markers. These are observations, not inferred live
+/// network state: a configured server is never labelled "connected" here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Readiness {
+    pub server_url: Option<String>,
+    pub account_present: bool,
+    pub device_id: Option<String>,
+    pub service_installed: bool,
+    pub agent_running: bool,
+}
 
+impl Readiness {
     #[must_use]
-    pub const fn command(self) -> &'static str {
-        match self {
-            Self::Connect => "/connect",
-            Self::Devices => "/devices",
-            Self::Workspace => "/workspace",
-            Self::Doctor => "/doctor",
-        }
+    pub fn needs_onboarding(&self) -> bool {
+        self.server_url.is_none() || !self.account_present || self.device_id.is_none()
     }
 
     #[must_use]
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::Connect => "Connect ChatGPT",
-            Self::Devices => "Trusted computers",
-            Self::Workspace => "Allowed folders",
-            Self::Doctor => "System health",
-        }
+    pub fn ready(&self) -> bool {
+        !self.needs_onboarding() && self.service_installed && self.agent_running
+    }
+
+    #[must_use]
+    pub fn connector_url(&self) -> Option<String> {
+        self.server_url
+            .as_deref()
+            .map(|url| format!("{}/mcp", url.trim_end_matches('/')))
     }
 }
 
@@ -157,6 +166,7 @@ pub enum Overlay {
     None,
     Help,
     Wizard,
+    Connector,
 }
 
 /// Root application model.
@@ -176,12 +186,13 @@ pub struct App {
     pub sessions: Vec<String>,
     pub activity: Vec<String>,
     pub doctor: DoctorReport,
+    pub readiness: Readiness,
     pub policy_preset: AccessPreset,
-    pub active_instance: Option<String>,
     pub overview_action_cursor: usize,
     pub status_line: String,
     pub should_quit: bool,
     pub list_cursor: usize,
+    pending_setup: Option<SetupRequest>,
 }
 
 impl App {
@@ -198,6 +209,7 @@ impl App {
                 .find(|instance| &instance.id == id)
                 .map(|instance| instance.base_url.clone())
         });
+        let readiness = readiness_from_local(&paths, &cfg, daemon.as_ref());
         // Read-only local observations only: no network probes, no secret material.
         let doctor = run_doctor(&doctor_input_from_local(
             &paths,
@@ -212,15 +224,7 @@ impl App {
             screen: Screen::Dashboard,
             overlay: Overlay::None,
             palette: PaletteState::default(),
-            wizard: WizardState {
-                lang,
-                lang_idx: Lang::ALL.iter().position(|l| *l == lang).unwrap_or(0),
-                preset_idx: WIZARD_PRESETS
-                    .iter()
-                    .position(|p| *p == policy_preset)
-                    .unwrap_or(1),
-                ..WizardState::default()
-            },
+            wizard: WizardState::from_existing(lang, policy_preset, active_instance.as_deref()),
             paths,
             daemon,
             approvals: Vec::new(),
@@ -229,12 +233,13 @@ impl App {
             sessions: Vec::new(),
             activity: Vec::new(),
             doctor,
+            readiness,
             policy_preset,
-            active_instance,
             overview_action_cursor: 0,
             status_line: String::new(),
             should_quit: false,
             list_cursor: 0,
+            pending_setup: None,
         }
     }
 
@@ -304,31 +309,101 @@ impl App {
     }
 
     pub fn move_overview_action(&mut self, delta: isize) {
-        let len = OverviewAction::ALL.len() as isize;
+        let len = self.overview_actions().len() as isize;
+        if len == 0 {
+            self.overview_action_cursor = 0;
+            return;
+        }
         self.overview_action_cursor =
             (self.overview_action_cursor as isize + delta).rem_euclid(len) as usize;
     }
 
+    #[must_use]
+    pub fn overview_actions(&self) -> Vec<OverviewAction> {
+        let mut actions = Vec::with_capacity(5);
+        if self.readiness.needs_onboarding() {
+            actions.push(OverviewAction::SetupRepair);
+        } else if !self.readiness.agent_running || !self.readiness.service_installed {
+            actions.push(OverviewAction::RepairAgent);
+        } else {
+            actions.push(OverviewAction::Connector);
+        }
+        if self.readiness.server_url.is_some() && !actions.contains(&OverviewAction::Connector) {
+            actions.push(OverviewAction::Connector);
+        }
+        actions.extend([
+            OverviewAction::Devices,
+            OverviewAction::Workspace,
+            OverviewAction::Doctor,
+        ]);
+        actions
+    }
+
     pub fn run_overview_action(&mut self) {
-        match OverviewAction::ALL
+        match self
+            .overview_actions()
             .get(self.overview_action_cursor)
             .copied()
-            .unwrap_or(OverviewAction::Connect)
+            .unwrap_or(OverviewAction::SetupRepair)
         {
-            OverviewAction::Connect => {
-                if self.active_instance.is_some() {
-                    self.status_line =
-                        "ChatGPT: add this control plane's /mcp URL in Connectors".into();
-                } else {
-                    self.overlay = Overlay::Wizard;
-                    self.wizard.step = WizardStep::Welcome;
-                    self.wizard.saved = false;
-                }
+            OverviewAction::SetupRepair => self.open_setup_wizard(),
+            OverviewAction::RepairAgent => {
+                self.pending_setup = Some(SetupRequest {
+                    control_plane_url: self.readiness.server_url.clone().unwrap_or_default(),
+                    lang: self.lang,
+                    preset: self.policy_preset,
+                    configure: false,
+                    update_policy: false,
+                    login: false,
+                    enroll: false,
+                    install_agent: true,
+                });
             }
+            OverviewAction::Connector => self.overlay = Overlay::Connector,
             OverviewAction::Devices => self.screen = Screen::Devices,
             OverviewAction::Workspace => self.screen = Screen::Workspaces,
             OverviewAction::Doctor => self.screen = Screen::Diagnostics,
         }
+    }
+
+    pub fn open_setup_wizard(&mut self) {
+        self.wizard = WizardState::from_existing(
+            self.lang,
+            self.policy_preset,
+            self.readiness.server_url.as_deref(),
+        );
+        self.overlay = Overlay::Wizard;
+    }
+
+    pub fn queue_wizard_setup(&mut self) -> Result<(), String> {
+        let request = self.wizard.build_request(
+            self.readiness.server_url.as_deref(),
+            SetupStatus {
+                account_present: self.readiness.account_present,
+                device_present: self.readiness.device_id.is_some(),
+                agent_running: self.readiness.agent_running,
+                service_installed: self.readiness.service_installed,
+            },
+        )?;
+        self.pending_setup = Some(request);
+        Ok(())
+    }
+
+    pub fn take_pending_setup(&mut self) -> Option<SetupRequest> {
+        self.pending_setup.take()
+    }
+
+    pub fn refresh_local_state(&mut self, daemon: Option<DaemonStatus>) {
+        let refreshed = Self::new(self.paths.clone(), daemon);
+        self.lang = refreshed.lang;
+        self.daemon = refreshed.daemon;
+        self.doctor = refreshed.doctor;
+        self.readiness = refreshed.readiness;
+        self.policy_preset = refreshed.policy_preset;
+        self.wizard = refreshed.wizard;
+        self.overview_action_cursor = self
+            .overview_action_cursor
+            .min(self.overview_actions().len().saturating_sub(1));
     }
 
     pub fn open_palette(&mut self) {
@@ -363,11 +438,7 @@ impl App {
                 self.screen = screen;
                 self.list_cursor = 0;
             }
-            PaletteAction::OpenWizard => {
-                self.overlay = Overlay::Wizard;
-                self.wizard.step = WizardStep::Welcome;
-                self.wizard.saved = false;
-            }
+            PaletteAction::OpenWizard => self.open_setup_wizard(),
             PaletteAction::OpenHelp => self.overlay = Overlay::Help,
             PaletteAction::Quit => self.should_quit = true,
             PaletteAction::ApproveSelected => {
@@ -451,6 +522,64 @@ impl App {
             t(self.lang, msg),
             preset_wire_name(self.policy_preset)
         )
+    }
+}
+
+fn readiness_from_local(
+    paths: &OwnMeshPaths,
+    cfg: &ownmesh_config::OwnMeshConfig,
+    daemon: Option<&DaemonStatus>,
+) -> Readiness {
+    let server_url = cfg.active_instance.as_ref().and_then(|id| {
+        cfg.instances
+            .iter()
+            .find(|instance| &instance.id == id)
+            .map(|instance| instance.base_url.trim().trim_end_matches('/').to_owned())
+            .filter(|url| !url.is_empty())
+    });
+    let session = fs::read_to_string(paths.state_dir.join("auth_session.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let session_issuer = session
+        .as_ref()
+        .and_then(|value| value.get("issuer"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|issuer| issuer.trim_end_matches('/'));
+    let session_matches_server = match (server_url.as_deref(), session_issuer) {
+        (Some(server), Some(issuer)) => server == issuer,
+        _ => false,
+    };
+    let account_present = session_matches_server
+        && session
+            .as_ref()
+            .and_then(|value| value.get("has_refresh_token"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let device_id = if session_matches_server {
+        session
+            .as_ref()
+            .and_then(|value| value.get("device_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    };
+    let service_installed =
+        fs::read_to_string(paths.state_dir.join("service").join("user-service.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value.get("installed").and_then(Value::as_bool))
+            .unwrap_or(false);
+
+    Readiness {
+        server_url,
+        account_present,
+        device_id,
+        service_installed,
+        agent_running: daemon.is_some(),
     }
 }
 

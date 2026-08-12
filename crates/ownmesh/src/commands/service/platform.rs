@@ -7,7 +7,10 @@
 #[cfg(target_os = "macos")]
 use super::descriptor::{render_launch_agent_plist, SERVICE_LABEL};
 #[cfg(windows)]
-use super::descriptor::{render_scheduled_task_xml, windows_task_run_command, SERVICE_TASK_NAME};
+use super::descriptor::{
+    render_scheduled_task_xml, windows_task_run_command, LEGACY_SERVICE_TASK_NAME,
+    SERVICE_TASK_NAME,
+};
 use super::descriptor::{render_systemd_user_unit, ServicePaths, SERVICE_UNIT_NAME};
 use super::security::reject_injection;
 use ownmesh_persist::write_atomically;
@@ -336,15 +339,14 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
         #[cfg(windows)]
         {
-            let out = self
-                .runner
-                .run("schtasks", &["/Run", "/TN", SERVICE_TASK_NAME])?;
+            let task = windows_installed_task_name(self.runner)?.unwrap_or(SERVICE_TASK_NAME);
+            let out = self.runner.run("schtasks", &["/Run", "/TN", task])?;
             return if out.success() {
                 Ok(())
             } else {
                 Err(format!(
-                    "schtasks /Run failed: {}{}",
-                    out.stdout, out.stderr
+                    "schtasks /Run failed (status {}); verify the current-user task exists",
+                    out.status
                 ))
             };
         }
@@ -395,9 +397,8 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
         #[cfg(windows)]
         {
-            let out = self
-                .runner
-                .run("schtasks", &["/End", "/TN", SERVICE_TASK_NAME])?;
+            let task = windows_installed_task_name(self.runner)?.unwrap_or(SERVICE_TASK_NAME);
+            let out = self.runner.run("schtasks", &["/End", "/TN", task])?;
             // /End may fail if not running — treat as soft success when task exists.
             if out.success()
                 || out.stdout.to_ascii_lowercase().contains("not running")
@@ -405,10 +406,7 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
             {
                 return Ok(());
             }
-            return Err(format!(
-                "schtasks /End failed: {}{}",
-                out.stdout, out.stderr
-            ));
+            return Err(format!("schtasks /End failed (status {})", out.status));
         }
         #[cfg(target_os = "macos")]
         {
@@ -616,8 +614,8 @@ fn install_windows<R: ProcessRunner + ?Sized>(
                 Ok(())
             } else {
                 Err(format!(
-                    "schtasks create failed: {}{} | fallback: {}{}",
-                    o.stdout, o.stderr, out2.stdout, out2.stderr
+                    "schtasks create failed (XML status {}); fallback failed (status {}); verify Task Scheduler is available for this user",
+                    o.status, out2.status
                 ))
             }
         }
@@ -627,57 +625,161 @@ fn install_windows<R: ProcessRunner + ?Sized>(
 
 #[cfg(windows)]
 fn uninstall_windows<R: ProcessRunner + ?Sized>(runner: &R) -> Result<(), String> {
-    let out = runner.run("schtasks", &["/Delete", "/TN", SERVICE_TASK_NAME, "/F"])?;
-    if out.success()
-        || out.stdout.to_ascii_lowercase().contains("cannot find")
-        || out.stderr.to_ascii_lowercase().contains("cannot find")
-        || out.stdout.to_ascii_lowercase().contains("not found")
-        || out.stderr.to_ascii_lowercase().contains("not found")
-        || out.status == 1
-            && (out.stdout.to_ascii_lowercase().contains("error")
-                || out.stderr.to_ascii_lowercase().contains("error"))
-    {
-        // Idempotent: missing task is success. Re-probe is done by caller.
-        // If delete failed for other reasons, still check probe.
-        let probe = probe_windows(runner)?;
-        if probe.installed {
+    let installed = query_windows_tasks(runner)?;
+    for (present, task) in [
+        (installed.current, SERVICE_TASK_NAME),
+        (installed.legacy, LEGACY_SERVICE_TASK_NAME),
+    ] {
+        if !present {
+            continue;
+        }
+        let out = runner.run("schtasks", &["/Delete", "/TN", task, "/F"])?;
+        if !out.success() && query_windows_tasks(runner)?.contains(task) {
             return Err(format!(
-                "schtasks delete failed: {}{}",
-                out.stdout, out.stderr
+                "schtasks could not delete task {task} (status {})",
+                out.status
             ));
         }
-        return Ok(());
+    }
+    let remaining = query_windows_tasks(runner)?;
+    if remaining.current || remaining.legacy {
+        return Err("OwnMesh scheduled task still exists after uninstall".into());
     }
     Ok(())
 }
 
 #[cfg(windows)]
 fn probe_windows<R: ProcessRunner + ?Sized>(runner: &R) -> Result<ServiceStatusSnapshot, String> {
-    let out = runner.run(
-        "schtasks",
-        &["/Query", "/TN", SERVICE_TASK_NAME, "/V", "/FO", "LIST"],
-    )?;
-    let installed = out.success();
-    let lower = format!("{}{}", out.stdout, out.stderr).to_ascii_lowercase();
-    let running = if !installed {
-        None
-    } else if lower.contains("status:") && lower.contains("running") {
-        Some(true)
-    } else {
-        Some(false)
-    };
+    let installed = query_windows_tasks(runner)?;
+    if installed.current {
+        let mut snapshot = probe_windows_named(runner, SERVICE_TASK_NAME)?;
+        if installed.legacy {
+            snapshot.unit_path = Some(format!(
+                "task:{SERVICE_TASK_NAME}; legacy:{LEGACY_SERVICE_TASK_NAME}"
+            ));
+            snapshot.message =
+                Some("legacy OwnMesh task also installed; reinstall to migrate".into());
+        }
+        return Ok(snapshot);
+    }
+    if installed.legacy {
+        return probe_windows_named(runner, LEGACY_SERVICE_TASK_NAME);
+    }
     Ok(ServiceStatusSnapshot {
         platform: "windows".into(),
         supported: true,
-        installed,
-        running,
+        installed: false,
+        running: None,
         unit_path: Some(format!("task:{SERVICE_TASK_NAME}")),
-        message: if installed {
-            None
-        } else {
-            Some("scheduled task not found".into())
-        },
+        message: Some("scheduled task not found".into()),
     })
+}
+
+#[cfg(windows)]
+fn windows_installed_task_name<R: ProcessRunner + ?Sized>(
+    runner: &R,
+) -> Result<Option<&'static str>, String> {
+    let installed = query_windows_tasks(runner)?;
+    if installed.current {
+        return Ok(Some(SERVICE_TASK_NAME));
+    }
+    if installed.legacy {
+        return Ok(Some(LEGACY_SERVICE_TASK_NAME));
+    }
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn probe_windows_named<R: ProcessRunner + ?Sized>(
+    runner: &R,
+    task: &str,
+) -> Result<ServiceStatusSnapshot, String> {
+    let out = runner.run("schtasks", &["/Query", "/TN", task, "/V", "/FO", "LIST"])?;
+    if !out.success() {
+        return Err(format!(
+            "schtasks query failed for {task} (status {})",
+            out.status
+        ));
+    }
+    Ok(ServiceStatusSnapshot {
+        platform: "windows".into(),
+        supported: true,
+        installed: true,
+        // `schtasks` localizes its state text. Agent IPC is the authoritative
+        // liveness signal, so do not report a false stopped/running value here.
+        running: None,
+        unit_path: Some(format!("task:{task}")),
+        message: None,
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WindowsTaskSet {
+    current: bool,
+    legacy: bool,
+}
+
+#[cfg(windows)]
+impl WindowsTaskSet {
+    fn contains(self, task: &str) -> bool {
+        if task.eq_ignore_ascii_case(SERVICE_TASK_NAME) {
+            self.current
+        } else if task.eq_ignore_ascii_case(LEGACY_SERVICE_TASK_NAME) {
+            self.legacy
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+fn query_windows_tasks<R: ProcessRunner + ?Sized>(runner: &R) -> Result<WindowsTaskSet, String> {
+    let out = runner.run("schtasks", &["/Query", "/FO", "CSV", "/NH"])?;
+    if !out.success() {
+        return Err(format!(
+            "schtasks could not enumerate scheduled tasks (status {})",
+            out.status
+        ));
+    }
+    Ok(parse_windows_task_set(&out.stdout))
+}
+
+#[cfg(windows)]
+fn parse_windows_task_set(stdout: &str) -> WindowsTaskSet {
+    let mut tasks = WindowsTaskSet::default();
+    for line in stdout.lines() {
+        let Some(name) = first_csv_field(line) else {
+            continue;
+        };
+        let normalized = name.trim().trim_start_matches('\\');
+        tasks.current |= normalized.eq_ignore_ascii_case(SERVICE_TASK_NAME);
+        tasks.legacy |= normalized.eq_ignore_ascii_case(LEGACY_SERVICE_TASK_NAME);
+    }
+    tasks
+}
+
+#[cfg(windows)]
+fn first_csv_field(line: &str) -> Option<String> {
+    let line = line.trim().trim_start_matches('\u{feff}');
+    if line.is_empty() {
+        return None;
+    }
+    let Some(mut rest) = line.strip_prefix('"') else {
+        return line.split(',').next().map(str::trim).map(ToOwned::to_owned);
+    };
+    let mut field = String::new();
+    loop {
+        let quote = rest.find('"')?;
+        field.push_str(&rest[..quote]);
+        rest = &rest[quote + 1..];
+        if let Some(after_escape) = rest.strip_prefix('"') {
+            field.push('"');
+            rest = after_escape;
+        } else {
+            return Some(field);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -914,5 +1016,103 @@ mod tests {
     fn resolve_missing_exe_errors() {
         let err = resolve_ownmeshd_path(Some("/no/such/ownmeshd-xyz")).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    #[cfg(windows)]
+    #[derive(Debug)]
+    struct WindowsTaskRunner {
+        tasks: Mutex<WindowsTaskSet>,
+        deny_enumeration: bool,
+    }
+
+    #[cfg(windows)]
+    impl ProcessRunner for WindowsTaskRunner {
+        fn run(&self, _program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+            let mut tasks = self.tasks.lock().expect("lock");
+            if args.first() == Some(&"/Query") && !args.contains(&"/TN") {
+                if self.deny_enumeration {
+                    return Ok(CommandOutput {
+                        status: 5,
+                        stdout: String::new(),
+                        stderr: "access denied".into(),
+                    });
+                }
+                let mut stdout = String::new();
+                if tasks.current {
+                    stdout.push_str("\"\\OwnMesh-ownmeshd\",\"N/A\",\"Ready\"\n");
+                }
+                if tasks.legacy {
+                    stdout.push_str("\"\\OwnMesh\\ownmeshd\",\"N/A\",\"Ready\"\n");
+                }
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout,
+                    stderr: String::new(),
+                });
+            }
+            if args.first() == Some(&"/Query") {
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            if args.first() == Some(&"/Delete") {
+                let task = args
+                    .windows(2)
+                    .find(|pair| pair[0] == "/TN")
+                    .map(|pair| pair[1])
+                    .unwrap_or_default();
+                if task.eq_ignore_ascii_case(SERVICE_TASK_NAME) {
+                    tasks.current = false;
+                } else if task.eq_ignore_ascii_case(LEGACY_SERVICE_TASK_NAME) {
+                    tasks.legacy = false;
+                }
+                return Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            unreachable!("unexpected command: {args:?}")
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scheduled_task_enumeration_is_locale_independent_and_fail_closed() {
+        let parsed = parse_windows_task_set(
+            "\"\\OwnMesh-ownmeshd\",\"N/A\",\"Ready\"\n\"\\OwnMesh\\ownmeshd\",\"N/A\",\"Ready\"\n",
+        );
+        assert_eq!(
+            parsed,
+            WindowsTaskSet {
+                current: true,
+                legacy: true
+            }
+        );
+
+        let denied = WindowsTaskRunner {
+            tasks: Mutex::new(WindowsTaskSet::default()),
+            deny_enumeration: true,
+        };
+        assert!(query_windows_tasks(&denied).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uninstall_removes_current_and_legacy_scheduled_tasks() {
+        let runner = WindowsTaskRunner {
+            tasks: Mutex::new(WindowsTaskSet {
+                current: true,
+                legacy: true,
+            }),
+            deny_enumeration: false,
+        };
+        uninstall_windows(&runner).unwrap();
+        assert_eq!(
+            *runner.tasks.lock().expect("lock"),
+            WindowsTaskSet::default()
+        );
     }
 }
