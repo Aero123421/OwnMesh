@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.2.2 — Grant isolation and local log access
+
+- Filesystem temporary grants are bound to one canonical workspace and native
+  path components, preventing cross-workspace or separator-based scope reuse.
+- `ownmesh logs providers/query` exposes bounded, cursor-paged device logs over
+  local authenticated IPC. Log bodies are intentionally not routed through the
+  remote MCP control plane.
+- Human-readable log output escapes terminal control characters.
+- The daemon runtime is split into focused session, transfer, and workspace
+  modules without changing its protocol contract.
+- Setup and Doctor guidance better distinguish the recommended path from the
+  broader full-access mode.
+
 ## v1.2.1 — Stable UX and contract fixes
 
 - Read-only first-run commands no longer create configuration that blocks setup.

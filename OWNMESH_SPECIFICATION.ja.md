@@ -1123,7 +1123,7 @@ acp = false
 
 実装名は衝突を避けるため `ownmesh_` prefix + snake_case とする。
 
-> **実装状況（v1.2.1 / [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md)）**
+> **実装状況（v1.2.2 / [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md)）**
 > 出荷カタログは `ownmesh_<family>_<verb>` の名詞先行形を正本とする
 > （`ownmesh_fs_read`、`ownmesh_session_open`、`ownmesh_transfer_plan`）。
 > capability ごとに整列し、`tools/list` を読むモデルが surface を辿りやすいため。
@@ -1188,13 +1188,13 @@ ownmesh_start_transfer
 ownmesh_cancel_transfer
 ```
 
-> **実装状況（v1.2.1）**
+> **実装状況（v1.2.2）**
 > 本節は目標カタログであり、出荷契約ではない。出荷契約は
 > `packages/control-plane/src/mcp.ts` の `MCP_TOOLS` と、`tools/list` に出る
 > `PUBLISHED_MCP_TOOLS` である。命名の対応は
 > [ADR 0004](./docs/adr/0004-mcp-tool-naming-and-aliases.md) を参照。
 >
-> v1.2.1 で **未実装** の項目:
+> v1.2.2 で **未実装** の項目:
 >
 > - `ownmesh_search_files` — ファイル検索 tool は未提供。
 > - `ownmesh_start_process` / `ownmesh_stop_process` — CLI の
@@ -1609,7 +1609,7 @@ fuzzy matching、最近使った操作、context-aware action を提供する。
 12. Final diagnostics
 ```
 
-> **実装状況（v1.2.1）**
+> **実装状況（v1.2.2）**
 > 12 段の完全 wizard は未実装。出荷しているのは 2 つの入口である。
 >
 > - `ownmesh setup`（CLI・TTY）: control plane URL、instance id、access preset、
@@ -1694,7 +1694,7 @@ ru-RU   Русский
 - diagnostics。
 - README quickstart を最低限 4 言語で用意することを推奨。
 
-> **実装状況（v1.2.1 / [ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）**
+> **実装状況（v1.2.2 / [ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）**
 > 出荷範囲は **TUI 全文のみ**。CLI help、setup 説明、error message、
 > diagnostics は英語固定であり、4 言語化は未実装の目標として残る。
 > CLI は 16.4 のとおり機械向け surface で、key・enum・error code・exit code を
@@ -1706,7 +1706,7 @@ ru-RU   Русский
 - command 名、config key、JSON key、error code は英語固定。
 - user-visible string をコードへ直書きしない。
 - 翻訳カタログは compile-time で完全性を強制する（[ADR 0005](./docs/adr/0005-i18n-compile-time-catalog.md)）。
-  v1.2.1 の実装は Rust の `enum Msg` + locale 表であり、locale ごとの欠落は
+  v1.2.2 の実装は Rust の `enum Msg` + locale 表であり、locale ごとの欠落は
   ビルド失敗になる。`ownmesh-tui --check-i18n` と CI が 4 言語の網羅を検査する。
   Fluent FTL は、runtime 読み込み可能な locale が必要になった時点で再検討する。
 - 文字列結合で文章を組み立てない。
