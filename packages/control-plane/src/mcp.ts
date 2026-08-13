@@ -1753,6 +1753,62 @@ async function loadOp(
   return tracked;
 }
 
+const EXPIRABLE_OPERATION_STATUSES = [
+  "pending",
+  "running",
+  "approval_required",
+  "cancel_requested",
+];
+
+/**
+ * Lazy recovery for durable rows whose Room correlation was lost before an
+ * expiry reconciliation could run. This executes only after the caller has
+ * passed owner/tenant validation in ownmesh_get_operation.
+ */
+async function reconcileExpiredOperationOnPoll(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  tracked: TrackedOperation,
+): Promise<TrackedOperation | undefined> {
+  const expiresAt = typeof tracked.expires_at === "string" ? tracked.expires_at : "";
+  const expiresMs = Date.parse(expiresAt);
+  if (
+    !EXPIRABLE_OPERATION_STATUSES.includes(tracked.status) ||
+    !Number.isFinite(expiresMs) ||
+    expiresMs > Date.now()
+  ) return tracked;
+
+  const updated = await store.updateMcpOperation(
+    tracked.operation_id,
+    {
+      status: "failed",
+      summary: "operation expired before a device result arrived",
+      // Retain durable approval/binding metadata while adding only a small,
+      // typed terminal receipt. publicTrackedView still strips dispatch bodies.
+      data: {
+        ...(tracked.data || {}),
+        phase: "expired",
+        expires_at: expiresAt,
+        error: {
+          code: "OWNMESH_E_OPERATION_EXPIRED",
+          message: "operation expired before a device result arrived",
+          retryable: true,
+        },
+      },
+      approval_required: false,
+    },
+    EXPIRABLE_OPERATION_STATUSES,
+  );
+  if (updated) {
+    const next = trackedFromRecord(updated);
+    tracker.put(next);
+    return next;
+  }
+  // A result/cancel may have won the race. Reload the authoritative row rather
+  // than returning a stale pending view or overwriting the terminal winner.
+  return loadOp(store, tracker, tracked.operation_id);
+}
+
 /**
  * Patch via store CAS only. Tracker is updated only after a successful store write.
  * No tracker-only path, write-back, or resurrection of missing rows.
@@ -4096,7 +4152,7 @@ export async function handleMcp(
 
     if (name === "ownmesh_get_operation") {
       const oid = String(args.operation_id || "");
-      const tracked = await loadOp(store, tracker, oid);
+      let tracked = await loadOp(store, tracker, oid);
       // Owner check: principal + tenant; never leak foreign ops.
       if (!tracked || tracked.principal !== rec.principal || tracked.tenant_id !== rec.tenant_id) {
         const env = makeEnvelope({
@@ -4113,6 +4169,10 @@ export async function handleMcp(
           },
         });
         return mcpResult(id, toolContent(env));
+      }
+      tracked = await reconcileExpiredOperationOnPoll(store, tracker, tracked);
+      if (!tracked) {
+        return mcpError(id, -32004, "operation disappeared during reconciliation", { operation_id: oid });
       }
       // Fail closed: re-validate device + credentials on every poll.
       if (tracked.device_id) {

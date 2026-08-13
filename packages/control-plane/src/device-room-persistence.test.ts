@@ -519,6 +519,152 @@ test("DeviceRoom persists lastSeq/seen/pending to storage and restores on new in
   assert.equal(room2.router.pending.has("op_persist_1"), true);
 });
 
+test("hibernated expired pending operation converges in D1 on DeviceRoom restart", async () => {
+  const originalNow = Date.now;
+  let now = 1_800_000_000_000;
+  (Date as unknown as { now: () => number }).now = () => now;
+  try {
+    const { adapter, store } = openSqliteAdapter();
+    const deviceId = "dev_expiry_reconcile_01";
+    await seedActiveDevice(store, deviceId);
+    const operationId = "op_expiry_reconcile_01";
+    const expiresAt = new Date(now + 60_000).toISOString();
+    await store.putMcpOperation({
+      operation_id: operationId,
+      tenant_id: DEFAULT_TENANT,
+      principal_id: "prin_dev",
+      device_id: deviceId,
+      tool: "ownmesh_fs_write",
+      status: "pending",
+      summary: "routed",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      correlation_id: operationId,
+      expires_at: expiresAt,
+      policy_authority: "ownmesh_device",
+      created_at: new Date(now).toISOString(),
+      updated_at: new Date(now).toISOString(),
+    });
+
+    const storage = new Map<string, unknown>();
+    storage.set(ROOM_STATE_STORAGE_KEY, {
+      v: 1,
+      device_id: deviceId,
+      seqOut: 0,
+      ingressGuards: {},
+      pending: [{
+        correlation_id: operationId,
+        type: "ownmesh_fs_write",
+        from_session: "http_client",
+        created_at: now,
+        expires_at: expiresAt,
+        payload: { operation_id: operationId, path: "must-not-be-persisted.txt" },
+      }],
+    } satisfies PersistedRoomState,
+    );
+
+    // Wake a new instance two hours later, as happens after idle hibernation.
+    now += 2 * 60 * 60 * 1000;
+    assert.equal(Date.now(), now);
+    const beforeRestart = await store.getMcpOperation(operationId);
+    assert.equal(beforeRestart?.correlation_id, operationId);
+    assert.equal(beforeRestart?.device_id, deviceId);
+    const room = new DeviceRoom(mockDOState({ storage }), {
+      DB: adapter as unknown as D1Database,
+      SESSION_SECRET,
+    });
+    await room.ready;
+
+    // This is intentionally the expected end state. Before the fix there is no
+    // alarm/restart reconciliation, so this assertion fails with `pending`.
+    assert.equal(room.isStorageBroken, false);
+    assert.equal(room.deviceId, deviceId);
+    assert.equal(room.router.pending.has(operationId), false);
+    const expiredRecord = await store.getMcpOperation(operationId);
+    assert.equal(expiredRecord?.status, "failed");
+    assert.deepEqual(expiredRecord?.data, {
+      phase: "expired",
+      expires_at: expiresAt,
+      error: {
+        code: "OWNMESH_E_OPERATION_EXPIRED",
+        message: "operation expired before a device result arrived",
+        retryable: true,
+      },
+    }, "expiry receipt remains bounded and contains no pending payload");
+  } finally {
+    (Date as unknown as { now: () => number }).now = originalNow;
+  }
+});
+
+test("DeviceRoom alarm uses the same expiry reconciliation after an idle deadline", async () => {
+  const originalNow = Date.now;
+  let now = 1_800_050_000_000;
+  (Date as unknown as { now: () => number }).now = () => now;
+  try {
+    const { adapter, store } = openSqliteAdapter();
+    const deviceId = "dev_expiry_alarm_01";
+    const operationId = "op_expiry_alarm_01";
+    const expiresAt = new Date(now + 60_000).toISOString();
+    await seedActiveDevice(store, deviceId);
+    await store.putMcpOperation({
+      operation_id: operationId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
+      tool: "ownmesh_command_shell", status: "pending", summary: "routed", data: {}, truncated: false,
+      next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, expires_at: expiresAt,
+      policy_authority: "ownmesh_device", created_at: new Date(now).toISOString(), updated_at: new Date(now).toISOString(),
+    });
+    const storage = new Map<string, unknown>();
+    storage.set(ROOM_STATE_STORAGE_KEY, {
+      v: 1, device_id: deviceId, seqOut: 0, ingressGuards: {},
+      pending: [{ correlation_id: operationId, type: "ownmesh_command_shell", from_session: "http_client", created_at: now, expires_at: expiresAt, payload: { operation_id: operationId, command: "secret command" } }],
+    } satisfies PersistedRoomState);
+    const room = new DeviceRoom(mockDOState({ storage }), { DB: adapter as unknown as D1Database, SESSION_SECRET });
+    await room.ready;
+    now += 2 * 60 * 60 * 1000;
+    await room.alarm();
+    assert.equal((await store.getMcpOperation(operationId))?.status, "failed");
+    assert.equal(room.router.pending.has(operationId), false);
+  } finally {
+    (Date as unknown as { now: () => number }).now = originalNow;
+  }
+});
+
+test("expired room snapshot cannot overwrite a concurrently terminal D1 operation", async () => {
+  const originalNow = Date.now;
+  let now = 1_800_100_000_000;
+  (Date as unknown as { now: () => number }).now = () => now;
+  try {
+    const { adapter, store } = openSqliteAdapter();
+    const deviceId = "dev_expiry_terminal_cas";
+    await seedActiveDevice(store, deviceId);
+    const operationId = "op_expiry_terminal_cas";
+    const expiresAt = new Date(now + 60_000).toISOString();
+    await store.putMcpOperation({
+      operation_id: operationId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
+      tool: "ownmesh_session_list", status: "completed", summary: "completed first", data: { entries: [] },
+      truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId,
+      expires_at: expiresAt, policy_authority: "ownmesh_device", created_at: new Date(now).toISOString(), updated_at: new Date(now).toISOString(),
+    });
+    const storage = new Map<string, unknown>();
+    storage.set(ROOM_STATE_STORAGE_KEY, {
+      v: 1, device_id: deviceId, seqOut: 0, ingressGuards: {},
+      pending: [{ correlation_id: operationId, type: "ownmesh_session_list", from_session: "http_client", created_at: now, expires_at: expiresAt, payload: { operation_id: operationId } }],
+    } satisfies PersistedRoomState);
+
+    now += 2 * 60 * 60 * 1000;
+    const room = new DeviceRoom(mockDOState({ storage }), { DB: adapter as unknown as D1Database, SESSION_SECRET });
+    await room.ready;
+    const record = await store.getMcpOperation(operationId);
+    assert.equal(record?.status, "completed");
+    assert.deepEqual(record?.data, { entries: [] });
+    assert.equal(room.router.pending.has(operationId), false);
+  } finally {
+    (Date as unknown as { now: () => number }).now = originalNow;
+  }
+});
+
 test("env.DB missing fails closed: /operation 503 and existing WS closed", async () => {
   const deviceId = "dev_no_db_fail_01ab";
   const att: SessionAttachment = {
@@ -1293,10 +1439,28 @@ test("live-operation sends raw ticket once but persists only a redacted tombston
   assert.equal(offline.status, 503);
   assert.equal(((await offline.json()) as { status: string }).status, "device_offline");
 
+  // An overdue prior live tombstone must reconcile its matching D1 operation
+  // before this new generation is admitted and persisted.
+  const expiredLiveId = "op_live_expired_before_next";
+  await store.putMcpOperation({
+    operation_id: expiredLiveId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev", device_id: deviceId,
+    tool: "__transfer_start_source", status: "pending", summary: "routed", data: {}, truncated: false,
+    next_cursor: null, approval_required: false, warnings: [], correlation_id: expiredLiveId,
+    expires_at: new Date(Date.now() - 1).toISOString(), policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
+  room.router.pending.set(expiredLiveId, {
+    correlation_id: expiredLiveId, type: "transfer.start", from_session: "", created_at: Date.now(),
+    expires_at: new Date(Date.now() - 1).toISOString(), live_only: true,
+    payload: { operation_id: expiredLiveId, capability: "transfer.start" },
+  });
+
   const marker = "ticket-live-boundary-secret";
   const delivered = await callLive("op_live_delivered", marker);
   assert.equal(delivered.status, 200);
   assert.equal(((await delivered.json()) as { status: string }).status, "routed_to_device");
+  assert.equal((await store.getMcpOperation(expiredLiveId))?.status, "failed");
+  assert.equal(room.router.pending.has(expiredLiveId), false);
   assert.equal(socket.sent.length, 1, "the ready exact Agent receives the one live request");
   assert.ok(socket.sent[0]!.includes(marker));
 

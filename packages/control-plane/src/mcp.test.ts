@@ -968,3 +968,42 @@ test("local tools still work without router (list_devices/get_device/list_profil
     /unknown operation|not found/i,
   );
 });
+
+test("get_operation lazily expires legacy D1-only pending rows without clobbering a terminal race", async () => {
+  const originalNow = Date.now;
+  let now = 1_800_200_000_000;
+  (Date as unknown as { now: () => number }).now = () => now;
+  try {
+    const { store, token } = await authed();
+    const expiresAt = new Date(now - 1).toISOString();
+    await store.putMcpOperation({
+      operation_id: "op_legacy_stale", tenant_id: "ten_default", principal_id: "prin_dev",
+      tool: "ownmesh_fs_write", status: "pending", summary: "legacy room lost correlation",
+      data: { approval_id: "apr_preserved" }, truncated: false, next_cursor: null,
+      approval_required: true, approval_id: "apr_preserved", warnings: [], expires_at: expiresAt,
+      policy_authority: "ownmesh_device", created_at: new Date(now - 60_000).toISOString(), updated_at: new Date(now - 60_000).toISOString(),
+    });
+    await store.putMcpOperation({
+      operation_id: "op_legacy_terminal", tenant_id: "ten_default", principal_id: "prin_dev",
+      tool: "ownmesh_session_list", status: "completed", summary: "device completed first",
+      data: { entries: [] }, truncated: false, next_cursor: null, approval_required: false, warnings: [], expires_at: expiresAt,
+      policy_authority: "ownmesh_device", created_at: new Date(now - 60_000).toISOString(), updated_at: new Date(now).toISOString(),
+    });
+
+    const stale = await callTool(store, token, "ownmesh_get_operation", { operation_id: "op_legacy_stale" });
+    const staleResult = stale.body.result!.structuredContent!;
+    assert.equal(staleResult.status, "failed");
+    assert.equal((staleResult.data as { phase?: string }).phase, "expired");
+    assert.equal(((staleResult.data as { error?: { code?: string } }).error?.code), "OWNMESH_E_OPERATION_EXPIRED");
+    const storedStale = await store.getMcpOperation("op_legacy_stale");
+    assert.equal(storedStale?.approval_required, false);
+    assert.equal(storedStale?.approval_id, "apr_preserved");
+    assert.equal(storedStale?.data.approval_id, "apr_preserved");
+
+    const terminal = await callTool(store, token, "ownmesh_get_operation", { operation_id: "op_legacy_terminal" });
+    assert.equal(terminal.body.result!.structuredContent!.status, "completed");
+    assert.deepEqual((await store.getMcpOperation("op_legacy_terminal"))?.data, { entries: [] });
+  } finally {
+    (Date as unknown as { now: () => number }).now = originalNow;
+  }
+});
