@@ -52,6 +52,8 @@ pub enum ExecError {
     IdempotencyConflict(String),
     #[error("journal error: {0}")]
     Journal(String),
+    #[error("resource limit: {0}")]
+    ResourceLimit(String),
     #[error("cancelled")]
     Cancelled,
 }
@@ -251,7 +253,7 @@ fn is_script_or_interpreter_in_dir(program: &str, cwd: Option<&Path>) -> bool {
 /// Hard ceiling for structured executable pin/revalidation hashing.
 /// Prevents a remote full-access structured command from forcing unbounded
 /// `read()` of a huge regular file before policy execution.
-pub const MAX_EXECUTABLE_PIN_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_EXECUTABLE_PIN_BYTES: u64 = ownmesh_domain::MAX_STRUCTURED_EXECUTABLE_BYTES;
 
 /// Hard ceiling for the on-disk idempotency journal file.
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -259,7 +261,7 @@ pub const MAX_JOURNAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
 /// Stream SHA-256 of a regular file up to `max_bytes` without unbounded allocation.
 fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResult<String> {
     if expected_len > max_bytes {
-        return Err(ExecError::Journal(format!(
+        return Err(ExecError::ResourceLimit(format!(
             "executable exceeds {max_bytes} byte pin budget: {} ({expected_len} bytes)",
             path.display()
         )));
@@ -276,7 +278,7 @@ fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResu
         }
         total = total.saturating_add(n as u64);
         if total > max_bytes {
-            return Err(ExecError::Journal(format!(
+            return Err(ExecError::ResourceLimit(format!(
                 "executable exceeded {max_bytes} byte pin budget while hashing: {}",
                 path.display()
             )));
@@ -1239,20 +1241,27 @@ mod tests {
     }
 
     #[test]
-    fn pin_executable_rejects_oversized_before_allocation() {
+    fn pin_executable_accepts_large_tool_and_rejects_over_limit() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("huge.bin");
+        let path = dir.path().join("large.bin");
         {
             let f = std::fs::File::create(&path).unwrap();
-            // Sparse when the FS supports it — still reports large len() for the ceiling.
-            f.set_len(MAX_EXECUTABLE_PIN_BYTES + 1).unwrap();
+            // Just beyond the former 64 MiB ceiling proves the larger bounded
+            // path without hashing a 299 MiB fixture on every CI platform.
+            f.set_len((64 * 1024 * 1024) + 1).unwrap();
         }
-        let err = pin_executable(&path, CommandKind::Structured).expect_err("must reject");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("pin budget") || msg.contains("byte"),
-            "unexpected error: {msg}"
-        );
+        let pin = pin_executable(&path, CommandKind::Structured).expect("must accept");
+        assert_eq!(pin.len, (64 * 1024 * 1024) + 1);
+        assert_eq!(pin.content_sha256.len(), 64);
+
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_EXECUTABLE_PIN_BYTES + 1)
+            .unwrap();
+        let error = pin_executable(&path, CommandKind::Structured).unwrap_err();
+        assert!(matches!(error, ExecError::ResourceLimit(_)));
     }
 
     #[test]

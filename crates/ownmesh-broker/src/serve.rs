@@ -16,6 +16,8 @@ use ownmesh_broker_client::{
     PeerBind, ReplayCache, DEFAULT_CAPABILITY_TTL_SECS, ELEVATED_CAPABILITY_SCOPE,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use ownmesh_domain::MAX_STRUCTURED_EXECUTABLE_BYTES;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use ownmesh_exec::{classify_command_kind_in_dir, CommandKind, RunRequest};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use sha2::{Digest, Sha256};
@@ -1290,7 +1292,7 @@ fn stage_linux_executable(
     let before = input.metadata().map_err(|e| e.to_string())?;
     if !before.file_type().is_file()
         || before.len() != facts.executable.image_len
-        || before.len() > 64 * 1024 * 1024
+        || before.len() > MAX_STRUCTURED_EXECUTABLE_BYTES
     {
         return Err("source executable type or bounded length changed (fail-closed)".into());
     }
@@ -1313,7 +1315,7 @@ fn stage_linux_executable(
             total = total
                 .checked_add(n as u64)
                 .ok_or_else(|| "source executable length overflow".to_string())?;
-            if total > 64 * 1024 * 1024 {
+            if total > MAX_STRUCTURED_EXECUTABLE_BYTES {
                 return Err("source executable exceeds staging bound".into());
             }
             hash.update(&buf[..n]);

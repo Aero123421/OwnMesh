@@ -47,6 +47,13 @@ pub const SHARED_FIXTURES_DIR: &str = concat!(
 pub const SHARED_SCHEMAS_DIR: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../spec-bundle/schemas");
 
+/// Maximum image size accepted for a pinned structured executable (512 MiB).
+///
+/// The cap admits normal large developer tools while keeping pinning,
+/// revalidation, and broker-private staging bounded. It is intentionally a
+/// hard policy/resource limit rather than a best-effort allocation limit.
+pub const MAX_STRUCTURED_EXECUTABLE_BYTES: u64 = 512 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
