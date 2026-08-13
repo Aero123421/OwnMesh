@@ -1287,6 +1287,140 @@ unsafe fn process_creation_filetime(
     Ok(u64::from(created.dwLowDateTime) | (u64::from(created.dwHighDateTime) << 32))
 }
 
+/// Return an OS-derived process birth identifier for a still-live PID.
+///
+/// `None` means the OS confirmed that the PID no longer exists.  An inability
+/// to inspect a live PID is an error, never a false "dead" result.  Callers
+/// can persist this value with a PID and reject a later PID reuse.
+#[cfg(windows)]
+pub fn process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: `OpenProcess` receives a scalar PID and the returned kernel
+    // handle is immediately wrapped in `OwnedHandle` for RAII cleanup.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        // ERROR_INVALID_PARAMETER is Windows' documented no-such-PID result.
+        return if error.raw_os_error() == Some(87) {
+            Ok(None)
+        } else {
+            Err(format!("OpenProcess({pid}) failed: {error}"))
+        };
+    }
+    // SAFETY: ownership of the non-null handle returned above is transferred
+    // exactly once to `OwnedHandle`.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: the owned process handle remains live for this call.
+    unsafe { process_creation_filetime(process.as_raw_handle()).map(Some) }
+}
+
+/// Linux `/proc/<pid>/stat` start time is kernel-supplied and changes on PID
+/// reuse.  Permission or parse failures fail closed rather than claiming a
+/// process is absent.
+#[cfg(target_os = "linux")]
+pub fn process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {path}: {error}")),
+    };
+    let end = stat
+        .rfind(')')
+        .ok_or_else(|| format!("parse {path}: missing comm terminator"))?;
+    let start = stat
+        .get(end + 2..)
+        .ok_or_else(|| format!("parse {path}: missing fields"))?;
+    start
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| format!("parse {path}: missing start time"))?
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| format!("parse {path} start time: {error}"))
+}
+
+/// macOS exposes the kernel-recorded process start timestamp through
+/// `proc_pidinfo(PROC_PIDTBSDINFO)`. Its second/microsecond pair changes when
+/// a numeric PID is reused, so encode it as a checked microsecond timestamp.
+#[cfg(target_os = "macos")]
+pub fn process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+    use std::mem::{size_of, MaybeUninit};
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(size_of::<libc::proc_bsdinfo>())
+        .map_err(|_| "proc_bsdinfo size exceeds c_int")?;
+    // SAFETY: `info` has exactly `size` writable bytes and `proc_pidinfo`
+    // initializes them on a successful full-size reply.
+    let copied = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid).map_err(|_| format!("PID {pid} exceeds c_int"))?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if copied == 0 {
+        let error = std::io::Error::last_os_error();
+        // proc_pidinfo reports an unknown/exited process as ESRCH (and some
+        // Darwin releases expose ENOENT for the same race). Other failures,
+        // including permission denial, remain indeterminate and fail closed.
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOENT) => Ok(None),
+            _ => Err(format!("proc_pidinfo({pid}) failed: {error}")),
+        };
+    }
+    if copied != size {
+        return Err(format!(
+            "proc_pidinfo({pid}) returned incomplete proc_bsdinfo ({copied} of {size} bytes)"
+        ));
+    }
+    // SAFETY: exact-size successful `proc_pidinfo` reply initialized info.
+    let info = unsafe { info.assume_init() };
+    const MICROS_PER_SECOND: u64 = 1_000_000;
+    if info.pbi_start_tvusec >= MICROS_PER_SECOND {
+        return Err(format!(
+            "proc_pidinfo({pid}) returned invalid start microseconds {}",
+            info.pbi_start_tvusec
+        ));
+    }
+    let birth = info
+        .pbi_start_tvsec
+        .checked_mul(MICROS_PER_SECOND)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .filter(|birth| *birth != 0)
+        .ok_or_else(|| format!("proc_pidinfo({pid}) returned invalid process start time"))?;
+    Ok(Some(birth))
+}
+
+/// Other platforms do not currently expose a safe, dependency-free process
+/// birth witness through the IPC crate.  Callers retain the session state
+/// instead of risking a PID-only reconciliation.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn process_birth_id(_pid: u32) -> Result<Option<u64>, String> {
+    Err("process birth identity is unavailable on this platform".into())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::process_birth_id;
+
+    #[test]
+    fn process_birth_id_is_stable_for_the_current_process() {
+        let first = process_birth_id(std::process::id())
+            .unwrap()
+            .expect("current process must have a Darwin birth witness");
+        let second = process_birth_id(std::process::id())
+            .unwrap()
+            .expect("current process must retain a Darwin birth witness");
+        assert_ne!(first, 0);
+        assert_eq!(first, second);
+    }
+}
+
 #[cfg(windows)]
 unsafe fn process_image_path_from_handle(
     handle: std::os::windows::io::RawHandle,

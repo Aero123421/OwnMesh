@@ -262,6 +262,14 @@ pub struct SidecarHostBinding {
     pub controller_epoch: u64,
     pub binding_expires_unix: i64,
     pub host_expires_unix: i64,
+    /// Child PID recorded by the authenticated supervisor at spawn/reattach.
+    /// It is only meaningful together with `child_process_birth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_pid: Option<u32>,
+    /// OS-issued start/birth witness for `child_pid`; prevents a later PID
+    /// reuse from being mistaken for the original session child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_process_birth: Option<u64>,
 }
 
 impl SessionInfo {
@@ -1015,6 +1023,15 @@ impl SessionManager {
     pub fn set_host_pid(&mut self, id: &str, pid: Option<u32>) -> SessionResult<()> {
         let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
         s.info.host_pid = pid;
+        Ok(())
+    }
+
+    /// Set a lifecycle state for durable recovery bookkeeping. The daemon uses
+    /// `Starting` only when a sidecar exists but its child identity could not
+    /// yet be attested; it is never a substitute for a running session.
+    pub fn set_state(&mut self, id: &str, state: SessionState) -> SessionResult<()> {
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        s.info.state = state;
         Ok(())
     }
 
