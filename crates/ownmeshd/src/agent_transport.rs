@@ -2836,6 +2836,9 @@ fn map_request_to_method(
         ("profile.show" | "profile", "profile.show" | "ownmesh_profile_show" | "show") => {
             methods::PROFILE_SHOW
         }
+        ("system.diagnose", "system.diagnose" | "ownmesh_system_diagnose" | "diagnose") => {
+            crate::runtime::ops_methods::SYSTEM_DIAGNOSE
+        }
         // Accept short fixture-style capability names used by the E0 contract samples.
         ("fs.read", _) => methods::OPS_FS_READ,
         ("fs.write", _) => methods::OPS_FS_WRITE,
@@ -2909,7 +2912,7 @@ fn map_request_to_method(
     Ok((method, Value::Object(args)))
 }
 
-/// Remote filesystem, Git, and command actions must carry the exact workspace
+/// Remote diagnosis, filesystem, Git, and command actions must carry the exact workspace
 /// selected by the control plane. The sole exception is an explicit absolute
 /// path/cwd compatibility request: it remains unbound (`workspace_id = null`)
 /// and the runtime admits it only in Full Access, never as `ws_default`.
@@ -2940,6 +2943,7 @@ fn require_workspace_binding_for_remote_action(
                 | "ownmesh_fs_patch"
                 | "ownmesh_fs_delete"
         ) | ("filesystem.delete", _)
+            | ("system.diagnose", _)
             | ("fs.read" | "fs.list" | "fs.write", _)
             | ("git.status" | "git.diff" | "git", _)
             | ("command.run", _)
@@ -2963,7 +2967,10 @@ fn require_workspace_binding_for_remote_action(
     if absolute {
         Ok(())
     } else {
-        Err("workspace_id is required for remote workspace-relative filesystem, Git, and command actions".into())
+        Err(
+            "workspace_id is required for remote diagnosis, filesystem, Git, and command actions"
+                .into(),
+        )
     }
 }
 
@@ -3014,7 +3021,8 @@ fn bind_envelope_workspace(
 fn bind_remote_result_workspace(mut result: Value, request: &OperationRequestPayload) -> Value {
     let scoped = matches!(
         request.capability.as_str(),
-        "filesystem.read"
+        "system.diagnose"
+            | "filesystem.read"
             | "filesystem.write"
             | "filesystem.delete"
             | "fs.read"

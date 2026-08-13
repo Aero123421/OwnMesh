@@ -29,6 +29,7 @@ import {
   verifyInternalContext,
 } from "./util.ts";
 import { createStore, type ControlPlaneStore, type McpOperationRecord } from "./store.ts";
+import { normalizeSystemDiagnosis } from "./mcp.ts";
 import { parseTransferPreflightResult, type TransferServerBinding } from "./transfer-orchestrator.ts";
 
 export const PROTOCOL = "ownmesh.device/1.0";
@@ -214,6 +215,9 @@ function requiredScopeForCapability(capability: string, actionOrOp: string): str
   }
   if (
     capability === "filesystem.read" ||
+    capability === "system.diagnose" ||
+    actionOrOp === "ownmesh_system_diagnose" ||
+    actionOrOp === "system.diagnose" ||
     actionOrOp.startsWith("ownmesh_fs_") ||
     actionOrOp.startsWith("ownmesh_profile") ||
     actionOrOp.startsWith("fs.")
@@ -3510,6 +3514,7 @@ export async function applyMcpOperationResult(
   // New absolute Full Access operations are explicitly bound to null; legacy
   // rows without the version field remain readable during rolling deployment.
   const workspaceBoundResultTool = new Set([
+    "ownmesh_system_diagnose",
     "ownmesh_fs_list", "ownmesh_list_files", "ownmesh_fs_stat", "ownmesh_fs_read", "ownmesh_read_file",
     "ownmesh_fs_write", "ownmesh_write_file", "ownmesh_fs_patch", "ownmesh_fs_delete",
     "ownmesh_command_run", "ownmesh_run_command", "ownmesh_command_shell", "ownmesh_run_shell",
@@ -3580,10 +3585,25 @@ export async function applyMcpOperationResult(
 
   let safeSummary: string | undefined;
   const internalTransferTool = isInternalTransferTool(op.tool);
+  const systemDiagnosisTool = op.tool === "ownmesh_system_diagnose";
   let data =
     payload.result && typeof payload.result === "object"
       ? (payload.result as Record<string, unknown>)
       : { ...payload };
+  if (systemDiagnosisTool) {
+    const device = op.device_id ? await store.getDevice(op.device_id) : null;
+    if (!device) return { ok: false, error: "diagnosis_device_missing" };
+    // This is the durable async result path. Apply the same allowlist as the
+    // immediate MCP path before any Agent result can enter operation storage.
+    data = normalizeSystemDiagnosis(
+      status === "completed" ? data : null,
+      device,
+      "online",
+    );
+    safeSummary = status === "completed"
+      ? "system diagnosis completed"
+      : "system diagnosis unavailable";
+  }
   if (op.tool === "__transfer_preflight_source" || op.tool === "__transfer_preflight_source_final" || op.tool === "__transfer_preflight_destination") {
     // A failed preflight carries only the normal bounded error envelope; a
     // completed preflight must pass the exact metadata/proof correlation gate.
@@ -3649,7 +3669,10 @@ export async function applyMcpOperationResult(
       safeSummary = internalTransferFailureSummary(op.tool, status);
     }
   }
-  if (status === "approval_required" && errDetails && !internalTransferTool) {
+  if (
+    status === "approval_required" && errDetails &&
+    !internalTransferTool && !systemDiagnosisTool
+  ) {
     Object.assign(data, {
       approval_required: true,
       approval_id: errDetails.approval_id ?? payload.approval_id,
@@ -3702,7 +3725,7 @@ export async function applyMcpOperationResult(
       next_cursor: nextCursor,
       approval_required: status === "approval_required",
       approval_id: approvalId,
-      session_id: internalTransferTool
+      session_id: internalTransferTool || systemDiagnosisTool
         ? op.session_id
         : payload.session_id != null ? String(payload.session_id) : op.session_id,
     },

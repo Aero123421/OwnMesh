@@ -14,10 +14,10 @@ use super::{
     normalize_handoff_target, official_adapter_spec, parse_adapter_event_page, parse_params,
     persistent_child_is_live, preset_name, reject_spoofed_principal, session_err, sha256_hex,
     AdapterDialect, ClientIdentity, DaemonRuntime, Deserialize, HostIoMode, IpcError, IpcResult,
-    LiveHost, NativeResume, Path, ProfileRegistry, PtyCommand, PtySize, SessionKind,
-    SessionStreamKind, SidecarHostBinding, SupervisorCommand, SupervisorEnv,
-    SupervisorSpawnRequest, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
-    Value,
+    LiveHost, NativeResume, OperationFacts, Path, ProfileRegistry, PtyCommand, PtySize,
+    SessionKind, SessionState, SessionStreamKind, SidecarHostBinding, SupervisorCommand,
+    SupervisorEnv, SupervisorSpawnRequest, SystemDiagnoseParams, TransitionKind, TransitionPhase,
+    TransitionRecord, TransitionTarget, Value,
 };
 
 /// Structured sidecar pages are capped below the durable MCP result budget.
@@ -26,6 +26,124 @@ use super::{
 const MAX_STRUCTURED_SIDECAR_PAGE_BYTES: usize = 48 * 1024;
 
 impl DaemonRuntime {
+    pub(super) async fn handle_system_diagnose(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let mut p: SystemDiagnoseParams = parse_params(params)?;
+        let workspace_id = Self::canonical_workspace_id(p.workspace_id.as_deref())?;
+        if !self.workspaces.iter().any(|workspace| {
+            workspace.id == workspace_id
+                || (workspace_id == "ws_default" && workspace.id == "default")
+        }) {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "requested workspace is not registered on this device".into(),
+            });
+        }
+        p.workspace_id = Some(workspace_id.clone());
+        let facts = OperationFacts {
+            capability: "system.diagnose".into(),
+            kind: "metadata".into(),
+            workspace_relative: true,
+            workspace_id: Some(workspace_id),
+            ..Default::default()
+        };
+        // This read-only observation is bound to the remote operation itself;
+        // it never reserves the local side-effect idempotency journal.
+        self.gate_and_run(
+            facts,
+            None,
+            super::PendingRequest::SystemDiagnose(p),
+            client,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_system_diagnose(
+        &self,
+        _params: &SystemDiagnoseParams,
+    ) -> IpcResult<Value> {
+        let observed_at = ownmesh_domain::Timestamp::now().to_rfc3339();
+        let now = Self::now();
+        let sessions = self.sessions.list();
+        let nonterminal_sessions = sessions
+            .iter()
+            .filter(|session| session.state != SessionState::Closed)
+            .count();
+        let registry_stale_sessions = sessions
+            .iter()
+            .filter(|session| {
+                session.state == SessionState::Starting
+                    || (session.state != SessionState::Closed
+                        && session
+                            .sidecar_host
+                            .as_ref()
+                            .is_some_and(|binding| binding.host_expires_unix <= now))
+            })
+            .count();
+        let live_sidecars = sessions
+            .iter()
+            .filter_map(|session| {
+                (session.state != SessionState::Closed)
+                    .then_some(session.sidecar_host.as_ref())
+                    .flatten()
+                    .filter(|binding| binding.host_expires_unix > now)
+                    .map(|binding| {
+                        (
+                            session.id.as_str(),
+                            binding,
+                            session.state == SessionState::Starting,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let supervisor_required = !live_sidecars.is_empty();
+        let (supervisor_available, supervisor_host_stale) = match self.supervisor.as_ref() {
+            _ if !supervisor_required => (true, 0),
+            None => (false, 0),
+            Some(supervisor) => {
+                let probe = async {
+                    let mut stale = 0;
+                    for (session_id, binding, already_stale) in live_sidecars {
+                        match supervisor
+                            .status(&super::supervisor_binding_from(session_id, binding))
+                            .await
+                        {
+                            Ok(status) if status.exited && !already_stale => stale += 1,
+                            // A typed server reply proves the supervisor is reachable;
+                            // failure to find/match this live binding makes the registry stale.
+                            Err(IpcError::Remote { .. }) if !already_stale => stale += 1,
+                            Ok(_) | Err(IpcError::Remote { .. }) => {}
+                            Err(_) => return None,
+                        }
+                    }
+                    Some(stale)
+                };
+                // Keep the typed health probe inside the Control Plane's bounded
+                // one-call wait. Healthy local supervisor IPC completes promptly;
+                // a slow or wedged supervisor is itself the unavailable result.
+                match tokio::time::timeout(std::time::Duration::from_millis(250), probe).await {
+                    Ok(Some(stale)) => (true, stale),
+                    Ok(None) | Err(_) => (false, 0),
+                }
+            }
+        };
+        let stale_sessions = registry_stale_sessions + supervisor_host_stale;
+        Ok(system_diagnosis_payload(
+            &observed_at,
+            SystemDiagnosisFacts {
+                lockdown: self.lockdown,
+                supervisor_required,
+                supervisor_available,
+                session_count: sessions.len(),
+                nonterminal_sessions,
+                stale_sessions,
+            },
+        ))
+    }
+
     pub(super) async fn handle_session_open(
         &mut self,
         params: Option<Value>,
@@ -2386,5 +2504,150 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             "live_pty": true,
             "resize_seq": applied_seq,
         }))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SystemDiagnosisFacts {
+    lockdown: bool,
+    supervisor_required: bool,
+    supervisor_available: bool,
+    session_count: usize,
+    nonterminal_sessions: usize,
+    stale_sessions: usize,
+}
+
+fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> Value {
+    let supervisor_state = if !facts.supervisor_required {
+        "not_required"
+    } else if facts.supervisor_available {
+        "available"
+    } else {
+        "unavailable"
+    };
+    let overall = if facts.lockdown {
+        "lockdown"
+    } else if supervisor_state == "unavailable" {
+        "supervisor_unavailable"
+    } else if facts.stale_sessions > 0 {
+        "stale_sessions"
+    } else {
+        "healthy"
+    };
+    let recommendation = match overall {
+        "lockdown" => "unlock_locally",
+        "supervisor_unavailable" => "restart_session_supervisor",
+        "stale_sessions" => "reconcile_stale_sessions",
+        _ => "none",
+    };
+    json!({
+        "schema": "ownmesh.system_diagnosis/1.0",
+        "overall": overall,
+        "observed_at": observed_at,
+        "agent": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": ownmesh_protocol::PROTOCOL_DEVICE_V1,
+            "provenance": "observed",
+            "observed_at": observed_at,
+        },
+        "checks": [
+            {
+                "id": "policy", "status": "pass", "state": "allow",
+                "provenance": "authoritative", "observed_at": observed_at,
+            },
+            {
+                "id": "workspace", "status": "pass", "state": "bound",
+                "provenance": "authoritative", "observed_at": observed_at,
+            },
+            {
+                "id": "daemon",
+                "status": if facts.lockdown { "warn" } else { "pass" },
+                "state": if facts.lockdown { "lockdown" } else { "running" },
+                "provenance": "observed", "observed_at": observed_at,
+            },
+            {
+                "id": "session_supervisor",
+                "status": if supervisor_state == "unavailable" { "fail" } else { "pass" },
+                "state": supervisor_state,
+                "provenance": "observed", "observed_at": observed_at,
+            },
+            {
+                "id": "sessions",
+                "status": if facts.stale_sessions > 0 { "warn" } else { "pass" },
+                "state": if facts.stale_sessions > 0 { "stale" } else { "healthy" },
+                "provenance": "authoritative", "observed_at": observed_at,
+                "count": facts.session_count,
+                "nonterminal_count": facts.nonterminal_sessions,
+                "stale_count": facts.stale_sessions,
+            },
+        ],
+        "recommendation": recommendation,
+    })
+}
+
+#[cfg(test)]
+mod system_diagnosis_tests {
+    use super::{system_diagnosis_payload, SystemDiagnosisFacts};
+
+    #[test]
+    fn common_device_local_states_are_typed_and_redacted() {
+        let cases = [
+            (
+                SystemDiagnosisFacts {
+                    lockdown: false,
+                    supervisor_required: false,
+                    supervisor_available: true,
+                    session_count: 0,
+                    nonterminal_sessions: 0,
+                    stale_sessions: 0,
+                },
+                "healthy",
+                "none",
+            ),
+            (
+                SystemDiagnosisFacts {
+                    lockdown: false,
+                    supervisor_required: true,
+                    supervisor_available: false,
+                    session_count: 1,
+                    nonterminal_sessions: 1,
+                    stale_sessions: 0,
+                },
+                "supervisor_unavailable",
+                "restart_session_supervisor",
+            ),
+            (
+                SystemDiagnosisFacts {
+                    lockdown: false,
+                    supervisor_required: false,
+                    supervisor_available: true,
+                    session_count: 1,
+                    nonterminal_sessions: 1,
+                    stale_sessions: 1,
+                },
+                "stale_sessions",
+                "reconcile_stale_sessions",
+            ),
+        ];
+        for (facts, overall, recommendation) in cases {
+            let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
+            assert_eq!(value["overall"], overall);
+            assert_eq!(value["recommendation"], recommendation);
+            assert_eq!(value["checks"].as_array().map(Vec::len), Some(5));
+            let serialized = value.to_string();
+            for forbidden in [
+                "credential",
+                "command",
+                "argv",
+                "environment",
+                "cwd",
+                "path",
+            ] {
+                assert!(
+                    !serialized.contains(forbidden),
+                    "leaked forbidden field: {serialized}"
+                );
+            }
+        }
     }
 }
