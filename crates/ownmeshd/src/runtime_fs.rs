@@ -84,6 +84,9 @@ impl DaemonRuntime {
             body.as_object_mut()
                 .expect("object")
                 .insert("next_offset".into(), json!(next_offset));
+            body.as_object_mut()
+                .expect("object")
+                .insert("next_cursor".into(), json!(format!("off_{next_offset}")));
         }
         Ok(body)
     }
@@ -197,6 +200,7 @@ impl DaemonRuntime {
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: FsReadParams = parse_params(params)?;
+        normalize_fs_read_cursor(&mut p)?;
         p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
@@ -256,5 +260,189 @@ impl DaemonRuntime {
         let key = p.idempotency_key.clone();
         self.gate_and_run(facts, key, PendingRequest::FsDelete(p), client)
             .await
+    }
+}
+
+/// Normalize the only supported filesystem read continuation token.
+///
+/// A file-read cursor is deliberately just a canonical byte offset: it carries
+/// no path, workspace, or authority, all of which remain exact action facts and
+/// are rechecked independently. Reject alternate encodings and contradictory
+/// offset/cursor pairs so a caller cannot accidentally reread or skip bytes.
+fn normalize_fs_read_cursor(p: &mut FsReadParams) -> IpcResult<()> {
+    let Some(cursor) = p.cursor.take() else {
+        return Ok(());
+    };
+    let offset = cursor
+        .strip_prefix("off_")
+        .filter(|raw| !raw.is_empty() && raw.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|offset| cursor == format!("off_{offset}"))
+        .ok_or_else(|| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: "invalid fs.read cursor".into(),
+        })?;
+    if p.offset.is_some_and(|explicit| explicit != offset) {
+        return Err(IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message: "fs.read cursor and offset disagree".into(),
+        });
+    }
+    p.offset = Some(offset);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ownmesh_config::OwnMeshPaths;
+    use ownmesh_ipc::methods;
+    use ownmesh_policy::{preset_document, AccessPreset};
+    use tempfile::tempdir;
+
+    fn read_result(response: &Value) -> &Value {
+        response
+            .get("result")
+            .expect("allowed read includes a result")
+    }
+
+    #[tokio::test]
+    async fn fs_read_cursor_resumes_utf8_and_binary_without_duplicate_bytes() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let root = paths.state_dir.join("workspace");
+        std::fs::write(root.join("utf8.txt"), "abécd").unwrap();
+        std::fs::write(root.join("binary.bin"), [0_u8, 255, 1, 254, 2, 253]).unwrap();
+        let client = ClientIdentity::new("fs-read-cursor-test", "test");
+
+        let first = runtime
+            .dispatch(
+                methods::OPS_FS_READ,
+                Some(json!({ "path": "utf8.txt", "max_bytes": 4 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let first = read_result(&first);
+        assert_eq!(first["content"], "abé");
+        assert_eq!(first["next_cursor"], "off_4");
+        let second = runtime
+            .dispatch(
+                methods::OPS_FS_READ,
+                Some(json!({ "path": "utf8.txt", "max_bytes": 4, "cursor": first["next_cursor"] })),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            format!(
+                "{}{}",
+                first["content"].as_str().unwrap(),
+                read_result(&second)["content"].as_str().unwrap()
+            ),
+            "abécd"
+        );
+
+        let first = runtime
+            .dispatch(
+                methods::OPS_FS_READ,
+                Some(json!({ "path": "binary.bin", "max_bytes": 3 })),
+                &client,
+            )
+            .await
+            .unwrap();
+        let first = read_result(&first);
+        assert_eq!(first["encoding"], "base64");
+        assert_eq!(first["next_cursor"], "off_3");
+        assert_eq!(first["content"], "AP8B");
+        let second = runtime
+            .dispatch(
+                methods::OPS_FS_READ,
+                Some(
+                    json!({ "path": "binary.bin", "max_bytes": 3, "cursor": first["next_cursor"] }),
+                ),
+                &client,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_result(&second)["encoding"], "base64");
+        assert_eq!(read_result(&second)["offset"], 3);
+        assert_eq!(read_result(&second)["content"], "/gL9");
+    }
+
+    #[tokio::test]
+    async fn fs_read_rejects_noncanonical_or_conflicting_continuations() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        std::fs::write(paths.state_dir.join("workspace").join("a.txt"), b"abcdef").unwrap();
+        let client = ClientIdentity::new("fs-read-cursor-invalid-test", "test");
+
+        let same_offset = runtime
+            .dispatch(
+                methods::OPS_FS_READ,
+                Some(json!({ "path": "a.txt", "cursor": "off_3", "offset": 3 })),
+                &client,
+            )
+            .await
+            .expect("matching cursor and offset are one canonical read");
+        assert_eq!(read_result(&same_offset)["offset"], 3);
+
+        for params in [
+            json!({ "path": "a.txt", "cursor": "cur_4" }),
+            json!({ "path": "a.txt", "cursor": "off_04" }),
+            json!({ "path": "a.txt", "cursor": "off_4", "offset": 3 }),
+        ] {
+            let error = runtime
+                .dispatch(methods::OPS_FS_READ, Some(params), &client)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_write_stale_hash_is_conflict_and_preserves_file() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let path = paths.state_dir.join("workspace").join("guarded.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let client = ClientIdentity::new("fs-write-hash-conflict-test", "test");
+
+        let error = runtime
+            .dispatch(
+                methods::OPS_FS_WRITE,
+                Some(json!({
+                    "path": "guarded.txt",
+                    "content": "after",
+                    "expected_sha256": "0".repeat(64),
+                    "idempotency_key": "fs-write-stale-hash"
+                })),
+                &client,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IpcError::Remote {
+                code: app_error::CONFLICT,
+                ..
+            }
+        ));
+        assert!(error
+            .to_string()
+            .ends_with("file changed since it was read"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
     }
 }
