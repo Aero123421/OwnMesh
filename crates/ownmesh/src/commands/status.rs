@@ -69,7 +69,7 @@ async fn status_async(cli: &Cli) -> Result<(), ExitCode> {
             reconnect_base_delay: Duration::from_millis(50),
         },
     )
-    .with_client_credential_from_env()
+    .with_client_credential_from_env_or_management_file(&paths.state_dir)
     .map_err(|err| {
         fail(
             cli,

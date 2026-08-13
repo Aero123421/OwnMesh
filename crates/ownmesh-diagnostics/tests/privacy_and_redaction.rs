@@ -20,8 +20,8 @@
 
 use ownmesh_diagnostics::{
     build_support_bundle, redact_text, run_doctor, BinaryObservation, CheckStatus,
-    ConfigObservation, ControlPlaneObservation, CredentialObservation, DaemonObservation,
-    DoctorInput, PrivacyPolicyObservation, ServiceObservation,
+    ConfigObservation, ControlPlaneObservation, CredentialObservation, CredentialState,
+    DaemonObservation, DoctorInput, PrivacyPolicyObservation, ServiceObservation,
 };
 use std::collections::BTreeMap;
 
@@ -47,12 +47,16 @@ fn base_input() -> DoctorInput {
             human_refresh_present: true,
             device_key_present: true,
             device_credential_present: true,
+            human_refresh_state: CredentialState::default(),
+            device_key_state: CredentialState::default(),
+            device_credential_state: CredentialState::default(),
             auth_session_present: true,
             enrolled_device_id_present: true,
         },
         daemon: DaemonObservation {
             endpoint: Some("local".into()),
             reachable: true,
+            pid: Some(1),
             message: None,
         },
         control_plane: ControlPlaneObservation {
@@ -120,6 +124,33 @@ fn doctor_warns_when_telemetry_or_relay_opted_in() {
         .checks
         .iter()
         .any(|c| c.id == "privacy.relay" && c.status == CheckStatus::Warn));
+}
+
+#[test]
+fn credential_states_are_explicit_without_values() {
+    let mut input = base_input();
+    input.credentials.human_refresh_present = false;
+    input.credentials.human_refresh_state = CredentialState::Unknown;
+    input.credentials.device_key_present = false;
+    input.credentials.device_key_state = CredentialState::NotRequiredForCurrentMode;
+    input.credentials.device_credential_present = false;
+    input.credentials.device_credential_state = CredentialState::Missing;
+    let report = run_doctor(&input);
+
+    for (id, state) in [
+        ("credential.human", CredentialState::Unknown),
+        (
+            "credential.device_key",
+            CredentialState::NotRequiredForCurrentMode,
+        ),
+        ("credential.device_connect", CredentialState::Missing),
+    ] {
+        let check = report.checks.iter().find(|check| check.id == id).unwrap();
+        assert_eq!(check.state, Some(state));
+    }
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(json.contains("not_required_for_current_mode"));
+    assert!(!json.contains("refresh_token"));
 }
 
 #[test]

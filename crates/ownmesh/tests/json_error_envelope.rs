@@ -39,7 +39,7 @@ fn run_json(root: &tempfile::TempDir, args: &[&str]) -> (i32, String, String) {
         .env("OWNMESH_STATE_DIR", base.join("state"))
         .env("OWNMESH_RUNTIME_DIR", base.join("run"))
         // Keep the probe local: no control plane is configured in this root.
-        .env_remove("OWNMESH_IPC_CLIENT_CREDENTIAL")
+        .env_remove("OWNMESH_CLIENT_CREDENTIAL")
         .output()
         .expect("run ownmesh");
     (

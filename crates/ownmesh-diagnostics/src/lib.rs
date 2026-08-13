@@ -86,6 +86,10 @@ pub struct DoctorCheck {
     /// Optional structured detail that must never contain secret values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Credential availability, when this check describes credential state.
+    /// This is metadata only; no credential value is ever included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<CredentialState>,
 }
 
 impl DoctorCheck {
@@ -96,6 +100,7 @@ impl DoctorCheck {
             status: CheckStatus::Pass,
             message: message.into(),
             detail: None,
+            state: None,
         }
     }
 
@@ -106,6 +111,7 @@ impl DoctorCheck {
             status: CheckStatus::Warn,
             message: message.into(),
             detail: None,
+            state: None,
         }
     }
 
@@ -116,12 +122,19 @@ impl DoctorCheck {
             status: CheckStatus::Fail,
             message: message.into(),
             detail: None,
+            state: None,
         }
     }
 
     #[must_use]
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_credential_state(mut self, state: CredentialState) -> Self {
+        self.state = Some(state);
         self
     }
 }
@@ -202,12 +215,33 @@ pub struct ConfigObservation {
     pub message: Option<String>,
 }
 
-/// Credential *presence* only — never include token/key material.
+/// Truthful availability of a secret without reading its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialState {
+    /// Non-secret metadata establishes that the credential was stored.
+    Present,
+    /// It is required for the configured mode and non-secret metadata establishes it is absent.
+    Missing,
+    /// A file/keychain-backed credential may exist, but read-only diagnostics cannot prove it.
+    #[default]
+    Unknown,
+    /// The active local mode does not require this credential.
+    NotRequiredForCurrentMode,
+}
+
+/// Credential availability metadata only — never include token/key material.
 #[derive(Debug, Clone, Default)]
 pub struct CredentialObservation {
+    /// Compatibility presence flag for integrations that have only a positive observation.
     pub human_refresh_present: bool,
+    /// Compatibility presence flag for integrations that have only a positive observation.
     pub device_key_present: bool,
+    /// Compatibility presence flag for integrations that have only a positive observation.
     pub device_credential_present: bool,
+    pub human_refresh_state: CredentialState,
+    pub device_key_state: CredentialState,
+    pub device_credential_state: CredentialState,
     pub auth_session_present: bool,
     pub enrolled_device_id_present: bool,
 }
@@ -217,6 +251,8 @@ pub struct CredentialObservation {
 pub struct DaemonObservation {
     pub endpoint: Option<String>,
     pub reachable: bool,
+    /// Observed only from a successful local IPC `daemon.status` response.
+    pub pid: Option<u32>,
     pub message: Option<String>,
 }
 
@@ -391,40 +427,35 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         }
     }
 
-    // Credential presence (values never appear)
-    if input.credentials.human_refresh_present {
-        checks.push(DoctorCheck::pass(
-            "credential.human",
-            "human refresh credential present (value redacted)",
-        ));
-    } else {
-        checks.push(DoctorCheck::warn(
-            "credential.human",
-            "human refresh credential absent (run `ownmesh login`)",
-        ));
-    }
-    if input.credentials.device_key_present {
-        checks.push(DoctorCheck::pass(
-            "credential.device_key",
-            "device key material present (value redacted)",
-        ));
-    } else {
-        checks.push(DoctorCheck::warn(
-            "credential.device_key",
-            "device key material absent",
-        ));
-    }
-    if input.credentials.device_credential_present {
-        checks.push(DoctorCheck::pass(
-            "credential.device_connect",
-            "device connect credential present (value redacted)",
-        ));
-    } else {
-        checks.push(DoctorCheck::warn(
-            "credential.device_connect",
-            "device connect credential absent (run `ownmesh device enroll`)",
-        ));
-    }
+    // Credential availability (values never appear). Do not equate the absence
+    // of a file-backed fallback with absence from an OS keychain.
+    checks.push(credential_check(
+        "credential.human",
+        observed_credential_state(
+            input.credentials.human_refresh_present,
+            input.credentials.human_refresh_state,
+        ),
+        "human refresh credential",
+        Some("run `ownmesh login`"),
+    ));
+    checks.push(credential_check(
+        "credential.device_key",
+        observed_credential_state(
+            input.credentials.device_key_present,
+            input.credentials.device_key_state,
+        ),
+        "device key material",
+        Some("run `ownmesh device enroll`"),
+    ));
+    checks.push(credential_check(
+        "credential.device_connect",
+        observed_credential_state(
+            input.credentials.device_credential_present,
+            input.credentials.device_credential_state,
+        ),
+        "device connect credential",
+        Some("run `ownmesh device enroll`"),
+    ));
     if input.credentials.enrolled_device_id_present {
         checks.push(DoctorCheck::pass(
             "enrollment",
@@ -648,6 +679,42 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         },
         checks,
     )
+}
+
+fn observed_credential_state(present: bool, state: CredentialState) -> CredentialState {
+    if present {
+        CredentialState::Present
+    } else {
+        state
+    }
+}
+
+fn credential_check(
+    id: &str,
+    state: CredentialState,
+    label: &str,
+    remediation: Option<&str>,
+) -> DoctorCheck {
+    let check = match state {
+        CredentialState::Present => {
+            DoctorCheck::pass(id, format!("{label} present (value redacted)"))
+        }
+        CredentialState::Missing => DoctorCheck::warn(
+            id,
+            format!(
+                "{label} missing{}",
+                remediation.map_or(String::new(), |hint| format!("; {hint}"))
+            ),
+        ),
+        CredentialState::Unknown => DoctorCheck::warn(
+            id,
+            format!("{label} state unknown (may be managed in the OS keychain)"),
+        ),
+        CredentialState::NotRequiredForCurrentMode => {
+            DoctorCheck::pass(id, format!("{label} not required for current mode"))
+        }
+    };
+    check.with_credential_state(state)
 }
 
 /// Legacy thin input used by older tests — maps into [`DoctorInput`].
