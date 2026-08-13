@@ -341,6 +341,7 @@ test("MCP: router unavailable from DO 429 → failed, not pending", async () => 
     (sc.data as { error: { code: string } }).error.code,
     "OWNMESH_E_DEVICE_ROOM_UNAVAILABLE",
   );
+  assert.equal(JSON.stringify(sc).includes("upstream_detail"), false);
 });
 
 test("MCP end-to-end: routeToDeviceRoom 403 stub → failed via real router path", async () => {

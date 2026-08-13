@@ -200,6 +200,12 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 - Large lists/files set `truncated: true` and `next_cursor` (`cur_…`).
 - With `async: false` (or omitted), the Worker waits at most one second for an
   authoritative device result, then returns a pollable non-terminal operation.
+- `content[0].text` is the JSON encoding of this same compact envelope for
+  MCP 2025-03-26 and existing CLI compatibility.
+- Durable authority fields (principal/tenant identity, action and payload
+  hashes, claim state, and dispatch outbox data) are never returned. Pass
+  `include_diagnostics: true` to operation polling only when the bounded,
+  redacted timing/tool metadata is needed.
 - Long commands should pass `async: true` and poll `ownmesh_get_operation`.
 - `phase` is server-derived (`queued`, `delivered`, `executing`,
   `waiting_approval`, or a terminal phase); `status` remains backward compatible.
