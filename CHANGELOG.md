@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## v1.2.6 — Runtime correctness and agent ergonomics
+
+- Device enrollment state and live routing presence are reported separately;
+  expired operations and reconnect backoff now converge after idle/restart paths.
+- Interrupted session creation and stale supervisor state reconcile only with
+  exact process-birth or authenticated supervisor evidence.
+- Linked Git worktrees, Rustup proxy execution, file-read cursors, optimistic
+  hash conflicts, Windows command output, and large executable pinning are
+  handled consistently.
+- Remote filesystem, Git, command, and diagnosis operations bind an explicit
+  workspace and its authoritative version through request and result receipts.
+- Synchronous MCP calls wait briefly for fast terminal results, while normal
+  responses are compact and durable authority metadata remains server-side.
+- Codex replay events are normalized into bounded semantic events, and the new
+  typed diagnosis tool explains common offline/supervisor/stale-session states
+  without exposing logs, paths, argv, environment values, or credentials.
+- The official CLI securely loads its managed IPC credential and Doctor reports
+  credential/service states without incorrectly declaring keychain data absent.
+- `/health` is a storage-free liveness probe; `/health/ready` remains the
+  fail-closed dependency and schema readiness check.
+
 ## v1.2.5 — Authentication recovery and rate-limit resilience
 
 - Remote operation polling now stays below the control-plane credential rate

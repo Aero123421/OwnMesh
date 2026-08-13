@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.5 · **Last updated:** 2026-08-13
+**Baseline:** v1.2.6 · **Last updated:** 2026-08-13
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
