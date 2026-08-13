@@ -383,11 +383,20 @@ fn file_identity(_meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
-/// Resolve an executable exactly once through an explicit path or the current PATH.
-/// Callers can spawn the returned canonical path to prevent a classified symlink
-/// from being reopened through a different target.
+/// Resolve the executable path used for process invocation without dereferencing
+/// a symlink.  Some native proxy executables use their own filename to select
+/// behavior (for example Rustup's `cargo.exe` proxy), so callers that need
+/// those semantics must retain this path separately from the canonical backing
+/// executable used for identity pinning.
 #[must_use]
-pub fn resolve_executable_path(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+pub fn resolve_executable_invocation_path(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let absolute = |path: PathBuf| {
+        if path.is_absolute() {
+            Some(path)
+        } else {
+            std::env::current_dir().ok().map(|base| base.join(path))
+        }
+    };
     let raw = program.trim().trim_matches('"').trim_matches('\'');
     if raw.is_empty() {
         return None;
@@ -399,7 +408,7 @@ pub fn resolve_executable_path(program: &str, cwd: Option<&Path>) -> Option<Path
         } else {
             cwd.unwrap_or_else(|| Path::new(".")).join(path)
         };
-        return std::fs::canonicalize(candidate).ok();
+        return candidate.is_file().then(|| absolute(candidate)).flatten();
     }
 
     let search = std::env::var_os("PATH")?;
@@ -410,20 +419,31 @@ pub fn resolve_executable_path(program: &str, cwd: Option<&Path>) -> Option<Path
             cwd.unwrap_or_else(|| Path::new(".")).join(directory)
         };
         let direct = directory.join(raw);
-        if let Ok(resolved) = std::fs::canonicalize(&direct) {
-            return Some(resolved);
+        if direct.is_file() {
+            return absolute(direct);
         }
         #[cfg(windows)]
         if Path::new(raw).extension().is_none() {
             for ext in ["exe", "cmd", "bat", "com"] {
-                if let Ok(resolved) = std::fs::canonicalize(directory.join(format!("{raw}.{ext}")))
-                {
-                    return Some(resolved);
+                let candidate = directory.join(format!("{raw}.{ext}"));
+                if candidate.is_file() {
+                    return absolute(candidate);
                 }
             }
         }
     }
     None
+}
+
+/// Resolve an executable through an explicit path or the current PATH.
+///
+/// The returned canonical backing path is suitable for executable identity
+/// pinning.  If the invocation name itself carries semantics, retain
+/// [`resolve_executable_invocation_path`] as well and revalidate both before
+/// spawning.
+#[must_use]
+pub fn resolve_executable_path(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    std::fs::canonicalize(resolve_executable_invocation_path(program, cwd)?).ok()
 }
 
 fn is_shell_binary_in_dir(program: &str, cwd: Option<&Path>) -> bool {
@@ -1484,6 +1504,14 @@ mod tests {
             idempotency_key: None,
         };
         assert_eq!(request_fingerprint(&req), request_fingerprint(&req));
+    }
+
+    #[test]
+    fn invocation_resolution_keeps_relative_path_absolute_without_canonicalizing() {
+        let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = resolve_executable_invocation_path("./Cargo.toml", Some(cwd)).unwrap();
+        assert!(path.is_absolute(), "invocation path must be persistable");
+        assert_eq!(path, cwd.join("./Cargo.toml"));
     }
 
     #[test]
