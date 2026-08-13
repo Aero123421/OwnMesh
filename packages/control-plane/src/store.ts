@@ -18,6 +18,8 @@ import {
 export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
 /** Rolling inactivity limit for a rotated refresh-token family. */
 export const REFRESH_TOKEN_IDLE_TTL_MS = 180 * 24 * 60 * 60 * 1000;
+/** Do not turn reconnect churn into a D1 write stream when metadata is unchanged. */
+export const DEVICE_READY_WRITE_INTERVAL_MS = 60_000;
 
 export type TokenRecord = {
   access_token: string;
@@ -56,8 +58,28 @@ export type DeviceRecord = {
   revoked: boolean;
   created_at: string;
   last_seen_at?: string;
+  /** Live session state is supplied by DeviceRoom, never used for authorization. */
+  connection_status?: "online" | "offline" | "unknown";
+  /** Explicit enrollment lifecycle; `status` remains for wire compatibility. */
+  enrollment_status?: "pending" | "active" | "revoked";
   status: "pending" | "active" | "revoked";
 };
+
+function shouldRecordReadyConnection(
+  device: DeviceRecord,
+  patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+): boolean {
+  if (
+    (patch.agent_version !== undefined && patch.agent_version !== device.agent_version) ||
+    patch.protocol_version !== device.protocol_version
+  ) {
+    return true;
+  }
+  const previous = device.last_seen_at ? Date.parse(device.last_seen_at) : NaN;
+  const observed = Date.parse(patch.last_seen_at);
+  return !Number.isFinite(previous) || !Number.isFinite(observed) ||
+    observed - previous >= DEVICE_READY_WRITE_INTERVAL_MS;
+}
 
 export type OAuthClientRecord = {
   client_id: string;
@@ -599,6 +621,17 @@ export interface ControlPlaneStore {
     id: string,
     principalId: string,
     patch: { name?: string; labels?: string[] },
+  ): Promise<DeviceRecord | null>;
+  /**
+   * Record a completed authenticated Agent handshake. This is deliberately
+   * connection-scoped (not heartbeat-scoped) and time-throttled when metadata
+   * is unchanged, avoiding a D1 write stream. The caller has already bound
+   * the live socket to this device credential; this method still refuses
+   * inactive or revoked devices.
+   */
+  recordDeviceReadyConnection(
+    id: string,
+    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
   ): Promise<DeviceRecord | null>;
   revokeDevice(id: string, principalId: string): Promise<boolean>;
   activateDeviceWithChallenge(deviceId: string, challengeId: string): Promise<boolean>;
@@ -1492,6 +1525,28 @@ export class MemoryStore implements ControlPlaneStore {
       ...device,
       ...(patch.name !== undefined ? { name: patch.name } : {}),
       ...(patch.labels !== undefined ? { labels: [...patch.labels] } : {}),
+    };
+    this.devices.set(id, updated);
+    return hydrateDevice(updated);
+  }
+  async recordDeviceReadyConnection(
+    id: string,
+    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+  ): Promise<DeviceRecord | null> {
+    const device = this.devices.get(id);
+    if (!device || device.revoked || device.status !== "active") return null;
+    if (!shouldRecordReadyConnection(device, patch)) return hydrateDevice(device);
+    const isNewer = !device.last_seen_at || patch.last_seen_at > device.last_seen_at;
+    const updated: DeviceRecord = {
+      ...device,
+      ...(isNewer && patch.agent_version ? { agent_version: patch.agent_version } : {}),
+      ...(isNewer ? { protocol_version: patch.protocol_version } : {}),
+      // The timestamp is server-generated. Keep it monotonic if two accepted
+      // connections finish out of order.
+      last_seen_at:
+        isNewer
+          ? patch.last_seen_at
+          : device.last_seen_at,
     };
     this.devices.set(id, updated);
     return hydrateDevice(updated);
@@ -3202,6 +3257,7 @@ export class SqlStore implements ControlPlaneStore {
       created_at: row.created_at,
       last_seen_at: row.last_seen_at ?? undefined,
       status: row.status,
+      enrollment_status: row.status,
     };
   }
 
@@ -3242,6 +3298,7 @@ export class SqlStore implements ControlPlaneStore {
         created_at: row.created_at,
         last_seen_at: row.last_seen_at ?? undefined,
         status: row.status,
+        enrollment_status: row.status,
       };
     });
   }
@@ -3277,6 +3334,39 @@ export class SqlStore implements ControlPlaneStore {
       return null;
     }
     const updated = await statement.run();
+    if (sqlChanges(updated) !== 1) return null;
+    return this.getDevice(id);
+  }
+
+  async recordDeviceReadyConnection(
+    id: string,
+    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+  ): Promise<DeviceRecord | null> {
+    const device = await this.getDevice(id);
+    if (!device || device.revoked || device.status !== "active") return null;
+    if (!shouldRecordReadyConnection(device, patch)) return device;
+    const publicKey = encodeDevicePublicKey(device.public_key, {
+      hostname: device.hostname,
+      os: device.os,
+      arch: device.arch,
+      agent_version: patch.agent_version || device.agent_version,
+      protocol_version: patch.protocol_version,
+    });
+    const updated = await this.db
+      .prepare(
+        `UPDATE devices
+         SET public_key = CASE
+               WHEN last_seen_at IS NULL OR last_seen_at < ? THEN ?
+               ELSE public_key
+             END,
+             last_seen_at = CASE
+               WHEN last_seen_at IS NULL OR last_seen_at < ? THEN ?
+               ELSE last_seen_at
+             END
+         WHERE id = ? AND revoked = 0 AND status = 'active'`,
+      )
+      .bind(patch.last_seen_at, publicKey, patch.last_seen_at, patch.last_seen_at, id)
+      .run();
     if (sqlChanges(updated) !== 1) return null;
     return this.getDevice(id);
   }
@@ -4661,6 +4751,7 @@ function hydrateDevice(d: DeviceRecord): DeviceRecord {
   const meta = parseDeviceMeta(d.public_key);
   return {
     ...d,
+    enrollment_status: d.status,
     labels: [...(d.labels ?? [])],
     hostname: d.hostname || meta.hostname || d.name,
     os: d.os && d.os !== "unknown" ? d.os : meta.os || "unknown",

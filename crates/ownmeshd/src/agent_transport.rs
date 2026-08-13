@@ -1477,6 +1477,10 @@ async fn perform_handshake(
         json!({
             "capabilities": capabilities,
             "operation_contracts": [OPERATION_CONTRACT_V1],
+            // DeviceRoom records display metadata only after proof+ready, not
+            // from the unauthenticated hello envelope.
+            "agent_version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": PROTOCOL_DEVICE_V1,
             "remote_routing_enabled": remote_routing_enabled,
         }),
         None,

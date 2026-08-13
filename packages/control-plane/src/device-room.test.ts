@@ -93,13 +93,21 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
     "accepted",
   );
 
-  await room.send(
+  const ready = await room.send(
     agent,
     envFor(agent, "ready", deviceId, {
       capabilities: ["filesystem.read", "filesystem.write", "command.run"],
+      agent_version: "1.2.5",
+      // Router derives this from the authenticated envelope protocol instead
+      // of trusting an independent payload value.
+      protocol_version: "untrusted-payload-value",
       remote_routing_enabled: true,
     }),
   );
+  assert.deepEqual(ready.authenticated_agent, {
+    agent_version: "1.2.5",
+    protocol_version: PROTOCOL,
+  });
   assert.equal((JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope).type, "ready.ack");
 
   // client operation -> agent
@@ -149,7 +157,22 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
   assert.equal(st.device_id, deviceId);
   assert.equal(st.agents, 1);
   assert.equal(st.clients, 1);
+  assert.equal(st.ready_agents, 1);
+  assert.equal(st.connection_status, "online");
   assert.equal(st.pending, 0);
+});
+
+test("DeviceRoom presence requires ready, not enrollment or remote routing", async () => {
+  const room = new DeviceRoomHarness("dev_presence_01", () => true);
+  const agent = room.connect("agent");
+  assert.equal(room.router.status().connection_status, "offline");
+
+  room.router.sessions.get(agent)!.phase = "ready";
+  // An authenticated E1 Agent can be present while intentionally declining
+  // remote operation routing.
+  room.router.sessions.get(agent)!.remote_routing_enabled = false;
+  assert.equal(room.router.status().connection_status, "online");
+  assert.equal(room.router.status().ready_agents, 1);
 });
 
 test("DeviceRoom fails closed on unknown types and unmatched agent results", async () => {

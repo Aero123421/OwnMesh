@@ -388,7 +388,24 @@ export type HandleMessageResult = {
   expired_pending?: PendingOperation[];
   /** Ready Agent whose durable pending work must be revalidated by the DO. */
   agent_ready_session_id?: string;
+  /** Metadata observed only after this Agent has completed proof and ready. */
+  authenticated_agent?: {
+    agent_version?: string;
+    protocol_version: string;
+  };
 };
+
+const MAX_AGENT_VERSION_LENGTH = 128;
+
+function readyAgentVersion(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const version = value.trim();
+  // Keep a display value bounded and line-safe. It is never an authority input.
+  if (version.length === 0 || version.length > MAX_AGENT_VERSION_LENGTH || /[\x00-\x1f\x7f]/.test(version)) {
+    return undefined;
+  }
+  return version;
+}
 
 type PrincipalCredentialBinding = {
   principal_id: string;
@@ -1093,6 +1110,7 @@ export class DeviceRoomRouter {
       }
       case "ready": {
         if (att.role !== "agent" || att.phase !== "proven") return { ok: false, error: "invalid_state" };
+        const agentVersion = readyAgentVersion(msg.payload.agent_version);
         att.phase = "ready";
         att.remote_routing_enabled = msg.payload.remote_routing_enabled === true;
         this.sessions.set(sessionId, att);
@@ -1110,7 +1128,9 @@ export class DeviceRoomRouter {
           summary: "agent ready",
           device_id: this.deviceId,
           meta: {
-            capabilities: msg.payload,
+            capability_count: Array.isArray(msg.payload.capabilities)
+              ? msg.payload.capabilities.length
+              : 0,
             remote_routing_enabled: att.remote_routing_enabled === true,
             pending_redelivered: 0,
             pending_expired: expired.length,
@@ -1119,6 +1139,12 @@ export class DeviceRoomRouter {
         return {
           ok: true,
           expired_pending: expired,
+          authenticated_agent: {
+            ...(agentVersion ? { agent_version: agentVersion } : {}),
+            // The envelope protocol was validated before the proof/ready state
+            // transition; do not trust a second payload claim for this value.
+            protocol_version: msg.protocol,
+          },
           ...(att.remote_routing_enabled === true ? { agent_ready_session_id: sessionId } : {}),
         };
       }
@@ -1405,7 +1431,10 @@ export class DeviceRoomRouter {
     if (readyAgents === 0) {
       return {
         ok: false,
-        result: { status: "device_offline", detail: { code: "OWNMESH_E_DEVICE_OFFLINE" } },
+        result: {
+          status: "device_offline",
+          detail: { code: "OWNMESH_E_DEVICE_OFFLINE", reason: "no_ready_agent" },
+        },
       };
     }
     const from = op.from_session || "http_client";
@@ -1546,7 +1575,10 @@ export class DeviceRoomRouter {
     if (n === 0) {
       this.pending.delete(prepared.correlation_id);
       this.notifyStateChange();
-      return { status: "device_offline", detail: { code: "OWNMESH_E_DEVICE_OFFLINE" } };
+      return {
+        status: "device_offline",
+        detail: { code: "OWNMESH_E_DEVICE_OFFLINE", reason: "no_ready_agent" },
+      };
     }
     const pending = this.pending.get(prepared.correlation_id);
     if (pending) {
@@ -1579,12 +1611,24 @@ export class DeviceRoomRouter {
     return this.dispatchPreparedInject(prep.prepared);
   }
 
-  status(): { device_id: string; sessions: number; pending: number; agents: number; clients: number } {
+  status(): {
+    device_id: string;
+    sessions: number;
+    pending: number;
+    agents: number;
+    clients: number;
+    ready_agents: number;
+    connection_status: "online" | "offline";
+  } {
     this.pruneExpiredPending();
     let agents = 0;
     let clients = 0;
+    let readyAgents = 0;
     for (const s of this.sessions.values()) {
-      if (s.role === "agent") agents++;
+      if (s.role === "agent") {
+        agents++;
+        if (s.phase === "ready") readyAgents++;
+      }
       else clients++;
     }
     return {
@@ -1593,6 +1637,11 @@ export class DeviceRoomRouter {
       pending: this.pending.size,
       agents,
       clients,
+      ready_agents: readyAgents,
+      // A room can authoritatively say online/offline only while it has a
+      // live hibernatable WebSocket attachment. The Worker maps probe failures
+      // to `unknown` rather than inferring a disconnect.
+      connection_status: readyAgents > 0 ? "online" : "offline",
     };
   }
 }
@@ -2053,6 +2102,24 @@ export class DeviceRoom {
   }
 
   /**
+   * Persist a coarse last-seen marker once an Agent has completed proof+ready.
+   * This deliberately runs only after accepted connections, never per
+   * heartbeat or status probe; unchanged reconnects are D1-throttled by the
+   * store.
+   */
+  private async recordAuthenticatedAgentConnection(
+    metadata: NonNullable<HandleMessageResult["authenticated_agent"]>,
+  ): Promise<void> {
+    if (!this.env.DB) throw new Error("storage_unavailable");
+    const store = createStore(this.env);
+    const updated = await store.recordDeviceReadyConnection(this.deviceId, {
+      ...metadata,
+      last_seen_at: nowIso(),
+    });
+    if (!updated) throw new Error("device_not_active");
+  }
+
+  /**
    * Verify that the immutable bound action still names the current, durable
    * OAuth credential epoch.  A signed internal context authenticates the
    * router caller, but it must never revive an operation authorized under a
@@ -2414,11 +2481,11 @@ export class DeviceRoom {
         return json({ error: generationCheck }, { status: 403 });
       }
       if (this.router.hasInternalNonce(opCtx.claims.nonce) || this.router.pending.has(correlationId)) {
-        return json({ status: "dispatch_uncertain", detail: { error: "live_operation_already_observed" } }, { status: 409 });
+        return json({ status: "dispatch_uncertain", detail: { reason: "dispatch_uncertain", error: "live_operation_already_observed" } }, { status: 409 });
       }
       const recipients = [...this.router.sessions.entries()].filter(([, session]) => this.router.isRemoteRoutingAgent(session));
       if (recipients.length !== 1) {
-        return json({ status: "device_offline", detail: { error: recipients.length === 0 ? "no_ready_agent" : "multiple_ready_agents" } }, { status: 503 });
+        return json({ status: "device_offline", detail: { reason: recipients.length === 0 ? "no_ready_agent" : "multiple_ready_agents" } }, { status: 503 });
       }
       const expiresAt = typeof body.expires_at === "string" && body.expires_at.trim() !== "" ? body.expires_at : undefined;
       const now = Date.now();
@@ -2471,7 +2538,7 @@ export class DeviceRoom {
         try { await this.persistNow(); } catch {
           return json({ error: "storage_unavailable" }, { status: 503 });
         }
-        return json({ status: "device_offline", detail: { error: "live_agent_send_failed" } }, { status: 503 });
+        return json({ status: "device_offline", detail: { reason: "reconnecting" } }, { status: 503 });
       }
       return json({ status: "routed_to_device", detail: { correlation_id: correlationId, live_only: true } });
     }
@@ -2780,6 +2847,18 @@ export class DeviceRoom {
       const guard = this.router.ingressGuards.get(sessionId);
       if (guard) updatedAttachment.lastSeq = guard.lastSeq;
       ws.serializeAttachment(updatedAttachment);
+    }
+
+    if (result.ok && result.authenticated_agent) {
+      try {
+        await this.recordAuthenticatedAgentConnection(result.authenticated_agent);
+      } catch {
+        // A concurrent revoke or D1 failure means this connection no longer
+        // has an authoritative identity. Do not leave a ready socket live.
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
     }
 
     if (result.ok && result.agent_ready_session_id) {
