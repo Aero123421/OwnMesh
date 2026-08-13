@@ -1,6 +1,6 @@
 # OwnMesh 1.x Definition of Done — release-quality audit
 
-**Release train:** v1.2.6
+**Release train:** v1.2.7
 
 **Audit date:** 2026-08-12
 
@@ -11,7 +11,7 @@
 
 ## Conclusion
 
-OwnMesh v1.2.6 is a stable release for the product surface admitted by the
+OwnMesh v1.2.7 is a stable release for the product surface admitted by the
 machine-checked registry. The Rust unsupported registries and the manifest both
 contain zero intentionally unimplemented CLI surfaces. Parser acceptance alone
 does not count: the admitted commands have fail-closed handlers and the relevant
@@ -21,13 +21,13 @@ This scoped completeness claim is deliberately narrower than §33 of the full
 target specification. Native code signing/notarization, some cross-platform
 privileged-route receipts, a fully automated external ChatGPT receipt, and an
 independent security review remain separate evidence or packaging work. Those
-items do not make implemented v1.2.6 commands “beta”, but they also must not be
+items do not make implemented v1.2.7 commands “beta”, but they also must not be
 reported as completed proof.
 
 Legend: **done** = shipped behavior and repository evidence cover the item ·
 **partial** = useful shipped behavior exists, but the broader specification or
 external evidence is incomplete · **out of scope** = explicitly not part of the
-v1.2.6 stable product surface.
+v1.2.7 stable product surface.
 
 ## §33 DoD (18 items)
 
@@ -44,7 +44,7 @@ v1.2.6 stable product surface.
 | 9 | Official 9 profiles conformance | **done** | Nine structured adapters, device detection, persistent profile sessions, public MCP routing, and CLI scan/list/show/login/test/start/resume are implemented. |
 | 10 | Session observer/controller handoff | **done** | Session list/show/attach/claim/release/give/close/terminate, observer ACLs, expiring controller leases, durable handoff, and bounded replay are shipped and regression-tested. |
 | 11 | TUI en/ja/zh-Hans/ru | **done** | The Ratatui UI and no-argument CLI handoff ship with en-US, ja-JP, zh-Hans, and ru-RU resources plus locale/snapshot coverage. |
-| 12 | R2/TURN relay default disabled | **done** | Relay is absent/disabled by default and the fail-closed invariant is tested. LAN/P2P discovery depth is not required for the v1.2.6 transfer route. |
+| 12 | R2/TURN relay default disabled | **done** | Relay is absent/disabled by default and the fail-closed invariant is tested. LAN/P2P discovery depth is not required for the v1.2.7 transfer route. |
 | 13 | Central telemetry default disabled | **done** | Setup defaults telemetry off; doctor and update keep network access off unless configured or explicitly requested. |
 | 14 | Local file/log not cloud-persisted by default | **done** | Local-first defaults are regression-tested. Transfer persists only explicitly requested bounded artifact pages and excludes credentials/private key material. |
 | 15 | Policy allow/ask/deny + temporary grant | **done** | Typed policy show/validate/explain/preset/rule mutation, exact approval decisions, and bounded temporary grants are shipped. Unsafe generic command/shell grants are deliberately refused while one-shot approval remains available. |
@@ -66,7 +66,7 @@ v1.2.6 stable product surface.
   release is forbidden. Provenance is attested by GitHub.
 - `scripts/check_release_quality.py` checks the publish graph, fail-closed
   workflow patterns, toolchain/version alignment, release-note selection, and
-  the registry-backed surface manifest. For v1.2.6 the unsupported counts are
+  the registry-backed surface manifest. For v1.2.7 the unsupported counts are
   zero and `completeness_claim` is true.
 - Release tags are annotated. Per
   [ADR 0001](./adr/0001-release-signing-sbom-provenance.md) they are also
@@ -90,10 +90,10 @@ v1.2.6 stable product surface.
 | W-E8-RECEIPTS | macOS/Windows native broker receipt and full public privileged route | Implementation and unit/loopback evidence do not substitute for the missing opt-in native/public receipts. |
 | W-E10-AUTO | Automated external ChatGPT exercise | Manual live compatibility plus local reproducible suites do not equal a fully automated third-party receipt. |
 | W-EXT-SEC | Independent external security review | Internal tests and review do not constitute an independent audit. |
-| W-PACKAGING | MSI/NSIS and native/universal macOS package | Portable signed archives and verified one-line installers are the v1.2.6 distribution contract. |
+| W-PACKAGING | MSI/NSIS and native/universal macOS package | Portable signed archives and verified one-line installers are the v1.2.7 distribution contract. |
 
 These caveats disclose evidence and scope. They do not reclassify implemented,
-registry-admitted v1.2.6 commands as unsupported, and they do not convert a
+registry-admitted v1.2.7 commands as unsupported, and they do not convert a
 broader §33 **partial** row into **done**.
 
 ## Required regression invariants
