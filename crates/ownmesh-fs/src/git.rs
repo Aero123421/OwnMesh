@@ -124,10 +124,10 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Returns an error when the repository path is invalid or outside the enforced
 /// workspace, or when a `git` subprocess cannot be run successfully.
 pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatusPage> {
-    let cwd = resolve_repo_cwd(ws, &opts.path)?;
+    let repo = resolve_repo_context(ws, &opts.path)?;
     // Cap status capture well under the hard ceiling; porcelain is line-oriented.
-    let (output, byte_truncated) = run_git_capped(
-        &cwd,
+    let (output, byte_truncated) = run_git_capped_in_context(
+        &repo,
         &["status", "--porcelain=v1", "-b", "--untracked-files=all"],
         512 * 1024,
     )?;
@@ -165,7 +165,7 @@ pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatu
         Some(u64::try_from(next_index).unwrap_or(u64::MAX))
     };
     Ok(GitStatusPage {
-        repo_root: cwd.to_string_lossy().into_owned(),
+        repo_root: repo.root.to_string_lossy().into_owned(),
         branch,
         upstream,
         clean,
@@ -180,8 +180,9 @@ pub fn git_status(ws: &WorkspaceRoot, opts: &GitStatusOpts) -> FsResult<GitStatu
 /// This shares the no-hooks/no-fsmonitor, timeout and capped-child handling
 /// used by the other read-only Git helpers.
 pub fn git_head_oid(ws: &WorkspaceRoot, path: &Path) -> FsResult<String> {
-    let cwd = resolve_repo_cwd(ws, path)?;
-    let (output, truncated) = run_git_capped(&cwd, &["rev-parse", "--verify", "HEAD"], 128)?;
+    let repo = resolve_repo_context(ws, path)?;
+    let (output, truncated) =
+        run_git_capped_in_context(&repo, &["rev-parse", "--verify", "HEAD"], 128)?;
     let oid = output.trim();
     if truncated
         || !matches!(oid.len(), 40 | 64)
@@ -209,7 +210,7 @@ pub fn git_head_oid(ws: &WorkspaceRoot, path: &Path) -> FsResult<String> {
 /// Returns an error when the repository path is invalid or outside the enforced
 /// workspace, or when a `git` subprocess cannot be run successfully.
 pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage> {
-    let cwd = resolve_repo_cwd(ws, &opts.path)?;
+    let repo = resolve_repo_context(ws, &opts.path)?;
     let mut args: Vec<String> = vec!["diff".into(), "--no-color".into(), "--no-ext-diff".into()];
     if opts.staged {
         args.push("--cached".into());
@@ -231,7 +232,7 @@ pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage>
     // later cursors page the same snapshot. Re-running git and re-capturing only
     // a prefix made cursors past that prefix return empty pages with another
     // continuation cursor (zero forward progress).
-    let spool = load_or_build_diff_spool(&cwd, &arg_refs, max_bytes)?;
+    let spool = load_or_build_diff_spool(&repo, &arg_refs, max_bytes)?;
     let total_lines = spool.lines.len();
     let byte_truncated = spool.truncated;
 
@@ -241,7 +242,7 @@ pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage>
         // (no silent claim of completeness; no fabricated progress).
         let exhausted = !byte_truncated;
         return Ok(GitDiffPage {
-            repo_root: cwd.to_string_lossy().into_owned(),
+            repo_root: repo.root.to_string_lossy().into_owned(),
             staged: opts.staged,
             lines: Vec::new(),
             next_cursor: (!exhausted).then(|| u64::try_from(start).unwrap_or(u64::MAX)),
@@ -259,7 +260,7 @@ pub fn git_diff(ws: &WorkspaceRoot, opts: &GitDiffOpts) -> FsResult<GitDiffPage>
     let exhausted = !more_after_page;
     let next_cursor = (!exhausted).then(|| u64::try_from(next_index).unwrap_or(u64::MAX));
     Ok(GitDiffPage {
-        repo_root: cwd.to_string_lossy().into_owned(),
+        repo_root: repo.root.to_string_lossy().into_owned(),
         staged: opts.staged,
         lines: page_lines,
         next_cursor,
@@ -310,9 +311,13 @@ fn whoami_fallback() -> String {
         .unwrap_or_else(|_| format!("uid-{}", std::process::id()))
 }
 
-fn diff_spool_path(cwd: &Path, args: &[&str], max_bytes: usize) -> PathBuf {
+fn diff_spool_path(repo: &RepoContext, args: &[&str], max_bytes: usize) -> PathBuf {
     let mut hasher = Sha256::new();
-    hasher.update(cwd.to_string_lossy().as_bytes());
+    hasher.update(repo.cwd.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(repo.root.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(repo.git_dir.to_string_lossy().as_bytes());
     hasher.update([0]);
     for a in args {
         hasher.update(a.as_bytes());
@@ -400,8 +405,12 @@ fn cleanup_diff_spools(dir: &Path) {
     }
 }
 
-fn load_or_build_diff_spool(cwd: &Path, args: &[&str], max_bytes: usize) -> FsResult<DiffSpool> {
-    let path = diff_spool_path(cwd, args, max_bytes);
+fn load_or_build_diff_spool(
+    repo: &RepoContext,
+    args: &[&str],
+    max_bytes: usize,
+) -> FsResult<DiffSpool> {
+    let path = diff_spool_path(repo, args, max_bytes);
     if let Some(parent) = path.parent() {
         let _ = ensure_private_spool_dir(parent);
         cleanup_diff_spools(parent);
@@ -440,7 +449,7 @@ fn load_or_build_diff_spool(cwd: &Path, args: &[&str], max_bytes: usize) -> FsRe
         }
     }
 
-    let (raw, byte_truncated) = run_git_capped(cwd, args, max_bytes)?;
+    let (raw, byte_truncated) = run_git_capped_in_context(repo, args, max_bytes)?;
     // Keep only complete lines when truncated mid-line so paging stays stable.
     let text = if byte_truncated && !raw.ends_with('\n') {
         match raw.rfind('\n') {
@@ -490,7 +499,17 @@ fn cursor_to_index(cursor: Option<u64>) -> usize {
     cursor.map_or(0, |value| usize::try_from(value).unwrap_or(usize::MAX))
 }
 
-fn resolve_repo_cwd(ws: &WorkspaceRoot, rel: &Path) -> FsResult<PathBuf> {
+/// Git's repository discovery result, binding the git dir and worktree chosen
+/// from the original caller context.  `root` is response metadata and a
+/// pathspec base, never the authority for choosing an index.
+#[derive(Debug)]
+struct RepoContext {
+    cwd: PathBuf,
+    root: PathBuf,
+    git_dir: PathBuf,
+}
+
+fn resolve_repo_context(ws: &WorkspaceRoot, rel: &Path) -> FsResult<RepoContext> {
     let path = if ws.enforce {
         crate::custody::resolve_dir_enforced(ws, rel)?
     } else if rel.as_os_str().is_empty() {
@@ -501,19 +520,37 @@ fn resolve_repo_cwd(ws: &WorkspaceRoot, rel: &Path) -> FsResult<PathBuf> {
     if !ws.enforce && !path.exists() {
         return Err(FsError::NotFound(path));
     }
-    // Discover toplevel so status works from a subdirectory.
+    // Capture the repository identity from the caller path before using the
+    // top-level as response metadata or a pathspec base.  In linked-worktree
+    // layouts, the reported top-level alone is not a safe substitute for this
+    // original git-dir/index context.
     let toplevel = run_git(&path, &["rev-parse", "--show-toplevel"])?;
     let root = PathBuf::from(toplevel.trim());
-    // Re-validate against workspace boundary (absolute resolve honors enforce).
+    let git_dir = PathBuf::from(run_git(&path, &["rev-parse", "--absolute-git-dir"])?.trim());
+    if !git_dir.is_absolute() {
+        return Err(FsError::InvalidPath(
+            "git reported a non-absolute git directory".into(),
+        ));
+    }
+    // Re-validate response metadata against the workspace boundary.  The
+    // original caller path was custody-checked above in restricted mode, and
+    // its discovered git-dir remains bound to subsequent commands.
     if ws.enforce {
-        // Git toplevel is absolute; require it to sit under the workspace root and
-        // re-pin the directory handle before returning it as cwd.
+        // Git toplevel is absolute; require it to sit under the workspace root.
         let checked = ws.resolve(&root)?;
-        let dir = crate::custody::resolve_dir_enforced(ws, &checked)?;
-        return Ok(dir);
+        let _ = crate::custody::resolve_dir_enforced(ws, &checked)?;
+        return Ok(RepoContext {
+            cwd: path,
+            root: checked,
+            git_dir,
+        });
     }
     let checked = ws.resolve(&root)?;
-    Ok(checked)
+    Ok(RepoContext {
+        cwd: path,
+        root: checked,
+        git_dir,
+    })
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> FsResult<String> {
@@ -529,6 +566,28 @@ fn run_git(cwd: &Path, args: &[&str]) -> FsResult<String> {
         });
     }
     Ok(out)
+}
+
+/// Run a Git operation bound to the git dir and worktree discovered from the
+/// original caller path.  We may run from the reported top-level to preserve
+/// repository-relative pathspec behavior, but do not rely on that directory to
+/// choose the git dir or index: those are bound explicitly below.
+fn run_git_capped_in_context(
+    repo: &RepoContext,
+    args: &[&str],
+    max_stdout: usize,
+) -> FsResult<(String, bool)> {
+    let git_dir = repo.git_dir.to_string_lossy();
+    let work_tree = repo.root.to_string_lossy();
+    let mut context_args = Vec::with_capacity(args.len() + 4);
+    context_args.extend([
+        "--git-dir",
+        git_dir.as_ref(),
+        "--work-tree",
+        work_tree.as_ref(),
+    ]);
+    context_args.extend_from_slice(args);
+    run_git_capped(&repo.root, &context_args, max_stdout)
 }
 
 /// Spawn git with piped stdout/stderr, concurrent capped drains, and a hard timeout.
@@ -862,6 +921,123 @@ mod tests {
     }
 
     #[test]
+    fn linked_worktree_keeps_the_requested_git_context() {
+        let dir = tempdir().unwrap();
+        let primary = dir.path().join("primary");
+        let linked = dir.path().join("linked");
+        fs::create_dir(&primary).unwrap();
+        init_repo(&primary);
+        assert!(Command::new("git")
+            .args(["worktree", "add", "-b", "linked", linked.to_str().unwrap()])
+            .current_dir(&primary)
+            .status()
+            .unwrap()
+            .success());
+
+        // Make the linked worktree clean at a commit that differs from the
+        // primary index, then point the primary repository's configured
+        // worktree at it. From `primary`, Git selects the primary git-dir/index
+        // and reports the linked files as dirty. If a caller follows only
+        // `--show-toplevel` and reruns from `linked`, Git instead selects the
+        // linked worktree's .git file/index and falsely reports clean.
+        fs::write(linked.join("README.md"), b"linked branch\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&linked)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "linked change"])
+            .current_dir(&linked)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "core.worktree", linked.to_str().unwrap()])
+            .current_dir(&primary)
+            .status()
+            .unwrap()
+            .success());
+
+        let native_primary = Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .current_dir(&primary)
+            .output()
+            .unwrap();
+        assert!(native_primary.status.success());
+        assert!(!native_primary.stdout.is_empty());
+        let native_linked = Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .current_dir(&linked)
+            .output()
+            .unwrap();
+        assert!(native_linked.status.success());
+        assert!(native_linked.stdout.is_empty());
+
+        let ws = WorkspaceRoot::new(dir.path(), true).unwrap();
+        let requested = PathBuf::from("primary");
+        let repo = resolve_repo_context(&ws, &requested).unwrap();
+        // `--show-toplevel` is metadata; it must not replace the original
+        // caller context used to select the git dir and index.
+        assert_eq!(repo.cwd, crate::dunce_canonicalize(&primary).unwrap());
+        assert_eq!(repo.root, crate::dunce_canonicalize(&linked).unwrap());
+        assert_eq!(
+            repo.git_dir,
+            crate::dunce_canonicalize(&primary.join(".git")).unwrap()
+        );
+
+        let status = git_status(
+            &ws,
+            &GitStatusOpts {
+                path: requested.clone(),
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .unwrap();
+        assert!(!status.clean);
+        assert!(status.exhausted);
+        assert_eq!(
+            status.repo_root,
+            crate::dunce_canonicalize(&linked)
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert!(status.entries.iter().any(|entry| entry.path == "README.md"));
+
+        let diff = git_diff(
+            &ws,
+            &GitDiffOpts {
+                path: requested.clone(),
+                pathspec: Some("README.md".into()),
+                staged: false,
+                cursor: None,
+                limit: 100,
+                max_bytes: 64 * 1024,
+            },
+        )
+        .unwrap();
+        assert!(
+            diff.lines.iter().any(|line| line.contains("linked branch")),
+            "{diff:?}"
+        );
+        assert_eq!(diff.repo_root, status.repo_root);
+
+        let expected_head = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&primary)
+            .output()
+            .unwrap();
+        assert!(expected_head.status.success());
+        assert_eq!(
+            git_head_oid(&ws, &requested).unwrap(),
+            String::from_utf8(expected_head.stdout).unwrap().trim()
+        );
+    }
+
+    #[test]
     fn status_cursor_pagination() {
         let dir = tempdir().unwrap();
         init_repo(dir.path());
@@ -988,9 +1164,9 @@ R  old.txt -> new.txt
         // Force a small capture by calling run_git_capped through a local helper path:
         // git_status uses 512 KiB; instead assert the truncated field plumbing via
         // a direct capped capture that mirrors the status argv.
-        let cwd = resolve_repo_cwd(&ws, Path::new("")).unwrap();
+        let repo = resolve_repo_context(&ws, Path::new("")).unwrap();
         let (output, truncated) = run_git_capped(
-            &cwd,
+            &repo.cwd,
             &["status", "--porcelain=v1", "-b", "--untracked-files=all"],
             2_048,
         )
