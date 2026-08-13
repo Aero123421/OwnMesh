@@ -1143,6 +1143,41 @@ impl DaemonRuntime {
         Ok(id.to_owned())
     }
 
+    /// Select the root used for a path operation without silently attributing
+    /// an absolute Full Access path to `ws_default`. Relative local IPC keeps
+    /// its single-workspace compatibility; multiple roots require a choice.
+    fn workspace_id_for_path(
+        &self,
+        workspace_id: Option<&str>,
+        path: &str,
+    ) -> IpcResult<Option<String>> {
+        if workspace_id.is_some_and(|id| !id.trim().is_empty()) {
+            return Self::canonical_workspace_id(workspace_id).map(Some);
+        }
+        if Path::new(path).is_absolute() {
+            if self.enforce_workspace {
+                return Err(IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: "absolute paths without workspace_id require Full Access".into(),
+                });
+            }
+            return Ok(None);
+        }
+        if self.workspaces.len() != 1 {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "workspace_id is required when more than one workspace is registered"
+                    .into(),
+            });
+        }
+        Self::canonical_workspace_id(
+            self.workspaces
+                .first()
+                .map(|workspace| workspace.id.as_str()),
+        )
+        .map(Some)
+    }
+
     fn workspace_for(&self, workspace_id: Option<&str>) -> IpcResult<WorkspaceRoot> {
         let id = Self::canonical_workspace_id(workspace_id)?;
         let entry = self
@@ -1741,7 +1776,12 @@ impl DaemonRuntime {
         // Elevated execution has no local fallback.  Only the custody-attested
         // Linux v2 broker path below may spawn with privilege.
         if p.elevated {
-            return self.try_broker_elevated(p).await;
+            let mut result = self.try_broker_elevated(p).await?;
+            result
+                .as_object_mut()
+                .expect("broker result serializes as an object")
+                .insert("workspace_id".into(), json!(p.workspace_id));
+            return Ok(result);
         }
         // Spawn mode follows the client request shape (argv vs shell-string).
         // Policy already used server-side classification in handle_exec.
@@ -1787,10 +1827,15 @@ impl DaemonRuntime {
                 message: e.to_string(),
             }
         })?;
-        serde_json::to_value(result).map_err(|e| IpcError::Remote {
+        let mut value = serde_json::to_value(result).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
-        })
+        })?;
+        value
+            .as_object_mut()
+            .expect("command result serializes as an object")
+            .insert("workspace_id".into(), json!(p.workspace_id));
+        Ok(value)
     }
 
     async fn try_broker_elevated(&self, p: &ExecParams) -> IpcResult<Value> {
@@ -2240,10 +2285,15 @@ impl DaemonRuntime {
             },
         )
         .map_err(fs_err)?;
-        serde_json::to_value(page).map_err(|e| IpcError::Remote {
+        let mut value = serde_json::to_value(page).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
-        })
+        })?;
+        value
+            .as_object_mut()
+            .expect("git status serializes as an object")
+            .insert("workspace_id".into(), json!(p.workspace_id));
+        Ok(value)
     }
 
     fn execute_git_diff(&self, p: &GitDiffParams) -> IpcResult<Value> {
@@ -2260,10 +2310,15 @@ impl DaemonRuntime {
             },
         )
         .map_err(fs_err)?;
-        serde_json::to_value(page).map_err(|e| IpcError::Remote {
+        let mut value = serde_json::to_value(page).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
-        })
+        })?;
+        value
+            .as_object_mut()
+            .expect("git diff serializes as an object")
+            .insert("workspace_id".into(), json!(p.workspace_id));
+        Ok(value)
     }
 
     async fn handle_exec(
@@ -2361,6 +2416,7 @@ full_user_access/full_access for arbitrary commands",
             elevated: p.elevated,
             path: p.cwd.clone(),
             workspace_relative: false,
+            workspace_id: p.workspace_id.clone(),
             executable_identity: p.executable_pin.as_ref().map(executable_identity_from_pin),
             ..Default::default()
         };
@@ -2555,12 +2611,12 @@ full_user_access/full_access for arbitrary commands",
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: GitStatusParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
+        p.workspace_id = self.workspace_id_for_path(p.workspace_id.as_deref(), &p.path)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "git".into(),
             path: Some(p.path.clone()),
-            workspace_relative: true,
+            workspace_relative: !Path::new(&p.path).is_absolute(),
             workspace_id: p.workspace_id.clone(),
             tags: vec!["git".into(), "status".into()],
             ..Default::default()
@@ -2576,12 +2632,12 @@ full_user_access/full_access for arbitrary commands",
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: GitDiffParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
+        p.workspace_id = self.workspace_id_for_path(p.workspace_id.as_deref(), &p.path)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "git".into(),
             path: Some(p.path.clone()),
-            workspace_relative: true,
+            workspace_relative: !Path::new(&p.path).is_absolute(),
             workspace_id: p.workspace_id.clone(),
             // A diff returns repository file contents. Without enumerating and
             // opening every changed path before the policy gate, it cannot prove

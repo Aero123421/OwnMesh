@@ -2379,6 +2379,20 @@ fn verify_exact_action_binding(
     if bound_workspace != request_workspace {
         return Err("bound workspace_id mismatch".into());
     }
+    let bound_workspace_version = bound_obj
+        .get("workspace_version")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if request.workspace_id.is_some()
+        && bound_workspace_version
+            .as_u64()
+            .is_none_or(|version| version == 0)
+    {
+        return Err("bound workspace_version is required for a workspace-bound request".into());
+    }
+    if request.workspace_id.is_none() && !bound_workspace_version.is_null() {
+        return Err("unbound request cannot claim a workspace_version".into());
+    }
 
     // Recompute action facts from the live arguments and require exact match.
     let mut args = args_object(request);
@@ -2531,6 +2545,7 @@ fn map_request_to_method(
     let action = action_of(request);
     let mut args = args_object(request);
     bind_envelope_workspace(request, &mut args)?;
+    require_workspace_binding_for_remote_action(request, &action, &args)?;
     // Only private exact-bound transfer operations receive server-derived peer
     // facts. `transfer.start` needs the complete signed plan so its local
     // runtime can reconstruct exactly what the Room ticket authorizes; it is
@@ -2894,6 +2909,74 @@ fn map_request_to_method(
     Ok((method, Value::Object(args)))
 }
 
+/// Remote filesystem, Git, and command actions must carry the exact workspace
+/// selected by the control plane. The sole exception is an explicit absolute
+/// path/cwd compatibility request: it remains unbound (`workspace_id = null`)
+/// and the runtime admits it only in Full Access, never as `ws_default`.
+fn require_workspace_binding_for_remote_action(
+    request: &OperationRequestPayload,
+    action: &str,
+    args: &Map<String, Value>,
+) -> Result<(), String> {
+    let workspace_scoped = matches!(
+        (request.capability.as_str(), action),
+        (
+            "filesystem.read",
+            "fs.list"
+                | "fs.stat"
+                | "fs.read"
+                | "ownmesh_fs_list"
+                | "ownmesh_list_files"
+                | "ownmesh_fs_stat"
+                | "ownmesh_fs_read"
+                | "ownmesh_read_file"
+        ) | (
+            "filesystem.write",
+            "fs.write"
+                | "fs.patch"
+                | "fs.delete"
+                | "ownmesh_fs_write"
+                | "ownmesh_write_file"
+                | "ownmesh_fs_patch"
+                | "ownmesh_fs_delete"
+        ) | ("filesystem.delete", _)
+            | ("fs.read" | "fs.list" | "fs.write", _)
+            | ("git.status" | "git.diff" | "git", _)
+            | ("command.run", _)
+    );
+    if !workspace_scoped || request.workspace_id.is_some() {
+        return Ok(());
+    }
+
+    let absolute = match request.capability.as_str() {
+        "command.run" => args
+            .get("cwd")
+            .and_then(Value::as_str)
+            .is_some_and(is_absolute_path),
+        "git.status" | "git.diff" | "git" | "filesystem.read" | "filesystem.write"
+        | "filesystem.delete" | "fs.read" | "fs.list" | "fs.write" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(is_absolute_path),
+        _ => false,
+    };
+    if absolute {
+        Ok(())
+    } else {
+        Err("workspace_id is required for remote workspace-relative filesystem, Git, and command actions".into())
+    }
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    let path = path.trim();
+    path.starts_with('/')
+        || path.starts_with(r"\\")
+        || (path.len() >= 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+            && matches!(path.as_bytes()[2], b'/' | b'\\'))
+}
+
 /// The envelope workspace is part of the authenticated exact action.  It is
 /// deliberately excluded from generic `facts` because it is a top-level
 /// routing/ownership boundary, so preserve it separately and never let an
@@ -2925,6 +3008,43 @@ fn bind_envelope_workspace(
                 Ok(())
             }
         }
+    }
+}
+
+fn bind_remote_result_workspace(mut result: Value, request: &OperationRequestPayload) -> Value {
+    let scoped = matches!(
+        request.capability.as_str(),
+        "filesystem.read"
+            | "filesystem.write"
+            | "filesystem.delete"
+            | "fs.read"
+            | "fs.list"
+            | "fs.write"
+            | "git.status"
+            | "git.diff"
+            | "git"
+            | "command.run"
+    );
+    if !scoped {
+        return result;
+    }
+    let workspace = request
+        .workspace_id
+        .as_ref()
+        .map(|id| Value::String(id.as_str().to_owned()))
+        .unwrap_or(Value::Null);
+    let workspace_version = request
+        .authorization
+        .as_ref()
+        .and_then(|authorization| authorization.bound_action.get("workspace_version"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("workspace_id".into(), workspace);
+        object.insert("workspace_version".into(), workspace_version);
+        result
+    } else {
+        json!({ "workspace_id": workspace, "workspace_version": workspace_version, "value": result })
     }
 }
 
@@ -2973,6 +3093,8 @@ fn bound_result_object(value: Value) -> Value {
             "replayed",
             "cancelled",
             "signal_delivered",
+            "workspace_id",
+            "workspace_version",
             "approval_decision_applied",
             "approval_id",
             "local_approval_id",
@@ -3588,6 +3710,7 @@ async fn dispatch_remote_operation(
             } else {
                 body.get("result").cloned().unwrap_or(body)
             };
+            let result = bind_remote_result_workspace(result, request);
             json!({
                 "operation_contract": OPERATION_CONTRACT_V1,
                 "operation_id": operation_id,
@@ -4307,7 +4430,8 @@ mod tests {
         bound.insert("principal_id".into(), json!("prin_dev"));
         bound.insert("tenant_id".into(), json!("ten_default"));
         bound.insert("oauth_client_id".into(), Value::Null);
-        bound.insert("workspace_id".into(), Value::Null);
+        bound.insert("workspace_id".into(), json!("ws_default"));
+        bound.insert("workspace_version".into(), json!(1));
         bound.insert("facts".into(), Value::Object(facts));
         bound.insert("operation_id".into(), json!("op_bind_test"));
         bound.insert("expires_at".into(), json!(expires));
@@ -4324,7 +4448,7 @@ mod tests {
             operation_contract: ownmesh_protocol::OperationContract::V1,
             operation_id: ownmesh_domain::OperationId::parse("op_bind_test").unwrap(),
             capability: "filesystem.write".into(),
-            workspace_id: None,
+            workspace_id: Some(ownmesh_domain::WorkspaceId::parse("ws_default").unwrap()),
             idempotency_key: "idem_bind_test".into(),
             payload_hash: Some(hash.clone()),
             authorization: Some(OperationAuthorizationBinding {
@@ -4432,6 +4556,9 @@ mod tests {
             .insert("workspace_id".into(), json!("ws_attacker"));
         refresh_bound_hash(&mut fs_request);
         assert!(verify_exact_action_binding(&device, &fs_request, Some(&expires)).is_ok());
+        let bound_result = bind_remote_result_workspace(json!({ "entries": [] }), &fs_request);
+        assert_eq!(bound_result["workspace_id"], "ws_verified");
+        assert_eq!(bound_result["workspace_version"], 1);
         assert!(map_request_to_method(&fs_request).is_err());
 
         let mut command_request = fs_request.clone();
@@ -4492,7 +4619,35 @@ mod tests {
             .insert("elevated".into(), json!(false));
         assert!(verify_exact_action_binding(&device, &command_request, Some(&expires)).is_err());
 
-        let (mut unscoped, _) = sample_bound_request(device.as_str(), "a.txt", Some("hello"));
+        let (mut unscoped, unscoped_expires) =
+            sample_bound_request(device.as_str(), "a.txt", Some("hello"));
+        unscoped.workspace_id = None;
+        unscoped
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_id".into(), Value::Null);
+        refresh_bound_hash(&mut unscoped);
+        assert!(verify_exact_action_binding(&device, &unscoped, Some(&unscoped_expires)).is_err());
+        unscoped
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_version".into(), Value::Null);
+        refresh_bound_hash(&mut unscoped);
+        let unscoped_binding =
+            verify_exact_action_binding(&device, &unscoped, Some(&unscoped_expires));
+        assert!(unscoped_binding.is_ok(), "{unscoped_binding:?}");
+        let unbound_result = bind_remote_result_workspace(json!({ "entries": [] }), &unscoped);
+        assert_eq!(unbound_result["workspace_id"], Value::Null);
+        assert_eq!(unbound_result["workspace_version"], Value::Null);
+        assert!(map_request_to_method(&unscoped).is_err());
         unscoped
             .arguments
             .as_object_mut()
@@ -4602,6 +4757,7 @@ mod tests {
             "principal_id": "prin_ticket",
             "tenant_id": "ten_ticket",
             "workspace_id": "ws_destination",
+            "workspace_version": 1,
             "claim_version": 1,
             "operation_id": "op_ticket_exact",
             "expires_at": expires,

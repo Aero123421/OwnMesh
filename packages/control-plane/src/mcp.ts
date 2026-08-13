@@ -74,6 +74,13 @@ const str = { type: "string" as const };
 const deviceProp = {
   device_id: { type: "string", description: "Enrolled device id (dev_...)" },
 };
+const workspaceProp = {
+  workspace_id: {
+    type: ["string", "null"],
+    description:
+      "Registered workspace id for workspace-relative work. Use null only with an absolute Full Access path; that path is deliberately not attributed to a workspace.",
+  },
+};
 /** Hard server-side ceilings (schema maximums are not authority alone). */
 export const MCP_MAX_TIMEOUT_MS = 300_000;
 /**
@@ -338,6 +345,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         path: str,
         ...cursorProps,
         max_entries: {
@@ -347,7 +355,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           default: 200,
         },
       },
-      required: ["device_id", "path"],
+      required: ["device_id", "workspace_id", "path"],
     },
     annotations: {
       readOnlyHint: true,
@@ -365,6 +373,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         path: str,
         ...cursorProps,
         max_entries: {
@@ -374,7 +383,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           default: 200,
         },
       },
-      required: ["device_id", "path"],
+      required: ["device_id", "workspace_id", "path"],
     },
     annotations: {
       readOnlyHint: true,
@@ -393,6 +402,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         path: str,
         ...cursorProps,
         cursor: {
@@ -401,7 +411,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         },
         offset: { type: "integer", minimum: 0 },
       },
-      required: ["device_id", "path"],
+      required: ["device_id", "workspace_id", "path"],
     },
     annotations: {
       readOnlyHint: true,
@@ -419,6 +429,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         path: str,
         ...cursorProps,
         cursor: {
@@ -427,7 +438,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         },
         offset: { type: "integer", minimum: 0 },
       },
-      required: ["device_id", "path"],
+      required: ["device_id", "workspace_id", "path"],
     },
     annotations: {
       readOnlyHint: true,
@@ -446,6 +457,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         path: str,
         content: str,
         idempotency_key: {
@@ -453,7 +465,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description: "Required caller idempotency key for exact-once write retries",
         },
       },
-      required: ["device_id", "path", "content", "idempotency_key"],
+      required: ["device_id", "workspace_id", "path", "content", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -471,6 +483,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         path: str,
         content: str,
         idempotency_key: {
@@ -478,7 +491,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description: "Required caller idempotency key for exact-once write retries",
         },
       },
-      required: ["device_id", "path", "content", "idempotency_key"],
+      required: ["device_id", "workspace_id", "path", "content", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -499,10 +512,10 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         hash: { type: "boolean", default: false },
-        workspace_id: str,
+        ...workspaceProp,
         idempotency_key: str,
       },
-      required: ["device_id", "path"],
+      required: ["device_id", "workspace_id", "path"],
     },
     annotations: {
       readOnlyHint: true,
@@ -522,13 +535,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         recursive: { type: "boolean", default: false },
-        workspace_id: str,
+        ...workspaceProp,
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once delete retries",
         },
       },
-      required: ["device_id", "id", "path", "idempotency_key"],
+      required: ["device_id", "workspace_id", "path", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -555,13 +568,13 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description: "replace (whole-file) or unified (bounded unified-diff apply)",
           enum: ["replace", "unified", "unified_diff", "diff"],
         },
-        workspace_id: str,
+        ...workspaceProp,
         idempotency_key: {
           type: "string",
           description: "Required caller idempotency key for exact-once patch retries",
         },
       },
-      required: ["device_id", "path", "content", "idempotency_key"],
+      required: ["device_id", "workspace_id", "path", "content", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -580,6 +593,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         program: str,
         args: { type: "array", items: { type: "string" } },
         cwd: str,
@@ -591,7 +605,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...execBoundProps,
         ...elevatedCommandProp,
       },
-      required: ["device_id", "program", "idempotency_key"],
+      required: ["device_id", "workspace_id", "program", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -609,6 +623,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         program: str,
         args: { type: "array", items: { type: "string" } },
         cwd: str,
@@ -620,7 +635,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...execBoundProps,
         ...elevatedCommandProp,
       },
-      required: ["device_id", "program", "idempotency_key"],
+      required: ["device_id", "workspace_id", "program", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -640,6 +655,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         command: str,
         cwd: str,
         idempotency_key: {
@@ -649,7 +665,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         async: { type: "boolean" },
         ...execBoundProps,
       },
-      required: ["device_id", "command", "idempotency_key"],
+      required: ["device_id", "workspace_id", "command", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -667,6 +683,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
+        ...workspaceProp,
         command: str,
         cwd: str,
         idempotency_key: {
@@ -676,7 +693,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         async: { type: "boolean" },
         ...execBoundProps,
       },
-      required: ["device_id", "command", "idempotency_key"],
+      required: ["device_id", "workspace_id", "command", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: false,
@@ -1154,7 +1171,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       properties: {
         ...deviceProp,
         path: str,
-        workspace_id: str,
+        ...workspaceProp,
         cursor: { type: "integer", minimum: 0 },
         limit: { type: "integer", minimum: 1, maximum: 1000 },
         idempotency_key: {
@@ -1162,7 +1179,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description: "Required caller idempotency key",
         },
       },
-      required: ["device_id", "idempotency_key"],
+      required: ["device_id", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: true,
@@ -1183,7 +1200,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         path: str,
         pathspec: str,
         staged: { type: "boolean" },
-        workspace_id: str,
+        ...workspaceProp,
         cursor: { type: "integer", minimum: 0 },
         limit: { type: "integer", minimum: 1, maximum: 5000 },
         max_bytes: { type: "integer", minimum: 1, maximum: 2097152 },
@@ -1192,7 +1209,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           description: "Required caller idempotency key",
         },
       },
-      required: ["device_id", "idempotency_key"],
+      required: ["device_id", "workspace_id", "idempotency_key"],
     },
     annotations: {
       readOnlyHint: true,
@@ -2521,6 +2538,43 @@ const MCP_COMMON_ARG_KEYS = new Set([
   "risk_note",
 ]);
 
+const WORKSPACE_SCOPED_TOOL_NAMES = new Set([
+  "ownmesh_fs_list",
+  "ownmesh_list_files",
+  "ownmesh_fs_stat",
+  "ownmesh_fs_read",
+  "ownmesh_read_file",
+  "ownmesh_fs_write",
+  "ownmesh_write_file",
+  "ownmesh_fs_patch",
+  "ownmesh_fs_delete",
+  "ownmesh_command_run",
+  "ownmesh_run_command",
+  "ownmesh_command_shell",
+  "ownmesh_run_shell",
+  "ownmesh_git_status",
+  "ownmesh_git_diff",
+]);
+
+function isAbsoluteMcpPath(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const path = value.trim();
+  return path.startsWith("/") || path.startsWith("\\\\") || /^[A-Za-z]:[\\/]/.test(path);
+}
+
+/** Absolute paths are a Full Access compatibility path, never a default workspace alias. */
+function isUnboundFullAccessPath(toolName: string, args: Record<string, unknown>): boolean {
+  if (toolName.startsWith("ownmesh_fs_") || toolName === "ownmesh_list_files" || toolName === "ownmesh_read_file") {
+    return isAbsoluteMcpPath(args.path);
+  }
+  if (toolName === "ownmesh_git_status" || toolName === "ownmesh_git_diff") {
+    return isAbsoluteMcpPath(args.path);
+  }
+  return toolName.startsWith("ownmesh_command_") || toolName.startsWith("ownmesh_run_")
+    ? isAbsoluteMcpPath(args.cwd)
+    : false;
+}
+
 /**
  * Resolve the declared argument allowlist for a tool from its inputSchema.
  * Unknown tools get only the common transport keys (fail closed on extras).
@@ -2833,6 +2887,11 @@ export async function buildDeviceOperation(opts: {
   } else if (typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== "") {
     workspaceId = String(opts.args.workspace_id);
     payload.workspace_id = workspaceId;
+  } else if (Object.prototype.hasOwnProperty.call(opts.args, "workspace_id") &&
+    opts.args.workspace_id === null) {
+    // Explicitly preserve the unbound Full Access choice on the device wire.
+    // Omission and null are intentionally different at the public MCP boundary.
+    payload.workspace_id = null;
   }
 
   return {
@@ -4661,6 +4720,42 @@ export async function handleMcp(
     const requestedWorkspaceId =
       workspaceManagementId ||
       (typeof safeArgs.workspace_id === "string" ? safeArgs.workspace_id.trim() : "");
+    const workspaceScoped = WORKSPACE_SCOPED_TOOL_NAMES.has(name);
+    const unboundFullAccessPath = isUnboundFullAccessPath(name, safeArgs);
+    if (workspaceScoped) {
+      if (!Object.prototype.hasOwnProperty.call(safeArgs, "workspace_id")) {
+        return mcpError(id, -32602, "workspace_id is required", {
+          code: "OWNMESH_E_WORKSPACE_ID_REQUIRED",
+        });
+      }
+      if (typeof safeArgs.workspace_id === "string" && !requestedWorkspaceId) {
+        return mcpError(id, -32602, "workspace_id must not be empty", {
+          code: "OWNMESH_E_WORKSPACE_ID_INVALID",
+        });
+      }
+      if (requestedWorkspaceId && unboundFullAccessPath) {
+        return mcpError(id, -32602, "absolute Full Access paths must use workspace_id: null", {
+          code: "OWNMESH_E_WORKSPACE_ABSOLUTE_PATH",
+        });
+      }
+      if (
+        safeArgs.workspace_id !== undefined &&
+        safeArgs.workspace_id !== null &&
+        typeof safeArgs.workspace_id !== "string"
+      ) {
+        return mcpError(id, -32602, "workspace_id must be a string or null", {
+          code: "OWNMESH_E_WORKSPACE_ID_INVALID",
+        });
+      }
+      if (!requestedWorkspaceId && !unboundFullAccessPath) {
+        return mcpError(id, -32602, "workspace_id: null requires an absolute Full Access path", {
+          code: "OWNMESH_E_WORKSPACE_ID_REQUIRED",
+        });
+      }
+      // Keep arguments, canonical action, and routed envelope byte-for-byte
+      // aligned after accepting harmless surrounding whitespace.
+      safeArgs.workspace_id = requestedWorkspaceId || null;
+    }
     let workspaceBinding: { workspace_id: string; version: number } | undefined;
     if (requestedWorkspaceId) {
       if (requestedWorkspaceId.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(requestedWorkspaceId)) {

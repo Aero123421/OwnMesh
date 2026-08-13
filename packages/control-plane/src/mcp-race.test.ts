@@ -226,7 +226,12 @@ test("fast DO terminal result is not overwritten by late route persist (CAS loss
           operation_id: opId,
           status: "completed",
           summary: "fast DO terminal result",
-          result: { winner: "device", marker: "do-first" },
+          result: {
+            winner: "device",
+            marker: "do-first",
+            workspace_id: null,
+            workspace_version: null,
+          },
         },
       });
       assert.equal(applied.ok, true, "DO CAS apply must succeed against pending/running");
@@ -242,7 +247,7 @@ test("fast DO terminal result is not overwritten by late route persist (CAS loss
     store,
     token,
     "ownmesh_fs_list",
-    { device_id: deviceId, path: "/" },
+    { device_id: deviceId, workspace_id: null, path: "/" },
     router,
     tracker,
   );

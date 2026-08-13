@@ -3506,6 +3506,41 @@ export async function applyMcpOperationResult(
     }
   }
 
+  // A workspace-bound operation may only complete with the same selected root.
+  // New absolute Full Access operations are explicitly bound to null; legacy
+  // rows without the version field remain readable during rolling deployment.
+  const workspaceBoundResultTool = new Set([
+    "ownmesh_fs_list", "ownmesh_list_files", "ownmesh_fs_stat", "ownmesh_fs_read", "ownmesh_read_file",
+    "ownmesh_fs_write", "ownmesh_write_file", "ownmesh_fs_patch", "ownmesh_fs_delete",
+    "ownmesh_command_run", "ownmesh_run_command", "ownmesh_command_shell", "ownmesh_run_shell",
+    "ownmesh_git_status", "ownmesh_git_diff",
+  ]).has(op.tool);
+  const canonicalWorkspaceAction =
+    op.action && typeof op.action === "object" && !Array.isArray(op.action)
+      ? (op.action as Record<string, unknown>)
+      : null;
+  const workspaceContractPresent =
+    canonicalWorkspaceAction !== null &&
+    Object.prototype.hasOwnProperty.call(canonicalWorkspaceAction, "workspace_version");
+  const rawResultStatus = String(opts.payload.status || "completed");
+  const completesWithResult = rawResultStatus === "completed" || rawResultStatus === "ok";
+  if (workspaceBoundResultTool && completesWithResult &&
+    (op.workspace_id !== null || workspaceContractPresent)) {
+    const result =
+      opts.payload.result && typeof opts.payload.result === "object"
+        ? (opts.payload.result as Record<string, unknown>)
+        : null;
+    const expectedWorkspaceVersion = canonicalWorkspaceAction?.workspace_version;
+    const validVersion = op.workspace_id === null
+      ? expectedWorkspaceVersion === null
+      : Number.isSafeInteger(expectedWorkspaceVersion) && Number(expectedWorkspaceVersion) > 0;
+    if (!result || result.workspace_id !== op.workspace_id ||
+      (workspaceContractPresent &&
+        (!validVersion || result.workspace_version !== expectedWorkspaceVersion))) {
+      return { ok: false, error: "workspace_result_mismatch" };
+    }
+  }
+
   const payload = opts.payload;
   let status = String(payload.status || "completed");
   if (payload.decision === "deny") status = "denied";
