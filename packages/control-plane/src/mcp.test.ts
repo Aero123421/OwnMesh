@@ -18,7 +18,11 @@ import {
   makeEnvelope,
   sanitizeMcpArgs,
 } from "./mcp.ts";
-import { DeviceRoomHarness, type DeviceEnvelope } from "./device-room.ts";
+import {
+  applyMcpOperationResult,
+  DeviceRoomHarness,
+  type DeviceEnvelope,
+} from "./device-room.ts";
 import { MemoryStore } from "./store.ts";
 import { randomId } from "./util.ts";
 import { __test } from "./index.ts";
@@ -140,6 +144,7 @@ test("MCP catalog has annotations and separates shell from structured run", () =
 
 test("workspace-scoped tools bind the selected workspace", async () => {
   const scopedTools = [
+    "ownmesh_system_diagnose",
     "ownmesh_fs_list", "ownmesh_list_files", "ownmesh_fs_stat", "ownmesh_fs_read", "ownmesh_read_file",
     "ownmesh_fs_write", "ownmesh_write_file", "ownmesh_fs_patch", "ownmesh_fs_delete",
     "ownmesh_command_run", "ownmesh_run_command", "ownmesh_command_shell", "ownmesh_run_shell",
@@ -598,6 +603,92 @@ test("device offline returns OWNMESH_E_DEVICE_OFFLINE", async () => {
     (sc.data as { error: { code: string } }).error.code,
     "OWNMESH_E_DEVICE_OFFLINE",
   );
+});
+
+test("system diagnosis reports an offline device in one bounded typed result", async () => {
+  const { store, token } = await authed();
+  const deviceId = "dev_diagnose_offline01";
+  const room = new DeviceRoomHarness(deviceId);
+  const router = createHarnessRouter({
+    inject: (_id, op) => room.router.injectOperation(op),
+  });
+
+  const { body } = await callTool(
+    store,
+    token,
+    "ownmesh_system_diagnose",
+    { device_id: deviceId, workspace_id: "ws_diagnose" },
+    router,
+  );
+  const envelope = body.result!.structuredContent!;
+  const diagnosis = envelope.data as {
+    schema: string;
+    overall: string;
+    recommendation: string;
+    checks: Array<Record<string, unknown>>;
+  };
+  assert.equal(envelope.status, "completed");
+  assert.equal(diagnosis.schema, "ownmesh.system_diagnosis/1.0");
+  assert.equal(diagnosis.overall, "device_offline");
+  assert.equal(diagnosis.recommendation, "reconnect_device");
+  assert.deepEqual(
+    diagnosis.checks.map((check) => [check.id, check.provenance]),
+    [["enrollment", "authoritative"], ["route", "observed"]],
+  );
+  assert.ok(diagnosis.checks.every((check) => typeof check.observed_at === "string"));
+});
+
+test("durable system diagnosis drops non-contract Agent fields", async () => {
+  const { store } = await authed();
+  const deviceId = "dev_diagnose_redact01";
+  const operationId = "op_diagnose_redact01";
+  const observedAt = "2026-08-13T00:00:00Z";
+  await store.putDevice({
+    id: deviceId, tenant_id: "ten_default", principal_id: "prin_dev", name: deviceId,
+    hostname: deviceId, os: "test", arch: "test", agent_version: "1.2.5",
+    protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false,
+    created_at: observedAt, status: "active",
+  });
+  await store.putMcpOperation({
+    operation_id: operationId, tenant_id: "ten_default", principal_id: "prin_dev",
+    device_id: deviceId, tool: "ownmesh_system_diagnose", status: "pending",
+    workspace_id: "ws_diagnose", action: { workspace_version: 1 },
+    summary: "routed", data: {}, truncated: false, next_cursor: null,
+    approval_required: false, warnings: [], correlation_id: operationId,
+    policy_authority: "ownmesh_device", created_at: observedAt, updated_at: observedAt,
+  });
+  const check = (id: string, state: string) => ({
+    id, status: "pass", state,
+    provenance: ["policy", "workspace", "sessions"].includes(id)
+      ? "authoritative"
+      : "observed",
+    observed_at: observedAt,
+  });
+  const applied = await applyMcpOperationResult(store, {
+    operationId,
+    correlationId: operationId,
+    deviceId,
+    payload: {
+      operation_id: operationId,
+      status: "completed",
+      result: {
+        workspace_id: "ws_diagnose", workspace_version: 1,
+        schema: "ownmesh.system_diagnosis/1.0",
+        observed_at: observedAt,
+        agent: { version: "1.2.5", protocol_version: "ownmesh.device/1.0" },
+        checks: [
+          check("policy", "allow"), check("workspace", "bound"),
+          check("daemon", "running"), check("session_supervisor", "not_required"),
+          { ...check("sessions", "healthy"), count: 0, nonterminal_count: 0, stale_count: 0 },
+        ],
+        path: "C:\\secret", credential: "must-not-persist", argv: ["secret"],
+      },
+    },
+  });
+  assert.equal(applied.ok, true);
+  const record = await store.getMcpOperation(operationId);
+  assert.equal(record?.data.overall, "healthy");
+  assert.doesNotMatch(JSON.stringify(record?.data), /must-not-persist|C:\\\\secret|argv/);
 });
 
 test("approval round-trip: ask → human approve metadata → completed result", async () => {

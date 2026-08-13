@@ -83,7 +83,7 @@ use ownmesh_profiles::{
 };
 use ownmesh_session::{PtyCommand, PtySize};
 use ownmesh_session::{
-    SessionKind, SessionManager, SidecarHostBinding, StreamKind as SessionStreamKind,
+    SessionKind, SessionManager, SessionState, SidecarHostBinding, StreamKind as SessionStreamKind,
 };
 use ownmesh_session_host::{
     default_shell_command, HostIoMode, LiveHost, OwnerSpool, SupervisorBinding, SupervisorClient,
@@ -147,6 +147,7 @@ pub mod ops_methods {
     pub const WORKSPACE_ADD: &str = "ops.workspace.add";
     pub const WORKSPACE_UPDATE: &str = "ops.workspace.update";
     pub const WORKSPACE_REMOVE: &str = "ops.workspace.remove";
+    pub const SYSTEM_DIAGNOSE: &str = "ops.system.diagnose";
 }
 
 const LOCAL_PRINCIPAL: &str = "prin_local";
@@ -270,12 +271,22 @@ pub enum PendingRequest {
     LogsQuery(LogsQueryParams),
     GitStatus(GitStatusParams),
     GitDiff(GitDiffParams),
+    SystemDiagnose(SystemDiagnoseParams),
     AdminPolicyPreset(AdminPolicyPresetParams),
     AdminPolicyRuleAdd(AdminPolicyRuleAddParams),
     AdminPolicyRuleRemove(AdminPolicyRuleRemoveParams),
     AdminDaemonUnlock(AdminDaemonUnlockParams),
     AdminTokenRevoke(AdminTokenRevokeParams),
     AdminApprovalBridge(AdminApprovalBridgeParams),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SystemDiagnoseParams {
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1289,6 +1300,7 @@ impl DaemonRuntime {
             methods::POLICY_VALIDATE,
             methods::STATUS,
             methods::PING,
+            ops_methods::SYSTEM_DIAGNOSE,
         ];
         if self.lockdown && !ALLOWED.contains(&method) {
             return Err(IpcError::Remote {
@@ -1306,7 +1318,12 @@ impl DaemonRuntime {
                 message: "device is not in emergency lockdown".into(),
             });
         }
-        if self.lockdown && !matches!(request, PendingRequest::AdminDaemonUnlock(_)) {
+        if self.lockdown
+            && !matches!(
+                request,
+                PendingRequest::AdminDaemonUnlock(_) | PendingRequest::SystemDiagnose(_)
+            )
+        {
             return Err(IpcError::Remote {
                 code: app_error::LOCKDOWN,
                 message: "emergency lockdown active; only a bound admin unlock may execute".into(),
@@ -1691,6 +1708,7 @@ impl DaemonRuntime {
             PendingRequest::LogsQuery(p) => self.execute_logs_query(p),
             PendingRequest::GitStatus(p) => self.execute_git_status(p),
             PendingRequest::GitDiff(p) => self.execute_git_diff(p),
+            PendingRequest::SystemDiagnose(p) => self.execute_system_diagnose(p).await,
             PendingRequest::AdminPolicyPreset(p) => self.execute_admin_policy_preset(p),
             PendingRequest::AdminPolicyRuleAdd(p) => self.execute_admin_policy_rule_add(p),
             PendingRequest::AdminPolicyRuleRemove(p) => self.execute_admin_policy_rule_remove(p),
@@ -3363,6 +3381,7 @@ full_user_access/full_access for arbitrary commands",
             PendingRequest::LogsQuery(x) => x.idempotency_key.clone(),
             PendingRequest::GitStatus(x) => x.idempotency_key.clone(),
             PendingRequest::GitDiff(x) => x.idempotency_key.clone(),
+            PendingRequest::SystemDiagnose(x) => x.idempotency_key.clone(),
             PendingRequest::AdminPolicyPreset(x) => Some(x.idempotency_key.clone()),
             PendingRequest::AdminPolicyRuleAdd(x) => Some(x.idempotency_key.clone()),
             PendingRequest::AdminPolicyRuleRemove(x) => Some(x.idempotency_key.clone()),
@@ -4645,6 +4664,7 @@ full_user_access/full_access for arbitrary commands",
             ops_methods::WORKSPACE_ADD => self.handle_workspace_add(params, client),
             ops_methods::WORKSPACE_UPDATE => self.handle_workspace_update(params, client),
             ops_methods::WORKSPACE_REMOVE => self.handle_workspace_remove(params, client),
+            ops_methods::SYSTEM_DIAGNOSE => self.handle_system_diagnose(params, client).await,
             methods::PROFILE_LIST | methods::PROFILE_SCAN => self.handle_profile_list(params),
             methods::PROFILE_SHOW => self.handle_profile_show(params),
             methods::APPROVAL_LIST => self.handle_approval_list(),

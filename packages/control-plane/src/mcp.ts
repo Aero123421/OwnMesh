@@ -190,6 +190,28 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     risk: "discovery",
   },
   {
+    name: "ownmesh_system_diagnose",
+    description:
+      "Explain common device/session failures with bounded typed checks. Returns no logs, paths, environment, argv, credentials, or executable remediation text.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        workspace_id: str,
+      },
+      required: ["device_id", "workspace_id"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
+  },
+  {
     name: "ownmesh_policy_preset",
     description:
       "Request a fresh-passkey-approved change to a device policy preset. The device queues the exact typed action; this call never changes policy directly.",
@@ -1730,6 +1752,218 @@ export type TrackedOperation = OwnMeshResultEnvelope & {
   updated_at: string;
 };
 
+const SYSTEM_DIAGNOSIS_SCHEMA = "ownmesh.system_diagnosis/1.0" as const;
+const SYSTEM_DIAGNOSIS_CHECK_IDS = new Set([
+  "policy",
+  "workspace",
+  "daemon",
+  "session_supervisor",
+  "sessions",
+]);
+const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
+  string,
+  Record<string, { status: "pass" | "warn" | "fail"; provenance: "authoritative" | "observed" }>
+> = {
+  policy: { allow: { status: "pass", provenance: "authoritative" } },
+  workspace: { bound: { status: "pass", provenance: "authoritative" } },
+  daemon: {
+    running: { status: "pass", provenance: "observed" },
+    lockdown: { status: "warn", provenance: "observed" },
+  },
+  session_supervisor: {
+    available: { status: "pass", provenance: "observed" },
+    not_required: { status: "pass", provenance: "observed" },
+    unavailable: { status: "fail", provenance: "observed" },
+  },
+  sessions: {
+    healthy: { status: "pass", provenance: "authoritative" },
+    stale: { status: "warn", provenance: "authoritative" },
+  },
+};
+
+type SystemDiagnosisDevice = {
+  agent_version: string;
+  protocol_version: string;
+  created_at: string;
+  last_seen_at?: string;
+};
+
+function diagnosisTimestamp(value: unknown): string | null {
+  if (typeof value !== "string" || value.length < 20 || value.length > 64) return null;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    return null;
+  }
+  return Number.isFinite(Date.parse(value)) ? value : null;
+}
+
+function diagnosisText(value: unknown, max = 64): string | null {
+  if (typeof value !== "string" || value.length < 1 || value.length > max) return null;
+  return /[\u0000-\u001f\u007f]/.test(value) ? null : value;
+}
+
+function diagnosisAgentVersion(value: unknown): string | null {
+  const text = diagnosisText(value, 32);
+  return text && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(text)
+    ? text
+    : null;
+}
+
+function diagnosisProtocolVersion(value: unknown): string | null {
+  const text = diagnosisText(value, 32);
+  return text && /^ownmesh\.device\/\d+\.\d+$/.test(text) ? text : null;
+}
+
+function diagnosisCheck(
+  id: string,
+  status: "pass" | "warn" | "fail",
+  state: string,
+  provenance: "authoritative" | "observed" | "cached",
+  observedAt: string,
+  counts?: { count?: number; nonterminal_count?: number; stale_count?: number },
+): Record<string, unknown> {
+  return { id, status, state, provenance, observed_at: observedAt, ...(counts || {}) };
+}
+
+/**
+ * Keep the remote diagnosis result a small allowlisted contract. An
+ * authenticated-but-buggy Agent must not turn this tool into a log/path/env
+ * exfiltration surface by adding fields to its result.
+ */
+export function normalizeSystemDiagnosis(
+  raw: unknown,
+  device: SystemDiagnosisDevice,
+  route: "online" | "offline",
+  observedAt = nowIso(),
+): Record<string, unknown> {
+  const enrollment = diagnosisCheck(
+    "enrollment",
+    "pass",
+    "active",
+    "authoritative",
+    observedAt,
+  );
+  const routeCheck = diagnosisCheck(
+    "route",
+    route === "online" ? "pass" : "fail",
+    route,
+    "observed",
+    observedAt,
+  );
+  if (route === "offline") {
+    const cachedAt = diagnosisTimestamp(device.last_seen_at) || diagnosisTimestamp(device.created_at) || observedAt;
+    return {
+      schema: SYSTEM_DIAGNOSIS_SCHEMA,
+      overall: "device_offline",
+      observed_at: observedAt,
+      agent: {
+        version: diagnosisAgentVersion(device.agent_version) || "unknown",
+        protocol_version: diagnosisProtocolVersion(device.protocol_version) || "unknown",
+        provenance: "cached",
+        observed_at: cachedAt,
+      },
+      checks: [enrollment, routeCheck],
+      recommendation: "reconnect_device",
+    };
+  }
+
+  const source = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? raw as Record<string, unknown>
+    : null;
+  const sourceObservedAt = diagnosisTimestamp(source?.observed_at);
+  const sourceAgent = source?.agent && typeof source.agent === "object" && !Array.isArray(source.agent)
+    ? source.agent as Record<string, unknown>
+    : null;
+  const agentVersion = diagnosisAgentVersion(sourceAgent?.version);
+  const protocolVersion = diagnosisProtocolVersion(sourceAgent?.protocol_version);
+  const rawChecks = Array.isArray(source?.checks) ? source.checks : [];
+  const checks: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const candidate of rawChecks.slice(0, SYSTEM_DIAGNOSIS_CHECK_IDS.size)) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const check = candidate as Record<string, unknown>;
+    const id = diagnosisText(check.id);
+    const state = diagnosisText(check.state);
+    const at = diagnosisTimestamp(check.observed_at);
+    const contract = id && state ? SYSTEM_DIAGNOSIS_CHECK_CONTRACT[id]?.[state] : undefined;
+    if (
+      !id || !SYSTEM_DIAGNOSIS_CHECK_IDS.has(id) || seen.has(id) ||
+      !state || !at || !contract ||
+      check.status !== contract.status || check.provenance !== contract.provenance
+    ) continue;
+    const counts: { count?: number; nonterminal_count?: number; stale_count?: number } = {};
+    for (const key of ["count", "nonterminal_count", "stale_count"] as const) {
+      const value = check[key];
+      if (Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 64) {
+        counts[key] = Number(value);
+      }
+    }
+    checks.push(diagnosisCheck(
+      id,
+      contract.status,
+      state,
+      contract.provenance,
+      at,
+      counts,
+    ));
+    seen.add(id);
+  }
+
+  if (
+    source?.schema !== SYSTEM_DIAGNOSIS_SCHEMA || !sourceObservedAt ||
+    !agentVersion || !protocolVersion ||
+    seen.size !== SYSTEM_DIAGNOSIS_CHECK_IDS.size
+  ) {
+    return {
+      schema: SYSTEM_DIAGNOSIS_SCHEMA,
+      overall: "diagnosis_unavailable",
+      observed_at: observedAt,
+      agent: {
+        version: diagnosisAgentVersion(device.agent_version) || "unknown",
+        protocol_version: diagnosisProtocolVersion(device.protocol_version) || "unknown",
+        provenance: "cached",
+        observed_at: diagnosisTimestamp(device.last_seen_at) || diagnosisTimestamp(device.created_at) || observedAt,
+      },
+      checks: [
+        enrollment,
+        routeCheck,
+        diagnosisCheck("device_diagnosis", "fail", "invalid_response", "observed", observedAt),
+      ],
+      recommendation: "run_local_doctor",
+    };
+  }
+
+  const stateFor = (id: string) => String(checks.find((check) => check.id === id)?.state || "");
+  const sessionsCheck = checks.find((check) => check.id === "sessions");
+  const staleCount = Number(sessionsCheck?.stale_count || 0);
+  const overall = stateFor("daemon") === "lockdown"
+    ? "lockdown"
+    : stateFor("session_supervisor") === "unavailable"
+      ? "supervisor_unavailable"
+      : sessionsCheck?.state === "stale" || staleCount > 0
+        ? "stale_sessions"
+        : "healthy";
+  const recommendation = overall === "lockdown"
+    ? "unlock_locally"
+    : overall === "supervisor_unavailable"
+      ? "restart_session_supervisor"
+      : overall === "stale_sessions"
+        ? "reconcile_stale_sessions"
+        : "none";
+  return {
+    schema: SYSTEM_DIAGNOSIS_SCHEMA,
+    overall,
+    observed_at: sourceObservedAt,
+    agent: {
+      version: agentVersion,
+      protocol_version: protocolVersion,
+      provenance: "observed",
+      observed_at: sourceObservedAt,
+    },
+    checks: [enrollment, routeCheck, ...checks],
+    recommendation,
+  };
+}
+
 /**
  * In-memory cache for MCP operations (Worker isolate / test process).
  * NOT authoritative — D1/MemoryStore mcp_operations is the source of truth.
@@ -2653,6 +2887,8 @@ function toolCapability(toolName: string): string {
       return "profile.show";
     case "ownmesh_profile_scan":
       return "profile.scan";
+    case "ownmesh_system_diagnose":
+      return "system.diagnose";
     case "ownmesh_fs_write":
     case "ownmesh_fs_delete":
     case "ownmesh_fs_patch":
@@ -2817,6 +3053,8 @@ function toolAction(toolName: string): string {
       return "profile.show";
     case "ownmesh_profile_scan":
       return "profile.scan";
+    case "ownmesh_system_diagnose":
+      return "system.diagnose";
     case "ownmesh_cancel_operation":
       return "cancel";
     case "__transfer_artifact_get":
@@ -2857,6 +3095,7 @@ const MCP_COMMON_ARG_KEYS = new Set([
 ]);
 
 const WORKSPACE_SCOPED_TOOL_NAMES = new Set([
+  "ownmesh_system_diagnose",
   "ownmesh_fs_list",
   "ownmesh_list_files",
   "ownmesh_fs_stat",
@@ -4992,6 +5231,9 @@ export async function handleMcp(
     }
 
     // Store re-validation of device ownership + credential expiry/revoke (fail closed).
+    const diagnosisDevice = name === "ownmesh_system_diagnose"
+      ? await store.getDevice(deviceId)
+      : null;
     const operable = await store.assertDeviceOperableForMcp(deviceId, rec.principal, rec.tenant_id);
     if (!operable.ok) {
       return mcpError(id, -32004, operable.error, { device_id: deviceId });
@@ -5615,6 +5857,31 @@ export async function handleMcp(
     }
 
     if (routed.status === "device_offline") {
+      if (name === "ownmesh_system_diagnose" && diagnosisDevice) {
+        const observedAt = nowIso();
+        const data = normalizeSystemDiagnosis(null, diagnosisDevice, "offline", observedAt);
+        const env = makeEnvelope({
+          operation_id: operationId,
+          status: "completed",
+          device_id: deviceId,
+          summary: "device offline",
+          data,
+          correlation_id: correlation,
+          warnings: injectWarnings,
+        });
+        const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+          status: env.status,
+          summary: env.summary,
+          data: env.data,
+          truncated: false,
+          next_cursor: null,
+          device_id: deviceId,
+          correlation_id: correlation,
+          warnings: env.warnings,
+          approval_required: false,
+        });
+        return mcpResult(id, toolContent(finalOp));
+      }
       const env = makeEnvelope({
         operation_id: operationId,
         status: "device_offline",
@@ -5717,6 +5984,9 @@ export async function handleMcp(
 
     if (detail.status === "completed" || detail.result !== undefined) {
       let data = (detail.result as Record<string, unknown>) || detail;
+      if (name === "ownmesh_system_diagnose" && diagnosisDevice) {
+        data = normalizeSystemDiagnosis(data, diagnosisDevice, "online");
+      }
       let truncated = Boolean((data as { truncated?: boolean }).truncated);
       let next_cursor: string | null = null;
       // Preserve device-side byte/range cursors. Never re-slice base64 as text or
