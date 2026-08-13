@@ -7,6 +7,7 @@
 
 use crate::windows::WindowsBrokerRunner;
 use ownmesh_broker_client::{BrokerRequestV2, BrokerResponseV2, MAX_BROKER_OUTPUT_BYTES};
+use ownmesh_domain::MAX_STRUCTURED_EXECUTABLE_BYTES;
 use ownmesh_ipc::spawn_suspended_windows_job;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const MAX_STAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_STAGE_BYTES: u64 = MAX_STRUCTURED_EXECUTABLE_BYTES;
 const KILL_WAIT: Duration = Duration::from_secs(2);
 const POLL_WAIT: Duration = Duration::from_millis(20);
 

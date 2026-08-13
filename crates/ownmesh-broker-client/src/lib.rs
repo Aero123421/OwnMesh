@@ -24,6 +24,8 @@
 
 mod transport;
 
+use ownmesh_domain::MAX_STRUCTURED_EXECUTABLE_BYTES;
+
 pub use transport::{
     broker_endpoint_display, build_cancel_intent_v2, connect_and_call, connect_and_cancel_v2,
     connect_and_execute_v2, connect_and_execute_v2_cancellable, default_broker_endpoint,
@@ -1068,7 +1070,7 @@ fn validate_v2_request_shape(req: &BrokerRequestV2, now_unix: i64) -> BrokerResu
         || req.facts.max_output_bytes == 0
         || req.facts.max_output_bytes > MAX_BROKER_OUTPUT_BYTES
         || req.facts.executable.image_len == 0
-        || req.facts.executable.image_len > 64 * 1024 * 1024
+        || req.facts.executable.image_len > MAX_STRUCTURED_EXECUTABLE_BYTES
     {
         return Err(BrokerError::Protocol(
             "invalid bounded operation facts".into(),
