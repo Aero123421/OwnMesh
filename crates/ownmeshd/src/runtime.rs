@@ -56,8 +56,9 @@ use ownmesh_broker_client::{
 use ownmesh_broker_client::{connect_and_execute_v2, connect_and_execute_v2_cancellable};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
-    classify_from_request_in_dir, pin_executable, resolve_executable_path, run_command_cancellable,
-    verify_executable_pin, CommandKind, ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
+    classify_from_request_in_dir, pin_executable, resolve_executable_invocation_path,
+    resolve_executable_path, run_command_cancellable, verify_executable_pin, CommandKind,
+    ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
 };
 use ownmesh_fs::{
     git_diff, git_head_oid, git_status, looks_sensitive, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
@@ -2641,6 +2642,7 @@ full_user_access/full_access for arbitrary commands",
                     program: command.program,
                     args: command.args,
                     timeout_ms: command.timeout_ms,
+                    invocation_pin: command.invocation_pin,
                     pin: command.pin,
                 })
             })
@@ -2953,14 +2955,24 @@ full_user_access/full_access for arbitrary commands",
                 message: "invalid review argv command".into(),
             });
         }
+        let invocation =
+            resolve_executable_invocation_path(&program, Some(cwd)).ok_or_else(|| {
+                IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: "review program could not be resolved to a regular executable".into(),
+                }
+            })?;
         let resolved =
             resolve_executable_path(&program, Some(cwd)).ok_or_else(|| IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
                 message: "review program could not be resolved to a regular executable".into(),
             })?;
-        let resolved_program = resolved.to_string_lossy().into_owned();
-        if classify_from_request_in_dir(None, &resolved_program, &args, Some(cwd))
+        let invocation_program = invocation.to_string_lossy().into_owned();
+        let backing_program = resolved.to_string_lossy().into_owned();
+        if classify_from_request_in_dir(None, &invocation_program, &args, Some(cwd))
             != CommandKind::Structured
+            || classify_from_request_in_dir(None, &backing_program, &args, Some(cwd))
+                != CommandKind::Structured
         {
             return Err(IpcError::Remote { code: app_error::POLICY_DENIED, message: "review commands must be pinned structured argv executables, not shells or interpreters".into() });
         }
@@ -2970,10 +2982,18 @@ full_user_access/full_access for arbitrary commands",
                 message: format!("unable to pin review executable: {error}"),
             }
         })?;
+        let invocation_pin =
+            pin_executable(&invocation, CommandKind::Structured).map_err(|error| {
+                IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!("unable to pin review invocation executable: {error}"),
+                }
+            })?;
         Ok(ReviewCommand {
-            program: resolved_program,
+            program: invocation_program,
             args,
             timeout_ms,
+            invocation_pin: Some(invocation_pin),
             pin,
         })
     }
@@ -2983,7 +3003,12 @@ full_user_access/full_access for arbitrary commands",
         command: &ReviewCommand,
         cwd: &Path,
     ) -> (bool, bool, RunResult) {
-        let revalidated = verify_executable_pin(Path::new(&command.pin.path), &command.pin).is_ok()
+        let invocation_pin = command.invocation_pin.as_ref().unwrap_or(&command.pin);
+        let revalidated = verify_executable_pin(Path::new(&command.program), invocation_pin)
+            .is_ok()
+            && verify_executable_pin(Path::new(&command.pin.path), &command.pin).is_ok()
+            && classify_from_request_in_dir(None, &command.program, &command.args, None)
+                == CommandKind::Structured
             && classify_from_request_in_dir(None, &command.pin.path, &command.args, None)
                 == CommandKind::Structured;
         if !revalidated {
@@ -3004,7 +3029,7 @@ full_user_access/full_access for arbitrary commands",
         }
         let request = RunRequest {
             kind: CommandKind::Structured,
-            program: command.pin.path.clone(),
+            program: command.program.clone(),
             args: command.args.clone(),
             cwd: Some(cwd.to_path_buf()),
             env: HashMap::new(),
@@ -3050,6 +3075,7 @@ full_user_access/full_access for arbitrary commands",
                 program: test.program.clone(),
                 args: test.args.clone(),
                 timeout_ms: test.timeout_ms,
+                invocation_pin: test.invocation_pin.clone(),
                 pin: test.pin.clone(),
             },
             cwd,
@@ -7536,6 +7562,50 @@ mod broker_intent_tests {
             pending.is_err(),
             "false cancel state must not preempt execute"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn review_cargo_rustup_proxy_keeps_cargo_invocation_identity() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let runtime = DaemonRuntime::open(&paths).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+
+        let command = runtime
+            .pin_review_command("cargo.exe".into(), vec!["--version".into()], 10_000, &cwd)
+            .expect("Windows Rust toolchain must expose a Cargo proxy");
+
+        let invocation_pin = command
+            .invocation_pin
+            .as_ref()
+            .expect("new review commands pin the invocation path too");
+        assert!(
+            Path::new(&command.program).is_absolute(),
+            "persisted invocation paths must be absolute: {}",
+            command.program
+        );
+        assert!(
+            command
+                .program
+                .to_ascii_lowercase()
+                .ends_with("\\cargo.exe"),
+            "review must invoke Cargo rather than its Rustup backing executable: {}",
+            command.program
+        );
+        assert_eq!(
+            PathBuf::from(&command.pin.path),
+            std::fs::canonicalize(&command.program).unwrap(),
+            "Cargo invocation must retain its canonical backing executable pin"
+        );
+        assert_eq!(invocation_pin.path, command.program);
+        verify_executable_pin(Path::new(&command.program), invocation_pin).unwrap();
+        verify_executable_pin(Path::new(&command.pin.path), &command.pin).unwrap();
+
+        let (succeeded, cancelled, result) = runtime.run_review_command(&command, &cwd).await;
+        assert!(succeeded, "cargo proxy review failed: {result:?}");
+        assert!(!cancelled);
+        assert!(result.stdout.to_ascii_lowercase().contains("cargo"));
     }
 
     #[cfg(windows)]

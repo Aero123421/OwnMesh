@@ -40,6 +40,10 @@ pub struct TestRequest {
     pub program: String,
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    /// The non-canonical executable path used for spawning when its filename
+    /// has proxy semantics. Legacy manifests omit this and require program=pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_pin: Option<ExecutablePin>,
     pub pin: ExecutablePin,
 }
 
@@ -50,6 +54,9 @@ pub struct ReviewCommand {
     pub program: String,
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    /// See [`TestRequest::invocation_pin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_pin: Option<ExecutablePin>,
     pub pin: ExecutablePin,
 }
 
@@ -431,7 +438,12 @@ fn validate(m: &ReviewManifest) -> Result<(), String> {
     if let Some(command) = &m.command {
         validate_command(&command.program, &command.args, command.timeout_ms)?;
         validate_pin(&command.pin)?;
-        if command.program != command.pin.path {
+        if let Some(invocation_pin) = &command.invocation_pin {
+            validate_pin(invocation_pin)?;
+            if command.program != invocation_pin.path {
+                return Err("review command invocation/pin mismatch".into());
+            }
+        } else if command.program != command.pin.path {
             return Err("review command program/pin mismatch".into());
         }
     }
@@ -452,7 +464,12 @@ fn validate(m: &ReviewManifest) -> Result<(), String> {
             return Err("invalid review test argument".into());
         }
         validate_pin(&test.pin)?;
-        if test.program != test.pin.path {
+        if let Some(invocation_pin) = &test.invocation_pin {
+            validate_pin(invocation_pin)?;
+            if test.program != invocation_pin.path {
+                return Err("review test invocation/pin mismatch".into());
+            }
+        } else if test.program != test.pin.path {
             return Err("review test program/pin mismatch".into());
         }
     }
@@ -521,6 +538,7 @@ mod tests {
                 program: pin().path.clone(),
                 args: vec!["test".into()],
                 timeout_ms: 60_000,
+                invocation_pin: None,
                 pin: pin(),
             }],
             remote_operation_id: None,
@@ -576,6 +594,10 @@ mod tests {
         assert!(validate(&m).is_err());
         let mut m = manifest();
         m.tests[0].pin.content_sha256 = "A".repeat(64);
+        assert!(validate(&m).is_err());
+        let mut m = manifest();
+        m.tests[0].invocation_pin = Some(pin());
+        m.tests[0].program = "C:/substituted.exe".into();
         assert!(validate(&m).is_err());
     }
     #[test]
