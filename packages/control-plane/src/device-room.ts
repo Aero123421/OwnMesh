@@ -288,6 +288,17 @@ export type PendingOperation = {
   live_only?: boolean;
 };
 
+/** Absolute deadline for a durable pending entry. Keep this shared by pruning
+ * and DO alarms so an idle/hibernated room cannot outlive its own TTL. */
+function pendingDeadlineMs(p: PendingOperation): number {
+  if (typeof p.expires_at === "string" && p.expires_at.trim() !== "") {
+    const parsed = Date.parse(p.expires_at);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  if (!Number.isFinite(p.created_at)) return NaN;
+  return p.created_at + (p.live_only ? LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS : PENDING_TTL_MS);
+}
+
 type ApprovalDecisionBinding = {
   target_operation_id: string;
   decision: "approve" | "deny";
@@ -416,6 +427,8 @@ export type PersistedIngressGuard = {
 
 export type PersistedRoomState = {
   v: 1;
+  /** Device identity survives a socket-free hibernation wake for D1 binding. */
+  device_id?: string;
   seqOut: number;
   ingressGuards: Record<string, PersistedIngressGuard>;
   pending: PendingOperation[];
@@ -501,7 +514,10 @@ export class DeviceRoomRouter {
 
   /** Snapshot for DO storage / hibernation restore. Enforces serialized-size bound. */
   exportState(): PersistedRoomState {
-    this.pruneAll();
+    // Do not prune pending here. A hibernated wake must surface every expired
+    // correlation to DeviceRoom so its matching D1 operation can be terminally
+    // reconciled; silently dropping it here was the stale-pending path.
+    for (const guard of this.ingressGuards.values()) pruneSeenMessageIds(guard, Date.now());
     // Bound guard-session count after prune (drop detached guards first).
     this.enforceGuardSessionBound();
     this.pruneConsumedNonces();
@@ -518,6 +534,7 @@ export class DeviceRoomRouter {
     }
     const state: PersistedRoomState = {
       v: 1,
+      device_id: this.deviceId,
       seqOut: this.seqOut,
       ingressGuards,
       pending: [...this.pending.values()].map((p) => ({ ...p, payload: { ...p.payload } })),
@@ -534,6 +551,9 @@ export class DeviceRoomRouter {
     const rawBytes = new TextEncoder().encode(JSON.stringify(state)).byteLength;
     if (rawBytes > MAX_SERIALIZED_STATE_BYTES) {
       throw new Error("room_state_too_large");
+    }
+    if (typeof state.device_id === "string" && state.device_id.trim() !== "") {
+      this.deviceId = state.device_id;
     }
     this.seqOut = Number.isFinite(state.seqOut) ? Math.max(0, Math.floor(state.seqOut)) : 0;
     this.ingressGuards.clear();
@@ -580,7 +600,9 @@ export class DeviceRoomRouter {
         this.consumedNonces.set(nonce, Number(exp));
       }
     }
-    this.pruneAll();
+    // Do not prune pending during import. Expired correlations must be handed
+    // to DeviceRoom's D1 reconciliation after restore, not silently discarded.
+    for (const guard of this.ingressGuards.values()) pruneSeenMessageIds(guard, Date.now());
     this.enforceGuardSessionBound();
     this.pruneConsumedNonces();
     // Re-check after prune — still over bound means corrupt/hostile snapshot.
@@ -602,6 +624,7 @@ export class DeviceRoomRouter {
     }
     return {
       v: 1,
+      device_id: this.deviceId,
       seqOut: this.seqOut,
       ingressGuards,
       pending: [...this.pending.values()].map((p) => ({ ...p, payload: { ...p.payload } })),
@@ -686,12 +709,7 @@ export class DeviceRoomRouter {
   pruneExpiredPending(now = Date.now()): PendingOperation[] {
     const removed: PendingOperation[] = [];
     for (const [key, p] of [...this.pending]) {
-      const expMs =
-        typeof p.expires_at === "string" && p.expires_at.trim() !== ""
-          ? Date.parse(p.expires_at)
-          : Number.isFinite(p.created_at)
-            ? p.created_at + PENDING_TTL_MS
-            : NaN;
+      const expMs = pendingDeadlineMs(p);
       // A live-only tombstone has no bearer to replay and exists solely to
       // correlate a genuine long-running transfer result. Its bounded transfer
       // expiry, rather than the ordinary 15-minute dispatch TTL, controls it.
@@ -1686,6 +1704,8 @@ export type DeviceRoomStorage = {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put(key: string, value: unknown): Promise<void>;
   delete(key: string): Promise<boolean | void>;
+  setAlarm?(scheduledTime: number): Promise<void>;
+  deleteAlarm?(): Promise<boolean | void>;
 };
 
 /**
@@ -1720,6 +1740,7 @@ export class DeviceRoom {
     this.ready = this.state.blockConcurrencyWhile(async () => {
       await this.restoreFromStorage();
       if (this.storageBroken) return;
+      if (this.router.deviceId !== "unknown") this.deviceId = this.router.deviceId;
       // Restore hibernated sockets after authoritative storage import.
       // https://developers.cloudflare.com/durable-objects/examples/websocket-hibernation-server/
       for (const ws of this.state.getWebSockets()) {
@@ -1741,6 +1762,23 @@ export class DeviceRoom {
       }
       if (this.deviceId !== "unknown") {
         this.router.deviceId = this.deviceId;
+      }
+      const expired = this.router.pruneExpiredPending();
+      if (expired.length > 0) {
+        try {
+          await this.reconcileExpiredPending(expired);
+          await this.persistNow();
+        } catch {
+          this.storageBroken = true;
+          this.failClosedAll("storage unavailable", 1013);
+        }
+      } else {
+        try {
+          await this.reschedulePendingAlarm();
+        } catch {
+          this.storageBroken = true;
+          this.failClosedAll("storage unavailable", 1013);
+        }
       }
     });
 
@@ -1825,6 +1863,7 @@ export class DeviceRoom {
     try {
       const snap = this.router.exportState();
       await this.storage().put(ROOM_STATE_STORAGE_KEY, snap);
+      await this.reschedulePendingAlarm();
     } catch (err) {
       this.storageBroken = true;
       const message = err instanceof Error ? err.message : String(err);
@@ -1836,6 +1875,85 @@ export class DeviceRoom {
       });
       this.failClosedAll("storage unavailable", 1013);
       throw err instanceof Error ? err : new Error("storage_persist_failed");
+    }
+  }
+
+  /** Keep the single DO alarm at the earliest pending deadline. */
+  private async reschedulePendingAlarm(): Promise<void> {
+    const storage = this.storage();
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const pending of this.router.pending.values()) {
+      const deadline = pendingDeadlineMs(pending);
+      if (Number.isFinite(deadline) && deadline < earliest) earliest = deadline;
+    }
+    if (Number.isFinite(earliest)) {
+      await storage.setAlarm?.(earliest);
+    } else {
+      await storage.deleteAlarm?.();
+    }
+  }
+
+  /**
+   * Terminalize only the operation that is exactly bound to the expired room
+   * correlation.  A malformed/substituted pending snapshot is dropped locally
+   * but must never update an unrelated D1 row.
+   */
+  private async reconcileExpiredPending(expired: PendingOperation[]): Promise<void> {
+    if (expired.length === 0) return;
+    if (!this.env.DB) throw new Error("storage_unavailable");
+    const store = createStore(this.env);
+    for (const pending of expired) {
+      const operationId =
+        typeof pending.payload?.operation_id === "string"
+          ? pending.payload.operation_id
+          : "";
+      if (!operationId || operationId !== pending.correlation_id || this.deviceId === "unknown") {
+        continue;
+      }
+      const expectedApprovalDecision = approvalDecisionBindingFromPayload(pending.payload);
+      const deadline = pendingDeadlineMs(pending);
+      const approvalDecisionResult = expectedApprovalDecision
+        ? {
+            approval_decision_applied: false,
+            target_operation_id: expectedApprovalDecision.target_operation_id,
+            approval_id: expectedApprovalDecision.approval_id,
+            decision: expectedApprovalDecision.decision,
+          }
+        : {
+            phase: "expired",
+            expires_at: Number.isFinite(deadline) ? new Date(deadline).toISOString() : null,
+            error: {
+              code: "OWNMESH_E_OPERATION_EXPIRED",
+              message: "operation expired before a device result arrived",
+              retryable: true,
+            },
+          };
+      // applyMcpOperationResult is the single binding/CAS implementation. It
+      // checks operation, correlation, device and terminal-status races before
+      // writing; a stale snapshot can therefore never overwrite a completion.
+      const applied = await applyMcpOperationResult(store, {
+        operationId,
+        correlationId: pending.correlation_id,
+        deviceId: this.deviceId,
+        expectedApprovalDecision,
+        payload: {
+          operation_contract: OPERATION_CONTRACT_V1,
+          operation_id: operationId,
+          status: "failed",
+          result: approvalDecisionResult,
+          error: {
+            code: "OWNMESH_E_OPERATION_EXPIRED",
+            message: "operation expired before a device result arrived",
+            retryable: true,
+          },
+        },
+      });
+      // A terminal race is benign and must preserve the winner. Every other
+      // binding failure is a corrupt/substituted room snapshot: fail closed
+      // instead of silently accepting or redirecting the expiry transition.
+      if (!applied.ok && applied.error !== "cas_conflict") {
+        throw new Error(`operation_expiry_reconcile_${applied.error}`);
+      }
     }
   }
 
@@ -2021,6 +2139,17 @@ export class DeviceRoom {
     if (url.pathname.endsWith("/status") || url.pathname === "/status") {
       if (this.storageBroken) {
         return json({ error: "storage_unavailable", hibernation: true }, { status: 503 });
+      }
+      const expired = this.router.pruneExpiredPending();
+      if (expired.length > 0) {
+        try {
+          await this.reconcileExpiredPending(expired);
+          await this.persistNow();
+        } catch {
+          this.storageBroken = true;
+          this.failClosedAll("storage unavailable", 1013);
+          return json({ error: "storage_unavailable", hibernation: true }, { status: 503 });
+        }
       }
       return json({
         ...this.router.status(),
@@ -2302,7 +2431,10 @@ export class DeviceRoom {
       // hibernation between requests could resurrect them and evade the cap.
       const pruned = this.router.pruneExpiredPending(now);
       if (pruned.length > 0) {
-        try { await this.persistNow(); } catch {
+        try {
+          await this.reconcileExpiredPending(pruned);
+          await this.persistNow();
+        } catch {
           return json({ error: "storage_unavailable" }, { status: 503 });
         }
       }
@@ -2628,6 +2760,20 @@ export class DeviceRoom {
       return;
     }
 
+    // Reconcile expiry before the router's ingress guards can prune it. This
+    // keeps active-message, alarm, and hibernation-restart paths equivalent.
+    const expiredBeforeMessage = this.router.pruneExpiredPending();
+    if (expiredBeforeMessage.length > 0) {
+      try {
+        await this.reconcileExpiredPending(expiredBeforeMessage);
+        await this.persistNow();
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+    }
+
     const result = await this.router.handleMessage(sessionId, text);
     const updatedAttachment = this.router.sessions.get(sessionId);
     if (updatedAttachment) {
@@ -2647,42 +2793,9 @@ export class DeviceRoom {
     }
 
     // Pending TTL/expiry must surface a terminal MCP status (never silent drop).
-    if (result.ok && result.expired_pending && result.expired_pending.length > 0 && this.env.DB) {
+    if (result.ok && result.expired_pending && result.expired_pending.length > 0) {
       try {
-        const store = createStore(this.env);
-        for (const expired of result.expired_pending) {
-          const opId =
-            expired.payload?.operation_id != null
-              ? String(expired.payload.operation_id)
-              : expired.correlation_id;
-          const expectedApprovalDecision = approvalDecisionBindingFromPayload(expired.payload);
-          const approvalDecisionResult = expectedApprovalDecision
-              ? {
-                  approval_decision_applied: false,
-                  target_operation_id: expectedApprovalDecision.target_operation_id,
-                  approval_id: expectedApprovalDecision.approval_id,
-                  decision: expectedApprovalDecision.decision,
-                }
-              : null;
-          await applyMcpOperationResult(store, {
-            operationId: opId,
-            correlationId: expired.correlation_id,
-            deviceId: this.deviceId,
-            expectedApprovalDecision,
-            payload: {
-              operation_contract: OPERATION_CONTRACT_V1,
-              operation_id: opId,
-              status: "failed",
-              ...(approvalDecisionResult ? { result: approvalDecisionResult } : {}),
-              error: {
-                code: "OWNMESH_E_OPERATION_EXPIRED",
-                message:
-                  "operation expired or was evicted before a device result arrived; retry with a new idempotency key if the side effect is still required",
-                retryable: true,
-              },
-            },
-          });
-        }
+        await this.reconcileExpiredPending(result.expired_pending);
       } catch {
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
@@ -2836,6 +2949,20 @@ export class DeviceRoom {
       } catch {
         /* ignore secondary failures */
       }
+    }
+  }
+
+  /** Wake from idle at the nearest persisted pending deadline. */
+  async alarm(): Promise<void> {
+    await this.ready;
+    if (this.storageBroken) return;
+    const expired = this.router.pruneExpiredPending();
+    try {
+      await this.reconcileExpiredPending(expired);
+      await this.persistNow();
+    } catch {
+      this.storageBroken = true;
+      this.failClosedAll("storage unavailable", 1013);
     }
   }
 }
