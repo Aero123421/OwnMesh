@@ -1,0 +1,11 @@
+{"id":1,"result":{"protocolVersion":"1"}}
+{"method":"initialized","params":{}}
+{"method":"turn/started","params":{"threadId":"thr_01","turn":{"id":"turn_01"}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"thr_01","itemId":"msg_01","delta":"Hello from Codex"}}
+{"method":"item/started","params":{"threadId":"thr_01","item":{"type":"commandExecution","id":"cmd_01"}}}
+{"method":"item/commandExecution/outputDelta","params":{"threadId":"thr_01","itemId":"cmd_01","delta":"command output"}}
+{"method":"item/completed","params":{"threadId":"thr_01","item":{"type":"commandExecution","id":"cmd_01","status":"completed"}}}
+{"method":"heartbeat","params":{}}
+{"method":"vendor/unknown","params":{"token":"must-not-be-exposed"}}
+{"method":"item/agentMessage/delta","params":{"threadId":"thr_01","itemId":"msg_01","delta":"after error"}}
+{"method":"turn/completed","params":{"threadId":"thr_01","turn":{"id":"turn_01","status":"completed"}}}

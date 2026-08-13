@@ -155,6 +155,13 @@ test("session open canonically exposes explicit profile adapter inputs", () => {
   }
 });
 
+test("session replay exposes an explicit raw sidecar diagnostic opt-in", () => {
+  const replay = MCP_TOOLS.find((candidate) => candidate.name === "ownmesh_session_replay")!;
+  const properties = replay.inputSchema.properties as Record<string, unknown>;
+  assert.deepEqual(properties.raw_sidecar, { type: "boolean", default: false });
+  assert.ok(properties.sidecar_cursor);
+});
+
 test("official profile catalog is 9 entries matching spec ids", () => {
   assert.equal(OFFICIAL_PROFILE_CATALOG.length, 9);
   const ids = OFFICIAL_PROFILE_CATALOG.map((p) => p.id);

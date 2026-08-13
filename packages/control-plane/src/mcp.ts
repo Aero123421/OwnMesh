@@ -893,7 +893,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_session_replay",
-    description: "Read bounded session output replay from a sequence cursor",
+    description: "Read bounded session output replay; raw sidecar bytes require explicit diagnostic opt-in",
     inputSchema: {
       type: "object",
       properties: {
@@ -904,6 +904,10 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         // is intentionally independent from UTF-8 session sequence replay so
         // each observer can resume bounded binary-safe output independently.
         sidecar_cursor: { type: "integer", minimum: 0 },
+        // Default replay returns normalized events only. This opt-in returns a
+        // separately cursor-paged, base64-encoded diagnostic page capped by
+        // the device runtime.
+        raw_sidecar: { type: "boolean", default: false },
         limit: { type: "integer", minimum: 1, maximum: 1000 },
         workspace_id: str,
         idempotency_key: {

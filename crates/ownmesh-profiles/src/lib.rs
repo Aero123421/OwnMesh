@@ -1432,6 +1432,10 @@ pub struct NormalizedEvent {
 pub const MAX_ADAPTER_LINE_BYTES: usize = 64 * 1024;
 /// Maximum normalized events returned in one replay page.
 pub const MAX_ADAPTER_EVENTS_PER_PAGE: usize = 256;
+/// Maximum bytes copied from an adapter payload into a display event.
+const MAX_NORMALIZED_EVENT_TEXT_BYTES: usize = 4 * 1024;
+/// Maximum bytes copied from an adapter event name.
+const MAX_NORMALIZED_EVENT_TYPE_BYTES: usize = 128;
 
 /// A normalized adapter record with an absolute raw-byte cursor.
 ///
@@ -1486,16 +1490,23 @@ pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPag
             }
         } else {
             match std::str::from_utf8(line) {
-                Ok(text) => match normalize_event_json(text.trim_end_matches('\r')) {
-                    Some(event) => AdapterEventRecord {
+                Ok(text) => match classify_adapter_event(text.trim_end_matches('\r')) {
+                    Ok(Some(event)) => AdapterEventRecord {
                         cursor,
                         event: Some(event),
                         error: None,
                     },
-                    None => AdapterEventRecord {
+                    Ok(None) => {
+                        // JSON-RPC handshakes, keepalives, and responses are
+                        // protocol control records, not user-visible replay.
+                        consumed = record_end;
+                        scan = record_end;
+                        continue;
+                    }
+                    Err(error) => AdapterEventRecord {
                         cursor,
                         event: None,
-                        error: Some("malformed adapter JSON event".into()),
+                        error: Some(error.into()),
                     },
                 },
                 Err(_) => AdapterEventRecord {
@@ -1527,48 +1538,218 @@ pub fn parse_adapter_event_page(raw: &[u8], base_cursor: u64) -> AdapterEventPag
 
 /// Best-effort event normalization from JSONL adapter lines.
 pub fn normalize_event_json(raw: &str) -> Option<NormalizedEvent> {
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let raw_type = if v.get("error").is_some() {
-        "error".to_owned()
-    } else {
-        v.get("type")
-            .or_else(|| v.get("event"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("unknown")
-            .to_string()
+    classify_adapter_event(raw).ok().flatten()
+}
+
+/// Classify one adapter record without exposing its raw JSON payload.
+///
+/// `Ok(None)` is reserved for protocol control traffic.  Invalid or unknown
+/// records deliberately remain visible to the paging caller as a typed error.
+fn classify_adapter_event(raw: &str) -> Result<Option<NormalizedEvent>, &'static str> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "malformed adapter JSON event")?;
+    let object = value.as_object().ok_or("malformed adapter JSON event")?;
+
+    if object.get("error").is_some() {
+        return Ok(Some(normalized_event(
+            "error",
+            "error",
+            bounded_json_string(object.get("error").and_then(|error| error.get("message"))),
+            native_session_id(Some(object), None),
+        )));
+    }
+
+    if let Some(method) = object.get("method").and_then(serde_json::Value::as_str) {
+        return classify_json_rpc_notification(method, object.get("params"));
+    }
+
+    // Headerless JSON-RPC still uses `id` for request responses.  These carry
+    // startup/heartbeat protocol state and must not appear in normal replay.
+    if object.contains_key("id") && object.contains_key("result") {
+        return Ok(None);
+    }
+
+    classify_legacy_adapter_event(object)
+}
+
+fn classify_json_rpc_notification(
+    method: &str,
+    params: Option<&serde_json::Value>,
+) -> Result<Option<NormalizedEvent>, &'static str> {
+    if matches!(
+        method,
+        "initialized" | "notifications/initialized" | "ping" | "heartbeat" | "keepalive"
+    ) {
+        return Ok(None);
+    }
+    let params = params.and_then(serde_json::Value::as_object);
+    let native_session_id = native_session_id(None, params);
+    let event = match method {
+        "turn/started" => normalized_event(
+            "session",
+            method,
+            Some("turn started".into()),
+            native_session_id,
+        ),
+        "turn/completed" => {
+            let turn = params.and_then(|value| value.get("turn"));
+            if turn
+                .and_then(|value| value.pointer("/error/message"))
+                .is_some()
+            {
+                normalized_event(
+                    "error",
+                    method,
+                    bounded_json_string(turn.and_then(|value| value.pointer("/error/message"))),
+                    native_session_id,
+                )
+            } else {
+                normalized_event(
+                    "completed",
+                    method,
+                    bounded_json_string(turn.and_then(|value| value.get("status"))),
+                    native_session_id,
+                )
+            }
+        }
+        "item/agentMessage/delta" | "item/reasoning/textDelta" => normalized_event(
+            "message",
+            method,
+            Some(required_json_string(
+                params.and_then(|value| value.get("delta")),
+            )?),
+            native_session_id,
+        ),
+        "item/started" | "item/completed" => {
+            let item = params.and_then(|value| value.get("item"));
+            let item_type = required_json_string(item.and_then(|value| value.get("type")))?;
+            if item_type == "agentMessage" && method == "item/started" {
+                return Ok(None);
+            }
+            if item_type == "agentMessage" {
+                normalized_event(
+                    "message",
+                    method,
+                    Some(required_json_string(
+                        item.and_then(|value| value.get("text")),
+                    )?),
+                    native_session_id,
+                )
+            } else {
+                normalized_event(
+                    if method == "item/completed" {
+                        "tool_result"
+                    } else {
+                        "tool_call"
+                    },
+                    method,
+                    Some(item_type),
+                    native_session_id,
+                )
+            }
+        }
+        "item/commandExecution/outputDelta" => normalized_event(
+            "tool_result",
+            method,
+            Some(required_json_string(
+                params.and_then(|value| value.get("delta")),
+            )?),
+            native_session_id,
+        ),
+        _ => return Err("unrecognized adapter JSON-RPC event"),
     };
-    let kind = match raw_type.as_str() {
+    Ok(Some(event))
+}
+
+fn classify_legacy_adapter_event(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<NormalizedEvent>, &'static str> {
+    let raw_type = object
+        .get("type")
+        .or_else(|| object.get("event"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("unrecognized adapter JSON event")?;
+    let kind = match raw_type {
         "message" | "assistant" | "text" | "content" => "message",
         "tool_call" | "tool" | "function_call" => "tool_call",
         "error" | "failed" => "error",
         "session" | "session_started" => "session",
         "done" | "completed" | "result" => "completed",
-        other => other,
-    }
-    .to_string();
-    let text = v
-        .get("text")
-        .or_else(|| v.get("content"))
-        .or_else(|| v.pointer("/message/content"))
-        .or_else(|| v.pointer("/error/message"))
-        .and_then(|x| {
-            if x.is_string() {
-                x.as_str().map(str::to_string)
-            } else {
-                Some(x.to_string())
-            }
-        });
-    let native_session_id = v
-        .get("session_id")
-        .or_else(|| v.get("native_session_id"))
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
-    Some(NormalizedEvent {
+        _ => return Err("unrecognized adapter JSON event"),
+    };
+    Ok(Some(normalized_event(
         kind,
+        raw_type,
+        bounded_json_string(
+            object
+                .get("text")
+                .or_else(|| object.get("content"))
+                .or_else(|| {
+                    object
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                }),
+        ),
+        native_session_id(Some(object), None),
+    )))
+}
+
+fn normalized_event(
+    kind: &str,
+    raw_type: &str,
+    text: Option<String>,
+    native_session_id: Option<String>,
+) -> NormalizedEvent {
+    NormalizedEvent {
+        kind: kind.into(),
         text,
         native_session_id,
-        raw_type,
-    })
+        raw_type: bounded_copy(raw_type, MAX_NORMALIZED_EVENT_TYPE_BYTES),
+    }
+}
+
+fn required_json_string(value: Option<&serde_json::Value>) -> Result<String, &'static str> {
+    bounded_json_string(value).ok_or("adapter event missing expected text")
+}
+
+fn bounded_json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(|value| bounded_copy(value, MAX_NORMALIZED_EVENT_TEXT_BYTES))
+}
+
+fn native_session_id(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    params: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    params
+        .and_then(|params| {
+            params
+                .get("threadId")
+                .or_else(|| params.get("session_id"))
+                .or_else(|| params.get("native_session_id"))
+                .or_else(|| params.get("thread").and_then(|thread| thread.get("id")))
+        })
+        .or_else(|| {
+            object.and_then(|object| {
+                object
+                    .get("session_id")
+                    .or_else(|| object.get("native_session_id"))
+            })
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(|value| bounded_copy(value, MAX_NORMALIZED_EVENT_TYPE_BYTES))
+}
+
+fn bounded_copy(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.into();
+    }
+    let mut end = max_bytes.saturating_sub('…'.len_utf8());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}…", &value[..end])
 }
 
 #[cfg(test)]
@@ -1855,6 +2036,37 @@ acp = false
                 .expect("JSON-RPC error must not disappear from replay");
         assert_eq!(event.kind, "error");
         assert_eq!(event.text.as_deref(), Some("turn failed"));
+    }
+
+    #[test]
+    fn codex_json_rpc_fixture_normalizes_events_without_protocol_or_raw_payloads() {
+        let raw = include_bytes!("../tests/fixtures/codex-app-server-replay.jsonl");
+        let page = parse_adapter_event_page(raw, 100);
+        assert_eq!(page.events.len(), 8);
+        assert_eq!(page.events[0].event.as_ref().unwrap().kind, "session");
+        assert_eq!(
+            page.events[1].event.as_ref().unwrap().text.as_deref(),
+            Some("Hello from Codex")
+        );
+        assert_eq!(page.events[2].event.as_ref().unwrap().kind, "tool_call");
+        assert_eq!(page.events[3].event.as_ref().unwrap().kind, "tool_result");
+        assert_eq!(page.events[4].event.as_ref().unwrap().kind, "tool_result");
+        assert_eq!(
+            page.events[5].error.as_deref(),
+            Some("unrecognized adapter JSON-RPC event")
+        );
+        assert_eq!(
+            page.events[6].event.as_ref().unwrap().text.as_deref(),
+            Some("after error")
+        );
+        assert_eq!(page.events[7].event.as_ref().unwrap().kind, "completed");
+        assert!(
+            !serde_json::to_string(&page)
+                .unwrap()
+                .contains("must-not-be-exposed"),
+            "unknown JSON-RPC params must not be copied into replay"
+        );
+        assert_eq!(page.next_cursor, 100 + raw.len() as u64);
     }
 
     #[test]

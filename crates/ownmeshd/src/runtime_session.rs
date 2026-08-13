@@ -19,6 +19,11 @@ use super::{
     TransitionRecord, TransitionTarget, Value,
 };
 
+/// Structured sidecar pages are capped below the durable MCP result budget.
+/// Both semantic replay and explicit raw diagnostics advance with the same
+/// independent byte cursor, so larger transcripts remain fully pageable.
+const MAX_STRUCTURED_SIDECAR_PAGE_BYTES: usize = 48 * 1024;
+
 impl DaemonRuntime {
     pub(super) async fn handle_session_open(
         &mut self,
@@ -1618,6 +1623,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             /// encoded explicitly because PTY output is raw bytes.
             #[serde(default)]
             sidecar_cursor: Option<u64>,
+            /// Return the raw sidecar page for explicit diagnostics only.
+            #[serde(default)]
+            raw_sidecar: bool,
             /// Ignored: read ACL uses authenticated client identity.
             #[serde(default)]
             principal: Option<String>,
@@ -1640,7 +1648,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             let max_bytes = p
                 .max_bytes
                 .unwrap_or(ownmesh_session::MAX_REPLAY_PAGE_BYTES)
-                .min(ownmesh_session::MAX_REPLAY_PAGE_BYTES);
+                .min(ownmesh_session::MAX_REPLAY_PAGE_BYTES)
+                .min(MAX_STRUCTURED_SIDECAR_PAGE_BYTES);
             let supervisor = self.ensure_remote_supervisor().await?;
             Some(
                 supervisor
@@ -1654,6 +1663,21 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             None
         };
+        if p.raw_sidecar {
+            let sidecar_truncated = sidecar_page
+                .as_ref()
+                .map(|page| page.truncated)
+                .unwrap_or(false);
+            return Ok(json!({
+                "session_id": p.id,
+                "raw_sidecar": true,
+                "truncated": sidecar_truncated,
+                "sidecar_bytes_encoding": sidecar_page.as_ref().map(|_| "base64"),
+                "sidecar_bytes_base64": sidecar_page.as_ref().map(|page| base64_standard(&page.bytes)),
+                "sidecar_next_cursor": sidecar_page.as_ref().and_then(|page| page.next_offset),
+                "sidecar_total_bytes": sidecar_page.as_ref().map(|page| page.total_bytes),
+            }));
+        }
         // Fold embedded live host output into the legacy durable replay ring.
         let drained = self.drain_live_output_into_session(&p.id)?;
         let page = self
@@ -1694,13 +1718,11 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             .unwrap_or(false);
         let sidecar_next_cursor = sidecar_page.as_ref().and_then(|page| page.next_offset);
         let sidecar_total_bytes = sidecar_page.as_ref().map(|page| page.total_bytes);
-        let sidecar_bytes_base64 = sidecar_page
-            .as_ref()
-            .map(|page| base64_standard(&page.bytes));
         // Structured profiles additionally expose a bounded, normalized view
-        // over the exact raw sidecar spool cursor.  The raw base64 field stays
-        // available for binary-safe recovery; malformed vendor output becomes
-        // an explicit adapter error rather than disappearing into a terminal.
+        // over the exact raw sidecar spool cursor. Raw bytes remain local to
+        // the sidecar; callers receive only the bounded normalized view and
+        // an explicit continuation cursor. Malformed vendor output becomes an
+        // explicit adapter error rather than disappearing into a terminal.
         let profile_events = self
             .sessions
             .get(&p.id)
@@ -1728,8 +1750,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             "live_drained_bytes": drained,
             "live_pending_bytes": live_pending,
             "live_pty": self.live_hosts.contains_key(&p.id) || sidecar_page.is_some(),
-            "sidecar_bytes_encoding": sidecar_page.as_ref().map(|_| "base64"),
-            "sidecar_bytes_base64": sidecar_bytes_base64,
             "sidecar_next_cursor": sidecar_next_cursor,
             "sidecar_total_bytes": sidecar_total_bytes,
             "profile_events": profile_events.as_ref().map(|page| &page.events),
