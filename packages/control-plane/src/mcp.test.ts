@@ -61,6 +61,7 @@ async function callTool(
   args: Record<string, unknown>,
   router?: Parameters<typeof handleMcp>[3],
   tracker?: OperationTracker,
+  options?: Parameters<typeof handleMcp>[4],
 ) {
   const deviceId = typeof args.device_id === "string" ? args.device_id : "";
   if (deviceId && !(await store.getDevice(deviceId))) {
@@ -76,7 +77,11 @@ async function callTool(
     store,
     new URL("https://cp.test/mcp"),
     router,
-    { issuer: "https://cp.test", tracker: tracker || new OperationTracker() },
+    {
+      ...options,
+      issuer: "https://cp.test",
+      tracker: tracker || new OperationTracker(),
+    },
   );
   const body = (await res.json()) as {
     result?: {
@@ -906,13 +911,24 @@ test("local tools still work without router (list_devices/get_device/list_profil
     status: "active",
   });
 
-  const list = await callTool(store, token, "ownmesh_list_devices", {});
+  const livePresence = { presenceForDevice: async () => "online" as const };
+  const list = await callTool(store, token, "ownmesh_list_devices", {}, undefined, undefined, livePresence);
   assert.equal(list.body.result!.structuredContent!.status, "completed");
+  const listedDevice = ((list.body.result!.structuredContent!.data as {
+    devices: Array<{ enrollment_status?: string; connection_status?: string }>;
+  }).devices[0]);
+  assert.equal(listedDevice?.enrollment_status, "active");
+  assert.equal(listedDevice?.connection_status, "online");
 
   const get = await callTool(store, token, "ownmesh_get_device", {
     device_id: deviceId,
-  });
+  }, undefined, undefined, livePresence);
   assert.equal(get.body.result!.structuredContent!.status, "completed");
+  const gotDevice = (get.body.result!.structuredContent!.data as {
+    device: { enrollment_status?: string; connection_status?: string };
+  }).device;
+  assert.equal(gotDevice.enrollment_status, "active");
+  assert.equal(gotDevice.connection_status, "online");
 
   const profiles = await callTool(store, token, "ownmesh_list_profiles", {});
   assert.equal(profiles.body.result!.structuredContent!.status, "completed");

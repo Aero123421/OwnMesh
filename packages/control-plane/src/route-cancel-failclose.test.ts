@@ -126,9 +126,10 @@ test("routeToDeviceRoom: stub.fetch throw → dispatch_uncertain (not thrown)", 
   assert.equal(routed.status, "dispatch_uncertain");
   assert.notEqual(routed.status, "routed_to_device");
   assert.notEqual(routed.status, "failed");
-  const detail = (routed.detail || {}) as { error?: string; message?: string };
+  const detail = (routed.detail || {}) as { error?: string; reason?: string; message?: string };
   assert.equal(detail.error, "device_room_fetch_failed");
-  assert.match(String(detail.message || ""), /simulated_do_crash/);
+  assert.equal(detail.reason, "dispatch_uncertain");
+  assert.equal(detail.message, undefined, "route failures must not surface arbitrary upstream text");
 });
 
 test("routeToDeviceRoom: unresolved stub fetch → dispatch_uncertain timeout", async () => {

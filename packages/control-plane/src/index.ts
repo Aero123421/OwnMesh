@@ -19,6 +19,7 @@ import {
   MemoryStore,
   MissingD1Error,
   type ControlPlaneStore,
+  type DeviceRecord,
   type SchemaReadiness,
 } from "./store.ts";
 import {
@@ -452,6 +453,7 @@ async function routeToDeviceRoom(
       return {
         status: "dispatch_uncertain",
         detail: {
+          reason: "dispatch_uncertain",
           error: "device_room_fetch_timeout",
           timeout_ms: timeoutMs,
           note: liveOnly
@@ -461,15 +463,15 @@ async function routeToDeviceRoom(
       };
     }
     res = outcome;
-  } catch (err) {
+  } catch {
     // Post-send throw is also uncertain: the DO may have accepted before the
     // Worker observed failure. Do not terminal-fail the MCP operation.
     return {
       status: "dispatch_uncertain",
       detail: {
+        reason: "dispatch_uncertain",
         error: "device_room_fetch_failed",
-        message: err instanceof Error ? err.message : String(err),
-          note: liveOnly
+        note: liveOnly
             ? "live ticket delivery is uncertain; never replay its bearer, advance to a fresh proof generation"
             : "post-send failure is not proof of rejection; keep pending for redelivery/dedup",
       },
@@ -533,6 +535,37 @@ async function routeToDeviceRoom(
     return { status: "rejected", detail };
   }
   return { status: "unavailable", detail };
+}
+
+/** Presence is a bounded observation of the hibernatable DeviceRoom, not a
+ * durable enrollment state. A failed or slow probe is explicitly unknown. */
+const DEVICE_PRESENCE_PROBE_TIMEOUT_MS = 1_000;
+
+async function deviceConnectionStatus(
+  env: Env,
+  device: DeviceRecord,
+): Promise<"online" | "offline" | "unknown"> {
+  if (!env.DEVICE_ROOM) return "unknown";
+  const stub = env.DEVICE_ROOM.get(env.DEVICE_ROOM.idFromName(device.id));
+  const timeout = Symbol("presence_probe_timeout");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race<Response | typeof timeout>([
+      stub.fetch(new Request(`https://device-room/status?device_id=${encodeURIComponent(device.id)}`)),
+      new Promise<typeof timeout>((resolve) => {
+        timer = setTimeout(() => resolve(timeout), DEVICE_PRESENCE_PROBE_TIMEOUT_MS);
+      }),
+    ]);
+    if (result === timeout || !result.ok) return "unknown";
+    const body: unknown = await result.json().catch(() => null);
+    if (!body || typeof body !== "object" || Array.isArray(body)) return "unknown";
+    const status = (body as { connection_status?: unknown }).connection_status;
+    return status === "online" || status === "offline" ? status : "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 export default {
@@ -799,6 +832,7 @@ export default {
         },
         {
           issuer,
+          presenceForDevice: (device) => deviceConnectionStatus(env, device),
           transferTicketSecret: env.SESSION_SECRET,
           terminalizeTransferRoom: env.TRANSFER_ROOM && env.SESSION_SECRET ? async (control) => {
             const signed = await issueTransferTerminalControl(env.SESSION_SECRET!, { v: 1, ...control });
@@ -916,7 +950,9 @@ export default {
     }
 
     if (url.pathname.startsWith("/v1/devices")) {
-      return handleDevices(request, store, url);
+      return handleDevices(request, store, url, {
+        presenceForDevice: (device) => deviceConnectionStatus(env, device),
+      });
     }
 
     if (url.pathname === "/v1/migrations/status" && request.method === "GET") {
@@ -962,6 +998,7 @@ export const __test = {
   MCP_TOOLS,
   requireScope,
   routeToDeviceRoom,
+  deviceConnectionStatus,
   signInternalContext,
   internalContextHeaderName,
   get store() {

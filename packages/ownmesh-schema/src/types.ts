@@ -94,6 +94,10 @@ export interface Device {
   public_key: string;
   labels?: string[];
   status: EntityStatus;
+  /** Enrollment lifecycle; `status` is retained for compatibility. */
+  enrollment_status?: "pending" | "active" | "revoked";
+  /** Live DeviceRoom observation; independent from enrollment `status`. */
+  connection_status?: "online" | "offline" | "unknown";
   last_seen_at?: string;
   created_at: string;
   revoked_at?: string;

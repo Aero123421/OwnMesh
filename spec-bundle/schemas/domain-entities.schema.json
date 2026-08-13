@@ -226,6 +226,8 @@
           "items": { "type": "string" }
         },
         "status": { "$ref": "#/$defs/entity_status" },
+        "enrollment_status": { "enum": ["pending", "active", "revoked"] },
+        "connection_status": { "enum": ["online", "offline", "unknown"] },
         "last_seen_at": { "$ref": "#/$defs/timestamp" },
         "created_at": { "$ref": "#/$defs/timestamp" },
         "revoked_at": { "$ref": "#/$defs/timestamp" }

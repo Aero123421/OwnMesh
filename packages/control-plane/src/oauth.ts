@@ -1019,6 +1019,10 @@ export async function handleDevices(
   req: Request,
   store: ControlPlaneStore,
   url: URL,
+  options?: {
+    /** Presence is a best-effort live DeviceRoom observation, not enrollment state. */
+    presenceForDevice?: (device: DeviceRecord) => Promise<"online" | "offline" | "unknown">;
+  },
 ): Promise<Response> {
   const token = bearer(req);
   if (!token) return json({ error: "unauthorized" }, { status: 401 });
@@ -1253,7 +1257,13 @@ export async function handleDevices(
 
   if (url.pathname === "/v1/devices" && req.method === "GET") {
     const devices = await store.listDevices(rec.principal);
-    return json({ devices });
+    const withPresence = options?.presenceForDevice
+      ? await Promise.all(devices.map(async (device) => ({
+        ...device,
+        connection_status: await options.presenceForDevice!(device).catch(() => "unknown" as const),
+      })))
+      : devices;
+    return json({ devices: withPresence });
   }
 
   // The legacy direct-create endpoint bypassed key proof and is intentionally

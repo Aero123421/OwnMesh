@@ -519,6 +519,64 @@ test("DeviceRoom persists lastSeq/seen/pending to storage and restores on new in
   assert.equal(room2.router.pending.has("op_persist_1"), true);
 });
 
+test("authenticated ready refreshes bounded metadata without heartbeat writes", async () => {
+  const deviceId = "dev_ready_metadata_01";
+  const { adapter, store } = openSqliteAdapter();
+  const { token } = await seedActiveDevice(store, deviceId);
+  const authHash = await sha256Hex(token);
+  const sessionId = "ags_ready_metadata";
+  const socket = mockSocket({
+    role: "agent",
+    device_id: deviceId,
+    session_id: sessionId,
+    connected_at: Date.now(),
+    // This phase is only reachable after proof; the real transport performs
+    // the signature exchange before it can send ready.
+    phase: "proven",
+    auth_hash: authHash,
+    lastSeq: 0,
+  });
+  const room = new DeviceRoom(mockDOState({ sockets: [socket] }), {
+    DB: adapter as unknown as D1Database,
+  });
+  await room.ready;
+
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "ready", deviceId, {
+      agent_version: "2.3.4",
+      protocol_version: "payload-is-not-authoritative",
+      remote_routing_enabled: false,
+    })),
+  );
+  const refreshed = await store.getDevice(deviceId);
+  assert.equal(refreshed?.agent_version, "2.3.4");
+  assert.equal(refreshed?.protocol_version, PROTOCOL);
+  assert.ok(refreshed?.last_seen_at);
+  const lastSeen = refreshed!.last_seen_at;
+
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "ping", deviceId, {}, undefined, { seq: 2 })),
+  );
+  assert.equal((await store.getDevice(deviceId))?.last_seen_at, lastSeen);
+
+  const throttled = await store.recordDeviceReadyConnection(deviceId, {
+    agent_version: "2.3.4",
+    protocol_version: PROTOCOL,
+    last_seen_at: new Date(Date.parse(lastSeen!) + 1).toISOString(),
+  });
+  assert.equal(throttled?.last_seen_at, lastSeen, "rapid unchanged reconnects do not rewrite last_seen");
+
+  const stale = await store.recordDeviceReadyConnection(deviceId, {
+    agent_version: "1.0.0-stale",
+    protocol_version: "ownmesh.device/stale",
+    last_seen_at: new Date(Date.parse(lastSeen!) - 1).toISOString(),
+  });
+  assert.equal(stale?.agent_version, "2.3.4", "an older ready observation cannot replace newer metadata");
+  assert.equal(stale?.protocol_version, PROTOCOL);
+});
+
 test("hibernated expired pending operation converges in D1 on DeviceRoom restart", async () => {
   const originalNow = Date.now;
   let now = 1_800_000_000_000;

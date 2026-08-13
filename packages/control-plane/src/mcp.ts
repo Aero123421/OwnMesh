@@ -16,7 +16,7 @@
  * Prompt-injection / model judgment MUST NOT bypass (2)/(3).
  */
 
-import type { ControlPlaneStore, McpOperationRecord } from "./store.ts";
+import type { ControlPlaneStore, DeviceRecord, McpOperationRecord } from "./store.ts";
 import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   bearer,
@@ -141,7 +141,7 @@ const elevatedCommandProp = {
 export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_list_devices",
-    description: "List enrolled devices for the current tenant",
+    description: "List devices with separate enrollment lifecycle and best-effort live connection presence",
     inputSchema: {
       type: "object",
       properties: { ...cursorProps },
@@ -158,7 +158,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_get_device",
-    description: "Get a single enrolled device by id",
+    description: "Get one device with separate enrollment lifecycle and best-effort live connection presence",
     inputSchema: {
       type: "object",
       properties: { device_id: str },
@@ -2270,6 +2270,8 @@ export type McpHandleOptions = {
    * Production Worker typically returns routed/async immediately.
    */
   waitForDeviceMs?: number;
+  /** Best-effort live DeviceRoom observation; never used for authorization. */
+  presenceForDevice?: (device: DeviceRecord) => Promise<"online" | "offline" | "unknown">;
 };
 
 function approvalUrl(issuer: string | undefined, operationId: string): string {
@@ -3727,11 +3729,20 @@ export async function handleMcp(
         limit: typeof args.limit === "number" ? args.limit : undefined,
         maxBytes: typeof args.max_bytes === "number" ? args.max_bytes : undefined,
       });
+      // Probe only the bounded public page, never the full durable owner set.
+      // Presence is display state and is not consulted by authorization.
+      const devicesWithPresence = await Promise.all((page as DeviceRecord[]).map(async (device) => ({
+        ...device,
+        enrollment_status: device.status,
+        connection_status: opts.presenceForDevice
+          ? await opts.presenceForDevice(device).catch(() => "unknown" as const)
+          : "unknown" as const,
+      })));
       const env = makeEnvelope({
         operation_id: operationId,
         status: "completed",
         summary: `listed ${page.length} device(s)`,
-        data: { devices: page },
+        data: { devices: devicesWithPresence },
         truncated,
         next_cursor,
         warnings: injectWarnings,
@@ -3787,7 +3798,15 @@ export async function handleMcp(
         status: "completed",
         device_id: deviceId,
         summary: `device ${d.name}`,
-        data: { device: d },
+        data: {
+          device: {
+            ...d,
+            enrollment_status: d.status,
+            connection_status: opts.presenceForDevice
+              ? await opts.presenceForDevice(d).catch(() => "unknown" as const)
+              : "unknown",
+          },
+        },
         warnings: injectWarnings,
       });
       await persistOp(store, tracker, {

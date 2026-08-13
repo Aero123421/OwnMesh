@@ -208,6 +208,31 @@ test("routeToDeviceRoom: 2xx routed_to_device unchanged", async () => {
   assert.equal(detail.ok, true);
 });
 
+test("slow DeviceRoom presence probe becomes unknown, not offline", async () => {
+  const room = stubDeviceRoom(() => new Promise<Response>(() => {}));
+  const started = Date.now();
+  const status = await __test.deviceConnectionStatus(
+    { DEVICE_ROOM: room },
+    {
+      id: "dev_presence_probe_01",
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      name: "probe",
+      hostname: "probe",
+      os: "test",
+      arch: "test",
+      agent_version: "1",
+      protocol_version: "ownmesh.device/1.0",
+      public_key: "ab".repeat(32),
+      revoked: false,
+      created_at: new Date().toISOString(),
+      status: "active",
+    },
+  );
+  assert.equal(status, "unknown");
+  assert.ok(Date.now() - started < 1_500, "presence probe is bounded");
+});
+
 // ---------------------------------------------------------------------------
 // MCP — rejected / unavailable must be failed envelopes, never pending
 // ---------------------------------------------------------------------------

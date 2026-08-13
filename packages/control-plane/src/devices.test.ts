@@ -232,3 +232,46 @@ test("PATCH device metadata is exact, normalized, owner-bound, and fail-closed",
   assert.equal(foreignBody, await missing.text());
   assert.equal((await store.getDevice("dev_metadata"))?.name, "Workstation");
 });
+
+test("device list keeps enrollment active while attaching best-effort live presence", async () => {
+  const { store, token } = await authedStore();
+  await store.putDevice({
+    id: "dev_presence_list",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    name: "presence",
+    hostname: "presence",
+    os: "linux",
+    arch: "x64",
+    agent_version: "1",
+    protocol_version: "ownmesh.device/1.0",
+    public_key: "ab".repeat(32),
+    revoked: false,
+    created_at: new Date().toISOString(),
+    status: "active",
+  });
+
+  const list = await handleDevices(
+    new Request("https://cp.test/v1/devices", { headers: { authorization: `Bearer ${token}` } }),
+    store,
+    new URL("https://cp.test/v1/devices"),
+    { presenceForDevice: async () => "online" },
+  );
+  const body = (await list.json()) as {
+    devices: Array<{ status: string; connection_status?: string }>;
+  };
+  assert.equal(body.devices[0]?.status, "active");
+  assert.equal(body.devices[0]?.connection_status, "online");
+
+  const unavailableProbe = await handleDevices(
+    new Request("https://cp.test/v1/devices", { headers: { authorization: `Bearer ${token}` } }),
+    store,
+    new URL("https://cp.test/v1/devices"),
+    { presenceForDevice: async () => { throw new Error("slow probe did not complete"); } },
+  );
+  const unavailableBody = (await unavailableProbe.json()) as {
+    devices: Array<{ status: string; connection_status?: string }>;
+  };
+  assert.equal(unavailableBody.devices[0]?.status, "active");
+  assert.equal(unavailableBody.devices[0]?.connection_status, "unknown");
+});
