@@ -395,6 +395,10 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         ...cursorProps,
+        cursor: {
+          type: "string",
+          description: "Continuation token returned by this tool (`off_N` byte offset)",
+        },
         offset: { type: "integer", minimum: 0 },
       },
       required: ["device_id", "path"],
@@ -417,6 +421,10 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         ...deviceProp,
         path: str,
         ...cursorProps,
+        cursor: {
+          type: "string",
+          description: "Continuation token returned by this tool (`off_N` byte offset)",
+        },
         offset: { type: "integer", minimum: 0 },
       },
       required: ["device_id", "path"],

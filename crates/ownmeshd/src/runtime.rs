@@ -426,6 +426,12 @@ pub struct FsReadParams {
     /// Byte offset for bounded range reads (E2).
     #[serde(default)]
     pub offset: Option<u64>,
+    /// Exact byte continuation token returned by a prior read (`off_N`).
+    ///
+    /// The control plane forwards MCP cursors unchanged, so the daemon owns
+    /// validation and normalization into `offset` before policy/IO execution.
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default)]
     pub workspace_id: Option<String>,
     #[serde(default)]
@@ -5576,6 +5582,15 @@ fn require_id(params: Option<Value>, field: &str) -> IpcResult<String> {
 }
 
 fn fs_err(err: ownmesh_fs::FsError) -> IpcError {
+    if matches!(err, ownmesh_fs::FsError::HashMismatch { .. }) {
+        return IpcError::Remote {
+            code: app_error::CONFLICT,
+            // The FS error includes an absolute custody path and file hashes.
+            // Neither belongs in a remote response; callers only need to know
+            // that their optimistic precondition became stale.
+            message: "file changed since it was read".into(),
+        };
+    }
     IpcError::Remote {
         code: app_error::INTERNAL,
         message: err.to_string(),
