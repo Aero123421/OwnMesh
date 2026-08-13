@@ -104,6 +104,37 @@
         }
     }
 
+    function Move-InstalledBinary {
+        param(
+            [Parameter(Mandatory)][string]$Source,
+            [Parameter(Mandatory)][string]$Destination
+        )
+
+        # A just-stopped daemon/session host or an antivirus scanner can retain a
+        # Windows image handle briefly. Retry only the Win32 sharing/lock shapes;
+        # every other error remains fail-fast and the outer transaction rolls back.
+        $maxAttempts = 25
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+                Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+                return
+            } catch {
+                $win32Code = $_.Exception.HResult -band 0xffff
+                $retryable = $win32Code -in @(32, 33, 183)
+                if (-not $retryable) { throw }
+
+                $leaf = [IO.Path]::GetFileName($Destination)
+                if ($attempt -eq $maxAttempts) {
+                    throw "Cannot replace $leaf because it is still in use. Close active OwnMesh sessions, run 'ownmesh service stop', and retry."
+                }
+                if ($attempt -eq 1) {
+                    Write-Host "Waiting for a running OwnMesh process to release $leaf..."
+                }
+                Start-Sleep -Milliseconds 200
+            }
+        }
+    }
+
     function Get-ChecksumFromSums {
         param(
             [Parameter(Mandatory)][string]$SumsPath,
@@ -480,7 +511,7 @@
                 Unblock-File -LiteralPath $staged -ErrorAction SilentlyContinue
                 $stagedFiles += $staged
                 $finalPath = Join-Path $InstallDir $bin
-                Move-Item -LiteralPath $staged -Destination $finalPath -Force
+                Move-InstalledBinary -Source $staged -Destination $finalPath
                 $replacedBins += $bin
                 if (-not (Test-Path -LiteralPath $finalPath -PathType Leaf)) {
                     throw "Installed target is not a file: $finalPath"

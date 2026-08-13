@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -686,6 +688,7 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("Refusing existing non-file", text)
         self.assertIn("Refusing existing reparse point", text)
         self.assertIn("[IO.File]::Replace", text)
+        self.assertIn("Move-InstalledBinary", text)
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
@@ -832,6 +835,64 @@ class InstallerAdversarialTests(unittest.TestCase):
             close_handle = ctypes.windll.kernel32.CloseHandle
             close_handle.argtypes = [wintypes.HANDLE]
             close_handle.restype = wintypes.BOOL
+            invalid_handle = ctypes.c_void_p(-1).value
+
+            # A short-lived image/share lock must converge without leaving a
+            # partial binary set. Release only after the staged host appears so
+            # this deterministically exercises the bounded retry path.
+            transient_install = tmp_path / "transient-lock-install"
+            transient_install.mkdir()
+            transient_host = transient_install / "ownmesh-session-host.exe"
+            shutil.copy2(sys.executable, transient_host)
+            transient_handle = create_file(
+                str(transient_host),
+                0x80000000,  # GENERIC_READ
+                0x00000001,  # FILE_SHARE_READ (deny replacement/delete)
+                None,
+                3,  # OPEN_EXISTING
+                0x00000080,  # FILE_ATTRIBUTE_NORMAL
+                None,
+            )
+            self.assertNotEqual(transient_handle, invalid_handle)
+            released = threading.Event()
+
+            def release_transient_lock() -> None:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if list(transient_install.glob(".ownmesh-session-host.exe.new-*")):
+                        time.sleep(0.4)
+                        break
+                    time.sleep(0.02)
+                close_handle(transient_handle)
+                released.set()
+
+            release_thread = threading.Thread(target=release_transient_lock, daemon=True)
+            release_thread.start()
+            env["OWNMESH_INSTALL_DIR"] = str(transient_install)
+            completed = subprocess.run(
+                [pwsh, "-NoProfile", "-File", str(PS_INSTALLER)],
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            release_thread.join(timeout=16)
+            self.assertTrue(released.is_set(), "transient lock was not released")
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn(
+                "Waiting for a running OwnMesh process",
+                completed.stdout + completed.stderr,
+            )
+            for binary in BINS:
+                self.assertEqual(
+                    _sha256(transient_install / f"{binary}.exe"),
+                    _sha256(package / f"{binary}.exe"),
+                    binary,
+                )
+
             locked_handle = create_file(
                 str(old_tui),
                 0x80000000,  # GENERIC_READ
@@ -841,7 +902,6 @@ class InstallerAdversarialTests(unittest.TestCase):
                 0x00000080,  # FILE_ATTRIBUTE_NORMAL
                 None,
             )
-            invalid_handle = ctypes.c_void_p(-1).value
             self.assertNotEqual(locked_handle, invalid_handle)
             env["OWNMESH_INSTALL_DIR"] = str(rollback_install)
             try:
