@@ -29,6 +29,8 @@ fn result(stdout: &str) -> RunResult {
         exit_code: Some(0),
         stdout: stdout.into(),
         stderr: String::new(),
+        stdout_decoding: None,
+        stderr_decoding: None,
         timed_out: false,
         duration_ms: 1,
         truncated: false,
