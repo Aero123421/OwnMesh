@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v1.2.7 — Windows installer reliability
+
+- The verified PowerShell installer now retries only transient Windows
+  sharing/image-lock failures while replacing installed binaries.
+- A persistent lock still aborts the upgrade, restores the prior installation,
+  and reports the exact recovery action; signature, checksum, custody, and
+  post-install verification remain unchanged.
+
 ## v1.2.6 — Runtime correctness and agent ergonomics
 
 - Device enrollment state and live routing presence are reported separately;
