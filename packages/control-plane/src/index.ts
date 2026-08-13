@@ -35,7 +35,7 @@ import {
   protectedResourceMetadata,
   type AuthenticatedPrincipal,
 } from "./oauth.ts";
-import { handleApprove, handleMcp, MCP_TOOLS } from "./mcp.ts";
+import { handleApprove, handleMcp, MCP_SYNC_WAIT_MS, MCP_TOOLS } from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
 import {
   handleChatGptConnector,
@@ -833,6 +833,8 @@ export default {
         {
           issuer,
           presenceForDevice: (device) => deviceConnectionStatus(env, device),
+          // Short fixed fast path only; command timeout remains device-side.
+          waitForDeviceMs: MCP_SYNC_WAIT_MS,
           transferTicketSecret: env.SESSION_SECRET,
           terminalizeTransferRoom: env.TRANSFER_ROOM && env.SESSION_SECRET ? async (control) => {
             const signed = await issueTransferTerminalControl(env.SESSION_SECRET!, { v: 1, ...control });

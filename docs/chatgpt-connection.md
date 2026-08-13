@@ -183,6 +183,8 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 {
   "operation_id": "op_…",
   "status": "completed",
+  "phase": "completed",
+  "phase_updated_at": "2026-08-13T00:00:00.000Z",
   "device_id": "dev_…",
   "summary": "…",
   "data": {},
@@ -196,7 +198,11 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 ```
 
 - Large lists/files set `truncated: true` and `next_cursor` (`cur_…`).
+- With `async: false` (or omitted), the Worker waits at most one second for an
+  authoritative device result, then returns a pollable non-terminal operation.
 - Long commands should pass `async: true` and poll `ownmesh_get_operation`.
+- `phase` is server-derived (`queued`, `delivered`, `executing`,
+  `waiting_approval`, or a terminal phase); `status` remains backward compatible.
 - `policy_authority` is always `ownmesh_device` — model text never becomes authorization.
 
 ---

@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import worker, { __setTestStore } from "./index.ts";
+import { MCP_SYNC_WAIT_MS } from "./mcp.ts";
 import {
   DeviceRoom,
   PROTOCOL,
@@ -1448,6 +1449,140 @@ test("production-path: DeviceRoom handshake → MCP inject → operation.result 
     assert.equal(polled.result?.structuredContent?.operation_id, opId);
     assert.equal(polled.result?.structuredContent?.status, "completed");
     assert.deepEqual(polled.result?.structuredContent?.data?.entries, ["README.md", "src/"]);
+  });
+});
+
+test("production-path: synchronous MCP uses a bounded authoritative fast path", async () => {
+  await withStoreAndAdapter(async (store, adapter) => {
+    const { publicKeyHex, privateKey } = await ed25519Keypair();
+    const { deviceId, deviceCredential, accessToken, room } = await enrollActivatedDevice(
+      store,
+      adapter,
+      privateKey,
+      publicKeyHex,
+      "prod-sync-wait-agent",
+    );
+    const { agentWs, nextSeq } = await connectAgentReady({
+      room,
+      deviceId,
+      deviceCredential,
+      privateKey,
+    });
+    const wenv = workerEnv(adapter, room);
+
+    const takeRequest = async (): Promise<DeviceEnvelope> => {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        const request = drainSocket(agentWs).find((message) => message.type === "operation.request");
+        if (request) return request;
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error("timed out waiting for operation.request");
+    };
+    const complete = async (request: DeviceEnvelope, summary: string): Promise<void> => {
+      await room.webSocketMessage(
+        agentWs as unknown as WebSocket,
+        JSON.stringify({
+          protocol: PROTOCOL,
+          message_id: randomId("msg_"),
+          type: "operation.result",
+          device_id: deviceId,
+          seq: nextSeq(),
+          sent_at: new Date().toISOString(),
+          correlation_id: request.correlation_id,
+          payload: {
+            status: "completed",
+            operation_id: request.payload.operation_id,
+            summary,
+            // Mirror the Agent's exact absolute-path workspace receipt.
+            result: { entries: [summary], workspace_id: null, workspace_version: null },
+          },
+        } satisfies DeviceEnvelope),
+      );
+    };
+    const content = async (response: Response) => {
+      assert.equal(response.status, 200, await response.clone().text());
+      const body = (await response.json()) as {
+        result?: { structuredContent?: Record<string, unknown> };
+        error?: unknown;
+      };
+      assert.equal(body.error, undefined);
+      return body.result?.structuredContent || {};
+    };
+
+    // A result arriving shortly after durable dispatch completes in this call.
+    const fastResponder = (async () => {
+      const request = await takeRequest();
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      await complete(request, "fast");
+    })();
+    const fastStarted = Date.now();
+    const fastResponse = await worker.fetch(
+      mcpRpc(
+        "ownmesh_fs_list",
+        { device_id: deviceId, workspace_id: null, path: "/fast", idempotency_key: "sync-fast" },
+        accessToken,
+      ),
+      wenv,
+      ctx,
+    );
+    await fastResponder;
+    const fast = await content(fastResponse);
+    assert.equal(fast.status, "completed");
+    assert.equal(fast.phase, "completed");
+    assert.match(String(fast.phase_updated_at), /^\d{4}-\d{2}-\d{2}T/);
+    assert.ok(Date.now() - fastStarted < MCP_SYNC_WAIT_MS + 500);
+
+    // No result within the fixed window remains durable, pollable pending.
+    const timeoutStarted = Date.now();
+    const timeout = await content(await worker.fetch(
+      mcpRpc(
+        "ownmesh_fs_list",
+        { device_id: deviceId, workspace_id: null, path: "/slow", idempotency_key: "sync-timeout" },
+        accessToken,
+      ),
+      wenv,
+      ctx,
+    ));
+    const timeoutElapsed = Date.now() - timeoutStarted;
+    assert.equal(timeout.status, "pending");
+    assert.equal(timeout.phase, "delivered");
+    assert.ok(timeoutElapsed >= MCP_SYNC_WAIT_MS - 100, `waited only ${timeoutElapsed}ms`);
+    assert.ok(timeoutElapsed < MCP_SYNC_WAIT_MS + 1_000, `waited ${timeoutElapsed}ms`);
+    assert.ok(await store.getMcpOperation(String(timeout.operation_id)));
+    drainSocket(agentWs);
+
+    // If the device wins before the Worker writes its pending route receipt,
+    // the terminal CAS winner must be returned and never overwritten.
+    let raced = false;
+    const racingStub = {
+      fetch: async (request: Request) => {
+        const response = await room.fetch(request);
+        const operationRequest = drainSocket(agentWs).find(
+          (message) => message.type === "operation.request",
+        );
+        assert.ok(operationRequest);
+        await complete(operationRequest!, "race-winner");
+        raced = true;
+        return response;
+      },
+    } as unknown as DurableObjectStub;
+    const racingNamespace = {
+      idFromName: (name: string) => ({ toString: () => name, equals: () => false, name }),
+      get: () => racingStub,
+    } as unknown as DurableObjectNamespace;
+    const race = await content(await worker.fetch(
+      mcpRpc(
+        "ownmesh_fs_list",
+        { device_id: deviceId, workspace_id: null, path: "/race", idempotency_key: "sync-race" },
+        accessToken,
+      ),
+      { ...wenv, DEVICE_ROOM: racingNamespace },
+      ctx,
+    ));
+    assert.equal(raced, true);
+    assert.equal(race.status, "completed");
+    assert.equal(race.phase, "completed");
   });
 });
 
