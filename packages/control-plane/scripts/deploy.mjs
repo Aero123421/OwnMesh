@@ -86,7 +86,8 @@ const ownerInit = spawnSync(process.execPath, [
 if (ownerInit.error) throw ownerInit.error;
 if (ownerInit.status !== 0) process.exit(ownerInit.status || 1);
 
-process.stdout.write(`\nHealth check:      ${issuer}/health\n`);
+process.stdout.write(`\nLiveness check:    ${issuer}/health\n`);
+process.stdout.write(`Readiness check:   ${issuer}/health/ready\n`);
 process.stdout.write(`ChatGPT MCP URL:   ${issuer}/mcp\n`);
 // The issuer is the one value the next step needs, so hand it over ready to
 // paste rather than sending the operator back to the README to assemble it.

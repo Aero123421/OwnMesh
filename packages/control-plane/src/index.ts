@@ -14,7 +14,13 @@
  *   https://developers.cloudflare.com/workers/platform/deploy-buttons/
  */
 
-import { createStore, MemoryStore, MissingD1Error, type ControlPlaneStore } from "./store.ts";
+import {
+  createStore,
+  MemoryStore,
+  MissingD1Error,
+  type ControlPlaneStore,
+  type SchemaReadiness,
+} from "./store.ts";
 import {
   captureAuthorizeRequestReceipt,
   handleAuthorize,
@@ -175,6 +181,19 @@ export type { ControlPlaneStore };
 /** Optional injected store for unit tests (avoids global mutable singleton). */
 let testStore: ControlPlaneStore | null = null;
 
+/**
+ * A readiness scan probes every required table, column, and index. Keep its
+ * result briefly per D1 binding/store so operator checks cannot turn it into a
+ * public D1 query multiplier. This caches no request data or secrets.
+ */
+const READINESS_CACHE_TTL_MS = 5_000;
+type ReadinessCacheEntry = {
+  checkedAt: number;
+  value?: SchemaReadiness;
+  pending?: Promise<SchemaReadiness>;
+};
+const readinessCache = new WeakMap<object, ReadinessCacheEntry>();
+
 export function __setTestStore(store: ControlPlaneStore | null): void {
   testStore = store;
 }
@@ -182,6 +201,61 @@ export function __setTestStore(store: ControlPlaneStore | null): void {
 function storeFor(env: Env): ControlPlaneStore {
   if (testStore) return testStore;
   return createStore(env);
+}
+
+function readinessCacheKey(env: Env, store: ControlPlaneStore): object {
+  // D1 bindings are isolate-scoped objects. In tests without D1, the injected
+  // store is the stable identity. Neither key contains request-scoped state.
+  return env.DB || store;
+}
+
+async function schemaReadinessFor(env: Env, store: ControlPlaneStore): Promise<SchemaReadiness> {
+  const key = readinessCacheKey(env, store);
+  const now = Date.now();
+  let entry = readinessCache.get(key);
+  if (entry?.value && now - entry.checkedAt < READINESS_CACHE_TTL_MS) {
+    return entry.value;
+  }
+  if (entry?.pending) return entry.pending;
+
+  entry ??= { checkedAt: 0 };
+  const pending = store.schemaReadiness()
+    .then((value) => {
+      entry!.value = value;
+      entry!.checkedAt = Date.now();
+      return value;
+    })
+    .finally(() => {
+      entry!.pending = undefined;
+    });
+  entry.pending = pending;
+  readinessCache.set(key, entry);
+  return pending;
+}
+
+function healthBase(env: Env) {
+  return {
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
+    features: [
+      "oauth",
+      "oauth-device-code",
+      "mcp",
+      "devices",
+      "device-room-hibernation",
+      "d1",
+      "no-central-telemetry",
+      "no-r2-turn",
+    ],
+    durable_objects: Boolean(env.DEVICE_ROOM),
+  };
+}
+
+function readinessBindings(env: Env) {
+  return {
+    sessionSecretBound: Boolean(env.SESSION_SECRET),
+    browserAuthBound: Boolean(env.AUTH_PROVIDER) || ownerAuthConfigured(env),
+  };
 }
 
 /** True for loopback hosts only (IPv4/IPv6 localhost names and literals). */
@@ -474,27 +548,23 @@ export default {
     if (rateLimited) return rateLimited;
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-      const base = {
-        service: SERVICE_NAME,
-        version: SERVICE_VERSION,
-        features: [
-          "oauth",
-          "oauth-device-code",
-          "mcp",
-          "devices",
-          "device-room-hibernation",
-          "d1",
-          "no-central-telemetry",
-          "no-r2-turn",
-        ],
-        durable_objects: Boolean(env.DEVICE_ROOM),
-      };
+      // Keep the endpoint used by deploy/doctor as liveness only: it must not
+      // execute D1 queries or disclose readiness internals to anonymous callers.
+      return json({
+        ...healthBase(env),
+        status: "ok",
+        liveness: true,
+        storage: env.DB ? "d1" : "unavailable",
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/health/ready") {
+      const base = healthBase(env);
+      const { sessionSecretBound, browserAuthBound } = readinessBindings(env);
       try {
         const store = storeFor(env);
-        const readiness = await store.schemaReadiness();
+        const readiness = await schemaReadinessFor(env, store);
         const storage = env.DB ? "d1" : store.kind;
-        const sessionSecretBound = Boolean(env.SESSION_SECRET);
-        const browserAuthBound = Boolean(env.AUTH_PROVIDER) || ownerAuthConfigured(env);
         // Browser OAuth must be usable before the instance is declared ready.
         const ready =
           readiness.schema_ready && Boolean(env.DEVICE_ROOM) && sessionSecretBound && browserAuthBound;
@@ -507,7 +577,7 @@ export default {
           session_secret_bound: sessionSecretBound,
           browser_auth_bound: browserAuthBound,
           durable_objects: Boolean(env.DEVICE_ROOM),
-        }, { status: ready ? 200 : 503 });
+        }, { status: ready ? 200 : 503, noStore: true });
       } catch (error) {
         if (error instanceof MissingD1Error) {
           return json({
@@ -515,12 +585,21 @@ export default {
             status: "not_ready",
             storage: "unavailable",
             schema_ready: false,
-            session_secret_bound: Boolean(env.SESSION_SECRET),
-            browser_auth_bound: Boolean(env.AUTH_PROVIDER) || ownerAuthConfigured(env),
+            session_secret_bound: sessionSecretBound,
+            browser_auth_bound: browserAuthBound,
             durable_objects: Boolean(env.DEVICE_ROOM),
-          }, { status: 503 });
+          }, { status: 503, noStore: true });
         }
-        throw error;
+        // Do not disclose internal D1/binding failures from a public endpoint.
+        return json({
+          ...base,
+          status: "not_ready",
+          storage: env.DB ? "d1" : "unavailable",
+          schema_ready: false,
+          session_secret_bound: sessionSecretBound,
+          browser_auth_bound: browserAuthBound,
+          durable_objects: Boolean(env.DEVICE_ROOM),
+        }, { status: 503, noStore: true });
       }
     }
 
@@ -843,7 +922,7 @@ export default {
     if (url.pathname === "/v1/migrations/status" && request.method === "GET") {
       // Do not synthesize applied migrations — only report rows actually present.
       const applied = await store.appliedMigrations();
-      const readiness = await store.schemaReadiness();
+      const readiness = await schemaReadinessFor(env, store);
       return json({
         applied,
         d1_bound: Boolean(env.DB),

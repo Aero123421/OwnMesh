@@ -207,6 +207,8 @@ Proof body: `{ "device_id", "challenge_id", "signature": "<64-byte ed25519 hex>"
 
 ```bash
 curl -s https://<worker>/health | jq .
-# expect: status=ok, features includes no-r2-turn, storage=d1 when bound
+# expect: status=ok, liveness=true, features includes no-r2-turn, storage=d1 when bound
+curl -s https://<worker>/health/ready | jq .
+# expect: status=ok only when required schema and bindings are ready (cached for at most 5 seconds)
 curl -s https://<worker>/v1/migrations/status | jq .
 ```
