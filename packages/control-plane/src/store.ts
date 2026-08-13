@@ -577,6 +577,7 @@ export interface ControlPlaneStore {
     id: string,
     csrfHash: string,
     principalId: string,
+    decision?: "approve" | "deny",
   ): Promise<DeviceVerificationTransaction | null>;
 
   putAuthorizeTransaction(tx: AuthorizeTransaction): Promise<void>;
@@ -1435,14 +1436,21 @@ export class MemoryStore implements ControlPlaneStore {
   async putDeviceVerificationTransaction(tx: DeviceVerificationTransaction): Promise<void> {
     this.verificationTransactions.set(tx.id, { ...tx });
   }
-  async consumeDeviceVerificationTransaction(id: string, csrfHash: string, principalId: string): Promise<DeviceVerificationTransaction | null> {
+  async consumeDeviceVerificationTransaction(
+    id: string,
+    csrfHash: string,
+    principalId: string,
+    decision: "approve" | "deny" = "approve",
+  ): Promise<DeviceVerificationTransaction | null> {
     const tx = this.verificationTransactions.get(id);
     if (!tx || tx.consumed || tx.csrf_hash !== csrfHash || tx.principal_id !== principalId || Date.now() > tx.expires_at) return null;
     const dc = await this.getDeviceCodeByUserCode(tx.user_code);
     if (!dc || dc.status !== "pending" || dc.client_id !== tx.client_id || dc.scope !== tx.scope || Date.now() > dc.expires_at) return null;
     tx.consumed = true;
     this.verificationTransactions.set(id, tx);
-    if (!(await this.approveDeviceCode(tx.user_code, principalId))) return null;
+    dc.status = decision === "approve" ? "approved" : "denied";
+    dc.principal_id = decision === "approve" ? principalId : undefined;
+    this.deviceCodes.set(dc.device_code, dc);
     return { ...tx };
   }
 
@@ -3013,14 +3021,42 @@ export class SqlStore implements ControlPlaneStore {
       nowIso(tx.expires_at), nowIso()).run();
   }
 
-  async consumeDeviceVerificationTransaction(id: string, csrfHash: string, principalId: string): Promise<DeviceVerificationTransaction | null> {
-    // Atomic CAS: consume verification tx + approve matching device code in one batch.
+  async consumeDeviceVerificationTransaction(
+    id: string,
+    csrfHash: string,
+    principalId: string,
+    decision: "approve" | "deny" = "approve",
+  ): Promise<DeviceVerificationTransaction | null> {
+    // Atomic CAS: consume verification tx + decide matching device code in one batch.
     // Fail closed when batch/transactions are unavailable (no sequential fallback).
     if (!this.db.batch) {
       throw new Error("SqlStore.consumeDeviceVerificationTransaction requires db.batch");
     }
     const ts = nowIso();
     type BatchResult = { meta?: { changes?: number }; success?: boolean };
+    const decide = decision === "approve"
+      ? this.db.prepare(
+        `UPDATE device_codes SET status = 'approved', principal_id = ?
+         WHERE status = 'pending' AND expires_at > ?
+           AND EXISTS (
+             SELECT 1 FROM device_verification_transactions vtx
+             WHERE vtx.id = ? AND vtx.csrf_hash = ? AND vtx.principal_id = ? AND vtx.consumed = 1
+               AND vtx.user_code = device_codes.user_code
+               AND vtx.client_id = device_codes.client_id
+               AND vtx.scope = device_codes.scope
+           )`,
+      ).bind(principalId, ts, id, csrfHash, principalId)
+      : this.db.prepare(
+        `UPDATE device_codes SET status = 'denied', principal_id = NULL
+         WHERE status = 'pending' AND expires_at > ?
+           AND EXISTS (
+             SELECT 1 FROM device_verification_transactions vtx
+             WHERE vtx.id = ? AND vtx.csrf_hash = ? AND vtx.principal_id = ? AND vtx.consumed = 1
+               AND vtx.user_code = device_codes.user_code
+               AND vtx.client_id = device_codes.client_id
+               AND vtx.scope = device_codes.scope
+           )`,
+      ).bind(ts, id, csrfHash, principalId);
     const batchResults = await this.db.batch<BatchResult>([
       this.db.prepare(
         `UPDATE device_verification_transactions SET consumed = 1
@@ -3033,22 +3069,12 @@ export class SqlStore implements ControlPlaneStore {
                AND dc.status = 'pending' AND dc.expires_at > ?
            )`,
       ).bind(id, csrfHash, principalId, ts, ts),
-      this.db.prepare(
-        `UPDATE device_codes SET status = 'approved', principal_id = ?
-         WHERE status = 'pending' AND expires_at > ?
-           AND EXISTS (
-             SELECT 1 FROM device_verification_transactions vtx
-             WHERE vtx.id = ? AND vtx.csrf_hash = ? AND vtx.principal_id = ? AND vtx.consumed = 1
-               AND vtx.user_code = device_codes.user_code
-               AND vtx.client_id = device_codes.client_id
-               AND vtx.scope = device_codes.scope
-           )`,
-      ).bind(principalId, ts, id, csrfHash, principalId),
+      decide,
     ]);
     // Only the CAS winner mutates rows; losers must not observe the winner's final state as success.
     const consumed = Number(batchResults[0]?.meta?.changes ?? 0) > 0;
-    const approved = Number(batchResults[1]?.meta?.changes ?? 0) > 0;
-    if (!consumed || !approved) return null;
+    const decided = Number(batchResults[1]?.meta?.changes ?? 0) > 0;
+    if (!consumed || !decided) return null;
     const row = await this.db.prepare(
       `SELECT user_code, client_id, scope, expires_at
        FROM device_verification_transactions

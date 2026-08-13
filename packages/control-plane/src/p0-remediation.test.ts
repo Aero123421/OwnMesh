@@ -99,6 +99,27 @@ test("device verification requires authenticated one-time CSRF transaction and b
   const results = await Promise.all([exchange(), exchange()]);
   assert.deepEqual(results.map((r) => r.status).sort(), [200, 400]);
 
+  await store.putDeviceCode({ device_code: "dcode_denied", user_code: "UVWX-YZ23", client_id: "cli", scope: "ownmesh.read", verification_uri: "https://cp.test/oauth/device", interval_sec: 5, expires_at: Date.now() + 60_000, status: "pending" });
+  const denyPage = await handleDeviceVerification(new Request("https://cp.test/oauth/device?user_code=UVWX-YZ23", { headers: { "accept-language": "ja-JP" } }), store, { principal });
+  const denyHtml = await denyPage.text();
+  assert.match(denyHtml, /<html lang="ja-JP">/);
+  assert.match(denyHtml, /name="decision" value="deny"/);
+  const denyTx = /name="transaction_id" value="([^"]+)"/.exec(denyHtml)![1]!;
+  const denyCsrf = /name="csrf_token" value="([^"]+)"/.exec(denyHtml)![1]!;
+  const denied = await handleDeviceVerification(new Request("https://cp.test/oauth/device", {
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "accept-language": "ja-JP" },
+    body: new URLSearchParams({ transaction_id: denyTx, csrf_token: denyCsrf, decision: "deny" }),
+  }), store, { principal });
+  assert.equal(denied.status, 200);
+  assert.match(await denied.text(), /デバイスを拒否しました/);
+  assert.equal((await store.getDeviceCode("dcode_denied"))?.status, "denied");
+  const deniedExchange = await handleToken(new Request("https://cp.test/oauth/token", {
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: "dcode_denied", client_id: "cli" }),
+  }), store);
+  assert.equal(deniedExchange.status, 400);
+  assert.equal(((await deniedExchange.json()) as { error: string }).error, "access_denied");
+
   await store.putDeviceCode({ device_code: "dcode_changed", user_code: "LMNP-QRST", client_id: "cli", scope: "ownmesh.read", verification_uri: "https://cp.test/oauth/device", interval_sec: 5, expires_at: Date.now() + 60_000, status: "pending" });
   const changedPage = await handleDeviceVerification(new Request("https://cp.test/oauth/device?user_code=LMNP-QRST"), store, { principal });
   const changedHtml = await changedPage.text();

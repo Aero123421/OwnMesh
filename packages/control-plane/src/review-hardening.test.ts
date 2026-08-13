@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import test from "node:test";
 
 import { MCP_TOOLS, PUBLISHED_MCP_TOOLS } from "./mcp.ts";
-import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
+import { AUTH_PAGE_CSP, authLocale, authPage, authText } from "./auth-ui.ts";
 import { ownerPasskeyScript } from "./owner-auth.ts";
 
 // --- MCP catalog: aliases stay callable but are not advertised ------------
@@ -142,6 +142,28 @@ test("auth page escapes caller-supplied text and keeps its strict CSP", () => {
   assert.ok(!page.includes("<script>alert(1)</script>"), "title must be escaped");
   assert.ok(AUTH_PAGE_CSP.includes("default-src 'none'"));
   assert.ok(AUTH_PAGE_CSP.includes("frame-ancestors 'none'"));
+});
+
+test("auth locale is bounded to four supported languages", () => {
+  assert.equal(
+    authLocale(new Request("https://cp.test/login", { headers: { "accept-language": "ja-JP,ja;q=0.9" } })),
+    "ja-JP",
+  );
+  assert.equal(authLocale(new Request("https://cp.test/login?ui_locales=ru")), "ru-RU");
+  assert.equal(authLocale(new Request("https://cp.test/login?lang=zh-CN")), "zh-Hans");
+  assert.equal(authLocale(new Request("https://cp.test/login?lang=%3Cscript%3E")), "en-US");
+
+  const page = authPage({
+    locale: "ja-JP",
+    title: "t",
+    eyebrow: "e",
+    heading: "h",
+    intro: "i",
+    body: "<p>b</p>",
+  });
+  assert.match(page, /<html lang="ja-JP">/);
+  assert.match(page, /ローカルポリシーが最終権限/);
+  assert.equal(authText("ru-RU", { en: "e", ja: "j", zh: "z", ru: "r" }), "r");
 });
 
 // --- Passkey failure messages --------------------------------------------

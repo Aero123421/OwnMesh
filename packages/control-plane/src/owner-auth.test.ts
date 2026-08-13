@@ -178,6 +178,22 @@ test("registered owner signs in with only the stored passkey", async () => {
   assert.equal(store.ownerAuthChallenges.size, 1);
 });
 
+test("owner login localizes the primary passkey and recovery guidance", async () => {
+  const store = new MemoryStore();
+  await seedPasskey(store);
+  const page = await handleOwnerLogin(
+    new Request(`${ISSUER}/login`, { headers: { "accept-language": "ja-JP" } }),
+    store,
+    ISSUER,
+    await env(),
+  );
+  const body = await page.text();
+  assert.match(body, /<html lang="ja-JP">/);
+  assert.match(body, /パスキーでサインイン/);
+  assert.match(body, /ownmesh login --device/);
+  assert.match(body, /reset-passkey/);
+});
+
 test("SQL passkey challenge is one-time and initial credential is insert-once", async () => {
   const store = sqlStore();
   await store.ensureBootstrap();

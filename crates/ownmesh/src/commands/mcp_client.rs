@@ -10,12 +10,15 @@ pub(crate) const MAX_MCP_MESSAGE_BYTES: usize = 256 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
 const MCP_PROTOCOL_VERSION_HEADER: HeaderName = HeaderName::from_static("mcp-protocol-version");
+const OPERATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 pub(crate) struct McpClientError {
     pub(crate) code: ErrorCode,
     pub(crate) message: String,
     pub(crate) hint: Option<&'static str>,
+    retry_after: Option<Duration>,
 }
 
 impl McpClientError {
@@ -24,11 +27,17 @@ impl McpClientError {
             code,
             message: message.into(),
             hint: None,
+            retry_after: None,
         }
     }
 
     fn with_hint(mut self, hint: &'static str) -> Self {
         self.hint = Some(hint);
+        self
+    }
+
+    fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
         self
     }
 }
@@ -210,16 +219,8 @@ impl McpHttpClient {
                     ),
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
             value = self
-                .call_tool_value(
-                    serde_json::json!(request_id),
-                    "ownmesh_get_operation",
-                    serde_json::json!({
-                        "operation_id": operation_id,
-                        "device_id": device_id,
-                    }),
-                )
+                .poll_operation(request_id, operation_id, device_id, started, max_wait)
                 .await?;
             if value.get("operation_id").and_then(Value::as_str) != Some(operation_id) {
                 return Err(McpClientError::new(
@@ -251,16 +252,8 @@ impl McpHttpClient {
                     ),
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
             let value = self
-                .call_tool_value(
-                    serde_json::json!(request_id),
-                    "ownmesh_get_operation",
-                    serde_json::json!({
-                        "operation_id": operation_id,
-                        "device_id": device_id,
-                    }),
-                )
+                .poll_operation(request_id, operation_id, device_id, started, max_wait)
                 .await?;
             if value.get("operation_id").and_then(Value::as_str) != Some(operation_id) {
                 return Err(McpClientError::new(
@@ -288,6 +281,41 @@ impl McpHttpClient {
                 }
             }
             request_id = request_id.saturating_add(1);
+        }
+    }
+
+    /// Poll one immutable operation record without exhausting the control-plane
+    /// credential budget. HTTP 429 is the only transport rejection retried
+    /// here, and only for the server-provided bounded `Retry-After` interval.
+    async fn poll_operation(
+        &mut self,
+        request_id: u64,
+        operation_id: &str,
+        device_id: &str,
+        started: Instant,
+        max_wait: Duration,
+    ) -> Result<Value, McpClientError> {
+        sleep_with_deadline(started, max_wait, OPERATION_POLL_INTERVAL, operation_id).await?;
+        loop {
+            match self
+                .call_tool_value(
+                    serde_json::json!(request_id),
+                    "ownmesh_get_operation",
+                    serde_json::json!({
+                        "operation_id": operation_id,
+                        "device_id": device_id,
+                    }),
+                )
+                .await
+            {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    let Some(delay) = error.retry_after else {
+                        return Err(error);
+                    };
+                    sleep_with_deadline(started, max_wait, delay, operation_id).await?;
+                }
+            }
         }
     }
 
@@ -332,19 +360,31 @@ impl McpHttpClient {
             ));
         }
         let response_session_id = response.headers().get(&MCP_SESSION_ID).cloned();
+        let retry_after = retry_after_delay(response.headers());
         let (content_type, bytes) = read_response_limited(response).await?;
 
         if !status.is_success() {
-            let detail = if bytes.is_empty() {
-                "request rejected".to_owned()
+            let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            let message = if rate_limited {
+                match retry_after {
+                    Some(delay) => format!(
+                        "control-plane rate limit reached; retry after {} seconds",
+                        delay.as_secs()
+                    ),
+                    None => "control-plane rate limit reached; retry later".to_owned(),
+                }
             } else {
-                let value = decode_json(content_type.as_deref(), &bytes)?;
-                response_error_message(&value).to_owned()
+                let detail = if bytes.is_empty() {
+                    "request rejected".to_owned()
+                } else {
+                    let value = decode_json(content_type.as_deref(), &bytes)?;
+                    response_error_message(&value).to_owned()
+                };
+                format!("control-plane request failed ({status}): {detail}")
             };
-            return Err(McpClientError::new(
-                error_code_for_http(status),
-                format!("control-plane request failed ({status}): {detail}"),
-            ));
+            let retry_after = if rate_limited { retry_after } else { None };
+            return Err(McpClientError::new(error_code_for_http(status), message)
+                .with_retry_after(retry_after));
         }
 
         if let Some(value) = response_session_id {
@@ -371,6 +411,37 @@ impl McpHttpClient {
         validate_response(&value, expected_id)?;
         Ok(Some(value))
     }
+}
+
+async fn sleep_with_deadline(
+    started: Instant,
+    max_wait: Duration,
+    delay: Duration,
+    operation_id: &str,
+) -> Result<(), McpClientError> {
+    let elapsed = started.elapsed();
+    if elapsed >= max_wait || delay > max_wait.saturating_sub(elapsed) {
+        return Err(McpClientError::new(
+            ErrorCode::Timeout,
+            format!(
+                "operation {operation_id} did not finish within {} seconds",
+                max_wait.as_secs()
+            ),
+        ));
+    }
+    tokio::time::sleep(delay).await;
+    Ok(())
+}
+
+fn retry_after_delay(headers: &HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds.max(1)).min(MAX_RETRY_AFTER))
 }
 
 async fn load_bound_access(
@@ -598,7 +669,7 @@ fn error_code_for_http(status: reqwest::StatusCode) -> ErrorCode {
         400 | 422 => ErrorCode::InvalidArgument,
         401 => ErrorCode::Authentication,
         403 => ErrorCode::Authorization,
-        408 | 504 => ErrorCode::Timeout,
+        408 | 429 | 504 => ErrorCode::Timeout,
         409 => ErrorCode::Conflict,
         _ if status.is_server_error() => ErrorCode::DeviceOffline,
         _ => ErrorCode::Internal,
@@ -644,5 +715,24 @@ mod tests {
             extract_tool_value(&serde_json::json!({"result": {}})),
             Err("missing tool content")
         );
+    }
+
+    #[test]
+    fn retry_after_is_bounded_and_never_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("0"));
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(1)));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("3600"),
+        );
+        assert_eq!(retry_after_delay(&headers), Some(MAX_RETRY_AFTER));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("not-seconds"),
+        );
+        assert_eq!(retry_after_delay(&headers), None);
     }
 }

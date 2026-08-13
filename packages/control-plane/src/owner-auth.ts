@@ -8,7 +8,13 @@ import {
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 import type { ControlPlaneStore, OwnerAuthChallenge } from "./store.ts";
-import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
+import {
+  AUTH_PAGE_CSP,
+  authLocale,
+  authPage,
+  authText,
+  type AuthLocale,
+} from "./auth-ui.ts";
 import {
   BodyTooLargeError,
   constantTimeEqual,
@@ -472,22 +478,83 @@ export function ownerPresenceRedirect(request: Request, issuer: string): Respons
   return new Response(null, { status: 302, headers: { location: login.toString() } });
 }
 
-function loginPage(issuer: string, returnTo: string, registered: boolean): Response {
+function loginPage(
+  issuer: string,
+  returnTo: string,
+  registered: boolean,
+  locale: AuthLocale,
+): Response {
   const mode = registered ? "authenticate" : "register";
   const intro = registered
-    ? "Use the passkey registered for this self-hosted instance."
-    : "Enter the one-time owner code, then create the first passkey.";
+    ? authText(locale, {
+        en: "Use the passkey registered for this self-hosted instance.",
+        ja: "このセルフホスト環境に登録したパスキーを使用します。",
+        zh: "使用为此自托管实例注册的通行密钥。",
+        ru: "Используйте ключ доступа, зарегистрированный для этого экземпляра.",
+      })
+    : authText(locale, {
+        en: "Enter the one-time owner code, then create the first passkey.",
+        ja: "一度限りのオーナーコードを入力し、最初のパスキーを作成します。",
+        zh: "输入一次性所有者代码，然后创建第一个通行密钥。",
+        ru: "Введите одноразовый код владельца и создайте первый ключ доступа.",
+      });
+  const ownerCodeLabel = authText(locale, {
+    en: "One-time owner code",
+    ja: "一度限りのオーナーコード",
+    zh: "一次性所有者代码",
+    ru: "Одноразовый код владельца",
+  });
   const codeInput = registered
     ? ""
-    : '<label for="owner_code">One-time owner code</label><input id="owner_code" name="owner_code" type="password" autocomplete="off" minlength="20" maxlength="128" required>';
-  const button = registered ? "Sign in with passkey" : "Create owner passkey";
+    : `<label for="owner_code">${ownerCodeLabel}</label><input id="owner_code" name="owner_code" type="password" autocomplete="off" minlength="20" maxlength="128" required>`;
+  const button = registered
+    ? authText(locale, {
+        en: "Sign in with passkey",
+        ja: "パスキーでサインイン",
+        zh: "使用通行密钥登录",
+        ru: "Войти с ключом доступа",
+      })
+    : authText(locale, {
+        en: "Create owner passkey",
+        ja: "オーナーのパスキーを作成",
+        zh: "创建所有者通行密钥",
+        ru: "Создать ключ доступа владельца",
+      });
+  const note = authText(locale, {
+    en: "Private keys stay inside your authenticator. OwnMesh stores only the public credential.",
+    ja: "秘密鍵は認証器の中に残り、OwnMeshには公開資格情報だけが保存されます。",
+    zh: "私钥始终保留在认证器内；OwnMesh 只保存公钥凭据。",
+    ru: "Закрытые ключи остаются в аутентификаторе; OwnMesh хранит только открытые данные.",
+  });
+  const helpSummary = authText(locale, {
+    en: "Can't use this passkey?",
+    ja: "このパスキーを使えない場合",
+    zh: "无法使用此通行密钥？",
+    ru: "Не удаётся использовать ключ доступа?",
+  });
+  const help = authText(locale, {
+    en: "For a headless server, run ownmesh login --device and open its URL on a phone or computer that has this passkey. If every passkey is lost, run pnpm run owner:init -- --reset-passkey from the control-plane deployment.",
+    ja: "ヘッドレス環境では ownmesh login --device を実行し、表示されたURLをこのパスキーが使えるスマートフォンまたはPCで開いてください。すべてのパスキーを紛失した場合は、Control Planeのデプロイ環境で pnpm run owner:init -- --reset-passkey を実行します。",
+    zh: "在无界面服务器上运行 ownmesh login --device，并在持有此通行密钥的手机或电脑上打开所示网址。若所有通行密钥均已丢失，请在控制平面部署目录运行 pnpm run owner:init -- --reset-passkey。",
+    ru: "На сервере без браузера выполните ownmesh login --device и откройте показанный URL на телефоне или компьютере с этим ключом. Если потеряны все ключи, выполните pnpm run owner:init -- --reset-passkey в развёртывании control plane.",
+  });
   return html(
     authPage({
-      title: "OwnMesh sign in",
-      eyebrow: registered ? "Owner authentication" : "Initial owner setup",
-      heading: registered ? "Unlock your private mesh" : "Create the owner identity",
+      locale,
+      title: authText(locale, {
+        en: "OwnMesh sign in",
+        ja: "OwnMesh サインイン",
+        zh: "OwnMesh 登录",
+        ru: "Вход в OwnMesh",
+      }),
+      eyebrow: registered
+        ? authText(locale, { en: "Owner authentication", ja: "オーナー認証", zh: "所有者认证", ru: "Аутентификация владельца" })
+        : authText(locale, { en: "Initial owner setup", ja: "初回オーナー設定", zh: "初始所有者设置", ru: "Первичная настройка владельца" }),
+      heading: registered
+        ? authText(locale, { en: "Unlock your private mesh", ja: "プライベートメッシュを開く", zh: "解锁您的私有网格", ru: "Открыть приватную сеть" })
+        : authText(locale, { en: "Create the owner identity", ja: "オーナーIDを作成", zh: "创建所有者身份", ru: "Создать учётную запись владельца" }),
       intro,
-      body: `<form id="passkey-form" class="stack" data-mode="${mode}"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">${codeInput}<button class="primary wide" type="submit">${button}</button></form><p id="passkey-status" class="status" role="status" aria-live="polite"></p><p class="note">Private keys stay inside your authenticator. OwnMesh stores only the public credential.</p><script src="/auth/passkey.js" defer></script>`,
+      body: `<form id="passkey-form" class="stack" data-mode="${mode}"><input type="hidden" name="return_to" value="${escapeHtml(returnTo)}">${codeInput}<button class="primary wide" type="submit">${button}</button></form><p id="passkey-status" class="status" role="status" aria-live="polite"></p><p class="note">${note}</p><details class="help"><summary>${helpSummary}</summary><p>${help}</p></details><script src="/auth/passkey.js" defer></script>`,
       footer: new URL(issuer).host,
     }),
     {
@@ -530,7 +597,12 @@ export async function handleOwnerLogin(
       return new Response(null, { status: 302, headers: { location: returnTo } });
     }
     try {
-      return loginPage(issuer, returnTo, (await store.listOwnerPasskeys()).length > 0);
+      return loginPage(
+        issuer,
+        returnTo,
+        (await store.listOwnerPasskeys()).length > 0,
+        authLocale(request),
+      );
     } catch {
       return json({ error: "owner_auth_schema_unavailable" }, { status: 503, noStore: true });
     }

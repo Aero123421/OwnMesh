@@ -321,6 +321,27 @@ fn run_interactive(mut app: App, rt: &tokio::runtime::Runtime) -> Result<(), Exi
                 continue;
             }
 
+            if app.take_pending_reauthentication() {
+                terminal
+                    .draw(|frame| ui::draw(frame, &app))
+                    .map_err(|_| ExitCode::Internal)?;
+                drop(terminal);
+                guard.restore().map_err(|_| ExitCode::Internal)?;
+                let authenticated = run_reauthentication_cli();
+
+                guard = TerminalGuard::enter().map_err(|err| {
+                    eprintln!("failed to restore raw terminal mode: {err}");
+                    ExitCode::Internal
+                })?;
+                terminal = create_ratatui().map_err(|_| ExitCode::Internal)?;
+                terminal.clear().map_err(|_| ExitCode::Internal)?;
+                drain_pending_events();
+
+                app.refresh_local_state(rt.block_on(fetch_status()).ok());
+                app.status_line = reauthentication_message(app.lang, authenticated).to_owned();
+                continue;
+            }
+
             let Some(pending) = app.take_pending_approval() else {
                 continue;
             };
@@ -656,6 +677,23 @@ fn run_ownmesh_step(executable: &Path, args: Vec<OsString>) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn run_reauthentication_cli() -> bool {
+    let Ok(current) = std::env::current_exe() else {
+        return false;
+    };
+    let ownmesh = sibling_ownmesh_path(&current);
+    if !ownmesh.is_file() {
+        eprintln!("OwnMesh CLI was not found beside ownmesh-tui.");
+        return false;
+    }
+    println!("\nOwnMesh account re-authentication\n");
+    run_ownmesh_step(&ownmesh, reauthentication_cli_args())
+}
+
+fn reauthentication_cli_args() -> Vec<OsString> {
+    vec![OsString::from("login"), OsString::from("--device")]
+}
+
 fn wait_for_daemon(rt: &tokio::runtime::Runtime, timeout: Duration) -> Option<DaemonStatus> {
     let started = Instant::now();
     loop {
@@ -674,6 +712,19 @@ fn local_setup_message(lang: Lang, en: &'static str, ja: &'static str) -> &'stat
         ja
     } else {
         en
+    }
+}
+
+fn reauthentication_message(lang: Lang, success: bool) -> &'static str {
+    match (lang, success) {
+        (Lang::EnUs, true) => "Account re-authenticated.",
+        (Lang::JaJp, true) => "アカウントを再認証しました。",
+        (Lang::ZhHans, true) => "账户已重新认证。",
+        (Lang::RuRu, true) => "Повторная аутентификация выполнена.",
+        (Lang::EnUs, false) => "Re-authentication failed. Review the terminal message and retry.",
+        (Lang::JaJp, false) => "再認証に失敗しました。端末の表示を確認して再試行してください。",
+        (Lang::ZhHans, false) => "重新认证失败。请检查终端消息后重试。",
+        (Lang::RuRu, false) => "Повторная аутентификация не удалась. Проверьте сообщение терминала и повторите попытку.",
     }
 }
 
@@ -880,6 +931,36 @@ mod tests {
                 OsString::from("--idempotency-key=attacker-value"),
             ]
         );
+    }
+
+    #[test]
+    fn reauthentication_uses_the_headless_safe_device_flow() {
+        assert_eq!(
+            reauthentication_cli_args(),
+            vec![OsString::from("login"), OsString::from("--device")]
+        );
+    }
+
+    #[test]
+    fn recorded_login_always_exposes_an_explicit_reauthentication_action() {
+        let dir = tempdir().unwrap();
+        let mut app = App::new(OwnMeshPaths::for_base(dir.path()), None);
+        app.readiness.server_url = Some("https://ownmesh.example".into());
+        app.readiness.account_present = true;
+        app.readiness.device_id = Some("dev_test".into());
+        app.readiness.service_installed = true;
+        app.readiness.agent_running = true;
+
+        let actions = app.overview_actions();
+        let index = actions
+            .iter()
+            .position(|action| *action == app::OverviewAction::Reauthenticate)
+            .expect("re-authentication action");
+        app.overview_action_cursor = index;
+        app.run_overview_action();
+
+        assert!(app.take_pending_reauthentication());
+        assert!(!app.take_pending_reauthentication());
     }
 
     #[test]

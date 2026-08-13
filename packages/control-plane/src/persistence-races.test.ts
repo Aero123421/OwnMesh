@@ -159,6 +159,38 @@ test("SQL device verification transaction CAS permits exactly one concurrent con
   assert.equal(dc?.principal_id, "prin_dev");
 });
 
+test("SQL device verification transaction records an explicit denial", async () => {
+  const s = store(); await s.ensureBootstrap();
+  await s.putDeviceCode({
+    device_code: "dcode_denied",
+    user_code: "DENY-CODE",
+    client_id: "client_ownmesh_cli",
+    scope: "ownmesh.read",
+    verification_uri: "https://cp.test/oauth/device",
+    interval_sec: 5,
+    expires_at: Date.now() + 60_000,
+    status: "pending",
+  });
+  await s.putDeviceVerificationTransaction({
+    id: "vtx_denied",
+    csrf_hash: "csrf_hash_denied",
+    user_code: "DENY-CODE",
+    principal_id: "prin_dev",
+    client_id: "client_ownmesh_cli",
+    scope: "ownmesh.read",
+    expires_at: Date.now() + 60_000,
+    consumed: false,
+  });
+  const tx = await s.consumeDeviceVerificationTransaction(
+    "vtx_denied",
+    "csrf_hash_denied",
+    "prin_dev",
+    "deny",
+  );
+  assert.equal(tx?.consumed, true);
+  assert.equal((await s.getDeviceCode("dcode_denied"))?.status, "denied");
+});
+
 test("SQL store fails closed when db.batch is absent for atomic device paths", async () => {
   const db = new DatabaseSync(":memory:");
   const dir = join(dirname(fileURLToPath(import.meta.url)), "..", "migrations");
