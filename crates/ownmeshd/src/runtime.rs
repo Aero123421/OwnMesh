@@ -86,7 +86,7 @@ use ownmesh_session::{
     SessionKind, SessionManager, SidecarHostBinding, StreamKind as SessionStreamKind,
 };
 use ownmesh_session_host::{
-    default_shell_command, HostIoMode, LiveHost, SupervisorBinding, SupervisorClient,
+    default_shell_command, HostIoMode, LiveHost, OwnerSpool, SupervisorBinding, SupervisorClient,
     SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest,
 };
 use ownmesh_transfer::{
@@ -717,6 +717,10 @@ impl DaemonRuntime {
         })?;
         let had_sessions = !sessions.list().is_empty();
         let _ = sessions.mark_hosts_detached_after_restart();
+        let _ = reconcile_dead_persistent_sessions(
+            &mut sessions,
+            &paths.state_dir.join("session-supervisor"),
+        );
         if had_sessions {
             sessions.save_to_path(&sessions_path).map_err(|e| {
                 format!(
@@ -938,6 +942,34 @@ impl DaemonRuntime {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Clear only persistent-session records whose stored process identity is
+    /// provably gone.  Identity probe failures and legacy rows without a
+    /// birth witness remain visible rather than being falsely terminalized.
+    fn reconcile_dead_persistent_sessions(&mut self) -> IpcResult<usize> {
+        let snapshot = self.sessions.clone();
+        let reconciled = reconcile_dead_persistent_sessions(
+            &mut self.sessions,
+            &self.paths.state_dir.join("session-supervisor"),
+        );
+        if reconciled == 0 {
+            return Ok(0);
+        }
+        self.commit_sessions(snapshot)?;
+        Ok(reconciled)
+    }
+
+    fn close_persistent_session_record(&mut self, session_id: &str) -> IpcResult<()> {
+        let snapshot = self.sessions.clone();
+        self.sessions.close(session_id).map_err(session_err)?;
+        self.sessions
+            .set_sidecar_host_binding(session_id, None)
+            .map_err(session_err)?;
+        self.sessions
+            .set_host_pid(session_id, None)
+            .map_err(session_err)?;
+        self.commit_sessions(snapshot)
     }
 
     /// Expire stale controller leases and persist demotions before session auth.
@@ -4713,9 +4745,11 @@ full_user_access/full_access for arbitrary commands",
     }
 
     /// Reattach every persisted, non-terminal sidecar without spawning a
-    /// replacement PTY. A missing active host is an explicit conflict; an
-    /// expired controller binding is deliberately left for exact reclaim so
-    /// expiry never kills a still-valid host TTL.
+    /// replacement PTY. A `Starting` row proves that open never completed, so
+    /// it is terminated with its exact authenticated binding and closed only
+    /// after the supervisor's durable acknowledgement. A missing active host
+    /// is an explicit conflict; an expired controller binding is deliberately
+    /// left for exact reclaim so expiry never kills a still-valid host TTL.
     async fn reattach_persistent_sidecars(&mut self) -> IpcResult<()> {
         const MAX_REATTACH: usize = 64;
         let now = Self::now();
@@ -4723,7 +4757,10 @@ full_user_access/full_access for arbitrary commands",
             .sessions
             .list()
             .into_iter()
-            .filter_map(|info| info.sidecar_host.map(|binding| (info.id, binding)))
+            .filter_map(|info| {
+                info.sidecar_host
+                    .map(|binding| (info.id, info.state, binding))
+            })
             .collect();
         if bindings.len() > MAX_REATTACH {
             return Err(IpcError::Remote {
@@ -4732,16 +4769,32 @@ full_user_access/full_access for arbitrary commands",
             });
         }
         let mut recovered_pids = Vec::new();
+        let mut interrupted_opens = Vec::new();
         {
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable during reattach".into(),
             })?;
-            for (session_id, binding) in bindings {
+            for (session_id, state, binding) in bindings {
+                let exact = supervisor_binding_from(&session_id, &binding);
+                if state == ownmesh_session::SessionState::Starting {
+                    let transition_id =
+                        format!("open-recovery:{session_id}:{}", binding.controller_epoch);
+                    proxy
+                        .terminate(&exact, transition_id)
+                        .await
+                        .map_err(|error| IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!(
+                                "interrupted persistent session {session_id} cleanup is pending: {error}"
+                            ),
+                        })?;
+                    interrupted_opens.push(session_id);
+                    continue;
+                }
                 if binding.binding_expires_unix <= now {
                     continue;
                 }
-                let exact = supervisor_binding_from(&session_id, &binding);
                 let status = proxy
                     .status(&exact)
                     .await
@@ -4751,16 +4804,63 @@ full_user_access/full_access for arbitrary commands",
                             "persistent session {session_id} cannot reattach without respawn: {error}"
                         ),
                     })?;
-                recovered_pids.push((session_id, status.pid));
+                let (pid, birth) = match (status.pid, status.process_birth_id) {
+                    (Some(pid), Some(birth)) if !status.exited => (pid, birth),
+                    _ => {
+                        return Err(IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!(
+                                "persistent session {session_id} did not attest child process identity"
+                            ),
+                        });
+                    }
+                };
+                if let (Some(expected_pid), Some(expected_birth)) =
+                    (binding.child_pid, binding.child_process_birth)
+                {
+                    if pid != expected_pid || birth != expected_birth {
+                        return Err(IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!(
+                                "persistent session {session_id} child process identity changed during reattach"
+                            ),
+                        });
+                    }
+                }
+                recovered_pids.push((session_id, pid, birth));
             }
         }
-        if recovered_pids.is_empty() {
+        if recovered_pids.is_empty() && interrupted_opens.is_empty() {
             return Ok(());
         }
         let snapshot = self.sessions.clone();
-        for (session_id, pid) in recovered_pids {
+        for session_id in interrupted_opens {
+            self.sessions.close(&session_id).map_err(session_err)?;
             self.sessions
-                .set_host_pid(&session_id, pid)
+                .set_sidecar_host_binding(&session_id, None)
+                .map_err(session_err)?;
+            self.sessions
+                .set_host_pid(&session_id, None)
+                .map_err(session_err)?;
+        }
+        for (session_id, pid, birth) in recovered_pids {
+            self.sessions
+                .set_host_pid(&session_id, Some(pid))
+                .map_err(session_err)?;
+            let mut binding = self
+                .sessions
+                .get(&session_id)
+                .map_err(session_err)?
+                .sidecar_host
+                .clone()
+                .ok_or_else(|| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: "reattached persistent session lost binding".into(),
+                })?;
+            binding.child_pid = Some(pid);
+            binding.child_process_birth = Some(birth);
+            self.sessions
+                .set_sidecar_host_binding(&session_id, Some(binding))
                 .map_err(session_err)?;
         }
         self.commit_sessions(snapshot)
@@ -4935,6 +5035,8 @@ full_user_access/full_access for arbitrary commands",
                         controller_epoch: next.controller_epoch,
                         binding_expires_unix: record.target.binding_expires_unix,
                         host_expires_unix: record.old_binding.host_expires_unix,
+                        child_pid: record.old_binding.child_pid,
+                        child_process_birth: record.old_binding.child_process_birth,
                     };
                     self.transition_journal
                         .mark_applied(&record.transition_id, binding.clone())
@@ -5877,11 +5979,86 @@ fn supervisor_binding_from(session_id: &str, binding: &SidecarHostBinding) -> Su
     }
 }
 
+/// Reconcile only rows whose original sidecar child is definitely gone.  A
+/// live process, unknown process identity, or a platform probe failure keeps
+/// the row intact for explicit recovery rather than risking a false terminal
+/// report or a PID-reuse kill.
+fn reconcile_dead_persistent_sessions(sessions: &mut SessionManager, sidecar_root: &Path) -> usize {
+    let candidates: Vec<_> = sessions
+        .list()
+        .into_iter()
+        .filter_map(|info| info.sidecar_host.map(|binding| (info.id, binding)))
+        .collect();
+    let mut reconciled = 0;
+    for (session_id, binding) in candidates {
+        let dead = match persistent_child_is_live(&binding) {
+            Ok(false) => true,
+            Ok(true) => false,
+            Err(_) => persistent_sidecar_has_terminal_receipt(sidecar_root, &binding, &session_id),
+        };
+        if !dead {
+            continue;
+        }
+        if sessions.close(&session_id).is_ok()
+            && sessions.set_sidecar_host_binding(&session_id, None).is_ok()
+        {
+            let _ = sessions.set_host_pid(&session_id, None);
+            reconciled += 1;
+        }
+    }
+    reconciled
+}
+
+fn persistent_sidecar_has_terminal_receipt(
+    sidecar_root: &Path,
+    binding: &SidecarHostBinding,
+    session_id: &str,
+) -> bool {
+    let Ok(Some(receipt)) = OwnerSpool::termination_receipt(sidecar_root, session_id) else {
+        return false;
+    };
+    receipt.session_id == session_id
+        && receipt.device_id == binding.device_id
+        && receipt.workspace_id == binding.workspace_id
+        && receipt.owner_principal == binding.owner_principal
+        && receipt.host_nonce == binding.host_nonce
+        && receipt.controller_epoch == binding.controller_epoch
+}
+
+/// A process is live only when both the stored PID and OS-issued birth witness
+/// still match. A missing/changing witness proves the original child ended,
+/// but does not assign ownership to a reused PID.
+fn persistent_child_is_live(binding: &SidecarHostBinding) -> Result<bool, String> {
+    let pid = binding
+        .child_pid
+        .ok_or("persistent sidecar binding lacks a durable child PID")?;
+    let expected = binding
+        .child_process_birth
+        .ok_or("persistent sidecar binding lacks a durable child birth witness")?;
+    match ownmesh_ipc::process_birth_id(pid)? {
+        Some(observed) => Ok(observed == expected),
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod device_binding_tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn reused_process_identity_fixture() -> (u32, u64) {
+        // A live PID with a different OS birth witness deterministically models
+        // PID reuse: the process exists, but it cannot be the persisted child.
+        let pid = std::process::id();
+        let observed = ownmesh_ipc::process_birth_id(pid).unwrap().unwrap();
+        let stale_birth = if observed == u64::MAX {
+            observed - 1
+        } else {
+            observed + 1
+        };
+        (pid, stale_birth)
+    }
 
     #[test]
     fn verified_remote_device_cannot_substitute_a_persistent_sidecar_binding() {
@@ -5910,6 +6087,8 @@ mod device_binding_tests {
                     controller_epoch: 1,
                     binding_expires_unix: DaemonRuntime::now() + 60,
                     host_expires_unix: DaemonRuntime::now() + 600,
+                    child_pid: None,
+                    child_process_birth: None,
                 }),
             )
             .unwrap();
@@ -5927,6 +6106,306 @@ mod device_binding_tests {
             runtime.sidecar_binding(&session.id).unwrap().device_id,
             "dev_a"
         );
+    }
+
+    #[test]
+    fn missing_supervisor_reconciles_only_a_confirmed_dead_child() {
+        let (dead_pid, dead_birth) = reused_process_identity_fixture();
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let session = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "dead-child",
+                "client:remote:tenant:owner",
+                DaemonRuntime::now(),
+                None,
+            )
+            .unwrap();
+        runtime
+            .sessions
+            .set_host_pid(&session.id, Some(dead_pid))
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(
+                &session.id,
+                Some(SidecarHostBinding {
+                    device_id: "dev_a".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "client:remote:tenant:owner".into(),
+                    host_nonce: "host_nonce".into(),
+                    controller_epoch: 1,
+                    binding_expires_unix: DaemonRuntime::now() + 60,
+                    host_expires_unix: DaemonRuntime::now() + 600,
+                    child_pid: Some(dead_pid),
+                    child_process_birth: Some(dead_birth),
+                }),
+            )
+            .unwrap();
+
+        assert!(runtime
+            .reconcile_terminal_after_supervisor_failure(&session.id, TransitionKind::Close)
+            .unwrap());
+        let reconciled = runtime.sessions.get(&session.id).unwrap();
+        assert_eq!(reconciled.state, ownmesh_session::SessionState::Closed);
+        assert!(reconciled.sidecar_host.is_none());
+    }
+
+    #[test]
+    fn startup_reconciles_a_provably_dead_persistent_session() {
+        let (dead_pid, dead_birth) = reused_process_identity_fixture();
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let session_id = {
+            let mut runtime = DaemonRuntime::open(&paths).unwrap();
+            let session = runtime
+                .sessions
+                .open(
+                    SessionKind::Pty,
+                    "dead-after-restart",
+                    "client:remote:tenant:owner",
+                    DaemonRuntime::now(),
+                    None,
+                )
+                .unwrap();
+            runtime
+                .sessions
+                .set_sidecar_host_binding(
+                    &session.id,
+                    Some(SidecarHostBinding {
+                        device_id: "dev_a".into(),
+                        workspace_id: "ws_default".into(),
+                        owner_principal: "client:remote:tenant:owner".into(),
+                        host_nonce: "host_nonce".into(),
+                        controller_epoch: 1,
+                        binding_expires_unix: DaemonRuntime::now() + 60,
+                        host_expires_unix: DaemonRuntime::now() + 600,
+                        child_pid: Some(dead_pid),
+                        child_process_birth: Some(dead_birth),
+                    }),
+                )
+                .unwrap();
+            runtime.persist_sessions().unwrap();
+            session.id
+        };
+
+        let runtime = DaemonRuntime::open(&paths).unwrap();
+        let recovered = runtime.sessions.get(&session_id).unwrap();
+        assert_eq!(recovered.state, ownmesh_session::SessionState::Closed);
+        assert!(recovered.sidecar_host.is_none());
+        assert!(recovered.host_pid.is_none());
+    }
+
+    #[tokio::test]
+    async fn close_retry_after_restart_terminates_an_interrupted_starting_sidecar() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let sidecar_root = paths.state_dir.join("session-supervisor");
+        let (supervisor_server, _) =
+            ownmesh_session_host::SupervisorIpcServer::new(&sidecar_root, &paths.runtime_dir)
+                .unwrap();
+        let endpoint = supervisor_server.endpoint().clone();
+        let server = Arc::clone(supervisor_server.server());
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move { server.serve().await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let management =
+            read_management_credential(supervisor_server.credential_state_dir()).unwrap();
+        let supervisor =
+            SupervisorClient::bootstrap(endpoint, paths.runtime_dir.clone(), management)
+                .await
+                .unwrap();
+
+        let session = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "interrupted-open",
+                "client:remote:tenant:owner",
+                DaemonRuntime::now(),
+                None,
+            )
+            .unwrap();
+        let lease = session.controller.clone().unwrap();
+        let (program, args) = if cfg!(windows) {
+            (
+                "ping.exe".to_owned(),
+                vec!["-n".into(), "30".into(), "127.0.0.1".into()],
+            )
+        } else {
+            ("/bin/sh".to_owned(), vec!["-c".into(), "sleep 30".into()])
+        };
+        let exact = supervisor
+            .spawn(SupervisorSpawnRequest {
+                session_id: session.id.clone(),
+                device_id: "dev_a".into(),
+                workspace_id: "ws_default".into(),
+                owner_principal: "client:remote:tenant:owner".into(),
+                controller_epoch: lease.epoch,
+                binding_expires_unix: lease.expires_unix,
+                host_expires_unix: DaemonRuntime::now() + 7_200,
+                command: SupervisorCommand {
+                    program,
+                    args,
+                    cwd: None,
+                    env: Vec::new(),
+                },
+                cols: 80,
+                rows: 24,
+                io_mode: HostIoMode::StructuredPipes,
+                profile_id: Some("test-profile".into()),
+                adapter_dialect: Some("test-jsonl".into()),
+            })
+            .await
+            .unwrap();
+        runtime
+            .sessions
+            .set_state(&session.id, ownmesh_session::SessionState::Starting)
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(
+                &session.id,
+                Some(SidecarHostBinding {
+                    device_id: exact.device_id.clone(),
+                    workspace_id: exact.workspace_id.clone(),
+                    owner_principal: exact.owner_principal.clone(),
+                    host_nonce: exact.host_nonce.clone(),
+                    controller_epoch: exact.controller_epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    host_expires_unix: DaemonRuntime::now() + 7_200,
+                    child_pid: None,
+                    child_process_birth: None,
+                }),
+            )
+            .unwrap();
+        runtime.persist_sessions().unwrap();
+        runtime.supervisor = Some(supervisor);
+
+        let result = runtime
+            .handle_session_close(
+                Some(json!({
+                    "id": session.id,
+                    "lease_id": lease.lease_id,
+                    "controller_epoch": lease.epoch,
+                    "workspace_id": "ws_default",
+                })),
+                &ClientIdentity::new("client:remote:tenant:owner", "test"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.get("closed"), Some(&json!(true)));
+        assert_eq!(result.get("reconciled"), Some(&json!(true)));
+
+        let recovered = runtime.sessions.get(&session.id).unwrap();
+        assert_eq!(recovered.state, ownmesh_session::SessionState::Closed);
+        assert!(recovered.sidecar_host.is_none());
+        assert!(runtime
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .status(&exact)
+            .await
+            .is_err());
+        let receipt = OwnerSpool::termination_receipt(&sidecar_root, &session.id)
+            .unwrap()
+            .expect("acknowledged recovery must leave a durable receipt");
+        assert_eq!(
+            receipt.transition_id,
+            format!("open-recovery:{}:{}", session.id, lease.epoch)
+        );
+
+        server.request_shutdown();
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn missing_supervisor_never_marks_a_live_pid_terminal() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let session = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "live-child",
+                "client:remote:tenant:owner",
+                DaemonRuntime::now(),
+                None,
+            )
+            .unwrap();
+        let child_pid = std::process::id();
+        let child_process_birth = ownmesh_ipc::process_birth_id(child_pid)
+            .unwrap()
+            .expect("current process has an OS birth identity");
+        runtime
+            .sessions
+            .set_host_pid(&session.id, Some(child_pid))
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(
+                &session.id,
+                Some(SidecarHostBinding {
+                    device_id: "dev_a".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "client:remote:tenant:owner".into(),
+                    host_nonce: "host_nonce".into(),
+                    controller_epoch: 1,
+                    binding_expires_unix: DaemonRuntime::now() + 60,
+                    host_expires_unix: DaemonRuntime::now() + 600,
+                    child_pid: Some(child_pid),
+                    child_process_birth: Some(child_process_birth),
+                }),
+            )
+            .unwrap();
+
+        let error = runtime
+            .reconcile_terminal_after_supervisor_failure(&session.id, TransitionKind::Close)
+            .unwrap_err();
+        match error {
+            IpcError::Remote { code, message } => {
+                assert_eq!(code, app_error::CONFLICT);
+                assert!(message.contains("child is still alive"), "{message}");
+            }
+            other => panic!("expected typed supervisor conflict, got {other}"),
+        }
+        assert_eq!(
+            runtime.sessions.get(&session.id).unwrap().state,
+            ownmesh_session::SessionState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_remote_open_never_leaves_running_session_metadata() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        let remote = ClientIdentity::new("client:remote:tenant:owner", "test");
+
+        let error = runtime
+            .dispatch(
+                session_methods::OPEN,
+                Some(json!({"title":"requires-device"})),
+                &remote,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                ..
+            }
+        ));
+        assert!(runtime.sessions.list().is_empty());
     }
 }
 

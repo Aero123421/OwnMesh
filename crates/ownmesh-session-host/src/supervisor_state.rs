@@ -38,6 +38,10 @@ impl SupervisorBinding {
 #[serde(deny_unknown_fields)]
 pub struct SupervisorStatus {
     pub pid: Option<u32>,
+    /// OS-derived process birth witness for `pid`, used by a restarted daemon
+    /// to distinguish a dead child from a reused numeric PID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_birth_id: Option<u64>,
     /// Compatibility aggregate; structured hosts expose the two bounded
     /// streams below so callers never mistake stderr for stdout replay.
     pub pending_output_bytes: usize,
@@ -90,6 +94,10 @@ impl HostedHost {
             Self::Pty(h) => status(h),
             Self::Structured(h) => SupervisorStatus {
                 pid: h.handle.pid,
+                process_birth_id: h
+                    .handle
+                    .pid
+                    .and_then(|pid| ownmesh_ipc::process_birth_id(pid).ok().flatten()),
                 pending_output_bytes: h.pending_output_bytes(),
                 pending_stdout_bytes: h.pending_stdout_bytes(),
                 pending_stderr_bytes: h.pending_stderr_bytes(),
@@ -649,6 +657,10 @@ fn unix_now() -> i64 {
 fn status(host: &LiveHost) -> SupervisorStatus {
     SupervisorStatus {
         pid: host.handle.pid,
+        process_birth_id: host
+            .handle
+            .pid
+            .and_then(|pid| ownmesh_ipc::process_birth_id(pid).ok().flatten()),
         pending_output_bytes: host.pending_output_bytes(),
         pending_stdout_bytes: host.pending_output_bytes(),
         pending_stderr_bytes: 0,

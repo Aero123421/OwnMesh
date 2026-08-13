@@ -222,6 +222,9 @@ fn validate(record: &TransitionRecord) -> Result<(), String> {
         {
             return Err("invalid transition journal binding".into());
         }
+        if binding.child_pid.is_some() != binding.child_process_birth.is_some() {
+            return Err("transition journal binding has incomplete child identity".into());
+        }
     }
     if record.phase == TransitionPhase::Applied
         && record.new_binding.is_none()
@@ -257,6 +260,8 @@ mod tests {
             controller_epoch: 1,
             binding_expires_unix: 200,
             host_expires_unix: 300,
+            child_pid: None,
+            child_process_birth: None,
         }
     }
     fn record() -> TransitionRecord {

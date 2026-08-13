@@ -12,11 +12,12 @@
 use super::{
     app_error, base64_standard, default_shell_command, fs_err, is_remote_runtime_principal, json,
     normalize_handoff_target, official_adapter_spec, parse_adapter_event_page, parse_params,
-    preset_name, reject_spoofed_principal, session_err, sha256_hex, AdapterDialect, ClientIdentity,
-    DaemonRuntime, Deserialize, HostIoMode, IpcError, IpcResult, LiveHost, NativeResume, Path,
-    ProfileRegistry, PtyCommand, PtySize, SessionKind, SessionStreamKind, SidecarHostBinding,
-    SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest, TransitionKind, TransitionPhase,
-    TransitionRecord, TransitionTarget, Value,
+    persistent_child_is_live, preset_name, reject_spoofed_principal, session_err, sha256_hex,
+    AdapterDialect, ClientIdentity, DaemonRuntime, Deserialize, HostIoMode, IpcError, IpcResult,
+    LiveHost, NativeResume, Path, ProfileRegistry, PtyCommand, PtySize, SessionKind,
+    SessionStreamKind, SidecarHostBinding, SupervisorCommand, SupervisorEnv,
+    SupervisorSpawnRequest, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
+    Value,
 };
 
 impl DaemonRuntime {
@@ -255,6 +256,29 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             None
         };
+        // Own a live PTY for interactive sessions (E5) and profile PTY fallback (E6).
+        // Process-only kinds stay metadata until structured adapters stream events.
+        // Failure to spawn is fail-closed so ChatGPT never sees a fake echo-only session.
+        let spawn_live = matches!(kind, SessionKind::Pty | SessionKind::ProfileAgent);
+        // A remote persistent session cannot be owned safely without the
+        // device identity authenticated by Agent transport. Check this before
+        // inserting session metadata: otherwise a rejected launch is visible
+        // as a `running` session for the lifetime of this daemon.
+        let remote_device_id = if spawn_live && is_remote_runtime_principal(&client.client_name) {
+            Some(
+                self.active_remote_device_id
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| IpcError::Remote {
+                        code: app_error::UNAUTHORIZED,
+                        message: "remote session.open requires verified Agent device identity"
+                            .into(),
+                    })?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
         let snapshot = self.sessions.clone();
         let info = self
             .sessions
@@ -271,10 +295,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 Some(workspace_id.clone()),
             )
             .map_err(session_err)?;
-        // Own a live PTY for interactive sessions (E5) and profile PTY fallback (E6).
-        // Process-only kinds stay metadata until structured adapters stream events.
-        // Failure to spawn is fail-closed so ChatGPT never sees a fake echo-only session.
-        let spawn_live = matches!(kind, SessionKind::Pty | SessionKind::ProfileAgent);
         if spawn_live {
             let pty_cmd = match command.as_ref() {
                 Some(argv) if !argv.is_empty() => PtyCommand {
@@ -294,16 +314,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 rows: info.rows,
             };
             if is_remote_runtime_principal(&client.client_name) {
-                let device_id = self
-                    .active_remote_device_id
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| IpcError::Remote {
-                        code: app_error::UNAUTHORIZED,
-                        message: "remote session.open requires verified Agent device identity"
-                            .into(),
-                    })?
-                    .to_owned();
+                let device_id = remote_device_id
+                    .clone()
+                    .expect("remote persistent session identity checked before metadata insert");
                 let lease = info.controller.as_ref().ok_or_else(|| IpcError::Remote {
                     code: app_error::CONFLICT,
                     message: "remote session open did not produce a controller lease".into(),
@@ -340,77 +353,105 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                         .as_ref()
                         .map(|(_, dialect)| dialect.as_str().to_owned()),
                 };
-                let binding = {
-                    let supervisor = self.ensure_remote_supervisor().await?;
-                    supervisor
-                        .spawn(request)
-                        .await
-                        .map_err(|err| IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!("persistent session sidecar spawn failed: {err}"),
-                        })?
-                };
-                if let Some((_, dialect)) = structured_adapter {
-                    let native_id = match Self::bootstrap_structured_adapter(
-                        self.ensure_remote_supervisor().await?,
-                        &binding,
-                        dialect,
-                        p.prompt.as_deref(),
-                        driver_native_session_id.as_deref(),
-                        cwd.as_deref().ok_or_else(|| IpcError::Remote {
-                            code: app_error::INVALID_PARAMS,
-                            message: "structured profile requires an absolute workspace cwd".into(),
-                        })?,
-                    )
-                    .await
-                    {
-                        Ok(native_id) => native_id,
-                        Err(error) => {
-                            if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                                let _ = proxy
-                                    .terminate(
-                                        &binding,
-                                        format!("open-rollback:{}:structured", info.id),
-                                    )
-                                    .await;
-                            }
+                let binding = match self.ensure_remote_supervisor().await {
+                    Ok(supervisor) => match supervisor.spawn(request).await {
+                        Ok(binding) => binding,
+                        Err(err) => {
                             self.sessions = snapshot;
-                            return Err(error);
+                            return Err(IpcError::Remote {
+                                code: app_error::CONFLICT,
+                                message: format!("persistent session sidecar spawn failed: {err}"),
+                            });
                         }
-                    };
-                    if let Some(native_id) = native_id {
-                        if let Err(error) = self.sessions.set_native_session_id(&info.id, native_id)
-                        {
-                            if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                                let _ = proxy
-                                    .terminate(
-                                        &binding,
-                                        format!("open-rollback:{}:native-id", info.id),
-                                    )
-                                    .await;
-                            }
-                            self.sessions = snapshot;
-                            return Err(session_err(error));
-                        }
+                    },
+                    Err(err) => {
+                        self.sessions = snapshot;
+                        return Err(err);
                     }
-                }
-                let status = {
-                    let supervisor = self.ensure_remote_supervisor().await?;
-                    supervisor
-                        .status(&binding)
-                        .await
-                        .map_err(|err| IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!("persistent session sidecar status failed: {err}"),
-                        })?
                 };
-                if let Err(err) = self.sessions.set_host_pid(&info.id, status.pid) {
-                    if let Ok(proxy) = self.ensure_remote_supervisor().await {
+                // A successful spawn is already an externally visible side
+                // effect. Persist its exact binding before any further RPC so
+                // a lost status/bootstrap reply cannot turn a live child into
+                // an untracked `running` session. `starting` deliberately
+                // tells callers that child identity is still being attested.
+                let provisional = SidecarHostBinding {
+                    device_id: device_id.clone(),
+                    workspace_id: workspace_id.clone(),
+                    owner_principal: client.client_name.clone(),
+                    host_nonce: binding.host_nonce.clone(),
+                    controller_epoch: binding.controller_epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    host_expires_unix: Self::now().saturating_add(24 * 60 * 60),
+                    child_pid: None,
+                    child_process_birth: None,
+                };
+                if let Err(err) = self
+                    .sessions
+                    .set_sidecar_host_binding(&info.id, Some(provisional))
+                {
+                    let _ = self
+                        .rollback_persistent_open(&info.id, &binding, "binding")
+                        .await;
+                    self.sessions = snapshot;
+                    return Err(session_err(err));
+                }
+                if let Err(err) = self
+                    .sessions
+                    .set_state(&info.id, ownmesh_session::SessionState::Starting)
+                {
+                    let _ = self
+                        .rollback_persistent_open(&info.id, &binding, "starting")
+                        .await;
+                    self.sessions = snapshot;
+                    return Err(session_err(err));
+                }
+                if let Err(err) = self.commit_sessions(snapshot) {
+                    // `commit_sessions` restored `snapshot`; cleanup is still
+                    // attempted, but a storage failure cannot safely retain a
+                    // durable record. Return the persistence error rather
+                    // than claiming that the child was rolled back.
+                    if let Some(proxy) = self.supervisor.as_ref() {
                         let _ = proxy
-                            .terminate(&binding, format!("open-rollback:{}:host-pid", info.id))
+                            .terminate(&binding, format!("open-rollback:{}:persist", info.id))
                             .await;
                     }
-                    self.sessions = snapshot;
+                    return Err(err);
+                }
+                let status = match self
+                    .supervisor
+                    .as_ref()
+                    .expect("successful persistent sidecar spawn retains supervisor client")
+                    .status(&binding)
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(err) => {
+                        let _ = self
+                            .rollback_persistent_open(&info.id, &binding, "status")
+                            .await;
+                        return Err(IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: format!("persistent session sidecar status failed: {err}"),
+                        });
+                    }
+                };
+                let (child_pid, child_process_birth) = match (status.pid, status.process_birth_id) {
+                    (Some(pid), Some(birth)) if !status.exited => (pid, birth),
+                    _ => {
+                        let _ = self
+                            .rollback_persistent_open(&info.id, &binding, "identity")
+                            .await;
+                        return Err(IpcError::Remote {
+                            code: app_error::CONFLICT,
+                            message: "persistent session sidecar did not attest a live child process identity".into(),
+                        });
+                    }
+                };
+                let durable_snapshot = self.sessions.clone();
+                if let Err(err) = self.sessions.set_host_pid(&info.id, Some(child_pid)) {
+                    let _ = self
+                        .rollback_persistent_open(&info.id, &binding, "host-pid")
+                        .await;
                     return Err(session_err(err));
                 }
                 let durable = SidecarHostBinding {
@@ -421,26 +462,77 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: binding.controller_epoch,
                     binding_expires_unix: lease.expires_unix,
                     host_expires_unix: Self::now().saturating_add(24 * 60 * 60),
+                    child_pid: Some(child_pid),
+                    child_process_birth: Some(child_process_birth),
                 };
                 if let Err(err) = self
                     .sessions
                     .set_sidecar_host_binding(&info.id, Some(durable))
                 {
-                    if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                        let _ = proxy
-                            .terminate(&binding, format!("open-rollback:{}:binding", info.id))
-                            .await;
-                    }
-                    self.sessions = snapshot;
+                    let _ = self
+                        .rollback_persistent_open(&info.id, &binding, "durable-binding")
+                        .await;
                     return Err(session_err(err));
                 }
-                if let Err(err) = self.commit_sessions(snapshot) {
-                    if let Ok(proxy) = self.ensure_remote_supervisor().await {
-                        let _ = proxy
-                            .terminate(&binding, format!("open-rollback:{}:persist", info.id))
-                            .await;
+                if let Err(err) = self
+                    .sessions
+                    .set_state(&info.id, ownmesh_session::SessionState::Running)
+                {
+                    let _ = self
+                        .rollback_persistent_open(&info.id, &binding, "running")
+                        .await;
+                    return Err(session_err(err));
+                }
+                // On persistence failure `commit_sessions` restores the
+                // already-persisted provisional record, not the pre-spawn
+                // snapshot, so the child remains recoverable.
+                self.commit_sessions(durable_snapshot)?;
+                if let Some((_, dialect)) = structured_adapter {
+                    // The successful spawn above installed the authenticated
+                    // supervisor client. Do not re-run global reattachment
+                    // here: an unrelated stale session must not strand this
+                    // newly created child before its metadata is committed.
+                    let supervisor = self
+                        .supervisor
+                        .as_ref()
+                        .expect("successful persistent sidecar spawn retains supervisor client");
+                    let native_id = match Self::bootstrap_structured_adapter(
+                        supervisor,
+                        &binding,
+                        dialect,
+                        p.prompt.as_deref(),
+                        driver_native_session_id.as_deref(),
+                        // `cwd` is always resolved from the selected workspace
+                        // before the session record is created.
+                        cwd.as_deref()
+                            .expect("session workspace always resolves an absolute cwd"),
+                    )
+                    .await
+                    {
+                        Ok(native_id) => native_id,
+                        Err(error) => {
+                            let _ = self
+                                .rollback_persistent_open(&info.id, &binding, "structured")
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                    if let Some(native_id) = native_id {
+                        let native_snapshot = self.sessions.clone();
+                        if let Err(error) = self.sessions.set_native_session_id(&info.id, native_id)
+                        {
+                            let _ = self
+                                .rollback_persistent_open(&info.id, &binding, "native-id")
+                                .await;
+                            return Err(session_err(error));
+                        }
+                        if let Err(error) = self.commit_sessions(native_snapshot) {
+                            let _ = self
+                                .rollback_persistent_open(&info.id, &binding, "native-persist")
+                                .await;
+                            return Err(error);
+                        }
                     }
-                    return Err(err);
                 }
                 let mut value =
                     serde_json::to_value(self.sessions.get(&info.id).map_err(session_err)?)
@@ -524,6 +616,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         }
         let p: P = parse_params(params)?;
         let now = self.prepare_session_access()?;
+        self.reconcile_dead_persistent_sessions()?;
         let principal = &client.client_name;
         // Remote MCP always supplies workspace_id. Restricted modes refuse an
         // unbound list so cross-workspace session metadata cannot leak.
@@ -822,6 +915,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 controller_epoch: returned.controller_epoch,
                 binding_expires_unix: lease.expires_unix,
                 host_expires_unix: old_binding.host_expires_unix,
+                child_pid: old_binding.child_pid,
+                child_process_birth: old_binding.child_process_birth,
             };
             self.transition_journal
                 .mark_applied(&transition_id, new_binding.clone())
@@ -980,6 +1075,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 controller_epoch: returned.controller_epoch,
                 binding_expires_unix: lease.expires_unix,
                 host_expires_unix: old_binding.host_expires_unix,
+                child_pid: old_binding.child_pid,
+                child_process_birth: old_binding.child_process_birth,
             };
             self.transition_journal
                 .mark_applied(&transition_id, new_binding.clone())
@@ -1096,6 +1193,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 controller_epoch: returned.controller_epoch,
                 binding_expires_unix: old_binding.binding_expires_unix,
                 host_expires_unix: old_binding.host_expires_unix,
+                child_pid: old_binding.child_pid,
+                child_process_birth: old_binding.child_process_birth,
             };
             self.transition_journal
                 .mark_applied(&transition_id, new_binding.clone())
@@ -1256,6 +1355,8 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 controller_epoch: returned.controller_epoch,
                 binding_expires_unix: lease.expires_unix,
                 host_expires_unix: old_binding.host_expires_unix,
+                child_pid: old_binding.child_pid,
+                child_process_birth: old_binding.child_process_birth,
             };
             self.transition_journal
                 .mark_applied(&transition_id, new_binding.clone())
@@ -1285,6 +1386,101 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             .into_iter()
             .collect();
         Ok(json!({ "lease": lease, "readers": readers, "workspace_id": bound_ws }))
+    }
+
+    /// A failed supervisor RPC is not proof that its child died.  We only
+    /// reconcile a terminal request when the durable child PID is proven gone;
+    /// a live or indeterminate PID remains actionable instead of being hidden
+    /// behind a false terminal session state.
+    pub(super) fn reconcile_terminal_after_supervisor_failure(
+        &mut self,
+        session_id: &str,
+        terminal: TransitionKind,
+    ) -> IpcResult<bool> {
+        debug_assert!(matches!(
+            terminal,
+            TransitionKind::Close | TransitionKind::Terminate
+        ));
+        let binding = self
+            .sessions
+            .get(session_id)
+            .map_err(session_err)?
+            .sidecar_host
+            .clone()
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "persistent session supervisor unavailable; session {session_id} has no durable child identity to reconcile safely"
+                ),
+            })?;
+        if persistent_child_is_live(&binding).map_err(|error| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: format!(
+                "persistent session supervisor unavailable; unable to verify child identity: {error}"
+            ),
+        })? {
+            Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: "persistent session supervisor unavailable; authenticated child is still alive, refusing PID-only termination".into(),
+            })
+        } else {
+            let snapshot = self.sessions.clone();
+            match terminal {
+                TransitionKind::Close => {
+                    self.sessions.close(session_id).map_err(session_err)?;
+                    self.sessions
+                        .set_sidecar_host_binding(session_id, None)
+                        .map_err(session_err)?;
+                    self.sessions
+                        .set_host_pid(session_id, None)
+                        .map_err(session_err)?;
+                }
+                TransitionKind::Terminate => {
+                    self.sessions.terminate(session_id).map_err(session_err)?;
+                }
+                _ => unreachable!("terminal reconciliation only accepts close/terminate"),
+            }
+            self.commit_sessions(snapshot)?;
+            Ok(true)
+        }
+    }
+
+    /// Roll back an already-persisted persistent open only after the
+    /// supervisor acknowledged termination. The supervisor writes a durable
+    /// termination receipt before replying, so a failed RPC leaves the
+    /// `starting`/`running` record and its exact binding available for later
+    /// reconciliation instead of hiding a possibly live child.
+    async fn rollback_persistent_open(
+        &mut self,
+        session_id: &str,
+        binding: &super::SupervisorBinding,
+        stage: &str,
+    ) -> IpcResult<()> {
+        // Make an uncertain cleanup visible before attempting the side effect.
+        // If the terminate RPC is lost, this durable `starting` record and its
+        // binding are reconciled later instead of masquerading as a usable
+        // running session.
+        let snapshot = self.sessions.clone();
+        self.sessions
+            .set_state(session_id, ownmesh_session::SessionState::Starting)
+            .map_err(session_err)?;
+        self.commit_sessions(snapshot)?;
+        let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: format!(
+                "persistent session open failed during {stage}; supervisor is unavailable and cleanup is pending"
+            ),
+        })?;
+        proxy
+            .terminate(binding, format!("open-rollback:{session_id}:{stage}"))
+            .await
+            .map_err(|error| IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "persistent session open failed during {stage}; supervisor termination was not acknowledged: {error}"
+                ),
+            })?;
+        self.close_persistent_session_record(session_id)
     }
 
     pub(super) async fn handle_session_close(
@@ -1352,7 +1548,40 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 p.lease_id.as_deref().unwrap_or(&active.lease_id),
                 p.controller_epoch.unwrap_or(active.epoch),
             );
-            self.ensure_remote_supervisor().await?;
+            let binding = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
+            if self.ensure_remote_supervisor().await.is_err() {
+                self.reconcile_terminal_after_supervisor_failure(&p.id, TransitionKind::Close)?;
+                return Ok(json!({
+                    "closed": true,
+                    "reconciled": true,
+                    "session_id": p.id,
+                    "workspace_id": bound_ws,
+                }));
+            }
+            // Reattachment may have just completed cleanup of an interrupted
+            // open. Treat the caller's retry as the same successful close;
+            // issuing a second transition id against its tombstone would be a
+            // false conflict.
+            match self.sessions.get(&p.id) {
+                Ok(current) if current.sidecar_host.is_none() => {
+                    return Ok(json!({
+                        "closed": true,
+                        "reconciled": true,
+                        "session_id": p.id,
+                        "workspace_id": bound_ws,
+                    }));
+                }
+                Err(ownmesh_session::SessionError::NotFound) => {
+                    return Ok(json!({
+                        "closed": true,
+                        "reconciled": true,
+                        "session_id": p.id,
+                        "workspace_id": bound_ws,
+                    }));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(session_err(error)),
+            }
             let record = TransitionRecord {
                 transition_id: transition_id.clone(),
                 kind: TransitionKind::Close,
@@ -1379,7 +1608,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar close journal: {e}"),
                 })?;
-            let binding = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
@@ -1535,7 +1763,43 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 p.lease_id.as_deref().unwrap_or(&active.lease_id),
                 p.controller_epoch.unwrap_or(active.epoch),
             );
-            self.ensure_remote_supervisor().await?;
+            let binding = self.verified_sidecar_binding_from(&id, &old_binding)?;
+            if self.ensure_remote_supervisor().await.is_err() {
+                self.reconcile_terminal_after_supervisor_failure(&id, TransitionKind::Terminate)?;
+                return Ok(json!({
+                    "terminated": 1,
+                    "reconciled": true,
+                    "session_id": id,
+                    "workspace_id": bound_ws,
+                }));
+            }
+            // Interrupted-open recovery may have acknowledged termination and
+            // closed this row while reconnecting the supervisor. Complete the
+            // requested removal locally instead of sending a different
+            // transition id to the existing termination receipt.
+            match self.sessions.get(&id) {
+                Ok(current) if current.sidecar_host.is_none() => {
+                    let recovered_snapshot = self.sessions.clone();
+                    self.sessions.terminate(&id).map_err(session_err)?;
+                    self.commit_sessions(recovered_snapshot)?;
+                    return Ok(json!({
+                        "terminated": 1,
+                        "reconciled": true,
+                        "session_id": id,
+                        "workspace_id": bound_ws,
+                    }));
+                }
+                Err(ownmesh_session::SessionError::NotFound) => {
+                    return Ok(json!({
+                        "terminated": 1,
+                        "reconciled": true,
+                        "session_id": id,
+                        "workspace_id": bound_ws,
+                    }));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(session_err(error)),
+            }
             let record = TransitionRecord {
                 transition_id: transition_id.clone(),
                 kind: TransitionKind::Terminate,
@@ -1562,7 +1826,6 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     code: app_error::INTERNAL,
                     message: format!("begin sidecar terminate journal: {e}"),
                 })?;
-            let binding = self.verified_sidecar_binding_from(&id, &old_binding)?;
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: "sidecar unavailable after bootstrap".into(),
