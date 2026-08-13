@@ -68,6 +68,40 @@ const MAX_TRANSFER_TICKET_WIRE_BYTES: usize = 16 * 1024;
 
 type AgentSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Tracks consecutive Agent connection failures. A session that completes the
+/// authenticated ready handshake starts a fresh reconnect history, even if the
+/// peer later closes the live socket.
+#[derive(Default)]
+struct ReconnectBackoff {
+    attempt: u32,
+}
+
+impl ReconnectBackoff {
+    fn reset_after_ready(&mut self) {
+        self.attempt = 0;
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        self.attempt = self.attempt.saturating_add(1).min(10);
+        let shift = self.attempt.min(5);
+        Duration::from_secs(1_u64 << shift).min(MAX_RECONNECT_DELAY)
+    }
+}
+
+fn reconnect_failure_category(error: &str) -> &'static str {
+    if error.contains("control plane rejected") || error.contains("unsupported device protocol") {
+        "protocol_rejection"
+    } else if error.contains("socket closed")
+        || error.contains("control plane closed")
+        || error.contains("WebSocket stream ended")
+        || error.contains("ConnectionClosed")
+    {
+        "peer_closed"
+    } else {
+        "transport_error"
+    }
+}
+
 /// Fully bound transport inputs. Secret-bearing fields intentionally have no
 /// `Debug` implementation.
 #[derive(Clone)]
@@ -1269,24 +1303,44 @@ pub async fn run(
             return;
         }
     };
-    let mut attempt = 0_u32;
+    let mut backoff = ReconnectBackoff::default();
     loop {
         if *shutdown.borrow() {
             return;
         }
-        match connect_and_run(&config, runtime.as_ref(), &mut state, &mut shutdown).await {
+        let mut reached_ready = false;
+        match connect_and_run(
+            &config,
+            runtime.as_ref(),
+            &mut state,
+            &mut shutdown,
+            &mut reached_ready,
+        )
+        .await
+        {
             Ok(()) => return,
             Err(error) => {
                 tracing::warn!(
                     issuer = %ownmesh_config::redact_control_plane_url(&config.issuer),
-                    error = %error,
+                    phase = if reached_ready { "authenticated_ready" } else { "pre_ready" },
+                    category = reconnect_failure_category(&error),
                     "Agent WebSocket disconnected; reconnecting"
                 );
             }
         }
-        attempt = attempt.saturating_add(1).min(10);
-        let shift = attempt.min(5);
-        let delay = Duration::from_secs(1_u64 << shift).min(MAX_RECONNECT_DELAY);
+        if reached_ready {
+            backoff.reset_after_ready();
+        }
+        let delay = backoff.next_delay();
+        tracing::info!(
+            phase = if reached_ready {
+                "authenticated_ready"
+            } else {
+                "pre_ready"
+            },
+            reconnect_delay_ms = delay.as_millis(),
+            "Agent reconnect delay selected"
+        );
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
             changed = shutdown.changed() => {
@@ -1303,6 +1357,7 @@ async fn connect_and_run(
     runtime: Option<&Arc<Mutex<DaemonRuntime>>>,
     state: &mut AgentTransportState,
     shutdown: &mut watch::Receiver<bool>,
+    reached_ready: &mut bool,
 ) -> Result<(), String> {
     let mut request = config
         .ws_url
@@ -1344,6 +1399,7 @@ async fn connect_and_run(
     };
 
     perform_handshake(&mut socket, config, state, runtime.is_some()).await?;
+    *reached_ready = true;
     tracing::info!(
         issuer = %ownmesh_config::redact_control_plane_url(&config.issuer),
         device_id = %config.device_id,
@@ -3687,6 +3743,42 @@ mod tests {
         assert_eq!(loopback.port(), Some(8787));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_backoff_resets_after_authenticated_ready_session() {
+        let mut backoff = ReconnectBackoff::default();
+
+        // Two failures before the ready handshake retain exponential backoff.
+        let first_delay = backoff.next_delay();
+        assert_eq!(first_delay, Duration::from_secs(2));
+        paused_sleep_completes_after(first_delay).await;
+
+        let second_delay = backoff.next_delay();
+        assert_eq!(second_delay, Duration::from_secs(4));
+        paused_sleep_completes_after(second_delay).await;
+
+        // A peer disconnect after an authenticated ready session is a new
+        // reconnect history, so its delay returns to the existing base delay.
+        backoff.reset_after_ready();
+        let post_ready_delay = backoff.next_delay();
+        assert_eq!(post_ready_delay, Duration::from_secs(2));
+        paused_sleep_completes_after(post_ready_delay).await;
+    }
+
+    async fn paused_sleep_completes_after(delay: Duration) {
+        let (complete_tx, mut complete_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = complete_tx.send(());
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            complete_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(delay).await;
+        complete_rx.await.unwrap();
+    }
+
     #[test]
     fn state_rejects_corruption_and_bounds_replay_windows() {
         let dir = tempdir().unwrap();
@@ -4073,17 +4165,29 @@ mod tests {
         let mut state = AgentTransportState::fresh(&config.issuer, &config.device_id);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut first_shutdown = shutdown_rx.clone();
-        assert!(
-            connect_and_run(&config, None, &mut state, &mut first_shutdown)
-                .await
-                .is_err()
-        );
+        let mut first_reached_ready = false;
+        assert!(connect_and_run(
+            &config,
+            None,
+            &mut state,
+            &mut first_shutdown,
+            &mut first_reached_ready,
+        )
+        .await
+        .is_err());
+        assert!(first_reached_ready);
         let mut second_shutdown = shutdown_rx;
-        assert!(
-            connect_and_run(&config, None, &mut state, &mut second_shutdown)
-                .await
-                .is_err()
-        );
+        let mut second_reached_ready = false;
+        assert!(connect_and_run(
+            &config,
+            None,
+            &mut state,
+            &mut second_shutdown,
+            &mut second_reached_ready,
+        )
+        .await
+        .is_err());
+        assert!(second_reached_ready);
         server.await.unwrap();
 
         let persisted =
