@@ -71,8 +71,14 @@ export type McpToolDef = {
 };
 
 const str = { type: "string" as const };
+const operationAsyncProp = {
+  type: "boolean" as const,
+  description:
+    "true returns after durable dispatch; false or omitted waits up to 1 second for an authoritative device result, then returns a pollable pending operation",
+};
 const deviceProp = {
   device_id: { type: "string", description: "Enrolled device id (dev_...)" },
+  async: operationAsyncProp,
 };
 const workspaceProp = {
   workspace_id: {
@@ -83,6 +89,8 @@ const workspaceProp = {
 };
 /** Hard server-side ceilings (schema maximums are not authority alone). */
 export const MCP_MAX_TIMEOUT_MS = 300_000;
+/** Cloudflare-safe production fast-path wait; never follows the command timeout. */
+export const MCP_SYNC_WAIT_MS = 1_000;
 /**
  * Aggregate stdout+stderr budget for a single durable MCP result hop.
  * Kept under the 256 KiB durable data_json ceiling (with JSON framing).
@@ -601,7 +609,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           type: "string",
           description: "Required caller idempotency key for exact-once command retries",
         },
-        async: { type: "boolean", description: "Return immediately with operation_id" },
+        async: operationAsyncProp,
         ...execBoundProps,
         ...elevatedCommandProp,
       },
@@ -631,7 +639,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           type: "string",
           description: "Required caller idempotency key for exact-once command retries",
         },
-        async: { type: "boolean" },
+        async: operationAsyncProp,
         ...execBoundProps,
         ...elevatedCommandProp,
       },
@@ -662,7 +670,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           type: "string",
           description: "Required caller idempotency key for exact-once shell retries",
         },
-        async: { type: "boolean" },
+        async: operationAsyncProp,
         ...execBoundProps,
       },
       required: ["device_id", "workspace_id", "command", "idempotency_key"],
@@ -690,7 +698,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
           type: "string",
           description: "Required caller idempotency key for exact-once shell retries",
         },
-        async: { type: "boolean" },
+        async: operationAsyncProp,
         ...execBoundProps,
       },
       required: ["device_id", "workspace_id", "command", "idempotency_key"],
@@ -1247,7 +1255,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         // async control field lets the caller receive its operation id promptly
         // and use the already exact-bound generic cancel operation while the
         // Agent owns the process-tree kill handle.
-        async: { type: "boolean" },
+        async: operationAsyncProp,
       },
       required: ["device_id", "workspace_id", "tests", "idempotency_key"], additionalProperties: false,
     },
@@ -1618,9 +1626,24 @@ export type OpStatus =
   | "cancel_requested"
   | "denied";
 
+export type OperationPhase =
+  | "queued"
+  | "delivered"
+  | "executing"
+  | "waiting_approval"
+  | "cancelling"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "denied"
+  | "offline";
+
 export type OwnMeshResultEnvelope = {
   operation_id: string;
   status: OpStatus;
+  /** Server-derived lifecycle detail; status remains the compatibility contract. */
+  phase?: OperationPhase;
+  phase_updated_at?: string;
   device_id?: string;
   summary: string;
   data: Record<string, unknown>;
@@ -1780,6 +1803,48 @@ async function loadOp(
   const tracked = trackedFromRecord(rec);
   tracker.put(tracked);
   return tracked;
+}
+
+const SYNC_WAIT_NON_TERMINAL = new Set([
+  "pending",
+  "running",
+  "cancel_requested",
+]);
+const MCP_SYNC_WAIT_POLL_MS = 100;
+
+/**
+ * Briefly observe only the authoritative operation row. This helper never
+ * writes, retries delivery, or follows the command timeout, so exact-once and
+ * cancellation semantics remain unchanged. A read failure falls back to the
+ * last authoritative row already obtained by the request.
+ */
+async function waitForAuthoritativeCompletion(
+  store: ControlPlaneStore,
+  tracker: OperationTracker,
+  initial: TrackedOperation,
+  requestedMs: number | undefined,
+): Promise<TrackedOperation> {
+  const waitMs = typeof requestedMs === "number" && Number.isFinite(requestedMs)
+    ? Math.min(MCP_SYNC_WAIT_MS, Math.max(0, Math.floor(requestedMs)))
+    : 0;
+  if (waitMs === 0 || !SYNC_WAIT_NON_TERMINAL.has(initial.status)) return initial;
+
+  const deadline = Date.now() + waitMs;
+  let current = initial;
+  while (SYNC_WAIT_NON_TERMINAL.has(current.status)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, Math.min(MCP_SYNC_WAIT_POLL_MS, remaining)),
+    );
+    try {
+      const fresh = await loadOp(store, tracker, current.operation_id);
+      if (fresh) current = fresh;
+    } catch {
+      break;
+    }
+  }
+  return current;
 }
 
 const EXPIRABLE_OPERATION_STATUSES = [
@@ -2185,9 +2250,37 @@ export function stripDispatchOutbox(
   return next;
 }
 
+function publicOperationPhase(
+  op: OwnMeshResultEnvelope & { updated_at?: string },
+): { phase: OperationPhase; phase_updated_at: string } {
+  let phase: OperationPhase;
+  switch (op.status) {
+    case "completed": phase = "completed"; break;
+    case "failed": phase = "failed"; break;
+    case "cancelled": phase = "cancelled"; break;
+    case "denied": phase = "denied"; break;
+    case "device_offline": phase = "offline"; break;
+    case "approval_required": phase = "waiting_approval"; break;
+    case "cancel_requested": phase = "cancelling"; break;
+    case "running": phase = "executing"; break;
+    case "pending": {
+      const outbox = readDispatchOutbox(op.data || {});
+      phase = outbox?.state === "dispatched" ? "delivered" : "queued";
+      break;
+    }
+  }
+  const raw = op.updated_at;
+  const parsed = typeof raw === "string" && raw.length <= 64 ? Date.parse(raw) : Number.NaN;
+  return {
+    phase,
+    phase_updated_at: Number.isFinite(parsed) ? new Date(parsed).toISOString() : nowIso(),
+  };
+}
+
 function publicTrackedView(op: TrackedOperation): TrackedOperation {
   return {
     ...op,
+    ...publicOperationPhase(op),
     data: stripDispatchOutbox(op.data || {}),
   };
 }
@@ -2197,6 +2290,7 @@ function toolContent(envelope: OwnMeshResultEnvelope) {
   // Never leak the durable dispatch outbox body to MCP clients.
   const publicEnvelope: OwnMeshResultEnvelope = {
     ...envelope,
+    ...publicOperationPhase(envelope),
     data: stripDispatchOutbox(envelope.data || {}),
   };
   return {
@@ -2213,6 +2307,7 @@ function toolContent(envelope: OwnMeshResultEnvelope) {
         approval_required: publicEnvelope.approval_required,
         policy_authority: "ownmesh_device",
         operation_id: publicEnvelope.operation_id,
+        phase: publicEnvelope.phase,
       },
     },
   };
@@ -2283,8 +2378,8 @@ export type McpHandleOptions = {
     transfer_id: string; plan_sha256: string; epoch: number; fence: number; artifact_sha256: string;
   }) => Promise<boolean>;
   /**
-   * When set, MCP waits briefly for device result (test harness / low-latency path).
-   * Production Worker typically returns routed/async immediately.
+   * Bounded authoritative-result wait. The production entrypoint supplies the
+   * fixed Cloudflare-safe cap; direct unit callers may omit it for an immediate path.
    */
   waitForDeviceMs?: number;
   /** Best-effort live DeviceRoom observation; never used for authorization. */
@@ -4891,7 +4986,7 @@ export async function handleMcp(
     const trackBase: TrackedOperation = {
       ...makeEnvelope({
         operation_id: operationId,
-        status: wantAsync ? "pending" : "running",
+        status: "pending",
         device_id: deviceId,
         summary: wantAsync ? "operation accepted (async)" : "routing to device",
         data: withDispatchOutbox(
@@ -5048,7 +5143,7 @@ export async function handleMcp(
               ["pending", "running", "cancel_requested"],
             );
             if (rejected) replayed = rejected;
-            return mcpResult(id, toolContent(publicTrackedView(replayed)));
+            return mcpResult(id, toolContent(replayed));
           }
           const redelivered = await router.routeToDevice(deviceId, box.body);
           // dispatch_uncertain: leave outbox pending for another identical retry;
@@ -5105,7 +5200,15 @@ export async function handleMcp(
           }
         }
       }
-      return mcpResult(id, toolContent(publicTrackedView(replayed)));
+      if (!wantAsync) {
+        replayed = await waitForAuthoritativeCompletion(
+          store,
+          tracker,
+          replayed,
+          opts.waitForDeviceMs,
+        );
+      }
+      return mcpResult(id, toolContent(replayed));
     }
 
     tracker.put(trackBase);
@@ -5468,7 +5571,7 @@ export async function handleMcp(
     }
 
     // Default: accepted / routed — async pattern
-    const status: OpStatus = wantAsync || isMutating ? "pending" : "pending";
+    const status: OpStatus = "pending";
     // Preserve durable dispatch outbox (already marked dispatched) under the
     // public route metadata so crash recovery never loses the bound body.
     const pendingData = withDispatchOutbox(
@@ -5523,7 +5626,7 @@ export async function handleMcp(
       });
       return mcpResult(id, toolContent(finalOp));
     }
-    const finalOp = await finalizeRoutedOp(store, tracker, operationId, {
+    let finalOp = await finalizeRoutedOp(store, tracker, operationId, {
       status: env.status,
       summary: env.summary,
       data: env.data,
@@ -5537,6 +5640,14 @@ export async function handleMcp(
       approval_url: env.approval_url,
       approval_id: env.approval_id,
     });
+    if (!wantAsync) {
+      finalOp = await waitForAuthoritativeCompletion(
+        store,
+        tracker,
+        finalOp,
+        opts.waitForDeviceMs,
+      );
+    }
     return mcpResult(id, toolContent(finalOp));
   }
 
