@@ -668,6 +668,12 @@ pub struct RunResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
+    /// Non-UTF-8 decoder used for stdout, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_decoding: Option<OutputDecoding>,
+    /// Non-UTF-8 decoder used for stderr, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_decoding: Option<OutputDecoding>,
     pub timed_out: bool,
     pub duration_ms: u64,
     pub truncated: bool,
@@ -887,8 +893,188 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     Ok(cmd)
 }
 
-fn bytes_to_text(data: &[u8]) -> String {
-    String::from_utf8_lossy(data).into_owned()
+/// Decoder metadata for non-UTF-8 captured output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputDecoding {
+    /// Decoder name (for example, `utf-16le` or `windows-oem-cp932`).
+    pub encoding: String,
+    /// True if recovery required replacement characters.
+    pub lossy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodedOutput {
+    text: String,
+    decoding: Option<OutputDecoding>,
+}
+
+fn decode_utf16_bom(data: &[u8]) -> Option<DecodedOutput> {
+    let (little_endian, body) = match data {
+        [0xff, 0xfe, rest @ ..] => (true, rest),
+        [0xfe, 0xff, rest @ ..] => (false, rest),
+        _ => return None,
+    };
+
+    // The captured input has already been bounded. `chunks_exact` makes an
+    // odd trailing byte explicit instead of panicking or silently dropping it.
+    let mut units = Vec::with_capacity(body.len() / 2);
+    let mut chunks = body.chunks_exact(2);
+    for bytes in &mut chunks {
+        let unit = if little_endian {
+            u16::from_le_bytes([bytes[0], bytes[1]])
+        } else {
+            u16::from_be_bytes([bytes[0], bytes[1]])
+        };
+        units.push(unit);
+    }
+    let trailing_byte = !chunks.remainder().is_empty();
+    let (text, invalid_units) = match String::from_utf16(&units) {
+        Ok(text) => (text, false),
+        Err(_) => (String::from_utf16_lossy(&units), true),
+    };
+    Some(DecodedOutput {
+        text,
+        decoding: Some(OutputDecoding {
+            encoding: if little_endian {
+                "utf-16le".into()
+            } else {
+                "utf-16be".into()
+            },
+            lossy: invalid_units || trailing_byte,
+        }),
+    })
+}
+
+#[cfg(windows)]
+fn decode_windows_code_page(data: &[u8], code_page: u32) -> Option<DecodedOutput> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Globalization::{
+        MultiByteToWideChar, WideCharToMultiByte, MB_ERR_INVALID_CHARS,
+    };
+
+    let input_len = i32::try_from(data.len()).ok()?;
+    // `MB_ERR_INVALID_CHARS` provides strict decoding where Windows supports
+    // it. Legacy code pages may reject that flag, so retry leniently and use a
+    // bounded round-trip check below to expose any recovery as lossy.
+    let mut strict = true;
+    // SAFETY: `data` is live for `input_len` bytes; null output is the API's
+    // documented sizing mode.
+    let mut wide_len = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            MB_ERR_INVALID_CHARS,
+            data.as_ptr(),
+            input_len,
+            null_mut(),
+            0,
+        )
+    };
+    if wide_len == 0 {
+        strict = false;
+        // SAFETY: same bounded input and documented null sizing mode as above.
+        wide_len =
+            unsafe { MultiByteToWideChar(code_page, 0, data.as_ptr(), input_len, null_mut(), 0) };
+    }
+    if wide_len <= 0 {
+        return None;
+    }
+    let mut wide = vec![0_u16; usize::try_from(wide_len).ok()?];
+    // SAFETY: the input slice and destination vector are valid for the exact
+    // lengths supplied; both lengths were returned/validated by Windows.
+    let converted = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            if strict { MB_ERR_INVALID_CHARS } else { 0 },
+            data.as_ptr(),
+            input_len,
+            wide.as_mut_ptr(),
+            wide_len,
+        )
+    };
+    if converted != wide_len {
+        return None;
+    }
+
+    let (text, invalid_units) = match String::from_utf16(&wide) {
+        Ok(text) => (text, false),
+        Err(_) => (String::from_utf16_lossy(&wide), true),
+    };
+
+    // A bounded round trip distinguishes valid legacy text from Windows'
+    // replacement-character recovery for malformed multibyte sequences.
+    // SAFETY: `wide` is a valid UTF-16 buffer and null output is documented
+    // sizing mode. `wide_len` is its checked element count.
+    let encoded_len = unsafe {
+        WideCharToMultiByte(
+            code_page,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            null_mut(),
+            0,
+            null(),
+            null_mut(),
+        )
+    };
+    let round_trips = if encoded_len < 0 || usize::try_from(encoded_len).ok()? > data.len() {
+        false
+    } else {
+        let mut encoded = vec![0_u8; usize::try_from(encoded_len).ok()?];
+        // SAFETY: the source and destination vectors are valid for the exact
+        // counts already returned by the preceding sizing call.
+        let written = unsafe {
+            WideCharToMultiByte(
+                code_page,
+                0,
+                wide.as_ptr(),
+                wide_len,
+                encoded.as_mut_ptr(),
+                encoded_len,
+                null(),
+                null_mut(),
+            )
+        };
+        written == encoded_len && encoded == data
+    };
+
+    Some(DecodedOutput {
+        text,
+        decoding: Some(OutputDecoding {
+            encoding: format!("windows-oem-cp{code_page}"),
+            lossy: invalid_units || !round_trips,
+        }),
+    })
+}
+
+fn decode_output(data: &[u8]) -> DecodedOutput {
+    if let Ok(text) = std::str::from_utf8(data) {
+        return DecodedOutput {
+            text: text.into(),
+            decoding: None,
+        };
+    }
+    if let Some(decoded) = decode_utf16_bom(data) {
+        return decoded;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::GetOEMCP;
+        // SAFETY: GetOEMCP has no pointer arguments and only reads the
+        // configured system code-page value.
+        let code_page = unsafe { GetOEMCP() };
+        if code_page != 0 {
+            if let Some(decoded) = decode_windows_code_page(data, code_page) {
+                return decoded;
+            }
+        }
+    }
+    DecodedOutput {
+        text: String::from_utf8_lossy(data).into_owned(),
+        decoding: Some(OutputDecoding {
+            encoding: "utf-8-lossy".into(),
+            lossy: true,
+        }),
+    }
 }
 
 /// Kill a process tree. Unix uses process-group signal; Windows uses taskkill /T.
@@ -1164,22 +1350,26 @@ pub async fn run_command_cancellable(
         return Err(ExecError::Cancelled);
     }
 
+    let stdout = decode_output(&stdout_raw);
+    let stderr = decode_output(&stderr_raw);
     let result = if timed_out {
         RunResult {
             exit_code: None,
-            stdout: bytes_to_text(&stdout_raw),
+            stdout: stdout.text,
+            stdout_decoding: stdout.decoding,
             stderr: {
                 let mut msg = format!(
                     "command timed out after {:?}",
                     timeout.expect("timeout result requires configured duration")
                 );
-                let err = bytes_to_text(&stderr_raw);
+                let err = stderr.text;
                 if !err.is_empty() {
                     msg.push('\n');
                     msg.push_str(&err);
                 }
                 msg
             },
+            stderr_decoding: stderr.decoding,
             timed_out: true,
             duration_ms: start.elapsed().as_millis() as u64,
             truncated,
@@ -1188,8 +1378,10 @@ pub async fn run_command_cancellable(
     } else {
         RunResult {
             exit_code,
-            stdout: bytes_to_text(&stdout_raw),
-            stderr: bytes_to_text(&stderr_raw),
+            stdout: stdout.text,
+            stdout_decoding: stdout.decoding,
+            stderr: stderr.text,
+            stderr_decoding: stderr.decoding,
             timed_out: false,
             duration_ms: start.elapsed().as_millis() as u64,
             truncated,
@@ -1225,6 +1417,42 @@ pub fn run_command_blocking(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn valid_utf8_output_is_unchanged() {
+        let decoded = decode_output("日本語 output".as_bytes());
+        assert_eq!(decoded.text, "日本語 output");
+        assert_eq!(decoded.decoding, None);
+    }
+
+    #[test]
+    fn malformed_utf16_bom_output_is_lossy_without_panicking() {
+        // An isolated high surrogate cannot form a Unicode scalar value.
+        let decoded = decode_output(&[0xff, 0xfe, 0x00, 0xd8]);
+        assert_eq!(
+            decoded.decoding.as_ref().map(|item| item.encoding.as_str()),
+            Some("utf-16le")
+        );
+        assert!(decoded.decoding.is_some_and(|item| item.lossy));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn japanese_windows_code_page_fixture_round_trips() {
+        // CP932 bytes for the Windows diagnostic: "アクセスが拒否されました。"
+        // Keep the fixture independent from the developer machine's locale.
+        let bytes = [
+            0x83, 0x41, 0x83, 0x4e, 0x83, 0x5a, 0x83, 0x58, 0x82, 0xaa, 0x8b, 0x91, 0x94, 0xdb,
+            0x82, 0xb3, 0x82, 0xea, 0x82, 0xdc, 0x82, 0xb5, 0x82, 0xbd, 0x81, 0x42,
+        ];
+        let decoded = decode_windows_code_page(&bytes, 932).expect("CP932 must be available");
+        assert_eq!(decoded.text, "アクセスが拒否されました。");
+        assert_eq!(
+            decoded.decoding.as_ref().map(|item| item.encoding.as_str()),
+            Some("windows-oem-cp932")
+        );
+        assert!(decoded.decoding.is_some_and(|item| !item.lossy));
+    }
 
     #[tokio::test]
     async fn structured_echo() {

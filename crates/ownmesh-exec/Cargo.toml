@@ -10,8 +10,14 @@ authors.workspace = true
 description = "ownmesh-exec"
 readme = "README.md"
 
-[lints]
-workspace = true
+# Windows exposes the configured OEM code page only through a tiny FFI surface.
+# Keep it local to the decoder rather than spawning a shell or guessing a locale.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
 
 [dependencies]
 ownmesh-domain = { path = "../ownmesh-domain" }
@@ -26,6 +32,9 @@ hex = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Globalization"] }
 
 [dev-dependencies]
 tempfile = "3"
