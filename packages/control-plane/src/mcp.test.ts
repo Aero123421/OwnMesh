@@ -447,6 +447,10 @@ test("list_devices supports cursor pagination", async () => {
   assert.equal((sc.data as { devices: unknown[] }).devices.length, 2);
   assert.ok(sc.next_cursor);
   assert.equal(sc.truncated, false);
+  const serialized = JSON.stringify(sc.data);
+  assert.equal(serialized.includes("tenant_id"), false);
+  assert.equal(serialized.includes("principal_id"), false);
+  assert.equal(serialized.includes("public_key"), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -513,6 +517,8 @@ test("read tool routes through DeviceRoom to agent and returns completed", async
   assert.equal(sc.policy_authority, "ownmesh_device");
   assert.equal(sc.approval_required, false);
   assert.ok(Array.isArray((sc.data as { entries: string[] }).entries));
+  const text = body.result!.content[0]!.text;
+  assert.deepEqual(JSON.parse(text), sc, "legacy JSON TextContent must match structuredContent");
 });
 
 test("write tool → device ask → approval_required with approval_url", async () => {
@@ -706,6 +712,38 @@ test("async command returns pending and is pollable", async () => {
     polled.body.result!.structuredContent!.operation_id,
     sc.operation_id,
   );
+  const compactJson = JSON.stringify(polled.body.result!.structuredContent);
+  assert.equal(compactJson.includes("payload_hash"), false);
+  assert.equal(compactJson.includes("claim_version"), false);
+  assert.equal(compactJson.includes("principal"), false);
+  assert.equal(polled.body.result!.structuredContent!.diagnostics, undefined);
+
+  const stored = await store.getMcpOperation(String(sc.operation_id));
+  assert.equal(typeof stored?.payload_hash, "string", "durable action binding remains stored");
+  assert.equal(stored?.claim_version, 1);
+  assert.ok(stored?.action, "durable exact-action facts remain stored");
+  assert.ok(
+    compactJson.length * 4 < JSON.stringify(stored).length * 3,
+    "default public operation must be materially smaller than its durable authority record",
+  );
+
+  const diagnosticPoll = await callTool(
+    store,
+    token,
+    "ownmesh_get_operation",
+    { operation_id: sc.operation_id as string, include_diagnostics: true },
+    router,
+    tracker,
+  );
+  const diagnostics = diagnosticPoll.body.result!.structuredContent!.diagnostics as
+    | Record<string, unknown>
+    | undefined;
+  assert.equal(diagnostics?.tool, "ownmesh_command_run");
+  assert.equal(diagnostics?.claim_version, 1);
+  const diagnosticJson = JSON.stringify(diagnostics);
+  for (const forbidden of ["payload_hash", "principal", "tenant_id", "oauth_client_id", "action"]) {
+    assert.equal(diagnosticJson.includes(forbidden), false, `${forbidden} must stay internal`);
+  }
 });
 
 test("session_open routes to device room", async () => {

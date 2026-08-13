@@ -596,7 +596,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_command_run",
     description:
-      "Run a structured argv command on a device (not raw shell).",
+      "Run one bounded non-interactive process with an exact program and argv. Use session_open for interactive or long-lived processes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -658,7 +658,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_command_shell",
     description:
-      "Run a raw shell command (separate capability from structured run).",
+      "Run one bounded non-interactive raw shell command. Prefer command_run for exact argv; use session_open for interactive or long-lived processes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -715,7 +715,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_session_open",
-    description: "Open an interactive session on a device",
+    description:
+      "Start an interactive or long-lived process with durable session lifecycle and replay; not a one-shot command.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1230,7 +1231,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_review_start",
-    description: "Create a bounded, device-local Git review receipt for one exact workspace repository and argv-only tests.",
+    description:
+      "Create a Git-bound review receipt for one exact workspace and run only the supplied bounded argv test list; not a general command or interactive session.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1403,12 +1405,19 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_get_operation",
-    description: "Poll status of a long-running or approval-gated operation",
+    description:
+      "Poll compact status/result for a long-running or approval-gated operation. Set include_diagnostics only for bounded non-secret troubleshooting metadata.",
     inputSchema: {
       type: "object",
       properties: {
         operation_id: str,
         device_id: str,
+        include_diagnostics: {
+          type: "boolean",
+          default: false,
+          description:
+            "Include bounded non-secret operation diagnostics; authority and audit records remain internal",
+        },
       },
       required: ["operation_id"],
       additionalProperties: false,
@@ -1657,6 +1666,54 @@ export type OwnMeshResultEnvelope = {
   correlation_id?: string;
   /** Explicit: model/tool text is never authorization */
   policy_authority: "ownmesh_device";
+};
+
+export type PublicOwnMeshError = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  details?: {
+    error?: string;
+    status?: string;
+    http_status?: number;
+    timeout_ms?: number;
+    retry_after_ms?: number;
+  };
+};
+
+/**
+ * Compact MCP-facing view. The durable operation record deliberately has a
+ * wider schema: authority bindings, action hashes, claims, and audit identity
+ * stay in storage and are never inferred from this presentation object.
+ */
+export type PublicOwnMeshResultEnvelope = {
+  operation_id: string;
+  status: OpStatus;
+  phase: OperationPhase;
+  phase_updated_at: string;
+  device_id?: string;
+  workspace_id?: string | null;
+  summary: string;
+  data: Record<string, unknown>;
+  truncated: boolean;
+  next_cursor: string | null;
+  approval_required: boolean;
+  approval_url?: string;
+  approval_id?: string;
+  session_id: string | null;
+  warnings: string[];
+  policy_authority: "ownmesh_device";
+  diagnostics?: {
+    summary: string;
+    policy_authority: "ownmesh_device";
+    tool?: string;
+    correlation_id?: string;
+    workspace_id?: string;
+    claim_version?: number;
+    expires_at?: string;
+    created_at?: string;
+    updated_at?: string;
+  };
 };
 
 export type TrackedOperation = OwnMeshResultEnvelope & {
@@ -2285,14 +2342,180 @@ function publicTrackedView(op: TrackedOperation): TrackedOperation {
   };
 }
 
-function toolContent(envelope: OwnMeshResultEnvelope) {
-  // structuredContent is the source of truth; text is a short summary for humans.
-  // Never leak the durable dispatch outbox body to MCP clients.
-  const publicEnvelope: OwnMeshResultEnvelope = {
-    ...envelope,
-    ...publicOperationPhase(envelope),
-    data: stripDispatchOutbox(envelope.data || {}),
+const PUBLIC_PRIVATE_KEYS = new Set([
+  DISPATCH_OUTBOX_KEY,
+  "action",
+  "authorization",
+  "bound_action",
+  "claim_token",
+  "claim_version",
+  "client_id",
+  "correlation_id",
+  "credential_generation",
+  "csrf_hash",
+  "idempotency_key",
+  "oauth_client_id",
+  "payload_hash",
+  "policy_authority",
+  "principal",
+  "principal_credential_generation",
+  "principal_id",
+  "public_key",
+  "tenant_id",
+]);
+
+const PUBLIC_TOP_LEVEL_COORDINATION_KEYS = new Set([
+  "capability",
+  "expires_at",
+  "op",
+  "tool",
+]);
+
+function boundedPublicText(value: unknown, fallback: string, maxChars = 512): string {
+  if (typeof value !== "string") return fallback;
+  const text = value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  return (text || fallback).slice(0, maxChars);
+}
+
+function isPrivatePublicKey(key: string): boolean {
+  const normalized = key.toLowerCase();
+  if (PUBLIC_PRIVATE_KEYS.has(normalized)) return true;
+  return /(^|_)(access_token|refresh_token|private_key|session_secret|secret|password|credential|credentials|ticket|token|token_hash)($|_)/.test(
+    normalized,
+  );
+}
+
+function compactPublicError(value: unknown, fallbackMessage: string): PublicOwnMeshError {
+  const raw = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const error: PublicOwnMeshError = {
+    code: boundedPublicText(raw.code, "OWNMESH_E_OPERATION_FAILED", 128),
+    message: boundedPublicText(raw.message, fallbackMessage),
+    retryable: raw.retryable === true,
   };
+  const rawDetails = raw.details && typeof raw.details === "object" && !Array.isArray(raw.details)
+    ? raw.details as Record<string, unknown>
+    : {};
+  const details: NonNullable<PublicOwnMeshError["details"]> = {};
+  if (typeof rawDetails.error === "string") {
+    details.error = boundedPublicText(rawDetails.error, "route_error", 128);
+  }
+  if (typeof rawDetails.status === "string") {
+    details.status = boundedPublicText(rawDetails.status, "unknown", 64);
+  }
+  for (const key of ["http_status", "timeout_ms", "retry_after_ms"] as const) {
+    const number = rawDetails[key];
+    if (Number.isSafeInteger(number) && Number(number) >= 0) details[key] = Number(number);
+  }
+  if (Object.keys(details).length > 0) error.details = details;
+  return error;
+}
+
+/** Remove internal authority/identity fields without mutating the durable result. */
+function compactPublicValue(
+  value: unknown,
+  fallbackErrorMessage: string,
+  depth = 0,
+): unknown {
+  if (depth > 12) return "[nested data omitted]";
+  if (Array.isArray(value)) {
+    return value.map((entry) => compactPublicValue(entry, fallbackErrorMessage, depth + 1));
+  }
+  if (!value || typeof value !== "object") return value;
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (isPrivatePublicKey(key)) continue;
+    if (depth === 0 && PUBLIC_TOP_LEVEL_COORDINATION_KEYS.has(key.toLowerCase())) continue;
+    if (entry === undefined) continue;
+    if (key === "error" && depth === 0) {
+      result[key] = compactPublicError(entry, fallbackErrorMessage);
+    } else if (key === "error" && typeof entry === "string") {
+      result[key] = boundedPublicText(entry, "route_error", 128);
+    } else {
+      result[key] = compactPublicValue(entry, fallbackErrorMessage, depth + 1);
+    }
+  }
+  return result;
+}
+
+function safeDiagnosticText(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  return boundedPublicText(value, "", 256) || undefined;
+}
+
+/**
+ * Build the one public structured representation of a durable operation.
+ * This allow-list is the security boundary: adding fields to TrackedOperation
+ * cannot accidentally publish them through object spread.
+ */
+export function compactPublicEnvelope(
+  envelope: OwnMeshResultEnvelope & Partial<TrackedOperation>,
+  includeDiagnostics = false,
+): PublicOwnMeshResultEnvelope {
+  const publicEnvelope: PublicOwnMeshResultEnvelope = {
+    operation_id: envelope.operation_id,
+    status: envelope.status,
+    ...publicOperationPhase(envelope),
+    summary: boundedPublicText(envelope.summary, envelope.status),
+    data: {},
+    truncated: Boolean(envelope.truncated),
+    next_cursor: envelope.next_cursor || null,
+    approval_required: Boolean(envelope.approval_required),
+    session_id: envelope.session_id || null,
+    warnings: [],
+    policy_authority: "ownmesh_device",
+  };
+  if (envelope.device_id) publicEnvelope.device_id = envelope.device_id;
+  if (envelope.workspace_id !== undefined) publicEnvelope.workspace_id = envelope.workspace_id;
+
+  const data = compactPublicValue(
+    stripDispatchOutbox(envelope.data || {}),
+    envelope.summary || "operation failed",
+  ) as Record<string, unknown>;
+  publicEnvelope.data = data;
+  if (envelope.approval_required) {
+    if (envelope.approval_url) publicEnvelope.approval_url = envelope.approval_url;
+    if (envelope.approval_id) publicEnvelope.approval_id = envelope.approval_id;
+  }
+  if (envelope.warnings.length > 0) {
+    publicEnvelope.warnings = envelope.warnings
+      .slice(0, 8)
+      .map((warning) => boundedPublicText(warning, "warning", 256));
+  }
+
+  if (includeDiagnostics) {
+    const diagnostics: NonNullable<PublicOwnMeshResultEnvelope["diagnostics"]> = {
+      summary: boundedPublicText(envelope.summary, envelope.status),
+      policy_authority: "ownmesh_device",
+    };
+    const tool = safeDiagnosticText(envelope.tool);
+    const correlationId = safeDiagnosticText(envelope.correlation_id);
+    const workspaceId = safeDiagnosticText(envelope.workspace_id);
+    const expiresAt = safeDiagnosticText(envelope.expires_at);
+    const createdAt = safeDiagnosticText(envelope.created_at);
+    const updatedAt = safeDiagnosticText(envelope.updated_at);
+    if (tool) diagnostics.tool = tool;
+    if (correlationId) diagnostics.correlation_id = correlationId;
+    if (workspaceId) diagnostics.workspace_id = workspaceId;
+    if (Number.isSafeInteger(envelope.claim_version) && Number(envelope.claim_version) >= 0) {
+      diagnostics.claim_version = Number(envelope.claim_version);
+    }
+    if (expiresAt) diagnostics.expires_at = expiresAt;
+    if (createdAt) diagnostics.created_at = createdAt;
+    if (updatedAt) diagnostics.updated_at = updatedAt;
+    publicEnvelope.diagnostics = diagnostics;
+  }
+  return publicEnvelope;
+}
+
+function toolContent(
+  envelope: OwnMeshResultEnvelope & Partial<TrackedOperation>,
+  includeDiagnostics = false,
+) {
+  // MCP 2025-03-26 clients consume JSON TextContent. Keep that compatibility
+  // contract while also exposing the same compact object to newer clients.
+  const publicEnvelope = compactPublicEnvelope(envelope, includeDiagnostics);
   return {
     content: [
       {
@@ -4370,7 +4593,7 @@ export async function handleMcp(
           return mcpError(id, -32004, gate.error, { device_id: tracked.device_id, operation_id: oid });
         }
       }
-      return mcpResult(id, toolContent(tracked));
+      return mcpResult(id, toolContent(tracked, args.include_diagnostics === true));
     }
 
     if (name === "ownmesh_cancel_operation") {

@@ -87,6 +87,39 @@ test("published tools that share a contract are still distinguishable by descrip
   }
 });
 
+test("small agent ergonomics matrix selects canonical tools without shell fallbacks", () => {
+  const tasks = [
+    { task: "list workspace files", tool: "ownmesh_fs_list", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "read a file page", tool: "ownmesh_fs_read", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "apply a guarded patch", tool: "ownmesh_fs_patch", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "run a bounded argv command", tool: "ownmesh_command_run", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "open an interactive agent", tool: "ownmesh_session_open", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "run pinned review tests", tool: "ownmesh_review_start", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "inspect a review receipt", tool: "ownmesh_review_show", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "plan a device transfer", tool: "ownmesh_transfer_plan", calls: 1, polls: 0, shellFallbacks: 0 },
+    { task: "poll accepted async work", tool: "ownmesh_get_operation", calls: 1, polls: 1, shellFallbacks: 0 },
+  ] as const;
+  const published = new Map(PUBLISHED_MCP_TOOLS.map((tool) => [tool.name, tool]));
+  for (const row of tasks) {
+    assert.ok(published.has(row.tool), `${row.task} must use one advertised canonical tool`);
+  }
+  assert.deepEqual(
+    tasks.reduce(
+      (totals, row) => ({
+        calls: totals.calls + row.calls,
+        polls: totals.polls + row.polls,
+        shellFallbacks: totals.shellFallbacks + row.shellFallbacks,
+      }),
+      { calls: 0, polls: 0, shellFallbacks: 0 },
+    ),
+    { calls: 9, polls: 1, shellFallbacks: 0 },
+  );
+
+  assert.match(published.get("ownmesh_command_run")!.description, /bounded non-interactive/);
+  assert.match(published.get("ownmesh_session_open")!.description, /interactive or long-lived/);
+  assert.match(published.get("ownmesh_review_start")!.description, /Git-bound review receipt/);
+});
+
 // --- Auth page contrast ---------------------------------------------------
 
 /** WCAG 2.1 relative luminance. */
