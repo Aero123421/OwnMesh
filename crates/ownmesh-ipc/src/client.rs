@@ -115,21 +115,33 @@ impl IpcClient {
     /// running as the same OS user. Invalid Unicode or an explicitly empty value is
     /// reported instead of silently falling back to an uncredentialed client.
     pub fn with_client_credential_from_env(mut self) -> IpcResult<Self> {
-        match std::env::var(crate::CLIENT_CREDENTIAL_ENV) {
-            Ok(value) if value.trim().is_empty() => Err(IpcError::Protocol(format!(
-                "{} is set but empty",
-                crate::CLIENT_CREDENTIAL_ENV
-            ))),
-            Ok(value) => {
-                self.client_credential = Some(value);
-                Ok(self)
-            }
-            Err(std::env::VarError::NotPresent) => Ok(self),
-            Err(std::env::VarError::NotUnicode(_)) => Err(IpcError::Protocol(format!(
-                "{} is not valid Unicode",
-                crate::CLIENT_CREDENTIAL_ENV
-            ))),
+        if let Some(credential) = explicit_client_credential_from_env()? {
+            self.client_credential = Some(credential);
         }
+        Ok(self)
+    }
+
+    /// Attach an explicit cooperative credential when supplied, otherwise use the
+    /// daemon's fixed owner-only management delivery file when it exists.
+    ///
+    /// The management credential is intentionally a convenience for the shipped
+    /// local CLI, not a replacement for an independent human-presence proof.
+    /// A present but malformed, substituted, or insecure delivery file is an
+    /// error; only an absent file leaves this client uncredentialed so read-only
+    /// `ipc.ping` / `daemon.status` remain available during first-run diagnosis.
+    pub fn with_client_credential_from_env_or_management_file(
+        mut self,
+        state_dir: impl AsRef<Path>,
+    ) -> IpcResult<Self> {
+        if let Some(credential) = explicit_client_credential_from_env()? {
+            self.client_credential = Some(credential);
+            return Ok(self);
+        }
+
+        if let Some(credential) = management_credential_if_present(state_dir.as_ref())? {
+            self.client_credential = Some(credential);
+        }
+        Ok(self)
     }
 
     /// Deliberately present a legacy shared token (negative / attack tests only).
@@ -362,12 +374,42 @@ impl IpcClient {
     }
 }
 
+fn explicit_client_credential_from_env() -> IpcResult<Option<String>> {
+    match std::env::var(crate::CLIENT_CREDENTIAL_ENV) {
+        Ok(value) if value.trim().is_empty() => Err(IpcError::Protocol(format!(
+            "{} is set but empty",
+            crate::CLIENT_CREDENTIAL_ENV
+        ))),
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(IpcError::Protocol(format!(
+            "{} is not valid Unicode",
+            crate::CLIENT_CREDENTIAL_ENV
+        ))),
+    }
+}
+
+fn management_credential_if_present(state_dir: &Path) -> IpcResult<Option<String>> {
+    let delivery = state_dir.join(crate::MANAGEMENT_CREDENTIAL_FILE_NAME);
+    match std::fs::symlink_metadata(&delivery) {
+        Ok(_) => {
+            // `read_management_credential` attests the complete path and opened
+            // file before returning a value. Do not downgrade any of its failures
+            // to an uncredentialed connection.
+            crate::read_management_credential(state_dir).map(Some)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(IpcError::Io(err)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::auth::AuthGate;
     use crate::endpoint::{Endpoint, IpcBus};
     use crate::server::{reject_unknown_handler, IpcServer, ServerConfig};
+    use crate::{current_os_user_id, read_management_credential, BootstrapStatus};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -390,6 +432,75 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         (server, endpoint, handle)
+    }
+
+    #[test]
+    fn management_delivery_is_loaded_without_an_environment_secret() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let (gate, bootstrap) = AuthGate::for_user(current_os_user_id())
+            .with_daemon_registry(&state_dir)
+            .unwrap();
+        assert_eq!(bootstrap, BootstrapStatus::Created);
+        drop(gate);
+
+        let expected = read_management_credential(&state_dir).unwrap();
+        let actual = management_credential_if_present(&state_dir).unwrap();
+        assert_eq!(actual.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn absent_management_delivery_does_not_create_or_invent_a_credential() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("never-created");
+        assert_eq!(management_credential_if_present(&state_dir).unwrap(), None);
+        assert!(!state_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn management_delivery_authenticates_a_strict_daemon_client() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let runtime_dir = dir.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        let endpoint = Endpoint::default_for(&runtime_dir, IpcBus::Daemon);
+        let (auth, _) = AuthGate::for_user(current_os_user_id())
+            .with_daemon_registry(&state_dir)
+            .unwrap();
+        let server = Arc::new(IpcServer::new(
+            ServerConfig::new(endpoint.clone(), auth, "ownmeshd-test", "0.1.0-test"),
+            Arc::new(|_, _, _| Box::pin(async { Ok(serde_json::json!({"ok": true})) })),
+        ));
+        let serve = Arc::clone(&server);
+        let task = tokio::spawn(async move { serve.serve().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = IpcClient::new(
+            endpoint,
+            &runtime_dir,
+            ClientIdentity::new("ownmesh", "test"),
+            ClientOptions::default(),
+        )
+        .with_client_credential_from_env_or_management_file(&state_dir)
+        .unwrap();
+        assert_eq!(
+            client.call("workspace.list", None).await.unwrap()["ok"],
+            true
+        );
+        let err = client
+            .call(crate::methods::POLICY_PRESET, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            IpcError::Remote {
+                code: crate::app_error::UNAUTHORIZED,
+                ..
+            }
+        ));
+
+        server.request_shutdown();
+        task.await.unwrap();
     }
 
     #[tokio::test]

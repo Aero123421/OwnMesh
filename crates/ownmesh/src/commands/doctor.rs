@@ -5,7 +5,7 @@ use crate::commands::service::{self, ServiceStatusSnapshot};
 use ownmesh_config::{redact_control_plane_url, OwnMeshPaths};
 use ownmesh_diagnostics::{
     appears_redacted, run_doctor, BinaryObservation, ConfigObservation, ControlPlaneObservation,
-    CredentialObservation, DaemonObservation, DoctorOutcome, DoctorReport,
+    CredentialObservation, CredentialState, DaemonObservation, DoctorOutcome, DoctorReport,
     PrivacyPolicyObservation, ServiceObservation,
 };
 use ownmesh_domain::ExitCode;
@@ -22,14 +22,17 @@ pub fn collect_doctor_report(
     args: &DoctorArgs,
     cli_version: &str,
 ) -> DoctorReport {
+    let daemon = observe_daemon(paths);
+    let mut service = observe_service();
+    merge_daemon_service_status(&daemon, &mut service);
     let mut input = ownmesh_diagnostics::DoctorInput {
         binary: observe_binaries(cli_version),
         config: observe_config(paths),
         credentials: observe_credentials(paths),
-        daemon: observe_daemon(paths),
+        daemon,
         control_plane: ControlPlaneObservation::default(),
         privacy_policy: observe_privacy_policy(paths),
-        service: observe_service(),
+        service,
     };
 
     // Control-plane URL from config. Unsafe URLs are rejected/redacted before any output.
@@ -211,15 +214,48 @@ fn observe_credentials(paths: &OwnMeshPaths) -> CredentialObservation {
     let session_file = paths.state_dir.join("auth_session.json");
     obs.auth_session_present = session_file.is_file();
     if obs.auth_session_present {
+        obs.device_key_state = CredentialState::NotRequiredForCurrentMode;
+        obs.device_credential_state = CredentialState::NotRequiredForCurrentMode;
         if let Ok(raw) = fs::read_to_string(&session_file) {
             // Presence only — never surface token fields even if mis-written.
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                obs.human_refresh_state = match v
+                    .get("has_refresh_token")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    // `auth_session.json` is deliberately non-secret metadata;
+                    // this marker is written only after a successful secret-store
+                    // save. It establishes presence without loading the value.
+                    Some(true) => CredentialState::Present,
+                    Some(false) => CredentialState::Missing,
+                    // Older metadata did not carry the marker. Do not turn its
+                    // absence into a false claim about an OS-keychain secret.
+                    None => CredentialState::Unknown,
+                };
                 obs.enrolled_device_id_present = v
                     .get("device_id")
                     .and_then(|x| x.as_str())
                     .is_some_and(|s| !s.is_empty());
+                if obs.enrolled_device_id_present {
+                    // An enrolled device can store material in the OS keychain.
+                    // File metadata alone cannot prove that it is missing.
+                    obs.device_key_state = CredentialState::Unknown;
+                    obs.device_credential_state = CredentialState::Unknown;
+                }
+            } else {
+                obs.human_refresh_state = CredentialState::Unknown;
+                obs.device_key_state = CredentialState::Unknown;
+                obs.device_credential_state = CredentialState::Unknown;
             }
+        } else {
+            obs.human_refresh_state = CredentialState::Unknown;
+            obs.device_key_state = CredentialState::Unknown;
+            obs.device_credential_state = CredentialState::Unknown;
         }
+    } else {
+        obs.human_refresh_state = CredentialState::NotRequiredForCurrentMode;
+        obs.device_key_state = CredentialState::NotRequiredForCurrentMode;
+        obs.device_credential_state = CredentialState::NotRequiredForCurrentMode;
     }
 
     // Presence from non-secret metadata only. Doctor must never call OS credential
@@ -246,12 +282,15 @@ fn observe_secret_presence_metadata_only(paths: &OwnMeshPaths, obs: &mut Credent
         keystore.join(format!("{}.oms", SecretPurpose::DeviceCredential.account()));
     if human_blob.is_file() {
         obs.human_refresh_present = true;
+        obs.human_refresh_state = CredentialState::Present;
     }
     if device_key_blob.is_file() {
         obs.device_key_present = true;
+        obs.device_key_state = CredentialState::Present;
     }
     if device_cred_blob.is_file() {
         obs.device_credential_present = true;
+        obs.device_credential_state = CredentialState::Present;
     }
 }
 
@@ -311,7 +350,7 @@ fn observe_daemon(paths: &OwnMeshPaths) -> DaemonObservation {
                 reconnect_base_delay: Duration::from_millis(20),
             },
         )
-        .with_client_credential_from_env()
+        .with_client_credential_from_env_or_management_file(&paths.state_dir)
         {
             Ok(c) => c,
             Err(err) => {
@@ -319,13 +358,16 @@ fn observe_daemon(paths: &OwnMeshPaths) -> DaemonObservation {
             }
         };
         match client.status().await {
-            Ok(_) => Ok(()),
+            Ok(status) => Ok(status),
             Err(err) => Err(err.to_string()),
         }
     });
 
     match reachable {
-        Ok(()) => obs.reachable = true,
+        Ok(status) => {
+            obs.reachable = true;
+            obs.pid = (status.pid != 0).then_some(status.pid);
+        }
         Err(msg) => {
             obs.reachable = false;
             obs.message = Some(msg);
@@ -404,6 +446,16 @@ fn service_obs_from_snapshot(snap: &ServiceStatusSnapshot) -> ServiceObservation
         running: snap.running,
         unit_path: snap.unit_path.clone(),
         message: snap.message.clone(),
+    }
+}
+
+/// Merge only an authenticated daemon fact into an otherwise indeterminate OS
+/// service probe. A reachable daemon does not prove that it belongs to a
+/// particular service descriptor, so explicit `false` is never overwritten.
+fn merge_daemon_service_status(daemon: &DaemonObservation, service: &mut ServiceObservation) {
+    if daemon.reachable && daemon.pid.is_some() && service.installed && service.running.is_none() {
+        service.running = Some(true);
+        service.message = Some("run-state confirmed by authenticated daemon.status".into());
     }
 }
 
@@ -608,6 +660,58 @@ mod tests {
         assert!(report.checks.iter().any(|c| c.id == "config.present"));
         let json = serde_json::to_string(&report).unwrap();
         assert!(appears_redacted(&json));
+    }
+
+    #[test]
+    fn doctor_uses_non_secret_session_markers_without_keychain_reads() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        fs::write(
+            paths.state_dir.join("auth_session.json"),
+            r#"{"has_refresh_token":true,"device_id":"dev_123"}"#,
+        )
+        .unwrap();
+
+        let observed = observe_credentials(&paths);
+        assert_eq!(observed.human_refresh_state, CredentialState::Present);
+        assert_eq!(observed.device_key_state, CredentialState::Unknown);
+        assert_eq!(observed.device_credential_state, CredentialState::Unknown);
+
+        fs::write(
+            paths.state_dir.join("auth_session.json"),
+            r#"{"device_id":"dev_legacy"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            observe_credentials(&paths).human_refresh_state,
+            CredentialState::Unknown
+        );
+    }
+
+    #[test]
+    fn daemon_status_only_resolves_indeterminate_service_state() {
+        let daemon = DaemonObservation {
+            endpoint: Some("local".into()),
+            reachable: true,
+            pid: Some(42),
+            message: None,
+        };
+        let mut unknown = ServiceObservation {
+            platform: "test".into(),
+            supported: true,
+            installed: true,
+            running: None,
+            unit_path: None,
+            message: None,
+        };
+        merge_daemon_service_status(&daemon, &mut unknown);
+        assert_eq!(unknown.running, Some(true));
+
+        let mut explicit_stopped = unknown.clone();
+        explicit_stopped.running = Some(false);
+        merge_daemon_service_status(&daemon, &mut explicit_stopped);
+        assert_eq!(explicit_stopped.running, Some(false));
     }
 
     #[test]

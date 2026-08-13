@@ -65,7 +65,7 @@ pub fn connect_daemon(cli: &Cli) -> Result<(OwnMeshPaths, IpcClient), ExitCode> 
             reconnect_base_delay: Duration::from_millis(50),
         },
     )
-    .with_client_credential_from_env()
+    .with_client_credential_from_env_or_management_file(&paths.state_dir)
     .map_err(|err| {
         fail(
             cli,
@@ -84,8 +84,8 @@ pub fn connect_daemon(cli: &Cli) -> Result<(OwnMeshPaths, IpcClient), ExitCode> 
 /// and the mapping can be unit-tested without capturing output.
 fn classify_ipc_err(err: &IpcError) -> (&'static str, String, Option<&'static str>, ExitCode) {
     const CREDENTIAL_HINT: &str = concat!(
-        "provision this cooperative client through the running daemon and set ",
-        "OWNMESH_IPC_CLIENT_CREDENTIAL",
+        "restart `ownmesh service` to restore the owner-only cooperative credential, ",
+        "or set OWNMESH_CLIENT_CREDENTIAL explicitly",
     );
     match err {
         IpcError::Unauthorized(_)

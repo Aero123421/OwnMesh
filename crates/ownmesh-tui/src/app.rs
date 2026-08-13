@@ -10,8 +10,8 @@ use crate::wizard::{
 use ownmesh_config::{load_config, load_policy, OwnMeshPaths};
 use ownmesh_diagnostics::{
     run_doctor, BinaryObservation, ConfigObservation, ControlPlaneObservation,
-    CredentialObservation, DaemonObservation, DoctorInput, DoctorReport, PrivacyPolicyObservation,
-    ServiceObservation,
+    CredentialObservation, CredentialState, DaemonObservation, DoctorInput, DoctorReport,
+    PrivacyPolicyObservation, ServiceObservation,
 };
 use ownmesh_ipc::DaemonStatus;
 use ownmesh_policy::AccessPreset;
@@ -645,12 +645,16 @@ fn doctor_input_from_local(
             human_refresh_present: false,
             device_key_present: false,
             device_credential_present: false,
+            human_refresh_state: CredentialState::default(),
+            device_key_state: CredentialState::default(),
+            device_credential_state: CredentialState::default(),
             auth_session_present,
             enrolled_device_id_present: false,
         },
         daemon: DaemonObservation {
             endpoint: None,
             reachable: daemon.is_some(),
+            pid: daemon.map(|status| status.pid),
             message: None,
         },
         // Network is opt-in; TUI never probes the control plane.
