@@ -181,7 +181,7 @@ test("DO stub fetch throw → MCP op stays pending (dispatch_uncertain)", async 
   };
 
   const res = await handleMcp(
-    rpc("ownmesh_fs_list", { device_id: deviceId, path: "/" }, token),
+    rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: null, path: "/" }, token),
     store,
     new URL("https://cp.test/mcp"),
     router,

@@ -125,6 +125,16 @@ async function putActiveDevice(
     created_at: new Date().toISOString(),
     status: "active",
   });
+  await store.putWorkspace({
+    workspace_id: "ws_default",
+    tenant_id: "ten_default",
+    device_id: id,
+    owner_principal_id: principal,
+    version: 1,
+    active: true,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
 }
 
 function rpc(name: string, args: Record<string, unknown>, token: string): Request {
@@ -250,7 +260,7 @@ test("store is authoritative: empty tracker still polls after isolate restart", 
   });
 
   const createRes = await handleMcp(
-    rpc("ownmesh_command_run", { device_id: deviceId, program: "echo", args: ["hi"], async: true, idempotency_key: "idem_auth_cmd" }, tok.access_token),
+    rpc("ownmesh_command_run", { device_id: deviceId, workspace_id: "ws_default", program: "echo", args: ["hi"], async: true, idempotency_key: "idem_auth_cmd" }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
     router,
@@ -452,7 +462,7 @@ test("revoked/expired device credential fails create/poll/cancel (MCP path)", as
   });
   const tracker = new OperationTracker();
   const created = await handleMcp(
-    rpc("ownmesh_fs_list", { device_id: deviceId, path: "/", async: true }, tok.access_token),
+    rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: null, path: "/", async: true }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
     router,
@@ -473,7 +483,7 @@ test("revoked/expired device credential fails create/poll/cancel (MCP path)", as
 
   // New create rejected
   const create2 = await handleMcp(
-    rpc("ownmesh_fs_list", { device_id: deviceId, path: "/" }, tok.access_token),
+    rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: null, path: "/" }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
     router,
@@ -509,7 +519,7 @@ test("revoked/expired device credential fails create/poll/cancel (MCP path)", as
   rec.expires_at = Date.now() - 1000;
   store.deviceCredentials.set(hash, rec);
   const create3 = await handleMcp(
-    rpc("ownmesh_fs_read", { device_id: deviceId, path: "/x" }, tok.access_token),
+    rpc("ownmesh_fs_read", { device_id: deviceId, workspace_id: null, path: "/x" }, tok.access_token),
     store,
     new URL("https://cp.test/mcp"),
     { routeToDevice: async () => ({ status: "should_not_run" }) },

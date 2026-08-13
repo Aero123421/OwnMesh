@@ -230,7 +230,7 @@ test("MCP: router rejected (DO 403 shape) → failed, not pending", async () => 
     store,
     token,
     "ownmesh_fs_list",
-    { device_id: deviceId, path: "/" },
+    { device_id: deviceId, workspace_id: null, path: "/" },
     router,
   );
   const sc = call.body.result!.structuredContent!;
@@ -268,7 +268,7 @@ test("MCP: router unavailable from DO 503 storage → failed, not pending", asyn
     store,
     token,
     "ownmesh_fs_read",
-    { device_id: deviceId, path: "/a" },
+    { device_id: deviceId, workspace_id: null, path: "/a" },
     router,
   );
   const sc = call.body.result!.structuredContent!;
@@ -303,7 +303,7 @@ test("MCP: router unavailable from DO 429 → failed, not pending", async () => 
     store,
     token,
     "ownmesh_fs_write",
-    { device_id: deviceId, path: "x.txt", content: "data", idempotency_key: "idem_route_write" },
+    { device_id: deviceId, workspace_id: null, path: "/x.txt", content: "data", idempotency_key: "idem_route_write" },
     router,
   );
   const sc = call.body.result!.structuredContent!;
@@ -358,7 +358,7 @@ test("MCP end-to-end: routeToDeviceRoom 403 stub → failed via real router path
     store,
     token,
     "ownmesh_fs_list",
-    { device_id: deviceId, path: "/" },
+    { device_id: deviceId, workspace_id: null, path: "/" },
     router,
   );
   const sc = call.body.result!.structuredContent!;

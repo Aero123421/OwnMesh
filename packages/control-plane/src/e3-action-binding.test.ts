@@ -225,7 +225,10 @@ test("principal credential generation is durable, rotates on credential changes,
         headers: { authorization: `Bearer ${fresh.access_token}`, "content-type": "application/json" },
         body: JSON.stringify({
           jsonrpc: "2.0", id: `credential-${store.kind}`, method: "tools/call",
-          params: { name: "ownmesh_fs_list", arguments: { device_id: deviceId, path: "/" } },
+          params: {
+            name: "ownmesh_fs_list",
+            arguments: { device_id: deviceId, workspace_id: null, path: "/" },
+          },
         }),
       }),
       store,
@@ -345,7 +348,7 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
 
   const firstAction = await buildCanonicalAction({
     toolName: "ownmesh_fs_write",
-    args: { path: "x.txt", content: "v1" },
+    args: { workspace_id: null, path: "/x.txt", content: "v1" },
     deviceId,
     principalId: "prin_dev",
     tenantId: "ten_default",
@@ -398,7 +401,8 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
             name: "ownmesh_fs_write",
             arguments: {
               device_id: deviceId,
-              path: "x.txt",
+              workspace_id: null,
+              path: "/x.txt",
               content,
               async: true,
               idempotency_key: "idem_e3_1",
@@ -459,7 +463,8 @@ test("concurrent identical idempotency keys claim one owner (MemoryStore)", asyn
             name: "ownmesh_fs_write",
             arguments: {
               device_id: deviceId,
-              path: "race.txt",
+              workspace_id: null,
+              path: "/race.txt",
               content: "same-body",
               async: true,
               idempotency_key: "idem_race_same",
@@ -512,7 +517,8 @@ test("concurrent differing actions with same key: one owner, one mismatch (SqlSt
             name: "ownmesh_fs_write",
             arguments: {
               device_id: deviceId,
-              path: "race.txt",
+              workspace_id: null,
+              path: "/race.txt",
               content,
               async: true,
               idempotency_key: "idem_race_diff",
@@ -573,7 +579,8 @@ test("mutating tools reject missing idempotency_key before route", async () => {
           name: "ownmesh_fs_write",
           arguments: {
             device_id: deviceId,
-            path: "x.txt",
+            workspace_id: null,
+            path: "/x.txt",
             content: "no-key",
             async: true,
           },
@@ -769,7 +776,8 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
     toolName: "ownmesh_fs_write",
     args: {
       device_id: deviceId,
-      path: "crash.txt",
+      workspace_id: null,
+      path: "/crash.txt",
       content: "after-crash",
       idempotency_key: "idem_crash_dispatch",
     },
@@ -832,7 +840,8 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
             name: "ownmesh_fs_write",
             arguments: {
               device_id: deviceId,
-              path: "crash.txt",
+              workspace_id: null,
+              path: "/crash.txt",
               content: "after-crash",
               async: true,
               idempotency_key: "idem_crash_dispatch",
@@ -929,7 +938,8 @@ test("dispatch_uncertain: timeout keeps pending outbox; delayed result finalizes
             name: "ownmesh_fs_write",
             arguments: {
               device_id: deviceId,
-              path: "uncertain.txt",
+              workspace_id: null,
+              path: "/uncertain.txt",
               content: "once-only",
               async: true,
               idempotency_key: "idem_uncertain_dispatch",
@@ -980,7 +990,12 @@ test("dispatch_uncertain: timeout keeps pending outbox; delayed result finalizes
       operation_id: opId,
       status: "completed",
       summary: "write completed after uncertain dispatch",
-      result: { path: "uncertain.txt", bytes_written: 9 },
+      result: {
+        path: "/uncertain.txt",
+        bytes_written: 9,
+        workspace_id: null,
+        workspace_version: null,
+      },
     },
   });
   assert.equal(applied.ok, true);
@@ -1045,7 +1060,8 @@ test("dispatch_uncertain: pending outbox is redelivered on identical retry", asy
             name: "ownmesh_fs_list",
             arguments: {
               device_id: deviceId,
-              path: ".",
+              workspace_id: null,
+              path: "/",
               async: true,
               idempotency_key: "idem_uncertain_redeliver",
             },
@@ -1196,7 +1212,8 @@ test("dispatch outbox survives large write claim (~300 KiB) and redelivers after
     toolName: "ownmesh_fs_write",
     args: {
       device_id: deviceId,
-      path: "large.bin.txt",
+      workspace_id: null,
+      path: "/large.bin.txt",
       content: largeContent,
       idempotency_key: "idem_large_outbox",
     },
@@ -1274,7 +1291,8 @@ test("dispatch outbox survives large write claim (~300 KiB) and redelivers after
           name: "ownmesh_fs_write",
           arguments: {
             device_id: deviceId,
-            path: "large.bin.txt",
+            workspace_id: null,
+            path: "/large.bin.txt",
             content: largeContent,
             async: true,
             idempotency_key: "idem_large_outbox",

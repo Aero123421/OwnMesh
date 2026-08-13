@@ -1349,7 +1349,7 @@ test("production-path: DeviceRoom handshake → MCP inject → operation.result 
     const createRes = await worker.fetch(
       mcpRpc(
         "ownmesh_fs_list",
-        { device_id: deviceId, path: "/workspace", async: true },
+        { device_id: deviceId, workspace_id: null, path: "/workspace", async: true },
         accessToken,
       ),
       wenv,
@@ -1405,7 +1405,11 @@ test("production-path: DeviceRoom handshake → MCP inject → operation.result 
         status: "completed",
         operation_id: opId,
         summary: "listed",
-        result: { entries: ["README.md", "src/"] },
+        result: {
+          entries: ["README.md", "src/"],
+          workspace_id: null,
+          workspace_version: null,
+        },
       },
     };
     await room.webSocketMessage(
@@ -1416,7 +1420,9 @@ test("production-path: DeviceRoom handshake → MCP inject → operation.result 
     // D1/SqlStore row updated only via DeviceRoom runtime path (no manual apply helper).
     const completed = await store.getMcpOperation(opId!);
     assert.equal(completed?.status, "completed");
-    assert.deepEqual(completed?.data, { entries: ["README.md", "src/"] });
+    assert.deepEqual((completed?.data as { entries?: string[] }).entries, ["README.md", "src/"]);
+    assert.equal((completed?.data as { workspace_id?: unknown }).workspace_id, null);
+    assert.equal((completed?.data as { workspace_version?: unknown }).workspace_version, null);
     assert.equal(
       room.router.pending.has(correlation!),
       false,

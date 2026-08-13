@@ -2395,6 +2395,7 @@ async fn production_filesystem_temporary_grant_still_works() {
             methods::OPS_FS_WRITE,
             Some(json!({
                 "path": "fs-grant-a.txt",
+                "workspace_id": "ws_default",
                 "content": "one",
                 "idempotency_key": "fs-grant-approve",
             })),
@@ -2423,7 +2424,7 @@ async fn production_filesystem_temporary_grant_still_works() {
         assert_eq!(
             grant.workspace_id.as_deref(),
             Some("ws_default"),
-            "an omitted workspace must be canonicalized before grant issuance"
+            "the grant must preserve the explicitly selected workspace"
         );
     }
 
@@ -2433,6 +2434,7 @@ async fn production_filesystem_temporary_grant_still_works() {
             methods::OPS_FS_WRITE,
             Some(json!({
                 "path": "fs-grant-a.txt",
+                "workspace_id": "ws_default",
                 "content": "two",
                 "idempotency_key": "fs-grant-reuse-in-scope",
             })),
@@ -2467,6 +2469,7 @@ async fn production_filesystem_temporary_grant_still_works() {
             methods::OPS_FS_WRITE,
             Some(json!({
                 "path": "fs-grant-b.txt",
+                "workspace_id": "ws_default",
                 "content": "two",
                 "idempotency_key": "fs-grant-reuse-out-of-scope",
             })),

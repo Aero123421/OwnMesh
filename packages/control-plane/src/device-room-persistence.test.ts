@@ -1351,6 +1351,64 @@ test("operation.result CAS binds op+correlation+device before forward; mismatch 
   );
 });
 
+test("workspace-bound result must echo the canonical workspace version", async () => {
+  const { store } = openSqliteAdapter();
+  await store.ensureBootstrap();
+  const deviceId = "dev_workspace_result_01";
+  await seedActiveDevice(store, deviceId);
+  const operationId = "op_workspace_result_01";
+  await store.putMcpOperation({
+    operation_id: operationId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev",
+    device_id: deviceId, tool: "ownmesh_fs_list", status: "pending", summary: "routed",
+    data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [],
+    correlation_id: operationId, workspace_id: "ws_bound", action: {
+      workspace_id: "ws_bound", workspace_version: 7,
+    }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const substituted = await applyMcpOperationResult(store, {
+    operationId, correlationId: operationId, deviceId,
+    payload: { operation_id: operationId, status: "completed", result: {
+      workspace_id: "ws_bound", workspace_version: 6, entries: [],
+    } },
+  });
+  assert.equal(substituted.ok, false);
+  assert.equal((await store.getMcpOperation(operationId))?.status, "pending");
+  const accepted = await applyMcpOperationResult(store, {
+    operationId, correlationId: operationId, deviceId,
+    payload: { operation_id: operationId, status: "completed", result: {
+      workspace_id: "ws_bound", workspace_version: 7, entries: [],
+    } },
+  });
+  assert.equal(accepted.ok, true);
+
+  const unboundOperationId = "op_workspace_result_unbound_01";
+  await store.putMcpOperation({
+    operation_id: unboundOperationId, tenant_id: DEFAULT_TENANT, principal_id: "prin_dev",
+    device_id: deviceId, tool: "ownmesh_fs_list", status: "pending", summary: "routed",
+    data: {}, truncated: false, next_cursor: null, approval_required: false, warnings: [],
+    correlation_id: unboundOperationId, workspace_id: null, action: {
+      capability: "filesystem.read", workspace_id: null, workspace_version: null,
+    }, policy_authority: "ownmesh_device", created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const falseAttribution = await applyMcpOperationResult(store, {
+    operationId: unboundOperationId, correlationId: unboundOperationId, deviceId,
+    payload: { operation_id: unboundOperationId, status: "completed", result: {
+      workspace_id: "ws_default", workspace_version: null, entries: [],
+    } },
+  });
+  assert.equal(falseAttribution.ok, false);
+  assert.equal((await store.getMcpOperation(unboundOperationId))?.status, "pending");
+  const unboundAccepted = await applyMcpOperationResult(store, {
+    operationId: unboundOperationId, correlationId: unboundOperationId, deviceId,
+    payload: { operation_id: unboundOperationId, status: "completed", result: {
+      workspace_id: null, workspace_version: null, entries: [],
+    } },
+  });
+  assert.equal(unboundAccepted.ok, true);
+});
+
 test("live transfer tombstone survives hibernation without bearer replay or storage", async () => {
   const deviceId = "dev_live_ticket_01";
   const rawBearer = "ticket.live-secret.jti-123";

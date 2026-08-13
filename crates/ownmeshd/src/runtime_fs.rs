@@ -36,17 +36,22 @@ impl DaemonRuntime {
             "next_cursor": page.next_cursor,
             "truncated": page.truncated,
             "total_matched": page.total_matched,
-            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+            "workspace_id": p.workspace_id,
         }))
     }
 
     pub(super) fn execute_fs_stat(&self, p: &FsStatParams) -> IpcResult<Value> {
         let ws = self.workspace_for(p.workspace_id.as_deref())?;
         let st = stat_path(&ws, &p.path, p.hash).map_err(fs_err)?;
-        serde_json::to_value(st).map_err(|e| IpcError::Remote {
+        let mut value = serde_json::to_value(st).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: e.to_string(),
-        })
+        })?;
+        value
+            .as_object_mut()
+            .expect("file stat serializes as an object")
+            .insert("workspace_id".into(), json!(p.workspace_id));
+        Ok(value)
     }
 
     pub(super) fn execute_fs_read(&self, p: &FsReadParams) -> IpcResult<Value> {
@@ -79,6 +84,7 @@ impl DaemonRuntime {
             "total_bytes": total,
             "truncated": truncated,
             "sha256": sha256_hex(&data),
+            "workspace_id": p.workspace_id,
         });
         if truncated {
             body.as_object_mut()
@@ -118,7 +124,7 @@ impl DaemonRuntime {
                 "sha256": new_hash,
                 "patched": true,
                 "patch_format": "unified",
-                "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+                "workspace_id": p.workspace_id,
             }));
         }
 
@@ -131,14 +137,14 @@ impl DaemonRuntime {
                 "sha256": new_hash,
                 "patched": true,
                 "patch_format": "replace",
-                "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+                "workspace_id": p.workspace_id,
             }));
         }
         write_file(&ws, &p.path, p.content.as_bytes()).map_err(fs_err)?;
         Ok(json!({
             "path": p.path,
             "bytes_written": p.content.len(),
-            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+            "workspace_id": p.workspace_id,
         }))
     }
 
@@ -148,7 +154,7 @@ impl DaemonRuntime {
         Ok(json!({
             "path": p.path,
             "deleted": true,
-            "workspace_id": p.workspace_id.as_deref().unwrap_or("ws_default"),
+            "workspace_id": p.workspace_id,
         }))
     }
 
@@ -158,12 +164,12 @@ impl DaemonRuntime {
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: FsListParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
+        p.workspace_id = self.workspace_id_for_path(p.workspace_id.as_deref(), &p.path)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "file".into(),
             path: Some(p.path.clone()),
-            workspace_relative: true,
+            workspace_relative: !std::path::Path::new(&p.path).is_absolute(),
             workspace_id: p.workspace_id.clone(),
             tags: sensitive_path_tags(&p.path, false),
             ..Default::default()
@@ -179,12 +185,12 @@ impl DaemonRuntime {
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: FsStatParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
+        p.workspace_id = self.workspace_id_for_path(p.workspace_id.as_deref(), &p.path)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "file".into(),
             path: Some(p.path.clone()),
-            workspace_relative: true,
+            workspace_relative: !std::path::Path::new(&p.path).is_absolute(),
             workspace_id: p.workspace_id.clone(),
             tags: sensitive_path_tags(&p.path, false),
             ..Default::default()
@@ -201,12 +207,12 @@ impl DaemonRuntime {
     ) -> IpcResult<Value> {
         let mut p: FsReadParams = parse_params(params)?;
         normalize_fs_read_cursor(&mut p)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
+        p.workspace_id = self.workspace_id_for_path(p.workspace_id.as_deref(), &p.path)?;
         let facts = OperationFacts {
             capability: "filesystem.read".into(),
             kind: "file".into(),
             path: Some(p.path.clone()),
-            workspace_relative: true,
+            workspace_relative: !std::path::Path::new(&p.path).is_absolute(),
             workspace_id: p.workspace_id.clone(),
             tags: sensitive_path_tags(&p.path, false),
             ..Default::default()
@@ -222,12 +228,12 @@ impl DaemonRuntime {
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: FsWriteParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
+        p.workspace_id = self.workspace_id_for_path(p.workspace_id.as_deref(), &p.path)?;
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
             kind: "file".into(),
             path: Some(p.path.clone()),
-            workspace_relative: true,
+            workspace_relative: !std::path::Path::new(&p.path).is_absolute(),
             workspace_id: p.workspace_id.clone(),
             tags: sensitive_path_tags(&p.path, true),
             ..Default::default()
@@ -243,12 +249,12 @@ impl DaemonRuntime {
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: FsDeleteParams = parse_params(params)?;
-        p.workspace_id = Some(Self::canonical_workspace_id(p.workspace_id.as_deref())?);
+        p.workspace_id = self.workspace_id_for_path(p.workspace_id.as_deref(), &p.path)?;
         let facts = OperationFacts {
             capability: "filesystem.write".into(),
             kind: "file".into(),
             path: Some(p.path.clone()),
-            workspace_relative: true,
+            workspace_relative: !std::path::Path::new(&p.path).is_absolute(),
             workspace_id: p.workspace_id.clone(),
             tags: {
                 let mut tags = vec!["delete".to_owned()];
