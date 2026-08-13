@@ -1,7 +1,7 @@
 /**
  * Health + migration readiness: never synthesize applied migrations;
  * probe required P0/MCP schema and return 503 when absent.
- * SESSION_SECRET and a browser-auth boundary must be bound for /health 200.
+ * SESSION_SECRET and a browser-auth boundary must be bound for /health/ready 200.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -24,9 +24,10 @@ const TEST_SESSION_SECRET = "test-session-secret-health-readiness";
 
 type SqlVal = null | number | string | bigint | Uint8Array;
 
-function adaptSqlite(db: DatabaseSync): SqlDatabase {
+function adaptSqlite(db: DatabaseSync, onPrepare?: () => void): SqlDatabase {
   return {
     prepare(query: string): SqlStatement {
+      onPrepare?.();
       const stmt = db.prepare(query);
       let bound: SqlVal[] = [];
       const api: SqlStatement = {
@@ -68,10 +69,13 @@ function allMigrationFiles(): string[] {
     .sort();
 }
 
-function openStoreWith(files: string[]): { db: DatabaseSync; store: SqlStore } {
+function openStoreWith(
+  files: string[],
+  onPrepare?: () => void,
+): { db: DatabaseSync; store: SqlStore } {
   const db = new DatabaseSync(":memory:");
   applyMigrations(db, files);
-  return { db, store: new SqlStore(adaptSqlite(db), "sqlite") };
+  return { db, store: new SqlStore(adaptSqlite(db, onPrepare), "sqlite") };
 }
 
 /** Minimal DurableObjectNamespace stub so /health can see DEVICE_ROOM bound. */
@@ -123,6 +127,53 @@ const ALL_SCHEMA_KEYS = [
   ...MCP_SCHEMA_KEYS,
 ] as const;
 
+test("/health is D1-free liveness; concurrent /health/ready checks coalesce one bounded scan", async () => {
+  let queryCount = 0;
+  const { store } = openStoreWith(allMigrationFiles(), () => {
+    queryCount += 1;
+  });
+
+  // Measure a single complete scan without populating the Worker cache.
+  await store.schemaReadiness();
+  const oneProbeQueryCount = queryCount;
+  assert.ok(oneProbeQueryCount > 1, "a complete schema probe uses multiple D1 queries");
+  queryCount = 0;
+
+  __setTestStore(store);
+  try {
+    const liveness = await worker.fetch(
+      new Request("https://cp.test/health"),
+      readyEnv(),
+      ctx,
+    );
+    assert.equal(liveness.status, 200);
+    const livenessBody = (await liveness.json()) as Record<string, unknown>;
+    assert.equal(livenessBody.status, "ok");
+    assert.equal(livenessBody.liveness, true);
+    assert.equal("schema_ready" in livenessBody, false);
+    assert.equal("schema_checks" in livenessBody, false);
+    assert.equal(queryCount, 0, "liveness must not access D1");
+
+    const [first, second] = await Promise.all([
+      worker.fetch(new Request("https://cp.test/health/ready"), readyEnv(), ctx),
+      worker.fetch(new Request("https://cp.test/health/ready"), readyEnv(), ctx),
+    ]);
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.equal(queryCount, oneProbeQueryCount, "concurrent readiness checks share one scan");
+
+    const cached = await worker.fetch(
+      new Request("https://cp.test/health/ready"),
+      readyEnv(),
+      ctx,
+    );
+    assert.equal(cached.status, 200);
+    assert.equal(queryCount, oneProbeQueryCount, "fresh readiness result is reused briefly");
+  } finally {
+    __setTestStore(null);
+  }
+});
+
 test("empty schema_migrations is not fabricated on /v1/migrations/status", async () => {
   const store = new MemoryStore();
   // Intentionally do not markMigration — applied must stay [].
@@ -149,7 +200,7 @@ test("empty schema_migrations is not fabricated on /v1/migrations/status", async
   }
 });
 
-test("sqlite DB missing P0 schema → /health 503 with schema_ready:false", async () => {
+test("sqlite DB missing P0 schema → /health/ready 503 with schema_ready:false", async () => {
   // Only 0001_init: devices has no status; 0002+/P0/MCP tables absent.
   const { store } = openStoreWith(["0001_init.sql"]);
   const readiness = await store.schemaReadiness();
@@ -159,7 +210,7 @@ test("sqlite DB missing P0 schema → /health 503 with schema_ready:false", asyn
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       readyEnv(),
       ctx,
     );
@@ -192,7 +243,7 @@ test("sqlite DB missing P0 schema → /health 503 with schema_ready:false", asyn
   }
 });
 
-test("full schema → /health 200 with schema_ready:true; MemoryStore ready", async () => {
+test("full schema → /health/ready 200 with schema_ready:true; MemoryStore ready", async () => {
   const mem = new MemoryStore();
   const memReady = await mem.schemaReadiness();
   assert.equal(memReady.schema_ready, true);
@@ -201,7 +252,7 @@ test("full schema → /health 200 with schema_ready:true; MemoryStore ready", as
   __setTestStore(mem);
   try {
     const memHealth = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       readyEnv(),
       ctx,
     );
@@ -234,7 +285,7 @@ test("full schema → /health 200 with schema_ready:true; MemoryStore ready", as
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       readyEnv(),
       ctx,
     );
@@ -269,14 +320,14 @@ test("full schema → /health 200 with schema_ready:true; MemoryStore ready", as
   }
 });
 
-test("schema ready but DEVICE_ROOM absent → /health 503 not_ready", async () => {
+test("schema ready but DEVICE_ROOM absent → /health/ready 503 not_ready", async () => {
   const mem = new MemoryStore();
   assert.equal((await mem.schemaReadiness()).schema_ready, true);
 
   __setTestStore(mem);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       { SESSION_SECRET: TEST_SESSION_SECRET }, // no DEVICE_ROOM
       ctx,
     );
@@ -303,7 +354,7 @@ test("schema ready but DEVICE_ROOM absent → /health 503 not_ready", async () =
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       { SESSION_SECRET: TEST_SESSION_SECRET }, // schema ready, DEVICE_ROOM unbound
       ctx,
     );
@@ -321,14 +372,14 @@ test("schema ready but DEVICE_ROOM absent → /health 503 not_ready", async () =
   }
 });
 
-test("schema ready but SESSION_SECRET unbound → /health 503 not_ready", async () => {
+test("schema ready but SESSION_SECRET unbound → /health/ready 503 not_ready", async () => {
   const mem = new MemoryStore();
   assert.equal((await mem.schemaReadiness()).schema_ready, true);
 
   __setTestStore(mem);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       { DEVICE_ROOM: fakeDeviceRoom() }, // no SESSION_SECRET
       ctx,
     );
@@ -354,7 +405,7 @@ test("schema ready but SESSION_SECRET unbound → /health 503 not_ready", async 
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       { DEVICE_ROOM: fakeDeviceRoom() },
       ctx,
     );
@@ -390,7 +441,7 @@ test("missing 0005 MCP objects → schema_ready:false while 0003/0004 retained",
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       readyEnv(),
       ctx,
     );
@@ -430,7 +481,7 @@ test("missing required column on 0003/0004 table → schema_ready:false", async 
   assert.equal(readiness.checks.mcp_approval_outbox, true);
 });
 
-test("missing 0002 objects → schema_ready:false and /health 503", async () => {
+test("missing 0002 objects → schema_ready:false and /health/ready 503", async () => {
   // 0001 only already covers absence; also verify after 0001 the 0002 keys are false
   // while applying 0002 alone (plus 0001) makes 0002 true and later keys false.
   const { store } = openStoreWith([
@@ -446,7 +497,7 @@ test("missing 0002 objects → schema_ready:false and /health 503", async () => 
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       readyEnv(),
       ctx,
     );
@@ -464,7 +515,7 @@ test("missing 0002 objects → schema_ready:false and /health 503", async () => 
   }
 });
 
-test("missing required 0002 index → schema_ready:false and /health 503", async () => {
+test("missing required 0002 index → schema_ready:false and /health/ready 503", async () => {
   const { db, store } = openStoreWith(allMigrationFiles());
   assert.equal((await store.schemaReadiness()).schema_ready, true);
   db.exec(`DROP INDEX idx_auth_codes_client`);
@@ -480,7 +531,7 @@ test("missing required 0002 index → schema_ready:false and /health 503", async
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       readyEnv(),
       ctx,
     );
@@ -497,7 +548,7 @@ test("missing required 0002 index → schema_ready:false and /health 503", async
   }
 });
 
-test("missing 0007 claim columns → schema_ready:false and /health 503", async () => {
+test("missing 0007 claim columns → schema_ready:false and /health/ready 503", async () => {
   // Through 0006 only — claimed_at present, claim_token/version absent.
   // Keep 0008 (mcp_operations action binding) so only outbox claim columns fail.
   const files = allMigrationFiles().filter((f) => !f.startsWith("0007"));
@@ -514,7 +565,7 @@ test("missing 0007 claim columns → schema_ready:false and /health 503", async 
   __setTestStore(store);
   try {
     const res = await worker.fetch(
-      new Request("https://cp.test/health"),
+      new Request("https://cp.test/health/ready"),
       readyEnv(),
       ctx,
     );
@@ -555,9 +606,9 @@ test("MemoryStore and SqlStore both report full 0002–0009 readiness", async ()
   for (const k of ALL_SCHEMA_KEYS) assert.equal(sqlR.checks[k], true, `sql:${k}`);
 });
 
-test("unavailable storage without DB/testStore → /health 503 schema_ready:false", async () => {
+test("unavailable storage without DB/testStore → /health/ready 503 schema_ready:false", async () => {
   __setTestStore(null);
-  const res = await worker.fetch(new Request("https://cp.test/health"), {}, ctx);
+  const res = await worker.fetch(new Request("https://cp.test/health/ready"), {}, ctx);
   assert.equal(res.status, 503);
   const body = (await res.json()) as {
     schema_ready: boolean;
