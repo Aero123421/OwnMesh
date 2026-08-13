@@ -1,6 +1,6 @@
 # OwnMesh roadmap
 
-**Baseline:** v1.2.4 · **Last updated:** 2026-08-12
+**Baseline:** v1.2.5 · **Last updated:** 2026-08-13
 
 Specification §31.3 asks for a public roadmap. This is it. It records what the
 project intends to do next and, just as importantly, what it has decided not to
@@ -45,6 +45,11 @@ These are the `W-*` waivers. The code exists; the receipt does not.
 
 ## Then — depth the specification asks for and the product does not yet have
 
+- **Bounded module decomposition.** The control-plane store/router and daemon
+  runtime have grown into large authority-bearing modules. Refactor them only
+  as behavior-preserving slices (OAuth/device state, MCP routing, transfer,
+  broker) with the existing contract tests kept green after each slice; do not
+  combine that structural work with a security or release patch.
 - **Localized CLI.** [ADR 0005](./adr/0005-i18n-compile-time-catalog.md) scopes
   localization to the TUI. Extending it means one mechanism shared by CLI and
   TUI plus placeholder validation, and a partial CLI translation is worse than

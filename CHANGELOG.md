@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v1.2.5 — Authentication recovery and rate-limit resilience
+
+- Remote operation polling now stays below the control-plane credential rate
+  limit and honors bounded `Retry-After` responses instead of failing long jobs.
+- The TUI exposes an explicit device-flow re-authentication action even when a
+  stale local login marker exists; it never reads or prints credential secrets.
+- Owner login, OAuth consent, and device verification provide primary UI copy
+  in English, Japanese, Simplified Chinese, and Russian, with headless/passkey
+  recovery guidance.
+- Device-code requests can be explicitly denied through the same short-lived,
+  single-use, principal-bound transaction used for approval.
+
 ## v1.2.4 — Guided TUI onboarding
 
 - The bundled dark TUI now guides first-run server setup, language and policy

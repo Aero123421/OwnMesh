@@ -387,7 +387,7 @@ fn draw_body(frame: &mut Frame<'_>, app: &App, area: Rect, narrow: bool) {
 fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let content = centered_width(area, 78);
     let actions = app.overview_actions();
-    let action_height = u16::try_from(actions.len()).unwrap_or(5).min(6);
+    let action_height = u16::try_from(actions.len()).unwrap_or(6).min(6);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -450,10 +450,10 @@ fn draw_dashboard(frame: &mut Frame<'_>, app: &App, area: Rect) {
             app.readiness.account_present,
             localized(
                 app.lang,
-                "credentials saved",
-                "ログイン情報あり",
-                "凭据已保存",
-                "данные входа сохранены",
+                "login recorded",
+                "ログイン記録あり",
+                "已记录登录",
+                "вход сохранён",
             ),
             localized(
                 app.lang,
@@ -618,6 +618,22 @@ fn overview_action_copy(lang: Lang, action: OverviewAction) -> (&'static str, &'
                 "MCP URLと手順を表示",
                 "显示 MCP URL 和说明",
                 "Показать MCP URL и инструкции",
+            ),
+        ),
+        OverviewAction::Reauthenticate => (
+            localized(
+                lang,
+                "Re-authenticate",
+                "再認証",
+                "重新认证",
+                "Войти заново",
+            ),
+            localized(
+                lang,
+                "Refresh the account login",
+                "アカウントのログインを更新",
+                "刷新账户登录",
+                "Обновить вход в аккаунт",
             ),
         ),
         OverviewAction::Devices => (

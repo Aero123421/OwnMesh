@@ -10,7 +10,14 @@
  */
 
 import type { ControlPlaneStore } from "./store.ts";
-import { AUTH_PAGE_CSP, authPage, oauthConsentCsp } from "./auth-ui.ts";
+import {
+  AUTH_PAGE_CSP,
+  authLocale,
+  authPage,
+  authText,
+  oauthConsentCsp,
+  type AuthLocale,
+} from "./auth-ui.ts";
 import { chatGptOAuthClientId, chatGptOAuthPair } from "./owner-auth.ts";
 import {
   ACCESS_TOKEN_TTL_MS,
@@ -71,9 +78,59 @@ const SCOPE_COPY: Record<string, string> = {
   "ownmesh.device": "Discover and address devices enrolled in this instance.",
   offline_access: "Keep ChatGPT connected using rotating refresh tokens.",
 };
-function scopeRows(scope: string): string {
+function scopeDescription(locale: AuthLocale, value: string): string {
+  const fallback = authText(locale, {
+    en: "Access requested by this OAuth client.",
+    ja: "この OAuth クライアントが要求するアクセスです。",
+    zh: "此 OAuth 客户端请求的访问权限。",
+    ru: "Доступ, запрошенный этим OAuth-клиентом.",
+  });
+  const en = SCOPE_COPY[value];
+  if (!en) return fallback;
+  const translated: Record<string, { ja: string; zh: string; ru: string }> = {
+    "ownmesh.read": {
+      ja: "許可されたワークスペースの内容とデバイス状態を読み取ります。",
+      zh: "读取设备状态和已允许工作区的内容。",
+      ru: "Чтение состояния устройств и разрешённого содержимого рабочих областей.",
+    },
+    "ownmesh.write": {
+      ja: "許可されたワークスペース内で内容を作成・変更します。",
+      zh: "在已允许的工作区内创建或修改内容。",
+      ru: "Создание и изменение данных в разрешённых рабочих областях.",
+    },
+    "ownmesh.exec": {
+      ja: "ローカルデバイスポリシーが許可したコマンドを実行します。",
+      zh: "运行本地设备策略允许的命令。",
+      ru: "Запуск команд, разрешённых локальной политикой устройства.",
+    },
+    "ownmesh.session": {
+      ja: "許可された対話セッションを開いて操作します。",
+      zh: "打开并控制允许的交互式会话。",
+      ru: "Открытие и управление разрешёнными интерактивными сеансами.",
+    },
+    "ownmesh.device": {
+      ja: "この環境に登録されたデバイスを検出して指定します。",
+      zh: "发现并寻址此实例中已注册的设备。",
+      ru: "Обнаружение и выбор устройств, зарегистрированных в этом экземпляре.",
+    },
+    offline_access: {
+      ja: "ローテーションする更新トークンで接続を維持します。",
+      zh: "使用轮换刷新令牌保持连接。",
+      ru: "Поддержание подключения с ротацией токенов обновления.",
+    },
+  };
+  const copy = translated[value];
+  return authText(locale, {
+    en,
+    ja: copy?.ja || fallback,
+    zh: copy?.zh || fallback,
+    ru: copy?.ru || fallback,
+  });
+}
+
+function scopeRows(scope: string, locale: AuthLocale = "en-US"): string {
   return scope.split(/\s+/).filter(Boolean).map((value) =>
-    `<div class="scope"><span class="scope-mark" aria-hidden="true"></span><span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(SCOPE_COPY[value] || "Access requested by this OAuth client.")}</small></span></div>`
+    `<div class="scope"><span class="scope-mark" aria-hidden="true"></span><span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(scopeDescription(locale, value))}</small></span></div>`
   ).join("");
 }
 function validScope(scope: string): boolean {
@@ -303,6 +360,7 @@ export async function handleAuthorize(
   const requestReceivedAt = authorizeRequestReceipts.get(req) ?? Date.now();
   authorizeRequestReceipts.delete(req);
   const url = new URL(req.url);
+  const locale = authLocale(req);
 
   // POST consent decision first: consume one-time transaction and issue code
   // solely from the stored snapshot (ignore any resubmitted/altered OAuth params).
@@ -483,12 +541,38 @@ export async function handleAuthorize(
   });
 
   const page = authPage({
-    title: "Authorize ChatGPT — OwnMesh",
-    eyebrow: "OAuth authorization",
-    heading: `Connect ${client.client_name || clientId}`,
-    intro: "Review the capabilities ChatGPT is requesting from this self-hosted OwnMesh instance.",
-    body: `<dl class="meta"><dt>Client</dt><dd>${escapeHtml(client.client_name || clientId)}</dd><dt>Returns to</dt><dd><code>${escapeHtml(new URL(redirect).host)}</code></dd><dt>Protocol</dt><dd>OAuth 2.1 / PKCE S256</dd></dl><div class="scope-list">${scopeRows(scope)}</div><p class="note">Your device policy remains the final authority. ChatGPT cannot bypass local workspace, command, or approval rules.</p><form method="post" action="/oauth/authorize"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">Authorize connection</button><button class="danger" name="decision" value="deny" type="submit">Deny</button></div></form>`,
-    footer: "One-time consent / 5 minute expiry",
+    locale,
+    title: authText(locale, {
+      en: "Authorize ChatGPT — OwnMesh",
+      ja: "ChatGPT を認証 — OwnMesh",
+      zh: "授权 ChatGPT — OwnMesh",
+      ru: "Авторизация ChatGPT — OwnMesh",
+    }),
+    eyebrow: authText(locale, {
+      en: "OAuth authorization",
+      ja: "OAuth 認証",
+      zh: "OAuth 授权",
+      ru: "Авторизация OAuth",
+    }),
+    heading: authText(locale, {
+      en: `Connect ${client.client_name || clientId}`,
+      ja: `${client.client_name || clientId} を接続`,
+      zh: `连接 ${client.client_name || clientId}`,
+      ru: `Подключить ${client.client_name || clientId}`,
+    }),
+    intro: authText(locale, {
+      en: "Review the capabilities ChatGPT is requesting from this self-hosted OwnMesh instance.",
+      ja: "ChatGPT がこのセルフホスト OwnMesh に要求している権限を確認してください。",
+      zh: "请检查 ChatGPT 向此自托管 OwnMesh 实例请求的权限。",
+      ru: "Проверьте права, которые ChatGPT запрашивает у этого экземпляра OwnMesh.",
+    }),
+    body: `<dl class="meta"><dt>${authText(locale, { en: "Client", ja: "クライアント", zh: "客户端", ru: "Клиент" })}</dt><dd>${escapeHtml(client.client_name || clientId)}</dd><dt>${authText(locale, { en: "Returns to", ja: "戻り先", zh: "返回到", ru: "Возврат" })}</dt><dd><code>${escapeHtml(new URL(redirect).host)}</code></dd><dt>${authText(locale, { en: "Protocol", ja: "プロトコル", zh: "协议", ru: "Протокол" })}</dt><dd>OAuth 2.1 / PKCE S256</dd></dl><div class="scope-list">${scopeRows(scope, locale)}</div><p class="note">${authText(locale, { en: "Your device policy remains the final authority. ChatGPT cannot bypass local workspace, command, or approval rules.", ja: "最終権限は常にデバイス側のポリシーです。ChatGPT はローカルのワークスペース、コマンド、承認ルールを迂回できません。", zh: "设备策略始终拥有最终权限。ChatGPT 无法绕过本地工作区、命令或审批规则。", ru: "Политика устройства остаётся окончательным источником прав. ChatGPT не может обойти локальные правила рабочих областей, команд или подтверждений." })}</p><form method="post" action="/oauth/authorize"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">${authText(locale, { en: "Authorize connection", ja: "接続を許可", zh: "授权连接", ru: "Разрешить подключение" })}</button><button class="danger" name="decision" value="deny" type="submit">${authText(locale, { en: "Deny", ja: "拒否", zh: "拒绝", ru: "Отклонить" })}</button></div></form>`,
+    footer: authText(locale, {
+      en: "One-time consent / 5 minute expiry",
+      ja: "一度限りの同意 / 5分で期限切れ",
+      zh: "一次性同意 / 5 分钟后过期",
+      ru: "Одноразовое согласие / срок 5 минут",
+    }),
   });
   return html(page, {
     status: 200,
@@ -760,6 +844,7 @@ export async function handleDeviceVerification(
   security: OAuthRequestSecurity = {},
 ): Promise<Response> {
   await store.ensureBootstrap();
+  const locale = authLocale(req);
   let principal = security.principal;
   if (!principal && security.allowDevBypass) principal = { id: "prin_dev", tenant_id: DEFAULT_TENANT };
   if (!principal) return json({ error: "authentication_required" }, { status: 401 });
@@ -777,12 +862,13 @@ export async function handleDeviceVerification(
     const userCode = (url.searchParams.get("user_code") || "").trim().toUpperCase();
     if (!userCode) {
       return html(authPage({
-        title: "Device sign in — OwnMesh",
-        eyebrow: "Device authorization",
-        heading: "Enter the code from your terminal",
-        intro: "Use this page when OwnMesh is running on a server without a local browser.",
-        body: `<form class="stack" method="get" action="/oauth/device"><div><label for="user_code">One-time device code</label><input id="user_code" name="user_code" autocomplete="one-time-code" required autofocus></div><button class="primary wide" type="submit">Continue</button></form>`,
-        footer: "RFC 8628 device flow",
+        locale,
+        title: authText(locale, { en: "Device sign in — OwnMesh", ja: "デバイスのサインイン — OwnMesh", zh: "设备登录 — OwnMesh", ru: "Вход устройства — OwnMesh" }),
+        eyebrow: authText(locale, { en: "Device authorization", ja: "デバイス認証", zh: "设备授权", ru: "Авторизация устройства" }),
+        heading: authText(locale, { en: "Enter the code from your terminal", ja: "端末に表示されたコードを入力", zh: "输入终端中显示的代码", ru: "Введите код из терминала" }),
+        intro: authText(locale, { en: "Use this page when OwnMesh is running on a server without a local browser.", ja: "ローカルブラウザのないサーバーで OwnMesh を使うときの認証ページです。", zh: "当 OwnMesh 运行在没有本地浏览器的服务器上时，请使用此页面。", ru: "Используйте эту страницу, когда OwnMesh работает на сервере без локального браузера." }),
+        body: `<form class="stack" method="get" action="/oauth/device"><div><label for="user_code">${authText(locale, { en: "One-time device code", ja: "一度限りのデバイスコード", zh: "一次性设备代码", ru: "Одноразовый код устройства" })}</label><input id="user_code" name="user_code" autocomplete="one-time-code" required autofocus></div><button class="primary wide" type="submit">${authText(locale, { en: "Continue", ja: "続ける", zh: "继续", ru: "Продолжить" })}</button></form>`,
+        footer: authText(locale, { en: "RFC 8628 device flow", ja: "RFC 8628 デバイスフロー", zh: "RFC 8628 设备流程", ru: "Поток устройства RFC 8628" }),
       }), {
         noStore: true,
         headers: { "content-security-policy": AUTH_PAGE_CSP },
@@ -801,12 +887,13 @@ export async function handleDeviceVerification(
       expires_at: Math.min(dc.expires_at, Date.now() + 5 * 60 * 1000), consumed: false,
     });
     const page = authPage({
-      title: "Authorize device — OwnMesh",
-      eyebrow: "Device authorization",
-      heading: `Authorize ${client.client_name || dc.client_id}`,
-      intro: "Confirm the terminal or headless server that requested this one-time code.",
-      body: `<dl class="meta"><dt>Client</dt><dd>${escapeHtml(client.client_name || dc.client_id)}</dd><dt>User code</dt><dd><code>${escapeHtml(userCode)}</code></dd><dt>Expires</dt><dd>${escapeHtml(new Date(dc.expires_at).toISOString())}</dd></dl><div class="scope-list">${scopeRows(dc.scope)}</div><form method="post" action="/oauth/device"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><button class="primary wide" name="decision" value="approve" type="submit">Authorize device</button></form>`,
-      footer: "One-time device authorization",
+      locale,
+      title: authText(locale, { en: "Authorize device — OwnMesh", ja: "デバイスを認証 — OwnMesh", zh: "授权设备 — OwnMesh", ru: "Авторизация устройства — OwnMesh" }),
+      eyebrow: authText(locale, { en: "Device authorization", ja: "デバイス認証", zh: "设备授权", ru: "Авторизация устройства" }),
+      heading: authText(locale, { en: `Authorize ${client.client_name || dc.client_id}`, ja: `${client.client_name || dc.client_id} を認証`, zh: `授权 ${client.client_name || dc.client_id}`, ru: `Разрешить ${client.client_name || dc.client_id}` }),
+      intro: authText(locale, { en: "Confirm the terminal or headless server that requested this one-time code.", ja: "この一度限りのコードを要求した端末またはヘッドレスサーバーを確認してください。", zh: "请确认请求此一次性代码的终端或无界面服务器。", ru: "Подтвердите терминал или сервер без интерфейса, запросивший этот одноразовый код." }),
+      body: `<dl class="meta"><dt>${authText(locale, { en: "Client", ja: "クライアント", zh: "客户端", ru: "Клиент" })}</dt><dd>${escapeHtml(client.client_name || dc.client_id)}</dd><dt>${authText(locale, { en: "User code", ja: "ユーザーコード", zh: "用户代码", ru: "Код пользователя" })}</dt><dd><code>${escapeHtml(userCode)}</code></dd><dt>${authText(locale, { en: "Expires", ja: "有効期限", zh: "过期时间", ru: "Истекает" })}</dt><dd>${escapeHtml(new Date(dc.expires_at).toISOString())}</dd></dl><div class="scope-list">${scopeRows(dc.scope, locale)}</div><form method="post" action="/oauth/device"><input type="hidden" name="transaction_id" value="${escapeHtml(transactionId)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><div class="actions"><button class="primary" name="decision" value="approve" type="submit">${authText(locale, { en: "Authorize device", ja: "デバイスを許可", zh: "授权设备", ru: "Разрешить устройство" })}</button><button class="danger" name="decision" value="deny" type="submit">${authText(locale, { en: "Deny", ja: "拒否", zh: "拒绝", ru: "Отклонить" })}</button></div></form>`,
+      footer: authText(locale, { en: "One-time device authorization", ja: "一度限りのデバイス認証", zh: "一次性设备授权", ru: "Одноразовая авторизация устройства" }),
     });
     return html(page, {
       noStore: true,
@@ -815,20 +902,28 @@ export async function handleDeviceVerification(
   }
   if (req.method === "POST") {
     const body = await readBody(req);
-    if (body.decision !== "approve" || !body.transaction_id || !body.csrf_token) {
+    if ((body.decision !== "approve" && body.decision !== "deny") || !body.transaction_id || !body.csrf_token) {
       return json({ error: "invalid_request" }, { status: 400 });
     }
     const tx = await store.consumeDeviceVerificationTransaction(
-      body.transaction_id, await sha256Hex(body.csrf_token), principal.id,
+      body.transaction_id, await sha256Hex(body.csrf_token), principal.id, body.decision,
     );
     if (!tx) return json({ error: "invalid_request", error_description: "invalid, expired, or used transaction" }, { status: 400 });
+    const approved = body.decision === "approve";
     return html(authPage({
-      title: "Device authorized — OwnMesh",
-      eyebrow: "Device authorization",
-      heading: "Device authorized",
-      intro: "Return to the terminal. It can now complete the token exchange.",
-      body: `<p class="note">This one-time authorization has been consumed and cannot be replayed.</p>`,
-      footer: "You can close this tab",
+      locale,
+      title: approved
+        ? authText(locale, { en: "Device authorized — OwnMesh", ja: "デバイスを許可しました — OwnMesh", zh: "设备已授权 — OwnMesh", ru: "Устройство разрешено — OwnMesh" })
+        : authText(locale, { en: "Device denied — OwnMesh", ja: "デバイスを拒否しました — OwnMesh", zh: "设备已拒绝 — OwnMesh", ru: "Устройство отклонено — OwnMesh" }),
+      eyebrow: authText(locale, { en: "Device authorization", ja: "デバイス認証", zh: "设备授权", ru: "Авторизация устройства" }),
+      heading: approved
+        ? authText(locale, { en: "Device authorized", ja: "デバイスを許可しました", zh: "设备已授权", ru: "Устройство разрешено" })
+        : authText(locale, { en: "Device denied", ja: "デバイスを拒否しました", zh: "设备已拒绝", ru: "Устройство отклонено" }),
+      intro: approved
+        ? authText(locale, { en: "Return to the terminal. It can now complete the token exchange.", ja: "端末に戻ってください。トークン交換を完了できます。", zh: "请返回终端。现在可以完成令牌交换。", ru: "Вернитесь в терминал. Теперь он может завершить обмен токенов." })
+        : authText(locale, { en: "Return to the terminal. The request was denied and no token will be issued.", ja: "端末に戻ってください。この要求は拒否され、トークンは発行されません。", zh: "请返回终端。请求已被拒绝，不会颁发令牌。", ru: "Вернитесь в терминал. Запрос отклонён, токен выдан не будет." }),
+      body: `<p class="note">${authText(locale, { en: "This one-time decision has been consumed and cannot be replayed.", ja: "この一度限りの判断は消費済みで、再利用できません。", zh: "此一次性决定已使用，无法重放。", ru: "Это одноразовое решение уже использовано и не может быть повторено." })}</p>`,
+      footer: authText(locale, { en: "You can close this tab", ja: "このタブを閉じられます", zh: "可以关闭此标签页", ru: "Эту вкладку можно закрыть" }),
     }), {
       noStore: true,
       headers: { "content-security-policy": AUTH_PAGE_CSP },

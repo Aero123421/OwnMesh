@@ -91,6 +91,7 @@ impl Screen {
 pub enum OverviewAction {
     SetupRepair,
     RepairAgent,
+    Reauthenticate,
     Connector,
     Devices,
     Workspace,
@@ -193,6 +194,7 @@ pub struct App {
     pub should_quit: bool,
     pub list_cursor: usize,
     pending_setup: Option<SetupRequest>,
+    pending_reauthentication: bool,
 }
 
 impl App {
@@ -240,6 +242,7 @@ impl App {
             should_quit: false,
             list_cursor: 0,
             pending_setup: None,
+            pending_reauthentication: false,
         }
     }
 
@@ -320,7 +323,7 @@ impl App {
 
     #[must_use]
     pub fn overview_actions(&self) -> Vec<OverviewAction> {
-        let mut actions = Vec::with_capacity(5);
+        let mut actions = Vec::with_capacity(6);
         if self.readiness.needs_onboarding() {
             actions.push(OverviewAction::SetupRepair);
         } else if !self.readiness.agent_running || !self.readiness.service_installed {
@@ -330,6 +333,12 @@ impl App {
         }
         if self.readiness.server_url.is_some() && !actions.contains(&OverviewAction::Connector) {
             actions.push(OverviewAction::Connector);
+        }
+        // Session metadata cannot prove that an OS-keychain item is still
+        // readable. Keep an explicit recovery path visible whenever a recorded
+        // login might otherwise make the setup wizard skip authentication.
+        if self.readiness.server_url.is_some() && self.readiness.account_present {
+            actions.push(OverviewAction::Reauthenticate);
         }
         actions.extend([
             OverviewAction::Devices,
@@ -360,6 +369,7 @@ impl App {
                 });
             }
             OverviewAction::Connector => self.overlay = Overlay::Connector,
+            OverviewAction::Reauthenticate => self.pending_reauthentication = true,
             OverviewAction::Devices => self.screen = Screen::Devices,
             OverviewAction::Workspace => self.screen = Screen::Workspaces,
             OverviewAction::Doctor => self.screen = Screen::Diagnostics,
@@ -391,6 +401,10 @@ impl App {
 
     pub fn take_pending_setup(&mut self) -> Option<SetupRequest> {
         self.pending_setup.take()
+    }
+
+    pub fn take_pending_reauthentication(&mut self) -> bool {
+        std::mem::take(&mut self.pending_reauthentication)
     }
 
     pub fn refresh_local_state(&mut self, daemon: Option<DaemonStatus>) {
