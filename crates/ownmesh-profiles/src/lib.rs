@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -960,18 +961,35 @@ fn expand_template(
         .collect()
 }
 
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const VERSION_PROBE_POLL: Duration = Duration::from_millis(20);
+const VERSION_PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+fn read_version_probe_output(file: &mut std::fs::File) -> Option<Vec<u8>> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut output = Vec::new();
+    file.take(VERSION_PROBE_OUTPUT_LIMIT)
+        .read_to_end(&mut output)
+        .ok()?;
+    Some(output)
+}
+
 fn probe_version(bin: &str, args: &[String]) -> Option<String> {
     // A vendor CLI may perform network or credential discovery even for
     // `--version`. Profile discovery is a read-only convenience path and must
-    // never hold the daemon request loop indefinitely.
-    const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-    const VERSION_PROBE_POLL: Duration = Duration::from_millis(20);
+    // never hold the daemon request loop indefinitely. Regular temporary files
+    // are used instead of pipes so a detached descendant cannot keep
+    // `wait_with_output` blocked after the direct child exits.
+    let mut stdout = tempfile::tempfile().ok()?;
+    let mut stderr = tempfile::tempfile().ok()?;
+    let child_stdout = stdout.try_clone().ok()?;
+    let child_stderr = stderr.try_clone().ok()?;
 
     let mut child = Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr))
         .spawn()
         .ok()?;
     let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
@@ -986,10 +1004,12 @@ fn probe_version(bin: &str, args: &[String]) -> Option<String> {
             }
         }
     }
-    let out = child.wait_with_output().ok()?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    child.wait().ok()?;
+    let stdout = read_version_probe_output(&mut stdout)?;
+    let stderr = read_version_probe_output(&mut stderr)?;
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
     if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&out.stderr).into_owned();
+        text = String::from_utf8_lossy(&stderr).into_owned();
     }
     let line = text.lines().next()?.trim().to_string();
     if line.is_empty() {
@@ -1802,6 +1822,72 @@ mod tests {
         ];
         let started = Instant::now();
         assert_eq!(probe_version(&exe.to_string_lossy(), &args), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for the inherited version-probe output test"]
+    #[allow(clippy::zombie_processes)] // The helper must exit while its descendant holds stdio.
+    fn inherited_version_probe_output_helper() {
+        const DESCENDANT_MARKER: &str = "OWNMESH_TEST_VERSION_PROBE_DESCENDANT";
+        if std::env::var_os(DESCENDANT_MARKER).is_some() {
+            std::thread::sleep(Duration::from_secs(15));
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let descendant = Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::inherited_version_probe_output_helper",
+                "--nocapture",
+            ])
+            .env(DESCENDANT_MARKER, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let pid_path = std::env::var_os("OWNMESH_TEST_VERSION_PROBE_PID_FILE").unwrap();
+        std::fs::write(pid_path, descendant.id().to_string()).unwrap();
+        println!("ownmesh-version 9.8.7");
+    }
+
+    fn terminate_version_probe_test_descendant(pid: &str) {
+        #[cfg(windows)]
+        let status = Command::new("taskkill")
+            .args(["/PID", pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        #[cfg(unix)]
+        let status = Command::new("kill")
+            .args(["-KILL", pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        assert!(status.is_ok_and(|status| status.success()));
+    }
+
+    #[test]
+    fn version_probe_does_not_wait_for_inherited_output_handles() {
+        const PID_FILE_ENV: &str = "OWNMESH_TEST_VERSION_PROBE_PID_FILE";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pid_file = temp_dir.path().join("descendant.pid");
+        std::env::set_var(PID_FILE_ENV, &pid_file);
+        let exe = std::env::current_exe().unwrap();
+        let args = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "tests::inherited_version_probe_output_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let started = Instant::now();
+        let _version = probe_version(&exe.to_string_lossy(), &args);
+        std::env::remove_var(PID_FILE_ENV);
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        terminate_version_probe_test_descendant(pid.trim());
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
