@@ -16,11 +16,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -962,54 +961,88 @@ fn expand_template(
 }
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const VERSION_PROBE_POLL: Duration = Duration::from_millis(20);
-const VERSION_PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+const VERSION_PROBE_STOP_GRACE: Duration = Duration::from_millis(500);
+const VERSION_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 
-fn read_version_probe_output(file: &mut std::fs::File) -> Option<Vec<u8>> {
-    file.seek(SeekFrom::Start(0)).ok()?;
-    let mut output = Vec::new();
-    file.take(VERSION_PROBE_OUTPUT_LIMIT)
-        .read_to_end(&mut output)
-        .ok()?;
-    Some(output)
+async fn stop_version_probe(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(VERSION_PROBE_STOP_GRACE, child.wait()).await;
 }
 
-fn probe_version(bin: &str, args: &[String]) -> Option<String> {
+async fn probe_version_bounded(bin: &str, args: &[String]) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
     // A vendor CLI may perform network or credential discovery even for
     // `--version`. Profile discovery is a read-only convenience path and must
-    // never hold the daemon request loop indefinitely. Regular temporary files
-    // are used instead of pipes so a detached descendant cannot keep
-    // `wait_with_output` blocked after the direct child exits.
-    let mut stdout = tempfile::tempfile().ok()?;
-    let mut stderr = tempfile::tempfile().ok()?;
-    let child_stdout = stdout.try_clone().ok()?;
-    let child_stderr = stderr.try_clone().ok()?;
-
-    let mut child = Command::new(bin)
+    // never hold the daemon request loop indefinitely. Async pipe reads cap
+    // both memory and the producer: once the direct child exits, the deadline
+    // expires, or the aggregate budget is full, dropping the read ends makes
+    // inherited descendant writes fail instead of growing a temporary file.
+    let mut child = tokio::process::Command::new(bin)
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(child_stdout))
-        .stderr(Stdio::from(child_stderr))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let mut stdout = child.stdout.take()?;
+    let mut stderr = child.stderr.take()?;
+    let deadline = tokio::time::Instant::now() + VERSION_PROBE_TIMEOUT;
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut stdout_output = Vec::new();
+    let mut stderr_output = Vec::new();
+    let mut stdout_chunk = [0_u8; 4096];
+    let mut stderr_chunk = [0_u8; 4096];
+
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(VERSION_PROBE_POLL),
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+        if tokio::time::Instant::now() >= deadline {
+            stop_version_probe(&mut child).await;
+            return None;
+        }
+        let used = stdout_output.len() + stderr_output.len();
+        if used >= VERSION_PROBE_OUTPUT_LIMIT {
+            if child.try_wait().ok()?.is_none() {
+                stop_version_probe(&mut child).await;
+            }
+            break;
+        }
+
+        let budget = VERSION_PROBE_OUTPUT_LIMIT - used;
+        tokio::select! {
+            biased;
+
+            read = stdout.read(&mut stdout_chunk), if !stdout_done => {
+                match read {
+                    Ok(0) | Err(_) => stdout_done = true,
+                    Ok(count) => stdout_output.extend_from_slice(&stdout_chunk[..count.min(budget)]),
+                }
+            }
+            read = stderr.read(&mut stderr_chunk), if !stderr_done => {
+                match read {
+                    Ok(0) | Err(_) => stderr_done = true,
+                    Ok(count) => stderr_output.extend_from_slice(&stderr_chunk[..count.min(budget)]),
+                }
+            }
+            status = child.wait() => {
+                status.ok()?;
+                break;
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                stop_version_probe(&mut child).await;
                 return None;
             }
         }
     }
-    child.wait().ok()?;
-    let stdout = read_version_probe_output(&mut stdout)?;
-    let stderr = read_version_probe_output(&mut stderr)?;
-    let mut text = String::from_utf8_lossy(&stdout).into_owned();
+
+    // Close both read ends before parsing so inherited writers cannot retain
+    // any output resource after this bounded probe returns.
+    drop(stdout);
+    drop(stderr);
+    let mut text = String::from_utf8_lossy(&stdout_output).into_owned();
     if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&stderr).into_owned();
+        text = String::from_utf8_lossy(&stderr_output).into_owned();
     }
     let line = text.lines().next()?.trim().to_string();
     if line.is_empty() {
@@ -1017,6 +1050,21 @@ fn probe_version(bin: &str, args: &[String]) -> Option<String> {
     } else {
         Some(line)
     }
+}
+
+fn probe_version(bin: &str, args: &[String]) -> Option<String> {
+    let bin = bin.to_owned();
+    let args = args.to_vec();
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime.block_on(probe_version_bounded(&bin, &args))
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 /// Extract `major.minor.patch` prefix from a version string.
@@ -1803,6 +1851,8 @@ fn bounded_copy(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::time::Instant;
 
     #[test]
     #[ignore = "subprocess helper for the bounded version-probe test"]
@@ -1831,7 +1881,26 @@ mod tests {
     fn inherited_version_probe_output_helper() {
         const DESCENDANT_MARKER: &str = "OWNMESH_TEST_VERSION_PROBE_DESCENDANT";
         if std::env::var_os(DESCENDANT_MARKER).is_some() {
-            std::thread::sleep(Duration::from_secs(15));
+            use std::io::Write;
+
+            std::thread::sleep(Duration::from_millis(200));
+            let mut output = std::io::stdout().lock();
+            let chunk = [b'x'; 4096];
+            let mut pipe_closed = false;
+            for _ in 0..200 {
+                if output.write_all(&chunk).is_err() || output.flush().is_err() {
+                    pipe_closed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let pid_path =
+                PathBuf::from(std::env::var_os("OWNMESH_TEST_VERSION_PROBE_PID_FILE").unwrap());
+            std::fs::write(
+                pid_path.with_extension("closed"),
+                if pipe_closed { "closed" } else { "open" },
+            )
+            .unwrap();
             return;
         }
 
@@ -1841,7 +1910,7 @@ mod tests {
                 "--ignored",
                 "--exact",
                 "tests::inherited_version_probe_output_helper",
-                "--nocapture",
+                "--quiet",
             ])
             .env(DESCENDANT_MARKER, "1")
             .stdin(Stdio::null())
@@ -1856,18 +1925,17 @@ mod tests {
 
     fn terminate_version_probe_test_descendant(pid: &str) {
         #[cfg(windows)]
-        let status = Command::new("taskkill")
+        let _ = Command::new("taskkill")
             .args(["/PID", pid, "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         #[cfg(unix)]
-        let status = Command::new("kill")
+        let _ = Command::new("kill")
             .args(["-KILL", pid])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        assert!(status.is_ok_and(|status| status.success()));
     }
 
     #[test]
@@ -1886,8 +1954,22 @@ mod tests {
         let started = Instant::now();
         let _version = probe_version(&exe.to_string_lossy(), &args);
         std::env::remove_var(PID_FILE_ENV);
-        let pid = std::fs::read_to_string(pid_file).unwrap();
-        terminate_version_probe_test_descendant(pid.trim());
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let closed_file = pid_file.with_extension("closed");
+        let close_deadline = Instant::now() + Duration::from_secs(3);
+        let closed = loop {
+            if let Ok(value) = std::fs::read_to_string(&closed_file) {
+                break value == "closed";
+            }
+            if Instant::now() >= close_deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if !closed {
+            terminate_version_probe_test_descendant(pid.trim());
+        }
+        assert!(closed, "descendant output pipe remained writable");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

@@ -17,6 +17,9 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
 toml = "0.8"
 which = "7"
+
+[dev-dependencies]
+tempfile = "3"
