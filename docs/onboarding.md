@@ -1,6 +1,6 @@
 # OwnMesh onboarding
 
-This document covers the supported v1.2.10 first-run, ChatGPT connection, and
+This document covers the supported v1.2.11 first-run, ChatGPT connection, and
 user-level service flow. The machine-checked command contract is
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
@@ -271,9 +271,31 @@ public MCP-to-broker E8 receipt remain separate open evidence.
 | Failed update apply | Client restores the staged backup automatically |
 | Doctor findings | No rollback required; doctor performs no mutation |
 
+## Signed self-update
+
+After bootstrap installation, normal upgrades do not require downloading and
+rerunning the installer:
+
+```bash
+ownmesh update
+ownmesh update status
+```
+
+The updater verifies `SHA256SUMS.minisig`, `SHA256SUMS`, and the selected
+platform archive before touching installed files. It drains sessions, stops the
+user service, replaces the complete binary set, restarts the service only when
+it was previously running, and verifies the installed CLI and daemon versions.
+Windows uses a private detached worker to avoid self-locking. A durable apply
+journal plus OS process-birth binding lets the next invocation restore an
+interrupted swap without trusting a reused PID. Config, policy, enrollment, and
+credential files are outside the update transaction and are not rewritten.
+The one-line installers use the same lifecycle checks for the initial transition
+from an older release, so a running daemon or session host does not leave a
+mixed-version installation.
+
 ## Distribution scope
 
-v1.2.10 supports signed portable archives and the verified shell/PowerShell
+v1.2.11 supports signed portable archives and the verified shell/PowerShell
 one-line installers. Windows MSI/NSIS, native/universal macOS packages,
 Authenticode, and Apple notarization are outside this release's distribution
 contract.

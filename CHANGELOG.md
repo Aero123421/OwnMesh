@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v1.2.11 — Crash-safe self-update
+
+- `ownmesh update` now performs the complete signed upgrade lifecycle: session
+  drain, service stop, five-binary replacement, restart, version/health check,
+  and verified rollback. Windows hands off to a private detached worker so the
+  installed CLI never locks its own replacement.
+- A durable apply journal and PID-plus-process-birth transaction binding recover
+  interrupted updates without trusting PID reuse or an unverified backup.
+- Portable installers quiesce exact installed OwnMesh processes, restart a
+  previously running service, and restore the previous binaries when post-install
+  health fails. Linux headless SSH sessions safely derive an existing systemd
+  user-bus environment without enabling lingering or creating a bus.
+
 ## v1.2.10 — Full Access routing compatibility
 
 - Explicit `workspace_id: null` remains the public Full Access selection but is

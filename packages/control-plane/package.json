@@ -1,7 +1,7 @@
 {
   "name": "@ownmesh/control-plane",
   "private": true,
-  "version": "1.2.10",
+  "version": "1.2.11",
   "description": "OwnMesh Cloudflare Workers control plane",
   "license": "Apache-2.0",
   "type": "module",

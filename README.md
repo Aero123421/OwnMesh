@@ -12,7 +12,7 @@ networkless broker handles explicitly approved privileged work.
 
 ## Status
 
-**v1.2.10 stable** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
+**v1.2.11 stable** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
 The shipped CLI surface has no intentionally unimplemented entries. Its
 machine-checked contract is
@@ -78,7 +78,23 @@ one trust root. `minisign.pub` is published alongside each release only as a
 convenience for readers who already know the key ID.
 
 The installers also enforce archive entry/size limits, an exact file allowlist,
-and reject traversal, links, devices, and duplicate members.
+and reject traversal, links, devices, and duplicate members. When upgrading an
+existing portable install, they quiesce the exact installed OwnMesh processes,
+restart a previously running service, verify its version, and restore the old
+binaries if post-install health fails.
+
+After the first installation, update Windows, macOS, or Linux with one command:
+
+```bash
+ownmesh update
+```
+
+It verifies the same signed release chain, drains sessions, stops and restores
+the user service, atomically replaces all five binaries, verifies the new CLI
+and daemon versions, and rolls back on failure. On Windows the update continues
+in a private detached worker, so the installed executable does not lock itself.
+Use `ownmesh update status` to inspect an in-progress or completed transaction.
+Homebrew-managed installations continue to use `brew upgrade ownmesh`.
 
 ## First run
 
@@ -163,7 +179,7 @@ Windows. Linux has a native root lifecycle receipt. macOS/Windows native release
 receipts and the full public MCP → installed agent → broker E8 receipt remain
 open evidence; this is not presented as live proof for those routes.
 Authenticode, Apple notarization, MSI/NSIS, and native macOS packages are not
-part of v1.2.10.
+part of v1.2.11.
 
 ChatGPT dynamic registration, OAuth, passkey return, refresh, and MCP linking
 have a manual live compatibility receipt. The local workerd suites are
@@ -193,7 +209,7 @@ Rust 1.92.0, Node 22, and pnpm 9.15.0 are pinned by the repository.
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [Roadmap](./docs/ROADMAP.md) — what is planned next, and what is not
-- [v1.2.10 release notes](./docs/RELEASE_NOTES_v1.2.10.md)
+- [v1.2.11 release notes](./docs/RELEASE_NOTES_v1.2.11.md)
 - [Target specification](./OWNMESH_SPECIFICATION.ja.md) — roadmap authority,
   not a claim that every optional target is shipped
 

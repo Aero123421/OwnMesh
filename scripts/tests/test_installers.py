@@ -689,6 +689,9 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("Refusing existing reparse point", text)
         self.assertIn("[IO.File]::Replace", text)
         self.assertIn("Move-InstalledBinary", text)
+        self.assertIn("Stop-InstalledOwnMeshProcesses", text)
+        self.assertIn("Restore-OwnMeshBackup", text)
+        self.assertIn("Updated OwnMesh daemon version did not match the CLI", text)
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
@@ -712,6 +715,9 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("tar -xOzf", text)
         # OwnMesh payload extract must stream single members (`$member`), not full-archive xzf.
         self.assertIn('tar -xOzf "$archive" "$member"', text)
+        self.assertIn("SERVICE_WAS_RUNNING", text)
+        self.assertIn('"$INSTALL_DIR/ownmesh" service restart', text)
+        self.assertIn("updated daemon health check failed; previous binaries restored", text)
         self.assertNotRegex(
             text,
             r'(?m)^(?!\s*#)\s*tar\s+-xzf\s+"\$archive"\s*$',
