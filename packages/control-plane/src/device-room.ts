@@ -38,6 +38,17 @@ export const OPERATION_CONTRACT_V1 = "ownmesh.operation/1.0";
 /** Default operation.request lifetime when the caller does not supply expires_at. */
 export const OPERATION_REQUEST_TTL_MS = 60_000;
 
+/** States that must never be dispatched or resurrected from room persistence. */
+const OPERATION_DISPATCH_FENCE_STATUSES = new Set([
+  "cancel_requested",
+  "completed",
+  "failed",
+  "denied",
+  "cancelled",
+  "device_offline",
+  "tombstone",
+]);
+
 /** Stream a request body with a hard cap. Returns null when oversized. */
 async function readTextLimited(request: Request, maxBytes: number): Promise<string | null> {
   if (!request.body) return "";
@@ -392,14 +403,36 @@ export type HandleMessageResult = {
   expired_pending?: PendingOperation[];
   /** Ready Agent whose durable pending work must be revalidated by the DO. */
   agent_ready_session_id?: string;
+  /** Agent-local crash outbox correlations offered for authoritative cleanup. */
+  agent_pending_correlations?: string[];
   /** Metadata observed only after this Agent has completed proof and ready. */
   authenticated_agent?: {
     agent_version?: string;
     protocol_version: string;
+    workspaces?: Array<{ id: string; generation: string }>;
+    enforce_workspace?: boolean;
   };
 };
 
 const MAX_AGENT_VERSION_LENGTH = 128;
+
+function readyPendingCorrelations(value: unknown): string[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 64) return null;
+  const seen = new Set<string>();
+  const correlations: string[] = [];
+  for (const candidate of value) {
+    if (
+      typeof candidate !== "string" ||
+      candidate.length > 128 ||
+      !/^op_[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidate) ||
+      seen.has(candidate)
+    ) return null;
+    seen.add(candidate);
+    correlations.push(candidate);
+  }
+  return correlations;
+}
 
 function readyAgentVersion(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -411,11 +444,91 @@ function readyAgentVersion(value: unknown): string | undefined {
   return version;
 }
 
+const MAX_READY_WORKSPACES = 64;
+
+function readyWorkspaceRegistry(
+  value: unknown,
+): { workspaces?: Array<{ id: string; generation: string }>; enforce_workspace: boolean } | undefined | null {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.enforce_workspace !== "boolean") return null;
+  // Pre-generation Agents advertised only ids. Preserve their policy
+  // observation but never authorize or refresh a cloud workspace mapping from
+  // an id that cannot prove which local root it currently denotes.
+  if (Array.isArray(raw.ids) && raw.workspaces === undefined) {
+    if (raw.ids.length < 1 || raw.ids.length > MAX_READY_WORKSPACES) return null;
+    const legacyIds = new Set<string>();
+    for (const candidate of raw.ids) {
+      if (
+        typeof candidate !== "string" ||
+        candidate.length > 128 ||
+        !/^ws_[A-Za-z0-9_-]*$/.test(candidate) ||
+        legacyIds.has(candidate)
+      ) return null;
+      legacyIds.add(candidate);
+    }
+    if (!legacyIds.has("ws_default")) return null;
+    return { enforce_workspace: raw.enforce_workspace };
+  }
+  if (!Array.isArray(raw.workspaces)) return null;
+  if (raw.workspaces.length < 1 || raw.workspaces.length > MAX_READY_WORKSPACES) return null;
+  const workspaces: Array<{ id: string; generation: string }> = [];
+  const seen = new Set<string>();
+  for (const candidate of raw.workspaces) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    const entry = candidate as Record<string, unknown>;
+    if (Object.keys(entry).some((key) => key !== "id" && key !== "generation")) return null;
+    const id = entry.id;
+    const generation = entry.generation;
+    if (
+      typeof id !== "string" ||
+      id.length > 128 ||
+      !/^ws_[A-Za-z0-9_-]*$/.test(id) ||
+      typeof generation !== "string" ||
+      !/^wsg_[a-f0-9]{32}$/.test(generation) ||
+      seen.has(id)
+    ) return null;
+    seen.add(id);
+    workspaces.push({ id, generation });
+  }
+  if (!seen.has("ws_default")) return null;
+  workspaces.sort((a, b) => a.id.localeCompare(b.id));
+  return { workspaces, enforce_workspace: raw.enforce_workspace };
+}
+
 type PrincipalCredentialBinding = {
   principal_id: string;
   tenant_id: string;
   generation: number;
 };
+
+type WorkspaceAuthorityResult =
+  | "ok"
+  | "binding_mismatch"
+  | "workspace_authority_changed"
+  | "storage_unavailable";
+
+function workspaceAuthorityBinding(
+  payload: Record<string, unknown>,
+): { workspace_id: string | null; version: number | null } | null {
+  const authorization = payload.authorization;
+  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
+  const bound = (authorization as Record<string, unknown>).bound_action;
+  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
+  const action = bound as Record<string, unknown>;
+  if (action.workspace_id === null && action.workspace_version === null) {
+    return { workspace_id: null, version: null };
+  }
+  if (
+    typeof action.workspace_id !== "string" ||
+    !/^ws_[A-Za-z0-9_-]*$/.test(action.workspace_id) ||
+    typeof action.workspace_version !== "number" ||
+    !Number.isSafeInteger(action.workspace_version) ||
+    action.workspace_version < 1
+  ) return null;
+  return { workspace_id: action.workspace_id, version: action.workspace_version };
+}
 
 /** Extract only a complete, server-bound credential epoch from an operation. */
 function principalCredentialBinding(payload: Record<string, unknown>): PrincipalCredentialBinding | null {
@@ -1115,6 +1228,14 @@ export class DeviceRoomRouter {
       case "ready": {
         if (att.role !== "agent" || att.phase !== "proven") return { ok: false, error: "invalid_state" };
         const agentVersion = readyAgentVersion(msg.payload.agent_version);
+        const workspaceRegistry = readyWorkspaceRegistry(msg.payload.workspace_registry);
+        const pendingCorrelations = readyPendingCorrelations(msg.payload.pending_correlations);
+        if (workspaceRegistry === null) {
+          return { ok: false, error: "invalid_workspace_registry" };
+        }
+        if (pendingCorrelations === null) {
+          return { ok: false, error: "invalid_pending_correlations" };
+        }
         att.phase = "ready";
         att.remote_routing_enabled = msg.payload.remote_routing_enabled === true;
         this.sessions.set(sessionId, att);
@@ -1143,11 +1264,20 @@ export class DeviceRoomRouter {
         return {
           ok: true,
           expired_pending: expired,
+          ...(pendingCorrelations ? { agent_pending_correlations: pendingCorrelations } : {}),
           authenticated_agent: {
             ...(agentVersion ? { agent_version: agentVersion } : {}),
             // The envelope protocol was validated before the proof/ready state
             // transition; do not trust a second payload claim for this value.
             protocol_version: msg.protocol,
+            ...(workspaceRegistry
+              ? {
+                  ...(workspaceRegistry.workspaces
+                    ? { workspaces: workspaceRegistry.workspaces }
+                    : {}),
+                  enforce_workspace: workspaceRegistry.enforce_workspace,
+                }
+              : {}),
           },
           ...(att.remote_routing_enabled === true ? { agent_ready_session_id: sessionId } : {}),
         };
@@ -1419,6 +1549,9 @@ export class DeviceRoomRouter {
       return { ok: false, result: { status: "rejected", detail: { code: "OWNMESH_E_PENDING_LIMIT" } } };
     }
     const payload = op.payload || {};
+    const durableOfflineCancel =
+      op.type === "ownmesh_cancel_operation" &&
+      payload.capability === "operation.cancel";
     const addBytes = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
     if (this.totalPendingPayloadBytes() + addBytes > MAX_PENDING_PAYLOAD_BYTES) {
       return {
@@ -1426,13 +1559,15 @@ export class DeviceRoomRouter {
         result: { status: "rejected", detail: { code: "OWNMESH_E_PENDING_PAYLOAD_LIMIT" } },
       };
     }
-    // Fail closed on offline before mutating pending/seq (no half-prepared state).
+    // Fail closed on offline before mutating ordinary operations. An exact
+    // operation.cancel control is the sole exception: it must remain durable
+    // and win reconnect ordering over the fenced original request.
     // Only agents that advertised remote_routing_enabled=true count as ready for E2.
     let readyAgents = 0;
     for (const session of this.sessions.values()) {
       if (this.isRemoteRoutingAgent(session)) readyAgents++;
     }
-    if (readyAgents === 0) {
+    if (readyAgents === 0 && !durableOfflineCancel) {
       return {
         ok: false,
         result: {
@@ -1576,6 +1711,20 @@ export class DeviceRoomRouter {
         action: (prepared.envelope.payload?.arguments as Record<string, unknown> | undefined)?.action,
       },
     });
+    const pending = this.pending.get(prepared.correlation_id);
+    const durableOfflineCancel =
+      pending?.type === "ownmesh_cancel_operation" &&
+      prepared.envelope.payload?.capability === "operation.cancel";
+    if (n === 0 && durableOfflineCancel) {
+      return {
+        status: "pending",
+        detail: {
+          code: "OWNMESH_CANCEL_QUEUED_FOR_RECONNECT",
+          correlation_id: prepared.correlation_id,
+          queued_for_reconnect: true,
+        },
+      };
+    }
     if (n === 0) {
       this.pending.delete(prepared.correlation_id);
       this.notifyStateChange();
@@ -1584,7 +1733,6 @@ export class DeviceRoomRouter {
         detail: { code: "OWNMESH_E_DEVICE_OFFLINE", reason: "no_ready_agent" },
       };
     }
-    const pending = this.pending.get(prepared.correlation_id);
     if (pending) {
       pending.dispatched_at = Date.now();
       pending.dispatch_count = (pending.dispatch_count || 0) + 1;
@@ -2121,6 +2269,9 @@ export class DeviceRoom {
       last_seen_at: nowIso(),
     });
     if (!updated) throw new Error("device_not_active");
+    if (metadata.workspaces) {
+      await store.syncDeviceWorkspaces(this.deviceId, metadata.workspaces);
+    }
   }
 
   /**
@@ -2151,26 +2302,99 @@ export class DeviceRoom {
     }
   }
 
+  private async workspaceAuthorityCurrent(
+    store: ControlPlaneStore,
+    payload: Record<string, unknown>,
+    operation: McpOperationRecord | null,
+  ): Promise<WorkspaceAuthorityResult> {
+    const binding = workspaceAuthorityBinding(payload);
+    if (!binding) return "binding_mismatch";
+    if (!operation) return "binding_mismatch";
+    if (binding.workspace_id === null) {
+      return operation.workspace_id !== null ? "binding_mismatch" : "ok";
+    }
+    if (
+      operation.device_id !== this.deviceId ||
+      operation.workspace_id !== binding.workspace_id ||
+      operation.action?.workspace_id !== binding.workspace_id ||
+      operation.action?.workspace_version !== binding.version
+    ) return "binding_mismatch";
+
+    // workspace.add establishes the first device-local generation. Cancellation
+    // controls must remain deliverable after a remap so they can only reduce
+    // side effects; neither exception grants access to workspace content.
+    if (operation.tool === "ownmesh_workspace_add" ||
+        operation.tool === "ownmesh_cancel_operation" ||
+        operation.tool === "__transfer_cancel_control") return "ok";
+    try {
+      const workspace = await store.getWorkspace(this.deviceId, binding.workspace_id);
+      return workspace?.active && workspace.local_generation && workspace.version === binding.version
+        ? "ok"
+        : "workspace_authority_changed";
+    } catch {
+      return "storage_unavailable";
+    }
+  }
+
   /**
    * Recheck every persisted request immediately before reconnect delivery.
    * Invalidated authority becomes a terminal durable result and is removed
    * before any Agent socket is sent a frame.
    */
-  private async redeliverCurrentPending(sessionId: string): Promise<void> {
+  private async redeliverCurrentPending(
+    sessionId: string,
+    agentPendingCorrelations: string[] = [],
+  ): Promise<void> {
     if (!this.env.DB) throw new Error("storage_unavailable");
     const store = createStore(this.env);
     let removed = false;
     for (const pending of [...this.router.pending.values()]) {
       if (pending.live_only) continue;
+      const operationId =
+        typeof pending.payload.operation_id === "string"
+          ? pending.payload.operation_id
+          : pending.correlation_id;
+
+      // The control-plane target state is authoritative at reconnect. In
+      // particular, cancel_requested is a durable fence written before the
+      // cancel signal is routed; never resurrect that original request from a
+      // DeviceRoom pending snapshot.
+      const operation = await store.getMcpOperation(operationId);
+      if (operation && OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)) {
+        this.router.pending.delete(pending.correlation_id);
+        removed = true;
+        continue;
+      }
+
+      const workspaceCheck = await this.workspaceAuthorityCurrent(store, pending.payload, operation);
+      if (workspaceCheck === "storage_unavailable") throw new Error("storage_unavailable");
+      if (workspaceCheck !== "ok") {
+        this.router.pending.delete(pending.correlation_id);
+        removed = true;
+        await store.updateMcpOperation(
+          operationId,
+          {
+            status: "failed",
+            summary: "workspace authority changed before device delivery",
+            data: {
+              error: {
+                code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+                message: "workspace mapping changed before device delivery",
+                retryable: false,
+              },
+            },
+            approval_required: false,
+          },
+          ["pending", "running", "approval_required", "cancel_requested"],
+        );
+        continue;
+      }
+
       const check = await this.credentialGenerationCurrent(pending.payload);
       if (check === "ok") continue;
       if (check === "storage_unavailable") throw new Error("storage_unavailable");
       this.router.pending.delete(pending.correlation_id);
       removed = true;
-      const operationId =
-        typeof pending.payload.operation_id === "string"
-          ? pending.payload.operation_id
-          : pending.correlation_id;
       await store.updateMcpOperation(
         operationId,
         {
@@ -2191,8 +2415,39 @@ export class DeviceRoom {
     // Persist removals before delivery; otherwise hibernation could resurrect
     // an invalid pending operation after a successful generation check.
     if (removed) await this.persistNow();
+    await this.reconcileAgentPending(sessionId, agentPendingCorrelations);
     const redelivered = this.router.redeliverPendingToAgent(sessionId);
     if (redelivered > 0) await this.persistNow();
+  }
+
+  /**
+   * Return only D1-authoritative terminal/fenced correlations reported by this
+   * authenticated Agent. Missing, foreign-device and non-terminal operations
+   * are intentionally omitted: the Agent must never purge unconfirmed work.
+   */
+  private async reconcileAgentPending(
+    sessionId: string,
+    correlations: string[],
+  ): Promise<void> {
+    if (!this.env.DB || correlations.length === 0) return;
+    const store = createStore(this.env);
+    const terminalCorrelations: string[] = [];
+    for (const correlation of correlations) {
+      const operation = await store.getMcpOperation(correlation);
+      if (
+        operation?.device_id === this.deviceId &&
+        OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)
+      ) {
+        terminalCorrelations.push(correlation);
+      }
+    }
+    if (terminalCorrelations.length === 0) return;
+    const envelope = this.router.nextEnvelope("operation.reconcile", {
+      terminal_correlations: terminalCorrelations,
+    });
+    // A failed send is safe: the Agent reports the still-durable correlations
+    // again on its next authenticated ready handshake.
+    this.router.sendToSession(sessionId, JSON.stringify(envelope));
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -2343,6 +2598,7 @@ export class DeviceRoom {
       }
       const correlationId =
         body.correlation_id || opCtx.claims.correlation_id || randomId("op_");
+
       const correlationTombstone = `correlation:${correlationId}`;
       if (this.router.hasInternalNonce(correlationTombstone)) {
         if (!this.router.consumeInternalNonce(opCtx.claims.nonce, opCtx.claims.exp)) {
@@ -2359,6 +2615,86 @@ export class DeviceRoom {
           detail: { correlation_id: correlationId, deduplicated: true, completed: true },
         });
       }
+
+      // Re-read the authoritative control-plane state at the final routing
+      // boundary. This closes the race where cancellation wins after a Worker
+      // claim but before DeviceRoom accepts/sends the original operation.
+      const operationId =
+        typeof body.payload?.operation_id === "string"
+          ? body.payload.operation_id
+          : correlationId;
+      try {
+        const store = createStore(this.env);
+        const operation = await store.getMcpOperation(operationId);
+        if (operation) {
+          if (
+            operation.device_id !== this.deviceId ||
+            operation.principal_id !== opCtx.claims.principal_id ||
+            operation.tenant_id !== opCtx.claims.tenant_id
+          ) {
+            return json({ error: "binding_mismatch" }, { status: 403 });
+          }
+          if (OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)) {
+            if (!this.router.consumeInternalNonce(opCtx.claims.nonce, opCtx.claims.exp)) {
+              return json({ error: "replay" }, { status: 401 });
+            }
+            this.router.pending.delete(correlationId);
+            try {
+              // Persist the nonce and pending removal before acknowledging the
+              // fence, so hibernation cannot resurrect the request.
+              await this.persistNow();
+            } catch {
+              this.router.releaseInternalNonce(opCtx.claims.nonce);
+              return json({ error: "storage_unavailable" }, { status: 503 });
+            }
+            return json({
+              status: "rejected",
+              detail: {
+                code: "OWNMESH_E_OPERATION_DISPATCH_FENCED",
+                operation_id: operationId,
+                operation_status: operation.status,
+              },
+            });
+          }
+          const workspaceCheck = await this.workspaceAuthorityCurrent(store, body.payload || {}, operation);
+          if (workspaceCheck === "storage_unavailable") throw new Error("storage_unavailable");
+          if (workspaceCheck !== "ok") {
+            await store.updateMcpOperation(
+              operationId,
+              {
+                status: "failed",
+                summary: "workspace authority changed before device delivery",
+                data: {
+                  error: {
+                    code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+                    message: "workspace mapping changed before device delivery",
+                    retryable: false,
+                  },
+                },
+                approval_required: false,
+              },
+              ["pending", "running", "approval_required"],
+            );
+            if (!this.router.consumeInternalNonce(opCtx.claims.nonce, opCtx.claims.exp)) {
+              return json({ error: "replay" }, { status: 401 });
+            }
+            this.router.pending.delete(correlationId);
+            await this.persistNow();
+            return json({
+              status: "rejected",
+              detail: {
+                code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+                operation_id: operationId,
+              },
+            });
+          }
+        }
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return json({ error: "storage_unavailable" }, { status: 503 });
+      }
+
       const existingPending = this.router.pending.get(correlationId);
       if (existingPending) {
         // Stable correlation_id is the external idempotency key (notably for
@@ -2865,9 +3201,12 @@ export class DeviceRoom {
       }
     }
 
-    if (result.ok && result.agent_ready_session_id) {
+    // Pending TTL/expiry must reach D1 before Agent outbox reconciliation, so
+    // an expired correlation is an authoritative terminal tombstone on this
+    // same reconnect rather than requiring a second connection.
+    if (result.ok && result.expired_pending && result.expired_pending.length > 0) {
       try {
-        await this.redeliverCurrentPending(result.agent_ready_session_id);
+        await this.reconcileExpiredPending(result.expired_pending);
       } catch {
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
@@ -2875,10 +3214,12 @@ export class DeviceRoom {
       }
     }
 
-    // Pending TTL/expiry must surface a terminal MCP status (never silent drop).
-    if (result.ok && result.expired_pending && result.expired_pending.length > 0) {
+    if (result.ok && result.agent_ready_session_id) {
       try {
-        await this.reconcileExpiredPending(result.expired_pending);
+        await this.redeliverCurrentPending(
+          result.agent_ready_session_id,
+          result.agent_pending_correlations || [],
+        );
       } catch {
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);

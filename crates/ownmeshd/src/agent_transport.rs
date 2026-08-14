@@ -8,7 +8,7 @@ use crate::runtime::DaemonRuntime;
 use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
 use futures_util::{SinkExt, StreamExt};
 use ownmesh_config::{atomic_write, OwnMeshConfig, OwnMeshPaths};
-use ownmesh_domain::{DeviceId, MessageId, Timestamp};
+use ownmesh_domain::{DeviceId, ErrorCode, MessageId, Timestamp};
 use ownmesh_identity::{
     load_device_credential, load_or_create_device_key, DeviceKeyPair, PreferredSecretStore,
     SecretString, DEFAULT_KEYCHAIN_SERVICE,
@@ -999,6 +999,11 @@ struct PendingDispatch {
     transfer_session_lost: bool,
     #[serde(default)]
     expires_at: Option<String>,
+    /// `Some(true)` is durably saved immediately before runtime dispatch;
+    /// `Some(false)` is known not to have crossed the side-effect boundary.
+    /// Legacy state has `None`, whose outcome must not be guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_started: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1169,6 +1174,16 @@ impl AgentTransportState {
     fn clear_pending_by_correlation(&mut self, correlation_id: &str) {
         self.pending_dispatches
             .retain(|pending| pending.correlation_id != correlation_id);
+    }
+
+    fn mark_dispatch_started(&mut self, correlation_id: &str) -> Result<(), String> {
+        let pending = self
+            .pending_dispatches
+            .iter_mut()
+            .find(|pending| pending.correlation_id == correlation_id)
+            .ok_or_else(|| "cannot mark a missing pending dispatch as started".to_owned())?;
+        pending.dispatch_started = Some(true);
+        Ok(())
     }
 
     fn enforce_pending_dispatch_budgets(&mut self) {
@@ -1398,7 +1413,12 @@ async fn connect_and_run(
         }
     };
 
-    perform_handshake(&mut socket, config, state, runtime.is_some()).await?;
+    let workspace_registry = if let Some(runtime) = runtime {
+        Some(runtime.lock().await.remote_workspace_registry())
+    } else {
+        None
+    };
+    perform_handshake(&mut socket, config, state, workspace_registry.as_ref()).await?;
     *reached_ready = true;
     tracing::info!(
         issuer = %ownmesh_config::redact_control_plane_url(&config.issuer),
@@ -1413,8 +1433,9 @@ async fn perform_handshake(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
     state: &mut AgentTransportState,
-    remote_routing_enabled: bool,
+    workspace_registry: Option<&(bool, Vec<crate::runtime::RemoteWorkspaceRegistration>)>,
 ) -> Result<(), String> {
+    let remote_routing_enabled = workspace_registry.is_some();
     let resume = json!({
         "last_server_seq": state.last_server_seq,
         "next_outbound_seq": state.next_outbound_seq,
@@ -1469,23 +1490,34 @@ async fn perform_handshake(
     } else {
         json!([])
     };
-    send_envelope(
-        socket,
-        config,
-        state,
-        "ready",
-        json!({
-            "capabilities": capabilities,
-            "operation_contracts": [OPERATION_CONTRACT_V1],
-            // DeviceRoom records display metadata only after proof+ready, not
-            // from the unauthenticated hello envelope.
-            "agent_version": env!("CARGO_PKG_VERSION"),
-            "protocol_version": PROTOCOL_DEVICE_V1,
-            "remote_routing_enabled": remote_routing_enabled,
-        }),
-        None,
-    )
-    .await?;
+    let mut ready_payload = json!({
+        "capabilities": capabilities,
+        "operation_contracts": [OPERATION_CONTRACT_V1],
+        // DeviceRoom records display/security metadata only after proof+ready,
+        // not from the unauthenticated hello envelope.
+        "agent_version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": PROTOCOL_DEVICE_V1,
+        "remote_routing_enabled": remote_routing_enabled,
+        // The authenticated control plane uses these bounded correlations only
+        // to return authoritative terminal tombstones. It must never ask the
+        // Agent to purge an unconfirmed or non-terminal operation.
+        "pending_correlations": state.pending_dispatches
+            .iter()
+            .map(|pending| pending.correlation_id.clone())
+            .collect::<Vec<_>>(),
+    });
+    if let (Some((enforce_workspace, workspaces)), Some(object)) =
+        (workspace_registry, ready_payload.as_object_mut())
+    {
+        object.insert(
+            "workspace_registry".into(),
+            json!({
+                "enforce_workspace": enforce_workspace,
+                "workspaces": workspaces,
+            }),
+        );
+    }
+    send_envelope(socket, config, state, "ready", ready_payload, None).await?;
     let _ = wait_for_type(socket, config, state, "ready.ack").await?;
     Ok(())
 }
@@ -1569,6 +1601,80 @@ fn transfer_session_lost_reply(operation_id: &str) -> Value {
     })
 }
 
+fn operation_expired_reply(operation_id: &ownmesh_domain::OperationId) -> Value {
+    json!({
+        "operation_contract": OPERATION_CONTRACT_V1,
+        "operation_id": operation_id,
+        "status": "failed",
+        "error": {
+            "code": "OWNMESH_E_OPERATION_EXPIRED",
+            "message": "operation request expired before device execution",
+            "retryable": false
+        }
+    })
+}
+
+fn authoritative_terminal_correlations(payload: &Value) -> Result<Vec<String>, String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "operation.reconcile payload must be an object".to_owned())?;
+    if object.keys().any(|key| key != "terminal_correlations") {
+        return Err("operation.reconcile payload contains an unknown field".into());
+    }
+    let correlations = object
+        .get("terminal_correlations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "operation.reconcile requires terminal_correlations".to_owned())?;
+    if correlations.len() > MAX_PENDING_DISPATCHES {
+        return Err(format!(
+            "operation.reconcile exceeds {MAX_PENDING_DISPATCHES} correlations"
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut validated = Vec::with_capacity(correlations.len());
+    for correlation in correlations {
+        let raw = correlation
+            .as_str()
+            .ok_or_else(|| "operation.reconcile correlation must be a string".to_owned())?;
+        let parsed = ownmesh_domain::OperationId::parse(raw).map_err(|_| {
+            "operation.reconcile correlation is not a valid operation id".to_owned()
+        })?;
+        if !seen.insert(parsed.to_string()) {
+            return Err("operation.reconcile contains a duplicate correlation".into());
+        }
+        validated.push(parsed.to_string());
+    }
+    Ok(validated)
+}
+
+fn dispatch_outcome_unknown_reply(operation_id: &ownmesh_domain::OperationId) -> Value {
+    json!({
+        "operation_contract": OPERATION_CONTRACT_V1,
+        "operation_id": operation_id,
+        "status": "failed",
+        "error": {
+            "code": "OWNMESH_E_DISPATCH_OUTCOME_UNKNOWN",
+            "message": "legacy dispatch outcome is unknown; the operation was not replayed",
+            "retryable": false,
+            "details": { "category": "dispatch_outcome_unknown" }
+        }
+    })
+}
+
+/// Commit the terminal receipt and remove its pending dispatch in one durable
+/// state write before attempting the network send. A failed send is therefore
+/// replayable after reconnect and can never resurrect the accepted request.
+async fn persist_and_send_completed(
+    socket: &mut AgentSocket,
+    config: &AgentTransportConfig,
+    state: &mut AgentTransportState,
+    completed: CompletedReply,
+) -> Result<(), String> {
+    state.remember_completed(completed.clone());
+    state.save(&config.state_path)?;
+    send_cached_result(socket, config, state, &completed).await
+}
+
 async fn live_loop(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
@@ -1586,64 +1692,12 @@ async fn live_loop(
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REMOTE_OPS));
     let active_dispatches = Arc::new(Mutex::new(HashSet::<String>::new()));
 
-    // Crash resume: redispatch any accepted-but-incomplete operation.request entries
-    // from the durable outbox. Runtime idempotency keys prevent duplicate side effects.
-    let pending_resume: Vec<PendingDispatch> = state.pending_dispatches.iter().cloned().collect();
-    for pending in pending_resume {
-        if state.completed(&pending.correlation_id).is_some() {
-            state.clear_pending_by_correlation(&pending.correlation_id);
-            continue;
-        }
-        if pending.transfer_session_lost {
-            let completed = CompletedReply {
-                correlation_id: pending.correlation_id.clone(),
-                operation_id: pending.operation_id.clone(),
-                payload: transfer_session_lost_reply(&pending.operation_id),
-            };
-            state.remember_completed(completed.clone());
-            state.save(&config.state_path)?;
-            send_cached_result(socket, config, state, &completed).await?;
-            continue;
-        }
-        let Ok(envelope) = Envelope::parse_str(&pending.raw) else {
-            // Corrupt outbox entry: fail closed with a terminal receipt.
-            let payload = json!({
-                "operation_contract": OPERATION_CONTRACT_V1,
-                "operation_id": pending.operation_id,
-                "status": "failed",
-                "error": {
-                    "code": "OWNMESH_E_DISPATCH_LOST",
-                    "message": "pending dispatch envelope is corrupt and cannot be resumed",
-                    "retryable": false
-                }
-            });
-            let completed = CompletedReply {
-                correlation_id: pending.correlation_id.clone(),
-                operation_id: pending.operation_id.clone(),
-                payload,
-            };
-            state.remember_completed(completed.clone());
-            state.save(&config.state_path)?;
-            send_cached_result(socket, config, state, &completed).await?;
-            continue;
-        };
-        handle_live_frame(
-            socket,
-            config,
-            runtime,
-            state,
-            InboundFrame::New {
-                raw: pending.raw.clone(),
-                envelope,
-            },
-            &cancel_registry,
-            &finish_tx,
-            &in_flight,
-            &active_dispatches,
-        )
-        .await?;
-    }
-    state.save(&config.state_path)?;
+    // Do not replay the Agent-local crash outbox on reconnect. DeviceRoom owns
+    // the authoritative pending/cancel state and redelivers only after applying
+    // its durable cancel fence. Starting local work before that redelivery lets
+    // a previously offline cancel lose the race. The outbox remains available
+    // for exact-once recovery when the control plane explicitly redelivers the
+    // stable correlation with a fresh message id/sequence.
 
     loop {
         tokio::select! {
@@ -1806,6 +1860,13 @@ fn parse_and_record_inbound(
             .to_owned();
         // Skip outbox when a terminal result already exists (replay after complete).
         if state.completed(&correlation_id).is_none() {
+            // A fresh control-plane redelivery must not erase crash knowledge
+            // about whether the previous process crossed the side-effect
+            // boundary. Legacy `None` also remains unknown/fail-closed.
+            let dispatch_started = state
+                .pending_by_correlation(&correlation_id)
+                .map(|pending| pending.dispatch_started)
+                .unwrap_or(Some(false));
             let transfer_session_lost = envelope.payload.get("capability").and_then(Value::as_str)
                 == Some("transfer.start");
             state.remember_pending(PendingDispatch {
@@ -1820,6 +1881,7 @@ fn parse_and_record_inbound(
                 accepted_at: Timestamp::now().to_rfc3339(),
                 transfer_session_lost,
                 expires_at: envelope.expires_at.as_ref().map(ToString::to_string),
+                dispatch_started,
             })?;
         }
     }
@@ -1857,6 +1919,17 @@ async fn handle_live_frame(
                 envelope.correlation_id.as_deref(),
             )
             .await
+        }
+        "operation.reconcile" => {
+            let correlations = authoritative_terminal_correlations(&envelope.payload)?;
+            let before = state.pending_dispatches.len();
+            for correlation in correlations {
+                state.clear_pending_by_correlation(&correlation);
+            }
+            if state.pending_dispatches.len() != before {
+                state.save(&config.state_path)?;
+            }
+            Ok(())
         }
         "operation.request" => {
             let correlation = envelope
@@ -1913,13 +1986,47 @@ async fn handle_live_frame(
             };
             let operation =
                 OperationEnvelope::parse_str(&raw).map_err(|error| error.to_string())?;
-            operation
-                .envelope
-                .validate_expiry_now()
-                .map_err(|error| error.to_string())?;
             let OperationPayload::Request(request) = operation.payload else {
                 return Err("operation.request parsed as a different payload type".into());
             };
+            if let Err(error) = operation.envelope.validate_expiry_now() {
+                if error.code != ErrorCode::Expired {
+                    return Err(error.to_string());
+                }
+                let dispatch_started = state
+                    .pending_by_correlation(correlation)
+                    .and_then(|pending| pending.dispatch_started);
+                match dispatch_started {
+                    Some(false) => {
+                        let completed = CompletedReply {
+                            correlation_id: correlation.to_owned(),
+                            operation_id: request.operation_id.to_string(),
+                            payload: operation_expired_reply(&request.operation_id),
+                        };
+                        return persist_and_send_completed(socket, config, state, completed).await;
+                    }
+                    Some(true) => {
+                        // A prior process may have crossed the side-effect
+                        // boundary. Re-enter the runtime idempotency path to
+                        // recover its result; never replace it with "expired".
+                        tracing::warn!(
+                            operation_id = %request.operation_id,
+                            "reconciling an expired operation whose dispatch had started"
+                        );
+                    }
+                    None => {
+                        // Pre-marker state cannot distinguish "accepted" from
+                        // "side effect completed before crash". Refuse both a
+                        // blind replay and a fabricated expiry outcome.
+                        let completed = CompletedReply {
+                            correlation_id: correlation.to_owned(),
+                            operation_id: request.operation_id.to_string(),
+                            payload: dispatch_outcome_unknown_reply(&request.operation_id),
+                        };
+                        return persist_and_send_completed(socket, config, state, completed).await;
+                    }
+                }
+            }
 
             // Cancel must run on the live loop so it can signal an in-flight op
             // without waiting for that op's runtime lock. Exact-action binding is
@@ -1958,6 +2065,8 @@ async fn handle_live_frame(
                     state.save(&config.state_path)?;
                     return send_cached_result(socket, config, state, &completed).await;
                 }
+                state.mark_dispatch_started(correlation)?;
+                state.save(&config.state_path)?;
                 let target = request
                     .arguments
                     .get("target_operation_id")
@@ -1969,6 +2078,13 @@ async fn handle_live_frame(
                 } else {
                     cancel_registry.cancel(&target).await
                 };
+                // The authenticated control-plane cancel is authoritative even
+                // when the target is not currently in this process. Remove its
+                // local crash-outbox copy so it cannot consume capacity or be
+                // mistaken for recoverable work after the durable cancel fence.
+                if !target.is_empty() {
+                    state.clear_pending_by_correlation(&target);
+                }
                 let payload = json!({
                     "operation_contract": OPERATION_CONTRACT_V1,
                     "operation_id": request.operation_id.to_string(),
@@ -2031,6 +2147,12 @@ async fn handle_live_frame(
                     return Ok(());
                 }
             }
+
+            // Persist the side-effect boundary before the task can run. If the
+            // process dies after this write, reconnect must use the runtime's
+            // idempotency journal even when the original envelope has expired.
+            state.mark_dispatch_started(correlation)?;
+            state.save(&config.state_path)?;
 
             // Register cancel before spawn so a concurrent cancel cannot miss the
             // window between accept and dispatch start.
@@ -2630,6 +2752,7 @@ fn map_request_to_method(
             }
             methods::ADMIN_APPROVAL_BRIDGE_REQUEST
         }
+        ("policy.show", "policy.show" | "ownmesh_policy_show" | "show") => methods::POLICY_SHOW,
         ("filesystem.read", "fs.list" | "ownmesh_fs_list" | "ownmesh_list_files") => {
             methods::OPS_FS_LIST
         }
@@ -2912,10 +3035,12 @@ fn map_request_to_method(
     Ok((method, Value::Object(args)))
 }
 
-/// Remote diagnosis, filesystem, Git, and command actions must carry the exact workspace
-/// selected by the control plane. The sole exception is an explicit absolute
-/// path/cwd compatibility request: it remains unbound (`workspace_id = null`)
-/// and the runtime admits it only in Full Access, never as `ws_default`.
+/// Filesystem, Git, and command actions must carry the exact workspace selected
+/// by the control plane. An explicit absolute path/cwd compatibility request
+/// remains unbound (`workspace_id = null`) and the runtime admits it only in
+/// Full Access, never as `ws_default`. The other unbound exception is the
+/// read-only system diagnosis itself: it accesses no path and reports the
+/// restricted/Full Access boundary as a fixed enum.
 fn require_workspace_binding_for_remote_action(
     request: &OperationRequestPayload,
     action: &str,
@@ -2948,7 +3073,10 @@ fn require_workspace_binding_for_remote_action(
             | ("git.status" | "git.diff" | "git", _)
             | ("command.run", _)
     );
-    if !workspace_scoped || request.workspace_id.is_some() {
+    if !workspace_scoped
+        || request.workspace_id.is_some()
+        || request.capability == "system.diagnose"
+    {
         return Ok(());
     }
 
@@ -2967,10 +3095,7 @@ fn require_workspace_binding_for_remote_action(
     if absolute {
         Ok(())
     } else {
-        Err(
-            "workspace_id is required for remote diagnosis, filesystem, Git, and command actions"
-                .into(),
-        )
+        Err("workspace_id is required for remote filesystem, Git, and command actions".into())
     }
 }
 
@@ -4127,6 +4252,7 @@ mod tests {
                     accepted_at: Timestamp::now().to_rfc3339(),
                     transfer_session_lost: false,
                     expires_at: None,
+                    dispatch_started: Some(false),
                 })
                 .unwrap();
         }
@@ -4139,6 +4265,7 @@ mod tests {
                 accepted_at: Timestamp::now().to_rfc3339(),
                 transfer_session_lost: false,
                 expires_at: None,
+                dispatch_started: Some(false),
             })
             .expect_err("must reject when full");
         assert!(
@@ -4150,7 +4277,189 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_websocket_auth_reconnect_resume_and_correlation_dedup() {
+    async fn terminal_receipt_survives_websocket_send_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_failed_send").unwrap();
+        let issuer = format!("http://{address}");
+        let config = AgentTransportConfig {
+            issuer: issuer.clone(),
+            ws_url: agent_connect_url(&issuer, device.as_str()).unwrap(),
+            origin: issuer,
+            device_id: device.clone(),
+            credential: SecretString::new("dcred_failed_send"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        let (mut socket, _) = tokio_tungstenite::connect_async(config.ws_url.as_str())
+            .await
+            .unwrap();
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            Message::Close(_)
+        ));
+
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        state
+            .remember_pending(PendingDispatch {
+                message_id: "msg_failed_send".into(),
+                correlation_id: "op_failed_send".into(),
+                operation_id: "op_failed_send".into(),
+                raw: "accepted-operation".into(),
+                accepted_at: Timestamp::now().to_rfc3339(),
+                transfer_session_lost: false,
+                expires_at: None,
+                dispatch_started: Some(false),
+            })
+            .unwrap();
+        state.save(&config.state_path).unwrap();
+        let operation_id = ownmesh_domain::OperationId::parse("op_failed_send").unwrap();
+        let completed = CompletedReply {
+            correlation_id: operation_id.to_string(),
+            operation_id: operation_id.to_string(),
+            payload: operation_expired_reply(&operation_id),
+        };
+        assert!(
+            persist_and_send_completed(&mut socket, &config, &mut state, completed)
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+
+        let persisted =
+            AgentTransportState::load(&config.state_path, &config.issuer, &config.device_id)
+                .unwrap();
+        assert!(persisted.pending_dispatches.is_empty());
+        assert_eq!(persisted.completed_replies.len(), 1);
+        assert_eq!(
+            persisted.completed_replies[0].payload["error"]["code"],
+            "OWNMESH_E_OPERATION_EXPIRED"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_waits_for_authoritative_cancel_before_local_pending_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_cancel_reconnect").unwrap();
+        let issuer = format!("http://{address}");
+        let config = AgentTransportConfig {
+            issuer: issuer.clone(),
+            ws_url: agent_connect_url(&issuer, device.as_str()).unwrap(),
+            origin: issuer,
+            device_id: device.clone(),
+            credential: SecretString::new("dcred_cancel_reconnect"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        let runtime_dir = tempdir().unwrap();
+        let runtime_paths = OwnMeshPaths::for_base(runtime_dir.path());
+        let mut daemon = DaemonRuntime::open(&runtime_paths).unwrap();
+        daemon.set_policy_for_test(ownmesh_policy::preset_document(
+            ownmesh_policy::AccessPreset::FullAccess,
+        ));
+        let runtime = Arc::new(Mutex::new(daemon));
+        let target = runtime_paths
+            .state_dir
+            .join("workspace/cancel-before-replay.txt");
+
+        let (pending_request, pending_expires) = sample_bound_request(
+            device.as_str(),
+            "cancel-before-replay.txt",
+            Some("must not be written"),
+        );
+        let pending_raw = json!({
+            "protocol": PROTOCOL_DEVICE_V1,
+            "message_id": "msg_pending_before_cancel",
+            "type": "operation.request",
+            "device_id": device.as_str(),
+            "correlation_id": pending_request.operation_id,
+            "seq": 1,
+            "sent_at": Timestamp::now(),
+            "expires_at": Timestamp::parse(&pending_expires).unwrap(),
+            "payload": pending_request,
+        })
+        .to_string();
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        parse_and_record_inbound(&pending_raw, &config, &mut state).unwrap();
+        state.save(&config.state_path).unwrap();
+
+        let server_device = device.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            // Before DeviceRoom sends its cancel-first authoritative frame, the
+            // Agent must emit no result and must not start its local outbox.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err()
+            );
+
+            let (cancel, cancel_expires) =
+                sample_bound_cancel(server_device.as_str(), "op_bind_test", 120);
+            let raw = json!({
+                "protocol": PROTOCOL_DEVICE_V1,
+                "message_id": "msg_cancel_first",
+                "type": "operation.request",
+                "device_id": server_device.as_str(),
+                "correlation_id": cancel.operation_id,
+                "seq": 2,
+                "sent_at": Timestamp::now(),
+                "expires_at": Timestamp::parse(&cancel_expires).unwrap(),
+                "payload": cancel,
+            });
+            socket
+                .send(Message::Text(raw.to_string().into()))
+                .await
+                .unwrap();
+            let result = receive_test_envelope(&mut socket).await;
+            assert_eq!(result.correlation_id.as_deref(), Some("op_cancel_bind"));
+            assert_eq!(result.payload["status"], "completed");
+            assert_eq!(result.payload["result"]["signal_delivered"], false);
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut socket, _) = tokio_tungstenite::connect_async(config.ws_url.as_str())
+            .await
+            .unwrap();
+        assert!(live_loop(
+            &mut socket,
+            &config,
+            Some(&runtime),
+            &mut state,
+            &mut shutdown_rx,
+        )
+        .await
+        .is_err());
+        drop(shutdown_tx);
+        server.await.unwrap();
+
+        assert!(
+            !target.exists(),
+            "offline cancel lost to local outbox replay"
+        );
+        let persisted =
+            AgentTransportState::load(&config.state_path, &config.issuer, &config.device_id)
+                .unwrap();
+        assert!(persisted.pending_by_correlation("op_bind_test").is_none());
+        assert!(persisted.completed("op_cancel_bind").is_some());
+    }
+
+    #[tokio::test]
+    async fn real_websocket_control_plane_redelivery_recovers_started_and_cached_results() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let dir = tempdir().unwrap();
@@ -4169,13 +4478,131 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             state_path: dir.path().join("transport.json"),
         };
+        let runtime_dir = tempdir().unwrap();
+        let runtime_paths = OwnMeshPaths::for_base(runtime_dir.path());
+        let mut daemon = DaemonRuntime::open(&runtime_paths).unwrap();
+        daemon.set_policy_for_test(ownmesh_policy::preset_document(
+            ownmesh_policy::AccessPreset::FullAccess,
+        ));
+        let target = runtime_paths.state_dir.join("workspace/replay-once.txt");
+        let (mut started_request, _) =
+            sample_bound_request(device.as_str(), "replay-once.txt", Some("first result"));
+        let started_expires_at = Timestamp::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+        let bound = &mut started_request.authorization.as_mut().unwrap().bound_action;
+        bound["expires_at"] = json!(started_expires_at.to_rfc3339());
+        started_request.payload_hash = Some(sha256_hex_str(&stable_stringify(bound)));
+        let runtime = Arc::new(Mutex::new(daemon));
+        let seeded_result = dispatch_remote_operation(
+            &runtime,
+            &device,
+            &config.key,
+            &config.preflight_ephemerals,
+            &config,
+            &started_request,
+            Some(&started_expires_at.to_rfc3339()),
+            &CancelRegistry::default(),
+            None,
+        )
+        .await;
+        assert_eq!(seeded_result["status"], "completed");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first result");
+        std::fs::write(&target, "sentinel after first execution").unwrap();
+
+        // Windows persisted this exact shape before every reconnect: a typed
+        // request plus the Expiry Display string in pending_dispatches.
+        let mut state = AgentTransportState::fresh(&config.issuer, &config.device_id);
+        let expired_raw = test_operation_request_raw(
+            &device,
+            1,
+            "msg_expired_resume",
+            "op_expired_resume",
+            Timestamp::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap(),
+        );
+        parse_and_record_inbound(&expired_raw, &config, &mut state).unwrap();
+        let pending = state.pending_by_correlation("op_expired_resume").unwrap();
+        assert!(pending
+            .expires_at
+            .as_deref()
+            .is_some_and(|expiry| expiry.starts_with("expires_at=")));
+        let legacy_raw = test_operation_request_raw(
+            &device,
+            2,
+            "msg_legacy_resume",
+            "op_legacy_resume",
+            Timestamp::now()
+                .checked_sub(Duration::from_secs(120))
+                .unwrap(),
+        );
+        parse_and_record_inbound(&legacy_raw, &config, &mut state).unwrap();
+        state
+            .pending_dispatches
+            .iter_mut()
+            .find(|pending| pending.correlation_id == "op_legacy_resume")
+            .unwrap()
+            .dispatch_started = None;
+        let started_raw = json!({
+            "protocol": PROTOCOL_DEVICE_V1,
+            "message_id": "msg_started_resume",
+            "type": "operation.request",
+            "device_id": device.as_str(),
+            "correlation_id": started_request.operation_id,
+            "seq": 3,
+            "sent_at": Timestamp::now(),
+            "expires_at": started_expires_at,
+            "payload": started_request
+        })
+        .to_string();
+        OperationEnvelope::parse_str(&started_raw).unwrap();
+        parse_and_record_inbound(&started_raw, &config, &mut state).unwrap();
+        state.mark_dispatch_started("op_bind_test").unwrap();
+        let stale_terminal_raw = test_operation_request_raw(
+            &device,
+            4,
+            "msg_authoritative_terminal",
+            "op_authoritative_terminal",
+            Timestamp::now()
+                .checked_add(Duration::from_secs(120))
+                .unwrap(),
+        );
+        state
+            .remember_pending(PendingDispatch {
+                message_id: "msg_authoritative_terminal".into(),
+                correlation_id: "op_authoritative_terminal".into(),
+                operation_id: "op_authoritative_terminal".into(),
+                raw: stale_terminal_raw,
+                accepted_at: Timestamp::now().to_rfc3339(),
+                transfer_session_lost: false,
+                expires_at: None,
+                dispatch_started: Some(false),
+            })
+            .unwrap();
+        state.save(&config.state_path).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(&config.state_path).unwrap()).unwrap();
+        let legacy = saved["pending_dispatches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pending| pending["correlation_id"] == "op_legacy_resume")
+            .unwrap();
+        assert!(legacy.get("dispatch_started").is_none());
 
         let server_device = device.clone();
         let server_origin = issuer.clone();
         let server_credential = credential.to_owned();
+        let expected_started_result = seeded_result.clone();
+        let replay_target = target.clone();
+        let redeliver_expired_raw = expired_raw.clone();
+        let redeliver_legacy_raw = legacy_raw.clone();
+        let redeliver_started_raw = started_raw.clone();
         let server = tokio::spawn(async move {
-            let mut server_seq = 0_u64;
+            let mut server_seq = 3_u64;
             let mut first_result: Option<Envelope> = None;
+            let mut first_expired_payload: Option<Value> = None;
             for connection_index in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let expected_origin = server_origin.clone();
@@ -4203,7 +4630,10 @@ mod tests {
                 let hello = receive_test_envelope(&mut socket).await;
                 assert_eq!(hello.message_type, "hello");
                 if connection_index == 1 {
-                    assert_eq!(hello.payload["resume"]["last_server_seq"].as_u64(), Some(4));
+                    assert_eq!(
+                        hello.payload["resume"]["last_server_seq"].as_u64(),
+                        Some(11)
+                    );
                     assert!(hello.payload["resume"]["next_outbound_seq"]
                         .as_u64()
                         .is_some_and(|seq| seq >= 4));
@@ -4252,7 +4682,18 @@ mod tests {
                 .await;
                 let ready = receive_test_envelope(&mut socket).await;
                 assert_eq!(ready.message_type, "ready");
-                assert_eq!(ready.payload["remote_routing_enabled"], Value::Bool(false));
+                assert_eq!(ready.payload["remote_routing_enabled"], Value::Bool(true));
+                let pending_correlations =
+                    ready.payload["pending_correlations"].as_array().unwrap();
+                if connection_index == 0 {
+                    assert!(pending_correlations
+                        .iter()
+                        .any(|value| value == "op_authoritative_terminal"));
+                } else {
+                    assert!(!pending_correlations
+                        .iter()
+                        .any(|value| value == "op_authoritative_terminal"));
+                }
 
                 server_seq += 1;
                 send_test_envelope(
@@ -4264,6 +4705,94 @@ mod tests {
                     None,
                 )
                 .await;
+
+                if connection_index == 0 {
+                    // The Agent must wait for authoritative DeviceRoom
+                    // redelivery instead of autonomously replaying its local
+                    // outbox immediately after ready.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), socket.next())
+                            .await
+                            .is_err()
+                    );
+
+                    server_seq += 1;
+                    send_test_envelope(
+                        &mut socket,
+                        &server_device,
+                        server_seq,
+                        "operation.reconcile",
+                        json!({
+                            "terminal_correlations": ["op_authoritative_terminal"]
+                        }),
+                        None,
+                    )
+                    .await;
+
+                    server_seq += 1;
+                    send_test_operation_redelivery(
+                        &mut socket,
+                        &redeliver_expired_raw,
+                        server_seq,
+                        "msg_expired_redelivery",
+                    )
+                    .await;
+                    let expired = receive_test_envelope(&mut socket).await;
+                    assert_eq!(expired.correlation_id.as_deref(), Some("op_expired_resume"));
+                    assert_eq!(
+                        expired.payload["error"]["code"],
+                        "OWNMESH_E_OPERATION_EXPIRED"
+                    );
+                    first_expired_payload = Some(expired.payload);
+
+                    server_seq += 1;
+                    send_test_operation_redelivery(
+                        &mut socket,
+                        &redeliver_legacy_raw,
+                        server_seq,
+                        "msg_legacy_redelivery",
+                    )
+                    .await;
+                    let legacy = receive_test_envelope(&mut socket).await;
+                    assert_eq!(
+                        legacy.payload["error"]["code"],
+                        "OWNMESH_E_DISPATCH_OUTCOME_UNKNOWN"
+                    );
+                    assert_eq!(
+                        legacy.payload["error"]["details"]["category"],
+                        "dispatch_outcome_unknown"
+                    );
+
+                    server_seq += 1;
+                    send_test_operation_redelivery(
+                        &mut socket,
+                        &redeliver_started_raw,
+                        server_seq,
+                        "msg_started_redelivery",
+                    )
+                    .await;
+                    let reconciled = receive_test_envelope(&mut socket).await;
+                    assert_eq!(reconciled.correlation_id.as_deref(), Some("op_bind_test"));
+                    assert_eq!(reconciled.payload, expected_started_result);
+                    assert_eq!(
+                        std::fs::read_to_string(&replay_target).unwrap(),
+                        "sentinel after first execution"
+                    );
+                } else {
+                    // A reconnect redelivery is answered from the durable
+                    // terminal cache and never executes the request again.
+                    server_seq += 1;
+                    send_test_operation_request_named(
+                        &mut socket,
+                        &server_device,
+                        server_seq,
+                        "msg_expired_replay",
+                        "op_expired_resume",
+                    )
+                    .await;
+                    let cached = receive_test_envelope(&mut socket).await;
+                    assert_eq!(cached.payload, first_expired_payload.clone().unwrap());
+                }
 
                 server_seq += 1;
                 send_test_operation_request(
@@ -4283,7 +4812,7 @@ mod tests {
                 assert_eq!(result.payload["status"], "failed");
                 assert_eq!(
                     result.payload["error"]["code"],
-                    "OWNMESH_E_UNSUPPORTED_SURFACE"
+                    "OWNMESH_E_ACTION_BINDING_MISMATCH"
                 );
                 OperationEnvelope::parse_slice(&result.to_vec().unwrap()).unwrap();
                 if let Some(first) = first_result.as_ref() {
@@ -4297,13 +4826,12 @@ mod tests {
             }
         });
 
-        let mut state = AgentTransportState::fresh(&config.issuer, &config.device_id);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut first_shutdown = shutdown_rx.clone();
         let mut first_reached_ready = false;
         assert!(connect_and_run(
             &config,
-            None,
+            Some(&runtime),
             &mut state,
             &mut first_shutdown,
             &mut first_reached_ready,
@@ -4315,7 +4843,7 @@ mod tests {
         let mut second_reached_ready = false;
         assert!(connect_and_run(
             &config,
-            None,
+            Some(&runtime),
             &mut state,
             &mut second_shutdown,
             &mut second_reached_ready,
@@ -4328,9 +4856,18 @@ mod tests {
         let persisted =
             AgentTransportState::load(&config.state_path, &config.issuer, &config.device_id)
                 .unwrap();
-        assert_eq!(persisted.last_server_seq, 8);
-        assert_eq!(persisted.completed_replies.len(), 1);
-        assert_eq!(persisted.completed_replies[0].correlation_id, "op_loopback");
+        assert_eq!(persisted.last_server_seq, 16);
+        assert_eq!(persisted.completed_replies.len(), 4);
+        assert!(persisted.pending_dispatches.is_empty());
+        assert!(persisted.completed("op_loopback").is_some());
+        assert_eq!(
+            persisted.completed("op_expired_resume").unwrap().payload["error"]["code"],
+            "OWNMESH_E_OPERATION_EXPIRED"
+        );
+        assert_eq!(
+            persisted.completed("op_legacy_resume").unwrap().payload["error"]["code"],
+            "OWNMESH_E_DISPATCH_OUTCOME_UNKNOWN"
+        );
     }
 
     async fn receive_test_envelope<S>(socket: &mut WebSocketStream<S>) -> Envelope
@@ -4409,6 +4946,74 @@ mod tests {
             .send(Message::Text(raw.to_string().into()))
             .await
             .unwrap();
+    }
+
+    async fn send_test_operation_request_named<S>(
+        socket: &mut WebSocketStream<S>,
+        device_id: &DeviceId,
+        seq: u64,
+        message_id: &str,
+        operation_id: &str,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let raw = test_operation_request_raw(
+            device_id,
+            seq,
+            message_id,
+            operation_id,
+            Timestamp::now()
+                .checked_add(Duration::from_secs(60))
+                .unwrap(),
+        );
+        socket.send(Message::Text(raw.into())).await.unwrap();
+    }
+
+    async fn send_test_operation_redelivery<S>(
+        socket: &mut WebSocketStream<S>,
+        original_raw: &str,
+        seq: u64,
+        message_id: &str,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut raw: Value = serde_json::from_str(original_raw).unwrap();
+        raw["message_id"] = json!(message_id);
+        raw["seq"] = json!(seq);
+        raw["sent_at"] = json!(Timestamp::now());
+        OperationEnvelope::parse_slice(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        socket
+            .send(Message::Text(raw.to_string().into()))
+            .await
+            .unwrap();
+    }
+
+    fn test_operation_request_raw(
+        device_id: &DeviceId,
+        seq: u64,
+        message_id: &str,
+        operation_id: &str,
+        expires_at: Timestamp,
+    ) -> String {
+        let raw = json!({
+            "protocol": PROTOCOL_DEVICE_V1,
+            "message_id": message_id,
+            "type": "operation.request",
+            "device_id": device_id,
+            "correlation_id": operation_id,
+            "seq": seq,
+            "sent_at": Timestamp::now(),
+            "expires_at": expires_at,
+            "payload": {
+                "operation_contract": OPERATION_CONTRACT_V1,
+                "operation_id": operation_id,
+                "capability": "fs.read",
+                "idempotency_key": format!("idem_{operation_id}"),
+                "arguments": { "path": "README.md" }
+            }
+        });
+        OperationEnvelope::parse_slice(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        raw.to_string()
     }
 
     fn sample_bound_request(
@@ -4662,6 +5267,40 @@ mod tests {
             .unwrap()
             .insert("workspace_id".into(), json!("ws_attacker"));
         assert!(map_request_to_method(&unscoped).is_err());
+    }
+
+    #[test]
+    fn unbound_system_diagnosis_maps_without_aliasing_a_default_workspace() {
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_diagnose_unbound_1").unwrap(),
+            capability: "system.diagnose".into(),
+            workspace_id: None,
+            idempotency_key: "idem_diagnose_unbound_1".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({ "action": "system.diagnose" }),
+        };
+        let (method, mapped) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, crate::runtime::ops_methods::SYSTEM_DIAGNOSE);
+        assert!(mapped.get("workspace_id").is_none());
+    }
+
+    #[test]
+    fn remote_policy_show_maps_to_read_only_policy_ipc() {
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_policy_show_1").unwrap(),
+            capability: "policy.show".into(),
+            workspace_id: None,
+            idempotency_key: "idem_policy_show_1".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({ "action": "policy.show" }),
+        };
+        let (method, mapped) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, methods::POLICY_SHOW);
+        assert!(mapped.get("workspace_id").is_none());
     }
 
     #[test]

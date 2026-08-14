@@ -15,8 +15,8 @@ async function fixture(store = new MemoryStore()) {
   const token = await store.issueTokens("client_transfer", "prin_dev", "ownmesh.read ownmesh.write");
   const foreign = await store.issueTokens("client_transfer_foreign", "prin_foreign", "ownmesh.read ownmesh.write");
   for (const id of ["dev_source", "dev_destination"]) await store.putDevice({ id, tenant_id: "ten_default", principal_id: "prin_dev", name: id, hostname: id, os: "test", arch: "test", agent_version: "test", protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false, created_at: new Date().toISOString(), status: "active" });
-  await store.putWorkspace({ workspace_id: "ws_source", tenant_id: "ten_default", device_id: "dev_source", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
-  await store.putWorkspace({ workspace_id: "ws_destination", tenant_id: "ten_default", device_id: "dev_destination", owner_principal_id: "prin_dev", version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  await store.putWorkspace({ workspace_id: "ws_source", tenant_id: "ten_default", device_id: "dev_source", owner_principal_id: "prin_dev", version: 1, local_generation: "wsg_11111111111111111111111111111111", active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  await store.putWorkspace({ workspace_id: "ws_destination", tenant_id: "ten_default", device_id: "dev_destination", owner_principal_id: "prin_dev", version: 1, local_generation: "wsg_22222222222222222222222222222222", active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   const routed: Array<{ deviceId: string; operation: Record<string, unknown> }> = [];
   const liveRouted: Array<{ deviceId: string; operation: Record<string, unknown> }> = [];
   const roomTerminalized: Array<Record<string, unknown>> = [];

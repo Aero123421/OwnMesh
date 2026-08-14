@@ -17,6 +17,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -957,11 +960,89 @@ fn expand_template(
         .collect()
 }
 
-fn probe_version(bin: &str, args: &[String]) -> Option<String> {
-    let out = std::process::Command::new(bin).args(args).output().ok()?;
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const VERSION_PROBE_STOP_GRACE: Duration = Duration::from_millis(500);
+const VERSION_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
+
+async fn stop_version_probe(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(VERSION_PROBE_STOP_GRACE, child.wait()).await;
+}
+
+async fn probe_version_bounded(bin: &str, args: &[String]) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    // A vendor CLI may perform network or credential discovery even for
+    // `--version`. Profile discovery is a read-only convenience path and must
+    // never hold the daemon request loop indefinitely. Async pipe reads cap
+    // both memory and the producer: once the direct child exits, the deadline
+    // expires, or the aggregate budget is full, dropping the read ends makes
+    // inherited descendant writes fail instead of growing a temporary file.
+    let mut child = tokio::process::Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut stderr = child.stderr.take()?;
+    let deadline = tokio::time::Instant::now() + VERSION_PROBE_TIMEOUT;
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut stdout_output = Vec::new();
+    let mut stderr_output = Vec::new();
+    let mut stdout_chunk = [0_u8; 4096];
+    let mut stderr_chunk = [0_u8; 4096];
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            stop_version_probe(&mut child).await;
+            return None;
+        }
+        let used = stdout_output.len() + stderr_output.len();
+        if used >= VERSION_PROBE_OUTPUT_LIMIT {
+            if child.try_wait().ok()?.is_none() {
+                stop_version_probe(&mut child).await;
+            }
+            break;
+        }
+
+        let budget = VERSION_PROBE_OUTPUT_LIMIT - used;
+        tokio::select! {
+            biased;
+
+            read = stdout.read(&mut stdout_chunk), if !stdout_done => {
+                match read {
+                    Ok(0) | Err(_) => stdout_done = true,
+                    Ok(count) => stdout_output.extend_from_slice(&stdout_chunk[..count.min(budget)]),
+                }
+            }
+            read = stderr.read(&mut stderr_chunk), if !stderr_done => {
+                match read {
+                    Ok(0) | Err(_) => stderr_done = true,
+                    Ok(count) => stderr_output.extend_from_slice(&stderr_chunk[..count.min(budget)]),
+                }
+            }
+            status = child.wait() => {
+                status.ok()?;
+                break;
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                stop_version_probe(&mut child).await;
+                return None;
+            }
+        }
+    }
+
+    // Close both read ends before parsing so inherited writers cannot retain
+    // any output resource after this bounded probe returns.
+    drop(stdout);
+    drop(stderr);
+    let mut text = String::from_utf8_lossy(&stdout_output).into_owned();
     if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&out.stderr).into_owned();
+        text = String::from_utf8_lossy(&stderr_output).into_owned();
     }
     let line = text.lines().next()?.trim().to_string();
     if line.is_empty() {
@@ -969,6 +1050,21 @@ fn probe_version(bin: &str, args: &[String]) -> Option<String> {
     } else {
         Some(line)
     }
+}
+
+fn probe_version(bin: &str, args: &[String]) -> Option<String> {
+    let bin = bin.to_owned();
+    let args = args.to_vec();
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime.block_on(probe_version_bounded(&bin, &args))
+    })
+    .join()
+    .ok()
+    .flatten()
 }
 
 /// Extract `major.minor.patch` prefix from a version string.
@@ -1755,6 +1851,202 @@ fn bounded_copy(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "subprocess helper for the bounded version-probe test"]
+    fn slow_version_probe_helper() {
+        std::thread::sleep(Duration::from_secs(10));
+        println!("late-version-output");
+    }
+
+    #[test]
+    fn version_probe_is_bounded() {
+        let exe = std::env::current_exe().unwrap();
+        let args = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "tests::slow_version_probe_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let started = Instant::now();
+        assert_eq!(probe_version(&exe.to_string_lossy(), &args), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for the inherited version-probe output test"]
+    #[allow(clippy::zombie_processes)] // The helper must exit while its descendant holds stdio.
+    fn inherited_version_probe_output_helper() {
+        const DESCENDANT_MARKER: &str = "OWNMESH_TEST_VERSION_PROBE_DESCENDANT";
+        if std::env::var_os(DESCENDANT_MARKER).is_some() {
+            use std::io::Write;
+
+            let status_addr = std::env::var("OWNMESH_TEST_VERSION_PROBE_STATUS_ADDR").unwrap();
+            let mut status = std::net::TcpStream::connect(status_addr).unwrap();
+            status.write_all(b"started\n").unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            let mut output = std::io::stdout().lock();
+            let chunk = [b'x'; 4096];
+            let mut pipe_closed = false;
+            for _ in 0..200 {
+                if output.write_all(&chunk).is_err() || output.flush().is_err() {
+                    pipe_closed = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            status
+                .write_all(if pipe_closed { b"closed\n" } else { b"open\n" })
+                .unwrap();
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let descendant = Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::inherited_version_probe_output_helper",
+                "--quiet",
+            ])
+            .env(DESCENDANT_MARKER, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let pid_path = std::env::var_os("OWNMESH_TEST_VERSION_PROBE_PID_FILE").unwrap();
+        std::fs::write(pid_path, descendant.id().to_string()).unwrap();
+        println!("ownmesh-version 9.8.7");
+    }
+
+    fn terminate_version_probe_test_descendant(pid: &str) {
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/PID", pid, "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        #[cfg(unix)]
+        let _ = Command::new("kill")
+            .args(["-KILL", pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    fn version_probe_test_descendant_is_alive(pid: &str) -> bool {
+        #[cfg(windows)]
+        {
+            let filter = format!("PID eq {pid}");
+            let Ok(output) = Command::new("tasklist")
+                .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            else {
+                return true;
+            };
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+        }
+        #[cfg(unix)]
+        {
+            Command::new("kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+    }
+
+    #[test]
+    fn version_probe_does_not_wait_for_inherited_output_handles() {
+        use std::io::Read;
+
+        const PID_FILE_ENV: &str = "OWNMESH_TEST_VERSION_PROBE_PID_FILE";
+        const STATUS_ADDR_ENV: &str = "OWNMESH_TEST_VERSION_PROBE_STATUS_ADDR";
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::env::set_var(PID_FILE_ENV, &pid_file);
+        std::env::set_var(STATUS_ADDR_ENV, listener.local_addr().unwrap().to_string());
+        let exe = std::env::current_exe().unwrap();
+        let args = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "tests::inherited_version_probe_output_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let started = Instant::now();
+        let _version = probe_version(&exe.to_string_lossy(), &args);
+        std::env::remove_var(PID_FILE_ENV);
+        std::env::remove_var(STATUS_ADDR_ENV);
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let accept_deadline = Instant::now() + Duration::from_secs(1);
+        let mut status_stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= accept_deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("writer status accept failed: {error}"),
+            }
+        };
+        let mut status = String::new();
+        let terminated = match status_stream.as_mut() {
+            // The direct helper recorded a successful spawn in `pid_file`.
+            // On Unix libtest can hit SIGPIPE before entering the descendant
+            // helper, so no status connection is itself the expected closure.
+            None => !version_probe_test_descendant_is_alive(pid.trim()),
+            Some(stream) => {
+                // Linux may propagate the listener's nonblocking mode to
+                // accepted sockets; restore blocking reads before the deadline.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                match stream.read_to_string(&mut status) {
+                    Ok(_) => {
+                        status.is_empty() || status == "started\n" || status == "started\nclosed\n"
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        status.is_empty() || status == "started\n"
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        false
+                    }
+                    Err(error) => panic!("writer status read failed: {error}"),
+                }
+            }
+        };
+        if !terminated {
+            terminate_version_probe_test_descendant(pid.trim());
+        }
+        assert!(
+            terminated,
+            "descendant output pipe remained writable: {status:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn nine_official_profiles() {

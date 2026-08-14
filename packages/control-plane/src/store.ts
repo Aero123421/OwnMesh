@@ -54,6 +54,8 @@ export type DeviceRecord = {
   arch: string;
   agent_version: string;
   protocol_version: string;
+  /** Authenticated Agent policy observation. Undefined for pre-1.2.9 Agents. */
+  enforce_workspace?: boolean;
   public_key: string;
   revoked: boolean;
   created_at: string;
@@ -67,11 +69,18 @@ export type DeviceRecord = {
 
 function shouldRecordReadyConnection(
   device: DeviceRecord,
-  patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+  patch: {
+    agent_version?: string;
+    protocol_version: string;
+    last_seen_at: string;
+    enforce_workspace?: boolean;
+  },
 ): boolean {
   if (
     (patch.agent_version !== undefined && patch.agent_version !== device.agent_version) ||
-    patch.protocol_version !== device.protocol_version
+    patch.protocol_version !== device.protocol_version ||
+    (patch.enforce_workspace !== undefined &&
+      patch.enforce_workspace !== device.enforce_workspace)
   ) {
     return true;
   }
@@ -225,10 +234,57 @@ export type WorkspaceRecord = {
   device_id: string;
   owner_principal_id: string;
   version: number;
+  /** Opaque Agent mapping generation. Paths and labels never leave the device. */
+  local_generation?: string;
   active: boolean;
   created_at: string;
   updated_at: string;
 };
+
+function workspaceStoreKey(deviceId: string, workspaceId: string): string {
+  return `${deviceId}\0${workspaceId}`;
+}
+
+function workspaceMemberStoreKey(
+  deviceId: string,
+  workspaceId: string,
+  principalId: string,
+): string {
+  return `${deviceId}\0${workspaceId}\0${principalId}`;
+}
+
+export type AdvertisedWorkspaceRegistration = {
+  id: string;
+  generation: string;
+};
+
+function validateAdvertisedWorkspaces(
+  workspaces: AdvertisedWorkspaceRegistration[],
+): AdvertisedWorkspaceRegistration[] {
+  if (workspaces.length < 1 || workspaces.length > 64) {
+    throw new Error("invalid_workspace_registry");
+  }
+  const ids = new Set<string>();
+  const validated: AdvertisedWorkspaceRegistration[] = [];
+  for (const workspace of workspaces) {
+    const id = workspace?.id;
+    const generation = workspace?.generation;
+    if (
+      typeof id !== "string" ||
+      id.length > 128 ||
+      !/^ws_[A-Za-z0-9_-]*$/.test(id) ||
+      typeof generation !== "string" ||
+      !/^wsg_[a-f0-9]{32}$/.test(generation) ||
+      ids.has(id)
+    ) {
+      throw new Error("invalid_workspace_registry");
+    }
+    ids.add(id);
+    validated.push({ id, generation });
+  }
+  if (!ids.has("ws_default")) throw new Error("invalid_workspace_registry");
+  return validated.sort((a, b) => a.id.localeCompare(b.id));
+}
 
 /** Authoritative MCP operation row (D1 / Memory). Isolate Maps are cache only. */
 export type McpOperationRecord = {
@@ -631,7 +687,12 @@ export interface ControlPlaneStore {
    */
   recordDeviceReadyConnection(
     id: string,
-    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+    patch: {
+      agent_version?: string;
+      protocol_version: string;
+      last_seen_at: string;
+      enforce_workspace?: boolean;
+    },
   ): Promise<DeviceRecord | null>;
   revokeDevice(id: string, principalId: string): Promise<boolean>;
   activateDeviceWithChallenge(deviceId: string, challengeId: string): Promise<boolean>;
@@ -801,9 +862,20 @@ export interface ControlPlaneStore {
 
   /** Create or update cloud workspace custody.  Only admin paths call this. */
   putWorkspace(workspace: WorkspaceRecord): Promise<void>;
-  getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null>;
-  putWorkspaceMember(workspaceId: string, principalId: string): Promise<void>;
-  isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean>;
+  getWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null>;
+  putWorkspaceMember(deviceId: string, workspaceId: string, principalId: string): Promise<void>;
+  isWorkspaceMember(deviceId: string, workspaceId: string, principalId: string): Promise<boolean>;
+  /**
+   * Reconcile the bounded id plus opaque-generation registry advertised by an
+   * authenticated Agent. Roots never leave the device. Observed ids are scoped
+   * to this exact device; absence does not deactivate a pending cloud reservation
+   * that may not have reached the Agent yet. A changed generation increments the
+   * exact-action version.
+   */
+  syncDeviceWorkspaces(
+    deviceId: string,
+    workspaces: AdvertisedWorkspaceRegistration[],
+  ): Promise<WorkspaceRecord[]>;
   /**
    * Fail-closed workspace ACL/version gate.  Device owners and tenant
    * owners/admins administer workspaces; ordinary members require ownership
@@ -826,7 +898,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0015). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0016). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -854,6 +926,9 @@ export type SchemaReadiness = {
     owner_auth_challenges: boolean;
     /** 0014 independent rolling refresh-token inactivity deadline */
     oauth_tokens_refresh_lifetime: boolean;
+    /** 0016 device-scoped workspace custody (workspace ids are device-local) */
+    device_workspaces: boolean;
+    device_workspace_members: boolean;
   };
 };
 
@@ -862,6 +937,26 @@ const SCHEMA_READINESS_OBJECTS: Record<
   keyof SchemaReadiness["checks"],
   { table: string; columns: string[]; indexes?: string[] }
 > = {
+  device_workspaces: {
+    table: "device_workspaces",
+    columns: [
+      "workspace_id",
+      "tenant_id",
+      "device_id",
+      "owner_principal_id",
+      "version",
+      "local_generation",
+      "active",
+      "created_at",
+      "updated_at",
+    ],
+    indexes: ["idx_device_workspaces_tenant_device", "idx_device_workspaces_owner"],
+  },
+  device_workspace_members: {
+    table: "device_workspace_members",
+    columns: ["device_id", "workspace_id", "principal_id", "created_at"],
+    indexes: ["idx_device_workspace_members_principal"],
+  },
   oauth_tokens_refresh_lifetime: {
     table: "oauth_tokens",
     columns: ["refresh_expires_at"],
@@ -1531,7 +1626,12 @@ export class MemoryStore implements ControlPlaneStore {
   }
   async recordDeviceReadyConnection(
     id: string,
-    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+    patch: {
+      agent_version?: string;
+      protocol_version: string;
+      last_seen_at: string;
+      enforce_workspace?: boolean;
+    },
   ): Promise<DeviceRecord | null> {
     const device = this.devices.get(id);
     if (!device || device.revoked || device.status !== "active") return null;
@@ -1541,6 +1641,9 @@ export class MemoryStore implements ControlPlaneStore {
       ...device,
       ...(isNewer && patch.agent_version ? { agent_version: patch.agent_version } : {}),
       ...(isNewer ? { protocol_version: patch.protocol_version } : {}),
+      ...(patch.enforce_workspace !== undefined
+        ? { enforce_workspace: patch.enforce_workspace }
+        : {}),
       // The timestamp is server-generated. Keep it monotonic if two accepted
       // connections finish out of order.
       last_seen_at:
@@ -2079,20 +2182,88 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
-    this.workspaces.set(workspace.workspace_id, { ...workspace });
+    const key = workspaceStoreKey(workspace.device_id, workspace.workspace_id);
+    const existing = this.workspaces.get(key);
+    this.workspaces.set(key, {
+      ...workspace,
+      ...(workspace.local_generation || existing?.local_generation
+        ? { local_generation: workspace.local_generation || existing?.local_generation }
+        : {}),
+    });
   }
 
-  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
-    const row = this.workspaces.get(workspaceId);
+  async getWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null> {
+    const row = this.workspaces.get(workspaceStoreKey(deviceId, workspaceId));
     return row ? { ...row } : null;
   }
 
-  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
-    this.workspaceMembers.add(`${workspaceId}\0${principalId}`);
+  async putWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<void> {
+    this.workspaceMembers.add(workspaceMemberStoreKey(deviceId, workspaceId, principalId));
   }
 
-  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
-    return this.workspaceMembers.has(`${workspaceId}\0${principalId}`);
+  async isWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<boolean> {
+    return this.workspaceMembers.has(workspaceMemberStoreKey(deviceId, workspaceId, principalId));
+  }
+
+  async syncDeviceWorkspaces(
+    deviceId: string,
+    workspaces: AdvertisedWorkspaceRegistration[],
+  ): Promise<WorkspaceRecord[]> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") {
+      throw new Error("device_not_active");
+    }
+    const registrations = validateAdvertisedWorkspaces(workspaces);
+    const observedAt = nowIso();
+    for (const registration of registrations) {
+      const workspaceId = registration.id;
+      const key = workspaceStoreKey(deviceId, workspaceId);
+      const existing = this.workspaces.get(key);
+      if (!existing) {
+        this.workspaces.set(key, {
+          workspace_id: workspaceId,
+          tenant_id: device.tenant_id,
+          device_id: deviceId,
+          owner_principal_id: device.principal_id,
+          version: 1,
+          local_generation: registration.generation,
+          active: true,
+          created_at: observedAt,
+          updated_at: observedAt,
+        });
+      } else if (
+        !existing.active ||
+        (existing.local_generation !== undefined &&
+          existing.local_generation !== registration.generation)
+      ) {
+        this.workspaces.set(key, {
+          ...existing,
+          active: true,
+          version: existing.version + 1,
+          local_generation: registration.generation,
+          updated_at: observedAt,
+        });
+      } else if (existing.local_generation === undefined) {
+        this.workspaces.set(key, {
+          ...existing,
+          version: existing.version + 1,
+          local_generation: registration.generation,
+          updated_at: observedAt,
+        });
+      }
+    }
+    return [...this.workspaces.values()]
+      .filter((workspace) => workspace.device_id === deviceId && workspace.active)
+      .map((workspace) => ({ ...workspace }))
+      .sort((a, b) => a.workspace_id.localeCompare(b.workspace_id));
   }
 
   async assertWorkspaceOperableForMcp(
@@ -2101,10 +2272,11 @@ export class MemoryStore implements ControlPlaneStore {
     principalId: string,
     tenantId: string,
   ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
-    const workspace = await this.getWorkspace(workspaceId);
+    const workspace = await this.getWorkspace(deviceId, workspaceId);
     if (
       !workspace ||
       !workspace.active ||
+      !workspace.local_generation ||
       workspace.tenant_id !== tenantId ||
       workspace.device_id !== deviceId
     ) {
@@ -2117,7 +2289,8 @@ export class MemoryStore implements ControlPlaneStore {
       device?.principal_id === principalId ||
       role === "owner" ||
       role === "admin" ||
-      (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
+      (role === "member" &&
+        (await this.isWorkspaceMember(deviceId, workspaceId, principalId)));
     return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
   }
 
@@ -3252,6 +3425,7 @@ export class SqlStore implements ControlPlaneStore {
       arch: meta.arch || "unknown",
       agent_version: meta.agent_version || "0",
       protocol_version: meta.protocol_version || "ownmesh.device/1.0",
+      enforce_workspace: meta.enforce_workspace,
       public_key: meta.public_key || row.public_key,
       revoked: Boolean(row.revoked),
       created_at: row.created_at,
@@ -3293,6 +3467,7 @@ export class SqlStore implements ControlPlaneStore {
         arch: meta.arch || "unknown",
         agent_version: meta.agent_version || "0",
         protocol_version: meta.protocol_version || "ownmesh.device/1.0",
+        enforce_workspace: meta.enforce_workspace,
         public_key: meta.public_key || row.public_key,
         revoked: Boolean(row.revoked),
         created_at: row.created_at,
@@ -3340,7 +3515,12 @@ export class SqlStore implements ControlPlaneStore {
 
   async recordDeviceReadyConnection(
     id: string,
-    patch: { agent_version?: string; protocol_version: string; last_seen_at: string },
+    patch: {
+      agent_version?: string;
+      protocol_version: string;
+      last_seen_at: string;
+      enforce_workspace?: boolean;
+    },
   ): Promise<DeviceRecord | null> {
     const device = await this.getDevice(id);
     if (!device || device.revoked || device.status !== "active") return null;
@@ -3351,6 +3531,7 @@ export class SqlStore implements ControlPlaneStore {
       arch: device.arch,
       agent_version: patch.agent_version || device.agent_version,
       protocol_version: patch.protocol_version,
+      enforce_workspace: patch.enforce_workspace ?? device.enforce_workspace,
     });
     const updated = await this.db
       .prepare(
@@ -4395,54 +4576,71 @@ export class SqlStore implements ControlPlaneStore {
   async putWorkspace(workspace: WorkspaceRecord): Promise<void> {
     await this.db
       .prepare(
-        `INSERT INTO workspaces
-           (workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(workspace_id) DO UPDATE SET
-           tenant_id = excluded.tenant_id, device_id = excluded.device_id,
+        `INSERT INTO device_workspaces
+           (workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(device_id, workspace_id) DO UPDATE SET
+           tenant_id = excluded.tenant_id,
            owner_principal_id = excluded.owner_principal_id, version = excluded.version,
+           local_generation = COALESCE(excluded.local_generation, device_workspaces.local_generation),
            active = excluded.active, updated_at = excluded.updated_at`,
       )
       .bind(workspace.workspace_id, workspace.tenant_id, workspace.device_id,
-        workspace.owner_principal_id, workspace.version, workspace.active ? 1 : 0,
+        workspace.owner_principal_id, workspace.version, workspace.local_generation ?? null,
+        workspace.active ? 1 : 0,
         workspace.created_at, workspace.updated_at)
       .run();
   }
 
-  async getWorkspace(workspaceId: string): Promise<WorkspaceRecord | null> {
+  async getWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null> {
     try {
       const row = await this.db
-        .prepare(`SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, active, created_at, updated_at FROM workspaces WHERE workspace_id = ? LIMIT 1`)
-        .bind(workspaceId)
+        .prepare(`SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active, created_at, updated_at FROM device_workspaces WHERE device_id = ? AND workspace_id = ? LIMIT 1`)
+        .bind(deviceId, workspaceId)
         .first<{
           workspace_id: string;
           tenant_id: string;
           device_id: string;
           owner_principal_id: string;
           version: number;
+          local_generation: string | null;
           active: number;
           created_at: string;
           updated_at: string;
         }>();
       if (!row) return null;
-      return { ...row, version: Number(row.version), active: Boolean(row.active) };
+      const { local_generation, ...base } = row;
+      return {
+        ...base,
+        version: Number(row.version),
+        active: Boolean(row.active),
+        ...(local_generation ? { local_generation } : {}),
+      };
     } catch {
       return null;
     }
   }
 
-  async putWorkspaceMember(workspaceId: string, principalId: string): Promise<void> {
+  async putWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<void> {
     await this.db
-      .prepare(`INSERT OR IGNORE INTO workspace_members (workspace_id, principal_id, created_at) VALUES (?, ?, ?)`)
-      .bind(workspaceId, principalId, nowIso())
+      .prepare(`INSERT OR IGNORE INTO device_workspace_members (device_id, workspace_id, principal_id, created_at) VALUES (?, ?, ?, ?)`)
+      .bind(deviceId, workspaceId, principalId, nowIso())
       .run();
   }
 
-  async isWorkspaceMember(workspaceId: string, principalId: string): Promise<boolean> {
+  async isWorkspaceMember(
+    deviceId: string,
+    workspaceId: string,
+    principalId: string,
+  ): Promise<boolean> {
     try {
       const row = await this.db
-        .prepare(`SELECT 1 AS ok FROM workspace_members WHERE workspace_id = ? AND principal_id = ? LIMIT 1`)
-        .bind(workspaceId, principalId)
+        .prepare(`SELECT 1 AS ok FROM device_workspace_members WHERE device_id = ? AND workspace_id = ? AND principal_id = ? LIMIT 1`)
+        .bind(deviceId, workspaceId, principalId)
         .first<{ ok: number }>();
       return !!row;
     } catch {
@@ -4450,16 +4648,126 @@ export class SqlStore implements ControlPlaneStore {
     }
   }
 
+  async syncDeviceWorkspaces(
+    deviceId: string,
+    workspaces: AdvertisedWorkspaceRegistration[],
+  ): Promise<WorkspaceRecord[]> {
+    if (!this.db.batch) {
+      throw new Error("SqlStore.syncDeviceWorkspaces requires db.batch");
+    }
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") {
+      throw new Error("device_not_active");
+    }
+    const current = await this.db
+      .prepare(
+        `SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active,
+                created_at, updated_at
+         FROM device_workspaces WHERE device_id = ?`,
+      )
+      .bind(deviceId)
+      .all<{
+        workspace_id: string;
+        tenant_id: string;
+        device_id: string;
+        owner_principal_id: string;
+        version: number;
+        local_generation: string | null;
+        active: number;
+        created_at: string;
+        updated_at: string;
+      }>();
+    const byId = new Map((current.results || []).map((row) => [row.workspace_id, row]));
+    const observedAt = nowIso();
+    const wanted = validateAdvertisedWorkspaces(workspaces);
+    const statements: SqlStatement[] = [];
+    for (const registration of wanted) {
+      const workspaceId = registration.id;
+      const row = byId.get(workspaceId);
+      if (!row) {
+        statements.push(
+          this.db
+            .prepare(
+              `INSERT INTO device_workspaces
+                 (workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active,
+                  created_at, updated_at)
+               VALUES (?, ?, ?, ?, 1, ?, 1, ?, ?)`,
+            )
+            .bind(
+              workspaceId,
+              device.tenant_id,
+              deviceId,
+              device.principal_id,
+              registration.generation,
+              observedAt,
+              observedAt,
+            ),
+        );
+      } else if (
+        !Boolean(row.active) ||
+        (row.local_generation !== null && row.local_generation !== registration.generation)
+      ) {
+        statements.push(
+          this.db
+            .prepare(
+              `UPDATE device_workspaces
+               SET active = 1, version = version + 1, local_generation = ?, updated_at = ?
+               WHERE device_id = ? AND workspace_id = ?`,
+            )
+            .bind(registration.generation, observedAt, deviceId, workspaceId),
+        );
+      } else if (row.local_generation === null) {
+        statements.push(
+          this.db
+            .prepare(
+              `UPDATE device_workspaces
+               SET version = version + 1, local_generation = ?, updated_at = ?
+               WHERE device_id = ? AND workspace_id = ? AND local_generation IS NULL`,
+            )
+            .bind(registration.generation, observedAt, deviceId, workspaceId),
+        );
+      }
+    }
+    if (statements.length > 0) await this.db.batch(statements);
+    const rows = await this.db
+      .prepare(
+        `SELECT workspace_id, tenant_id, device_id, owner_principal_id, version, local_generation, active,
+                created_at, updated_at
+         FROM device_workspaces WHERE device_id = ? AND active = 1 ORDER BY workspace_id`,
+      )
+      .bind(deviceId)
+      .all<{
+        workspace_id: string;
+        tenant_id: string;
+        device_id: string;
+        owner_principal_id: string;
+        version: number;
+        local_generation: string | null;
+        active: number;
+        created_at: string;
+        updated_at: string;
+      }>();
+    return (rows.results || []).map((row) => {
+      const { local_generation, ...base } = row;
+      return {
+        ...base,
+        version: Number(row.version),
+        active: Boolean(row.active),
+        ...(local_generation ? { local_generation } : {}),
+      };
+    });
+  }
+
   async assertWorkspaceOperableForMcp(
     workspaceId: string, deviceId: string, principalId: string, tenantId: string,
   ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
-    const workspace = await this.getWorkspace(workspaceId);
-    if (!workspace || !workspace.active || workspace.tenant_id !== tenantId || workspace.device_id !== deviceId) {
+    const workspace = await this.getWorkspace(deviceId, workspaceId);
+    if (!workspace || !workspace.active || !workspace.local_generation || workspace.tenant_id !== tenantId || workspace.device_id !== deviceId) {
       return { ok: false, error: "workspace_not_available" };
     }
     const device = await this.getDevice(deviceId);
     const role = await this.getTenantMemberRole(tenantId, principalId);
-    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin" || (role === "member" && (await this.isWorkspaceMember(workspaceId, principalId)));
+    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin" || (role === "member" && (await this.isWorkspaceMember(deviceId, workspaceId, principalId)));
     return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
   }
 
@@ -4700,6 +5008,7 @@ export function encodeDevicePublicKey(
     arch?: string;
     agent_version?: string;
     protocol_version?: string;
+    enforce_workspace?: boolean;
   },
 ): string {
   return JSON.stringify({
@@ -4709,6 +5018,7 @@ export function encodeDevicePublicKey(
     arch: meta.arch,
     agent_version: meta.agent_version,
     protocol_version: meta.protocol_version,
+    enforce_workspace: meta.enforce_workspace,
   });
 }
 
@@ -4719,6 +5029,7 @@ function parseDeviceMeta(raw: string): {
   arch?: string;
   agent_version?: string;
   protocol_version?: string;
+  enforce_workspace?: boolean;
 } {
   if (raw.startsWith("{")) {
     try {
@@ -4729,6 +5040,7 @@ function parseDeviceMeta(raw: string): {
         arch?: string;
         agent_version?: string;
         protocol_version?: string;
+        enforce_workspace?: boolean;
       };
     } catch {
       return { public_key: raw };
@@ -4759,6 +5071,7 @@ function hydrateDevice(d: DeviceRecord): DeviceRecord {
     agent_version: d.agent_version || meta.agent_version || "0",
     protocol_version:
       d.protocol_version || meta.protocol_version || "ownmesh.device/1.0",
+    enforce_workspace: d.enforce_workspace ?? meta.enforce_workspace,
     public_key: meta.public_key || d.public_key,
   };
 }

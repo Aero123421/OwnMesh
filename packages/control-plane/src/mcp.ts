@@ -68,6 +68,8 @@ export type McpToolDef = {
    * between them and doubled the catalog's context cost.
    */
   aliasOf?: string;
+  /** Keep a legacy callable tool out of model-facing `tools/list`. */
+  hidden?: boolean;
 };
 
 const str = { type: "string" as const };
@@ -156,7 +158,8 @@ const elevatedCommandProp = {
 export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_list_devices",
-    description: "List devices with separate enrollment lifecycle and best-effort live connection presence",
+    description:
+      "List devices. connection_status is live route presence; last_seen_at is a coarse proof/ready marker, not the last operation or heartbeat.",
     inputSchema: {
       type: "object",
       properties: { ...cursorProps },
@@ -173,7 +176,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_get_device",
-    description: "Get one device with separate enrollment lifecycle and best-effort live connection presence",
+    description:
+      "Get one device. connection_status is live route presence; last_seen_at is a coarse proof/ready marker, not the last operation or heartbeat.",
     inputSchema: {
       type: "object",
       properties: { device_id: str },
@@ -197,9 +201,32 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
-        workspace_id: str,
+        workspace_id: {
+          type: ["string", "null"],
+          description:
+            "Registered workspace id, or null to diagnose the device's unbound Full Access/restricted workspace state without accessing a path.",
+        },
       },
       required: ["device_id", "workspace_id"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
+  },
+  {
+    name: "ownmesh_policy_show",
+    description:
+      "Read the device's effective policy preset, bounded rules, lockdown state, delegation setting, and grants without changing policy.",
+    inputSchema: {
+      type: "object",
+      properties: { ...deviceProp },
+      required: ["device_id"],
       additionalProperties: false,
     },
     annotations: {
@@ -1138,6 +1165,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.session",
     risk: "session",
+    hidden: true,
   },
   {
     name: "ownmesh_session_give",
@@ -1549,7 +1577,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
  * mattered for more than context cost.
  */
 export const PUBLISHED_MCP_TOOLS: readonly McpToolDef[] = MCP_TOOLS.filter(
-  (tool) => !tool.aliasOf,
+  (tool) => !tool.aliasOf && !tool.hidden,
 );
 
 const ADMIN_MCP_TOOL_NAMES = new Set([
@@ -1659,6 +1687,7 @@ export type OpStatus =
 
 export type OperationPhase =
   | "queued"
+  | "dispatched"
   | "delivered"
   | "executing"
   | "waiting_approval"
@@ -1765,7 +1794,15 @@ const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
   Record<string, { status: "pass" | "warn" | "fail"; provenance: "authoritative" | "observed" }>
 > = {
   policy: { allow: { status: "pass", provenance: "authoritative" } },
-  workspace: { bound: { status: "pass", provenance: "authoritative" } },
+  workspace: {
+    // `bound` remains accepted for pre-1.2.9 Agents. New Agents expose the
+    // binding + enforcement combination as one fixed, redacted enum.
+    bound: { status: "pass", provenance: "authoritative" },
+    bound_enforced: { status: "pass", provenance: "authoritative" },
+    bound_full_access: { status: "pass", provenance: "authoritative" },
+    unbound_full_access: { status: "pass", provenance: "authoritative" },
+    unbound_enforced: { status: "warn", provenance: "authoritative" },
+  },
   daemon: {
     running: { status: "pass", provenance: "observed" },
     lockdown: { status: "warn", provenance: "observed" },
@@ -1941,14 +1978,18 @@ export function normalizeSystemDiagnosis(
       ? "supervisor_unavailable"
       : sessionsCheck?.state === "stale" || staleCount > 0
         ? "stale_sessions"
-        : "healthy";
+        : stateFor("workspace") === "unbound_enforced"
+          ? "workspace_selection_required"
+          : "healthy";
   const recommendation = overall === "lockdown"
     ? "unlock_locally"
     : overall === "supervisor_unavailable"
       ? "restart_session_supervisor"
       : overall === "stale_sessions"
         ? "reconcile_stale_sessions"
-        : "none";
+        : overall === "workspace_selection_required"
+          ? "select_workspace"
+          : "none";
   return {
     schema: SYSTEM_DIAGNOSIS_SCHEMA,
     overall,
@@ -2556,7 +2597,10 @@ function publicOperationPhase(
     case "running": phase = "executing"; break;
     case "pending": {
       const outbox = readDispatchOutbox(op.data || {});
-      phase = outbox?.state === "dispatched" ? "delivered" : "queued";
+      // DeviceRoom acceptance is durable dispatch, not proof that the Agent
+      // received the operation. Only an authoritative Agent result advances
+      // the operation to running/executing (or a terminal state).
+      phase = outbox?.state === "dispatched" ? "dispatched" : "queued";
       break;
     }
   }
@@ -2889,6 +2933,8 @@ function toolCapability(toolName: string): string {
       return "profile.scan";
     case "ownmesh_system_diagnose":
       return "system.diagnose";
+    case "ownmesh_policy_show":
+      return "policy.show";
     case "ownmesh_fs_write":
     case "ownmesh_fs_delete":
     case "ownmesh_fs_patch":
@@ -3055,6 +3101,8 @@ function toolAction(toolName: string): string {
       return "profile.scan";
     case "ownmesh_system_diagnose":
       return "system.diagnose";
+    case "ownmesh_policy_show":
+      return "policy.show";
     case "ownmesh_cancel_operation":
       return "cancel";
     case "__transfer_artifact_get":
@@ -3303,6 +3351,28 @@ export async function buildCanonicalAction(opts: {
     workspace_version: opts.workspaceBinding?.version ?? null,
     facts,
   };
+}
+
+/**
+ * Canonical identity used only for idempotency-key reuse decisions.
+ *
+ * The credential generation remains part of the exact dispatch action and
+ * payload hash, but is deliberately excluded here: rotating credentials does
+ * not turn an otherwise identical user action into a different semantic
+ * request. A reused key therefore converges on the original operation rather
+ * than authorizing a second execution under the new generation.
+ */
+export function semanticIdempotencyAction(
+  action: Record<string, unknown>,
+): Record<string, unknown> {
+  const { principal_credential_generation: _authorizationInstance, ...semantic } = action;
+  return semantic;
+}
+
+export async function hashSemanticIdempotencyAction(
+  action: Record<string, unknown>,
+): Promise<string> {
+  return hashCanonicalAction(semanticIdempotencyAction(action));
 }
 
 /**
@@ -4914,6 +4984,35 @@ export async function handleMcp(
       }
 
       const cancelDeviceId = tracked.device_id;
+
+      // Fence the target durably before any device/network dependency. A
+      // failed or offline cancel route must never leave the original request
+      // eligible for reconnect redelivery. Terminal-result CAS remains the
+      // winner if the Agent completed the operation before this transition.
+      const fencedTarget = await patchOp(
+        store,
+        tracker,
+        oid,
+        {
+          status: "cancel_requested",
+          summary: "cancel requested; device signal pending",
+          approval_required: false,
+        },
+        ["pending", "running", "approval_required", "cancel_requested"],
+      );
+      if (!fencedTarget) {
+        const latest = await loadOp(store, tracker, oid);
+        const env = makeEnvelope({
+          operation_id: oid,
+          status: latest?.status || "failed",
+          summary: latest?.summary || "operation changed before cancellation was fenced",
+          data: { previous: latest ? publicTrackedView(latest) : null },
+          device_id: cancelDeviceId,
+          correlation_id: latest?.correlation_id || tracked.correlation_id,
+        });
+        return mcpResult(id, toolContent(env));
+      }
+
       const gate = await store.assertDeviceOperableForMcp(
         cancelDeviceId,
         rec.principal,
@@ -4935,7 +5034,7 @@ export async function handleMcp(
               retryable: true,
               operation_id: oid,
             },
-            previous: publicTrackedView(tracked),
+            previous: publicTrackedView(fencedTarget),
           },
           correlation_id: tracked.correlation_id,
         });
@@ -4991,7 +5090,7 @@ export async function handleMcp(
         tenant_id: rec.tenant_id,
         payload_hash: cancelDeviceOp.payload_hash,
         idempotency_key: cancelIdem,
-        workspace_id: tracked.workspace_id ?? null,
+        workspace_id: fencedTarget.workspace_id ?? null,
         expires_at: cancelExpiresAt,
         claim_version: 1,
         action: cancelDeviceOp.canonical_action,
@@ -5042,9 +5141,9 @@ export async function handleMcp(
       // Action-binding guard on cancel claim reuse.
       if (cancelClaim.outcome === "existing") {
         const priorHash = cancelClaim.op.action
-          ? await hashCanonicalAction(cancelClaim.op.action)
+          ? await hashSemanticIdempotencyAction(cancelClaim.op.action)
           : cancelClaim.op.payload_hash || "";
-        const wantHash = await hashCanonicalAction(cancelDeviceOp.canonical_action);
+        const wantHash = await hashSemanticIdempotencyAction(cancelDeviceOp.canonical_action);
         if (priorHash && priorHash !== wantHash) {
           const env = makeEnvelope({
             operation_id: cancelOpId,
@@ -5095,22 +5194,25 @@ export async function handleMcp(
           routed.status === "running" ||
           routed.status === "completed"
         ) {
+          const cancelConfirmed = routed.status === "completed";
           const marked = await patchOp(
             store,
             tracker,
             cancelRow.operation_id,
             {
               data: markDispatchOutboxDispatched(cancelRow.data || {}),
-              status: "completed",
-              summary: "cancel delivered to device",
+              status: cancelConfirmed ? "completed" : cancelRow.status,
+              summary: cancelConfirmed
+                ? "cancel confirmed by device"
+                : "cancel dispatched to device room",
             },
             ["pending", "running", "cancel_requested"],
           );
           if (marked) cancelRow = marked;
         } else if (routed.status === "dispatch_uncertain") {
           // Body may already be durable in DeviceRoom — keep cancel outbox pending
-          // for identical retry redelivery. Do NOT mark the target cancel_requested
-          // until a confirmed route (uncertain ≠ confirmed).
+          // for identical retry redelivery. The target was already fenced before
+          // routing, so reconnect cannot run the original operation.
           const noted = await patchOp(
             store,
             tracker,
@@ -5141,15 +5243,15 @@ export async function handleMcp(
                 details: routed.detail ?? { status: routed.status },
               },
               cancel_operation_id: cancelRow.operation_id,
-              previous: publicTrackedView(tracked),
+              previous: publicTrackedView(fencedTarget),
               route_status: "dispatch_uncertain",
             },
-            correlation_id: tracked.correlation_id,
+            correlation_id: fencedTarget.correlation_id,
           });
           return mcpResult(id, toolContent(env));
         } else {
-          // Reject/error: keep cancel claim pending with outbox for retry; do not
-          // mutate the target operation.
+          // Reject/error: keep cancel claim pending with outbox for retry. The
+          // target remains durably fenced as cancel_requested.
           const detailObj =
             routed.detail && typeof routed.detail === "object"
               ? (routed.detail as Record<string, unknown>)
@@ -5176,23 +5278,24 @@ export async function handleMcp(
                 details: routed.detail ?? { status: routed.status },
               },
               cancel_operation_id: cancelRow.operation_id,
-              previous: publicTrackedView(tracked),
+              previous: publicTrackedView(fencedTarget),
               route_status: routed.status,
             },
-            correlation_id: tracked.correlation_id,
+            correlation_id: fencedTarget.correlation_id,
           });
           return mcpResult(id, toolContent(env));
         }
       }
 
-      // Confirmed delivery (or prior successful cancel claim): mark target.
+      // Keep the target fenced until an authoritative Agent result wins the
+      // terminal CAS. DeviceRoom acceptance alone is not device delivery.
       const updatedTarget = await patchOp(
         store,
         tracker,
         oid,
         {
           status: "cancel_requested",
-          summary: "cancel requested on device",
+          summary: "cancel requested; device signal pending",
           approval_required: false,
         },
         ["pending", "running", "approval_required", "cancel_requested"],
@@ -5231,13 +5334,15 @@ export async function handleMcp(
     }
 
     // Store re-validation of device ownership + credential expiry/revoke (fail closed).
-    const diagnosisDevice = name === "ownmesh_system_diagnose"
-      ? await store.getDevice(deviceId)
-      : null;
     const operable = await store.assertDeviceOperableForMcp(deviceId, rec.principal, rec.tenant_id);
     if (!operable.ok) {
       return mcpError(id, -32004, operable.error, { device_id: deviceId });
     }
+    const routedDevice = await store.getDevice(deviceId);
+    if (!routedDevice) {
+      return mcpError(id, -32004, "device_not_available", { device_id: deviceId });
+    }
+    const diagnosisDevice = name === "ownmesh_system_diagnose" ? routedDevice : null;
 
     const safeArgs = sanitizeMcpArgs(args, name);
     if (ADMIN_MCP_TOOL_NAMES.has(name)) {
@@ -5282,6 +5387,8 @@ export async function handleMcp(
       (typeof safeArgs.workspace_id === "string" ? safeArgs.workspace_id.trim() : "");
     const workspaceScoped = WORKSPACE_SCOPED_TOOL_NAMES.has(name);
     const unboundFullAccessPath = isUnboundFullAccessPath(name, safeArgs);
+    const unboundDiagnosis =
+      name === "ownmesh_system_diagnose" && safeArgs.workspace_id === null;
     if (workspaceScoped) {
       if (!Object.prototype.hasOwnProperty.call(safeArgs, "workspace_id")) {
         return mcpError(id, -32602, "workspace_id is required", {
@@ -5307,10 +5414,22 @@ export async function handleMcp(
           code: "OWNMESH_E_WORKSPACE_ID_INVALID",
         });
       }
-      if (!requestedWorkspaceId && !unboundFullAccessPath) {
+      if (!requestedWorkspaceId && !unboundFullAccessPath && !unboundDiagnosis) {
         return mcpError(id, -32602, "workspace_id: null requires an absolute Full Access path", {
           code: "OWNMESH_E_WORKSPACE_ID_REQUIRED",
         });
+      }
+      if (unboundFullAccessPath && routedDevice.enforce_workspace === true) {
+        return mcpError(
+          id,
+          -32004,
+          "device policy requires a registered workspace",
+          {
+            code: "OWNMESH_E_WORKSPACE_POLICY_REQUIRED",
+            device_id: deviceId,
+            enforce_workspace: true,
+          },
+        );
       }
       // Keep arguments, canonical action, and routed envelope byte-for-byte
       // aligned after accepting harmless surrounding whitespace.
@@ -5333,7 +5452,7 @@ export async function handleMcp(
             code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
           });
         }
-        const existing = await store.getWorkspace(requestedWorkspaceId);
+        const existing = await store.getWorkspace(deviceId, requestedWorkspaceId);
         if (existing) {
           return mcpError(id, -32602, "workspace id is already registered", {
             code: "OWNMESH_E_WORKSPACE_ID_CONFLICT",
@@ -5431,7 +5550,7 @@ export async function handleMcp(
       injectionAttempt,
       workspaceBinding,
     });
-    const actionHash = await hashCanonicalAction(deviceOp.canonical_action);
+    const actionHash = await hashSemanticIdempotencyAction(deviceOp.canonical_action);
 
     const dispatchOutbox = buildDispatchOutbox(deviceOp);
     // Fail closed before claim when the immutable dispatch body cannot be stored
@@ -5534,7 +5653,7 @@ export async function handleMcp(
     if (claim.outcome === "existing") {
       const prior = claim.op;
       const priorActionHash = prior.action
-        ? await hashCanonicalAction(prior.action)
+        ? await hashSemanticIdempotencyAction(prior.action)
         : prior.payload_hash || "";
       if (priorActionHash && priorActionHash !== actionHash) {
         const env = makeEnvelope({
@@ -5584,7 +5703,7 @@ export async function handleMcp(
       tracker.put(replayed);
       // E3 crash-safe dispatch: if the claim was accepted but never marked
       // dispatched, redeliver the original bound body exactly once per retry.
-      if (router && needsDispatchRedelivery(replayed)) {
+      if (router && replayed.status !== "cancel_requested" && needsDispatchRedelivery(replayed)) {
         const box = readDispatchOutbox(replayed.data || {});
         if (box) {
           if (!(await boundCredentialGenerationCurrent(store, box.body))) {
@@ -5712,6 +5831,14 @@ export async function handleMcp(
         approval_id: env.approval_id,
       });
       return mcpResult(id, toolContent(finalOp));
+    }
+
+    // Cancellation may race the narrow claim→route interval. Observe the
+    // durable fence once more before entering DeviceRoom; DeviceRoom repeats
+    // this check at its final dispatch boundary.
+    const beforeRoute = await loadOp(store, tracker, operationId);
+    if (beforeRoute?.status === "cancel_requested") {
+      return mcpResult(id, toolContent(beforeRoute));
     }
 
     if (!(await boundCredentialGenerationCurrent(store, deviceOp))) {

@@ -32,22 +32,28 @@ impl DaemonRuntime {
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
         let mut p: SystemDiagnoseParams = parse_params(params)?;
-        let workspace_id = Self::canonical_workspace_id(p.workspace_id.as_deref())?;
-        if !self.workspaces.iter().any(|workspace| {
-            workspace.id == workspace_id
-                || (workspace_id == "ws_default" && workspace.id == "default")
-        }) {
-            return Err(IpcError::Remote {
-                code: app_error::INVALID_PARAMS,
-                message: "requested workspace is not registered on this device".into(),
-            });
-        }
-        p.workspace_id = Some(workspace_id.clone());
+        let workspace_id = match p.workspace_id.as_deref() {
+            Some(_) => {
+                let workspace_id = Self::canonical_workspace_id(p.workspace_id.as_deref())?;
+                if !self.workspaces.iter().any(|workspace| {
+                    workspace.id == workspace_id
+                        || (workspace_id == "ws_default" && workspace.id == "default")
+                }) {
+                    return Err(IpcError::Remote {
+                        code: app_error::INVALID_PARAMS,
+                        message: "requested workspace is not registered on this device".into(),
+                    });
+                }
+                Some(workspace_id)
+            }
+            None => None,
+        };
+        p.workspace_id.clone_from(&workspace_id);
         let facts = OperationFacts {
             capability: "system.diagnose".into(),
             kind: "metadata".into(),
-            workspace_relative: true,
-            workspace_id: Some(workspace_id),
+            workspace_relative: workspace_id.is_some(),
+            workspace_id,
             ..Default::default()
         };
         // This read-only observation is bound to the remote operation itself;
@@ -63,7 +69,7 @@ impl DaemonRuntime {
 
     pub(super) async fn execute_system_diagnose(
         &self,
-        _params: &SystemDiagnoseParams,
+        params: &SystemDiagnoseParams,
     ) -> IpcResult<Value> {
         let observed_at = ownmesh_domain::Timestamp::now().to_rfc3339();
         let now = Self::now();
@@ -135,6 +141,10 @@ impl DaemonRuntime {
             &observed_at,
             SystemDiagnosisFacts {
                 lockdown: self.lockdown,
+                workspace_state: workspace_diagnosis_state(
+                    params.workspace_id.is_some(),
+                    self.enforce_workspace,
+                ),
                 supervisor_required,
                 supervisor_available,
                 session_count: sessions.len(),
@@ -2510,11 +2520,21 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
 #[derive(Debug, Clone, Copy)]
 struct SystemDiagnosisFacts {
     lockdown: bool,
+    workspace_state: &'static str,
     supervisor_required: bool,
     supervisor_available: bool,
     session_count: usize,
     nonterminal_sessions: usize,
     stale_sessions: usize,
+}
+
+fn workspace_diagnosis_state(bound: bool, enforce_workspace: bool) -> &'static str {
+    match (bound, enforce_workspace) {
+        (true, true) => "bound_enforced",
+        (true, false) => "bound_full_access",
+        (false, true) => "unbound_enforced",
+        (false, false) => "unbound_full_access",
+    }
 }
 
 fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> Value {
@@ -2531,6 +2551,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "supervisor_unavailable"
     } else if facts.stale_sessions > 0 {
         "stale_sessions"
+    } else if facts.workspace_state == "unbound_enforced" {
+        "workspace_selection_required"
     } else {
         "healthy"
     };
@@ -2538,6 +2560,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "lockdown" => "unlock_locally",
         "supervisor_unavailable" => "restart_session_supervisor",
         "stale_sessions" => "reconcile_stale_sessions",
+        "workspace_selection_required" => "select_workspace",
         _ => "none",
     };
     json!({
@@ -2556,7 +2579,9 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "provenance": "authoritative", "observed_at": observed_at,
             },
             {
-                "id": "workspace", "status": "pass", "state": "bound",
+                "id": "workspace",
+                "status": if facts.workspace_state == "unbound_enforced" { "warn" } else { "pass" },
+                "state": facts.workspace_state,
                 "provenance": "authoritative", "observed_at": observed_at,
             },
             {
@@ -2587,7 +2612,18 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
 
 #[cfg(test)]
 mod system_diagnosis_tests {
-    use super::{system_diagnosis_payload, SystemDiagnosisFacts};
+    use super::{system_diagnosis_payload, workspace_diagnosis_state, SystemDiagnosisFacts};
+
+    #[test]
+    fn workspace_diagnosis_is_a_fixed_redacted_boundary_state() {
+        assert_eq!(workspace_diagnosis_state(true, true), "bound_enforced");
+        assert_eq!(workspace_diagnosis_state(true, false), "bound_full_access");
+        assert_eq!(workspace_diagnosis_state(false, true), "unbound_enforced");
+        assert_eq!(
+            workspace_diagnosis_state(false, false),
+            "unbound_full_access"
+        );
+    }
 
     #[test]
     fn common_device_local_states_are_typed_and_redacted() {
@@ -2595,6 +2631,7 @@ mod system_diagnosis_tests {
             (
                 SystemDiagnosisFacts {
                     lockdown: false,
+                    workspace_state: "bound_enforced",
                     supervisor_required: false,
                     supervisor_available: true,
                     session_count: 0,
@@ -2607,6 +2644,7 @@ mod system_diagnosis_tests {
             (
                 SystemDiagnosisFacts {
                     lockdown: false,
+                    workspace_state: "bound_full_access",
                     supervisor_required: true,
                     supervisor_available: false,
                     session_count: 1,
@@ -2619,6 +2657,7 @@ mod system_diagnosis_tests {
             (
                 SystemDiagnosisFacts {
                     lockdown: false,
+                    workspace_state: "unbound_full_access",
                     supervisor_required: false,
                     supervisor_available: true,
                     session_count: 1,
@@ -2627,6 +2666,19 @@ mod system_diagnosis_tests {
                 },
                 "stale_sessions",
                 "reconcile_stale_sessions",
+            ),
+            (
+                SystemDiagnosisFacts {
+                    lockdown: false,
+                    workspace_state: "unbound_enforced",
+                    supervisor_required: false,
+                    supervisor_available: true,
+                    session_count: 0,
+                    nonterminal_sessions: 0,
+                    stale_sessions: 0,
+                },
+                "workspace_selection_required",
+                "select_workspace",
             ),
         ];
         for (facts, overall, recommendation) in cases {

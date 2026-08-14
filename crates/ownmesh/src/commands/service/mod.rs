@@ -15,14 +15,20 @@ pub use platform::{
 pub use security::{canonicalize_executable, validate_service_path};
 
 use crate::cli::{Cli, ServiceActionArgs, ServiceCmd};
-use ownmesh_config::OwnMeshPaths;
+use ownmesh_config::{load_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
+use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use ownmesh_persist::write_atomically;
 use serde::Serialize;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(15);
+const SERVICE_STATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Persisted install record under the user state directory (not secrets).
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -363,7 +369,7 @@ fn run_uninstall(
 
 fn run_lifecycle(
     cli: &Cli,
-    _paths: &OwnMeshPaths,
+    paths: &OwnMeshPaths,
     manager: &ServiceManager<'_, impl ProcessRunner>,
     args: &ServiceActionArgs,
     action: Lifecycle,
@@ -385,33 +391,87 @@ fn run_lifecycle(
         return Ok(());
     }
 
-    let result = match action {
-        Lifecycle::Start => manager.start(),
-        Lifecycle::Stop => manager.stop(),
-        Lifecycle::Restart => manager.restart(),
+    let verified_running = match action {
+        Lifecycle::Start => manager.start().map(|()| None),
+        Lifecycle::Stop => manager.stop().map(|()| None),
+        Lifecycle::Restart => (|| {
+            // Task Scheduler acknowledges `/End` before the process has always
+            // released its instance. Starting immediately can therefore return
+            // success without launching a replacement. Cross the observable IPC
+            // offline boundary before requesting a new instance.
+            manager.stop()?;
+            wait_for_daemon_state(paths, false, SERVICE_STOP_TIMEOUT)?;
+            manager.start()?;
+            wait_for_daemon_state(paths, true, SERVICE_START_TIMEOUT)?;
+            Ok(Some(true))
+        })(),
     };
-    result.map_err(|e| {
+    let verified_running = verified_running.map_err(|e| {
         eprintln!("service {name}: {e}");
         ExitCode::Internal
     })?;
 
     let probe = manager.probe().ok();
+    let running = verified_running.or_else(|| probe.as_ref().and_then(|p| p.running));
     let value = json!({
         "schema_version": 1,
         "ok": true,
         "action": name,
         "installed": probe.as_ref().map(|p| p.installed),
-        "running": probe.as_ref().and_then(|p| p.running),
+        "running": running,
     });
     emit_json_or_text(cli, &value, || {
         println!("service {name} ok");
-        if let Some(p) = &probe {
-            if let Some(r) = p.running {
-                println!("  running: {r}");
-            }
+        if let Some(running) = running {
+            println!("  running: {running}");
         }
     });
     Ok(())
+}
+
+/// Wait until the daemon's public status endpoint agrees with the requested
+/// lifecycle state. OS service managers may acknowledge start/stop before the
+/// process is actually ready/gone; reporting success earlier makes restart
+/// races indistinguishable from a healthy transition.
+fn wait_for_daemon_state(
+    paths: &OwnMeshPaths,
+    expected_online: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let cfg =
+        load_config(paths).map_err(|error| format!("load config for readiness check: {error}"))?;
+    let endpoint =
+        Endpoint::configured_daemon(&paths.runtime_dir, cfg.service_socket.path.as_deref())
+            .map_err(|error| format!("resolve daemon endpoint for readiness check: {error}"))?;
+    let client = IpcClient::new(
+        endpoint,
+        paths.runtime_dir.clone(),
+        ClientIdentity::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        ClientOptions {
+            request_timeout: Duration::from_millis(300),
+            max_reconnect_attempts: 0,
+            reconnect_base_delay: Duration::from_millis(25),
+        },
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("create daemon readiness runtime: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let online = runtime.block_on(client.status()).is_ok();
+        if online == expected_online {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let expected = if expected_online { "ready" } else { "stopped" };
+            return Err(format!(
+                "daemon did not become {expected} within {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(SERVICE_STATE_POLL_INTERVAL);
+    }
 }
 
 fn run_status(

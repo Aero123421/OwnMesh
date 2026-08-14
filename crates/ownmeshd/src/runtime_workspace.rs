@@ -97,6 +97,7 @@ impl DaemonRuntime {
             id,
             root,
             label: p.label,
+            generation: String::new(),
         };
         let stored = self.upsert_workspace(entry)?;
         self.append_audit(
@@ -165,7 +166,10 @@ impl DaemonRuntime {
                 code: app_error::INTERNAL,
                 message: e.to_string(),
             })?;
-            self.workspaces[idx].root = root;
+            if self.workspaces[idx].root != root {
+                self.workspaces[idx].root = root;
+                self.workspaces[idx].generation = super::new_workspace_generation();
+            }
         }
         if let Some(label) = p.label {
             let label = label.trim().to_owned();

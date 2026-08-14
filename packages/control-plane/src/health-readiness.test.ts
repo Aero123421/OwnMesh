@@ -104,6 +104,11 @@ const MCP_SCHEMA_KEYS = [
   "mcp_approval_outbox",
 ] as const;
 
+const WORKSPACE_SCHEMA_KEYS = [
+  "device_workspaces",
+  "device_workspace_members",
+] as const;
+
 const P0_SCHEMA_KEYS = [
   "devices_status",
   "revoked_refresh_families",
@@ -125,6 +130,7 @@ const ALL_SCHEMA_KEYS = [
   ...M0002_SCHEMA_KEYS,
   ...P0_SCHEMA_KEYS,
   ...MCP_SCHEMA_KEYS,
+  ...WORKSPACE_SCHEMA_KEYS,
 ] as const;
 
 test("/health is D1-free liveness; concurrent /health/ready checks coalesce one bounded scan", async () => {
@@ -238,6 +244,34 @@ test("sqlite DB missing P0 schema → /health/ready 503 with schema_ready:false"
     // schema_migrations table may not exist yet → empty, never synthesized.
     assert.deepEqual(migBody.applied, []);
     assert.equal(migBody.schema_ready, false);
+  } finally {
+    __setTestStore(null);
+  }
+});
+
+test("pre-0016 workspace schema is never reported ready", async () => {
+  const files = allMigrationFiles().filter((file) => file !== "0016_device_scoped_workspaces.sql");
+  const { store } = openStoreWith(files);
+  const readiness = await store.schemaReadiness();
+  assert.equal(readiness.schema_ready, false);
+  assert.equal(readiness.checks.device_workspaces, false);
+  assert.equal(readiness.checks.device_workspace_members, false);
+
+  __setTestStore(store);
+  try {
+    const response = await worker.fetch(
+      new Request("https://cp.test/health/ready"),
+      readyEnv(),
+      ctx,
+    );
+    assert.equal(response.status, 503);
+    const body = (await response.json()) as {
+      schema_ready: boolean;
+      schema_checks: Record<string, boolean>;
+    };
+    assert.equal(body.schema_ready, false);
+    assert.equal(body.schema_checks.device_workspaces, false);
+    assert.equal(body.schema_checks.device_workspace_members, false);
   } finally {
     __setTestStore(null);
   }

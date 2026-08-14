@@ -570,6 +570,28 @@ pub struct WorkspaceEntry {
     pub root: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Opaque, device-local mapping generation. It changes whenever this id is
+    /// rebound to another root and is the only mapping fact sent off-device.
+    #[serde(default)]
+    pub generation: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RemoteWorkspaceRegistration {
+    pub id: String,
+    pub generation: String,
+}
+
+fn new_workspace_generation() -> String {
+    format!("wsg_{}", Uuid::new_v4().simple())
+}
+
+fn valid_workspace_generation(value: &str) -> bool {
+    value.len() == 36
+        && value.starts_with("wsg_")
+        && value[4..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1211,6 +1233,28 @@ impl DaemonRuntime {
         })
     }
 
+    /// Id plus opaque local-generation registry advertised after the Agent has
+    /// authenticated. Paths and labels remain device-local; the control plane
+    /// uses this bounded snapshot only to scope custody to this exact device and
+    /// preflight workspace policy.
+    pub fn remote_workspace_registry(&self) -> (bool, Vec<RemoteWorkspaceRegistration>) {
+        let mut registrations = self
+            .workspaces
+            .iter()
+            .map(|workspace| RemoteWorkspaceRegistration {
+                id: if workspace.id == "default" {
+                    "ws_default".to_owned()
+                } else {
+                    workspace.id.clone()
+                },
+                generation: workspace.generation.clone(),
+            })
+            .collect::<Vec<_>>();
+        registrations.sort_by(|a, b| a.id.cmp(&b.id));
+        registrations.dedup_by(|a, b| a.id == b.id);
+        (self.enforce_workspace, registrations)
+    }
+
     /// Register or update a workspace root (device-local). Roots must be absolute
     /// existing directories. Does not cross-tenant; ownership is the device itself.
     pub fn upsert_workspace(&mut self, entry: WorkspaceEntry) -> IpcResult<WorkspaceEntry> {
@@ -1243,9 +1287,18 @@ impl DaemonRuntime {
             id: id.to_owned(),
             root,
             label: entry.label.clone(),
+            generation: String::new(),
         };
         if let Some(slot) = self.workspaces.iter_mut().find(|w| w.id == stored.id) {
-            *slot = stored.clone();
+            let generation = if slot.root == stored.root {
+                slot.generation.clone()
+            } else {
+                new_workspace_generation()
+            };
+            *slot = WorkspaceEntry {
+                generation,
+                ..stored.clone()
+            };
         } else {
             if self.workspaces.len() >= 64 {
                 return Err(IpcError::Remote {
@@ -1253,10 +1306,20 @@ impl DaemonRuntime {
                     message: "workspace registry full (max 64)".into(),
                 });
             }
-            self.workspaces.push(stored.clone());
+            self.workspaces.push(WorkspaceEntry {
+                generation: new_workspace_generation(),
+                ..stored.clone()
+            });
         }
         self.persist_workspaces()?;
-        Ok(stored)
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == id)
+            .cloned()
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "workspace persistence lost the updated entry".into(),
+            })
     }
 
     fn persist_workspaces(&self) -> IpcResult<()> {
@@ -6127,6 +6190,93 @@ mod device_binding_tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn authenticated_workspace_registry_contains_ids_and_policy_but_no_roots() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_repo".into(),
+                root: dir.path().join("repo"),
+                label: Some("Repository".into()),
+                generation: String::new(),
+            })
+            .unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::Recommended));
+
+        let (enforce_workspace, registrations) = runtime.remote_workspace_registry();
+        assert!(enforce_workspace);
+        assert_eq!(
+            registrations
+                .iter()
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ws_default", "ws_repo"]
+        );
+        assert!(registrations
+            .iter()
+            .all(|workspace| valid_workspace_generation(&workspace.generation)));
+
+        runtime.workspaces[0].id = "default".into();
+        let (_, legacy) = runtime.remote_workspace_registry();
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ws_default", "ws_repo"]
+        );
+    }
+
+    #[test]
+    fn workspace_generation_changes_only_when_the_id_maps_to_another_root() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let first = runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_repo".into(),
+                root: dir.path().join("repo-a"),
+                label: Some("A".into()),
+                generation: String::new(),
+            })
+            .unwrap();
+        let label_only = runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_repo".into(),
+                root: dir.path().join("repo-a"),
+                label: Some("renamed".into()),
+                generation: String::new(),
+            })
+            .unwrap();
+        assert_eq!(label_only.generation, first.generation);
+
+        let remapped = runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_repo".into(),
+                root: dir.path().join("repo-b"),
+                label: None,
+                generation: String::new(),
+            })
+            .unwrap();
+        assert_ne!(remapped.generation, first.generation);
+
+        runtime
+            .workspaces
+            .retain(|workspace| workspace.id != "ws_repo");
+        runtime.persist_workspaces().unwrap();
+        let readded = runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_repo".into(),
+                root: dir.path().join("repo-b"),
+                label: None,
+                generation: String::new(),
+            })
+            .unwrap();
+        assert_ne!(readded.generation, remapped.generation);
+    }
+
     fn reused_process_identity_fixture() -> (u32, u64) {
         // A live PID with a different OS birth witness deterministically models
         // PID reuse: the process exists, but it cannot be the persisted child.
@@ -6587,6 +6737,7 @@ mod transfer_runtime_tests {
                 id: "ws_destination".into(),
                 root: destination_root.clone(),
                 label: None,
+                generation: String::new(),
             })
             .unwrap();
         bind_remote_transfer(&mut destination_runtime);
@@ -6673,6 +6824,7 @@ mod transfer_runtime_tests {
                 id: "ws_destination".into(),
                 root: destination_root,
                 label: None,
+                generation: String::new(),
             })
             .unwrap();
         bind_remote_transfer(&mut destination);
@@ -7051,6 +7203,7 @@ mod transfer_runtime_tests {
                 id: "ws_destination".into(),
                 root: destination_root.clone(),
                 label: None,
+                generation: String::new(),
             })
             .unwrap();
         let mut bytes = vec![0_u8; MAX_CHUNK_BYTES * 5 + 17];
@@ -7207,6 +7360,7 @@ mod transfer_runtime_tests {
                 id: "ws_destination".into(),
                 root: temp.path().join("destination"),
                 label: None,
+                generation: String::new(),
             })
             .unwrap();
         std::fs::write(
@@ -7305,6 +7459,7 @@ mod transfer_runtime_tests {
                 id: "ws_destination".into(),
                 root: temp.path().join("destination"),
                 label: Some("destination".into()),
+                generation: String::new(),
             })
             .unwrap();
         let content = b"normal-published-transfer";
@@ -7423,6 +7578,7 @@ mod transfer_runtime_tests {
                 id: "ws_destination".into(),
                 root: destination_root,
                 label: Some("destination".into()),
+                generation: String::new(),
             })
             .unwrap();
         let source = paths.state_dir.join("workspace").join("source.bin");
@@ -7755,6 +7911,7 @@ fn load_or_init_workspaces(
         id: "ws_default".into(),
         root: default_root.to_path_buf(),
         label: Some("Default workspace".into()),
+        generation: new_workspace_generation(),
     };
     if !path.exists() {
         let file = WorkspaceRegistryFile {
@@ -7792,6 +7949,7 @@ fn load_or_init_workspaces(
     }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let mut upgraded = false;
     for mut entry in file.workspaces {
         entry.id = entry.id.trim().to_string();
         if entry.id.is_empty()
@@ -7814,6 +7972,15 @@ fn load_or_init_workspaces(
         if !seen.insert(entry.id.clone()) {
             return Err(format!("duplicate workspace id: {}", entry.id));
         }
+        if entry.generation.is_empty() {
+            entry.generation = new_workspace_generation();
+            upgraded = true;
+        } else if !valid_workspace_generation(&entry.generation) {
+            return Err(format!(
+                "invalid workspace generation in registry: {}",
+                entry.id
+            ));
+        }
         out.push(entry);
     }
     if !out
@@ -7821,12 +7988,30 @@ fn load_or_init_workspaces(
         .any(|w| w.id == "ws_default" || w.id == "default")
     {
         out.insert(0, default_entry);
+        upgraded = true;
     }
     // Normalize legacy bare "default" id to the domain-shaped ws_default.
     for entry in &mut out {
         if entry.id == "default" {
             entry.id = "ws_default".into();
+            upgraded = true;
         }
+    }
+    if upgraded {
+        let upgraded_file = WorkspaceRegistryFile {
+            schema_version: 1,
+            workspaces: out.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&upgraded_file).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_BYTES as usize {
+            return Err(format!(
+                "upgraded workspaces.json exceeds {MAX_BYTES} byte budget ({})",
+                bytes.len()
+            ));
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
     }
     Ok(out)
 }

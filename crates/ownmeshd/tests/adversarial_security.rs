@@ -2370,6 +2370,7 @@ async fn production_filesystem_temporary_grant_still_works() {
                 id: "ws_other".into(),
                 root: other_root,
                 label: None,
+                generation: String::new(),
             })
             .unwrap();
         guard.set_policy_for_test(PolicyDocument {
