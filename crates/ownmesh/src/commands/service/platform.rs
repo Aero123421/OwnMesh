@@ -446,11 +446,6 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
     }
 
-    pub fn restart(&self) -> Result<(), String> {
-        let _ = self.stop();
-        self.start()
-    }
-
     pub fn probe(&self) -> Result<ServiceStatusSnapshot, String> {
         if let Some(root) = self.runner.fs_root() {
             let unit = root.join(SERVICE_UNIT_NAME);
