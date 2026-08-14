@@ -488,16 +488,19 @@ impl DaemonRuntime {
             source_relative_path: p.source_path,
             destination_relative_path: p.destination_path,
         };
+        let source_relative_path = binding.source_relative_path.clone();
+        let workspace_id = p.workspace_id.clone();
+        let grant = TransferGrant {
+            grant_id: p.grant_id.clone(),
+            operation_id: p.grant_operation_id.clone(),
+            payload_sha256: p.grant_payload_sha256.clone(),
+            expires_at_unix: p.grant_expires_at_unix,
+        };
         let plan = TransferPlan::from_verified(
             binding,
-            TransferGrant {
-                grant_id: p.grant_id,
-                operation_id: p.grant_operation_id,
-                payload_sha256: p.grant_payload_sha256,
-                expires_at_unix: p.grant_expires_at_unix,
-            },
+            grant.clone(),
             p.size_bytes,
-            p.content_sha256,
+            p.content_sha256.clone(),
         )
         .map_err(Self::transfer_error)?;
         if plan.plan_sha256() != p.plan_sha256 {
@@ -505,6 +508,26 @@ impl DaemonRuntime {
                 code: app_error::UNAUTHORIZED,
                 message: "transfer start plan hash mismatch".into(),
             });
+        }
+        if p.role == "source" {
+            let source = self.workspace_for(Some(&workspace_id))?;
+            let source_handle = source
+                .open_verified_read(Path::new(&source_relative_path))
+                .map_err(fs_err)?;
+            let observed = TransferPlan::for_workspace_source(
+                source_handle,
+                plan.binding().clone(),
+                grant,
+                PlanLimits::default(),
+                Self::now() as u64,
+            )
+            .map_err(Self::transfer_error)?;
+            if observed.size_bytes() != plan.size_bytes() || observed.sha256() != plan.sha256() {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: "source changed after preflight evidence".into(),
+                });
+            }
         }
         self.transfer_store
             .save_plan(&plan)

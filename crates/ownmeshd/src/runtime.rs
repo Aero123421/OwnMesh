@@ -6984,6 +6984,76 @@ mod transfer_runtime_tests {
     }
 
     #[tokio::test]
+    async fn source_start_rejects_mutation_before_admission() {
+        let signed_expires_at_unix = DaemonRuntime::now() + 300;
+        let source_temp = tempdir().unwrap();
+        let source_paths = OwnMeshPaths::for_base(source_temp.path());
+        let mut source = DaemonRuntime::open(&source_paths).unwrap();
+        let content = b"immutable source bytes";
+        let source_file = source_paths.state_dir.join("workspace").join("source.bin");
+        std::fs::write(&source_file, content).unwrap();
+        bind_remote_transfer(&mut source);
+        source.active_remote_expires_at_unix = Some(signed_expires_at_unix);
+        source.active_remote_device_id = Some("dev_source".into());
+        let expires_at = u64::try_from(signed_expires_at_unix).unwrap();
+        let binding = TransferBinding {
+            tenant_id: "tenant_a".into(),
+            source_principal_id: "principal_a".into(),
+            destination_principal_id: "principal_a".into(),
+            source_device_id: "dev_source".into(),
+            destination_device_id: "dev_destination".into(),
+            source_workspace_id: "ws_default".into(),
+            destination_workspace_id: "ws_destination".into(),
+            source_relative_path: "source.bin".into(),
+            destination_relative_path: "received.bin".into(),
+        };
+        let transfer_id = "xfer_mutated_source";
+        let plan = TransferPlan::from_verified(
+            binding,
+            TransferGrant {
+                grant_id: transfer_id.into(),
+                operation_id: transfer_id.into(),
+                payload_sha256: "a".repeat(64),
+                expires_at_unix: expires_at,
+            },
+            content.len() as u64,
+            sha256_hex(content),
+        )
+        .unwrap();
+        std::fs::write(&source_file, b"mutated source bytes!!!!").unwrap();
+        let started = source
+            .handle_transfer_start(
+                Some(json!({
+                    "transfer_id": transfer_id,
+                    "role": "source",
+                    "ticket": "opaque.ticket",
+                    "plan_sha256": plan.plan_sha256(),
+                    "content_sha256": plan.sha256(),
+                    "size_bytes": plan.size_bytes(),
+                    "source_path": "source.bin",
+                    "destination_path": "received.bin",
+                    "source_device_id": "dev_source",
+                    "destination_device_id": "dev_destination",
+                    "source_workspace_id": "ws_default",
+                    "destination_workspace_id": "ws_destination",
+                    "source_workspace_version": 1,
+                    "destination_workspace_version": 1,
+                    "workspace_id": "ws_default",
+                    "workspace_version": 1,
+                    "epoch": 1,
+                    "fence": 1,
+                    "grant_id": transfer_id,
+                    "grant_operation_id": transfer_id,
+                    "grant_payload_sha256": "a".repeat(64),
+                    "grant_expires_at_unix": expires_at
+                })),
+                &remote_client(),
+            )
+            .await;
+        assert!(started.is_err());
+    }
+
+    #[tokio::test]
     async fn source_reconnect_reuses_retained_snapshot_after_original_is_removed() {
         let temp = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(temp.path());

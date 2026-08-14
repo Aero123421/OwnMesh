@@ -22,6 +22,7 @@
 )]
 
 mod app;
+mod control_plane;
 mod i18n;
 mod palette;
 mod terminal;
@@ -32,6 +33,7 @@ mod wizard;
 
 use app::{App, ApprovalDecision, Overlay, PendingApproval, Screen};
 use clap::Parser;
+use control_plane::{fetch_device_inventory, redacted_error, DeviceInventory};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use i18n::Lang;
 use ownmesh_config::{load_config, OwnMeshPaths};
@@ -483,6 +485,9 @@ fn handle_key(app: &mut App, key: KeyEvent, rt: &tokio::runtime::Runtime) {
         KeyCode::Char('r') if app.screen == Screen::Approvals => {
             refresh_approvals(app, rt);
         }
+        KeyCode::Char('r') if app.screen == Screen::Devices => {
+            refresh_devices(app, rt);
+        }
         KeyCode::Char('p') if app.screen == Screen::Settings => {
             app.cycle_settings_preset();
         }
@@ -609,6 +614,45 @@ fn refresh_approvals(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
         }
         Err(e) => {
             app.status_line = actionable_ipc_error(&e);
+            false
+        }
+    }
+}
+
+fn refresh_devices(app: &mut App, rt: &tokio::runtime::Runtime) -> bool {
+    if app.readiness.server_url.is_none() {
+        app.replace_device_inventory(DeviceInventory::NotConfigured);
+        app.status_line = "devices: control plane is not configured".into();
+        return false;
+    }
+    if !app.readiness.account_present {
+        app.replace_device_inventory(DeviceInventory::AuthRequired);
+        app.status_line = "devices: authentication required".into();
+        return false;
+    }
+    match rt.block_on(fetch_device_inventory(&app.paths)) {
+        Ok(inventory) => {
+            let count = match &inventory {
+                DeviceInventory::Loaded { devices, .. } => devices.len(),
+                DeviceInventory::Empty => 0,
+                _ => 0,
+            };
+            app.replace_device_inventory(inventory);
+            app.status_line = format!("devices: {count}");
+            true
+        }
+        Err(err) => {
+            let message = redacted_error(&err);
+            let previous = app
+                .device_inventory
+                .loaded_snapshot()
+                .cloned()
+                .map(Box::new);
+            app.replace_device_inventory(DeviceInventory::Unreachable {
+                message: message.clone(),
+                previous,
+            });
+            app.status_line = format!("devices refresh failed: {message}");
             false
         }
     }

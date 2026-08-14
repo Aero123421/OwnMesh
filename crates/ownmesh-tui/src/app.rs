@@ -1,5 +1,6 @@
 //! Application state, navigation, and pure helpers.
 
+use crate::control_plane::{classify_local_inventory, DeviceInventory};
 use crate::i18n::{t, Lang, Msg};
 use crate::palette::{filter_commands, PaletteAction, PaletteState};
 use crate::theme::{ColorMode, Theme};
@@ -193,6 +194,7 @@ pub struct App {
     pub status_line: String,
     pub should_quit: bool,
     pub list_cursor: usize,
+    pub device_inventory: DeviceInventory,
     pending_setup: Option<SetupRequest>,
     pending_reauthentication: bool,
 }
@@ -212,6 +214,11 @@ impl App {
                 .map(|instance| instance.base_url.clone())
         });
         let readiness = readiness_from_local(&paths, &cfg, daemon.as_ref());
+        let device_inventory = classify_local_inventory(
+            &paths,
+            readiness.server_url.as_deref(),
+            readiness.account_present,
+        );
         // Read-only local observations only: no network probes, no secret material.
         let doctor = run_doctor(&doctor_input_from_local(
             &paths,
@@ -241,6 +248,7 @@ impl App {
             status_line: String::new(),
             should_quit: false,
             list_cursor: 0,
+            device_inventory,
             pending_setup: None,
             pending_reauthentication: false,
         }
@@ -296,6 +304,10 @@ impl App {
             let state = s.get("state").and_then(|v| v.as_str()).unwrap_or("");
             self.sessions.push(format!("{id}  {state}"));
         }
+    }
+
+    pub fn replace_device_inventory(&mut self, inventory: DeviceInventory) {
+        self.device_inventory = inventory;
     }
 
     pub fn next_screen(&mut self) {

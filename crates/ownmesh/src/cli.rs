@@ -575,7 +575,8 @@ pub enum TransferCmd {
         #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(60..=86_400))]
         ttl_seconds: u32,
     },
-    /// Start or resume a previously planned transfer.
+    /// Start or resume a previously planned transfer. One call advances as far as
+    /// authoritative state allows; the response includes typed next_action semantics.
     Send {
         /// Immutable transfer id returned by `transfer plan`.
         id: String,

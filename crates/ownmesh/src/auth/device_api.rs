@@ -28,6 +28,18 @@ pub struct DeviceInfo {
     #[serde(default)]
     pub arch: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
+    pub agent_version: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub connection_status: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub enrollment_status: Option<String>,
+    #[serde(default)]
     pub public_key: Option<String>,
     #[serde(default)]
     pub revoked: Option<bool>,
