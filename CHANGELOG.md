@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v1.2.9 — Runtime and workspace authority
+
+- Workspace records are device-scoped and synchronized from authenticated
+  Agent readiness; restricted null-workspace operations are rejected before
+  routing.
+- Durable cancel fencing, clearer dispatch phases, credential-rotation-safe
+  idempotency, and bounded internal-context timing make operation state converge
+  across disconnects and retries.
+- Expired Agent dispatches reconcile through exact-once receipts instead of
+  poisoning the WebSocket; uncertain legacy dispatches fail closed.
+- Windows service restart waits for a real stop/ready transition, profile probes
+  are time-bounded, effective policy is remotely readable, and deprecated
+  session release is hidden from model-facing discovery.
+
 ## v1.2.8 — Git workspace binding
 
 - Relative Git operations now fail closed when repository-local configuration
