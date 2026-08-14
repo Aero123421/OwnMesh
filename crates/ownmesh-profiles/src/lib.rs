@@ -1883,6 +1883,9 @@ mod tests {
         if std::env::var_os(DESCENDANT_MARKER).is_some() {
             use std::io::Write;
 
+            let status_addr = std::env::var("OWNMESH_TEST_VERSION_PROBE_STATUS_ADDR").unwrap();
+            let mut status = std::net::TcpStream::connect(status_addr).unwrap();
+            status.write_all(b"started\n").unwrap();
             std::thread::sleep(Duration::from_millis(200));
             let mut output = std::io::stdout().lock();
             let chunk = [b'x'; 4096];
@@ -1894,13 +1897,9 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let pid_path =
-                PathBuf::from(std::env::var_os("OWNMESH_TEST_VERSION_PROBE_PID_FILE").unwrap());
-            std::fs::write(
-                pid_path.with_extension("closed"),
-                if pipe_closed { "closed" } else { "open" },
-            )
-            .unwrap();
+            status
+                .write_all(if pipe_closed { b"closed\n" } else { b"open\n" })
+                .unwrap();
             return;
         }
 
@@ -1938,12 +1937,44 @@ mod tests {
             .status();
     }
 
+    fn version_probe_test_descendant_is_alive(pid: &str) -> bool {
+        #[cfg(windows)]
+        {
+            let filter = format!("PID eq {pid}");
+            let Ok(output) = Command::new("tasklist")
+                .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            else {
+                return true;
+            };
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+        }
+        #[cfg(unix)]
+        {
+            Command::new("kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+    }
+
     #[test]
     fn version_probe_does_not_wait_for_inherited_output_handles() {
+        use std::io::Read;
+
         const PID_FILE_ENV: &str = "OWNMESH_TEST_VERSION_PROBE_PID_FILE";
+        const STATUS_ADDR_ENV: &str = "OWNMESH_TEST_VERSION_PROBE_STATUS_ADDR";
         let temp_dir = tempfile::tempdir().unwrap();
         let pid_file = temp_dir.path().join("descendant.pid");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
         std::env::set_var(PID_FILE_ENV, &pid_file);
+        std::env::set_var(STATUS_ADDR_ENV, listener.local_addr().unwrap().to_string());
         let exe = std::env::current_exe().unwrap();
         let args = vec![
             "--ignored".to_owned(),
@@ -1954,22 +1985,66 @@ mod tests {
         let started = Instant::now();
         let _version = probe_version(&exe.to_string_lossy(), &args);
         std::env::remove_var(PID_FILE_ENV);
+        std::env::remove_var(STATUS_ADDR_ENV);
         let pid = std::fs::read_to_string(&pid_file).unwrap();
-        let closed_file = pid_file.with_extension("closed");
-        let close_deadline = Instant::now() + Duration::from_secs(3);
-        let closed = loop {
-            if let Ok(value) = std::fs::read_to_string(&closed_file) {
-                break value == "closed";
+        let accept_deadline = Instant::now() + Duration::from_secs(1);
+        let mut status_stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= accept_deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("writer status accept failed: {error}"),
             }
-            if Instant::now() >= close_deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
         };
-        if !closed {
+        let mut status = String::new();
+        let terminated = match status_stream.as_mut() {
+            // The direct helper recorded a successful spawn in `pid_file`.
+            // On Unix libtest can hit SIGPIPE before entering the descendant
+            // helper, so no status connection is itself the expected closure.
+            None => !version_probe_test_descendant_is_alive(pid.trim()),
+            Some(stream) => {
+                // Linux may propagate the listener's nonblocking mode to
+                // accepted sockets; restore blocking reads before the deadline.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                match stream.read_to_string(&mut status) {
+                    Ok(_) => {
+                        status.is_empty() || status == "started\n" || status == "started\nclosed\n"
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        status.is_empty() || status == "started\n"
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        false
+                    }
+                    Err(error) => panic!("writer status read failed: {error}"),
+                }
+            }
+        };
+        if !terminated {
             terminate_version_probe_test_descendant(pid.trim());
         }
-        assert!(closed, "descendant output pipe remained writable");
+        assert!(
+            terminated,
+            "descendant output pipe remained writable: {status:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
