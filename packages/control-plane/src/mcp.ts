@@ -3891,6 +3891,7 @@ async function transferAuthorities(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (meta.tenant_id !== tenant || meta.principal_id !== principal) return { ok: false, error: "transfer_not_available" };
   if (transferIsTerminal(meta.state)) return { ok: true };
+  if (Date.parse(meta.expires_at) <= Date.now()) return { ok: false, error: "transfer_not_available" };
   const [sourceDevice, destinationDevice, sourceWorkspace, destinationWorkspace] = await Promise.all([
     store.assertDeviceOperableForMcp(meta.source_device_id, principal, tenant),
     store.assertDeviceOperableForMcp(meta.destination_device_id, principal, tenant),
@@ -4836,6 +4837,8 @@ export async function handleMcp(
             const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: revalidateId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
             const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${meta.transfer_id}`, coordinator_request_id: revalidateId, workspace_version: meta.source_workspace_version };
             await store.putMcpOperation({ operation_id: revalidateId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.source_device_id, tool: "__transfer_preflight_source_send", status: "pending", summary: "transfer source send-boundary revalidation", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: revalidateId, payload_hash: deviceOp.payload_hash, idempotency_key: revalidateId, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
+            const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
+            if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source send-boundary revalidation dispatch failed");
             const claimed: TransferPlanMeta = { ...meta, source_send_revalidate_operation_id: revalidateId };
             const updated = await patchOp(store, tracker, plan.operation_id, { status: "pending", summary: "source send-boundary revalidation dispatched", data: { [TRANSFER_META_KEY]: claimed } }, ["pending", "running"]);
             if (!updated) {
@@ -4845,8 +4848,6 @@ export async function handleMcp(
               plan = current; meta = currentMeta;
               continue;
             }
-            const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
-            if (routed.status !== "routed_to_device" && routed.status !== "pending" && routed.status !== "dispatch_uncertain") return mcpError(id, -32009, "source send-boundary revalidation dispatch failed");
             plan = updated; meta = claimed;
             sendEnvelope = updated;
             sendTransfer = publicTransferMeta(claimed, { nextAction: "wait_for_source", operationId: revalidateId });
