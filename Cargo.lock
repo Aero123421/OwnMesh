@@ -2255,17 +2255,21 @@ dependencies = [
 name = "ownmesh-tui"
 version = "1.2.11"
 dependencies = [
+ "anyhow",
  "base64",
  "clap",
  "crossterm 0.28.1",
  "ownmesh-config",
  "ownmesh-diagnostics",
  "ownmesh-domain",
+ "ownmesh-identity",
  "ownmesh-ipc",
  "ownmesh-policy",
  "ownmesh-profiles",
  "ownmesh-transfer",
  "ratatui",
+ "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

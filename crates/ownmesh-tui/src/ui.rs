@@ -676,15 +676,75 @@ fn overview_action_copy(lang: Lang, action: OverviewAction) -> (&'static str, &'
 }
 
 fn draw_devices(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(t(app.lang, Msg::DevicesLocal), app.theme.body)),
         Line::from(match &app.daemon {
             Some(s) => format!("  endpoint={} state={}", s.endpoint, s.state),
             None => format!("  {}", t(app.lang, Msg::DaemonOffline)),
         }),
         Line::from(""),
-        Line::from(Span::styled(t(app.lang, Msg::DevicesHint), app.theme.muted)),
+        Line::from(Span::styled(
+            t(app.lang, Msg::DevicesInventory),
+            app.theme.body,
+        )),
     ];
+    let snapshot = app.device_inventory.loaded_snapshot().cloned();
+    match &app.device_inventory {
+        crate::control_plane::DeviceInventory::NotConfigured => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesNotConfigured)));
+        }
+        crate::control_plane::DeviceInventory::AuthRequired => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesAuthRequired)));
+        }
+        crate::control_plane::DeviceInventory::Empty => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesEmpty)));
+        }
+        crate::control_plane::DeviceInventory::Loaded { devices, truncated } => {
+            for device in devices {
+                lines.push(Line::from(crate::control_plane::format_device_row(
+                    device,
+                    app.readiness.device_id.as_deref(),
+                )));
+            }
+            if *truncated {
+                lines.push(Line::from(Span::styled(
+                    t(app.lang, Msg::DevicesTruncated),
+                    app.theme.muted,
+                )));
+            }
+        }
+        crate::control_plane::DeviceInventory::Unreachable { message, .. } => {
+            lines.push(Line::from(format!(
+                "{} {}",
+                t(app.lang, Msg::DevicesUnreachable),
+                message
+            )));
+            if let Some(crate::control_plane::DeviceInventory::Loaded { devices, truncated }) =
+                snapshot.as_ref()
+            {
+                for device in devices {
+                    lines.push(Line::from(crate::control_plane::format_device_row(
+                        device,
+                        app.readiness.device_id.as_deref(),
+                    )));
+                }
+                if *truncated {
+                    lines.push(Line::from(Span::styled(
+                        t(app.lang, Msg::DevicesTruncated),
+                        app.theme.muted,
+                    )));
+                }
+            }
+        }
+        crate::control_plane::DeviceInventory::Idle => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesHint)));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t(app.lang, Msg::DevicesHintRefresh),
+        app.theme.muted,
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
@@ -1423,5 +1483,77 @@ mod tests {
         let snapshot = render_snapshot(&app, 120, 32).to_ascii_lowercase();
         assert!(snapshot.contains("https://mesh.example/mcp"));
         assert!(snapshot.contains("separate from enrolling this pc"));
+    }
+
+    #[test]
+    fn devices_inventory_renders_multi_device_and_keeps_error_snapshot() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Devices;
+        app.readiness.device_id = Some("dev_local".into());
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::Loaded {
+            devices: vec![
+                crate::control_plane::InventoryDevice {
+                    id: "dev_local".into(),
+                    name: Some("This PC".into()),
+                    enrollment_status: Some("active".into()),
+                    connection_status: Some("connected".into()),
+                    agent_version: Some("1.2.11".into()),
+                    last_seen_at: Some("2026-08-14T00:00:00Z".into()),
+                },
+                crate::control_plane::InventoryDevice {
+                    id: "dev_other".into(),
+                    name: Some("Studio".into()),
+                    enrollment_status: Some("active".into()),
+                    connection_status: Some("offline".into()),
+                    agent_version: Some("1.2.10".into()),
+                    last_seen_at: Some("2026-08-13T00:00:00Z".into()),
+                },
+            ],
+            truncated: false,
+        });
+        let snap = render_snapshot(&app, 120, 32);
+        assert!(snap.contains("dev_local"));
+        assert!(snap.contains("This PC"));
+        assert!(snap.contains("dev_other"));
+        assert!(snap.contains("Studio"));
+        assert!(snap.contains("enroll=active"));
+        assert!(snap.contains("route=offline"));
+        assert!(snap.to_ascii_lowercase().contains("refresh"));
+        assert!(!snap.contains("atk_"));
+        assert!(!snap.to_ascii_lowercase().contains("bearer "));
+
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::Unreachable {
+            message: "[REDACTED line containing bearer]".into(),
+            previous: Some(Box::new(crate::control_plane::DeviceInventory::Loaded {
+                devices: vec![crate::control_plane::InventoryDevice {
+                    id: "dev_local".into(),
+                    name: Some("This PC".into()),
+                    enrollment_status: Some("active".into()),
+                    connection_status: Some("connected".into()),
+                    agent_version: Some("1.2.11".into()),
+                    last_seen_at: None,
+                }],
+                truncated: false,
+            })),
+        });
+        let failed = render_snapshot(&app, 120, 32);
+        assert!(failed.contains("This PC"));
+        assert!(failed.contains("unreachable"));
+        assert!(!failed.contains("atk_secret"));
+    }
+
+    #[test]
+    fn devices_empty_and_auth_states_are_honest() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Devices;
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::Empty);
+        let empty = render_snapshot(&app, MIN_COLS, MIN_ROWS).to_ascii_lowercase();
+        assert!(empty.contains("no enrolled devices"));
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::AuthRequired);
+        let auth = render_snapshot(&app, MIN_COLS, MIN_ROWS).to_ascii_lowercase();
+        assert!(auth.contains("authentication required"));
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::NotConfigured);
+        let missing = render_snapshot(&app, MIN_COLS, MIN_ROWS).to_ascii_lowercase();
+        assert!(missing.contains("not configured"));
     }
 }
