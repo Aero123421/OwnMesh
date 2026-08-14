@@ -17,6 +17,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -958,7 +961,32 @@ fn expand_template(
 }
 
 fn probe_version(bin: &str, args: &[String]) -> Option<String> {
-    let out = std::process::Command::new(bin).args(args).output().ok()?;
+    // A vendor CLI may perform network or credential discovery even for
+    // `--version`. Profile discovery is a read-only convenience path and must
+    // never hold the daemon request loop indefinitely.
+    const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    const VERSION_PROBE_POLL: Duration = Duration::from_millis(20);
+
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(VERSION_PROBE_POLL),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1755,6 +1783,27 @@ fn bounded_copy(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "subprocess helper for the bounded version-probe test"]
+    fn slow_version_probe_helper() {
+        std::thread::sleep(Duration::from_secs(10));
+        println!("late-version-output");
+    }
+
+    #[test]
+    fn version_probe_is_bounded() {
+        let exe = std::env::current_exe().unwrap();
+        let args = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "tests::slow_version_probe_helper".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let started = Instant::now();
+        assert_eq!(probe_version(&exe.to_string_lossy(), &args), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn nine_official_profiles() {
