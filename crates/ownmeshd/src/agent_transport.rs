@@ -1652,64 +1652,12 @@ async fn live_loop(
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REMOTE_OPS));
     let active_dispatches = Arc::new(Mutex::new(HashSet::<String>::new()));
 
-    // Crash resume: redispatch any accepted-but-incomplete operation.request entries
-    // from the durable outbox. Runtime idempotency keys prevent duplicate side effects.
-    let pending_resume: Vec<PendingDispatch> = state.pending_dispatches.iter().cloned().collect();
-    for pending in pending_resume {
-        if state.completed(&pending.correlation_id).is_some() {
-            state.clear_pending_by_correlation(&pending.correlation_id);
-            continue;
-        }
-        if pending.transfer_session_lost {
-            let completed = CompletedReply {
-                correlation_id: pending.correlation_id.clone(),
-                operation_id: pending.operation_id.clone(),
-                payload: transfer_session_lost_reply(&pending.operation_id),
-            };
-            state.remember_completed(completed.clone());
-            state.save(&config.state_path)?;
-            send_cached_result(socket, config, state, &completed).await?;
-            continue;
-        }
-        let Ok(envelope) = Envelope::parse_str(&pending.raw) else {
-            // Corrupt outbox entry: fail closed with a terminal receipt.
-            let payload = json!({
-                "operation_contract": OPERATION_CONTRACT_V1,
-                "operation_id": pending.operation_id,
-                "status": "failed",
-                "error": {
-                    "code": "OWNMESH_E_DISPATCH_LOST",
-                    "message": "pending dispatch envelope is corrupt and cannot be resumed",
-                    "retryable": false
-                }
-            });
-            let completed = CompletedReply {
-                correlation_id: pending.correlation_id.clone(),
-                operation_id: pending.operation_id.clone(),
-                payload,
-            };
-            state.remember_completed(completed.clone());
-            state.save(&config.state_path)?;
-            send_cached_result(socket, config, state, &completed).await?;
-            continue;
-        };
-        handle_live_frame(
-            socket,
-            config,
-            runtime,
-            state,
-            InboundFrame::New {
-                raw: pending.raw.clone(),
-                envelope,
-            },
-            &cancel_registry,
-            &finish_tx,
-            &in_flight,
-            &active_dispatches,
-        )
-        .await?;
-    }
-    state.save(&config.state_path)?;
+    // Do not replay the Agent-local crash outbox on reconnect. DeviceRoom owns
+    // the authoritative pending/cancel state and redelivers only after applying
+    // its durable cancel fence. Starting local work before that redelivery lets
+    // a previously offline cancel lose the race. The outbox remains available
+    // for exact-once recovery when the control plane explicitly redelivers the
+    // stable correlation with a fresh message id/sequence.
 
     loop {
         tokio::select! {
@@ -1872,6 +1820,13 @@ fn parse_and_record_inbound(
             .to_owned();
         // Skip outbox when a terminal result already exists (replay after complete).
         if state.completed(&correlation_id).is_none() {
+            // A fresh control-plane redelivery must not erase crash knowledge
+            // about whether the previous process crossed the side-effect
+            // boundary. Legacy `None` also remains unknown/fail-closed.
+            let dispatch_started = state
+                .pending_by_correlation(&correlation_id)
+                .map(|pending| pending.dispatch_started)
+                .unwrap_or(Some(false));
             let transfer_session_lost = envelope.payload.get("capability").and_then(Value::as_str)
                 == Some("transfer.start");
             state.remember_pending(PendingDispatch {
@@ -1886,7 +1841,7 @@ fn parse_and_record_inbound(
                 accepted_at: Timestamp::now().to_rfc3339(),
                 transfer_session_lost,
                 expires_at: envelope.expires_at.as_ref().map(ToString::to_string),
-                dispatch_started: Some(false),
+                dispatch_started,
             })?;
         }
     }
@@ -2072,6 +2027,13 @@ async fn handle_live_frame(
                 } else {
                     cancel_registry.cancel(&target).await
                 };
+                // The authenticated control-plane cancel is authoritative even
+                // when the target is not currently in this process. Remove its
+                // local crash-outbox copy so it cannot consume capacity or be
+                // mistaken for recoverable work after the durable cancel fence.
+                if !target.is_empty() {
+                    state.clear_pending_by_correlation(&target);
+                }
                 let payload = json!({
                     "operation_contract": OPERATION_CONTRACT_V1,
                     "operation_id": request.operation_id.to_string(),
@@ -4333,7 +4295,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_websocket_auth_reconnect_resume_and_correlation_dedup() {
+    async fn reconnect_waits_for_authoritative_cancel_before_local_pending_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_cancel_reconnect").unwrap();
+        let issuer = format!("http://{address}");
+        let config = AgentTransportConfig {
+            issuer: issuer.clone(),
+            ws_url: agent_connect_url(&issuer, device.as_str()).unwrap(),
+            origin: issuer,
+            device_id: device.clone(),
+            credential: SecretString::new("dcred_cancel_reconnect"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        let runtime_dir = tempdir().unwrap();
+        let runtime_paths = OwnMeshPaths::for_base(runtime_dir.path());
+        let mut daemon = DaemonRuntime::open(&runtime_paths).unwrap();
+        daemon.set_policy_for_test(ownmesh_policy::preset_document(
+            ownmesh_policy::AccessPreset::FullAccess,
+        ));
+        let runtime = Arc::new(Mutex::new(daemon));
+        let target = runtime_paths
+            .state_dir
+            .join("workspace/cancel-before-replay.txt");
+
+        let (pending_request, pending_expires) = sample_bound_request(
+            device.as_str(),
+            "cancel-before-replay.txt",
+            Some("must not be written"),
+        );
+        let pending_raw = json!({
+            "protocol": PROTOCOL_DEVICE_V1,
+            "message_id": "msg_pending_before_cancel",
+            "type": "operation.request",
+            "device_id": device.as_str(),
+            "correlation_id": pending_request.operation_id,
+            "seq": 1,
+            "sent_at": Timestamp::now(),
+            "expires_at": Timestamp::parse(&pending_expires).unwrap(),
+            "payload": pending_request,
+        })
+        .to_string();
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        parse_and_record_inbound(&pending_raw, &config, &mut state).unwrap();
+        state.save(&config.state_path).unwrap();
+
+        let server_device = device.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            // Before DeviceRoom sends its cancel-first authoritative frame, the
+            // Agent must emit no result and must not start its local outbox.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err()
+            );
+
+            let (cancel, cancel_expires) =
+                sample_bound_cancel(server_device.as_str(), "op_bind_test", 120);
+            let raw = json!({
+                "protocol": PROTOCOL_DEVICE_V1,
+                "message_id": "msg_cancel_first",
+                "type": "operation.request",
+                "device_id": server_device.as_str(),
+                "correlation_id": cancel.operation_id,
+                "seq": 2,
+                "sent_at": Timestamp::now(),
+                "expires_at": Timestamp::parse(&cancel_expires).unwrap(),
+                "payload": cancel,
+            });
+            socket
+                .send(Message::Text(raw.to_string().into()))
+                .await
+                .unwrap();
+            let result = receive_test_envelope(&mut socket).await;
+            assert_eq!(result.correlation_id.as_deref(), Some("op_cancel_bind"));
+            assert_eq!(result.payload["status"], "completed");
+            assert_eq!(result.payload["result"]["signal_delivered"], false);
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut socket, _) = tokio_tungstenite::connect_async(config.ws_url.as_str())
+            .await
+            .unwrap();
+        assert!(live_loop(
+            &mut socket,
+            &config,
+            Some(&runtime),
+            &mut state,
+            &mut shutdown_rx,
+        )
+        .await
+        .is_err());
+        drop(shutdown_tx);
+        server.await.unwrap();
+
+        assert!(
+            !target.exists(),
+            "offline cancel lost to local outbox replay"
+        );
+        let persisted =
+            AgentTransportState::load(&config.state_path, &config.issuer, &config.device_id)
+                .unwrap();
+        assert!(persisted.pending_by_correlation("op_bind_test").is_none());
+        assert!(persisted.completed("op_cancel_bind").is_some());
+    }
+
+    #[tokio::test]
+    async fn real_websocket_control_plane_redelivery_recovers_started_and_cached_results() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let dir = tempdir().unwrap();
@@ -4449,6 +4524,9 @@ mod tests {
         let server_credential = credential.to_owned();
         let expected_started_result = seeded_result.clone();
         let replay_target = target.clone();
+        let redeliver_expired_raw = expired_raw.clone();
+        let redeliver_legacy_raw = legacy_raw.clone();
+        let redeliver_started_raw = started_raw.clone();
         let server = tokio::spawn(async move {
             let mut server_seq = 3_u64;
             let mut first_result: Option<Envelope> = None;
@@ -4480,7 +4558,10 @@ mod tests {
                 let hello = receive_test_envelope(&mut socket).await;
                 assert_eq!(hello.message_type, "hello");
                 if connection_index == 1 {
-                    assert_eq!(hello.payload["resume"]["last_server_seq"].as_u64(), Some(7));
+                    assert_eq!(
+                        hello.payload["resume"]["last_server_seq"].as_u64(),
+                        Some(10)
+                    );
                     assert!(hello.payload["resume"]["next_outbound_seq"]
                         .as_u64()
                         .is_some_and(|seq| seq >= 4));
@@ -4543,8 +4624,23 @@ mod tests {
                 .await;
 
                 if connection_index == 0 {
-                    // Crash resume terminalizes the expired operation without
-                    // closing the socket, then the normal request below runs.
+                    // The Agent must wait for authoritative DeviceRoom
+                    // redelivery instead of autonomously replaying its local
+                    // outbox immediately after ready.
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), socket.next())
+                            .await
+                            .is_err()
+                    );
+
+                    server_seq += 1;
+                    send_test_operation_redelivery(
+                        &mut socket,
+                        &redeliver_expired_raw,
+                        server_seq,
+                        "msg_expired_redelivery",
+                    )
+                    .await;
                     let expired = receive_test_envelope(&mut socket).await;
                     assert_eq!(expired.correlation_id.as_deref(), Some("op_expired_resume"));
                     assert_eq!(
@@ -4552,6 +4648,15 @@ mod tests {
                         "OWNMESH_E_OPERATION_EXPIRED"
                     );
                     first_expired_payload = Some(expired.payload);
+
+                    server_seq += 1;
+                    send_test_operation_redelivery(
+                        &mut socket,
+                        &redeliver_legacy_raw,
+                        server_seq,
+                        "msg_legacy_redelivery",
+                    )
+                    .await;
                     let legacy = receive_test_envelope(&mut socket).await;
                     assert_eq!(
                         legacy.payload["error"]["code"],
@@ -4561,6 +4666,15 @@ mod tests {
                         legacy.payload["error"]["details"]["category"],
                         "dispatch_outcome_unknown"
                     );
+
+                    server_seq += 1;
+                    send_test_operation_redelivery(
+                        &mut socket,
+                        &redeliver_started_raw,
+                        server_seq,
+                        "msg_started_redelivery",
+                    )
+                    .await;
                     let reconciled = receive_test_envelope(&mut socket).await;
                     assert_eq!(reconciled.correlation_id.as_deref(), Some("op_bind_test"));
                     assert_eq!(reconciled.payload, expected_started_result);
@@ -4646,7 +4760,7 @@ mod tests {
         let persisted =
             AgentTransportState::load(&config.state_path, &config.issuer, &config.device_id)
                 .unwrap();
-        assert_eq!(persisted.last_server_seq, 12);
+        assert_eq!(persisted.last_server_seq, 15);
         assert_eq!(persisted.completed_replies.len(), 4);
         assert!(persisted.pending_dispatches.is_empty());
         assert!(persisted.completed("op_loopback").is_some());
@@ -4757,6 +4871,25 @@ mod tests {
                 .unwrap(),
         );
         socket.send(Message::Text(raw.into())).await.unwrap();
+    }
+
+    async fn send_test_operation_redelivery<S>(
+        socket: &mut WebSocketStream<S>,
+        original_raw: &str,
+        seq: u64,
+        message_id: &str,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut raw: Value = serde_json::from_str(original_raw).unwrap();
+        raw["message_id"] = json!(message_id);
+        raw["seq"] = json!(seq);
+        raw["sent_at"] = json!(Timestamp::now());
+        OperationEnvelope::parse_slice(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        socket
+            .send(Message::Text(raw.to_string().into()))
+            .await
+            .unwrap();
     }
 
     fn test_operation_request_raw(
