@@ -225,7 +225,7 @@ test("workspace-scoped tools bind the selected workspace", async () => {
     device_id: deviceId, workspace_id: null, path: "C:\\absolute",
   }, router);
   const absolutePayload: Record<string, unknown> = routed[absoluteRouteIndex]!;
-  assert.equal(absolutePayload.workspace_id, null);
+  assert.equal(Object.prototype.hasOwnProperty.call(absolutePayload, "workspace_id"), false);
   const absoluteBound =
     (absolutePayload.authorization as { bound_action: Record<string, unknown> }).bound_action;
   assert.equal(absoluteBound.workspace_id, null);

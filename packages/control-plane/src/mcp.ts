@@ -3514,12 +3514,14 @@ export async function buildDeviceOperation(opts: {
   } else if (typeof opts.args.workspace_id === "string" && opts.args.workspace_id.trim() !== "") {
     workspaceId = String(opts.args.workspace_id);
     payload.workspace_id = workspaceId;
-  } else if (Object.prototype.hasOwnProperty.call(opts.args, "workspace_id") &&
-    opts.args.workspace_id === null) {
-    // Explicitly preserve the unbound Full Access choice on the device wire.
-    // Omission and null are intentionally different at the public MCP boundary.
-    payload.workspace_id = null;
   }
+  // `workspace_id: null` is meaningful only at the public MCP boundary: it
+  // selects the unbound Full Access path after the checks above. The internal
+  // ownmesh.operation/1.0 contract represents an unbound optional workspace by
+  // omitting the field; explicit null is deliberately rejected by existing
+  // Agents and the shared schema. The exact bound action still carries
+  // workspace_id/workspace_version as null, so this normalization cannot turn
+  // an unbound operation into a workspace-bound one.
 
   return {
     type: action,
