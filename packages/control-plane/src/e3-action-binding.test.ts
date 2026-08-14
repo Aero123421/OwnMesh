@@ -1497,6 +1497,8 @@ test("cancel claim: concurrent retries share one outbox and redeliver once path"
     approval_required: false,
     warnings: [],
     correlation_id: "op_target_long",
+    workspace_id: "ws_target",
+    action: { workspace_id: "ws_target", workspace_version: 7 },
     policy_authority: "ownmesh_device",
     created_at: nowIso(),
     updated_at: nowIso(),
@@ -1509,6 +1511,10 @@ test("cancel claim: concurrent retries share one outbox and redeliver once path"
       const payload = (op as { payload?: Record<string, unknown> }).payload || {};
       const args = (payload.arguments || {}) as Record<string, unknown>;
       assert.equal(args.target_operation_id, "op_target_long");
+      assert.equal(Object.prototype.hasOwnProperty.call(payload, "workspace_id"), false);
+      const bound = (payload.authorization as { bound_action: Record<string, unknown> }).bound_action;
+      assert.equal(bound.workspace_id, null);
+      assert.equal(bound.workspace_version, null);
       return { status: "routed_to_device" };
     },
   };
@@ -1558,5 +1564,7 @@ test("cancel claim: concurrent retries share one outbox and redeliver once path"
   const cancelRow = await store.getMcpOperation(cancelOpId!);
   assert.ok(cancelRow);
   assert.equal(cancelRow?.idempotency_key, "cancel:op_target_long");
+  assert.equal(cancelRow?.workspace_id, null);
+  assert.equal(cancelRow?.action?.workspace_id, null);
   assert.equal(readDispatchOutbox(cancelRow?.data || {})?.state, "dispatched");
 });
