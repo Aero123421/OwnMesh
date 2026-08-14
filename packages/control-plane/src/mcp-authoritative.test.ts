@@ -131,6 +131,7 @@ async function putActiveDevice(
     device_id: id,
     owner_principal_id: principal,
     version: 1,
+    local_generation: "wsg_00000000000000000000000000000001",
     active: true,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -209,6 +210,7 @@ test("public MCP workspace custody denies a tenant member and binds owner action
     device_id: deviceId,
     owner_principal_id: "prin_dev",
     version: 7,
+    local_generation: "wsg_77777777777777777777777777777777",
     active: true,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -245,6 +247,10 @@ test("workspace custody is device-scoped and ready reconciliation is fail-closed
     await putActiveDevice(store, first);
     await putActiveDevice(store, second);
 
+    const firstDefault = { id: "ws_default", generation: "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    const secondDefault = { id: "ws_default", generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+    await store.syncDeviceWorkspaces(first, [firstDefault]);
+    await store.syncDeviceWorkspaces(second, [secondDefault]);
     assert.equal((await store.getWorkspace(first, "ws_default"))?.device_id, first);
     assert.equal((await store.getWorkspace(second, "ws_default"))?.device_id, second);
     assert.equal(
@@ -257,18 +263,27 @@ test("workspace custody is device-scoped and ready reconciliation is fail-closed
       true,
     );
 
-    await store.syncDeviceWorkspaces(first, ["ws_default", "ws_cli"]);
+    const cli = { id: "ws_cli", generation: "wsg_cccccccccccccccccccccccccccccccc" };
+    await store.syncDeviceWorkspaces(first, [firstDefault, cli]);
     assert.equal((await store.getWorkspace(first, "ws_cli"))?.active, true);
     assert.equal(await store.getWorkspace(second, "ws_cli"), null);
 
     // Missing from one ready snapshot must not cancel a cloud reservation that
     // may be waiting for reconnect delivery.
-    await store.syncDeviceWorkspaces(first, ["ws_default"]);
+    await store.syncDeviceWorkspaces(first, [firstDefault]);
     assert.equal((await store.getWorkspace(first, "ws_cli"))?.version, 1);
+    await store.syncDeviceWorkspaces(first, [
+      firstDefault,
+      { ...cli, generation: "wsg_dddddddddddddddddddddddddddddddd" },
+    ]);
+    assert.equal((await store.getWorkspace(first, "ws_cli"))?.version, 2);
     const inactive = await store.getWorkspace(first, "ws_cli");
     assert.ok(inactive);
-    await store.putWorkspace({ ...inactive, active: false, version: 2 });
-    await store.syncDeviceWorkspaces(first, ["ws_default", "ws_cli"]);
+    await store.putWorkspace({ ...inactive, active: false });
+    await store.syncDeviceWorkspaces(first, [
+      firstDefault,
+      { ...cli, generation: "wsg_dddddddddddddddddddddddddddddddd" },
+    ]);
     assert.equal((await store.getWorkspace(first, "ws_cli"))?.version, 3);
   }
 });

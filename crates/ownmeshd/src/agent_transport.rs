@@ -1433,7 +1433,7 @@ async fn perform_handshake(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
     state: &mut AgentTransportState,
-    workspace_registry: Option<&(bool, Vec<String>)>,
+    workspace_registry: Option<&(bool, Vec<crate::runtime::RemoteWorkspaceRegistration>)>,
 ) -> Result<(), String> {
     let remote_routing_enabled = workspace_registry.is_some();
     let resume = json!({
@@ -1499,14 +1499,14 @@ async fn perform_handshake(
         "protocol_version": PROTOCOL_DEVICE_V1,
         "remote_routing_enabled": remote_routing_enabled,
     });
-    if let (Some((enforce_workspace, workspace_ids)), Some(object)) =
+    if let (Some((enforce_workspace, workspaces)), Some(object)) =
         (workspace_registry, ready_payload.as_object_mut())
     {
         object.insert(
             "workspace_registry".into(),
             json!({
                 "enforce_workspace": enforce_workspace,
-                "ids": workspace_ids,
+                "workspaces": workspaces,
             }),
         );
     }

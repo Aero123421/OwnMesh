@@ -81,6 +81,7 @@ async function callTool(
     await store.putWorkspace({
       workspace_id: workspaceId, tenant_id: "ten_default", device_id: deviceId,
       owner_principal_id: "prin_dev", version: 1, active: true,
+      local_generation: "wsg_00000000000000000000000000000001",
       created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
     });
   }
@@ -176,7 +177,8 @@ test("workspace-scoped tools bind the selected workspace", async () => {
   for (const workspace_id of ["ws_alpha", "ws_beta"]) {
     await store.putWorkspace({
       workspace_id, tenant_id: "ten_default", device_id: deviceId, owner_principal_id: "prin_dev",
-      version: 1, active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      version: 1, local_generation: "wsg_00000000000000000000000000000001",
+      active: true, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
     });
   }
 

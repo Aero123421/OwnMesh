@@ -407,7 +407,7 @@ export type HandleMessageResult = {
   authenticated_agent?: {
     agent_version?: string;
     protocol_version: string;
-    workspace_ids?: string[];
+    workspaces?: Array<{ id: string; generation: string }>;
     enforce_workspace?: boolean;
   };
 };
@@ -428,27 +428,53 @@ const MAX_READY_WORKSPACES = 64;
 
 function readyWorkspaceRegistry(
   value: unknown,
-): { ids: string[]; enforce_workspace: boolean } | undefined | null {
+): { workspaces?: Array<{ id: string; generation: string }>; enforce_workspace: boolean } | undefined | null {
   if (value === undefined) return undefined;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
-  if (typeof raw.enforce_workspace !== "boolean" || !Array.isArray(raw.ids)) return null;
-  if (raw.ids.length < 1 || raw.ids.length > MAX_READY_WORKSPACES) return null;
-  const ids: string[] = [];
+  if (typeof raw.enforce_workspace !== "boolean") return null;
+  // Pre-generation Agents advertised only ids. Preserve their policy
+  // observation but never authorize or refresh a cloud workspace mapping from
+  // an id that cannot prove which local root it currently denotes.
+  if (Array.isArray(raw.ids) && raw.workspaces === undefined) {
+    if (raw.ids.length < 1 || raw.ids.length > MAX_READY_WORKSPACES) return null;
+    const legacyIds = new Set<string>();
+    for (const candidate of raw.ids) {
+      if (
+        typeof candidate !== "string" ||
+        candidate.length > 128 ||
+        !/^ws_[A-Za-z0-9_-]*$/.test(candidate) ||
+        legacyIds.has(candidate)
+      ) return null;
+      legacyIds.add(candidate);
+    }
+    if (!legacyIds.has("ws_default")) return null;
+    return { enforce_workspace: raw.enforce_workspace };
+  }
+  if (!Array.isArray(raw.workspaces)) return null;
+  if (raw.workspaces.length < 1 || raw.workspaces.length > MAX_READY_WORKSPACES) return null;
+  const workspaces: Array<{ id: string; generation: string }> = [];
   const seen = new Set<string>();
-  for (const candidate of raw.ids) {
+  for (const candidate of raw.workspaces) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+    const entry = candidate as Record<string, unknown>;
+    if (Object.keys(entry).some((key) => key !== "id" && key !== "generation")) return null;
+    const id = entry.id;
+    const generation = entry.generation;
     if (
-      typeof candidate !== "string" ||
-      candidate.length > 128 ||
-      !/^ws_[A-Za-z0-9_-]*$/.test(candidate) ||
-      seen.has(candidate)
+      typeof id !== "string" ||
+      id.length > 128 ||
+      !/^ws_[A-Za-z0-9_-]*$/.test(id) ||
+      typeof generation !== "string" ||
+      !/^wsg_[a-f0-9]{32}$/.test(generation) ||
+      seen.has(id)
     ) return null;
-    seen.add(candidate);
-    ids.push(candidate);
+    seen.add(id);
+    workspaces.push({ id, generation });
   }
   if (!seen.has("ws_default")) return null;
-  ids.sort();
-  return { ids, enforce_workspace: raw.enforce_workspace };
+  workspaces.sort((a, b) => a.id.localeCompare(b.id));
+  return { workspaces, enforce_workspace: raw.enforce_workspace };
 }
 
 type PrincipalCredentialBinding = {
@@ -456,6 +482,33 @@ type PrincipalCredentialBinding = {
   tenant_id: string;
   generation: number;
 };
+
+type WorkspaceAuthorityResult =
+  | "ok"
+  | "binding_mismatch"
+  | "workspace_authority_changed"
+  | "storage_unavailable";
+
+function workspaceAuthorityBinding(
+  payload: Record<string, unknown>,
+): { workspace_id: string | null; version: number | null } | null {
+  const authorization = payload.authorization;
+  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
+  const bound = (authorization as Record<string, unknown>).bound_action;
+  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
+  const action = bound as Record<string, unknown>;
+  if (action.workspace_id === null && action.workspace_version === null) {
+    return { workspace_id: null, version: null };
+  }
+  if (
+    typeof action.workspace_id !== "string" ||
+    !/^ws_[A-Za-z0-9_-]*$/.test(action.workspace_id) ||
+    typeof action.workspace_version !== "number" ||
+    !Number.isSafeInteger(action.workspace_version) ||
+    action.workspace_version < 1
+  ) return null;
+  return { workspace_id: action.workspace_id, version: action.workspace_version };
+}
 
 /** Extract only a complete, server-bound credential epoch from an operation. */
 function principalCredentialBinding(payload: Record<string, unknown>): PrincipalCredentialBinding | null {
@@ -1194,7 +1247,9 @@ export class DeviceRoomRouter {
             protocol_version: msg.protocol,
             ...(workspaceRegistry
               ? {
-                  workspace_ids: workspaceRegistry.ids,
+                  ...(workspaceRegistry.workspaces
+                    ? { workspaces: workspaceRegistry.workspaces }
+                    : {}),
                   enforce_workspace: workspaceRegistry.enforce_workspace,
                 }
               : {}),
@@ -2189,8 +2244,8 @@ export class DeviceRoom {
       last_seen_at: nowIso(),
     });
     if (!updated) throw new Error("device_not_active");
-    if (metadata.workspace_ids) {
-      await store.syncDeviceWorkspaces(this.deviceId, metadata.workspace_ids);
+    if (metadata.workspaces) {
+      await store.syncDeviceWorkspaces(this.deviceId, metadata.workspaces);
     }
   }
 
@@ -2222,6 +2277,40 @@ export class DeviceRoom {
     }
   }
 
+  private async workspaceAuthorityCurrent(
+    store: ControlPlaneStore,
+    payload: Record<string, unknown>,
+    operation: McpOperationRecord | null,
+  ): Promise<WorkspaceAuthorityResult> {
+    const binding = workspaceAuthorityBinding(payload);
+    if (!binding) return "binding_mismatch";
+    if (!operation) return "binding_mismatch";
+    if (binding.workspace_id === null) {
+      return operation.workspace_id !== null ? "binding_mismatch" : "ok";
+    }
+    if (
+      operation.device_id !== this.deviceId ||
+      operation.workspace_id !== binding.workspace_id ||
+      operation.action?.workspace_id !== binding.workspace_id ||
+      operation.action?.workspace_version !== binding.version
+    ) return "binding_mismatch";
+
+    // workspace.add establishes the first device-local generation. Cancellation
+    // controls must remain deliverable after a remap so they can only reduce
+    // side effects; neither exception grants access to workspace content.
+    if (operation.tool === "ownmesh_workspace_add" ||
+        operation.tool === "ownmesh_cancel_operation" ||
+        operation.tool === "__transfer_cancel_control") return "ok";
+    try {
+      const workspace = await store.getWorkspace(this.deviceId, binding.workspace_id);
+      return workspace?.active && workspace.local_generation && workspace.version === binding.version
+        ? "ok"
+        : "workspace_authority_changed";
+    } catch {
+      return "storage_unavailable";
+    }
+  }
+
   /**
    * Recheck every persisted request immediately before reconnect delivery.
    * Invalidated authority becomes a terminal durable result and is removed
@@ -2246,6 +2335,30 @@ export class DeviceRoom {
       if (operation && OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)) {
         this.router.pending.delete(pending.correlation_id);
         removed = true;
+        continue;
+      }
+
+      const workspaceCheck = await this.workspaceAuthorityCurrent(store, pending.payload, operation);
+      if (workspaceCheck === "storage_unavailable") throw new Error("storage_unavailable");
+      if (workspaceCheck !== "ok") {
+        this.router.pending.delete(pending.correlation_id);
+        removed = true;
+        await store.updateMcpOperation(
+          operationId,
+          {
+            status: "failed",
+            summary: "workspace authority changed before device delivery",
+            data: {
+              error: {
+                code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+                message: "workspace mapping changed before device delivery",
+                retryable: false,
+              },
+            },
+            approval_required: false,
+          },
+          ["pending", "running", "approval_required", "cancel_requested"],
+        );
         continue;
       }
 
@@ -2452,7 +2565,8 @@ export class DeviceRoom {
           ? body.payload.operation_id
           : correlationId;
       try {
-        const operation = await createStore(this.env).getMcpOperation(operationId);
+        const store = createStore(this.env);
+        const operation = await store.getMcpOperation(operationId);
         if (operation) {
           if (
             operation.device_id !== this.deviceId ||
@@ -2480,6 +2594,38 @@ export class DeviceRoom {
                 code: "OWNMESH_E_OPERATION_DISPATCH_FENCED",
                 operation_id: operationId,
                 operation_status: operation.status,
+              },
+            });
+          }
+          const workspaceCheck = await this.workspaceAuthorityCurrent(store, body.payload || {}, operation);
+          if (workspaceCheck === "storage_unavailable") throw new Error("storage_unavailable");
+          if (workspaceCheck !== "ok") {
+            await store.updateMcpOperation(
+              operationId,
+              {
+                status: "failed",
+                summary: "workspace authority changed before device delivery",
+                data: {
+                  error: {
+                    code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+                    message: "workspace mapping changed before device delivery",
+                    retryable: false,
+                  },
+                },
+                approval_required: false,
+              },
+              ["pending", "running", "approval_required"],
+            );
+            if (!this.router.consumeInternalNonce(opCtx.claims.nonce, opCtx.claims.exp)) {
+              return json({ error: "replay" }, { status: 401 });
+            }
+            this.router.pending.delete(correlationId);
+            await this.persistNow();
+            return json({
+              status: "rejected",
+              detail: {
+                code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+                operation_id: operationId,
               },
             });
           }

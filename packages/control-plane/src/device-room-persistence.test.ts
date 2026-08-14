@@ -1218,6 +1218,95 @@ test("credential rotation terminally removes a pending operation before Agent re
   assert.equal((await store.getMcpOperation(operationId))?.status, "failed");
 });
 
+test("workspace root remap terminally invalidates an older pending action before redelivery", async () => {
+  const { adapter, store } = openSqliteAdapter();
+  const deviceId = "dev_workspace_remap_redelivery_01";
+  await seedActiveDevice(store, deviceId);
+  await store.syncDeviceWorkspaces(deviceId, [{
+    id: "ws_default",
+    generation: "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  }]);
+  const operationId = "op_workspace_remap_redelivery_01";
+  const credentialGeneration = (await store.getPrincipal("prin_dev"))!.credential_generation;
+  const boundAction = {
+    capability: "fs.list",
+    action: "fs.list",
+    tool: "ownmesh_fs_list",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    principal_credential_generation: credentialGeneration,
+    workspace_id: "ws_default",
+    workspace_version: 1,
+    facts: { path: "." },
+  };
+  await store.putMcpOperation({
+    operation_id: operationId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_list",
+    status: "pending",
+    summary: "awaiting redelivery",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: operationId,
+    workspace_id: "ws_default",
+    action: boundAction,
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
+  const room = new DeviceRoom(mockDOState(), {
+    DB: adapter as unknown as D1Database,
+    SESSION_SECRET,
+  });
+  await room.ready;
+  room.deviceId = deviceId;
+  room.router.deviceId = deviceId;
+  const agentId = "ags_workspace_remap_redelivery";
+  room.router.registerSession({
+    role: "agent", device_id: deviceId, session_id: agentId,
+    connected_at: Date.now(), phase: "ready", remote_routing_enabled: true,
+  });
+  let sends = 0;
+  room.router.sendToSession = () => {
+    sends += 1;
+    return true;
+  };
+  room.router.pending.set(operationId, {
+    correlation_id: operationId,
+    type: "ownmesh_fs_list",
+    from_session: "http_client",
+    created_at: Date.now(),
+    payload: {
+      operation_id: operationId,
+      capability: "fs.list",
+      authorization: { bound_action: boundAction },
+    },
+  });
+
+  await store.syncDeviceWorkspaces(deviceId, [{
+    id: "ws_default",
+    generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }]);
+  assert.equal((await store.getWorkspace(deviceId, "ws_default"))?.version, 2);
+  await (room as unknown as { redeliverCurrentPending(sessionId: string): Promise<void> })
+    .redeliverCurrentPending(agentId);
+
+  assert.equal(sends, 0);
+  assert.equal(room.router.pending.has(operationId), false);
+  const failed = await store.getMcpOperation(operationId);
+  assert.equal(failed?.status, "failed");
+  assert.equal(
+    ((failed?.data.error as { code?: string } | undefined)?.code),
+    "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+  );
+});
+
 test("cancel_requested durably fences a pending operation before Agent redelivery", async () => {
   const { adapter, store } = openSqliteAdapter();
   const deviceId = "dev_cancel_fence_redelivery_01";
