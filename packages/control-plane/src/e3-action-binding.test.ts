@@ -12,6 +12,7 @@ import {
   buildCanonicalAction,
   buildDeviceOperation,
   buildDispatchOutbox,
+  hashSemanticIdempotencyAction,
   handleMcp,
   needsDispatchRedelivery,
   normalizeCommandEnv,
@@ -211,6 +212,10 @@ test("principal credential generation is durable, rotates on credential changes,
       principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3,
     });
     assert.notEqual(await hashCanonicalAction(before), await hashCanonicalAction(after));
+    assert.equal(
+      await hashSemanticIdempotencyAction(before),
+      await hashSemanticIdempotencyAction(after),
+    );
 
     const fresh = await store.issueTokens(
       "client_mcp", "prin_dev", "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device",
@@ -245,6 +250,144 @@ test("principal credential generation is durable, rotates on credential changes,
     assert.equal(bound?.principal_credential_generation, 3);
     assert.equal(routed?.payload_hash, await hashCanonicalAction(bound!));
   }
+});
+
+test("idempotency retry converges on the original operation across credential rotation", async () => {
+  const store = new MemoryStore();
+  const tok = await seedAuthed(store);
+  const deviceId = "dev_e3_rotation_retry";
+  await putActiveDevice(store, deviceId);
+  await store.issueDeviceCredential((await store.getDevice(deviceId))!, 3_600_000);
+
+  let routed = 0;
+  const router: OperationRouter = {
+    async routeToDevice() {
+      routed += 1;
+      return { status: "dispatch_uncertain" };
+    },
+  };
+  const call = async (idempotencyKey: string, id: number) => {
+    const response = await handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tok.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_fs_write",
+            arguments: {
+              device_id: deviceId,
+              workspace_id: null,
+              path: "/rotation.txt",
+              content: "same semantic action",
+              async: true,
+              idempotency_key: idempotencyKey,
+            },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      router,
+    );
+    const body = (await response.json()) as {
+      result?: { structuredContent?: Record<string, unknown> };
+    };
+    return body.result?.structuredContent || {};
+  };
+
+  const first = await call("idem_rotation_stable", 1);
+  const firstId = String(first.operation_id);
+  assert.match(firstId, /^op_/);
+  assert.equal(routed, 1);
+  assert.equal((await store.getMcpOperation(firstId))?.action?.principal_credential_generation, 1);
+
+  assert.equal(await store.advancePrincipalCredentialGeneration("prin_dev"), 2);
+  const retry = await call("idem_rotation_stable", 2);
+  assert.equal(retry.operation_id, firstId);
+  assert.equal(retry.status, "failed");
+  assert.equal(
+    ((retry.data as { error?: { code?: string } } | undefined)?.error?.code),
+    "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+  );
+  assert.equal(routed, 1, "same key must not re-execute under the new credential generation");
+  assert.equal((await store.getMcpOperation(firstId))?.action?.principal_credential_generation, 1);
+
+  const fresh = await call("idem_rotation_fresh", 3);
+  const freshId = String(fresh.operation_id);
+  assert.notEqual(freshId, firstId);
+  assert.equal(routed, 2, "execution under the new generation requires a new key");
+  assert.equal((await store.getMcpOperation(freshId))?.action?.principal_credential_generation, 2);
+});
+
+test("idempotency retry cannot redeliver an outbox after cancel_requested wins", async () => {
+  const store = new MemoryStore();
+  const tok = await seedAuthed(store);
+  const deviceId = "dev_e3_cancelled_retry";
+  await putActiveDevice(store, deviceId);
+  await store.issueDeviceCredential((await store.getDevice(deviceId))!, 3_600_000);
+
+  let routed = 0;
+  const call = async (id: number) => {
+    const response = await handleMcp(
+      new Request("https://cp.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${tok.access_token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "ownmesh_fs_write",
+            arguments: {
+              device_id: deviceId,
+              workspace_id: null,
+              path: "/cancelled-retry.txt",
+              content: "must not be redelivered",
+              async: true,
+              idempotency_key: "idem_cancelled_retry",
+            },
+          },
+        }),
+      }),
+      store,
+      new URL("https://cp.test/mcp"),
+      {
+        async routeToDevice() {
+          routed += 1;
+          return { status: "dispatch_uncertain" };
+        },
+      },
+    );
+    const body = (await response.json()) as {
+      result?: { structuredContent?: Record<string, unknown> };
+    };
+    return body.result?.structuredContent || {};
+  };
+
+  const first = await call(1);
+  const operationId = String(first.operation_id);
+  assert.equal(first.status, "pending");
+  assert.equal(routed, 1);
+  assert.equal(readDispatchOutbox((await store.getMcpOperation(operationId))?.data || {})?.state, "pending");
+  assert.ok(await store.updateMcpOperation(
+    operationId,
+    { status: "cancel_requested", summary: "cancel requested; device signal pending" },
+    ["pending"],
+  ));
+
+  const retry = await call(2);
+  assert.equal(retry.operation_id, operationId);
+  assert.equal(retry.status, "cancel_requested");
+  assert.equal(routed, 1, "cancel_requested must fence Worker outbox redelivery");
 });
 
 test("buildDeviceOperation always sets server payload_hash and wire binding fields", async () => {

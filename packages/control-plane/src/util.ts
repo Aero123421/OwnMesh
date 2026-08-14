@@ -284,8 +284,14 @@ export type InternalContextClaims = {
   body_sha256?: string;
 };
 
-/** Default / maximum internal-context lifetime (short-lived). */
+/** Maximum accepted internal-context lifetime (short-lived). */
 export const INTERNAL_CONTEXT_TTL_MS = 30_000;
+
+/**
+ * Default minted lifetime. Keep headroom below the verifier maximum so a DO
+ * whose clock is slightly behind the signer does not reject a fresh token.
+ */
+export const INTERNAL_CONTEXT_DEFAULT_TTL_MS = 25_000;
 
 /** Hard cap on remembered nonces (after TTL prune). */
 export const INTERNAL_CONTEXT_REPLAY_MAX = 4096;
@@ -447,7 +453,7 @@ export async function signInternalContext(
       throw new Error("ttl_exceeds_max");
     }
   }
-  const exp = claims.exp ?? now + (claims.ttlMs ?? INTERNAL_CONTEXT_TTL_MS);
+  const exp = claims.exp ?? now + (claims.ttlMs ?? INTERNAL_CONTEXT_DEFAULT_TTL_MS);
   if (!Number.isFinite(exp)) throw new Error("exp_invalid");
   // Enforce short maximum lifetime at sign time (explicit exp or derived).
   if (exp > now + INTERNAL_CONTEXT_TTL_MS) {

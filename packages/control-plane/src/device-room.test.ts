@@ -374,6 +374,30 @@ test("injectOperation clears pending when no ready agent", () => {
   assert.equal(room.router.status().pending, 0);
 });
 
+test("offline cancel control stays durable for Agent reconnect", () => {
+  const deviceId = "dev_cancel_queue_01abc";
+  const room = new DeviceRoomHarness(deviceId);
+  const corr = randomId("op_");
+  const routed = room.router.injectOperation({
+    type: "ownmesh_cancel_operation",
+    payload: {
+      operation_id: corr,
+      capability: "operation.cancel",
+      arguments: { target_operation_id: "op_target" },
+    },
+    correlation_id: corr,
+  });
+  assert.equal(routed.status, "pending");
+  assert.equal(room.router.pending.has(corr), true);
+
+  const agent = room.connect("agent");
+  room.router.sessions.get(agent)!.phase = "ready";
+  room.router.sessions.get(agent)!.remote_routing_enabled = true;
+  assert.equal(room.router.redeliverPendingToAgent(agent), 1);
+  const messages = room.drain(agent).map((raw) => JSON.parse(raw) as DeviceEnvelope);
+  assert.equal(messages[0]?.correlation_id, corr);
+});
+
 test("router redelivers durable pending operation.request with fresh seq after DO-authorized ready", async () => {
   const deviceId = "dev_ready_redeliv_01ab";
   const room = new DeviceRoomHarness(deviceId, () => true);

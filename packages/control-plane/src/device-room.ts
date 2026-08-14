@@ -38,6 +38,17 @@ export const OPERATION_CONTRACT_V1 = "ownmesh.operation/1.0";
 /** Default operation.request lifetime when the caller does not supply expires_at. */
 export const OPERATION_REQUEST_TTL_MS = 60_000;
 
+/** States that must never be dispatched or resurrected from room persistence. */
+const OPERATION_DISPATCH_FENCE_STATUSES = new Set([
+  "cancel_requested",
+  "completed",
+  "failed",
+  "denied",
+  "cancelled",
+  "device_offline",
+  "tombstone",
+]);
+
 /** Stream a request body with a hard cap. Returns null when oversized. */
 async function readTextLimited(request: Request, maxBytes: number): Promise<string | null> {
   if (!request.body) return "";
@@ -1419,6 +1430,9 @@ export class DeviceRoomRouter {
       return { ok: false, result: { status: "rejected", detail: { code: "OWNMESH_E_PENDING_LIMIT" } } };
     }
     const payload = op.payload || {};
+    const durableOfflineCancel =
+      op.type === "ownmesh_cancel_operation" &&
+      payload.capability === "operation.cancel";
     const addBytes = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
     if (this.totalPendingPayloadBytes() + addBytes > MAX_PENDING_PAYLOAD_BYTES) {
       return {
@@ -1426,13 +1440,15 @@ export class DeviceRoomRouter {
         result: { status: "rejected", detail: { code: "OWNMESH_E_PENDING_PAYLOAD_LIMIT" } },
       };
     }
-    // Fail closed on offline before mutating pending/seq (no half-prepared state).
+    // Fail closed on offline before mutating ordinary operations. An exact
+    // operation.cancel control is the sole exception: it must remain durable
+    // and win reconnect ordering over the fenced original request.
     // Only agents that advertised remote_routing_enabled=true count as ready for E2.
     let readyAgents = 0;
     for (const session of this.sessions.values()) {
       if (this.isRemoteRoutingAgent(session)) readyAgents++;
     }
-    if (readyAgents === 0) {
+    if (readyAgents === 0 && !durableOfflineCancel) {
       return {
         ok: false,
         result: {
@@ -1576,6 +1592,20 @@ export class DeviceRoomRouter {
         action: (prepared.envelope.payload?.arguments as Record<string, unknown> | undefined)?.action,
       },
     });
+    const pending = this.pending.get(prepared.correlation_id);
+    const durableOfflineCancel =
+      pending?.type === "ownmesh_cancel_operation" &&
+      prepared.envelope.payload?.capability === "operation.cancel";
+    if (n === 0 && durableOfflineCancel) {
+      return {
+        status: "pending",
+        detail: {
+          code: "OWNMESH_CANCEL_QUEUED_FOR_RECONNECT",
+          correlation_id: prepared.correlation_id,
+          queued_for_reconnect: true,
+        },
+      };
+    }
     if (n === 0) {
       this.pending.delete(prepared.correlation_id);
       this.notifyStateChange();
@@ -1584,7 +1614,6 @@ export class DeviceRoomRouter {
         detail: { code: "OWNMESH_E_DEVICE_OFFLINE", reason: "no_ready_agent" },
       };
     }
-    const pending = this.pending.get(prepared.correlation_id);
     if (pending) {
       pending.dispatched_at = Date.now();
       pending.dispatch_count = (pending.dispatch_count || 0) + 1;
@@ -2162,15 +2191,27 @@ export class DeviceRoom {
     let removed = false;
     for (const pending of [...this.router.pending.values()]) {
       if (pending.live_only) continue;
+      const operationId =
+        typeof pending.payload.operation_id === "string"
+          ? pending.payload.operation_id
+          : pending.correlation_id;
+
+      // The control-plane target state is authoritative at reconnect. In
+      // particular, cancel_requested is a durable fence written before the
+      // cancel signal is routed; never resurrect that original request from a
+      // DeviceRoom pending snapshot.
+      const operation = await store.getMcpOperation(operationId);
+      if (operation && OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)) {
+        this.router.pending.delete(pending.correlation_id);
+        removed = true;
+        continue;
+      }
+
       const check = await this.credentialGenerationCurrent(pending.payload);
       if (check === "ok") continue;
       if (check === "storage_unavailable") throw new Error("storage_unavailable");
       this.router.pending.delete(pending.correlation_id);
       removed = true;
-      const operationId =
-        typeof pending.payload.operation_id === "string"
-          ? pending.payload.operation_id
-          : pending.correlation_id;
       await store.updateMcpOperation(
         operationId,
         {
@@ -2343,6 +2384,7 @@ export class DeviceRoom {
       }
       const correlationId =
         body.correlation_id || opCtx.claims.correlation_id || randomId("op_");
+
       const correlationTombstone = `correlation:${correlationId}`;
       if (this.router.hasInternalNonce(correlationTombstone)) {
         if (!this.router.consumeInternalNonce(opCtx.claims.nonce, opCtx.claims.exp)) {
@@ -2359,6 +2401,53 @@ export class DeviceRoom {
           detail: { correlation_id: correlationId, deduplicated: true, completed: true },
         });
       }
+
+      // Re-read the authoritative control-plane state at the final routing
+      // boundary. This closes the race where cancellation wins after a Worker
+      // claim but before DeviceRoom accepts/sends the original operation.
+      const operationId =
+        typeof body.payload?.operation_id === "string"
+          ? body.payload.operation_id
+          : correlationId;
+      try {
+        const operation = await createStore(this.env).getMcpOperation(operationId);
+        if (operation) {
+          if (
+            operation.device_id !== this.deviceId ||
+            operation.principal_id !== opCtx.claims.principal_id ||
+            operation.tenant_id !== opCtx.claims.tenant_id
+          ) {
+            return json({ error: "binding_mismatch" }, { status: 403 });
+          }
+          if (OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)) {
+            if (!this.router.consumeInternalNonce(opCtx.claims.nonce, opCtx.claims.exp)) {
+              return json({ error: "replay" }, { status: 401 });
+            }
+            this.router.pending.delete(correlationId);
+            try {
+              // Persist the nonce and pending removal before acknowledging the
+              // fence, so hibernation cannot resurrect the request.
+              await this.persistNow();
+            } catch {
+              this.router.releaseInternalNonce(opCtx.claims.nonce);
+              return json({ error: "storage_unavailable" }, { status: 503 });
+            }
+            return json({
+              status: "rejected",
+              detail: {
+                code: "OWNMESH_E_OPERATION_DISPATCH_FENCED",
+                operation_id: operationId,
+                operation_status: operation.status,
+              },
+            });
+          }
+        }
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return json({ error: "storage_unavailable" }, { status: 503 });
+      }
+
       const existingPending = this.router.pending.get(correlationId);
       if (existingPending) {
         // Stable correlation_id is the external idempotency key (notably for

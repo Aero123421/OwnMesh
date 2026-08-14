@@ -1546,7 +1546,7 @@ test("production-path: synchronous MCP uses a bounded authoritative fast path", 
     ));
     const timeoutElapsed = Date.now() - timeoutStarted;
     assert.equal(timeout.status, "pending");
-    assert.equal(timeout.phase, "delivered");
+    assert.equal(timeout.phase, "dispatched");
     assert.ok(timeoutElapsed >= MCP_SYNC_WAIT_MS - 100, `waited only ${timeoutElapsed}ms`);
     assert.ok(timeoutElapsed < MCP_SYNC_WAIT_MS + 1_000, `waited ${timeoutElapsed}ms`);
     assert.ok(await store.getMcpOperation(String(timeout.operation_id)));

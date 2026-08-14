@@ -1659,6 +1659,7 @@ export type OpStatus =
 
 export type OperationPhase =
   | "queued"
+  | "dispatched"
   | "delivered"
   | "executing"
   | "waiting_approval"
@@ -2556,7 +2557,10 @@ function publicOperationPhase(
     case "running": phase = "executing"; break;
     case "pending": {
       const outbox = readDispatchOutbox(op.data || {});
-      phase = outbox?.state === "dispatched" ? "delivered" : "queued";
+      // DeviceRoom acceptance is durable dispatch, not proof that the Agent
+      // received the operation. Only an authoritative Agent result advances
+      // the operation to running/executing (or a terminal state).
+      phase = outbox?.state === "dispatched" ? "dispatched" : "queued";
       break;
     }
   }
@@ -3303,6 +3307,28 @@ export async function buildCanonicalAction(opts: {
     workspace_version: opts.workspaceBinding?.version ?? null,
     facts,
   };
+}
+
+/**
+ * Canonical identity used only for idempotency-key reuse decisions.
+ *
+ * The credential generation remains part of the exact dispatch action and
+ * payload hash, but is deliberately excluded here: rotating credentials does
+ * not turn an otherwise identical user action into a different semantic
+ * request. A reused key therefore converges on the original operation rather
+ * than authorizing a second execution under the new generation.
+ */
+export function semanticIdempotencyAction(
+  action: Record<string, unknown>,
+): Record<string, unknown> {
+  const { principal_credential_generation: _authorizationInstance, ...semantic } = action;
+  return semantic;
+}
+
+export async function hashSemanticIdempotencyAction(
+  action: Record<string, unknown>,
+): Promise<string> {
+  return hashCanonicalAction(semanticIdempotencyAction(action));
 }
 
 /**
@@ -4914,6 +4940,35 @@ export async function handleMcp(
       }
 
       const cancelDeviceId = tracked.device_id;
+
+      // Fence the target durably before any device/network dependency. A
+      // failed or offline cancel route must never leave the original request
+      // eligible for reconnect redelivery. Terminal-result CAS remains the
+      // winner if the Agent completed the operation before this transition.
+      const fencedTarget = await patchOp(
+        store,
+        tracker,
+        oid,
+        {
+          status: "cancel_requested",
+          summary: "cancel requested; device signal pending",
+          approval_required: false,
+        },
+        ["pending", "running", "approval_required", "cancel_requested"],
+      );
+      if (!fencedTarget) {
+        const latest = await loadOp(store, tracker, oid);
+        const env = makeEnvelope({
+          operation_id: oid,
+          status: latest?.status || "failed",
+          summary: latest?.summary || "operation changed before cancellation was fenced",
+          data: { previous: latest ? publicTrackedView(latest) : null },
+          device_id: cancelDeviceId,
+          correlation_id: latest?.correlation_id || tracked.correlation_id,
+        });
+        return mcpResult(id, toolContent(env));
+      }
+
       const gate = await store.assertDeviceOperableForMcp(
         cancelDeviceId,
         rec.principal,
@@ -4935,7 +4990,7 @@ export async function handleMcp(
               retryable: true,
               operation_id: oid,
             },
-            previous: publicTrackedView(tracked),
+            previous: publicTrackedView(fencedTarget),
           },
           correlation_id: tracked.correlation_id,
         });
@@ -4991,7 +5046,7 @@ export async function handleMcp(
         tenant_id: rec.tenant_id,
         payload_hash: cancelDeviceOp.payload_hash,
         idempotency_key: cancelIdem,
-        workspace_id: tracked.workspace_id ?? null,
+        workspace_id: fencedTarget.workspace_id ?? null,
         expires_at: cancelExpiresAt,
         claim_version: 1,
         action: cancelDeviceOp.canonical_action,
@@ -5042,9 +5097,9 @@ export async function handleMcp(
       // Action-binding guard on cancel claim reuse.
       if (cancelClaim.outcome === "existing") {
         const priorHash = cancelClaim.op.action
-          ? await hashCanonicalAction(cancelClaim.op.action)
+          ? await hashSemanticIdempotencyAction(cancelClaim.op.action)
           : cancelClaim.op.payload_hash || "";
-        const wantHash = await hashCanonicalAction(cancelDeviceOp.canonical_action);
+        const wantHash = await hashSemanticIdempotencyAction(cancelDeviceOp.canonical_action);
         if (priorHash && priorHash !== wantHash) {
           const env = makeEnvelope({
             operation_id: cancelOpId,
@@ -5095,22 +5150,25 @@ export async function handleMcp(
           routed.status === "running" ||
           routed.status === "completed"
         ) {
+          const cancelConfirmed = routed.status === "completed";
           const marked = await patchOp(
             store,
             tracker,
             cancelRow.operation_id,
             {
               data: markDispatchOutboxDispatched(cancelRow.data || {}),
-              status: "completed",
-              summary: "cancel delivered to device",
+              status: cancelConfirmed ? "completed" : cancelRow.status,
+              summary: cancelConfirmed
+                ? "cancel confirmed by device"
+                : "cancel dispatched to device room",
             },
             ["pending", "running", "cancel_requested"],
           );
           if (marked) cancelRow = marked;
         } else if (routed.status === "dispatch_uncertain") {
           // Body may already be durable in DeviceRoom — keep cancel outbox pending
-          // for identical retry redelivery. Do NOT mark the target cancel_requested
-          // until a confirmed route (uncertain ≠ confirmed).
+          // for identical retry redelivery. The target was already fenced before
+          // routing, so reconnect cannot run the original operation.
           const noted = await patchOp(
             store,
             tracker,
@@ -5141,15 +5199,15 @@ export async function handleMcp(
                 details: routed.detail ?? { status: routed.status },
               },
               cancel_operation_id: cancelRow.operation_id,
-              previous: publicTrackedView(tracked),
+              previous: publicTrackedView(fencedTarget),
               route_status: "dispatch_uncertain",
             },
-            correlation_id: tracked.correlation_id,
+            correlation_id: fencedTarget.correlation_id,
           });
           return mcpResult(id, toolContent(env));
         } else {
-          // Reject/error: keep cancel claim pending with outbox for retry; do not
-          // mutate the target operation.
+          // Reject/error: keep cancel claim pending with outbox for retry. The
+          // target remains durably fenced as cancel_requested.
           const detailObj =
             routed.detail && typeof routed.detail === "object"
               ? (routed.detail as Record<string, unknown>)
@@ -5176,23 +5234,24 @@ export async function handleMcp(
                 details: routed.detail ?? { status: routed.status },
               },
               cancel_operation_id: cancelRow.operation_id,
-              previous: publicTrackedView(tracked),
+              previous: publicTrackedView(fencedTarget),
               route_status: routed.status,
             },
-            correlation_id: tracked.correlation_id,
+            correlation_id: fencedTarget.correlation_id,
           });
           return mcpResult(id, toolContent(env));
         }
       }
 
-      // Confirmed delivery (or prior successful cancel claim): mark target.
+      // Keep the target fenced until an authoritative Agent result wins the
+      // terminal CAS. DeviceRoom acceptance alone is not device delivery.
       const updatedTarget = await patchOp(
         store,
         tracker,
         oid,
         {
           status: "cancel_requested",
-          summary: "cancel requested on device",
+          summary: "cancel requested; device signal pending",
           approval_required: false,
         },
         ["pending", "running", "approval_required", "cancel_requested"],
@@ -5431,7 +5490,7 @@ export async function handleMcp(
       injectionAttempt,
       workspaceBinding,
     });
-    const actionHash = await hashCanonicalAction(deviceOp.canonical_action);
+    const actionHash = await hashSemanticIdempotencyAction(deviceOp.canonical_action);
 
     const dispatchOutbox = buildDispatchOutbox(deviceOp);
     // Fail closed before claim when the immutable dispatch body cannot be stored
@@ -5534,7 +5593,7 @@ export async function handleMcp(
     if (claim.outcome === "existing") {
       const prior = claim.op;
       const priorActionHash = prior.action
-        ? await hashCanonicalAction(prior.action)
+        ? await hashSemanticIdempotencyAction(prior.action)
         : prior.payload_hash || "";
       if (priorActionHash && priorActionHash !== actionHash) {
         const env = makeEnvelope({
@@ -5584,7 +5643,7 @@ export async function handleMcp(
       tracker.put(replayed);
       // E3 crash-safe dispatch: if the claim was accepted but never marked
       // dispatched, redeliver the original bound body exactly once per retry.
-      if (router && needsDispatchRedelivery(replayed)) {
+      if (router && replayed.status !== "cancel_requested" && needsDispatchRedelivery(replayed)) {
         const box = readDispatchOutbox(replayed.data || {});
         if (box) {
           if (!(await boundCredentialGenerationCurrent(store, box.body))) {
@@ -5712,6 +5771,14 @@ export async function handleMcp(
         approval_id: env.approval_id,
       });
       return mcpResult(id, toolContent(finalOp));
+    }
+
+    // Cancellation may race the narrow claim→route interval. Observe the
+    // durable fence once more before entering DeviceRoom; DeviceRoom repeats
+    // this check at its final dispatch boundary.
+    const beforeRoute = await loadOp(store, tracker, operationId);
+    if (beforeRoute?.status === "cancel_requested") {
+      return mcpResult(id, toolContent(beforeRoute));
     }
 
     if (!(await boundCredentialGenerationCurrent(store, deviceOp))) {
