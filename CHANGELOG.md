@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v1.2.8 — Git workspace binding
+
+- Relative Git operations now fail closed when repository-local configuration
+  redirects the worktree outside the selected OwnMesh workspace.
+- Valid linked worktrees and explicit absolute Full Access operations retain
+  their existing behavior.
+
 ## v1.2.7 — Windows installer reliability
 
 - The verified PowerShell installer now retries only transient Windows
