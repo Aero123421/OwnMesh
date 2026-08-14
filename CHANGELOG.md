@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.2.10 — Full Access routing compatibility
+
+- Explicit `workspace_id: null` remains the public Full Access selection but is
+  normalized to the schema-compatible omitted field on the internal Agent wire,
+  preventing valid unbound operations from disconnecting the Agent.
+- Device cancel controls remain workspace-independent while retaining their
+  exact target, principal, tenant, device, and idempotency bindings, so online
+  cancellation reaches workspace-bound operations.
+
 ## v1.2.9 — Runtime and workspace authority
 
 - Workspace records are device-scoped and synchronized from authenticated

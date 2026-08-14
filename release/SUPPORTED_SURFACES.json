@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "release_train": "1.2.9",
+  "release_train": "1.2.10",
   "completeness_claim": true,
   "supported": [
     "status",
@@ -30,5 +30,5 @@
   "explicit_unsupported_surfaces": [],
   "additional_unsupported": [],
   "total_unsupported_surfaces": 0,
-  "notes": "v1.2.9 stable surface contract. Completeness means every CLI surface admitted by this shipped registry has an implemented, fail-closed handler; it is not a claim that the aspirational specification, every optional packaging format, or every external platform receipt is complete. E5 provides bounded PTY/process-tree and replay behavior. E6 provides nine structured profile adapters plus CLI profile flows. E7 provides bounded unified-diff review execution. E9 provides authenticated resumable transfer and the public transfer CLI. Device metadata mutation, authenticated remote exec/session creation, approval watch, profile management, bounded MCP stdio, and typed security-admin actions are supported. Sensitive approval, policy, unlock, and token mutations require an operation-bound fresh passkey decision and execute exactly once. E8's networkless broker lifecycle is implemented on Linux, macOS, and Windows; Linux has a native root receipt, while macOS/Windows native release receipts and the full E8 public-route receipt remain open evidence. Live ChatGPT DCR/OAuth/passkey return has a manual compatibility receipt; reproducible automated E10 evidence remains open. SERVICE_VERSION 1.2.9."
+  "notes": "v1.2.10 stable surface contract. Completeness means every CLI surface admitted by this shipped registry has an implemented, fail-closed handler; it is not a claim that the aspirational specification, every optional packaging format, or every external platform receipt is complete. E5 provides bounded PTY/process-tree and replay behavior. E6 provides nine structured profile adapters plus CLI profile flows. E7 provides bounded unified-diff review execution. E9 provides authenticated resumable transfer and the public transfer CLI. Device metadata mutation, authenticated remote exec/session creation, approval watch, profile management, bounded MCP stdio, and typed security-admin actions are supported. Sensitive approval, policy, unlock, and token mutations require an operation-bound fresh passkey decision and execute exactly once. E8's networkless broker lifecycle is implemented on Linux, macOS, and Windows; Linux has a native root receipt, while macOS/Windows native release receipts and the full E8 public-route receipt remain open evidence. Live ChatGPT DCR/OAuth/passkey return has a manual compatibility receipt; reproducible automated E10 evidence remains open. SERVICE_VERSION 1.2.10."
 }
