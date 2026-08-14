@@ -1349,6 +1349,26 @@ test("cancel_requested durably fences a pending operation before Agent redeliver
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   });
+  const nonterminalId = "op_nonterminal_pending_01";
+  await store.putMcpOperation({
+    operation_id: nonterminalId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "pending",
+    summary: "still authoritative",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: nonterminalId,
+    action: boundAction,
+    policy_authority: "ownmesh_device",
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  });
   const room = new DeviceRoom(mockDOState(), {
     DB: adapter as unknown as D1Database,
     SESSION_SECRET,
@@ -1361,9 +1381,9 @@ test("cancel_requested durably fences a pending operation before Agent redeliver
     role: "agent", device_id: deviceId, session_id: agentId,
     connected_at: Date.now(), phase: "ready", remote_routing_enabled: true,
   });
-  let sends = 0;
-  room.router.sendToSession = () => {
-    sends += 1;
+  const sends: DeviceEnvelope[] = [];
+  room.router.sendToSession = (_sessionId, data) => {
+    sends.push(JSON.parse(data) as DeviceEnvelope);
     return true;
   };
   room.router.pending.set(operationId, {
@@ -1381,9 +1401,20 @@ test("cancel_requested durably fences a pending operation before Agent redeliver
   await (room as unknown as { redeliverCurrentPending(sessionId: string): Promise<void> })
     .redeliverCurrentPending(agentId);
 
-  assert.equal(sends, 0);
+  assert.equal(sends.length, 0);
   assert.equal(room.router.pending.has(operationId), false);
   assert.equal((await store.getMcpOperation(operationId))?.status, "cancel_requested");
+
+  await (room as unknown as {
+    reconcileAgentPending(sessionId: string, correlations: string[]): Promise<void>;
+  }).reconcileAgentPending(agentId, [
+    operationId,
+    nonterminalId,
+    "op_unconfirmed_missing_01",
+  ]);
+  assert.equal(sends.length, 1);
+  assert.equal(sends[0]?.type, "operation.reconcile");
+  assert.deepEqual(sends[0]?.payload.terminal_correlations, [operationId]);
 });
 
 test("DeviceRoom refuses a newly routed operation after the control-plane cancel fence wins", async () => {

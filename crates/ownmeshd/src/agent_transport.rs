@@ -1498,6 +1498,13 @@ async fn perform_handshake(
         "agent_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": PROTOCOL_DEVICE_V1,
         "remote_routing_enabled": remote_routing_enabled,
+        // The authenticated control plane uses these bounded correlations only
+        // to return authoritative terminal tombstones. It must never ask the
+        // Agent to purge an unconfirmed or non-terminal operation.
+        "pending_correlations": state.pending_dispatches
+            .iter()
+            .map(|pending| pending.correlation_id.clone())
+            .collect::<Vec<_>>(),
     });
     if let (Some((enforce_workspace, workspaces)), Some(object)) =
         (workspace_registry, ready_payload.as_object_mut())
@@ -1605,6 +1612,39 @@ fn operation_expired_reply(operation_id: &ownmesh_domain::OperationId) -> Value 
             "retryable": false
         }
     })
+}
+
+fn authoritative_terminal_correlations(payload: &Value) -> Result<Vec<String>, String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "operation.reconcile payload must be an object".to_owned())?;
+    if object.keys().any(|key| key != "terminal_correlations") {
+        return Err("operation.reconcile payload contains an unknown field".into());
+    }
+    let correlations = object
+        .get("terminal_correlations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "operation.reconcile requires terminal_correlations".to_owned())?;
+    if correlations.len() > MAX_PENDING_DISPATCHES {
+        return Err(format!(
+            "operation.reconcile exceeds {MAX_PENDING_DISPATCHES} correlations"
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut validated = Vec::with_capacity(correlations.len());
+    for correlation in correlations {
+        let raw = correlation
+            .as_str()
+            .ok_or_else(|| "operation.reconcile correlation must be a string".to_owned())?;
+        let parsed = ownmesh_domain::OperationId::parse(raw).map_err(|_| {
+            "operation.reconcile correlation is not a valid operation id".to_owned()
+        })?;
+        if !seen.insert(parsed.to_string()) {
+            return Err("operation.reconcile contains a duplicate correlation".into());
+        }
+        validated.push(parsed.to_string());
+    }
+    Ok(validated)
 }
 
 fn dispatch_outcome_unknown_reply(operation_id: &ownmesh_domain::OperationId) -> Value {
@@ -1879,6 +1919,17 @@ async fn handle_live_frame(
                 envelope.correlation_id.as_deref(),
             )
             .await
+        }
+        "operation.reconcile" => {
+            let correlations = authoritative_terminal_correlations(&envelope.payload)?;
+            let before = state.pending_dispatches.len();
+            for correlation in correlations {
+                state.clear_pending_by_correlation(&correlation);
+            }
+            if state.pending_dispatches.len() != before {
+                state.save(&config.state_path)?;
+            }
+            Ok(())
         }
         "operation.request" => {
             let correlation = envelope
@@ -4508,6 +4559,27 @@ mod tests {
         OperationEnvelope::parse_str(&started_raw).unwrap();
         parse_and_record_inbound(&started_raw, &config, &mut state).unwrap();
         state.mark_dispatch_started("op_bind_test").unwrap();
+        let stale_terminal_raw = test_operation_request_raw(
+            &device,
+            4,
+            "msg_authoritative_terminal",
+            "op_authoritative_terminal",
+            Timestamp::now()
+                .checked_add(Duration::from_secs(120))
+                .unwrap(),
+        );
+        state
+            .remember_pending(PendingDispatch {
+                message_id: "msg_authoritative_terminal".into(),
+                correlation_id: "op_authoritative_terminal".into(),
+                operation_id: "op_authoritative_terminal".into(),
+                raw: stale_terminal_raw,
+                accepted_at: Timestamp::now().to_rfc3339(),
+                transfer_session_lost: false,
+                expires_at: None,
+                dispatch_started: Some(false),
+            })
+            .unwrap();
         state.save(&config.state_path).unwrap();
         let saved: Value =
             serde_json::from_slice(&std::fs::read(&config.state_path).unwrap()).unwrap();
@@ -4560,7 +4632,7 @@ mod tests {
                 if connection_index == 1 {
                     assert_eq!(
                         hello.payload["resume"]["last_server_seq"].as_u64(),
-                        Some(10)
+                        Some(11)
                     );
                     assert!(hello.payload["resume"]["next_outbound_seq"]
                         .as_u64()
@@ -4611,6 +4683,17 @@ mod tests {
                 let ready = receive_test_envelope(&mut socket).await;
                 assert_eq!(ready.message_type, "ready");
                 assert_eq!(ready.payload["remote_routing_enabled"], Value::Bool(true));
+                let pending_correlations =
+                    ready.payload["pending_correlations"].as_array().unwrap();
+                if connection_index == 0 {
+                    assert!(pending_correlations
+                        .iter()
+                        .any(|value| value == "op_authoritative_terminal"));
+                } else {
+                    assert!(!pending_correlations
+                        .iter()
+                        .any(|value| value == "op_authoritative_terminal"));
+                }
 
                 server_seq += 1;
                 send_test_envelope(
@@ -4632,6 +4715,19 @@ mod tests {
                             .await
                             .is_err()
                     );
+
+                    server_seq += 1;
+                    send_test_envelope(
+                        &mut socket,
+                        &server_device,
+                        server_seq,
+                        "operation.reconcile",
+                        json!({
+                            "terminal_correlations": ["op_authoritative_terminal"]
+                        }),
+                        None,
+                    )
+                    .await;
 
                     server_seq += 1;
                     send_test_operation_redelivery(
@@ -4760,7 +4856,7 @@ mod tests {
         let persisted =
             AgentTransportState::load(&config.state_path, &config.issuer, &config.device_id)
                 .unwrap();
-        assert_eq!(persisted.last_server_seq, 15);
+        assert_eq!(persisted.last_server_seq, 16);
         assert_eq!(persisted.completed_replies.len(), 4);
         assert!(persisted.pending_dispatches.is_empty());
         assert!(persisted.completed("op_loopback").is_some());

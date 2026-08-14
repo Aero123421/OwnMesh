@@ -403,6 +403,8 @@ export type HandleMessageResult = {
   expired_pending?: PendingOperation[];
   /** Ready Agent whose durable pending work must be revalidated by the DO. */
   agent_ready_session_id?: string;
+  /** Agent-local crash outbox correlations offered for authoritative cleanup. */
+  agent_pending_correlations?: string[];
   /** Metadata observed only after this Agent has completed proof and ready. */
   authenticated_agent?: {
     agent_version?: string;
@@ -413,6 +415,24 @@ export type HandleMessageResult = {
 };
 
 const MAX_AGENT_VERSION_LENGTH = 128;
+
+function readyPendingCorrelations(value: unknown): string[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 64) return null;
+  const seen = new Set<string>();
+  const correlations: string[] = [];
+  for (const candidate of value) {
+    if (
+      typeof candidate !== "string" ||
+      candidate.length > 128 ||
+      !/^op_[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidate) ||
+      seen.has(candidate)
+    ) return null;
+    seen.add(candidate);
+    correlations.push(candidate);
+  }
+  return correlations;
+}
 
 function readyAgentVersion(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -1209,8 +1229,12 @@ export class DeviceRoomRouter {
         if (att.role !== "agent" || att.phase !== "proven") return { ok: false, error: "invalid_state" };
         const agentVersion = readyAgentVersion(msg.payload.agent_version);
         const workspaceRegistry = readyWorkspaceRegistry(msg.payload.workspace_registry);
+        const pendingCorrelations = readyPendingCorrelations(msg.payload.pending_correlations);
         if (workspaceRegistry === null) {
           return { ok: false, error: "invalid_workspace_registry" };
+        }
+        if (pendingCorrelations === null) {
+          return { ok: false, error: "invalid_pending_correlations" };
         }
         att.phase = "ready";
         att.remote_routing_enabled = msg.payload.remote_routing_enabled === true;
@@ -1240,6 +1264,7 @@ export class DeviceRoomRouter {
         return {
           ok: true,
           expired_pending: expired,
+          ...(pendingCorrelations ? { agent_pending_correlations: pendingCorrelations } : {}),
           authenticated_agent: {
             ...(agentVersion ? { agent_version: agentVersion } : {}),
             // The envelope protocol was validated before the proof/ready state
@@ -2316,7 +2341,10 @@ export class DeviceRoom {
    * Invalidated authority becomes a terminal durable result and is removed
    * before any Agent socket is sent a frame.
    */
-  private async redeliverCurrentPending(sessionId: string): Promise<void> {
+  private async redeliverCurrentPending(
+    sessionId: string,
+    agentPendingCorrelations: string[] = [],
+  ): Promise<void> {
     if (!this.env.DB) throw new Error("storage_unavailable");
     const store = createStore(this.env);
     let removed = false;
@@ -2387,8 +2415,39 @@ export class DeviceRoom {
     // Persist removals before delivery; otherwise hibernation could resurrect
     // an invalid pending operation after a successful generation check.
     if (removed) await this.persistNow();
+    await this.reconcileAgentPending(sessionId, agentPendingCorrelations);
     const redelivered = this.router.redeliverPendingToAgent(sessionId);
     if (redelivered > 0) await this.persistNow();
+  }
+
+  /**
+   * Return only D1-authoritative terminal/fenced correlations reported by this
+   * authenticated Agent. Missing, foreign-device and non-terminal operations
+   * are intentionally omitted: the Agent must never purge unconfirmed work.
+   */
+  private async reconcileAgentPending(
+    sessionId: string,
+    correlations: string[],
+  ): Promise<void> {
+    if (!this.env.DB || correlations.length === 0) return;
+    const store = createStore(this.env);
+    const terminalCorrelations: string[] = [];
+    for (const correlation of correlations) {
+      const operation = await store.getMcpOperation(correlation);
+      if (
+        operation?.device_id === this.deviceId &&
+        OPERATION_DISPATCH_FENCE_STATUSES.has(operation.status)
+      ) {
+        terminalCorrelations.push(correlation);
+      }
+    }
+    if (terminalCorrelations.length === 0) return;
+    const envelope = this.router.nextEnvelope("operation.reconcile", {
+      terminal_correlations: terminalCorrelations,
+    });
+    // A failed send is safe: the Agent reports the still-durable correlations
+    // again on its next authenticated ready handshake.
+    this.router.sendToSession(sessionId, JSON.stringify(envelope));
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -3142,9 +3201,12 @@ export class DeviceRoom {
       }
     }
 
-    if (result.ok && result.agent_ready_session_id) {
+    // Pending TTL/expiry must reach D1 before Agent outbox reconciliation, so
+    // an expired correlation is an authoritative terminal tombstone on this
+    // same reconnect rather than requiring a second connection.
+    if (result.ok && result.expired_pending && result.expired_pending.length > 0) {
       try {
-        await this.redeliverCurrentPending(result.agent_ready_session_id);
+        await this.reconcileExpiredPending(result.expired_pending);
       } catch {
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
@@ -3152,10 +3214,12 @@ export class DeviceRoom {
       }
     }
 
-    // Pending TTL/expiry must surface a terminal MCP status (never silent drop).
-    if (result.ok && result.expired_pending && result.expired_pending.length > 0) {
+    if (result.ok && result.agent_ready_session_id) {
       try {
-        await this.reconcileExpiredPending(result.expired_pending);
+        await this.redeliverCurrentPending(
+          result.agent_ready_session_id,
+          result.agent_pending_correlations || [],
+        );
       } catch {
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
