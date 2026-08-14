@@ -21,10 +21,10 @@ regexes = ['''^logs-winevt-1$''']
 paths = ['''^crates/ownmeshd/src/daemon\.rs$''']
 
 [[rules.allowlists]]
-description = "Fixed idempotency value in the Agent binding regression test"
+description = "Fixed idempotency value in the unbound diagnosis regression test"
 condition = "AND"
 regexTarget = "secret"
-regexes = ['''^idem_bind_test$''']
+regexes = ['''^idem_diagnose_unbound_1$''']
 paths = ['''^crates/ownmeshd/src/agent_transport\.rs$''']
 
 [[rules.allowlists]]
