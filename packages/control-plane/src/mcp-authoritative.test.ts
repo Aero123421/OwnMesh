@@ -182,6 +182,8 @@ test("schemaReadiness tracks 0005 MCP objects for both store kinds", async () =>
   assert.equal(memR.checks.mcp_operations, true);
   assert.equal(memR.checks.mcp_approval_transactions, true);
   assert.equal(memR.checks.mcp_approval_outbox, true);
+  assert.equal(memR.checks.device_workspaces, true);
+  assert.equal(memR.checks.device_workspace_members, true);
 
   const sql = openSqlStore();
   const sqlR = await sql.schemaReadiness();
@@ -189,6 +191,8 @@ test("schemaReadiness tracks 0005 MCP objects for both store kinds", async () =>
   assert.equal(sqlR.checks.mcp_operations, true);
   assert.equal(sqlR.checks.mcp_approval_transactions, true);
   assert.equal(sqlR.checks.mcp_approval_outbox, true);
+  assert.equal(sqlR.checks.device_workspaces, true);
+  assert.equal(sqlR.checks.device_workspace_members, true);
 });
 
 test("public MCP workspace custody denies a tenant member and binds owner action version", async () => {
@@ -231,6 +235,78 @@ test("public MCP workspace custody denies a tenant member and binds owner action
   assert.equal(ownerResult.status, 200);
   assert.equal(bound?.workspace_id, "owner-root");
   assert.equal(bound?.workspace_version, 7);
+});
+
+test("workspace custody is device-scoped and ready reconciliation is fail-closed", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await seedAuthed(store);
+    const first = "dev_same_default_a_01";
+    const second = "dev_same_default_b_01";
+    await putActiveDevice(store, first);
+    await putActiveDevice(store, second);
+
+    assert.equal((await store.getWorkspace(first, "ws_default"))?.device_id, first);
+    assert.equal((await store.getWorkspace(second, "ws_default"))?.device_id, second);
+    assert.equal(
+      (await store.assertWorkspaceOperableForMcp(
+        "ws_default",
+        second,
+        "prin_dev",
+        "ten_default",
+      )).ok,
+      true,
+    );
+
+    await store.syncDeviceWorkspaces(first, ["ws_default", "ws_cli"]);
+    assert.equal((await store.getWorkspace(first, "ws_cli"))?.active, true);
+    assert.equal(await store.getWorkspace(second, "ws_cli"), null);
+
+    // Missing from one ready snapshot must not cancel a cloud reservation that
+    // may be waiting for reconnect delivery.
+    await store.syncDeviceWorkspaces(first, ["ws_default"]);
+    assert.equal((await store.getWorkspace(first, "ws_cli"))?.version, 1);
+    const inactive = await store.getWorkspace(first, "ws_cli");
+    assert.ok(inactive);
+    await store.putWorkspace({ ...inactive, active: false, version: 2 });
+    await store.syncDeviceWorkspaces(first, ["ws_default", "ws_cli"]);
+    assert.equal((await store.getWorkspace(first, "ws_cli"))?.version, 3);
+  }
+});
+
+test("default workspace reservation is idempotent after a partial enrollment retry", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await seedAuthed(store);
+    const deviceId = `dev_enroll_retry_${store.kind}`;
+    const createdAt = new Date().toISOString();
+    await store.putDevice({
+      id: deviceId,
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      name: deviceId,
+      hostname: deviceId,
+      os: "test",
+      arch: "x64",
+      agent_version: "1",
+      protocol_version: "ownmesh.device/1.0",
+      public_key: "ab".repeat(32),
+      revoked: false,
+      created_at: createdAt,
+      status: "pending",
+    });
+    const reservation = {
+      workspace_id: "ws_default",
+      tenant_id: "ten_default",
+      device_id: deviceId,
+      owner_principal_id: "prin_dev",
+      version: 1,
+      active: true,
+      created_at: createdAt,
+      updated_at: createdAt,
+    };
+    await store.putWorkspace(reservation);
+    await store.putWorkspace(reservation);
+    assert.deepEqual(await store.getWorkspace(deviceId, "ws_default"), reservation);
+  }
 });
 
 test("store is authoritative: empty tracker still polls after isolate restart", async () => {

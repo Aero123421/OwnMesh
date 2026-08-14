@@ -1413,7 +1413,12 @@ async fn connect_and_run(
         }
     };
 
-    perform_handshake(&mut socket, config, state, runtime.is_some()).await?;
+    let workspace_registry = if let Some(runtime) = runtime {
+        Some(runtime.lock().await.remote_workspace_registry())
+    } else {
+        None
+    };
+    perform_handshake(&mut socket, config, state, workspace_registry.as_ref()).await?;
     *reached_ready = true;
     tracing::info!(
         issuer = %ownmesh_config::redact_control_plane_url(&config.issuer),
@@ -1428,8 +1433,9 @@ async fn perform_handshake(
     socket: &mut AgentSocket,
     config: &AgentTransportConfig,
     state: &mut AgentTransportState,
-    remote_routing_enabled: bool,
+    workspace_registry: Option<&(bool, Vec<String>)>,
 ) -> Result<(), String> {
+    let remote_routing_enabled = workspace_registry.is_some();
     let resume = json!({
         "last_server_seq": state.last_server_seq,
         "next_outbound_seq": state.next_outbound_seq,
@@ -1484,23 +1490,27 @@ async fn perform_handshake(
     } else {
         json!([])
     };
-    send_envelope(
-        socket,
-        config,
-        state,
-        "ready",
-        json!({
-            "capabilities": capabilities,
-            "operation_contracts": [OPERATION_CONTRACT_V1],
-            // DeviceRoom records display metadata only after proof+ready, not
-            // from the unauthenticated hello envelope.
-            "agent_version": env!("CARGO_PKG_VERSION"),
-            "protocol_version": PROTOCOL_DEVICE_V1,
-            "remote_routing_enabled": remote_routing_enabled,
-        }),
-        None,
-    )
-    .await?;
+    let mut ready_payload = json!({
+        "capabilities": capabilities,
+        "operation_contracts": [OPERATION_CONTRACT_V1],
+        // DeviceRoom records display/security metadata only after proof+ready,
+        // not from the unauthenticated hello envelope.
+        "agent_version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": PROTOCOL_DEVICE_V1,
+        "remote_routing_enabled": remote_routing_enabled,
+    });
+    if let (Some((enforce_workspace, workspace_ids)), Some(object)) =
+        (workspace_registry, ready_payload.as_object_mut())
+    {
+        object.insert(
+            "workspace_registry".into(),
+            json!({
+                "enforce_workspace": enforce_workspace,
+                "ids": workspace_ids,
+            }),
+        );
+    }
+    send_envelope(socket, config, state, "ready", ready_payload, None).await?;
     let _ = wait_for_type(socket, config, state, "ready.ack").await?;
     Ok(())
 }
@@ -3011,10 +3021,12 @@ fn map_request_to_method(
     Ok((method, Value::Object(args)))
 }
 
-/// Remote diagnosis, filesystem, Git, and command actions must carry the exact workspace
-/// selected by the control plane. The sole exception is an explicit absolute
-/// path/cwd compatibility request: it remains unbound (`workspace_id = null`)
-/// and the runtime admits it only in Full Access, never as `ws_default`.
+/// Filesystem, Git, and command actions must carry the exact workspace selected
+/// by the control plane. An explicit absolute path/cwd compatibility request
+/// remains unbound (`workspace_id = null`) and the runtime admits it only in
+/// Full Access, never as `ws_default`. The other unbound exception is the
+/// read-only system diagnosis itself: it accesses no path and reports the
+/// restricted/Full Access boundary as a fixed enum.
 fn require_workspace_binding_for_remote_action(
     request: &OperationRequestPayload,
     action: &str,
@@ -3047,7 +3059,10 @@ fn require_workspace_binding_for_remote_action(
             | ("git.status" | "git.diff" | "git", _)
             | ("command.run", _)
     );
-    if !workspace_scoped || request.workspace_id.is_some() {
+    if !workspace_scoped
+        || request.workspace_id.is_some()
+        || request.capability == "system.diagnose"
+    {
         return Ok(());
     }
 
@@ -3066,10 +3081,7 @@ fn require_workspace_binding_for_remote_action(
     if absolute {
         Ok(())
     } else {
-        Err(
-            "workspace_id is required for remote diagnosis, filesystem, Git, and command actions"
-                .into(),
-        )
+        Err("workspace_id is required for remote filesystem, Git, and command actions".into())
     }
 }
 
@@ -5025,6 +5037,23 @@ mod tests {
             .unwrap()
             .insert("workspace_id".into(), json!("ws_attacker"));
         assert!(map_request_to_method(&unscoped).is_err());
+    }
+
+    #[test]
+    fn unbound_system_diagnosis_maps_without_aliasing_a_default_workspace() {
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_diagnose_unbound_1").unwrap(),
+            capability: "system.diagnose".into(),
+            workspace_id: None,
+            idempotency_key: "idem_diagnose_unbound_1".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({ "action": "system.diagnose" }),
+        };
+        let (method, mapped) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, crate::runtime::ops_methods::SYSTEM_DIAGNOSE);
+        assert!(mapped.get("workspace_id").is_none());
     }
 
     #[test]

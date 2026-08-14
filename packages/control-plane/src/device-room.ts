@@ -407,6 +407,8 @@ export type HandleMessageResult = {
   authenticated_agent?: {
     agent_version?: string;
     protocol_version: string;
+    workspace_ids?: string[];
+    enforce_workspace?: boolean;
   };
 };
 
@@ -420,6 +422,33 @@ function readyAgentVersion(value: unknown): string | undefined {
     return undefined;
   }
   return version;
+}
+
+const MAX_READY_WORKSPACES = 64;
+
+function readyWorkspaceRegistry(
+  value: unknown,
+): { ids: string[]; enforce_workspace: boolean } | undefined | null {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.enforce_workspace !== "boolean" || !Array.isArray(raw.ids)) return null;
+  if (raw.ids.length < 1 || raw.ids.length > MAX_READY_WORKSPACES) return null;
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of raw.ids) {
+    if (
+      typeof candidate !== "string" ||
+      candidate.length > 128 ||
+      !/^ws_[A-Za-z0-9_-]*$/.test(candidate) ||
+      seen.has(candidate)
+    ) return null;
+    seen.add(candidate);
+    ids.push(candidate);
+  }
+  if (!seen.has("ws_default")) return null;
+  ids.sort();
+  return { ids, enforce_workspace: raw.enforce_workspace };
 }
 
 type PrincipalCredentialBinding = {
@@ -1126,6 +1155,10 @@ export class DeviceRoomRouter {
       case "ready": {
         if (att.role !== "agent" || att.phase !== "proven") return { ok: false, error: "invalid_state" };
         const agentVersion = readyAgentVersion(msg.payload.agent_version);
+        const workspaceRegistry = readyWorkspaceRegistry(msg.payload.workspace_registry);
+        if (workspaceRegistry === null) {
+          return { ok: false, error: "invalid_workspace_registry" };
+        }
         att.phase = "ready";
         att.remote_routing_enabled = msg.payload.remote_routing_enabled === true;
         this.sessions.set(sessionId, att);
@@ -1159,6 +1192,12 @@ export class DeviceRoomRouter {
             // The envelope protocol was validated before the proof/ready state
             // transition; do not trust a second payload claim for this value.
             protocol_version: msg.protocol,
+            ...(workspaceRegistry
+              ? {
+                  workspace_ids: workspaceRegistry.ids,
+                  enforce_workspace: workspaceRegistry.enforce_workspace,
+                }
+              : {}),
           },
           ...(att.remote_routing_enabled === true ? { agent_ready_session_id: sessionId } : {}),
         };
@@ -2150,6 +2189,9 @@ export class DeviceRoom {
       last_seen_at: nowIso(),
     });
     if (!updated) throw new Error("device_not_active");
+    if (metadata.workspace_ids) {
+      await store.syncDeviceWorkspaces(this.deviceId, metadata.workspace_ids);
+    }
   }
 
   /**

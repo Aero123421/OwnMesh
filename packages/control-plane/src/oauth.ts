@@ -1139,6 +1139,20 @@ export async function handleDevices(
       public_key: encodeDevicePublicKey(body.public_key, device),
     };
     await store.putDevice(toStore);
+    // Every daemon creates a device-local `ws_default`. Register its id under
+    // this exact device at enrollment time so pre-ready and legacy Agents do
+    // not inherit another device's same-named custody row. The root never
+    // leaves the Agent.
+    await store.putWorkspace({
+      workspace_id: "ws_default",
+      tenant_id: rec.tenant_id,
+      device_id: deviceId,
+      owner_principal_id: rec.principal,
+      version: 1,
+      active: true,
+      created_at: created,
+      updated_at: created,
+    });
     const nonce = randomToken("n_").slice(0, 24);
     const challengeId = randomId("ech_");
     const message = `ownmesh-device-challenge:${nonce}:${deviceId}`;

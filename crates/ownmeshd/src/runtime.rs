@@ -1211,6 +1211,26 @@ impl DaemonRuntime {
         })
     }
 
+    /// Id-only registry advertised after the Agent has authenticated. Paths and
+    /// labels remain device-local; the control plane uses this bounded snapshot
+    /// only to scope custody to this exact device and preflight workspace policy.
+    pub fn remote_workspace_registry(&self) -> (bool, Vec<String>) {
+        let mut ids = self
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                if workspace.id == "default" {
+                    "ws_default".to_owned()
+                } else {
+                    workspace.id.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        (self.enforce_workspace, ids)
+    }
+
     /// Register or update a workspace root (device-local). Roots must be absolute
     /// existing directories. Does not cross-tenant; ownership is the device itself.
     pub fn upsert_workspace(&mut self, entry: WorkspaceEntry) -> IpcResult<WorkspaceEntry> {
@@ -6126,6 +6146,29 @@ fn persistent_child_is_live(binding: &SidecarHostBinding) -> Result<bool, String
 mod device_binding_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn authenticated_workspace_registry_contains_ids_and_policy_but_no_roots() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime
+            .upsert_workspace(WorkspaceEntry {
+                id: "ws_repo".into(),
+                root: dir.path().join("repo"),
+                label: Some("Repository".into()),
+            })
+            .unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::Recommended));
+
+        let (enforce_workspace, ids) = runtime.remote_workspace_registry();
+        assert!(enforce_workspace);
+        assert_eq!(ids, vec!["ws_default", "ws_repo"]);
+
+        runtime.workspaces[0].id = "default".into();
+        let (_, legacy_ids) = runtime.remote_workspace_registry();
+        assert_eq!(legacy_ids, vec!["ws_default", "ws_repo"]);
+    }
 
     fn reused_process_identity_fixture() -> (u32, u64) {
         // A live PID with a different OS birth witness deterministically models

@@ -102,11 +102,17 @@ test("DeviceRoom routes operation.request agent <-> client over harness WS", asy
       // of trusting an independent payload value.
       protocol_version: "untrusted-payload-value",
       remote_routing_enabled: true,
+      workspace_registry: {
+        enforce_workspace: true,
+        ids: ["ws_repo", "ws_default"],
+      },
     }),
   );
   assert.deepEqual(ready.authenticated_agent, {
     agent_version: "1.2.5",
     protocol_version: PROTOCOL,
+    workspace_ids: ["ws_default", "ws_repo"],
+    enforce_workspace: true,
   });
   assert.equal((JSON.parse(room.drain(agent)[0]!) as DeviceEnvelope).type, "ready.ack");
 

@@ -77,7 +77,7 @@ async function callTool(
     });
   }
   const workspaceId = typeof args.workspace_id === "string" ? args.workspace_id : "";
-  if (deviceId && workspaceId && !(await store.getWorkspace(workspaceId))) {
+  if (deviceId && workspaceId && !(await store.getWorkspace(deviceId, workspaceId))) {
     await store.putWorkspace({
       workspace_id: workspaceId, tenant_id: "ten_default", device_id: deviceId,
       owner_principal_id: "prin_dev", version: 1, active: true,
@@ -135,6 +135,13 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   const shellProps = shell.inputSchema.properties as Record<string, unknown>;
   assert.equal((runProps.elevated as { default?: boolean }).default, false);
   assert.equal(shellProps.elevated, undefined);
+
+  const diagnose = MCP_TOOLS.find((t) => t.name === "ownmesh_system_diagnose")!;
+  const diagnoseProps = diagnose.inputSchema.properties as Record<
+    string,
+    { type?: unknown }
+  >;
+  assert.deepEqual(diagnoseProps.workspace_id?.type, ["string", "null"]);
 
   const list = MCP_TOOLS.find((t) => t.name === "ownmesh_list_devices")!;
   assert.equal(list.annotations.readOnlyHint, true);
@@ -246,6 +253,64 @@ test("workspace-scoped tools bind the selected workspace", async () => {
     assert.equal(bound.workspace_id, "ws_beta", `${name} binds workspace id`);
     assert.equal(bound.workspace_version, 1, `${name} binds workspace version`);
   }
+});
+
+test("known restricted workspace policy rejects unbound absolute paths before routing", async () => {
+  const { store, token } = await authed();
+  const deviceId = "dev_workspace_policy_01";
+  const base = {
+    id: deviceId,
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    name: "restricted",
+    hostname: "restricted",
+    os: "test",
+    arch: "test",
+    agent_version: "1.2.9",
+    protocol_version: "ownmesh.device/1.0",
+    public_key: "ab".repeat(32),
+    revoked: false,
+    created_at: new Date().toISOString(),
+    status: "active" as const,
+  };
+  await store.putDevice({ ...base, enforce_workspace: true });
+  let routes = 0;
+  const router = {
+    async routeToDevice() {
+      routes += 1;
+      return { status: "routed_to_device" };
+    },
+  };
+  const denied = await callTool(store, token, "ownmesh_command_run", {
+    device_id: deviceId,
+    workspace_id: null,
+    cwd: "/tmp",
+    program: "true",
+    idempotency_key: "restricted-null-workspace",
+  }, router);
+  assert.equal(routes, 0);
+  assert.equal(
+    (denied.body.error?.data as { code?: string } | undefined)?.code,
+    "OWNMESH_E_WORKSPACE_POLICY_REQUIRED",
+  );
+
+  await callTool(store, token, "ownmesh_system_diagnose", {
+    device_id: deviceId,
+    workspace_id: null,
+    async: true,
+  }, router);
+  assert.equal(routes, 1, "read-only unbound diagnosis remains routable under restriction");
+
+  await store.putDevice({ ...base, enforce_workspace: false });
+  await callTool(store, token, "ownmesh_command_run", {
+    device_id: deviceId,
+    workspace_id: null,
+    cwd: "/tmp",
+    program: "true",
+    idempotency_key: "full-access-null-workspace",
+    async: true,
+  }, router);
+  assert.equal(routes, 2, "known Full Access compatibility remains routable");
 });
 
 test("elevated structured command is normalized and exact-action-bound", async () => {
@@ -652,13 +717,13 @@ test("durable system diagnosis drops non-contract Agent fields", async () => {
   await store.putMcpOperation({
     operation_id: operationId, tenant_id: "ten_default", principal_id: "prin_dev",
     device_id: deviceId, tool: "ownmesh_system_diagnose", status: "pending",
-    workspace_id: "ws_diagnose", action: { workspace_version: 1 },
+    workspace_id: null, action: { workspace_version: null },
     summary: "routed", data: {}, truncated: false, next_cursor: null,
     approval_required: false, warnings: [], correlation_id: operationId,
     policy_authority: "ownmesh_device", created_at: observedAt, updated_at: observedAt,
   });
-  const check = (id: string, state: string) => ({
-    id, status: "pass", state,
+  const check = (id: string, state: string, status: "pass" | "warn" = "pass") => ({
+    id, status, state,
     provenance: ["policy", "workspace", "sessions"].includes(id)
       ? "authoritative"
       : "observed",
@@ -672,12 +737,12 @@ test("durable system diagnosis drops non-contract Agent fields", async () => {
       operation_id: operationId,
       status: "completed",
       result: {
-        workspace_id: "ws_diagnose", workspace_version: 1,
+        workspace_id: null, workspace_version: null,
         schema: "ownmesh.system_diagnosis/1.0",
         observed_at: observedAt,
         agent: { version: "1.2.5", protocol_version: "ownmesh.device/1.0" },
         checks: [
-          check("policy", "allow"), check("workspace", "bound"),
+          check("policy", "allow"), check("workspace", "unbound_enforced", "warn"),
           check("daemon", "running"), check("session_supervisor", "not_required"),
           { ...check("sessions", "healthy"), count: 0, nonterminal_count: 0, stale_count: 0 },
         ],
@@ -687,7 +752,8 @@ test("durable system diagnosis drops non-contract Agent fields", async () => {
   });
   assert.equal(applied.ok, true);
   const record = await store.getMcpOperation(operationId);
-  assert.equal(record?.data.overall, "healthy");
+  assert.equal(record?.data.overall, "workspace_selection_required");
+  assert.equal(record?.data.recommendation, "select_workspace");
   assert.doesNotMatch(JSON.stringify(record?.data), /must-not-persist|C:\\\\secret|argv/);
 });
 

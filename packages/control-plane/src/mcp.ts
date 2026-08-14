@@ -197,7 +197,11 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       type: "object",
       properties: {
         ...deviceProp,
-        workspace_id: str,
+        workspace_id: {
+          type: ["string", "null"],
+          description:
+            "Registered workspace id, or null to diagnose the device's unbound Full Access/restricted workspace state without accessing a path.",
+        },
       },
       required: ["device_id", "workspace_id"],
       additionalProperties: false,
@@ -1766,7 +1770,15 @@ const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
   Record<string, { status: "pass" | "warn" | "fail"; provenance: "authoritative" | "observed" }>
 > = {
   policy: { allow: { status: "pass", provenance: "authoritative" } },
-  workspace: { bound: { status: "pass", provenance: "authoritative" } },
+  workspace: {
+    // `bound` remains accepted for pre-1.2.9 Agents. New Agents expose the
+    // binding + enforcement combination as one fixed, redacted enum.
+    bound: { status: "pass", provenance: "authoritative" },
+    bound_enforced: { status: "pass", provenance: "authoritative" },
+    bound_full_access: { status: "pass", provenance: "authoritative" },
+    unbound_full_access: { status: "pass", provenance: "authoritative" },
+    unbound_enforced: { status: "warn", provenance: "authoritative" },
+  },
   daemon: {
     running: { status: "pass", provenance: "observed" },
     lockdown: { status: "warn", provenance: "observed" },
@@ -1942,14 +1954,18 @@ export function normalizeSystemDiagnosis(
       ? "supervisor_unavailable"
       : sessionsCheck?.state === "stale" || staleCount > 0
         ? "stale_sessions"
-        : "healthy";
+        : stateFor("workspace") === "unbound_enforced"
+          ? "workspace_selection_required"
+          : "healthy";
   const recommendation = overall === "lockdown"
     ? "unlock_locally"
     : overall === "supervisor_unavailable"
       ? "restart_session_supervisor"
       : overall === "stale_sessions"
         ? "reconcile_stale_sessions"
-        : "none";
+        : overall === "workspace_selection_required"
+          ? "select_workspace"
+          : "none";
   return {
     schema: SYSTEM_DIAGNOSIS_SCHEMA,
     overall,
@@ -5290,13 +5306,15 @@ export async function handleMcp(
     }
 
     // Store re-validation of device ownership + credential expiry/revoke (fail closed).
-    const diagnosisDevice = name === "ownmesh_system_diagnose"
-      ? await store.getDevice(deviceId)
-      : null;
     const operable = await store.assertDeviceOperableForMcp(deviceId, rec.principal, rec.tenant_id);
     if (!operable.ok) {
       return mcpError(id, -32004, operable.error, { device_id: deviceId });
     }
+    const routedDevice = await store.getDevice(deviceId);
+    if (!routedDevice) {
+      return mcpError(id, -32004, "device_not_available", { device_id: deviceId });
+    }
+    const diagnosisDevice = name === "ownmesh_system_diagnose" ? routedDevice : null;
 
     const safeArgs = sanitizeMcpArgs(args, name);
     if (ADMIN_MCP_TOOL_NAMES.has(name)) {
@@ -5341,6 +5359,8 @@ export async function handleMcp(
       (typeof safeArgs.workspace_id === "string" ? safeArgs.workspace_id.trim() : "");
     const workspaceScoped = WORKSPACE_SCOPED_TOOL_NAMES.has(name);
     const unboundFullAccessPath = isUnboundFullAccessPath(name, safeArgs);
+    const unboundDiagnosis =
+      name === "ownmesh_system_diagnose" && safeArgs.workspace_id === null;
     if (workspaceScoped) {
       if (!Object.prototype.hasOwnProperty.call(safeArgs, "workspace_id")) {
         return mcpError(id, -32602, "workspace_id is required", {
@@ -5366,10 +5386,22 @@ export async function handleMcp(
           code: "OWNMESH_E_WORKSPACE_ID_INVALID",
         });
       }
-      if (!requestedWorkspaceId && !unboundFullAccessPath) {
+      if (!requestedWorkspaceId && !unboundFullAccessPath && !unboundDiagnosis) {
         return mcpError(id, -32602, "workspace_id: null requires an absolute Full Access path", {
           code: "OWNMESH_E_WORKSPACE_ID_REQUIRED",
         });
+      }
+      if (unboundFullAccessPath && routedDevice.enforce_workspace === true) {
+        return mcpError(
+          id,
+          -32004,
+          "device policy requires a registered workspace",
+          {
+            code: "OWNMESH_E_WORKSPACE_POLICY_REQUIRED",
+            device_id: deviceId,
+            enforce_workspace: true,
+          },
+        );
       }
       // Keep arguments, canonical action, and routed envelope byte-for-byte
       // aligned after accepting harmless surrounding whitespace.
@@ -5392,7 +5424,7 @@ export async function handleMcp(
             code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
           });
         }
-        const existing = await store.getWorkspace(requestedWorkspaceId);
+        const existing = await store.getWorkspace(deviceId, requestedWorkspaceId);
         if (existing) {
           return mcpError(id, -32602, "workspace id is already registered", {
             code: "OWNMESH_E_WORKSPACE_ID_CONFLICT",
