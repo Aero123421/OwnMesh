@@ -5,8 +5,8 @@
 ## v1.2.9 — Runtime and workspace authority
 
 - Workspace records are device-scoped and synchronized from authenticated
-  Agent readiness; restricted null-workspace operations are rejected before
-  routing.
+  Agent readiness; opaque mapping generations fence same-ID root replacement,
+  and restricted null-workspace operations are rejected before routing.
 - Durable cancel fencing, clearer dispatch phases, credential-rotation-safe
   idempotency, and bounded internal-context timing make operation state converge
   across disconnects and retries.

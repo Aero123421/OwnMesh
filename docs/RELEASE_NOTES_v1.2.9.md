@@ -10,12 +10,14 @@ remains [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 - Workspace authority is now keyed by both device and workspace ID. Multiple
   devices may safely use `ws_default`, and authenticated Agent readiness keeps
   the Control Plane's bounded workspace registry in sync without sending paths.
+  An opaque local generation invalidates old operations when the same ID is
+  remapped to another root or removed and added again.
 - Restricted devices reject unbound absolute paths before DeviceRoom routing;
   Full Access compatibility remains explicit and the Agent is still the final
   policy authority.
 - Cancellation writes a durable fence before network delivery. Offline targets
-  receive the cancel control first after reconnect, so fenced work is not
-  silently redelivered.
+  receive the cancel control first after reconnect, and Agents no longer replay
+  a local outbox before that authoritative reconciliation.
 - Public operation phases distinguish dispatch from device execution, and an
   identical idempotency retry still converges after credential rotation without
   weakening the generation bound on the actual dispatch.
@@ -25,7 +27,7 @@ remains [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
   replaying a possible side effect.
 - Internal routing contexts retain clock-skew headroom, Windows service restart
   waits for a real daemon stop and ready transition, and profile version probes
-  have a fixed timeout.
+  remain bounded even when a descendant inherits their output handles.
 - Remote MCP can inspect effective policy with a read-only tool. The deprecated
   session release tool remains callable by older clients but is no longer
   advertised to models.
