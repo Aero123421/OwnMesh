@@ -3,7 +3,7 @@
 //! This module is the **final owner** of the CLI registration table. Later tickets
 //! implement command bodies without reshaping the tree.
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// `OwnMesh` command-line interface.
 #[derive(Debug, Parser)]
@@ -89,9 +89,11 @@ pub enum Commands {
     /// Privileged broker lifecycle.
     #[command(subcommand)]
     Privileged(PrivilegedCmd),
-    /// Update checks and application.
-    #[command(subcommand)]
-    Update(UpdateCmd),
+    /// Update OwnMesh. With no subcommand, securely updates this machine.
+    Update(UpdateArgs),
+    /// Internal detached update worker. Not a public CLI surface.
+    #[command(name = "__update-worker", hide = true)]
+    UpdateWorker(UpdateWorkerArgs),
     /// MCP helpers.
     #[command(subcommand)]
     Mcp(McpCmd),
@@ -699,14 +701,32 @@ pub enum PrivilegedCmd {
 }
 
 /// `ownmesh update` subcommands.
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Optional update operation. Omit to download, verify, and install the latest release.
+    #[command(subcommand)]
+    pub command: Option<UpdateCmd>,
+}
+
+/// Arguments passed only to the detached self-update worker.
+#[derive(Debug, Clone, Args)]
+pub struct UpdateWorkerArgs {
+    /// Transaction identifier created by the parent CLI.
+    #[arg(long, hide = true)]
+    pub transaction_id: String,
+}
+
+/// `ownmesh update` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum UpdateCmd {
     /// Check for updates.
     Check,
     /// Download an update.
     Download,
-    /// Apply a downloaded update.
+    /// Download, verify, and apply the latest release (same as `ownmesh update`).
     Apply,
+    /// Show the most recent update transaction.
+    Status,
     /// Show or set the update channel.
     Channel {
         /// Optional new channel.

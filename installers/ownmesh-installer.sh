@@ -34,6 +34,7 @@ MINISIGN_BIN="${OWNMESH_MINISIGN:-}"
 BOOTSTRAP_MINISIGN="${OWNMESH_BOOTSTRAP_MINISIGN:-auto}"
 PATH_PROFILE_UPDATED=0
 PATH_PROFILE=""
+SERVICE_WAS_RUNNING=0
 
 REQUIRED_BINARIES="ownmesh ownmesh-tui ownmeshd ownmesh-session-host ownmesh-broker"
 
@@ -603,6 +604,31 @@ ACTUAL="$(sha256_file "$ARCHIVE" | tr 'A-F' 'a-f')"
 
 safe_extract "$ARCHIVE" "$EXTRACT_DIR"
 
+# Unix permits replacing a running executable, so the old daemon can otherwise
+# survive the install and report the previous version indefinitely. Detect only
+# the exact installed ownmeshd image; never select a process by name alone.
+if [ -f "$INSTALL_DIR/ownmeshd" ]; then
+  if [ -d /proc ]; then
+    for exe in /proc/[0-9]*/exe; do
+      resolved="$(readlink "$exe" 2>/dev/null || true)"
+      if [ "$resolved" = "$INSTALL_DIR/ownmeshd" ]; then
+        SERVICE_WAS_RUNNING=1
+        break
+      fi
+    done
+  elif command_exists pgrep; then
+    for pid in $(pgrep -x ownmeshd 2>/dev/null || true); do
+      command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+      case "$command_line" in
+        "$INSTALL_DIR/ownmeshd"|"$INSTALL_DIR/ownmeshd"\ *)
+          SERVICE_WAS_RUNNING=1
+          break
+          ;;
+      esac
+    done
+  fi
+fi
+
 # Backup existing binaries, then atomic replace per binary.
 mkdir -p "$INSTALL_DIR"
 BACKUP_DIR="$(mktemp -d "$INSTALL_DIR/.ownmesh-backup.XXXXXX")" ||
@@ -678,12 +704,42 @@ for bin in $REQUIRED_BINARIES; do
     fail "failed to install $bin; previous binaries restored"
   fi
 done
-rm -rf "$BACKUP_DIR"
 
 maybe_add_to_path
 
-INSTALLED_VERSION="$("$INSTALL_DIR/ownmesh" --version 2>/dev/null)" ||
-  fail "installed binary did not start (--version smoke failed)"
+if ! INSTALLED_VERSION="$("$INSTALL_DIR/ownmesh" --version 2>/dev/null)"; then
+  if rollback_install; then
+    "$INSTALL_DIR/ownmesh" service start >/dev/null 2>&1 || true
+    rm -rf "$BACKUP_DIR"
+    fail "installed binary did not start; previous binaries restored"
+  fi
+  KEEP_BACKUP=1
+  fail "installed binary did not start and rollback failed (backup left at $BACKUP_DIR)"
+fi
+if [ "$SERVICE_WAS_RUNNING" -eq 1 ]; then
+  if ! "$INSTALL_DIR/ownmesh" service restart >/dev/null 2>&1; then
+    if rollback_install; then
+      "$INSTALL_DIR/ownmesh" service start >/dev/null 2>&1 || true
+      rm -rf "$BACKUP_DIR"
+      fail "updated service did not restart; previous binaries restored"
+    fi
+    KEEP_BACKUP=1
+    fail "updated service did not restart and rollback failed (backup left at $BACKUP_DIR)"
+  fi
+  expected_version="${INSTALLED_VERSION##* }"
+  status_json="$("$INSTALL_DIR/ownmesh" --json status 2>/dev/null || true)"
+  if ! printf '%s' "$status_json" | grep -Fq "\"version\":\"$expected_version\""; then
+    "$INSTALL_DIR/ownmesh" service stop >/dev/null 2>&1 || true
+    if rollback_install; then
+      "$INSTALL_DIR/ownmesh" service start >/dev/null 2>&1 || true
+      rm -rf "$BACKUP_DIR"
+      fail "updated daemon health check failed; previous binaries restored"
+    fi
+    KEEP_BACKUP=1
+    fail "updated daemon health check failed and rollback failed (backup left at $BACKUP_DIR)"
+  fi
+fi
+rm -rf "$BACKUP_DIR"
 say "Installed $INSTALLED_VERSION to $INSTALL_DIR/ownmesh"
 for bin in $REQUIRED_BINARIES; do
   say "  - $INSTALL_DIR/$bin"

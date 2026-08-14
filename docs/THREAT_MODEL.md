@@ -1,6 +1,6 @@
-# OwnMesh Threat Model (v1.2.10)
+# OwnMesh Threat Model (v1.2.11)
 
-**Status:** Published for release train v1.2.10
+**Status:** Published for release train v1.2.11
 **Related:** [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md), [`SECURITY.md`](../SECURITY.md), ADR [`0001-release-signing-sbom-provenance.md`](./adr/0001-release-signing-sbom-provenance.md)  
 **Method:** STRIDE-oriented asset / adversary / control mapping. Full Access is an intentional product mode; the trust boundary is integrity of authenticated intent, not “block the AI.”
 
@@ -110,7 +110,7 @@ the release notes for the evidence split.
 
 See [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md) for per-checkbox deep links.
 
-## 6. Explicit non-goals / waivers (v1.2.10)
+## 6. Explicit non-goals / waivers (v1.2.11)
 
 | ID | Scope | Note |
 | --- | --- | --- |

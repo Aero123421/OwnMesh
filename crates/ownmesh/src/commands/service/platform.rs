@@ -59,8 +59,11 @@ impl ProcessRunner for RealProcessRunner {
                 return Err("argument contains control characters".into());
             }
         }
-        let output = Command::new(program)
-            .args(args)
+        let mut command = Command::new(program);
+        command.args(args);
+        #[cfg(target_os = "linux")]
+        configure_linux_user_bus(&mut command, program, args);
+        let output = command
             .output()
             .map_err(|e| format!("spawn {program}: {e}"))?;
         Ok(CommandOutput {
@@ -68,6 +71,58 @@ impl ProcessRunner for RealProcessRunner {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+}
+
+/// `systemctl --user` normally inherits these variables from a graphical or
+/// login session. A non-interactive SSH command often does not, even while the
+/// user's systemd manager and bus are healthy. Derive only the standard runtime
+/// paths for the current uid, and only when the corresponding directory/socket
+/// already exists. This never enables lingering or creates a user bus.
+#[cfg(target_os = "linux")]
+fn configure_linux_user_bus(command: &mut Command, program: &str, args: &[&str]) {
+    if program != "systemctl" || !args.contains(&"--user") {
+        return;
+    }
+    let inherited_runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let inherited_bus = env::var_os("DBUS_SESSION_BUS_ADDRESS");
+    let runtime_dir = inherited_runtime.clone().unwrap_or_else(|| {
+        PathBuf::from("/run/user").join(rustix::process::getuid().as_raw().to_string())
+    });
+    configure_linux_user_bus_from(command, inherited_runtime, inherited_bus, &runtime_dir);
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_user_bus_from(
+    command: &mut Command,
+    inherited_runtime: Option<PathBuf>,
+    inherited_bus: Option<std::ffi::OsString>,
+    runtime_dir: &Path,
+) {
+    use std::os::linux::fs::MetadataExt as _;
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let Ok(runtime_meta) = fs::symlink_metadata(runtime_dir) else {
+        return;
+    };
+    if !runtime_meta.file_type().is_dir()
+        || runtime_meta.st_uid() != rustix::process::getuid().as_raw()
+        || runtime_meta.st_mode() & 0o077 != 0
+    {
+        return;
+    }
+    let bus = runtime_dir.join("bus");
+    let trusted_bus = fs::symlink_metadata(&bus).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && metadata.st_uid() == rustix::process::getuid().as_raw()
+    });
+    if inherited_runtime.is_none() {
+        command.env("XDG_RUNTIME_DIR", runtime_dir);
+    }
+    if inherited_bus.is_none() && trusted_bus {
+        command.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", bus.display()),
+        );
     }
 }
 
@@ -1011,6 +1066,35 @@ mod tests {
     fn resolve_missing_exe_errors() {
         let err = resolve_ownmeshd_path(Some("/no/such/ownmeshd-xyz")).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn headless_systemd_user_bus_is_derived_only_from_an_existing_standard_runtime() {
+        let dir = tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let _bus = std::os::unix::net::UnixListener::bind(dir.path().join("bus")).unwrap();
+        let mut command = Command::new("systemctl");
+        configure_linux_user_bus_from(&mut command, None, None, dir.path());
+        let env = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("XDG_RUNTIME_DIR")),
+            Some(&dir.path().as_os_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
+                .map(|value| value.to_string_lossy().into_owned()),
+            Some(format!("unix:path={}", dir.path().join("bus").display()))
+        );
+
+        let missing = dir.path().join("missing");
+        let mut command = Command::new("systemctl");
+        configure_linux_user_bus_from(&mut command, None, None, &missing);
+        assert_eq!(command.get_envs().count(), 0);
     }
 
     #[cfg(windows)]

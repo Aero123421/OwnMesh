@@ -81,7 +81,8 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Transfer(cmd)) => dispatch_transfer(cli, cmd),
         Some(Commands::Service(cmd)) => dispatch_service(cli, cmd),
         Some(Commands::Privileged(cmd)) => dispatch_privileged(cli, cmd),
-        Some(Commands::Update(cmd)) => update_cmd::dispatch_update(cli, cmd),
+        Some(Commands::Update(args)) => update_cmd::dispatch_update(cli, args),
+        Some(Commands::UpdateWorker(args)) => update_cmd::run_worker(cli, args),
         Some(Commands::Mcp(cmd)) => dispatch_mcp(cli, cmd),
         Some(Commands::Completion(args)) => run_completion(args),
     }
