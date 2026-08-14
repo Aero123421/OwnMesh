@@ -268,6 +268,25 @@ test("workspace custody is device-scoped and ready reconciliation is fail-closed
     assert.equal((await store.getWorkspace(first, "ws_cli"))?.active, true);
     assert.equal(await store.getWorkspace(second, "ws_cli"), null);
 
+    await store.putWorkspace({
+      workspace_id: "ws_legacy",
+      tenant_id: "ten_default",
+      device_id: first,
+      owner_principal_id: "prin_dev",
+      version: 7,
+      active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    await store.syncDeviceWorkspaces(first, [
+      firstDefault,
+      cli,
+      { id: "ws_legacy", generation: "wsg_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+    ]);
+    const upgradedLegacy = await store.getWorkspace(first, "ws_legacy");
+    assert.equal(upgradedLegacy?.version, 8);
+    assert.equal(upgradedLegacy?.local_generation, "wsg_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
     // Missing from one ready snapshot must not cancel a cloud reservation that
     // may be waiting for reconnect delivery.
     await store.syncDeviceWorkspaces(first, [firstDefault]);

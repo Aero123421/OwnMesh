@@ -2254,6 +2254,7 @@ export class MemoryStore implements ControlPlaneStore {
       } else if (existing.local_generation === undefined) {
         this.workspaces.set(key, {
           ...existing,
+          version: existing.version + 1,
           local_generation: registration.generation,
           updated_at: observedAt,
         });
@@ -4720,7 +4721,7 @@ export class SqlStore implements ControlPlaneStore {
           this.db
             .prepare(
               `UPDATE device_workspaces
-               SET local_generation = ?, updated_at = ?
+               SET version = version + 1, local_generation = ?, updated_at = ?
                WHERE device_id = ? AND workspace_id = ? AND local_generation IS NULL`,
             )
             .bind(registration.generation, observedAt, deviceId, workspaceId),

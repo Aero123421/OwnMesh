@@ -1218,14 +1218,21 @@ test("credential rotation terminally removes a pending operation before Agent re
   assert.equal((await store.getMcpOperation(operationId))?.status, "failed");
 });
 
-test("workspace root remap terminally invalidates an older pending action before redelivery", async () => {
+test("first generation observation terminally invalidates a pre-generation pending action", async () => {
   const { adapter, store } = openSqliteAdapter();
   const deviceId = "dev_workspace_remap_redelivery_01";
   await seedActiveDevice(store, deviceId);
-  await store.syncDeviceWorkspaces(deviceId, [{
-    id: "ws_default",
-    generation: "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  }]);
+  const now = new Date().toISOString();
+  await store.putWorkspace({
+    workspace_id: "ws_default",
+    tenant_id: DEFAULT_TENANT,
+    device_id: deviceId,
+    owner_principal_id: "prin_dev",
+    version: 1,
+    active: true,
+    created_at: now,
+    updated_at: now,
+  });
   const operationId = "op_workspace_remap_redelivery_01";
   const credentialGeneration = (await store.getPrincipal("prin_dev"))!.credential_generation;
   const boundAction = {
@@ -1291,7 +1298,7 @@ test("workspace root remap terminally invalidates an older pending action before
 
   await store.syncDeviceWorkspaces(deviceId, [{
     id: "ws_default",
-    generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    generation: "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   }]);
   assert.equal((await store.getWorkspace(deviceId, "ws_default"))?.version, 2);
   await (room as unknown as { redeliverCurrentPending(sessionId: string): Promise<void> })
