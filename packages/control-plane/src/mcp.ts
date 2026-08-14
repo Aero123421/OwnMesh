@@ -68,6 +68,8 @@ export type McpToolDef = {
    * between them and doubled the catalog's context cost.
    */
   aliasOf?: string;
+  /** Keep a legacy callable tool out of model-facing `tools/list`. */
+  hidden?: boolean;
 };
 
 const str = { type: "string" as const };
@@ -156,7 +158,8 @@ const elevatedCommandProp = {
 export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_list_devices",
-    description: "List devices with separate enrollment lifecycle and best-effort live connection presence",
+    description:
+      "List devices. connection_status is live route presence; last_seen_at is a coarse proof/ready marker, not the last operation or heartbeat.",
     inputSchema: {
       type: "object",
       properties: { ...cursorProps },
@@ -173,7 +176,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_get_device",
-    description: "Get one device with separate enrollment lifecycle and best-effort live connection presence",
+    description:
+      "Get one device. connection_status is live route presence; last_seen_at is a coarse proof/ready marker, not the last operation or heartbeat.",
     inputSchema: {
       type: "object",
       properties: { device_id: str },
@@ -204,6 +208,25 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         },
       },
       required: ["device_id", "workspace_id"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
+  },
+  {
+    name: "ownmesh_policy_show",
+    description:
+      "Read the device's effective policy preset, bounded rules, lockdown state, delegation setting, and grants without changing policy.",
+    inputSchema: {
+      type: "object",
+      properties: { ...deviceProp },
+      required: ["device_id"],
       additionalProperties: false,
     },
     annotations: {
@@ -1142,6 +1165,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
     },
     scope: "ownmesh.session",
     risk: "session",
+    hidden: true,
   },
   {
     name: "ownmesh_session_give",
@@ -1553,7 +1577,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
  * mattered for more than context cost.
  */
 export const PUBLISHED_MCP_TOOLS: readonly McpToolDef[] = MCP_TOOLS.filter(
-  (tool) => !tool.aliasOf,
+  (tool) => !tool.aliasOf && !tool.hidden,
 );
 
 const ADMIN_MCP_TOOL_NAMES = new Set([
@@ -2909,6 +2933,8 @@ function toolCapability(toolName: string): string {
       return "profile.scan";
     case "ownmesh_system_diagnose":
       return "system.diagnose";
+    case "ownmesh_policy_show":
+      return "policy.show";
     case "ownmesh_fs_write":
     case "ownmesh_fs_delete":
     case "ownmesh_fs_patch":
@@ -3075,6 +3101,8 @@ function toolAction(toolName: string): string {
       return "profile.scan";
     case "ownmesh_system_diagnose":
       return "system.diagnose";
+    case "ownmesh_policy_show":
+      return "policy.show";
     case "ownmesh_cancel_operation":
       return "cancel";
     case "__transfer_artifact_get":

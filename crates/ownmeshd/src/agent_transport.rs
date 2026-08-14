@@ -2739,6 +2739,7 @@ fn map_request_to_method(
             }
             methods::ADMIN_APPROVAL_BRIDGE_REQUEST
         }
+        ("policy.show", "policy.show" | "ownmesh_policy_show" | "show") => methods::POLICY_SHOW,
         ("filesystem.read", "fs.list" | "ownmesh_fs_list" | "ownmesh_list_files") => {
             methods::OPS_FS_LIST
         }
@@ -5053,6 +5054,23 @@ mod tests {
         };
         let (method, mapped) = map_request_to_method(&request).unwrap();
         assert_eq!(method, crate::runtime::ops_methods::SYSTEM_DIAGNOSE);
+        assert!(mapped.get("workspace_id").is_none());
+    }
+
+    #[test]
+    fn remote_policy_show_maps_to_read_only_policy_ipc() {
+        let request = OperationRequestPayload {
+            operation_contract: ownmesh_protocol::OperationContract::V1,
+            operation_id: ownmesh_domain::OperationId::parse("op_policy_show_1").unwrap(),
+            capability: "policy.show".into(),
+            workspace_id: None,
+            idempotency_key: "idem_policy_show_1".into(),
+            payload_hash: None,
+            authorization: None,
+            arguments: json!({ "action": "policy.show" }),
+        };
+        let (method, mapped) = map_request_to_method(&request).unwrap();
+        assert_eq!(method, methods::POLICY_SHOW);
         assert!(mapped.get("workspace_id").is_none());
     }
 
