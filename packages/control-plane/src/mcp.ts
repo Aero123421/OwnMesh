@@ -5092,7 +5092,12 @@ export async function handleMcp(
         tenant_id: rec.tenant_id,
         payload_hash: cancelDeviceOp.payload_hash,
         idempotency_key: cancelIdem,
-        workspace_id: fencedTarget.workspace_id ?? null,
+        // Cancellation is bound to the exact target operation id, principal,
+        // tenant, and device, but it must remain workspace-independent. A
+        // workspace can be removed or remapped while its operation is running;
+        // copying the target workspace onto this otherwise-unbound control
+        // action also makes DeviceRoom reject its own row/action binding.
+        workspace_id: null,
         expires_at: cancelExpiresAt,
         claim_version: 1,
         action: cancelDeviceOp.canonical_action,
