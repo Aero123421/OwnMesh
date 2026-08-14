@@ -52,6 +52,8 @@ pub enum FsError {
     },
     #[error("path escapes workspace: {0}")]
     EscapesWorkspace(PathBuf),
+    #[error("git worktree is outside the selected workspace")]
+    GitWorktreeOutsideWorkspace,
     #[error("path not found: {0}")]
     NotFound(PathBuf),
     #[error("expected hash mismatch for {path}: expected {expected}, got {actual}")]

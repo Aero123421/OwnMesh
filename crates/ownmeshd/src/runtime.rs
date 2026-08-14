@@ -5790,18 +5790,22 @@ fn require_id(params: Option<Value>, field: &str) -> IpcResult<String> {
 }
 
 fn fs_err(err: ownmesh_fs::FsError) -> IpcError {
-    if matches!(err, ownmesh_fs::FsError::HashMismatch { .. }) {
-        return IpcError::Remote {
+    match err {
+        ownmesh_fs::FsError::HashMismatch { .. } => IpcError::Remote {
             code: app_error::CONFLICT,
             // The FS error includes an absolute custody path and file hashes.
             // Neither belongs in a remote response; callers only need to know
             // that their optimistic precondition became stale.
             message: "file changed since it was read".into(),
-        };
-    }
-    IpcError::Remote {
-        code: app_error::INTERNAL,
-        message: err.to_string(),
+        },
+        ownmesh_fs::FsError::GitWorktreeOutsideWorkspace => IpcError::Remote {
+            code: app_error::POLICY_DENIED,
+            message: "git worktree is outside the selected workspace".into(),
+        },
+        other => IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: other.to_string(),
+        },
     }
 }
 
