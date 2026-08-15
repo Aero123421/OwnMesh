@@ -23,17 +23,19 @@ pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode>
                             w["activation_state"].as_str().unwrap_or("device_local")
                         );
                     }
-                    if let Some(note) = v["workspace_root_enforcement_note"].as_str() {
-                        println!(
-                            "workspace_root_enforcement: {} ({note})",
-                            v["workspace_root_enforcement"]
-                        );
-                    } else if !v["enforce_workspace"].is_null() {
-                        println!(
-                            "workspace_root_enforcement: {} (independent of access_preset)",
-                            v["workspace_root_enforcement"]
-                        );
-                    }
+                }
+                if let Some(note) = v["workspace_root_enforcement_note"].as_str() {
+                    println!(
+                        "workspace_root_enforcement: {} ({note})",
+                        v["workspace_root_enforcement"]
+                    );
+                } else if !v["workspace_root_enforcement"].is_null()
+                    || !v["enforce_workspace"].is_null()
+                {
+                    println!(
+                        "workspace_root_enforcement: {} (independent of access_preset)",
+                        v["workspace_root_enforcement"]
+                    );
                 }
             });
             Ok(())

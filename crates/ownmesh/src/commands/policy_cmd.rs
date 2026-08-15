@@ -32,6 +32,9 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                             v["workspace_root_enforcement"]
                         );
                     }
+                    if let Some(note) = v["workspace_root_enforcement_note"].as_str() {
+                        println!("workspace_root_enforcement_note: {note}");
+                    }
                     if v["preset"] == "full_access" {
                         println!(
                             "full_access_no_hidden_deny: {}",

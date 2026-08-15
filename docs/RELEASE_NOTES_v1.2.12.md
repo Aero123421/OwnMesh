@@ -16,13 +16,17 @@ and Control Plane storage schema unchanged. The machine-checked contract remains
   immediately, so Agent reconnect is no longer required for the first successful
   use. Missing the workspace from a later ready snapshot still does not cancel a
   pending cloud reservation. A completed remove keeps the last generation as a
-  tombstone, so a stale list cannot mark the same id executable again.
+  tombstone, so a stale list cannot mark the same id executable again. Re-adding
+  that id is allowed; it becomes executable only after a new Agent generation.
 - `workspace_root_enforcement` is labeled independently of `access_preset`.
   Switching to Full Access updates the observed enforcement flag without waiting
   for the next Agent handshake, and absolute Full Access paths remain
   `workspace_id: null`.
 - Fresh-passkey `approval_required` results always persist a same-origin
-  `approval_url` (`/approve?operation_id=...`). The CLI no longer fails with
+  `approval_url` (`/approve?operation_id=...`) when an absolute issuer is
+  available. MCP publish mints that URL from the request issuer and ignores
+  stored relative or cross-origin values, so default deploys without
+  `OAUTH_ISSUER` still return a CLI-valid URL. The CLI no longer fails with
   `OWNMESH_E_BAD_ENVELOPE: approval response omitted approval_url`.
 - Linux device enrollment reads the OS hostname (uname / `/etc/hostname`)
   instead of defaulting to `unknown-host`. Interactive enroll prompts when the

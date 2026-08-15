@@ -2781,8 +2781,8 @@ export function compactPublicEnvelope(
   ) as Record<string, unknown>;
   publicEnvelope.data = data;
   if (envelope.approval_required) {
-    const url = envelope.approval_url || (issuer ? approvalUrl(issuer, envelope.operation_id) : "");
-    if (url && /^https?:\/\//i.test(url)) publicEnvelope.approval_url = url;
+    const url = mintApprovalUrl(issuer, envelope.operation_id);
+    if (url) publicEnvelope.approval_url = url;
     if (envelope.approval_id) publicEnvelope.approval_id = envelope.approval_id;
   }
   if (envelope.warnings.length > 0) {
@@ -2917,13 +2917,23 @@ export type McpHandleOptions = {
   presenceForDevice?: (device: DeviceRecord) => Promise<"online" | "offline" | "unknown">;
 };
 
-function approvalUrl(issuer: string | undefined, operationId: string): string {
+function mintApprovalUrl(issuer: string | undefined, operationId: string): string | undefined {
   const base = (issuer || "").replace(/\/$/, "");
-  if (!base) return `/approve?operation_id=${encodeURIComponent(operationId)}`;
-  return `${base}/approve?operation_id=${encodeURIComponent(operationId)}`;
+  if (!base || !/^https?:\/\//i.test(base)) return undefined;
+  try {
+    const origin = new URL(base);
+    if (origin.username || origin.password) return undefined;
+    return `${base}/approve?operation_id=${encodeURIComponent(operationId)}`;
+  } catch {
+    return undefined;
+  }
 }
 
-export { approvalUrl };
+function approvalUrl(issuer: string | undefined, operationId: string): string {
+  return mintApprovalUrl(issuer, operationId) || "";
+}
+
+export { approvalUrl, mintApprovalUrl };
 
 /** Independent operation payload contract carried by device envelopes. */
 export const OPERATION_CONTRACT_V1 = "ownmesh.operation/1.0" as const;
@@ -5645,7 +5655,7 @@ export async function handleMcp(
       if (name === "ownmesh_workspace_add") {
         const device = await store.getDevice(deviceId);
         const existing = await store.getWorkspace(deviceId, requestedWorkspaceId);
-        if (existing?.local_generation) {
+        if (existing?.active && existing.local_generation) {
           return mcpError(id, -32602, "workspace id is already registered", {
             code: "OWNMESH_E_WORKSPACE_ID_CONFLICT",
           });

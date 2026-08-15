@@ -1767,3 +1767,138 @@ test("workspace add requires admin even when id is omitted", async () => {
   assert.equal(body.error?.data?.code, "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED");
 });
 
+test("removed workspace id can be re-registered after a new Agent generation", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    const owner = await seedAuthed(store);
+    const deviceId = `dev_ws_reregister_${store.kind}`;
+    await putActiveDevice(store, deviceId);
+    const createdAt = new Date().toISOString();
+    const oldGeneration = "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    await store.putWorkspace({
+      workspace_id: "ws_dev",
+      tenant_id: "ten_default",
+      device_id: deviceId,
+      owner_principal_id: "prin_dev",
+      version: 2,
+      local_generation: oldGeneration,
+      active: false,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+
+    let routes = 0;
+    const added = await handleMcp(
+      rpc(
+        "ownmesh_workspace_add",
+        {
+          device_id: deviceId,
+          id: "ws_dev",
+          path: "/home/tonakai/Dev",
+          idempotency_key: `reregister-${store.kind}`,
+        },
+        owner.access_token,
+      ),
+      store,
+      new URL("https://cp.test/mcp"),
+      {
+        routeToDevice: async () => {
+          routes += 1;
+          return { status: "routed_to_device" };
+        },
+      },
+      { tracker: new OperationTracker() },
+    );
+    assert.equal(added.status, 200);
+    assert.equal(routes, 1, "inactive tombstone must not conflict on re-add");
+    const addedBody = (await added.json()) as { error?: { data?: { code?: string } } };
+    assert.equal(addedBody.error?.data?.code, undefined);
+
+    const addOp = `op_ws_reregister_${store.kind}`;
+    await store.putMcpOperation({
+      operation_id: addOp,
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      device_id: deviceId,
+      tool: "ownmesh_workspace_add",
+      status: "pending",
+      summary: "routing",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      correlation_id: addOp,
+      workspace_id: "ws_dev",
+      policy_authority: "ownmesh_device",
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+    const applied = await applyMcpOperationResult(store, {
+      operationId: addOp,
+      correlationId: addOp,
+      deviceId,
+      payload: {
+        status: "completed",
+        operation_id: addOp,
+        result: {
+          id: "ws_dev",
+          root: "/home/tonakai/Dev",
+          created: true,
+          generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        },
+      },
+    });
+    assert.equal(applied.ok, true);
+    const revived = await store.getWorkspace(deviceId, "ws_dev");
+    assert.equal(revived?.active, true);
+    assert.equal(revived?.local_generation, "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    assert.equal(
+      (await store.assertWorkspaceOperableForMcp("ws_dev", deviceId, "prin_dev", "ten_default")).ok,
+      true,
+    );
+  }
+});
+
+test("approval_required without issuer does not persist a relative approval_url", async () => {
+  const store = new MemoryStore();
+  await seedAuthed(store);
+  const deviceId = "dev_approval_no_issuer";
+  await putActiveDevice(store, deviceId);
+  const createdAt = new Date().toISOString();
+  await store.putMcpOperation({
+    operation_id: "op_approval_no_issuer01",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_policy_preset",
+    status: "pending",
+    summary: "routing",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_approval_no_issuer01",
+    policy_authority: "ownmesh_device",
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+  const applied = await applyMcpOperationResult(store, {
+    operationId: "op_approval_no_issuer01",
+    correlationId: "op_approval_no_issuer01",
+    deviceId,
+    payload: {
+      status: "failed",
+      operation_id: "op_approval_no_issuer01",
+      error: {
+        code: "OWNMESH_E_APPROVAL_REQUIRED",
+        message: "fresh passkey required",
+        details: { approval_id: "apr_policy", reason: "policy preset" },
+      },
+    },
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.ok && applied.record?.approval_required, true);
+  assert.equal(applied.ok && applied.record?.approval_url, undefined);
+});
+

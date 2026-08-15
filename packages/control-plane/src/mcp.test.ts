@@ -15,6 +15,7 @@ import {
   truncateText,
   approvalRequiredEnvelope,
   buildDeviceOperation,
+  compactPublicEnvelope,
   makeEnvelope,
   sanitizeMcpArgs,
 } from "./mcp.ts";
@@ -1093,6 +1094,68 @@ test("approvalRequiredEnvelope always sets policy_authority ownmesh_device", () 
   assert.equal(env.policy_authority, "ownmesh_device");
   assert.equal(env.approval_required, true);
   assert.match(env.approval_url || "", /https:\/\/cp\.test\/approve/);
+});
+
+test("compactPublicEnvelope mints same-origin approval_url and ignores stored foreign URLs", () => {
+  const minted = compactPublicEnvelope(
+    {
+      operation_id: "op_approve_origin",
+      status: "approval_required",
+      summary: "fresh passkey required",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_url: "https://evil.test/approve?operation_id=op_approve_origin",
+      warnings: [],
+      policy_authority: "ownmesh_device",
+    },
+    false,
+    "https://cp.test",
+  );
+  assert.equal(
+    minted.approval_url,
+    "https://cp.test/approve?operation_id=op_approve_origin",
+  );
+
+  const relative = compactPublicEnvelope(
+    {
+      operation_id: "op_approve_relative",
+      status: "approval_required",
+      summary: "fresh passkey required",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_url: "/approve?operation_id=op_approve_relative",
+      warnings: [],
+      policy_authority: "ownmesh_device",
+    },
+    false,
+    "https://cp.test",
+  );
+  assert.equal(
+    relative.approval_url,
+    "https://cp.test/approve?operation_id=op_approve_relative",
+  );
+
+  const noIssuer = compactPublicEnvelope(
+    {
+      operation_id: "op_approve_blank",
+      status: "approval_required",
+      summary: "fresh passkey required",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: true,
+      approval_url: "/approve?operation_id=op_approve_blank",
+      warnings: [],
+      policy_authority: "ownmesh_device",
+    },
+    false,
+    undefined,
+  );
+  assert.equal(noIssuer.approval_url, undefined);
 });
 
 test("makeEnvelope defaults policy_authority", () => {

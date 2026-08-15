@@ -4139,8 +4139,7 @@ export async function applyMcpOperationResult(
 
   const approvalUrlValue =
     status === "approval_required"
-      ? op.approval_url ||
-        (opts.issuer ? approvalUrlFromIssuer(opts.issuer, op.operation_id) : undefined)
+      ? approvalUrlFromIssuer(opts.issuer, op.operation_id)
       : op.approval_url;
 
   // Internal transfer tools may not make a durable row into a bearer or

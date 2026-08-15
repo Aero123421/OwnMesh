@@ -559,7 +559,7 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "workspace_root_enforcement is independent of access_preset. Remote MCP cannot use a new workspace until activation_state is active.",
+        "workspace_root_enforcement is independent of access_preset. This screen shows the local workspace root; remote MCP waits for activation_state=active on list/show.",
     );
     insert(&mut m, Msg::SessionsTitle, "Sessions");
     insert(&mut m, Msg::SessionsEmpty, "No interactive sessions yet.");
@@ -833,7 +833,7 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "workspace_root_enforcement は access_preset と独立です。新しいワークスペースは activation_state が active になるまでリモート MCP から使えません。",
+        "workspace_root_enforcement は access_preset と独立です。この画面はローカルのワークスペース root です。リモート MCP は list/show の activation_state が active になるまで使えません。",
     );
     insert(&mut m, Msg::SessionsTitle, "セッション");
     insert(
@@ -1083,7 +1083,7 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "workspace_root_enforcement 独立于 access_preset。新工作区在 activation_state 为 active 之前不能用于远程 MCP。",
+        "workspace_root_enforcement 独立于 access_preset。此屏幕显示本地工作区根路径；远程 MCP 需等到 list/show 的 activation_state 为 active。",
     );
     insert(&mut m, Msg::SessionsTitle, "会话");
     insert(&mut m, Msg::SessionsEmpty, "尚无交互会话。");
@@ -1341,7 +1341,7 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::WorkspacesHint,
-        "workspace_root_enforcement не зависит от access_preset. Удалённый MCP не использует новую рабочую область, пока activation_state не станет active.",
+        "workspace_root_enforcement не зависит от access_preset. Этот экран показывает локальный корень рабочей области; удалённый MCP ждёт activation_state=active в list/show.",
     );
     insert(&mut m, Msg::SessionsTitle, "Сессии");
     insert(&mut m, Msg::SessionsEmpty, "Интерактивных сессий пока нет.");

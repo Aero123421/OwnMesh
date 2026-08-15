@@ -2,7 +2,7 @@
 
 **Release train:** v1.2.12
 
-**Audit date:** 2026-08-12
+**Audit date:** 2026-08-15
 
 **Authority:** `OWNMESH_SPECIFICATION.ja.md` §33 and the shipped-surface registry
 
