@@ -81,7 +81,7 @@ use ownmesh_profiles::{
     official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
     ProfileStatus,
 };
-use ownmesh_session::{PtyCommand, PtySize};
+use ownmesh_session::{PtyCommand, PtySize, SessionInfo};
 use ownmesh_session::{
     SessionKind, SessionManager, SessionState, SidecarHostBinding, StreamKind as SessionStreamKind,
 };
@@ -768,7 +768,7 @@ impl DaemonRuntime {
         transfer_store
             .cleanup_expired(Self::now() as u64)
             .map_err(|error| format!("cleanup transfer state: {error}"))?;
-        Ok(Self {
+        let mut runtime = Self {
             paths: paths.clone(),
             policy,
             custom_policy_rules,
@@ -814,7 +814,13 @@ impl DaemonRuntime {
             transfer_journal_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
             transfer_receiver_rebuilds: AtomicUsize::new(0),
-        })
+        };
+        if runtime.paths.state_dir.join("op-journal.json").exists() {
+            runtime
+                .persist_op_journal()
+                .map_err(|error| format!("persist compacted op journal: {error}"))?;
+        }
+        Ok(runtime)
     }
 
     /// Shared handle used by the IPC server for hello/dispatch revocation checks.
@@ -850,9 +856,10 @@ impl DaemonRuntime {
             })
     }
 
-    fn persist_op_journal(&self) -> IpcResult<()> {
+    fn persist_op_journal(&mut self) -> IpcResult<()> {
         #[cfg(test)]
         self.maybe_inject_persist_fault(&self.op_journal_persist_fault, "op journal")?;
+        self.op_journal = reclaim_op_journal(std::mem::take(&mut self.op_journal), Self::now());
         let encoded =
             serde_json::to_vec_pretty(&self.op_journal).map_err(|e| IpcError::Remote {
                 code: app_error::INTERNAL,
@@ -862,14 +869,16 @@ impl DaemonRuntime {
             return Err(IpcError::Remote {
                 code: app_error::INTERNAL,
                 message: format!(
-                    "op journal exceeds {MAX_OP_JOURNAL_FILE_BYTES} durable byte budget"
+                    "op journal exceeds {MAX_OP_JOURNAL_FILE_BYTES} durable byte budget after retention"
                 ),
             });
         }
         if self.op_journal.len() > MAX_OP_JOURNAL_ENTRIES {
             return Err(IpcError::Remote {
                 code: app_error::INTERNAL,
-                message: format!("op journal exceeds {MAX_OP_JOURNAL_ENTRIES} entry budget"),
+                message: format!(
+                    "op journal exceeds {MAX_OP_JOURNAL_ENTRIES} entry budget after retention"
+                ),
             });
         }
         write_json(
@@ -1578,6 +1587,7 @@ impl DaemonRuntime {
                 message: format!("idempotency key {key} is already reserved"),
             });
         }
+        self.op_journal = reclaim_op_journal(std::mem::take(&mut self.op_journal), Self::now());
         if self.op_journal.len() >= MAX_OP_JOURNAL_ENTRIES {
             return Err(IpcError::Remote {
                 code: app_error::INTERNAL,
@@ -1609,7 +1619,13 @@ impl DaemonRuntime {
             return Ok(());
         };
         let snapshot = self.op_journal.clone();
-        self.op_journal.insert(k.clone(), value.clone());
+        let mut stored = value.clone();
+        if let Some(object) = stored.as_object_mut() {
+            object
+                .entry("completed_unix")
+                .or_insert_with(|| json!(Self::now()));
+        }
+        self.op_journal.insert(k.clone(), stored);
         if let Err(e) = self.persist_op_journal() {
             self.op_journal = snapshot;
             return Err(e);
@@ -1901,6 +1917,9 @@ impl DaemonRuntime {
         .map_err(|e| {
             let code = match &e {
                 ownmesh_exec::ExecError::Cancelled => app_error::CONFLICT,
+                ownmesh_exec::ExecError::ExecutableNotFound(_)
+                | ownmesh_exec::ExecError::ExecutableFormat(_)
+                | ownmesh_exec::ExecError::EmptyProgram => app_error::INVALID_PARAMS,
                 _ => app_error::INTERNAL,
             };
             IpcError::Remote {
@@ -5016,10 +5035,8 @@ full_user_access/full_access for arbitrary commands",
         self.transition_recovery_running = true;
         let records = self.transition_journal.pending();
         for record in records {
-            let result = self.recover_transition_record(record).await;
-            if let Err(error) = result {
-                self.transition_recovery_running = false;
-                return Err(error);
+            if let Err(error) = self.recover_transition_record(record).await {
+                tracing::warn!(error = %error, "sidecar transition recovery skipped a record");
             }
         }
         self.transition_recovery_running = false;
@@ -5030,7 +5047,32 @@ full_user_access/full_access for arbitrary commands",
         &mut self,
         record: session_transition_journal::TransitionRecord,
     ) -> IpcResult<()> {
+        let current = match self.sessions.get(&record.session_id) {
+            Ok(current) => Some(current.clone()),
+            Err(ownmesh_session::SessionError::NotFound) => None,
+            Err(error) => return Err(session_err(error)),
+        };
         if record.expires_unix <= Self::now() {
+            if expired_transition_is_harmless(current.as_ref()) {
+                self.append_audit(
+                    "session.transition.reconcile",
+                    Some("session.open"),
+                    Some(&record.session_id),
+                    Some("allow"),
+                    format!(
+                        "cleared expired stale {} transition {}",
+                        transition_kind_label(record.kind),
+                        record.transition_id
+                    ),
+                );
+                return self
+                    .transition_journal
+                    .clear(&record.transition_id)
+                    .map_err(|e| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: format!("clear expired stale transition: {e}"),
+                    });
+            }
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: format!(
@@ -5043,14 +5085,9 @@ full_user_access/full_access for arbitrary commands",
             record.kind,
             TransitionKind::Close | TransitionKind::Terminate
         );
-        let current = match self.sessions.get(&record.session_id) {
-            Ok(current) => current,
-            // `terminate` removes its SessionManager entry. If the durable
-            // sidecar tombstone and the session snapshot were both committed,
-            // a crash can leave only the harmless journal cleanup outstanding.
-            Err(ownmesh_session::SessionError::NotFound)
-                if terminal && record.phase == TransitionPhase::Applied =>
-            {
+        let current = match current {
+            Some(current) => current,
+            None if terminal && record.phase == TransitionPhase::Applied => {
                 return self
                     .transition_journal
                     .clear(&record.transition_id)
@@ -5059,7 +5096,7 @@ full_user_access/full_access for arbitrary commands",
                         message: format!("clear completed terminal transition: {e}"),
                     });
             }
-            Err(error) => return Err(session_err(error)),
+            None => return Err(session_err(ownmesh_session::SessionError::NotFound)),
         };
         if current.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
             return Err(IpcError::Remote {
@@ -5627,6 +5664,91 @@ full_user_access/full_access for arbitrary commands",
     #[must_use]
     pub fn session_count_for_test(&self) -> usize {
         self.sessions.list().len()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn open_closed_session_for_test(&mut self, title: &str) -> String {
+        let session = self
+            .sessions
+            .open(
+                SessionKind::Process,
+                title,
+                "local",
+                Self::now(),
+                None,
+            )
+            .expect("open session");
+        self.sessions.close(&session.id).expect("close session");
+        self.persist_sessions().expect("persist sessions");
+        session.id
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub async fn recover_sidecar_transitions_for_test(&mut self) -> IpcResult<()> {
+        self.recover_sidecar_transitions().await
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn pending_transition_count_for_test(&self) -> usize {
+        self.transition_journal.pending().len()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn op_journal_utilization_for_test(&self) -> (usize, usize, usize, usize) {
+        op_journal_utilization(&self.op_journal)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn seed_expired_detach_transition_for_test(&mut self, session_id: &str) {
+        let now = Self::now();
+        let session = self
+            .sessions
+            .get(session_id)
+            .expect("session must exist to seed a transition");
+        let workspace_id = session
+            .workspace_id
+            .clone()
+            .unwrap_or_else(|| "ws_default".into());
+        let binding = SidecarHostBinding {
+            device_id: "dev_local".into(),
+            workspace_id: workspace_id.clone(),
+            owner_principal: "local".into(),
+            host_nonce: "nonce_expired_detach".into(),
+            controller_epoch: 1,
+            binding_expires_unix: now - 20,
+            host_expires_unix: now + 3_600,
+            child_pid: None,
+            child_process_birth: None,
+        };
+        self.transition_journal
+            .begin(TransitionRecord {
+                transition_id: format!("tr_expired_{session_id}"),
+                kind: TransitionKind::Detach,
+                phase: TransitionPhase::Intent,
+                session_id: session_id.to_owned(),
+                device_id: "dev_local".into(),
+                workspace_id,
+                authenticated_principal: "local".into(),
+                old_binding: binding,
+                target: TransitionTarget {
+                    principal: "local".into(),
+                    controller_epoch: 1,
+                    binding_expires_unix: now - 20,
+                    controller_attached: false,
+                    terminal: false,
+                },
+                new_binding: None,
+                created_unix: now - 100,
+                expires_unix: now - 10,
+            })
+            .expect("seed expired detach");
     }
 
     /// Test helper: drop the live PTY while keeping session metadata (daemon restart).
@@ -7997,6 +8119,119 @@ fn policy_from_file(file: &PolicyFile) -> PolicyDocument {
 const MAX_OP_JOURNAL_ENTRIES: usize = 4_096;
 const MAX_OP_JOURNAL_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_OP_JOURNAL_VALUE_BYTES: usize = 64 * 1024;
+const OP_JOURNAL_PAYLOAD_TTL_SECS: i64 = 24 * 60 * 60;
+const OP_JOURNAL_ENTRY_WATERMARK: usize = (MAX_OP_JOURNAL_ENTRIES * 3) / 4;
+const OP_JOURNAL_BYTE_WATERMARK: usize = (MAX_OP_JOURNAL_FILE_BYTES * 3) / 4;
+
+fn transition_kind_label(kind: TransitionKind) -> &'static str {
+    match kind {
+        TransitionKind::Detach => "detach",
+        TransitionKind::Claim => "claim",
+        TransitionKind::Give => "give",
+        TransitionKind::Renew => "renew",
+        TransitionKind::Reclaim => "reclaim",
+        TransitionKind::Close => "close",
+        TransitionKind::Terminate => "terminate",
+    }
+}
+
+fn expired_transition_is_harmless(current: Option<&SessionInfo>) -> bool {
+    match current {
+        None => true,
+        Some(session) => {
+            session.state == SessionState::Closed
+                || (session.sidecar_host.is_none() && session.controller.is_none())
+        }
+    }
+}
+
+fn op_journal_completed_unix(value: &Value) -> i64 {
+    value
+        .get("completed_unix")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn compact_op_journal_receipt(value: &Value) -> Value {
+    let encoded = serde_json::to_vec(value).unwrap_or_default();
+    let mut receipt = json!({
+        "durable_receipt": true,
+        "truncated": true,
+        "status": value.get("status").cloned().unwrap_or_else(|| json!("completed")),
+        "result_sha256": sha256_hex(&encoded),
+        "note": "op-journal payload compacted under retention policy"
+    });
+    if let Some(object) = receipt.as_object_mut() {
+        if let Some(operation_id) = value.get("operation_id").cloned() {
+            object.insert("operation_id".into(), operation_id);
+        }
+        if let Some(state) = value.get(OP_JOURNAL_STATE_FIELD).cloned() {
+            object.insert(OP_JOURNAL_STATE_FIELD.into(), state);
+        }
+        if let Some(completed) = value.get("completed_unix").cloned() {
+            object.insert("completed_unix".into(), completed);
+        }
+    }
+    receipt
+}
+
+fn encoded_op_journal_bytes(journal: &HashMap<String, Value>) -> usize {
+    serde_json::to_vec(journal)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn reclaim_op_journal(mut journal: HashMap<String, Value>, now: i64) -> HashMap<String, Value> {
+    for value in journal.values_mut() {
+        if is_op_journal_in_progress(value) {
+            continue;
+        }
+        let encoded_len = serde_json::to_vec(&*value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        let age = now.saturating_sub(op_journal_completed_unix(value));
+        if encoded_len > MAX_OP_JOURNAL_VALUE_BYTES || age >= OP_JOURNAL_PAYLOAD_TTL_SECS {
+            *value = compact_op_journal_receipt(value);
+        }
+    }
+    let over_watermark = journal.len() > OP_JOURNAL_ENTRY_WATERMARK
+        || encoded_op_journal_bytes(&journal) > OP_JOURNAL_BYTE_WATERMARK;
+    if over_watermark {
+        for value in journal.values_mut() {
+            if !is_op_journal_in_progress(value) {
+                *value = compact_op_journal_receipt(value);
+            }
+        }
+    }
+    let over_hard = journal.len() >= MAX_OP_JOURNAL_ENTRIES
+        || encoded_op_journal_bytes(&journal) > MAX_OP_JOURNAL_FILE_BYTES;
+    if over_hard {
+        let mut completed: Vec<(String, i64)> = journal
+            .iter()
+            .filter(|(_, value)| !is_op_journal_in_progress(value))
+            .map(|(key, value)| (key.clone(), op_journal_completed_unix(value)))
+            .collect();
+        completed.sort_by_key(|(_, ts)| *ts);
+        for (key, _) in completed {
+            if journal.len() < OP_JOURNAL_ENTRY_WATERMARK
+                && encoded_op_journal_bytes(&journal) <= OP_JOURNAL_BYTE_WATERMARK
+            {
+                break;
+            }
+            journal.remove(&key);
+        }
+    }
+    journal
+}
+
+fn op_journal_utilization(journal: &HashMap<String, Value>) -> (usize, usize, usize, usize) {
+    (
+        journal.len(),
+        MAX_OP_JOURNAL_ENTRIES,
+        encoded_op_journal_bytes(journal),
+        MAX_OP_JOURNAL_FILE_BYTES,
+    )
+}
 
 /// Hard ceilings for durable grants / approvals / revoked-principal state.
 /// Stat-before-read + entry budgets keep startup fail-closed under oversized
@@ -8147,7 +8382,14 @@ fn load_op_journal(path: &Path) -> Result<HashMap<String, Value>, String> {
     }
     let parsed: HashMap<String, Value> = serde_json::from_slice(&raw)
         .map_err(|e| format!("corrupt operation journal {}: {e}", path.display()))?;
-    bound_op_journal(parsed)
+    let bounded = bound_op_journal(parsed)?;
+    Ok(reclaim_op_journal(
+        bounded,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0),
+    ))
 }
 
 fn bound_op_journal(mut journal: HashMap<String, Value>) -> Result<HashMap<String, Value>, String> {

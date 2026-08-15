@@ -172,6 +172,7 @@ fn get_config(paths: &OwnMeshPaths, key: &str) -> Result<Value, ConfigCommandErr
         "service_socket.group" => option_string(cfg.service_socket.group.as_deref()),
         "service_socket.mode" => option_string(cfg.service_socket.mode.as_deref()),
         "service_socket.allowed_uids" => json!(cfg.service_socket.allowed_uids),
+        "runtime.exec_path" => json!(cfg.runtime.exec_path),
         _ => {
             return Err(ConfigCommandError::Usage(
                 "unknown or non-readable configuration key",
@@ -255,6 +256,9 @@ fn set_config(paths: &OwnMeshPaths, key: &str, value: &str) -> Result<(), Config
         "service_socket.allowed_uids" => {
             cfg.service_socket.allowed_uids = parse_u32_list(value)?;
         }
+        "runtime.exec_path" => {
+            cfg.runtime.exec_path = parse_exec_path_list(value)?;
+        }
         "schema_version" => {
             return Err(ConfigCommandError::Usage("schema_version is read-only"));
         }
@@ -324,6 +328,24 @@ fn parse_u32_list(value: &str) -> Result<Vec<u32>, ConfigCommandError> {
         .map_err(|_| ConfigCommandError::Usage("expected comma-separated decimal user ids"))?;
     if values.len() > 64 {
         return Err(ConfigCommandError::Usage("too many allowed user ids"));
+    }
+    Ok(values)
+}
+
+fn parse_exec_path_list(value: &str) -> Result<Vec<String>, ConfigCommandError> {
+    if value.is_empty() || value == "none" {
+        return Ok(Vec::new());
+    }
+    let values = value
+        .split(if cfg!(windows) { ';' } else { ':' })
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if values.len() > 64 {
+        return Err(ConfigCommandError::Usage(
+            "too many runtime.exec_path entries",
+        ));
     }
     Ok(values)
 }

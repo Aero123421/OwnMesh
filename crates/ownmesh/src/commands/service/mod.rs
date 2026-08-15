@@ -661,6 +661,9 @@ mod tests {
         // Paths themselves must not carry injection newlines (unit body is multi-line).
         assert!(!sp.executable.canonical.display().to_string().contains('\n'));
         assert!(unit.contains("NoNewPrivileges=true"));
+        assert!(unit.contains("ProtectSystem=true"));
+        assert!(!unit.contains("ProtectSystem=strict"));
+        assert!(!unit.contains("ProtectHome="));
 
         let plist = render_launch_agent_plist(&sp);
         assert!(plist.contains("<?xml"));

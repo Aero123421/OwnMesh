@@ -1373,3 +1373,76 @@ async fn session_resize_without_live_host_fails_before_consuming_sequence() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn expired_closed_session_detach_does_not_block_other_opens() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let closed = rt.open_closed_session_for_test("stale-detach");
+    rt.seed_expired_detach_transition_for_test(&closed);
+    assert!(rt.pending_transition_count_for_test() >= 1);
+    rt.recover_sidecar_transitions_for_test()
+        .await
+        .expect("harmless expired detach must not abort recovery");
+    assert_eq!(rt.pending_transition_count_for_test(), 0);
+    let opened = open_session(&mut rt, "owner", "fresh-after-stale").await;
+    assert_ne!(opened, closed);
+}
+
+#[tokio::test]
+async fn expired_live_session_detach_does_not_block_unrelated_opens() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let mut rt = DaemonRuntime::open(&paths).expect("runtime");
+    let live = open_session(&mut rt, "owner", "live-detach").await;
+    rt.seed_expired_detach_transition_for_test(&live);
+    assert!(rt.pending_transition_count_for_test() >= 1);
+    rt.recover_sidecar_transitions_for_test()
+        .await
+        .expect("per-record failure must not abort the whole recover");
+    assert!(
+        rt.pending_transition_count_for_test() >= 1,
+        "live expired detach must stay fail-closed"
+    );
+    let other = open_session(&mut rt, "owner", "unrelated").await;
+    assert_ne!(other, live);
+}
+
+#[test]
+fn oversized_completed_op_journal_is_compacted_on_open() {
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    paths.ensure_layout().unwrap();
+    let journal_path = paths.state_dir.join("op-journal.json");
+    let mut journal = serde_json::Map::new();
+    for i in 0..70 {
+        journal.insert(
+            format!("completed-{i}"),
+            json!({
+                "status": "completed",
+                "operation_id": format!("op-{i}"),
+                "completed_unix": 1,
+                "blob": "x".repeat(50_000),
+            }),
+        );
+    }
+    fs::write(
+        &journal_path,
+        serde_json::to_vec(&Value::Object(journal)).unwrap(),
+    )
+    .unwrap();
+    let before = fs::metadata(&journal_path).unwrap().len();
+    assert!(before > 2 * 1024 * 1024, "fixture should be large: {before}");
+    let rt = DaemonRuntime::open(&paths).expect("runtime");
+    let after = fs::metadata(&journal_path).unwrap().len();
+    assert!(
+        after < before,
+        "startup retention should shrink the durable journal: {after} >= {before}"
+    );
+    let (len, _max_len, bytes, max_bytes) = rt.op_journal_utilization_for_test();
+    assert!(len <= 70);
+    assert!(bytes < max_bytes);
+}

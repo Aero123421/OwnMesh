@@ -444,6 +444,7 @@ pub fn apply_setup(
             display_name: None,
         }],
         service_socket: ownmesh_config::ServiceSocketConfig::default(),
+        runtime: ownmesh_config::RuntimeConfig::default(),
     };
     cfg.validate()
         .map_err(|e| ApplySetupError::usage(format!("config validation failed: {e}")))?;

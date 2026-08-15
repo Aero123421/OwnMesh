@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v1.2.13 — Windows/Linux real-machine reliability
+
+- Expired sidecar `detach` journal records no longer abort recovery for every
+  session. Closed/harmless intents are cleared; live leftovers stay isolated.
+- Completed op-journal payloads compact to receipts and evict under the 4MiB /
+  4096 cap without dropping in-progress keys. Doctor warns from file `stat`.
+- Linux user units keep `NoNewPrivileges` but drop `ProtectHome` and
+  `ProtectSystem=strict`. Daemon PATH is an explicit contract
+  (`OWNMESH_EXEC_PATH` / `runtime.exec_path` / discovered user bins), not
+  sourced from `.bashrc`.
+- Windows PATHEXT resolution prefers `.cmd`/`.exe` over extensionless npm
+  shims; Win32 193 is not `INTERNAL`. `system.diagnose` / `doctor` report
+  broken session, journal, and sandbox state instead of a false `healthy`.
+
 ## v1.2.12 — Workspace activation and transfer expiry
 
 - Newly registered workspaces stay `pending_activation` until the Agent

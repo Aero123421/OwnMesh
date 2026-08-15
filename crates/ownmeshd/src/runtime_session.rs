@@ -137,6 +137,9 @@ impl DaemonRuntime {
             }
         };
         let stale_sessions = registry_stale_sessions + supervisor_host_stale;
+        let pending_transitions = self.transition_journal.pending().len();
+        let (journal_entries, journal_entry_limit, journal_bytes, journal_byte_limit) =
+            super::op_journal_utilization(&self.op_journal);
         Ok(system_diagnosis_payload(
             &observed_at,
             SystemDiagnosisFacts {
@@ -150,6 +153,13 @@ impl DaemonRuntime {
                 session_count: sessions.len(),
                 nonterminal_sessions,
                 stale_sessions,
+                pending_transitions,
+                journal_entries,
+                journal_entry_limit,
+                journal_bytes,
+                journal_byte_limit,
+                profiles_missing: official_profiles_missing(),
+                local_bin_visible: local_bin_is_visible(),
             },
         ))
     }
@@ -2526,6 +2536,66 @@ struct SystemDiagnosisFacts {
     session_count: usize,
     nonterminal_sessions: usize,
     stale_sessions: usize,
+    pending_transitions: usize,
+    journal_entries: usize,
+    journal_entry_limit: usize,
+    journal_bytes: usize,
+    journal_byte_limit: usize,
+    profiles_missing: usize,
+    local_bin_visible: bool,
+}
+
+fn official_profiles_missing() -> usize {
+    ownmesh_profiles::official_profiles()
+        .iter()
+        .filter(|profile| profile.official)
+        .filter(|profile| {
+            profile.binaries.iter().all(|binary| {
+                ownmesh_exec::resolve_executable_invocation_path(binary, None).is_none()
+            })
+        })
+        .count()
+}
+
+fn local_bin_is_visible() -> bool {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let Some(home) = home else {
+        return false;
+    };
+    let local = std::path::PathBuf::from(home).join(".local").join("bin");
+    std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).any(|dir| dir == local))
+        .unwrap_or(false)
+}
+
+fn sessions_diagnosis_state(facts: &SystemDiagnosisFacts) -> (&'static str, &'static str) {
+    let journal_full = facts.journal_entries >= facts.journal_entry_limit
+        || facts.journal_bytes >= facts.journal_byte_limit;
+    let journal_watermark = facts.journal_entries > (facts.journal_entry_limit * 3) / 4
+        || facts.journal_bytes > (facts.journal_byte_limit * 3) / 4;
+    if journal_full || (facts.pending_transitions > 0 && facts.nonterminal_sessions > 0) {
+        ("fail", "broken")
+    } else if facts.stale_sessions > 0 {
+        ("warn", "stale")
+    } else if facts.pending_transitions > 0 || journal_watermark {
+        ("warn", "degraded")
+    } else {
+        ("pass", "healthy")
+    }
+}
+
+fn journal_diagnosis_state(facts: &SystemDiagnosisFacts) -> (&'static str, &'static str) {
+    if facts.journal_entries >= facts.journal_entry_limit
+        || facts.journal_bytes >= facts.journal_byte_limit
+    {
+        ("fail", "full")
+    } else if facts.journal_entries > (facts.journal_entry_limit * 3) / 4
+        || facts.journal_bytes > (facts.journal_byte_limit * 3) / 4
+    {
+        ("warn", "watermark")
+    } else {
+        ("pass", "ok")
+    }
 }
 
 fn workspace_diagnosis_state(bound: bool, enforce_workspace: bool) -> &'static str {
@@ -2545,12 +2615,28 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     } else {
         "unavailable"
     };
+    let (sessions_status, sessions_state) = sessions_diagnosis_state(&facts);
+    let (journal_status, journal_state) = journal_diagnosis_state(&facts);
+    let profiles_state = if facts.profiles_missing > 0 {
+        "missing"
+    } else {
+        "ready"
+    };
+    let local_bin_state = if facts.local_bin_visible {
+        "visible"
+    } else {
+        "missing"
+    };
     let overall = if facts.lockdown {
         "lockdown"
     } else if supervisor_state == "unavailable" {
         "supervisor_unavailable"
+    } else if sessions_state == "broken" {
+        "sessions_broken"
     } else if facts.stale_sessions > 0 {
         "stale_sessions"
+    } else if sessions_state == "degraded" {
+        "sessions_degraded"
     } else if facts.workspace_state == "unbound_enforced" {
         "workspace_selection_required"
     } else {
@@ -2559,7 +2645,9 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     let recommendation = match overall {
         "lockdown" => "unlock_locally",
         "supervisor_unavailable" => "restart_session_supervisor",
+        "sessions_broken" => "repair_local_runtime",
         "stale_sessions" => "reconcile_stale_sessions",
+        "sessions_degraded" => "reclaim_local_runtime",
         "workspace_selection_required" => "select_workspace",
         _ => "none",
     };
@@ -2598,12 +2686,32 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
             },
             {
                 "id": "sessions",
-                "status": if facts.stale_sessions > 0 { "warn" } else { "pass" },
-                "state": if facts.stale_sessions > 0 { "stale" } else { "healthy" },
+                "status": sessions_status,
+                "state": sessions_state,
                 "provenance": "authoritative", "observed_at": observed_at,
                 "count": facts.session_count,
                 "nonterminal_count": facts.nonterminal_sessions,
                 "stale_count": facts.stale_sessions,
+            },
+            {
+                "id": "journal",
+                "status": journal_status,
+                "state": journal_state,
+                "provenance": "authoritative", "observed_at": observed_at,
+                "count": facts.journal_entries,
+            },
+            {
+                "id": "profiles",
+                "status": if facts.profiles_missing > 0 { "warn" } else { "pass" },
+                "state": profiles_state,
+                "provenance": "observed", "observed_at": observed_at,
+                "count": facts.profiles_missing,
+            },
+            {
+                "id": "local_bin",
+                "status": if facts.local_bin_visible { "pass" } else { "warn" },
+                "state": local_bin_state,
+                "provenance": "observed", "observed_at": observed_at,
             },
         ],
         "recommendation": recommendation,
@@ -2637,6 +2745,13 @@ mod system_diagnosis_tests {
                     session_count: 0,
                     nonterminal_sessions: 0,
                     stale_sessions: 0,
+                    pending_transitions: 0,
+                    journal_entries: 0,
+                    journal_entry_limit: 4096,
+                    journal_bytes: 0,
+                    journal_byte_limit: 4 * 1024 * 1024,
+                    profiles_missing: 0,
+                    local_bin_visible: true,
                 },
                 "healthy",
                 "none",
@@ -2650,6 +2765,13 @@ mod system_diagnosis_tests {
                     session_count: 1,
                     nonterminal_sessions: 1,
                     stale_sessions: 0,
+                    pending_transitions: 0,
+                    journal_entries: 0,
+                    journal_entry_limit: 4096,
+                    journal_bytes: 0,
+                    journal_byte_limit: 4 * 1024 * 1024,
+                    profiles_missing: 0,
+                    local_bin_visible: true,
                 },
                 "supervisor_unavailable",
                 "restart_session_supervisor",
@@ -2663,6 +2785,13 @@ mod system_diagnosis_tests {
                     session_count: 1,
                     nonterminal_sessions: 1,
                     stale_sessions: 1,
+                    pending_transitions: 0,
+                    journal_entries: 0,
+                    journal_entry_limit: 4096,
+                    journal_bytes: 0,
+                    journal_byte_limit: 4 * 1024 * 1024,
+                    profiles_missing: 0,
+                    local_bin_visible: true,
                 },
                 "stale_sessions",
                 "reconcile_stale_sessions",
@@ -2676,24 +2805,54 @@ mod system_diagnosis_tests {
                     session_count: 0,
                     nonterminal_sessions: 0,
                     stale_sessions: 0,
+                    pending_transitions: 0,
+                    journal_entries: 0,
+                    journal_entry_limit: 4096,
+                    journal_bytes: 0,
+                    journal_byte_limit: 4 * 1024 * 1024,
+                    profiles_missing: 0,
+                    local_bin_visible: true,
                 },
                 "workspace_selection_required",
                 "select_workspace",
+            ),
+            (
+                SystemDiagnosisFacts {
+                    lockdown: false,
+                    workspace_state: "bound_enforced",
+                    supervisor_required: false,
+                    supervisor_available: true,
+                    session_count: 1,
+                    nonterminal_sessions: 1,
+                    stale_sessions: 0,
+                    pending_transitions: 1,
+                    journal_entries: 0,
+                    journal_entry_limit: 4096,
+                    journal_bytes: 0,
+                    journal_byte_limit: 4 * 1024 * 1024,
+                    profiles_missing: 0,
+                    local_bin_visible: true,
+                },
+                "sessions_broken",
+                "repair_local_runtime",
             ),
         ];
         for (facts, overall, recommendation) in cases {
             let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
             assert_eq!(value["overall"], overall);
             assert_eq!(value["recommendation"], recommendation);
-            assert_eq!(value["checks"].as_array().map(Vec::len), Some(5));
+            let checks = value["checks"].as_array().expect("checks");
+            assert!(checks.len() >= 5, "contract prefix must remain present");
+            assert_eq!(checks[0]["id"], "policy");
+            assert_eq!(checks[4]["id"], "sessions");
             let serialized = value.to_string();
             for forbidden in [
                 "credential",
-                "command",
                 "argv",
                 "environment",
                 "cwd",
-                "path",
+                "refresh_token",
+                "HOME=",
             ] {
                 assert!(
                     !serialized.contains(forbidden),

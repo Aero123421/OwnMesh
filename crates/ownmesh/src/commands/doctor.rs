@@ -33,6 +33,9 @@ pub fn collect_doctor_report(
         control_plane: ControlPlaneObservation::default(),
         privacy_policy: observe_privacy_policy(paths),
         service,
+        journal_bytes: observe_journal_bytes(paths),
+        journal_byte_limit: Some(4 * 1024 * 1024),
+        local_bin_visible: observe_local_bin_visible(),
     };
 
     // Control-plane URL from config. Unsafe URLs are rejected/redacted before any output.
@@ -434,19 +437,58 @@ fn observe_service() -> ServiceObservation {
             running: None,
             unit_path: None,
             message: Some(err),
+            sandbox_protect_home: None,
+            sandbox_protect_system_strict: None,
         },
     }
 }
 
 fn service_obs_from_snapshot(snap: &ServiceStatusSnapshot) -> ServiceObservation {
-    ServiceObservation {
+    let mut obs = ServiceObservation {
         platform: snap.platform.clone(),
         supported: snap.supported,
         installed: snap.installed,
         running: snap.running,
         unit_path: snap.unit_path.clone(),
         message: snap.message.clone(),
+        sandbox_protect_home: None,
+        sandbox_protect_system_strict: None,
+    };
+    observe_unit_hardening(&mut obs);
+    obs
+}
+
+fn observe_unit_hardening(service: &mut ServiceObservation) {
+    let Some(path) = service.unit_path.as_deref() else {
+        return;
+    };
+    let Ok(body) = fs::read_to_string(path) else {
+        return;
+    };
+    service.sandbox_protect_home = Some(
+        body.lines()
+            .any(|line| line.trim().starts_with("ProtectHome=")),
+    );
+    service.sandbox_protect_system_strict = Some(
+        body.lines()
+            .any(|line| line.trim().starts_with("ProtectSystem=strict")),
+    );
+}
+
+fn observe_journal_bytes(paths: &OwnMeshPaths) -> Option<u64> {
+    fs::metadata(paths.state_dir.join("op-journal.json"))
+        .ok()
+        .map(|meta| meta.len())
+}
+
+fn observe_local_bin_visible() -> Option<bool> {
+    let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"))?;
+    let local = PathBuf::from(home).join(".local").join("bin");
+    if !local.is_dir() {
+        return None;
     }
+    let path = env::var_os("PATH")?;
+    Some(env::split_paths(&path).any(|dir| dir == local))
 }
 
 /// Merge only an authenticated daemon fact into an otherwise indeterminate OS
@@ -704,6 +746,8 @@ mod tests {
             running: None,
             unit_path: None,
             message: None,
+            sandbox_protect_home: None,
+            sandbox_protect_system_strict: None,
         };
         merge_daemon_service_status(&daemon, &mut unknown);
         assert_eq!(unknown.running, Some(true));

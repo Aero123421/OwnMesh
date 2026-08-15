@@ -62,12 +62,15 @@ RestartSec=3
 Environment=OWNMESH_CONFIG_DIR="{config}"
 Environment=OWNMESH_STATE_DIR="{state}"
 Environment=OWNMESH_RUNTIME_DIR="{runtime}"
-# User-level only — never elevate.
+# Privilege confinement. Independent of filesystem namespacing.
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths="{config}" "{state}" "{runtime}"
+# ProtectSystem=true makes /usr /boot /efi read-only. ProtectSystem=strict
+# and ProtectHome=* create a mount namespace that can present /home as
+# uid 65534 (nobody), which OwnMesh path-custody rejects, and they hide
+# registered workspaces under the user home. Do not set ProtectHome.
+ProtectSystem=true
 PrivateTmp=true
+ReadWritePaths="{config}" "{state}" "{runtime}"
 
 [Install]
 WantedBy=default.target

@@ -1822,6 +1822,8 @@ const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
   sessions: {
     healthy: { status: "pass", provenance: "authoritative" },
     stale: { status: "warn", provenance: "authoritative" },
+    degraded: { status: "warn", provenance: "authoritative" },
+    broken: { status: "fail", provenance: "authoritative" },
   },
 };
 
@@ -1983,8 +1985,12 @@ export function normalizeSystemDiagnosis(
     ? "lockdown"
     : stateFor("session_supervisor") === "unavailable"
       ? "supervisor_unavailable"
+      : sessionsCheck?.state === "broken"
+        ? "sessions_broken"
       : sessionsCheck?.state === "stale" || staleCount > 0
         ? "stale_sessions"
+        : sessionsCheck?.state === "degraded"
+          ? "sessions_degraded"
         : stateFor("workspace") === "unbound_enforced"
           ? "workspace_selection_required"
           : "healthy";
@@ -1992,8 +1998,12 @@ export function normalizeSystemDiagnosis(
     ? "unlock_locally"
     : overall === "supervisor_unavailable"
       ? "restart_session_supervisor"
+      : overall === "sessions_broken"
+        ? "repair_local_runtime"
       : overall === "stale_sessions"
         ? "reconcile_stale_sessions"
+        : overall === "sessions_degraded"
+          ? "reclaim_local_runtime"
         : overall === "workspace_selection_required"
           ? "select_workspace"
           : "none";

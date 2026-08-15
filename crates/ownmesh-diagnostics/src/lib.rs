@@ -292,6 +292,10 @@ pub struct ServiceObservation {
     pub running: Option<bool>,
     pub unit_path: Option<String>,
     pub message: Option<String>,
+    /// Some(true) when the observed user unit sets ProtectHome.
+    pub sandbox_protect_home: Option<bool>,
+    /// Some(true) when the observed user unit sets ProtectSystem=strict.
+    pub sandbox_protect_system_strict: Option<bool>,
 }
 
 /// Full set of doctor inputs gathered by the CLI (read-only observations).
@@ -304,6 +308,12 @@ pub struct DoctorInput {
     pub control_plane: ControlPlaneObservation,
     pub privacy_policy: PrivacyPolicyObservation,
     pub service: ServiceObservation,
+    /// On-disk op-journal size from `stat` only (never the journal contents).
+    pub journal_bytes: Option<u64>,
+    pub journal_byte_limit: Option<u64>,
+    /// None skips the check. Some(false) means `~/.local/bin` exists but is not
+    /// on this process PATH.
+    pub local_bin_visible: Option<bool>,
 }
 
 /// True for built-in presets that deny `command.run` / `session.open`.
@@ -669,6 +679,52 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                 .clone()
                 .unwrap_or_else(|| "user-level ownmeshd service not installed".into()),
         ));
+    }
+    if input.service.sandbox_protect_home == Some(true)
+        || input.service.sandbox_protect_system_strict == Some(true)
+    {
+        checks.push(DoctorCheck::fail(
+            "service.sandbox",
+            "user-level unit uses ProtectHome or ProtectSystem=strict; this hides $HOME and registered workspaces",
+        ));
+    } else if input.service.sandbox_protect_home == Some(false)
+        && input.service.sandbox_protect_system_strict == Some(false)
+    {
+        checks.push(DoctorCheck::pass(
+            "service.sandbox",
+            "user-level unit keeps home writable for custody and workspaces",
+        ));
+    }
+
+    if let (Some(bytes), Some(limit)) = (input.journal_bytes, input.journal_byte_limit) {
+        if limit > 0 && bytes >= limit {
+            checks.push(DoctorCheck::fail(
+                "journal.capacity",
+                format!("op-journal is at the durable byte cap ({bytes}/{limit})"),
+            ));
+        } else if limit > 0 && bytes > (limit * 3) / 4 {
+            checks.push(DoctorCheck::warn(
+                "journal.capacity",
+                format!("op-journal is over 75% of the durable byte cap ({bytes}/{limit})"),
+            ));
+        } else {
+            checks.push(DoctorCheck::pass(
+                "journal.capacity",
+                format!("op-journal size is within budget ({bytes}/{limit})"),
+            ));
+        }
+    }
+
+    match input.local_bin_visible {
+        Some(true) => checks.push(DoctorCheck::pass(
+            "execution.local_bin",
+            "user local bin directory is visible on PATH",
+        )),
+        Some(false) => checks.push(DoctorCheck::warn(
+            "execution.local_bin",
+            "user local bin directory exists but is not on PATH; set runtime.exec_path or OWNMESH_EXEC_PATH",
+        )),
+        None => {}
     }
 
     DoctorReport::from_checks(

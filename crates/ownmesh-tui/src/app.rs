@@ -691,5 +691,8 @@ fn doctor_input_from_local(
             update_network_off: cfg.update.mode == "off",
         },
         service: ServiceObservation::default(),
+        journal_bytes: None,
+        journal_byte_limit: None,
+        local_bin_visible: None,
     }
 }

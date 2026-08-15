@@ -1,6 +1,6 @@
 # OwnMesh onboarding
 
-This document covers the supported v1.2.12 first-run, ChatGPT connection, and
+This document covers the supported v1.2.13 first-run, ChatGPT connection, and
 user-level service flow. The machine-checked command contract is
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
@@ -208,7 +208,9 @@ ownmesh doctor --offline         # never touches the network
 ```
 
 It checks binary/config/service state, non-secret credential presence, daemon
-IPC reachability, policy/privacy defaults, and the configured control plane.
+IPC reachability, policy/privacy defaults, the configured control plane,
+op-journal capacity (`stat` only), user-local bin visibility, and Linux user
+unit sandbox flags. A fail check is never reported as healthy.
 
 The network is contacted **only** with `--check-network`. Earlier releases also
 probed whenever a control-plane URL happened to be configured, which made the
@@ -226,6 +228,21 @@ inspected. Healthy/warn-only returns `0`; any fail check returns `2`.
 | Windows | Task Scheduler, current user, `ONLOGON`, `LeastPrivilege` | `OwnMesh\ownmeshd` |
 | macOS | LaunchAgent | `~/Library/LaunchAgents/dev.ownmesh.ownmeshd.plist` |
 | Linux | systemd --user | `~/.config/systemd/user/ownmesh-ownmeshd.service` |
+
+Linux user units set `NoNewPrivileges=true` and `ProtectSystem=true`. They do
+**not** set `ProtectHome` or `ProtectSystem=strict`; those options hide `$HOME`
+and registered workspaces from the daemon. Re-run `ownmesh service install`
+after upgrading from v1.2.12 if an older unit is still installed.
+
+The daemon PATH is an explicit contract. OwnMesh never sources `.bashrc` or
+other interactive rc files. Extra directories come from `OWNMESH_EXEC_PATH`,
+`runtime.exec_path` in `config.toml` (absolute paths only), and discovered
+user tool dirs such as `~/.local/bin`. Profile CLIs that are not installed
+fail immediately instead of spawning a bare name.
+
+Completed operation-journal payloads are compacted to receipts so the 4MiB /
+4096-entry durable cap cannot brick the daemon. `ownmesh doctor` warns when
+the on-disk journal is over 75% of that cap.
 
 ```bash
 ownmesh service install
@@ -295,7 +312,7 @@ mixed-version installation.
 
 ## Distribution scope
 
-v1.2.12 supports signed portable archives and the verified shell/PowerShell
+v1.2.13 supports signed portable archives and the verified shell/PowerShell
 one-line installers. Windows MSI/NSIS, native/universal macOS packages,
 Authenticode, and Apple notarization are outside this release's distribution
 contract.

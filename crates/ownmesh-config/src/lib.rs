@@ -22,7 +22,7 @@ pub use error::{ConfigError, ConfigResult};
 pub use paths::OwnMeshPaths;
 pub use schema::{
     redact_control_plane_url, valid_instance_id, validate_control_plane_base_url, InstanceConfig,
-    OwnMeshConfig, PolicyFile, ServiceSocketConfig, TelemetryConfig, UpdateConfig,
+    OwnMeshConfig, PolicyFile, RuntimeConfig, ServiceSocketConfig, TelemetryConfig, UpdateConfig,
     CONFIG_SCHEMA_VERSION, INSTANCE_ID_SYNTAX,
 };
 pub use store::{

@@ -86,7 +86,12 @@ fn base_input() -> DoctorInput {
             running: Some(true),
             unit_path: None,
             message: None,
+            sandbox_protect_home: None,
+            sandbox_protect_system_strict: None,
         },
+        journal_bytes: None,
+        journal_byte_limit: None,
+        local_bin_visible: None,
     }
 }
 
@@ -154,7 +159,27 @@ fn credential_states_are_explicit_without_values() {
 }
 
 #[test]
-fn support_bundle_always_redacted_and_strips_secrets() {
+fn doctor_warns_when_journal_is_over_watermark() {
+    let mut input = base_input();
+    input.journal_bytes = Some(3 * 1024 * 1024 + 1);
+    input.journal_byte_limit = Some(4 * 1024 * 1024);
+    let report = run_doctor(&input);
+    assert!(report.checks.iter().any(|c| {
+        c.id == "journal.capacity" && c.status == CheckStatus::Warn
+    }));
+}
+
+#[test]
+fn doctor_fails_when_user_unit_sets_protect_home() {
+    let mut input = base_input();
+    input.service.sandbox_protect_home = Some(true);
+    input.service.sandbox_protect_system_strict = Some(false);
+    let report = run_doctor(&input);
+    assert!(!report.ok);
+    assert!(report.checks.iter().any(|c| {
+        c.id == "service.sandbox" && c.status == CheckStatus::Fail
+    }));
+}
     let doctor = run_doctor(&DoctorInput::default());
     let mut sections = BTreeMap::new();
     sections.insert(

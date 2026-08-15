@@ -47,6 +47,13 @@ async fn run_async() -> Result<(), ExitCode> {
         ExitCode::UsageConfig
     })?;
     tracing::info!(lang = %cfg.lang, "config loaded");
+    let exec_dirs: Vec<std::path::PathBuf> = cfg
+        .runtime
+        .exec_path
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    ownmesh_exec::apply_user_execution_path(&exec_dirs);
 
     let public = ensure_device_identity(&paths, &cfg).map_err(|err| {
         tracing::error!(error = %err, "device identity bootstrap failed");

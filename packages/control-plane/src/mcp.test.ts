@@ -760,6 +760,61 @@ test("durable system diagnosis drops non-contract Agent fields", async () => {
   assert.doesNotMatch(JSON.stringify(record?.data), /must-not-persist|C:\\\\secret|argv/);
 });
 
+test("durable system diagnosis maps broken sessions without leaking extra fields", async () => {
+  const { store } = await authed();
+  const deviceId = "dev_diagnose_broken01";
+  const operationId = "op_diagnose_broken01";
+  const observedAt = "2026-08-15T00:00:00Z";
+  await store.putDevice({
+    id: deviceId, tenant_id: "ten_default", principal_id: "prin_dev", name: deviceId,
+    hostname: deviceId, os: "test", arch: "test", agent_version: "1.2.13",
+    protocol_version: "ownmesh.device/1.0", public_key: "ab".repeat(32), revoked: false,
+    created_at: observedAt, status: "active",
+  });
+  await store.putMcpOperation({
+    operation_id: operationId, tenant_id: "ten_default", principal_id: "prin_dev",
+    device_id: deviceId, tool: "ownmesh_system_diagnose", status: "pending",
+    workspace_id: null, action: { workspace_version: null },
+    summary: "routed", data: {}, truncated: false, next_cursor: null,
+    approval_required: false, warnings: [], correlation_id: operationId,
+    policy_authority: "ownmesh_device", created_at: observedAt, updated_at: observedAt,
+  });
+  const check = (id: string, state: string, status: "pass" | "warn" | "fail" = "pass") => ({
+    id, status, state,
+    provenance: ["policy", "workspace", "sessions"].includes(id)
+      ? "authoritative"
+      : "observed",
+    observed_at: observedAt,
+  });
+  const applied = await applyMcpOperationResult(store, {
+    operationId,
+    correlationId: operationId,
+    deviceId,
+    payload: {
+      operation_id: operationId,
+      status: "completed",
+      result: {
+        workspace_id: null, workspace_version: null,
+        schema: "ownmesh.system_diagnosis/1.0",
+        observed_at: observedAt,
+        agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+        checks: [
+          check("policy", "allow"), check("workspace", "bound_enforced"),
+          check("daemon", "running"), check("session_supervisor", "not_required"),
+          { ...check("sessions", "broken", "fail"), count: 1, nonterminal_count: 1, stale_count: 0 },
+          check("journal", "full", "fail"),
+        ],
+        HOME: "/secret/home",
+      },
+    },
+  });
+  assert.equal(applied.ok, true);
+  const record = await store.getMcpOperation(operationId);
+  assert.equal(record?.data.overall, "sessions_broken");
+  assert.equal(record?.data.recommendation, "repair_local_runtime");
+  assert.doesNotMatch(JSON.stringify(record?.data), /\/secret\/home|journal/);
+});
+
 test("approval round-trip: ask → human approve metadata → completed result", async () => {
   const { store, token } = await authed();
   const deviceId = "dev_mcp_apr_roundtrip01";

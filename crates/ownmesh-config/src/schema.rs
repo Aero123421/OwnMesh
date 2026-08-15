@@ -30,6 +30,9 @@ pub struct OwnMeshConfig {
     /// Local service IPC socket privilege boundary (Unix path/owner/group/mode/uids).
     #[serde(default)]
     pub service_socket: ServiceSocketConfig,
+    /// Daemon execution PATH extras (never sourced from shell rc files).
+    #[serde(default, skip_serializing_if = "RuntimeConfig::is_empty")]
+    pub runtime: RuntimeConfig,
 }
 
 impl Default for OwnMeshConfig {
@@ -42,6 +45,7 @@ impl Default for OwnMeshConfig {
             telemetry: TelemetryConfig::default(),
             instances: Vec::new(),
             service_socket: ServiceSocketConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -75,7 +79,44 @@ impl OwnMeshConfig {
         }
         self.update.validate()?;
         self.service_socket.validate()?;
+        self.runtime.validate()?;
         // Secrets must never appear as fields on this struct — enforced by type design.
+        Ok(())
+    }
+}
+
+/// Daemon execution environment independent of interactive shells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RuntimeConfig {
+    /// Extra directories prepended to the daemon execution PATH.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_path: Vec<String>,
+}
+
+impl RuntimeConfig {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.exec_path.is_empty()
+    }
+
+    fn validate(&self) -> ConfigResult<()> {
+        if self.exec_path.len() > 64 {
+            return Err(ConfigError::Validation {
+                message: "runtime.exec_path has too many entries".into(),
+            });
+        }
+        for entry in &self.exec_path {
+            let path = std::path::Path::new(entry);
+            if entry.is_empty()
+                || entry.len() > 4096
+                || entry.chars().any(char::is_control)
+                || !path.is_absolute()
+            {
+                return Err(ConfigError::Validation {
+                    message: "runtime.exec_path entries must be absolute paths".into(),
+                });
+            }
+        }
         Ok(())
     }
 }

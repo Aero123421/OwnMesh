@@ -39,6 +39,8 @@ pub const fn crate_version() -> &'static str {
 pub enum ProfileError {
     #[error("unknown profile: {0}")]
     Unknown(String),
+    #[error("profile not installed: {0}")]
+    NotInstalled(String),
     #[error("unsupported version: {0}")]
     UnsupportedVersion(String),
     #[error("io: {0}")]
@@ -769,12 +771,12 @@ impl ProfileRegistry {
         let mut notes = Vec::new();
         let mut binary_path = None;
         for b in &p.binaries {
-            match which::which(b) {
-                Ok(path) => {
+            match ownmesh_exec::resolve_executable_invocation_path(b, None) {
+                Some(path) => {
                     binary_path = Some(path.to_string_lossy().into_owned());
                     break;
                 }
-                Err(_) => notes.push(format!("binary not on PATH: {b}")),
+                None => notes.push(format!("binary not on PATH: {b}")),
             }
         }
         let detected = binary_path.is_some();
@@ -836,18 +838,28 @@ impl ProfileRegistry {
     ) -> ProfileResult<LaunchPlan> {
         let p = self.get(id)?;
         let status = self.detect(id)?;
+        if matches!(status.state, ProfileReadyState::NotInstalled) {
+            return Err(ProfileError::NotInstalled(id.into()));
+        }
         let program = status
             .binary_path
             .clone()
-            .or_else(|| p.binaries.first().cloned())
-            .ok_or_else(|| ProfileError::Unknown(id.into()))?;
+            .ok_or_else(|| ProfileError::NotInstalled(id.into()))?;
 
         if matches!(status.state, ProfileReadyState::UnsupportedVersion) {
             return Err(ProfileError::UnsupportedVersion(
                 status.version.unwrap_or_else(|| "unknown".into()),
             ));
         }
+        Ok(Self::finish_launch_plan(p, program, prompt, force_pty))
+    }
 
+    fn finish_launch_plan(
+        p: &Profile,
+        program: String,
+        prompt: Option<&str>,
+        force_pty: bool,
+    ) -> LaunchPlan {
         let interface = if force_pty {
             InterfacePreference::Pty
         } else {
@@ -869,7 +881,7 @@ impl ProfileRegistry {
             }
         };
 
-        Ok(LaunchPlan {
+        LaunchPlan {
             profile_id: Some(p.id.clone()),
             program,
             args,
@@ -877,7 +889,7 @@ impl ProfileRegistry {
             interface,
             use_pty: interface == InterfacePreference::Pty || force_pty,
             env: BTreeMap::new(),
-        })
+        }
     }
 
     /// Build a native resume plan when supported.
@@ -923,10 +935,12 @@ impl ProfileRegistry {
         {
             return Err(ProfileError::Parse("invalid native resume id".into()));
         }
+        if matches!(status.state, ProfileReadyState::NotInstalled) {
+            return Err(ProfileError::NotInstalled(id.into()));
+        }
         let program = status
             .binary_path
-            .or_else(|| p.binaries.first().cloned())
-            .ok_or_else(|| ProfileError::Unknown(id.into()))?;
+            .ok_or_else(|| ProfileError::NotInstalled(id.into()))?;
         Ok(LaunchPlan {
             profile_id: Some(p.id.clone()),
             program,
@@ -2198,11 +2212,31 @@ acp = false
             let plan = match reg.launch_plan(id.as_str(), Some("hello"), false) {
                 Ok(plan) => plan,
                 Err(ProfileError::UnsupportedVersion(_)) => continue,
+                Err(ProfileError::NotInstalled(_)) => {
+                    let profile = reg.get(id.as_str()).unwrap();
+                    ProfileRegistry::finish_launch_plan(
+                        profile,
+                        profile.binaries.first().cloned().unwrap(),
+                        Some("hello"),
+                        false,
+                    )
+                }
                 Err(e) => panic!("{} launch: {e}", id.as_str()),
             };
             assert_eq!(plan.profile_id.as_deref(), Some(id.as_str()));
-            // force PTY fallback
-            let pty = reg.launch_plan(id.as_str(), None, true).unwrap();
+            let pty = match reg.launch_plan(id.as_str(), None, true) {
+                Ok(plan) => plan,
+                Err(ProfileError::NotInstalled(_)) => {
+                    let profile = reg.get(id.as_str()).unwrap();
+                    ProfileRegistry::finish_launch_plan(
+                        profile,
+                        profile.binaries.first().cloned().unwrap(),
+                        None,
+                        true,
+                    )
+                }
+                Err(e) => panic!("{} pty launch: {e}", id.as_str()),
+            };
             assert!(pty.use_pty);
             assert_eq!(pty.interface, InterfacePreference::Pty);
 
@@ -2210,9 +2244,15 @@ acp = false
                 official_adapter_spec(id.as_str()).unwrap().resume,
                 NativeResume::Argv { .. }
             ) {
-                let r = reg
-                    .resume_plan_with_prompt(id.as_str(), "native_abc", Some("follow up"))
-                    .unwrap();
+                let r = match reg.resume_plan_with_prompt(
+                    id.as_str(),
+                    "native_abc",
+                    Some("follow up"),
+                ) {
+                    Ok(plan) => plan,
+                    Err(ProfileError::NotInstalled(_)) => continue,
+                    Err(e) => panic!("{} resume: {e}", id.as_str()),
+                };
                 assert!(r.args.iter().any(|a| a.contains("native_abc")));
             }
         }
@@ -2260,9 +2300,19 @@ acp = false
     fn profile_launch_argv_matches_each_source_backed_adapter_start() {
         let reg = ProfileRegistry::with_official();
         for spec in official_adapter_specs() {
-            let plan = reg
-                .launch_plan(&spec.profile_id, Some("fixture prompt"), false)
-                .unwrap_or_else(|err| panic!("{}: {err}", spec.profile_id));
+            let plan = match reg.launch_plan(&spec.profile_id, Some("fixture prompt"), false) {
+                Ok(plan) => plan,
+                Err(ProfileError::NotInstalled(_)) => {
+                    let profile = reg.get(&spec.profile_id).unwrap();
+                    ProfileRegistry::finish_launch_plan(
+                        profile,
+                        profile.binaries.first().cloned().unwrap(),
+                        Some("fixture prompt"),
+                        false,
+                    )
+                }
+                Err(err) => panic!("{}: {err}", spec.profile_id),
+            };
             let expected: Vec<_> = spec
                 .start_args
                 .iter()
@@ -2270,19 +2320,22 @@ acp = false
                 .collect();
             assert_eq!(plan.args, expected, "{}", spec.profile_id);
             if let NativeResume::Argv { args } = spec.resume {
-                let resume = reg
-                    .resume_plan_with_prompt(
-                        &spec.profile_id,
-                        "native_fixture",
-                        Some("fixture prompt"),
-                    )
-                    .unwrap();
                 let expected_resume: Vec<_> = args
                     .iter()
                     .map(|arg| arg.replace("{{prompt}}", "fixture prompt"))
                     .map(|arg| arg.replace("{{native_id}}", "native_fixture"))
                     .collect();
-                assert_eq!(resume.args, expected_resume, "{}", spec.profile_id);
+                match reg.resume_plan_with_prompt(
+                    &spec.profile_id,
+                    "native_fixture",
+                    Some("fixture prompt"),
+                ) {
+                    Ok(resume) => {
+                        assert_eq!(resume.args, expected_resume, "{}", spec.profile_id);
+                    }
+                    Err(ProfileError::NotInstalled(_)) => {}
+                    Err(err) => panic!("{} resume: {err}", spec.profile_id),
+                }
             }
         }
     }
@@ -2421,5 +2474,82 @@ acp = false
         let raw = serde_json::to_string_pretty(fx).unwrap();
         let back: ProfileFixture = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.id, fx.id);
+    }
+
+    #[test]
+    fn not_installed_profile_fails_closed_instead_of_bare_name_spawn() {
+        let mut reg = ProfileRegistry::with_official();
+        reg.insert(Profile {
+            id: "missing-cli".into(),
+            display_name: "Missing".into(),
+            binaries: vec!["ownmesh-definitely-missing-binary".into()],
+            interface_order: vec![InterfacePreference::Pty],
+            version_args: vec![],
+            version_regex: None,
+            auth_status_args: vec![],
+            supports_native_resume: false,
+            supports_structured: false,
+            supports_acp: false,
+            min_version: None,
+            non_interactive_args: vec![],
+            structured_start_args: vec![],
+            resume_args: vec![],
+            official: false,
+        });
+        let status = reg.detect("missing-cli").unwrap();
+        assert!(!status.detected);
+        assert!(matches!(status.state, ProfileReadyState::NotInstalled));
+        assert!(matches!(
+            reg.launch_plan("missing-cli", None, true),
+            Err(ProfileError::NotInstalled(_))
+        ));
+    }
+
+    #[test]
+    fn local_bin_is_detected_without_shell_rc() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("bin");
+        std::fs::create_dir_all(&local).unwrap();
+        let tool = local.join("ownmesh-path-fixture");
+        std::fs::write(&tool, b"#!/bin/sh\necho 1.0.0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&tool, perms).unwrap();
+        }
+        let previous_path = std::env::var_os("PATH");
+        let mut search = vec![local.clone()];
+        if let Some(rest) = &previous_path {
+            search.extend(std::env::split_paths(rest));
+        }
+        std::env::set_var("PATH", std::env::join_paths(&search).unwrap());
+        let mut reg = ProfileRegistry::with_official();
+        reg.insert(Profile {
+            id: "path-fixture".into(),
+            display_name: "Path fixture".into(),
+            binaries: vec!["ownmesh-path-fixture".into()],
+            interface_order: vec![InterfacePreference::Pty],
+            version_args: vec![],
+            version_regex: None,
+            auth_status_args: vec![],
+            supports_native_resume: false,
+            supports_structured: false,
+            supports_acp: false,
+            min_version: None,
+            non_interactive_args: vec![],
+            structured_start_args: vec![],
+            resume_args: vec![],
+            official: false,
+        });
+        let status = reg.detect("path-fixture").unwrap();
+        match previous_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(status.detected, "{status:?}");
+        let plan = reg.launch_plan("path-fixture", None, true).unwrap();
+        assert!(plan.program.ends_with("ownmesh-path-fixture"));
     }
 }

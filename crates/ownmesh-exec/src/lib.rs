@@ -27,6 +27,12 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
+mod user_path;
+pub use user_path::{
+    apply_user_execution_path, configured_exec_dirs_from_env, discover_user_exec_dirs,
+    execution_path_report, merge_exec_dirs, ExecutionPathReport, EXEC_PATH_ENV,
+};
+
 /// Stable crate name used by diagnostics and tests.
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -56,6 +62,10 @@ pub enum ExecError {
     ResourceLimit(String),
     #[error("cancelled")]
     Cancelled,
+    #[error("executable not found: {0}")]
+    ExecutableNotFound(String),
+    #[error("executable is not a valid native launcher: {0}")]
+    ExecutableFormat(String),
 }
 
 /// Result alias.
@@ -420,21 +430,81 @@ pub fn resolve_executable_invocation_path(program: &str, cwd: Option<&Path>) -> 
         } else {
             cwd.unwrap_or_else(|| Path::new(".")).join(directory)
         };
-        let direct = directory.join(raw);
-        if direct.is_file() {
-            return absolute(direct);
-        }
         #[cfg(windows)]
-        if Path::new(raw).extension().is_none() {
-            for ext in ["exe", "cmd", "bat", "com"] {
-                let candidate = directory.join(format!("{raw}.{ext}"));
-                if candidate.is_file() {
-                    return absolute(candidate);
-                }
+        {
+            if let Some(candidate) = windows_path_candidate(&directory, raw) {
+                return absolute(candidate);
+            }
+            continue;
+        }
+        #[cfg(not(windows))]
+        {
+            let direct = directory.join(raw);
+            if direct.is_file() {
+                return absolute(direct);
             }
         }
     }
     None
+}
+
+/// Windows PATHEXT-compatible resolution for a bare command name.
+///
+/// Extensionless npm shims must not win over `.cmd` / `.exe` launchers.
+#[cfg(windows)]
+fn windows_path_candidate(directory: &Path, raw: &str) -> Option<PathBuf> {
+    let path = Path::new(raw);
+    if path.extension().is_some() {
+        let candidate = directory.join(raw);
+        return candidate.is_file().then_some(candidate);
+    }
+    for ext in windows_launcher_exts() {
+        let candidate = directory.join(format!("{raw}{ext}"));
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_launcher_exts() -> Vec<String> {
+    let default = [".COM", ".EXE", ".BAT", ".CMD"];
+    let from_env = std::env::var("PATHEXT").unwrap_or_default();
+    let mut exts: Vec<String> = from_env
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| {
+            if ext.starts_with('.') {
+                ext.to_ascii_uppercase()
+            } else {
+                format!(".{ext}").to_ascii_uppercase()
+            }
+        })
+        .filter(|ext| matches!(ext.as_str(), ".COM" | ".EXE" | ".BAT" | ".CMD"))
+        .collect();
+    if exts.is_empty() {
+        exts = default.into_iter().map(str::to_string).collect();
+    }
+    exts
+}
+
+/// Classify spawn IO failures so callers do not map Win32 193 to INTERNAL.
+#[must_use]
+pub fn classify_spawn_io_error(program: &str, error: &std::io::Error) -> ExecError {
+    #[cfg(windows)]
+    const ERROR_BAD_EXE_FORMAT: i32 = 193;
+    #[cfg(windows)]
+    {
+        if error.raw_os_error() == Some(ERROR_BAD_EXE_FORMAT) {
+            return ExecError::ExecutableFormat(program.to_owned());
+        }
+    }
+    match error.kind() {
+        std::io::ErrorKind::NotFound => ExecError::ExecutableNotFound(program.to_owned()),
+        _ => ExecError::Io(std::io::Error::new(error.kind(), error.to_string())),
+    }
 }
 
 /// Resolve an executable through an explicit path or the current PATH.
@@ -1326,7 +1396,9 @@ pub async fn run_command_cancellable(
     }
 
     let start = Instant::now();
-    let mut child = cmd.spawn()?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| classify_spawn_io_error(&capped.program, &error))?;
 
     if let Some(input) = &capped.stdin {
         if let Some(mut stdin) = child.stdin.take() {
@@ -1749,6 +1821,46 @@ mod tests {
         let path = resolve_executable_invocation_path("./Cargo.toml", Some(cwd)).unwrap();
         assert!(path.is_absolute(), "invocation path must be persistable");
         assert_eq!(path, cwd.join("./Cargo.toml"));
+    }
+
+    #[test]
+    fn npm_shim_triplet_prefers_windows_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path();
+        std::fs::write(bin.join("tool"), b"#!/usr/bin/env node\n").unwrap();
+        std::fs::write(bin.join("tool.cmd"), b"@echo off\n").unwrap();
+        std::fs::write(bin.join("tool.ps1"), b"# powershell shim\n").unwrap();
+        let previous = std::env::var_os("PATH");
+        std::env::set_var("PATH", bin);
+        let resolved = resolve_executable_invocation_path("tool", None).unwrap();
+        match previous {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(resolved.file_name().unwrap(), "tool.cmd");
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(resolved.file_name().unwrap(), "tool");
+        }
+    }
+
+    #[test]
+    fn spawn_not_found_is_typed() {
+        let err = classify_spawn_io_error(
+            "missing-bin",
+            &std::io::Error::new(std::io::ErrorKind::NotFound, "gone"),
+        );
+        assert!(matches!(err, ExecError::ExecutableNotFound(name) if name == "missing-bin"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bad_exe_format_is_typed() {
+        let err = classify_spawn_io_error("pi", &std::io::Error::from_raw_os_error(193));
+        assert!(matches!(err, ExecError::ExecutableFormat(name) if name == "pi"));
     }
 
     #[test]
