@@ -35,6 +35,7 @@ import {
   annotateWorkspaceList,
   annotateWorkspaceRecord,
   parseWorkspaceGeneration,
+  parseWorkspaceId,
 } from "./workspace-activation.ts";
 import { parseTransferPreflightResult, type TransferServerBinding } from "./transfer-orchestrator.ts";
 
@@ -3684,13 +3685,18 @@ async function applyWorkspaceActivationSideEffects(
 ): Promise<Record<string, unknown>> {
   if (!op.device_id) return data;
   const deviceId = op.device_id;
-  const workspaceId =
-    (typeof data.id === "string" && data.id) ||
-    op.workspace_id ||
-    undefined;
+  const reservedId = parseWorkspaceId(op.workspace_id);
+  const resultId = parseWorkspaceId(data.id);
+  const resultMatchesReservation = !reservedId || !resultId || resultId === reservedId;
+  const workspaceId = reservedId || resultId;
 
   if (status === "completed") {
-    if (op.tool === "ownmesh_workspace_add" || op.tool === "ownmesh_workspace_update" || op.tool === "ownmesh_workspace_show") {
+    if (
+      resultMatchesReservation &&
+      (op.tool === "ownmesh_workspace_add" ||
+        op.tool === "ownmesh_workspace_update" ||
+        op.tool === "ownmesh_workspace_show")
+    ) {
       const generation = parseWorkspaceGeneration(data.generation);
       if (workspaceId && generation) {
         await store.observeWorkspaceGeneration(deviceId, workspaceId, generation);
@@ -3700,7 +3706,7 @@ async function applyWorkspaceActivationSideEffects(
       for (const entry of data.workspaces) {
         if (!entry || typeof entry !== "object") continue;
         const row = entry as Record<string, unknown>;
-        const id = typeof row.id === "string" ? row.id : "";
+        const id = parseWorkspaceId(row.id);
         const generation = parseWorkspaceGeneration(row.generation);
         if (id && generation) {
           await store.observeWorkspaceGeneration(deviceId, id, generation);

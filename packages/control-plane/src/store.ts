@@ -18,6 +18,7 @@ import {
   classifyWorkspaceAvailability,
   classifyWorkspaceVisibility,
   parseWorkspaceGeneration,
+  parseWorkspaceId,
   type WorkspaceOperableGate,
 } from "./workspace-activation.ts";
 
@@ -909,6 +910,8 @@ export interface ControlPlaneStore {
   /**
    * Apply one Agent-observed opaque generation. Unlike syncDeviceWorkspaces this
    * does not require a complete registry snapshot (ws_default may be absent).
+   * Inactive rows keep the last generation as a tombstone: the same value does
+   * not reactivate; a later add must advertise a new generation.
    */
   observeWorkspaceGeneration(
     deviceId: string,
@@ -2289,6 +2292,7 @@ export class MemoryStore implements ControlPlaneStore {
       } else if (existing.local_generation === undefined) {
         this.workspaces.set(key, {
           ...existing,
+          active: true,
           version: existing.version + 1,
           local_generation: registration.generation,
           updated_at: observedAt,
@@ -2370,7 +2374,7 @@ export class MemoryStore implements ControlPlaneStore {
     workspaceId: string,
     generation: string,
   ): Promise<WorkspaceRecord | null> {
-    if (!parseWorkspaceGeneration(generation)) return null;
+    if (!parseWorkspaceId(workspaceId) || !parseWorkspaceGeneration(generation)) return null;
     const device = await this.getDevice(deviceId);
     if (!device || device.revoked || device.status !== "active") return null;
     const existing = await this.getWorkspace(deviceId, workspaceId);
@@ -4838,7 +4842,7 @@ export class SqlStore implements ControlPlaneStore {
           this.db
             .prepare(
               `UPDATE device_workspaces
-               SET version = version + 1, local_generation = ?, updated_at = ?
+               SET active = 1, version = version + 1, local_generation = ?, updated_at = ?
                WHERE device_id = ? AND workspace_id = ? AND local_generation IS NULL`,
             )
             .bind(registration.generation, observedAt, deviceId, workspaceId),
@@ -4923,7 +4927,7 @@ export class SqlStore implements ControlPlaneStore {
     workspaceId: string,
     generation: string,
   ): Promise<WorkspaceRecord | null> {
-    if (!parseWorkspaceGeneration(generation)) return null;
+    if (!parseWorkspaceId(workspaceId) || !parseWorkspaceGeneration(generation)) return null;
     const device = await this.getDevice(deviceId);
     if (!device || device.revoked || device.status !== "active") return null;
     const existing = await this.getWorkspace(deviceId, workspaceId);

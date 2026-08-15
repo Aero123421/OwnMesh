@@ -6,6 +6,7 @@
 
 - Newly registered workspaces stay `pending_activation` until the Agent
   generation is observed, so `workspace_list` cannot imply execution readiness.
+  A completed remove is not revived by a later stale list of the same generation.
 - `workspace_not_available` now carries a bounded cause and next action.
   Fresh-passkey `approval_required` responses always include a same-origin
   `approval_url`. Linux enrollment uses the OS hostname instead of

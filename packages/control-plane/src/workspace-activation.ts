@@ -9,6 +9,7 @@
 import type { WorkspaceRecord } from "./store.ts";
 
 export const WORKSPACE_GENERATION_RE = /^wsg_[a-f0-9]{32}$/;
+export const WORKSPACE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export const WORKSPACE_ROOT_ENFORCEMENT_NOTE =
   "Independent of access_preset. When true, filesystem and command tools require a registered workspace. Full Access still allows an explicitly permitted absolute path only with workspace_id: null.";
@@ -45,6 +46,12 @@ export type WorkspaceOperableGate =
 
 export function parseWorkspaceGeneration(value: unknown): string | undefined {
   return typeof value === "string" && WORKSPACE_GENERATION_RE.test(value) ? value : undefined;
+}
+
+export function parseWorkspaceId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length <= 128 && WORKSPACE_ID_RE.test(value)
+    ? value
+    : undefined;
 }
 
 export function workspaceActivationView(
@@ -165,6 +172,11 @@ export function applyObservedGeneration(
       created_at: input.observedAt,
       updated_at: input.observedAt,
     };
+  }
+  // A completed remove leaves the same generation as a tombstone. Stale list/show
+  // results must not revive it; a later add advertises a new generation.
+  if (!existing.active && existing.local_generation === input.generation) {
+    return { ...existing };
   }
   const generationChanged =
     existing.local_generation !== undefined && existing.local_generation !== input.generation;

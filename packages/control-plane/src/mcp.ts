@@ -5621,6 +5621,21 @@ export async function handleMcp(
       safeArgs.workspace_id = requestedWorkspaceId || null;
     }
     let workspaceBinding: { workspace_id: string; version: number } | undefined;
+    if (name === "ownmesh_workspace_add") {
+      const mayAdminister = await mayAdministerDevice(
+        store,
+        deviceId,
+        rec.tenant_id,
+        rec.principal,
+      );
+      if (!mayAdminister) {
+        return mcpError(id, -32004, "workspace_not_available", {
+          code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
+          cause: "not_authorized",
+          next_action: "select_active_workspace",
+        });
+      }
+    }
     if (requestedWorkspaceId) {
       if (requestedWorkspaceId.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(requestedWorkspaceId)) {
         return mcpError(id, -32602, "invalid workspace id", {
@@ -5629,16 +5644,6 @@ export async function handleMcp(
       }
       if (name === "ownmesh_workspace_add") {
         const device = await store.getDevice(deviceId);
-        const role = await store.getTenantMemberRole(rec.tenant_id, rec.principal);
-        const mayAdminister =
-          device?.principal_id === rec.principal || role === "owner" || role === "admin";
-        if (!mayAdminister) {
-          return mcpError(id, -32004, "workspace_not_available", {
-            code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
-            cause: "not_authorized",
-            next_action: "select_active_workspace",
-          });
-        }
         const existing = await store.getWorkspace(deviceId, requestedWorkspaceId);
         if (existing?.local_generation) {
           return mcpError(id, -32602, "workspace id is already registered", {
@@ -5693,7 +5698,8 @@ export async function handleMcp(
           const nextAction =
             workspaceGate.cause === "pending_activation"
               ? workspaceGate.next_action
-              : device?.enforce_workspace === false
+              : (workspaceGate.cause === "not_found" || workspaceGate.cause === "inactive") &&
+                  device?.enforce_workspace === false
                 ? "use_permitted_absolute_path"
                 : workspaceGate.next_action;
           return workspaceUnavailableMcpError(

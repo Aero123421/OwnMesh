@@ -15,7 +15,8 @@ and Control Plane storage schema unchanged. The machine-checked contract remains
 - Completed `workspace.add` / `workspace.list` results observe that generation
   immediately, so Agent reconnect is no longer required for the first successful
   use. Missing the workspace from a later ready snapshot still does not cancel a
-  pending cloud reservation.
+  pending cloud reservation. A completed remove keeps the last generation as a
+  tombstone, so a stale list cannot mark the same id executable again.
 - `workspace_root_enforcement` is labeled independently of `access_preset`.
   Switching to Full Access updates the observed enforcement flag without waiting
   for the next Agent handshake, and absolute Full Access paths remain
