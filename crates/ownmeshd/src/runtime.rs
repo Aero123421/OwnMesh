@@ -3780,6 +3780,10 @@ full_user_access/full_access for arbitrary commands",
             } else {
                 true
             },
+            "workspace_root_enforcement": self.enforce_workspace,
+            "enforce_workspace": self.enforce_workspace,
+            "workspace_root_enforcement_note":
+                "Independent of access_preset. When true, filesystem and command tools require a registered workspace. Full Access still allows an explicitly permitted absolute path only with workspace_id: null.",
         }))
     }
 
@@ -6227,6 +6231,40 @@ mod device_binding_tests {
                 .collect::<Vec<_>>(),
             vec!["ws_default", "ws_repo"]
         );
+    }
+
+    #[test]
+    fn workspace_add_returns_generation_and_does_not_claim_cloud_readiness() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let added = runtime
+            .handle_workspace_add(
+                Some(json!({
+                    "path": root.to_string_lossy(),
+                    "id": "ws_proj",
+                    "label": "Project",
+                })),
+                &ClientIdentity::new("client:local:test", "test"),
+            )
+            .unwrap();
+        assert_eq!(added["id"], "ws_proj");
+        assert_eq!(added["activation_state"], "device_local");
+        let generation = added["generation"].as_str().unwrap();
+        assert!(valid_workspace_generation(generation));
+        let listed = runtime
+            .handle_workspace_list(&ClientIdentity::new("client:local:test", "test"))
+            .unwrap();
+        assert_eq!(
+            listed["workspace_root_enforcement"],
+            listed["enforce_workspace"]
+        );
+        assert!(listed["workspace_root_enforcement_note"]
+            .as_str()
+            .unwrap()
+            .contains("Independent of access_preset"));
     }
 
     #[test]

@@ -25,6 +25,8 @@ impl DaemonRuntime {
                     "id": w.id,
                     "root": w.root.to_string_lossy(),
                     "label": w.label,
+                    "generation": w.generation,
+                    "activation_state": "device_local",
                 })
             })
             .collect();
@@ -37,7 +39,10 @@ impl DaemonRuntime {
         Ok(json!({
             "workspaces": workspaces,
             "count": workspaces.len(),
+            "workspace_root_enforcement": self.enforce_workspace,
             "enforce_workspace": self.enforce_workspace,
+            "workspace_root_enforcement_note":
+                "Independent of access_preset. When true, filesystem and command tools require a registered workspace. Full Access still allows an explicitly permitted absolute path only with workspace_id: null.",
         }))
     }
 
@@ -61,6 +66,8 @@ impl DaemonRuntime {
             "root": entry.root.to_string_lossy(),
             "label": entry.label,
             "exists": entry.root.exists(),
+            "generation": entry.generation,
+            "activation_state": "device_local",
         }))
     }
 
@@ -116,6 +123,8 @@ impl DaemonRuntime {
             "root": stored.root.to_string_lossy(),
             "label": stored.label,
             "created": true,
+            "generation": stored.generation,
+            "activation_state": "device_local",
         }))
     }
 
@@ -193,6 +202,8 @@ impl DaemonRuntime {
             "root": stored.root.to_string_lossy(),
             "label": stored.label,
             "updated": true,
+            "generation": stored.generation,
+            "activation_state": "device_local",
         }))
     }
 

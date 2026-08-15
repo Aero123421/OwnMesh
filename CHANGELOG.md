@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v1.2.12 — Workspace activation and transfer expiry
+
+- Newly registered workspaces stay `pending_activation` until the Agent
+  generation is observed, so `workspace_list` cannot imply execution readiness.
+- `workspace_not_available` now carries a bounded cause and next action.
+  Fresh-passkey `approval_required` responses always include a same-origin
+  `approval_url`. Linux enrollment uses the OS hostname instead of
+  `unknown-host`.
+- Transfer plan/send/status expose typed next-action semantics, expire
+  non-terminal transfers, and revalidate the immutable source at send. The TUI
+  Devices screen can refresh Control Plane inventory on an explicit keypress.
+
 ## v1.2.11 — Crash-safe self-update
 
 - `ownmesh update` now performs the complete signed upgrade lifecycle: session

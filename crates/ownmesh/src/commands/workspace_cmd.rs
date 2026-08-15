@@ -16,10 +16,22 @@ pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode>
                 } else {
                     for w in list {
                         println!(
-                            "{}  {}  {}",
+                            "{}  {}  {}  {}",
                             w["id"].as_str().unwrap_or("?"),
                             w["root"].as_str().unwrap_or("?"),
-                            w["label"].as_str().unwrap_or("-")
+                            w["label"].as_str().unwrap_or("-"),
+                            w["activation_state"].as_str().unwrap_or("device_local")
+                        );
+                    }
+                    if let Some(note) = v["workspace_root_enforcement_note"].as_str() {
+                        println!(
+                            "workspace_root_enforcement: {} ({note})",
+                            v["workspace_root_enforcement"]
+                        );
+                    } else if !v["enforce_workspace"].is_null() {
+                        println!(
+                            "workspace_root_enforcement: {} (independent of access_preset)",
+                            v["workspace_root_enforcement"]
                         );
                     }
                 }
@@ -44,9 +56,10 @@ pub fn dispatch_workspace(cli: &Cli, cmd: &WorkspaceCmd) -> Result<(), ExitCode>
             let value = call_daemon(cli, "ops.workspace.add", Some(params))?;
             print_value(cli.json, &value, |v| {
                 println!(
-                    "workspace {} root={}",
+                    "workspace {} root={} activation_state={}",
                     v["id"].as_str().unwrap_or("?"),
-                    v["root"].as_str().unwrap_or("?")
+                    v["root"].as_str().unwrap_or("?"),
+                    v["activation_state"].as_str().unwrap_or("device_local")
                 );
             });
             Ok(())

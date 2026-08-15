@@ -38,6 +38,10 @@ import {
   nowIso,
 } from "./store.ts";
 import { mintTransferTicketPair } from "./transfer-orchestrator.ts";
+import {
+  WORKSPACE_ROOT_ENFORCEMENT_NOTE,
+  type WorkspaceOperableGate,
+} from "./workspace-activation.ts";
 
 // ---------------------------------------------------------------------------
 // Tool catalog (annotations are UX hints only — not authorization)
@@ -86,7 +90,7 @@ const workspaceProp = {
   workspace_id: {
     type: ["string", "null"],
     description:
-      "Registered workspace id for workspace-relative work. Use null only with an absolute Full Access path; that path is deliberately not attributed to a workspace.",
+      "Registered workspace id for workspace-relative work. Use null only with an absolute Full Access path; that path is deliberately not attributed to a workspace. workspace_id and workspace_root_enforcement are independent of access_preset.",
   },
 };
 /** Hard server-side ceilings (schema maximums are not authority alone). */
@@ -222,7 +226,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_policy_show",
     description:
-      "Read the device's effective policy preset, bounded rules, lockdown state, delegation setting, and grants without changing policy.",
+      "Read the device's effective access_preset, bounded rules, lockdown state, delegation setting, and grants. workspace_root_enforcement is an independent layer: Full Access may still require a registered workspace when that flag is true, and absolute paths use workspace_id: null.",
     inputSchema: {
       type: "object",
       properties: { ...deviceProp },
@@ -1327,7 +1331,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_workspace_list",
-    description: "List device-local workspace roots registered on a PC (CRUD configuration)",
+    description:
+      "List device-local workspace roots and their control-plane activation_state (pending_activation, active, or unavailable). A listed workspace is not executable until activation_state is active.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1351,7 +1356,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_workspace_show",
-    description: "Show one device-local workspace root by id",
+    description:
+      "Show one device-local workspace root and its authoritative activation_state. Poll this after create until activation_state is active.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1376,7 +1382,8 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   },
   {
     name: "ownmesh_workspace_add",
-    description: "Register an absolute workspace root on a device (device-local registry)",
+    description:
+      "Register an absolute workspace root on a device. The create response is not execution-ready until activation_state is active; poll ownmesh_workspace_show or retry the create.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2401,6 +2408,26 @@ function mcpError(
   return json({ jsonrpc: "2.0", id: id ?? null, error: { code, message, data } });
 }
 
+function workspaceUnavailableMcpError(
+  id: string | number | null | undefined,
+  deviceId: string,
+  workspaceId: string,
+  gate: Extract<WorkspaceOperableGate, { ok: false }>,
+  extra?: Record<string, unknown>,
+): Response {
+  return mcpError(id, -32004, "workspace_not_available", {
+    code:
+      gate.cause === "pending_activation"
+        ? "OWNMESH_E_WORKSPACE_PENDING_ACTIVATION"
+        : "OWNMESH_E_WORKSPACE_NOT_AVAILABLE",
+    cause: gate.cause,
+    next_action: gate.next_action,
+    device_id: deviceId,
+    workspace_id: workspaceId,
+    ...extra,
+  });
+}
+
 /** Durable prepare→dispatch outbox key (never returned to MCP clients). */
 export const DISPATCH_OUTBOX_KEY = "__ownmesh_dispatch_outbox";
 
@@ -2730,6 +2757,7 @@ function safeDiagnosticText(value: unknown): string | undefined {
 export function compactPublicEnvelope(
   envelope: OwnMeshResultEnvelope & Partial<TrackedOperation>,
   includeDiagnostics = false,
+  issuer?: string,
 ): PublicOwnMeshResultEnvelope {
   const publicEnvelope: PublicOwnMeshResultEnvelope = {
     operation_id: envelope.operation_id,
@@ -2753,7 +2781,8 @@ export function compactPublicEnvelope(
   ) as Record<string, unknown>;
   publicEnvelope.data = data;
   if (envelope.approval_required) {
-    if (envelope.approval_url) publicEnvelope.approval_url = envelope.approval_url;
+    const url = envelope.approval_url || (issuer ? approvalUrl(issuer, envelope.operation_id) : "");
+    if (url && /^https?:\/\//i.test(url)) publicEnvelope.approval_url = url;
     if (envelope.approval_id) publicEnvelope.approval_id = envelope.approval_id;
   }
   if (envelope.warnings.length > 0) {
@@ -2787,13 +2816,14 @@ export function compactPublicEnvelope(
   return publicEnvelope;
 }
 
-function toolContent(
+function buildToolContent(
   envelope: OwnMeshResultEnvelope & Partial<TrackedOperation>,
   includeDiagnostics = false,
+  issuer?: string,
 ) {
   // MCP 2025-03-26 clients consume JSON TextContent. Keep that compatibility
   // contract while also exposing the same compact object to newer clients.
-  const publicEnvelope = compactPublicEnvelope(envelope, includeDiagnostics);
+  const publicEnvelope = compactPublicEnvelope(envelope, includeDiagnostics, issuer);
   return {
     content: [
       {
@@ -2892,6 +2922,8 @@ function approvalUrl(issuer: string | undefined, operationId: string): string {
   if (!base) return `/approve?operation_id=${encodeURIComponent(operationId)}`;
   return `${base}/approve?operation_id=${encodeURIComponent(operationId)}`;
 }
+
+export { approvalUrl };
 
 /** Independent operation payload contract carried by device envelopes. */
 export const OPERATION_CONTRACT_V1 = "ownmesh.operation/1.0" as const;
@@ -4303,6 +4335,10 @@ export async function handleMcp(
 ): Promise<Response> {
   const tracker = opts.tracker || defaultOpTracker;
   const issuer = opts.issuer || url.origin;
+  const toolContent = (
+    envelope: OwnMeshResultEnvelope & Partial<TrackedOperation>,
+    includeDiagnostics = false,
+  ) => buildToolContent(envelope, includeDiagnostics, issuer);
 
   if (req.method === "OPTIONS") return json({ error: "cors_not_enabled" }, { status: 405 });
 
@@ -5573,7 +5609,10 @@ export async function handleMcp(
           {
             code: "OWNMESH_E_WORKSPACE_POLICY_REQUIRED",
             device_id: deviceId,
+            workspace_root_enforcement: true,
             enforce_workspace: true,
+            workspace_root_enforcement_note: WORKSPACE_ROOT_ENFORCEMENT_NOTE,
+            next_action: "select_active_workspace",
           },
         );
       }
@@ -5596,41 +5635,78 @@ export async function handleMcp(
         if (!mayAdminister) {
           return mcpError(id, -32004, "workspace_not_available", {
             code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
+            cause: "not_authorized",
+            next_action: "select_active_workspace",
           });
         }
         const existing = await store.getWorkspace(deviceId, requestedWorkspaceId);
-        if (existing) {
+        if (existing?.local_generation) {
           return mcpError(id, -32602, "workspace id is already registered", {
             code: "OWNMESH_E_WORKSPACE_ID_CONFLICT",
           });
         }
-        const timestamp = nowIso();
-        // Reserve authority before dispatch.  The local daemon still validates
-        // the root and can fail the operation; until then no other principal can
-        // substitute this id during an async/reconnect retry.
-        await store.putWorkspace({
-          workspace_id: requestedWorkspaceId,
-          tenant_id: rec.tenant_id,
-          device_id: deviceId,
-          owner_principal_id: rec.principal,
-          version: 1,
-          active: true,
-          created_at: timestamp,
-          updated_at: timestamp,
-        });
-        workspaceBinding = { workspace_id: requestedWorkspaceId, version: 1 };
-      } else {
-        const workspaceGate = await store.assertWorkspaceOperableForMcp(
-          requestedWorkspaceId,
-          deviceId,
-          rec.principal,
-          rec.tenant_id,
-        );
-        if (!workspaceGate.ok) {
-          return mcpError(id, -32004, workspaceGate.error, {
-            device_id: deviceId,
-            workspace_id: requestedWorkspaceId,
+        if (existing && existing.owner_principal_id !== rec.principal && device?.principal_id !== rec.principal) {
+          return mcpError(id, -32004, "workspace_not_available", {
+            code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
+            cause: "not_authorized",
+            next_action: "select_active_workspace",
           });
+        }
+        const timestamp = nowIso();
+        // Reserve the id without implying execution readiness. The Agent still
+        // validates the root; activation requires an observed local_generation.
+        if (!existing) {
+          await store.putWorkspace({
+            workspace_id: requestedWorkspaceId,
+            tenant_id: rec.tenant_id,
+            device_id: deviceId,
+            owner_principal_id: rec.principal,
+            version: 1,
+            active: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+          });
+          workspaceBinding = { workspace_id: requestedWorkspaceId, version: 1 };
+        } else {
+          workspaceBinding = {
+            workspace_id: existing.workspace_id,
+            version: existing.version,
+          };
+        }
+      } else {
+        const workspaceGate =
+          name === "ownmesh_workspace_show" || name === "ownmesh_workspace_remove"
+            ? await store.assertWorkspaceVisibleForMcp(
+                requestedWorkspaceId,
+                deviceId,
+                rec.principal,
+                rec.tenant_id,
+              )
+            : await store.assertWorkspaceOperableForMcp(
+                requestedWorkspaceId,
+                deviceId,
+                rec.principal,
+                rec.tenant_id,
+              );
+        if (!workspaceGate.ok) {
+          const device = await store.getDevice(deviceId);
+          const nextAction =
+            workspaceGate.cause === "pending_activation"
+              ? workspaceGate.next_action
+              : device?.enforce_workspace === false
+                ? "use_permitted_absolute_path"
+                : workspaceGate.next_action;
+          return workspaceUnavailableMcpError(
+            id,
+            deviceId,
+            requestedWorkspaceId,
+            { ...workspaceGate, next_action: nextAction },
+            {
+              workspace_root_enforcement: device?.enforce_workspace === true,
+              enforce_workspace: device?.enforce_workspace === true,
+              workspace_root_enforcement_note: WORKSPACE_ROOT_ENFORCEMENT_NOTE,
+            },
+          );
         }
         // Workspace root mutation/removal additionally needs a custodian.
         if (workspaceMutation.has(name)) {
@@ -5644,6 +5720,8 @@ export async function handleMcp(
           if (!mayAdminister) {
             return mcpError(id, -32004, "workspace_not_available", {
               code: "OWNMESH_E_WORKSPACE_ADMIN_REQUIRED",
+              cause: "not_authorized",
+              next_action: "select_active_workspace",
             });
           }
         }

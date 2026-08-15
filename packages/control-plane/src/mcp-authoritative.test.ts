@@ -1353,3 +1353,208 @@ test("cancel owner path updates store and is CAS-safe", async () => {
   assert.equal(secondRoutes, 0, "idempotent cancel claim must not re-route");
   assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
 });
+
+test("newly created workspace is not executable until Agent generation is observed", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    const owner = await seedAuthed(store);
+    const deviceId = `dev_pending_ws_${store.kind}`;
+    await putActiveDevice(store, deviceId);
+    const createdAt = new Date().toISOString();
+    await store.putWorkspace({
+      workspace_id: "ws_dev",
+      tenant_id: "ten_default",
+      device_id: deviceId,
+      owner_principal_id: "prin_dev",
+      version: 1,
+      active: false,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+
+    const listed = await store.getWorkspace(deviceId, "ws_dev");
+    assert.equal(listed?.active, false);
+    assert.equal(listed?.local_generation, undefined);
+
+    let routes = 0;
+    const denied = await handleMcp(
+      rpc("ownmesh_fs_list", { device_id: deviceId, workspace_id: "ws_dev", idempotency_key: "pending-read" }, owner.access_token),
+      store, new URL("https://cp.test/mcp"),
+      { routeToDevice: async () => { routes += 1; return { status: "routed_to_device" }; } },
+      { tracker: new OperationTracker() },
+    );
+    assert.equal(denied.status, 200);
+    assert.equal(routes, 0);
+    const deniedBody = await denied.json() as { error?: { message?: string; data?: Record<string, unknown> } };
+    assert.equal(deniedBody.error?.message, "workspace_not_available");
+    assert.equal(deniedBody.error?.data?.cause, "pending_activation");
+    assert.equal(deniedBody.error?.data?.next_action, "retry_activation");
+    assert.equal(deniedBody.error?.data?.code, "OWNMESH_E_WORKSPACE_PENDING_ACTIVATION");
+
+    const observed = await store.observeWorkspaceGeneration(
+      deviceId,
+      "ws_dev",
+      "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    );
+    assert.equal(observed?.active, true);
+    assert.equal(observed?.local_generation, "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const operable = await store.assertWorkspaceOperableForMcp("ws_dev", deviceId, "prin_dev", "ten_default");
+    assert.equal(operable.ok, true);
+  }
+});
+
+test("workspace add result observes generation and does not report active before that", async () => {
+  const store = new MemoryStore();
+  await seedAuthed(store);
+  const deviceId = "dev_ws_add_result_01abcdef";
+  await putActiveDevice(store, deviceId);
+  const createdAt = new Date().toISOString();
+  await store.putWorkspace({
+    workspace_id: "ws_dev",
+    tenant_id: "ten_default",
+    device_id: deviceId,
+    owner_principal_id: "prin_dev",
+    version: 1,
+    active: false,
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+  await store.putMcpOperation({
+    operation_id: "op_ws_add_pending",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_workspace_add",
+    status: "pending",
+    summary: "routing",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_ws_add_pending",
+    workspace_id: "ws_dev",
+    policy_authority: "ownmesh_device",
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+
+  const before = await applyMcpOperationResult(store, {
+    operationId: "op_ws_add_pending",
+    correlationId: "op_ws_add_pending",
+    deviceId,
+    payload: {
+      status: "completed",
+      operation_id: "op_ws_add_pending",
+      result: { id: "ws_dev", root: "/home/tonakai/Dev", created: true },
+    },
+  });
+  assert.equal(before.ok, true);
+  assert.equal((await store.getWorkspace(deviceId, "ws_dev"))?.active, false);
+  assert.equal(before.ok && before.record?.data?.activation_state, "pending_activation");
+
+  await store.putMcpOperation({
+    operation_id: "op_ws_add_ready",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_workspace_add",
+    status: "pending",
+    summary: "routing",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_ws_add_ready",
+    workspace_id: "ws_dev",
+    policy_authority: "ownmesh_device",
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+  const after = await applyMcpOperationResult(store, {
+    operationId: "op_ws_add_ready",
+    correlationId: "op_ws_add_ready",
+    deviceId,
+    payload: {
+      status: "completed",
+      operation_id: "op_ws_add_ready",
+      result: {
+        id: "ws_dev",
+        root: "/home/tonakai/Dev",
+        created: true,
+        generation: "wsg_cccccccccccccccccccccccccccccccc",
+      },
+    },
+  });
+  assert.equal(after.ok, true);
+  const activated = await store.getWorkspace(deviceId, "ws_dev");
+  assert.equal(activated?.active, true);
+  assert.equal(activated?.local_generation, "wsg_cccccccccccccccccccccccccccccccc");
+  assert.equal(after.ok && after.record?.data?.activation_state, "active");
+  assert.equal(after.ok && after.record?.data?.generation, undefined);
+});
+
+test("fresh-passkey approval_required always persists a same-origin approval_url", async () => {
+  const store = new MemoryStore();
+  await seedAuthed(store);
+  const deviceId = "dev_approval_url_01abcdef";
+  await putActiveDevice(store, deviceId);
+  const createdAt = new Date().toISOString();
+  await store.putMcpOperation({
+    operation_id: "op_47485e58d8c9411e9cbc10",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_policy_preset",
+    status: "pending",
+    summary: "routing",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    correlation_id: "op_47485e58d8c9411e9cbc10",
+    policy_authority: "ownmesh_device",
+    created_at: createdAt,
+    updated_at: createdAt,
+  });
+
+  const applied = await applyMcpOperationResult(store, {
+    operationId: "op_47485e58d8c9411e9cbc10",
+    correlationId: "op_47485e58d8c9411e9cbc10",
+    deviceId,
+    issuer: "https://cp.test",
+    payload: {
+      status: "failed",
+      operation_id: "op_47485e58d8c9411e9cbc10",
+      error: {
+        code: "OWNMESH_E_APPROVAL_REQUIRED",
+        message: "fresh passkey required",
+        details: { approval_id: "apr_policy", reason: "policy preset" },
+      },
+    },
+  });
+  assert.equal(applied.ok, true);
+  assert.equal(applied.ok && applied.record?.status, "approval_required");
+  assert.equal(applied.ok && applied.record?.approval_required, true);
+  assert.equal(
+    applied.ok && applied.record?.approval_url,
+    "https://cp.test/approve?operation_id=op_47485e58d8c9411e9cbc10",
+  );
+});
+
+test("policy observation updates workspace_root_enforcement independently of access_preset", async () => {
+  const store = new MemoryStore();
+  await seedAuthed(store);
+  const deviceId = "dev_policy_enforcement_01abcdef";
+  await putActiveDevice(store, deviceId);
+  await store.recordDeviceReadyConnection(deviceId, {
+    protocol_version: "ownmesh.device/1.0",
+    last_seen_at: new Date().toISOString(),
+    enforce_workspace: true,
+  });
+  assert.equal((await store.getDevice(deviceId))?.enforce_workspace, true);
+  await store.recordObservedWorkspaceEnforcement(deviceId, false);
+  assert.equal((await store.getDevice(deviceId))?.enforce_workspace, false);
+});
+

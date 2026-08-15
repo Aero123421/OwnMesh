@@ -26,6 +26,12 @@ pub fn dispatch_policy(cli: &Cli, cmd: &PolicyCmd) -> Result<(), ExitCode> {
                     println!("lockdown: {}", v["lockdown"]);
                     let rules = v["rules"].as_array().map_or(0, Vec::len);
                     println!("rules: {rules}");
+                    if !v["workspace_root_enforcement"].is_null() {
+                        println!(
+                            "workspace_root_enforcement: {} (independent of access_preset)",
+                            v["workspace_root_enforcement"]
+                        );
+                    }
                     if v["preset"] == "full_access" {
                         println!(
                             "full_access_no_hidden_deny: {}",

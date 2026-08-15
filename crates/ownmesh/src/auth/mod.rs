@@ -14,6 +14,7 @@ mod oauth;
 mod pkce;
 mod session;
 
+pub(crate) use device_api::{device_name_candidate, is_generic_device_name};
 #[allow(unused_imports)]
 pub use device_api::{
     enroll_device, list_devices, revoke_device, rotate_local_device_key, update_device_metadata,
