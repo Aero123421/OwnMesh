@@ -28,8 +28,15 @@ import {
   verifyEd25519Hex,
   verifyInternalContext,
 } from "./util.ts";
-import { createStore, type ControlPlaneStore, type McpOperationRecord } from "./store.ts";
+import { createStore, type ControlPlaneStore, type McpOperationRecord, type WorkspaceRecord } from "./store.ts";
 import { normalizeSystemDiagnosis } from "./mcp.ts";
+import {
+  annotatePolicyObservation,
+  annotateWorkspaceList,
+  annotateWorkspaceRecord,
+  parseWorkspaceGeneration,
+  parseWorkspaceId,
+} from "./workspace-activation.ts";
 import { parseTransferPreflightResult, type TransferServerBinding } from "./transfer-orchestrator.ts";
 
 export const PROTOCOL = "ownmesh.device/1.0";
@@ -3245,6 +3252,7 @@ export class DeviceRoom {
           payload: result.mcp_result.payload,
           deviceId: this.deviceId,
           expectedApprovalDecision,
+          issuer: this.env.OAUTH_ISSUER,
         });
         if (!applied.ok) {
           // Unknown/mismatched/CAS loss — do not forward or drop pending.
@@ -3663,6 +3671,108 @@ function internalTransferFailureSummary(tool: string, status: string): string {
   return needsApproval ? "transfer start requires approval" : "transfer start failed";
 }
 
+function approvalUrlFromIssuer(issuer: string | undefined, operationId: string): string | undefined {
+  const base = (issuer || "").replace(/\/$/, "");
+  if (!base || !/^https?:\/\//i.test(base)) return undefined;
+  return `${base}/approve?operation_id=${encodeURIComponent(operationId)}`;
+}
+
+async function applyWorkspaceActivationSideEffects(
+  store: ControlPlaneStore,
+  op: McpOperationRecord,
+  data: Record<string, unknown>,
+  status: string,
+): Promise<Record<string, unknown>> {
+  if (!op.device_id) return data;
+  const deviceId = op.device_id;
+  const reservedId = parseWorkspaceId(op.workspace_id);
+  const resultId = parseWorkspaceId(data.id);
+  const resultMatchesReservation = !reservedId || !resultId || resultId === reservedId;
+  const workspaceId = reservedId || resultId;
+
+  if (status === "completed") {
+    if (
+      resultMatchesReservation &&
+      (op.tool === "ownmesh_workspace_add" ||
+        op.tool === "ownmesh_workspace_update" ||
+        op.tool === "ownmesh_workspace_show")
+    ) {
+      const generation = parseWorkspaceGeneration(data.generation);
+      if (workspaceId && generation) {
+        await store.observeWorkspaceGeneration(deviceId, workspaceId, generation);
+      }
+    }
+    if (op.tool === "ownmesh_workspace_list" && Array.isArray(data.workspaces)) {
+      for (const entry of data.workspaces) {
+        if (!entry || typeof entry !== "object") continue;
+        const row = entry as Record<string, unknown>;
+        const id = parseWorkspaceId(row.id);
+        const generation = parseWorkspaceGeneration(row.generation);
+        if (id && generation) {
+          await store.observeWorkspaceGeneration(deviceId, id, generation);
+        }
+      }
+    }
+    if (op.tool === "ownmesh_workspace_remove" && workspaceId) {
+      await store.deactivateWorkspace(deviceId, workspaceId);
+    }
+    const enforcement =
+      typeof data.workspace_root_enforcement === "boolean"
+        ? data.workspace_root_enforcement
+        : typeof data.enforce_workspace === "boolean"
+          ? data.enforce_workspace
+          : undefined;
+    if (
+      enforcement !== undefined &&
+      (op.tool === "ownmesh_workspace_list" ||
+        op.tool === "ownmesh_policy_show" ||
+        op.tool === "ownmesh_policy_preset")
+    ) {
+      await store.recordObservedWorkspaceEnforcement(deviceId, enforcement);
+    }
+  }
+
+  if (
+    status === "failed" &&
+    op.tool === "ownmesh_workspace_remove" &&
+    workspaceId
+  ) {
+    const existing = await store.getWorkspace(deviceId, workspaceId);
+    if (existing && !existing.local_generation) {
+      await store.deactivateWorkspace(deviceId, workspaceId);
+    }
+  }
+
+  const device = await store.getDevice(deviceId);
+  if (op.tool === "ownmesh_workspace_list") {
+    const records = new Map<string, WorkspaceRecord>();
+    if (Array.isArray(data.workspaces)) {
+      for (const entry of data.workspaces) {
+        if (!entry || typeof entry !== "object") continue;
+        const id = (entry as { id?: string }).id;
+        if (typeof id === "string") {
+          const record = await store.getWorkspace(deviceId, id);
+          if (record) records.set(id, record);
+        }
+      }
+    }
+    return annotateWorkspaceList(data, records, device?.enforce_workspace);
+  }
+  if (
+    op.tool === "ownmesh_workspace_add" ||
+    op.tool === "ownmesh_workspace_update" ||
+    op.tool === "ownmesh_workspace_show" ||
+    op.tool === "ownmesh_workspace_remove"
+  ) {
+    const record = workspaceId ? await store.getWorkspace(deviceId, workspaceId) : null;
+    return annotateWorkspaceRecord(data, record);
+  }
+  if (op.tool === "ownmesh_policy_show" || op.tool === "ownmesh_policy_preset") {
+    return annotatePolicyObservation(data, device?.enforce_workspace);
+  }
+  return data;
+}
+
 /**
  * Map a device-originated operation.result onto authoritative mcp_operations state.
  * Single runtime helper (DeviceRoom DO); mcp.ts must not duplicate this.
@@ -3679,6 +3789,7 @@ export async function applyMcpOperationResult(
     payload: Record<string, unknown>;
     deviceId?: string;
     expectedApprovalDecision?: ApprovalDecisionBinding | null;
+    issuer?: string;
   },
 ): Promise<ApplyMcpOperationResultOutcome> {
   const payloadOpId = opts.payload.operation_id != null ? String(opts.payload.operation_id) : undefined;
@@ -4022,6 +4133,15 @@ export async function applyMcpOperationResult(
     });
   }
 
+  if (op.device_id && (status === "completed" || status === "failed")) {
+    data = await applyWorkspaceActivationSideEffects(store, op, data, status);
+  }
+
+  const approvalUrlValue =
+    status === "approval_required"
+      ? approvalUrlFromIssuer(opts.issuer, op.operation_id)
+      : op.approval_url;
+
   // Internal transfer tools may not make a durable row into a bearer or
   // diagnostics channel through an approval id or session id either. Preserve
   // only a pre-existing authoritative value; never copy Agent input.
@@ -4065,6 +4185,7 @@ export async function applyMcpOperationResult(
       truncated: truncatedFlag,
       next_cursor: nextCursor,
       approval_required: status === "approval_required",
+      approval_url: approvalUrlValue,
       approval_id: approvalId,
       session_id: internalTransferTool || systemDiagnosisTool
         ? op.session_id

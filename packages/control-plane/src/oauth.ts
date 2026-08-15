@@ -1142,14 +1142,15 @@ export async function handleDevices(
     // Every daemon creates a device-local `ws_default`. Register its id under
     // this exact device at enrollment time so pre-ready and legacy Agents do
     // not inherit another device's same-named custody row. The root never
-    // leaves the Agent.
+    // leaves the Agent, and the reservation stays pending until a generation
+    // is observed.
     await store.putWorkspace({
       workspace_id: "ws_default",
       tenant_id: rec.tenant_id,
       device_id: deviceId,
       owner_principal_id: rec.principal,
       version: 1,
-      active: true,
+      active: false,
       created_at: created,
       updated_at: created,
     });

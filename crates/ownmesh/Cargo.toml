@@ -77,5 +77,5 @@ tokio = { version = "1.43.0", features = [
     "time",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", default-features = false, features = ["process"] }
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process", "system"] }

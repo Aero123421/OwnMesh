@@ -13,6 +13,16 @@ import {
   sha256Hex,
   generateUserCode,
 } from "./util.ts";
+import {
+  applyObservedGeneration,
+  classifyWorkspaceAvailability,
+  classifyWorkspaceVisibility,
+  parseWorkspaceGeneration,
+  parseWorkspaceId,
+  type WorkspaceOperableGate,
+} from "./workspace-activation.ts";
+
+export type { WorkspaceOperableGate } from "./workspace-activation.ts";
 
 /** Short-lived bearer used for API requests. */
 export const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000;
@@ -886,7 +896,35 @@ export interface ControlPlaneStore {
     deviceId: string,
     principalId: string,
     tenantId: string,
-  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }>;
+  ): Promise<WorkspaceOperableGate>;
+  /**
+   * Visibility/admin gate for show/remove/retry. Pending reservations are
+   * visible to custodians so activation can be polled or abandoned.
+   */
+  assertWorkspaceVisibleForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<WorkspaceOperableGate>;
+  /**
+   * Apply one Agent-observed opaque generation. Unlike syncDeviceWorkspaces this
+   * does not require a complete registry snapshot (ws_default may be absent).
+   * Inactive rows keep the last generation as a tombstone: the same value does
+   * not reactivate; a later add must advertise a new generation.
+   */
+  observeWorkspaceGeneration(
+    deviceId: string,
+    workspaceId: string,
+    generation: string,
+  ): Promise<WorkspaceRecord | null>;
+  /** Mark a cloud custody row inactive after a successful or abandoned remove. */
+  deactivateWorkspace(deviceId: string, workspaceId: string): Promise<WorkspaceRecord | null>;
+  /** Persist Agent-observed workspace-root enforcement independently of access_preset. */
+  recordObservedWorkspaceEnforcement(
+    deviceId: string,
+    enforceWorkspace: boolean,
+  ): Promise<DeviceRecord | null>;
 
   appliedMigrations(): Promise<string[]>;
   markMigration(id: string): Promise<void>;
@@ -2254,6 +2292,7 @@ export class MemoryStore implements ControlPlaneStore {
       } else if (existing.local_generation === undefined) {
         this.workspaces.set(key, {
           ...existing,
+          active: true,
           version: existing.version + 1,
           local_generation: registration.generation,
           updated_at: observedAt,
@@ -2271,27 +2310,109 @@ export class MemoryStore implements ControlPlaneStore {
     deviceId: string,
     principalId: string,
     tenantId: string,
-  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, true);
+  }
+
+  async assertWorkspaceVisibleForMcp(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, false);
+  }
+
+  private async workspaceGate(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+    requireActiveGeneration: boolean,
+  ): Promise<WorkspaceOperableGate> {
     const workspace = await this.getWorkspace(deviceId, workspaceId);
-    if (
-      !workspace ||
-      !workspace.active ||
-      !workspace.local_generation ||
-      workspace.tenant_id !== tenantId ||
-      workspace.device_id !== deviceId
-    ) {
-      return { ok: false, error: "workspace_not_available" };
-    }
+    const classified = requireActiveGeneration
+      ? classifyWorkspaceAvailability(workspace, deviceId, tenantId)
+      : classifyWorkspaceVisibility(workspace, deviceId, tenantId);
+    if (!classified.ok) return classified;
+    const allowed = await this.workspacePrincipalAllowed(
+      classified.workspace,
+      deviceId,
+      principalId,
+      tenantId,
+    );
+    return allowed
+      ? classified
+      : {
+          ok: false,
+          error: "workspace_not_available",
+          cause: "not_authorized",
+          next_action: "select_active_workspace",
+        };
+  }
+
+  private async workspacePrincipalAllowed(
+    workspace: WorkspaceRecord,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+  ): Promise<boolean> {
     const device = await this.getDevice(deviceId);
     const role = await this.getTenantMemberRole(tenantId, principalId);
-    const allowed =
+    return (
       workspace.owner_principal_id === principalId ||
       device?.principal_id === principalId ||
       role === "owner" ||
       role === "admin" ||
       (role === "member" &&
-        (await this.isWorkspaceMember(deviceId, workspaceId, principalId)));
-    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
+        (await this.isWorkspaceMember(deviceId, workspace.workspace_id, principalId)))
+    );
+  }
+
+  async observeWorkspaceGeneration(
+    deviceId: string,
+    workspaceId: string,
+    generation: string,
+  ): Promise<WorkspaceRecord | null> {
+    if (!parseWorkspaceId(workspaceId) || !parseWorkspaceGeneration(generation)) return null;
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    const next = applyObservedGeneration(existing, {
+      workspaceId,
+      deviceId,
+      tenantId: device.tenant_id,
+      ownerPrincipalId: existing?.owner_principal_id || device.principal_id,
+      generation,
+      observedAt: nowIso(),
+    });
+    await this.putWorkspace(next);
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async deactivateWorkspace(
+    deviceId: string,
+    workspaceId: string,
+  ): Promise<WorkspaceRecord | null> {
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    if (!existing) return null;
+    await this.putWorkspace({
+      ...existing,
+      active: false,
+      updated_at: nowIso(),
+    });
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async recordObservedWorkspaceEnforcement(
+    deviceId: string,
+    enforceWorkspace: boolean,
+  ): Promise<DeviceRecord | null> {
+    const device = this.devices.get(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    device.enforce_workspace = enforceWorkspace;
+    this.devices.set(deviceId, device);
+    return hydrateDevice(device);
   }
 
   async canOperateDevice(
@@ -4721,7 +4842,7 @@ export class SqlStore implements ControlPlaneStore {
           this.db
             .prepare(
               `UPDATE device_workspaces
-               SET version = version + 1, local_generation = ?, updated_at = ?
+               SET active = 1, version = version + 1, local_generation = ?, updated_at = ?
                WHERE device_id = ? AND workspace_id = ? AND local_generation IS NULL`,
             )
             .bind(registration.generation, observedAt, deviceId, workspaceId),
@@ -4760,15 +4881,104 @@ export class SqlStore implements ControlPlaneStore {
 
   async assertWorkspaceOperableForMcp(
     workspaceId: string, deviceId: string, principalId: string, tenantId: string,
-  ): Promise<{ ok: true; workspace: WorkspaceRecord } | { ok: false; error: string }> {
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, true);
+  }
+
+  async assertWorkspaceVisibleForMcp(
+    workspaceId: string, deviceId: string, principalId: string, tenantId: string,
+  ): Promise<WorkspaceOperableGate> {
+    return this.workspaceGate(workspaceId, deviceId, principalId, tenantId, false);
+  }
+
+  private async workspaceGate(
+    workspaceId: string,
+    deviceId: string,
+    principalId: string,
+    tenantId: string,
+    requireActiveGeneration: boolean,
+  ): Promise<WorkspaceOperableGate> {
     const workspace = await this.getWorkspace(deviceId, workspaceId);
-    if (!workspace || !workspace.active || !workspace.local_generation || workspace.tenant_id !== tenantId || workspace.device_id !== deviceId) {
-      return { ok: false, error: "workspace_not_available" };
-    }
+    const classified = requireActiveGeneration
+      ? classifyWorkspaceAvailability(workspace, deviceId, tenantId)
+      : classifyWorkspaceVisibility(workspace, deviceId, tenantId);
+    if (!classified.ok) return classified;
     const device = await this.getDevice(deviceId);
     const role = await this.getTenantMemberRole(tenantId, principalId);
-    const allowed = workspace.owner_principal_id === principalId || device?.principal_id === principalId || role === "owner" || role === "admin" || (role === "member" && (await this.isWorkspaceMember(deviceId, workspaceId, principalId)));
-    return allowed ? { ok: true, workspace } : { ok: false, error: "workspace_not_available" };
+    const allowed =
+      classified.workspace.owner_principal_id === principalId ||
+      device?.principal_id === principalId ||
+      role === "owner" ||
+      role === "admin" ||
+      (role === "member" &&
+        (await this.isWorkspaceMember(deviceId, classified.workspace.workspace_id, principalId)));
+    return allowed
+      ? classified
+      : {
+          ok: false,
+          error: "workspace_not_available",
+          cause: "not_authorized",
+          next_action: "select_active_workspace",
+        };
+  }
+
+  async observeWorkspaceGeneration(
+    deviceId: string,
+    workspaceId: string,
+    generation: string,
+  ): Promise<WorkspaceRecord | null> {
+    if (!parseWorkspaceId(workspaceId) || !parseWorkspaceGeneration(generation)) return null;
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    const next = applyObservedGeneration(existing, {
+      workspaceId,
+      deviceId,
+      tenantId: device.tenant_id,
+      ownerPrincipalId: existing?.owner_principal_id || device.principal_id,
+      generation,
+      observedAt: nowIso(),
+    });
+    await this.putWorkspace(next);
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async deactivateWorkspace(
+    deviceId: string,
+    workspaceId: string,
+  ): Promise<WorkspaceRecord | null> {
+    const existing = await this.getWorkspace(deviceId, workspaceId);
+    if (!existing) return null;
+    await this.putWorkspace({
+      ...existing,
+      active: false,
+      updated_at: nowIso(),
+    });
+    return this.getWorkspace(deviceId, workspaceId);
+  }
+
+  async recordObservedWorkspaceEnforcement(
+    deviceId: string,
+    enforceWorkspace: boolean,
+  ): Promise<DeviceRecord | null> {
+    const device = await this.getDevice(deviceId);
+    if (!device || device.revoked || device.status !== "active") return null;
+    const publicKey = encodeDevicePublicKey(device.public_key, {
+      hostname: device.hostname,
+      os: device.os,
+      arch: device.arch,
+      agent_version: device.agent_version,
+      protocol_version: device.protocol_version,
+      enforce_workspace: enforceWorkspace,
+    });
+    const updated = await this.db
+      .prepare(
+        `UPDATE devices SET public_key = ? WHERE id = ? AND revoked = 0 AND status = 'active'`,
+      )
+      .bind(publicKey, deviceId)
+      .run();
+    if (sqlChanges(updated) !== 1) return null;
+    return this.getDevice(deviceId);
   }
 
   async canOperateDevice(

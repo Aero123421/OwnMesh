@@ -56,11 +56,14 @@ test("enroll returns challenge shape then proof + revoke persist", async () => {
     `ownmesh-device-challenge:${body.challenge.nonce}:${body.device_id}`,
   );
   assert.equal(body.connect_path, "/agent/connect");
+  const reservedDefault = await store.getWorkspace(body.device_id, "ws_default");
   assert.equal(
-    (await store.getWorkspace(body.device_id, "ws_default"))?.device_id,
+    reservedDefault?.device_id,
     body.device_id,
     "enrollment must reserve this device's own default workspace",
   );
+  assert.equal(reservedDefault?.active, false);
+  assert.equal(reservedDefault?.local_generation, undefined);
 
   const signatureBytes = new Uint8Array(await crypto.subtle.sign(
     "Ed25519", keyPair.privateKey, new TextEncoder().encode(body.challenge.message),

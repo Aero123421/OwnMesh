@@ -103,7 +103,11 @@ pub async fn enroll_device(
     let hostname = hostname_string();
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let display = name.map(str::to_owned).unwrap_or_else(|| hostname.clone());
+    let display = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| hostname.clone());
 
     let enroll_resp = http
         .post(format!("{issuer}/v1/devices/enroll"))
@@ -336,12 +340,70 @@ pub fn rotate_local_device_key(
     Ok((new_key.public_identity(), old))
 }
 
+pub(crate) fn device_name_candidate() -> String {
+    hostname_string()
+}
+
+pub(crate) fn is_generic_device_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || lower == "unknown-host"
+        || lower == "localhost"
+        || lower == "(none)"
+        || lower == format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
 fn hostname_string() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown-host".into())
+        .and_then(sanitize_hostname)
+        .or_else(os_nodename)
+        .or_else(read_hostname_file)
+        .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+fn sanitize_hostname(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first = trimmed.split('.').next().unwrap_or(trimmed).trim();
+    if first.is_empty() {
+        return None;
+    }
+    let lower = first.to_ascii_lowercase();
+    if lower == "unknown-host" || lower == "localhost" || lower == "(none)" {
+        return None;
+    }
+    Some(first.to_owned())
+}
+
+fn os_nodename() -> Option<String> {
+    #[cfg(unix)]
+    {
+        sanitize_hostname(
+            rustix::system::uname()
+                .nodename()
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn read_hostname_file() -> Option<String> {
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            if let Some(name) = sanitize_hostname(raw) {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -415,5 +477,24 @@ mod device_metadata_tests {
         assert!(!rendered.contains("atk_super_secret"));
         assert!(rendered.contains("labels"));
         assert!(rendered.len() <= 512);
+    }
+
+    #[test]
+    fn device_name_candidate_is_not_unknown_host() {
+        let candidate = device_name_candidate();
+        assert_ne!(candidate, "unknown-host");
+        assert!(!candidate.trim().is_empty());
+    }
+
+    #[test]
+    fn generic_device_names_are_detected() {
+        assert!(is_generic_device_name("unknown-host"));
+        assert!(is_generic_device_name("localhost"));
+        assert!(is_generic_device_name(&format!(
+            "{}-{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )));
+        assert!(!is_generic_device_name("tonakai-linux"));
     }
 }

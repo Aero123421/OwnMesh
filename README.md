@@ -12,7 +12,7 @@ networkless broker handles explicitly approved privileged work.
 
 ## Status
 
-**v1.2.11 stable** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
+**v1.2.12 stable** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
 
 The shipped CLI surface has no intentionally unimplemented entries. Its
 machine-checked contract is
@@ -179,7 +179,7 @@ Windows. Linux has a native root lifecycle receipt. macOS/Windows native release
 receipts and the full public MCP → installed agent → broker E8 receipt remain
 open evidence; this is not presented as live proof for those routes.
 Authenticode, Apple notarization, MSI/NSIS, and native macOS packages are not
-part of v1.2.11.
+part of v1.2.12.
 
 ChatGPT dynamic registration, OAuth, passkey return, refresh, and MCP linking
 have a manual live compatibility receipt. The local workerd suites are
@@ -209,7 +209,7 @@ Rust 1.92.0, Node 22, and pnpm 9.15.0 are pinned by the repository.
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [Roadmap](./docs/ROADMAP.md) — what is planned next, and what is not
-- [v1.2.11 release notes](./docs/RELEASE_NOTES_v1.2.11.md)
+- [v1.2.12 release notes](./docs/RELEASE_NOTES_v1.2.12.md)
 - [Target specification](./OWNMESH_SPECIFICATION.ja.md) — roadmap authority,
   not a claim that every optional target is shipped
 
