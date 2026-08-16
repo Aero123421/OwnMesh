@@ -1435,7 +1435,10 @@ fn oversized_completed_op_journal_is_compacted_on_open() {
     )
     .unwrap();
     let before = fs::metadata(&journal_path).unwrap().len();
-    assert!(before > 2 * 1024 * 1024, "fixture should be large: {before}");
+    assert!(
+        before > 2 * 1024 * 1024,
+        "fixture should be large: {before}"
+    );
     let rt = DaemonRuntime::open(&paths).expect("runtime");
     let after = fs::metadata(&journal_path).unwrap().len();
     assert!(

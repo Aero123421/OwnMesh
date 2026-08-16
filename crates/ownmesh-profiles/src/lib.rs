@@ -2244,15 +2244,13 @@ acp = false
                 official_adapter_spec(id.as_str()).unwrap().resume,
                 NativeResume::Argv { .. }
             ) {
-                let r = match reg.resume_plan_with_prompt(
-                    id.as_str(),
-                    "native_abc",
-                    Some("follow up"),
-                ) {
-                    Ok(plan) => plan,
-                    Err(ProfileError::NotInstalled(_)) => continue,
-                    Err(e) => panic!("{} resume: {e}", id.as_str()),
-                };
+                let r =
+                    match reg.resume_plan_with_prompt(id.as_str(), "native_abc", Some("follow up"))
+                    {
+                        Ok(plan) => plan,
+                        Err(ProfileError::NotInstalled(_)) => continue,
+                        Err(e) => panic!("{} resume: {e}", id.as_str()),
+                    };
                 assert!(r.args.iter().any(|a| a.contains("native_abc")));
             }
         }
@@ -2544,12 +2542,12 @@ acp = false
             official: false,
         });
         let status = reg.detect("path-fixture").unwrap();
+        assert!(status.detected, "{status:?}");
+        let plan = reg.launch_plan("path-fixture", None, true).unwrap();
         match previous_path {
             Some(value) => std::env::set_var("PATH", value),
             None => std::env::remove_var("PATH"),
         }
-        assert!(status.detected, "{status:?}");
-        let plan = reg.launch_plan("path-fixture", None, true).unwrap();
         assert!(plan.program.ends_with("ownmesh-path-fixture"));
     }
 }

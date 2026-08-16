@@ -5671,13 +5671,7 @@ full_user_access/full_access for arbitrary commands",
     pub fn open_closed_session_for_test(&mut self, title: &str) -> String {
         let session = self
             .sessions
-            .open(
-                SessionKind::Process,
-                title,
-                "local",
-                Self::now(),
-                None,
-            )
+            .open(SessionKind::Process, title, "local", Self::now(), None)
             .expect("open session");
         self.sessions.close(&session.id).expect("close session");
         self.persist_sessions().expect("persist sessions");

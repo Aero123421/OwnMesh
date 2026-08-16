@@ -865,12 +865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env_home"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1964,7 +1958,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "ownmesh"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "anyhow",
  "base64",
@@ -2000,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-broker"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "clap",
  "hex",
@@ -2022,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-broker-client"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -2043,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-config"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "ownmesh-domain",
  "ownmesh-persist",
@@ -2058,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-diagnostics"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "serde",
  "serde_json",
@@ -2067,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-domain"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "jsonschema",
  "serde",
@@ -2077,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-exec"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "hex",
  "ownmesh-domain",
@@ -2095,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-fs"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "hex",
  "libc",
@@ -2111,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-identity"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "argon2",
  "base64",
@@ -2132,7 +2126,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-ipc"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "bytes",
  "libc",
@@ -2151,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-logs"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "serde",
  "serde_json",
@@ -2161,14 +2155,14 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-persist"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "ownmesh-policy"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "ownmesh-domain",
  "serde",
@@ -2179,20 +2173,20 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-profiles"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
+ "ownmesh-exec",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "toml",
- "which",
 ]
 
 [[package]]
 name = "ownmesh-protocol"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "jsonschema",
  "ownmesh-domain",
@@ -2203,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-session"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "ownmesh-domain",
  "ownmesh-persist",
@@ -2216,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-session-host"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "clap",
  "crossterm 0.28.1",
@@ -2237,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-transfer"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "fs2",
  "hex",
@@ -2253,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-tui"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "anyhow",
  "base64",
@@ -2280,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-update"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "flate2",
  "hex",
@@ -2300,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "ownmeshd"
-version = "1.2.12"
+version = "1.2.13"
 dependencies = [
  "clap",
  "futures-util",
@@ -4056,18 +4050,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "which"
-version = "7.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
-dependencies = [
- "either",
- "env_home",
- "rustix 1.1.4",
- "winsafe",
-]
-
-[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4339,12 +4321,6 @@ checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
 dependencies = [
  "winapi",
 ]
-
-[[package]]
-name = "winsafe"
-version = "0.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wit-bindgen"

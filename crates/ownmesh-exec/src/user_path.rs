@@ -5,7 +5,6 @@
 //! `OWNMESH_EXEC_PATH`, and optional config extras.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Environment variable listing extra execution directories (OS path separator).
