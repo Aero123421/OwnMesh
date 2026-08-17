@@ -508,6 +508,19 @@ fn validate_pin(pin: &ExecutablePin) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
     fn pin() -> ExecutablePin {
         ExecutablePin {
             path: std::env::current_exe()
@@ -552,7 +565,7 @@ mod tests {
     }
     #[test]
     fn durable_idempotent_and_phase_bound() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let mut store = ReviewManifestStore::open(dir.path()).unwrap();
         let m = manifest();
         assert_eq!(store.begin(m.clone()).unwrap(), m);
@@ -602,7 +615,7 @@ mod tests {
     }
     #[test]
     fn result_spool_pages_and_rejects_future_cursor() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir().unwrap();
         let store = ReviewResultStore::open(dir.path()).unwrap();
         store
             .write(

@@ -77,6 +77,26 @@ async fn run_async() -> Result<(), ExitCode> {
         ExitCode::Internal
     })?;
 
+    // P0-A: reconcile provably-moot expired transition records at startup so a
+    // stale row can never poison the first sessions of a fresh daemon. The
+    // pass is non-blocking and fail-closed: ambiguous records stay retained
+    // and are surfaced by system.diagnose / doctor instead of aborting start.
+    {
+        let mut guard = runtime.lock().await;
+        guard.reconcile_expired_transitions().await;
+    }
+
+    // P1-E review (ADR 0011): surface the effective-sandbox condition that
+    // makes OwnMesh custody validation unsound BEFORE the first state access.
+    // A systemd `--user` unit that forces a user namespace (PrivateUsers=yes
+    // or any filesystem namespacing directive) hides real host uids behind
+    // the overflow uid 65534, so custody cannot verify host-root-owned
+    // ancestors and fails closed. Logging the cause + remediation here turns
+    // the cryptic `ancestor is owned by untrusted uid 65534` startup failure
+    // into an actionable one; the daemon still fails closed via custody.
+    #[cfg(target_os = "linux")]
+    reconcile_user_namespace_sandbox();
+
     let (endpoint, auth) = service_endpoint_and_auth(&paths, &cfg).map_err(|err| {
         tracing::error!(error = %err, "service socket configuration failed (fail-closed)");
         ExitCode::UsageConfig
@@ -174,6 +194,52 @@ fn remove_legacy_token(path: &std::path::Path) -> std::io::Result<bool> {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
+    }
+}
+
+/// True when `/proc/self/uid_map` content is NOT the full identity mapping
+/// (`0 0 4294967295`) — i.e. the process is inside a user namespace where at
+/// least some host uids are hidden or remapped. Pure so the predicate is
+/// unit-testable on any platform. An empty/unreadable map is treated as the
+/// normal case (no hiding) so the check itself never breaks startup.
+#[cfg(target_os = "linux")]
+fn user_namespace_hides_host_uids(uid_map: &str) -> bool {
+    let trimmed = uid_map.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !trimmed
+        .lines()
+        .all(|line| line.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"])
+}
+
+/// P1-E / ADR 0011: detect a user namespace that hides real host uids and
+/// log the custody consequence with remediation before the first state
+/// access. A systemd `--user` unit forces `PrivateUsers=yes` when any
+/// filesystem namespacing directive is present (systemd NEWS v254;
+/// systemd.exec(5): "in which case PrivateUsers= is implicitly enabled"),
+/// mapping host root and every other host user to the overflow uid 65534.
+/// Inside that namespace OwnMesh custody validation cannot verify real
+/// ownership, so it fails closed with `ancestor is owned by untrusted uid
+/// 65534`. This warning is diagnostic only — custody still enforces the
+/// boundary — and it makes the failure actionable instead of cryptic.
+#[cfg(target_os = "linux")]
+fn reconcile_user_namespace_sandbox() {
+    let Ok(map) = std::fs::read_to_string("/proc/self/uid_map") else {
+        return;
+    };
+    if user_namespace_hides_host_uids(&map) {
+        tracing::warn!(
+            uid_map = %map.trim(),
+            "ownmeshd is running inside a user namespace that hides real host uids \
+        (PrivateUsers=yes or a filesystem namespacing directive such as ProtectSystem/ProtectHome/\
+        ReadWritePaths/PrivateTmp in a systemd --user unit; see ADR 0011 and systemd.exec(5)). \
+        OwnMesh custody validation cannot distinguish host-root-owned ancestors from attacker-owned \
+        ones (both appear as uid 65534) and will fail closed with `ancestor is owned by untrusted uid \
+        65534` unless every state/config ancestor is owned by this daemon inside the namespace. \
+        Remove the namespacing directives or the drop-in that adds them, then re-run \
+        `ownmesh service install`; `ownmesh doctor` discloses the effective unit."
+        );
     }
 }
 
@@ -571,7 +637,44 @@ mod tests {
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
-    use tempfile::tempdir;
+
+    /// P1-E review (ADR 0011): the pure predicate that detects a user
+    /// namespace hiding real host uids. The normal process map is the single
+    /// full identity line `0 0 4294967295`; every namespace shape systemd
+    /// produces for a `--user` service (self→self `1000 1000 1`, a
+    /// root-mapped `0 0 1`, multi-line maps) hides some host uids behind the
+    /// overflow uid, which is exactly the condition that makes OwnMesh
+    /// custody validation fail closed. CI host hostnames/uid maps must never
+    /// influence the test — the predicate is fed synthetic maps only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_namespace_hiding_predicate_matches_systemd_user_shapes() {
+        assert!(!user_namespace_hides_host_uids("0 0 4294967295"));
+        assert!(!user_namespace_hides_host_uids("0 0 4294967295\n"));
+        assert!(!user_namespace_hides_host_uids(""));
+        // systemd --user with PrivateUsers=yes: self→self single-line map.
+        assert!(user_namespace_hides_host_uids("1000 1000 1"));
+        // Root-mapped user namespace (unprivileged userns variants).
+        assert!(user_namespace_hides_host_uids("0 0 1"));
+        // systemd --user under root's manager: root + user lines, host root
+        // still hidden from the daemon's point of view.
+        assert!(user_namespace_hides_host_uids("0 0 1\n1000 1000 1"));
+        // A truncated/partial identity map hides the unmapped range.
+        assert!(user_namespace_hides_host_uids("0 0 1\n1 1 4294967294"));
+    }
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn configured_service_endpoint_uses_shared_resolution() {
@@ -1228,7 +1331,14 @@ mod tests {
             .await
             .expect("second");
         assert_eq!(second["replayed"], true);
-        assert_eq!(first["result"]["stdout"], second["result"]["stdout"]);
+        // P0-B: replay returns the compact exact-once receipt (never a
+        // re-execution); the full body exists only in the immediate response.
+        assert_eq!(second["durable_receipt"], true);
+        assert_eq!(second["truncated"], true);
+        assert!(
+            second.get("result").is_none(),
+            "replay must be the compact receipt: {second}"
+        );
         assert_eq!(first["operation_id"], second["operation_id"]);
 
         server.request_shutdown();

@@ -21,7 +21,8 @@
 use ownmesh_diagnostics::{
     build_support_bundle, redact_text, run_doctor, BinaryObservation, CheckStatus,
     ConfigObservation, ControlPlaneObservation, CredentialObservation, CredentialState,
-    DaemonObservation, DoctorInput, PrivacyPolicyObservation, ServiceObservation,
+    DaemonObservation, DoctorInput, JournalsObservation, PrivacyPolicyObservation,
+    ServiceObservation,
 };
 use std::collections::BTreeMap;
 
@@ -86,7 +87,10 @@ fn base_input() -> DoctorInput {
             running: Some(true),
             unit_path: None,
             message: None,
+            hardening: None,
         },
+        journals: JournalsObservation::default(),
+        profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
     }
 }
 

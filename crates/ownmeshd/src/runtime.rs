@@ -33,8 +33,6 @@ mod runtime_session;
 mod runtime_transfer;
 #[path = "runtime_workspace.rs"]
 mod runtime_workspace;
-#[path = "session_transition_journal.rs"]
-mod session_transition_journal;
 #[path = "structured_adapter.rs"]
 mod structured_adapter;
 #[cfg(target_os = "linux")]
@@ -94,15 +92,16 @@ use ownmesh_transfer::{
     TransferBinding, TransferChunk, TransferError, TransferGrant, TransferPlan, TransferReceiver,
     TransferSender, MAX_CHUNK_BYTES,
 };
+use ownmesh_transition_journal as session_transition_journal;
+use ownmesh_transition_journal::{
+    SessionTransitionJournal, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
+};
 use review_manifest::{
     ResultKind, ReviewCommand, ReviewManifest, ReviewManifestStore, ReviewPhase, ReviewResultChunk,
     ReviewResultStore, TestRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use session_transition_journal::{
-    SessionTransitionJournal, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
-};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -399,6 +398,15 @@ pub struct ExecParams {
     /// Server-computed executable identity pin (device/inode/digest). Client values overwritten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_pin: Option<ExecutablePin>,
+    /// Server-computed pin of the *invocation* path (resolved but not
+    /// canonicalized, e.g. `~/.cargo/bin/cargo` for a rustup proxy symlink).
+    /// Proxy executables dispatch on their argv[0] filename, so the spawn
+    /// must keep the invocation path while identity pinning uses the
+    /// canonical backing path; the two pins together catch a retargeted
+    /// symlink between approval and spawn (P0-B review). Client values
+    /// overwritten; absent for raw-shell/legacy requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_pin: Option<ExecutablePin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -612,7 +620,7 @@ pub struct DaemonRuntime {
     /// invocation may satisfy a policy Ask. Defaults fail-closed to false.
     delegate_remote_mcp: bool,
     grants: Vec<TemporaryGrant>,
-    approvals: HashMap<String, ApprovalRecord>,
+    pub(crate) approvals: HashMap<String, ApprovalRecord>,
     /// Completed operation results keyed by client idempotency key.
     op_journal: HashMap<String, Value>,
     exec_journal: IdempotencyJournal,
@@ -638,6 +646,11 @@ pub struct DaemonRuntime {
     /// compatibility keeps the legacy embedded host path until fully migrated.
     supervisor: Option<SupervisorClient>,
     transition_journal: SessionTransitionJournal,
+    /// Bounded health state for transition-journal recovery (P0-A). Records
+    /// that expired with the session still present and non-terminal are
+    /// retained fail-closed and surfaced here instead of poisoning unrelated
+    /// future sessions.
+    transition_recovery_health: TransitionRecoveryHealth,
     review_manifests: ReviewManifestStore,
     review_results: ReviewResultStore,
     transition_recovery_running: bool,
@@ -675,6 +688,8 @@ pub struct DaemonRuntime {
     transfer_receivers: HashMap<String, CachedDestinationTransfer>,
     #[cfg(test)]
     op_journal_persist_fault: AtomicUsize,
+    #[cfg(test)]
+    op_journal_write_fault: AtomicUsize,
     #[cfg(test)]
     approvals_persist_fault: AtomicUsize,
     #[cfg(test)]
@@ -790,6 +805,7 @@ impl DaemonRuntime {
             live_hosts: HashMap::new(),
             supervisor: None,
             transition_journal,
+            transition_recovery_health: TransitionRecoveryHealth::default(),
             review_manifests,
             review_results,
             transition_recovery_running: false,
@@ -806,6 +822,8 @@ impl DaemonRuntime {
             transfer_receivers: HashMap::new(),
             #[cfg(test)]
             op_journal_persist_fault: AtomicUsize::new(0),
+            #[cfg(test)]
+            op_journal_write_fault: AtomicUsize::new(0),
             #[cfg(test)]
             approvals_persist_fault: AtomicUsize::new(0),
             #[cfg(test)]
@@ -853,11 +871,15 @@ impl DaemonRuntime {
     fn persist_op_journal(&self) -> IpcResult<()> {
         #[cfg(test)]
         self.maybe_inject_persist_fault(&self.op_journal_persist_fault, "op journal")?;
-        let encoded =
-            serde_json::to_vec_pretty(&self.op_journal).map_err(|e| IpcError::Remote {
-                code: app_error::INTERNAL,
-                message: format!("failed to serialize op journal: {e}"),
-            })?;
+        // Completed entries are compacted to exact-once receipts before
+        // durable persistence (P0-B): large stdout/file bodies are never
+        // retained in durable state when a compact receipt is sufficient.
+        // In-progress/uncertain markers are never compacted.
+        let durable = op_journal_durable_view(&self.op_journal);
+        let encoded = serde_json::to_vec_pretty(&durable).map_err(|e| IpcError::Remote {
+            code: app_error::INTERNAL,
+            message: format!("failed to serialize op journal: {e}"),
+        })?;
         if encoded.len() > MAX_OP_JOURNAL_FILE_BYTES {
             return Err(IpcError::Remote {
                 code: app_error::INTERNAL,
@@ -872,14 +894,146 @@ impl DaemonRuntime {
                 message: format!("op journal exceeds {MAX_OP_JOURNAL_ENTRIES} entry budget"),
             });
         }
-        write_json(
-            &self.paths.state_dir.join("op-journal.json"),
-            &self.op_journal,
-        )
-        .map_err(|e| IpcError::Remote {
+        let primary = self.paths.state_dir.join("op-journal.json");
+        // P0-B review: remove a stale backup *before* the compacted write so
+        // a crash between the write and the cleanup cannot leave a legacy
+        // large-body copy on disk while the daemon is stopped. The primary is
+        // authoritative and the write recreates it from the in-memory durable
+        // view, so the stale duplicate can be removed first. When the primary
+        // is missing (external removal while the daemon runs) the backup is
+        // the only durable copy of the exact-once receipts, so it is kept
+        // until the write succeeds (fail-closed: never destroy the only copy
+        // before a replacement is durable).
+        //
+        // P0-B review: the stale backup may hold the pre-compaction legacy
+        // journal with large stdout/file bodies. This persist must fail
+        // closed (rolling back the in-memory mutation in `store_idempotent`/
+        // `begin_idempotent`) instead of claiming compaction succeeded while
+        // the sensitive copy remains on disk — the same fail-closed contract
+        // as the load path (which refuses startup). The operator resolves the
+        // lock/permission and retries; doctor surfaces the backup while it
+        // exists.
+        if primary.exists() {
+            remove_stale_op_journal_backup_fallible(&primary).map_err(|e| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: format!(
+                    "failed to remove stale op journal backup {} before writing the compacted \
+primary: {e}; remove or repair the backup (it may hold a legacy large-body journal) and \
+retry — refusing the persist rather than claiming compaction succeeded while the copy remains",
+                    stale_op_journal_backup_path(&primary).display(),
+                ),
+            })?;
+        }
+        // P0-B review: fault injection point *after* the stale-backup removal
+        // and *before* the write, so a test can prove the removal happens
+        // before the write (a crash between the write and the cleanup cannot
+        // leave a legacy large-body copy behind).
+        #[cfg(test)]
+        self.maybe_inject_persist_fault(&self.op_journal_write_fault, "op journal write")?;
+        write_op_journal(&primary, &durable).map_err(|e| IpcError::Remote {
             code: app_error::INTERNAL,
             message: format!("failed to persist op journal: {e}"),
-        })
+        })?;
+        // The no-backup writer never creates a `.bak`, so any `op-journal.json.bak`
+        // left by an older version (or a crash between its backup copy and cleanup)
+        // is now stale by definition. Retry its removal on every successful persist
+        // so a transient lock (Windows file handle, antivirus scan) does not retain
+        // the pre-compaction large-body journal indefinitely (P0-B review). A
+        // lingering backup is surfaced by doctor while it exists.
+        remove_stale_op_journal_backup(&primary);
+        Ok(())
+    }
+
+    /// Estimate of the durable (compacted) op-journal size in bytes.
+    ///
+    /// P0-B: the estimate must match the durable file exactly — the same
+    /// pretty-serialized view `persist_op_journal` writes — so eviction and
+    /// diagnostics never under-report pressure against the real
+    /// [`MAX_OP_JOURNAL_FILE_BYTES`] budget. A per-entry sum that omits JSON
+    /// framing and pretty-print overhead would let the real file hit the
+    /// hard cap while the estimate still reports headroom, refusing new
+    /// side-effect operations without evicting eligible old receipts first.
+    fn op_journal_durable_byte_estimate(&self) -> usize {
+        let durable = op_journal_durable_view(&self.op_journal);
+        serde_json::to_vec_pretty(&durable)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Bounded lifecycle for terminal receipts (P0-B): when at capacity,
+    /// evict only completed entries older than [`OP_JOURNAL_COMPLETED_TTL_SECS`].
+    /// In-progress/uncertain markers are never evicted. Persist failure rolls
+    /// back the in-memory eviction so the durable file stays authoritative.
+    fn evict_expired_completed_op_journal_entries(&mut self) -> IpcResult<usize> {
+        let now = Self::now();
+        let snapshot = self.op_journal.clone();
+        let before = self.op_journal.len();
+        self.op_journal.retain(|_, value| {
+            if op_journal_entry_state(value) != OpJournalEntryState::Completed {
+                // Exact-once marker or unknown state: never pruned, regardless
+                // of age (fail-closed: an uncertain outcome must not become
+                // retriable).
+                return true;
+            }
+            match value
+                .get(OP_JOURNAL_COMPLETED_UNIX_FIELD)
+                .and_then(Value::as_i64)
+            {
+                Some(stamp) if stamp > 0 => {
+                    now.saturating_sub(stamp) < OP_JOURNAL_COMPLETED_TTL_SECS
+                }
+                // Unknown age (legacy) — keep fail-closed.
+                _ => true,
+            }
+        });
+        let evicted = before - self.op_journal.len();
+        if evicted == 0 {
+            return Ok(0);
+        }
+        if let Err(e) = self.persist_op_journal() {
+            self.op_journal = snapshot;
+            return Err(e);
+        }
+        Ok(evicted)
+    }
+
+    /// Make durable room before reserving a new idempotency key: evict only
+    /// old completed receipts; if nothing is evictable the caller's capacity
+    /// check fails closed (no new side effects accepted).
+    ///
+    /// P0-B review (near-capacity behavior): eviction must trigger BEFORE the
+    /// incoming in-progress marker is inserted, not only when the journal is
+    /// already at the byte cap. Inserting the marker can otherwise push the
+    /// serialized durable file over `MAX_OP_JOURNAL_FILE_BYTES` and make
+    /// `persist_op_journal` refuse the operation even though expired completed
+    /// receipts were evictable — refusing new side effects safely, but
+    /// defeating the bounded-lifecycle intent (long-lived normal operation
+    /// should stay away from the cap by pruning old terminal receipts). The
+    /// projected size is the same pretty-serialized durable view the writer
+    /// persists, plus the new marker entry, so the estimate never under-reports
+    /// against the real budget.
+    fn maybe_make_op_journal_room(&mut self, key: &str, operation_id: &str) -> IpcResult<()> {
+        // Project the durable view with the incoming in-progress marker
+        // inserted. The marker is the exact shape `begin_idempotent` writes
+        // (including the real operation_id), so the projection is
+        // byte-accurate against the writer's serialization.
+        let mut projected = self.op_journal.clone();
+        projected.insert(
+            key.to_string(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                "operation_id": operation_id,
+            }),
+        );
+        let projected_bytes = serde_json::to_vec_pretty(&op_journal_durable_view(&projected))
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        let at_byte_cap = projected_bytes >= MAX_OP_JOURNAL_FILE_BYTES;
+        if self.op_journal.len() < MAX_OP_JOURNAL_ENTRIES && !at_byte_cap {
+            return Ok(());
+        }
+        self.evict_expired_completed_op_journal_entries()?;
+        Ok(())
     }
 
     fn persist_approvals(&self) -> IpcResult<()> {
@@ -1548,20 +1702,60 @@ impl DaemonRuntime {
         evaluate_with_grants(&self.policy, facts, &self.grants, Self::now(), principal)
     }
 
-    fn lookup_idempotent(&self, key: Option<&String>) -> IpcResult<Option<Value>> {
+    fn lookup_idempotent(&mut self, key: Option<&String>) -> IpcResult<Option<Value>> {
         let Some(key) = key else {
             return Ok(None);
         };
         let Some(entry) = self.op_journal.get(key) else {
             return Ok(None);
         };
-        if is_op_journal_in_progress(entry) {
+        // Fail closed: only provably-completed entries may be replayed as
+        // receipts. An in-progress marker and any unknown/forward-version
+        // state are both uncertain — replaying them as completed could hide
+        // an unfinished side effect (P0-B).
+        if is_op_journal_uncertain(entry) {
             return Err(IpcError::Remote {
                 code: app_error::CONFLICT,
                 message: format!(
                     "idempotency key {key} has an in-progress or uncertain outcome; retry refused"
                 ),
             });
+        }
+        // Retention-window synchronization (P0-B / control plane): the
+        // control plane hard-deletes its idempotency tombstones after
+        // `MCP_OPS_TOMBSTONE_TTL_MS` (30 days) and then dispatches a retry as
+        // a *new* operation. A completed receipt older than the same window
+        // must therefore not be replayed — the caller expects a fresh
+        // operation, and returning the stale receipt would silently replace
+        // it. Eviction normally happens at capacity; this lookup enforces the
+        // same documented window on the replay path so a long-lived daemon
+        // cannot return a stale device/operation receipt after the CP window
+        // closed. Only completed receipts may expire; in-progress/uncertain
+        // markers are never aged out (fail-closed: an uncertain outcome must
+        // not become retriable).
+        if op_journal_entry_state(entry) == OpJournalEntryState::Completed {
+            let now = Self::now();
+            let expired = entry
+                .get(OP_JOURNAL_COMPLETED_UNIX_FIELD)
+                .and_then(Value::as_i64)
+                .is_some_and(|stamp| {
+                    stamp > 0 && now.saturating_sub(stamp) >= OP_JOURNAL_COMPLETED_TTL_SECS
+                });
+            if expired {
+                // Best-effort removal of the expired receipt; a persist
+                // failure is not fatal for correctness (the in-memory copy is
+                // authoritative and the next persist rewrites the file), but
+                // the lookup must not return it.
+                let snapshot = self.op_journal.clone();
+                self.op_journal.remove(key);
+                if let Err(e) = self.persist_op_journal() {
+                    self.op_journal = snapshot;
+                    eprintln!(
+                        "warning: failed to persist op journal after expiring receipt {key}: {e}"
+                    );
+                }
+                return Ok(None);
+            }
         }
         Ok(Some(entry.clone()))
     }
@@ -1578,11 +1772,18 @@ impl DaemonRuntime {
                 message: format!("idempotency key {key} is already reserved"),
             });
         }
+        // Bounded lifecycle: make durable room by evicting only old completed
+        // receipts before refusing a new side-effect operation (P0-B). The new
+        // marker's serialized size is included in the pressure projection so a
+        // near-capacity journal evicts eligible receipts instead of letting the
+        // marker push the durable file over the byte budget.
+        self.maybe_make_op_journal_room(key, operation_id)?;
         if self.op_journal.len() >= MAX_OP_JOURNAL_ENTRIES {
             return Err(IpcError::Remote {
                 code: app_error::INTERNAL,
                 message: format!(
-                    "op journal at capacity ({MAX_OP_JOURNAL_ENTRIES}); refuse new idempotency key"
+                    "op journal at capacity ({MAX_OP_JOURNAL_ENTRIES}) with no evictable completed \
+receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)"
                 ),
             });
         }
@@ -1604,15 +1805,32 @@ impl DaemonRuntime {
     /// Replace an already durable in-progress marker with the completed result.
     /// On failure, memory is restored to the marker snapshot; the atomic writer
     /// leaves that same non-retriable marker durable on disk.
+    ///
+    /// P0-B: after the compact receipt is durably persisted, the in-memory
+    /// entry is replaced by that same receipt so full result bodies are never
+    /// retained indefinitely in memory either (the caller already holds the
+    /// full result for the immediate response; replay returns the receipt).
     fn store_idempotent(&mut self, key: Option<&String>, value: &Value) -> IpcResult<()> {
         let Some(k) = key else {
             return Ok(());
         };
         let snapshot = self.op_journal.clone();
-        self.op_journal.insert(k.clone(), value.clone());
+        let mut stored = value.clone();
+        // Stamp completion time so the bounded lifecycle can evict old
+        // terminal receipts at capacity without ever touching in-progress
+        // markers (P0-B). The field is additive for replay consumers.
+        if let Some(object) = stored.as_object_mut() {
+            object.insert(OP_JOURNAL_COMPLETED_UNIX_FIELD.into(), json!(Self::now()));
+        }
+        self.op_journal.insert(k.clone(), stored);
         if let Err(e) = self.persist_op_journal() {
             self.op_journal = snapshot;
             return Err(e);
+        }
+        // In-memory compaction mirrors the durable file: completed entries
+        // become exact-once receipts; uncertain entries stay verbatim.
+        if let Some(receipt) = op_journal_durable_view(&self.op_journal).remove(k.as_str()) {
+            self.op_journal.insert(k.clone(), receipt);
         }
         Ok(())
     }
@@ -1795,11 +2013,37 @@ impl DaemonRuntime {
     }
 
     async fn execute_exec(&mut self, p: &ExecParams, use_exec_journal: bool) -> IpcResult<Value> {
-        // Re-resolve executable aliases immediately before execution. In particular,
-        // an approval delay must not let a previously structured symlink become a shell.
+        // P0-B review: decide the exact spawn path *before* re-classification.
+        // When the invocation path is pinned separately (proxy executables
+        // such as rustup's `cargo`, whose argv[0] filename drives dispatch),
+        // it is authoritative for the spawn only while it still matches its
+        // pin. A retargeted symlink between approval and spawn falls back to
+        // the pinned canonical backing (verified below) — the changed
+        // invocation is never reopened or executed, preserving the documented
+        // TOCTOU property that a swapped structured symlink must not become a
+        // shell.
         let cwd = p.cwd.as_deref().map(Path::new);
+        let execution_program = if let Some(invocation_pin) = &p.invocation_pin {
+            if verify_executable_pin(Path::new(&p.program), invocation_pin).is_ok() {
+                p.program.clone()
+            } else {
+                p.executable_pin
+                    .as_ref()
+                    .map(|pin| pin.path.clone())
+                    .unwrap_or_else(|| p.program.clone())
+            }
+        } else {
+            p.executable_pin
+                .as_ref()
+                .map(|pin| pin.path.clone())
+                .unwrap_or_else(|| p.program.clone())
+        };
+        // Re-resolve executable aliases immediately before execution. In
+        // particular, an approval delay must not let a previously structured
+        // symlink become a shell — the re-classification runs against the
+        // exact path that will be spawned, never the changed alias.
         let current_kind =
-            classify_from_request_in_dir(p.kind.as_deref(), &p.program, &p.args, cwd);
+            classify_from_request_in_dir(p.kind.as_deref(), &execution_program, &p.args, cwd);
         let approved_kind = CommandKind::parse_requested(p.policy_kind.as_deref());
         if matches!(current_kind, CommandKind::RawShell)
             && !matches!(approved_kind, CommandKind::RawShell)
@@ -1845,14 +2089,10 @@ impl DaemonRuntime {
                         .into(),
             });
         }
-        // `handle_exec` replaced argv executable aliases with the exact canonical
-        // path that was classified. Do not reopen the original symlink/PATH alias.
+        // `handle_exec` replaced argv executable aliases with the exact invocation
+        // path that was classified and pinned; the canonical backing identity is
+        // separately pinned. Do not reopen the original symlink/PATH alias.
         let kind = CommandKind::parse_requested(p.kind.as_deref());
-        let execution_program = p
-            .executable_pin
-            .as_ref()
-            .map(|pin| pin.path.clone())
-            .unwrap_or_else(|| p.program.clone());
 
         // Elevated execution has no local fallback.  Only the custody-attested
         // Linux v2 broker path below may spawn with privilege.
@@ -2410,6 +2650,7 @@ impl DaemonRuntime {
         let mut p: ExecParams = parse_params(params)?;
         // Never trust client-supplied pins / policy classification.
         p.executable_pin = None;
+        p.invocation_pin = None;
         p.policy_kind = None;
         if p.elevated
             && (self.policy.preset != AccessPreset::FullAccess
@@ -2465,19 +2706,87 @@ full_user_access/full_access for arbitrary commands",
             }
         }
         let cwd = p.cwd.as_deref().map(Path::new);
+        let mut structured_unresolvable = false;
+        let mut pinned_invocation: Option<(PathBuf, PathBuf)> = None;
         if matches!(
             CommandKind::parse_requested(p.kind.as_deref()),
             CommandKind::Structured
         ) {
-            if let Some(resolved) = resolve_executable_path(&p.program, cwd) {
-                p.program = resolved.to_string_lossy().into_owned();
+            // P1-D review: resolve every structured program to its exact
+            // launchable path. The old code silently fell back to the bare
+            // name when resolution failed, and the Unix spawn path then ran
+            // `Command::new(program)` — an OS PATH lookup that can disagree
+            // with profile detection/review pinning/session launch and spawn
+            // a different binary than the one authorized (detect-ready then
+            // spawn-bare-name inconsistency, TOCTOU).
+            //
+            // P0-B review: retain the *invocation* path (resolved but not
+            // canonicalized) separately from the canonical backing path used
+            // for identity pinning. Proxy executables (rustup's `cargo`,
+            // version-manager node wrappers that are symlinks to a real
+            // binary) dispatch on their argv[0] filename: canonicalizing
+            // `cargo` to the rustup binary would spawn rustup with cargo's
+            // args and fail. Review pinning already keeps both paths
+            // (`invocation_pin`/`pin`); generic `command.run` must not
+            // disagree with review execution about resolution semantics.
+            let invocation = resolve_executable_invocation_path(&p.program, cwd);
+            let backing = resolve_executable_path(&p.program, cwd);
+            match (invocation, backing) {
+                (Some(invocation), Some(backing)) => {
+                    // `p.program` keeps the invocation filename so the spawn
+                    // preserves proxy semantics; both paths are pinned below
+                    // so a retargeted symlink between approval and spawn is
+                    // caught by revalidation before execution.
+                    p.program = invocation.to_string_lossy().into_owned();
+                    pinned_invocation = Some((invocation, backing));
+                }
+                _ => structured_unresolvable = true,
             }
         }
         // Reclassify on the server so direct shells, resolved shell symlinks, and
         // all `env` indirection cannot bypass raw_shell rules.
         let kind = classify_from_request_in_dir(p.kind.as_deref(), &p.program, &p.args, cwd);
         p.policy_kind = Some(kind.as_str().to_owned());
-        if matches!(kind, CommandKind::Structured) {
+        // P1-D review: a program classified Structured that never resolved to
+        // a launchable file must fail closed here instead of reaching the
+        // spawner as a bare name. Classification of the unresolved name runs
+        // first so a shell binary (even one not installed, e.g. `/bin/zsh` on
+        // a minimal host) is still denied as raw_shell by policy, never
+        // silently admitted as structured; only genuinely structured programs
+        // are rejected with the resolution error.
+        if matches!(kind, CommandKind::Structured) && structured_unresolvable {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!(
+                    "structured program `{}` could not be resolved to a launchable \
+regular executable (searched PATH and the deterministic user-local bins); pass an absolute \
+path or install the tool so detection and execution agree",
+                    p.program
+                ),
+            });
+        }
+        // P0-B review: pin the canonical backing path for identity and the
+        // invocation path for argv[0]-driven proxy dispatch. A structured
+        // program that resolved but is *not* a native binary (shell/script
+        // payload) was reclassified raw above and skips this block.
+        if let Some((invocation, backing)) = pinned_invocation {
+            if matches!(kind, CommandKind::Structured) {
+                p.executable_pin =
+                    Some(pin_executable(Path::new(&backing), kind).map_err(|e| {
+                        IpcError::Remote {
+                            code: app_error::POLICY_DENIED,
+                            message: format!("unable to pin structured executable identity: {e}"),
+                        }
+                    })?);
+                p.invocation_pin =
+                    Some(pin_executable(Path::new(&invocation), kind).map_err(|e| {
+                        IpcError::Remote {
+                            code: app_error::POLICY_DENIED,
+                            message: format!("unable to pin structured invocation identity: {e}"),
+                        }
+                    })?);
+            }
+        } else if matches!(kind, CommandKind::Structured) {
             let program_path = Path::new(&p.program);
             if program_path.is_absolute() {
                 p.executable_pin =
@@ -2784,6 +3093,31 @@ full_user_access/full_access for arbitrary commands",
                 message: "review.start requires verified Agent device identity".into(),
             })?
             .to_owned();
+        let principal = canonicalize_principal_key(client.principal_key());
+        // Exact-once journal replay (P0-B / MCP `review.start` contract):
+        // consult the receipt *before* workspace/pinning/policy preflight so
+        // a retried start after response loss returns the original review
+        // even when the workspace was removed or a program is no longer
+        // installed (the first operation already ran; its receipt carries the
+        // `review_id` continuation and the exact payload hash). An
+        // in-progress/uncertain marker stays fail-closed. The durable marker
+        // itself is still reserved only after preflight, so a preflight
+        // failure on a *new* operation never poisons the key.
+        let journal_key = self
+            .active_remote_operation_id
+            .as_ref()
+            .map(|operation_id| principal_journal_key(&principal, operation_id));
+        if let Some(previous) = self.lookup_idempotent(journal_key.as_ref())? {
+            if previous.get("remote_payload_hash").and_then(Value::as_str)
+                != self.active_remote_payload_hash.as_deref()
+            {
+                return Err(IpcError::Remote {
+                    code: app_error::UNAUTHORIZED,
+                    message: "review operation id replay payload binding mismatch".into(),
+                });
+            }
+            return Ok(previous);
+        }
         if self.enforce_workspace {
             return Err(IpcError::Remote {
                 code: app_error::POLICY_DENIED,
@@ -2826,7 +3160,6 @@ full_user_access/full_access for arbitrary commands",
         // Review runs are a batch of independently policy-sensitive programs.
         // Never infer authorization from the first program: the most restrictive
         // local verdict wins before repository inspection or process execution.
-        let principal = canonicalize_principal_key(client.principal_key());
         let mut aggregate = Decision::Allow;
         let mut reasons = Vec::new();
         let mut review_programs: Vec<(&String, &ExecutablePin)> = Vec::new();
@@ -2872,21 +3205,6 @@ full_user_access/full_access for arbitrary commands",
                 code: app_error::POLICY_DENIED,
                 message: format!("review batch requires a policy approval path which is not available for review.start: {}", reasons.join("; ")),
             });
-        }
-        let journal_key = self
-            .active_remote_operation_id
-            .as_ref()
-            .map(|operation_id| principal_journal_key(&principal, operation_id));
-        if let Some(previous) = self.lookup_idempotent(journal_key.as_ref())? {
-            if previous.get("remote_payload_hash").and_then(Value::as_str)
-                != self.active_remote_payload_hash.as_deref()
-            {
-                return Err(IpcError::Remote {
-                    code: app_error::UNAUTHORIZED,
-                    message: "review operation id replay payload binding mismatch".into(),
-                });
-            }
-            return Ok(previous);
         }
         let operation_id = self
             .active_remote_operation_id
@@ -3112,6 +3430,18 @@ full_user_access/full_access for arbitrary commands",
                 "remote_payload_hash".into(),
                 json!(self.active_remote_payload_hash),
             );
+            // The compaction classifier recognizes a completed receipt only
+            // when it carries the exact-once `operation_id` this version
+            // writes in `begin_idempotent` (P0-B). `ReviewManifest` serializes
+            // the control-plane id as `remote_operation_id`, so without this
+            // field a finished review was classified uncertain: compaction
+            // refused to shrink it (retaining pins/argv durably) and a retried
+            // `review.start` after restart or response loss received an
+            // "in-progress or uncertain" CONFLICT instead of the documented
+            // receipt. The local journal id equals `active_remote_operation_id`
+            // on the Agent path and is freshly minted for local runs; it is
+            // additive for receipt consumers.
+            object.insert("operation_id".into(), json!(operation_id));
         }
         self.store_idempotent(journal_key.as_ref(), &body)?;
         Ok(body)
@@ -5009,21 +5339,110 @@ full_user_access/full_access for arbitrary commands",
         self.commit_sessions(snapshot)
     }
 
-    async fn recover_sidecar_transitions(&mut self) -> IpcResult<()> {
+    /// Reconcile only expired transition-journal records (the safe, non-blocking
+    /// pass). Live in-window records are left for the supervisor path so a
+    /// diagnosis or startup can never fail on replay of an ambiguous transition.
+    ///
+    /// P0-A: a stale row whose host TTL expired must never poison unrelated
+    /// future sessions; provably-moot records are cleared, anything else is
+    /// retained fail-closed and surfaced through `transition_recovery_health`.
+    /// The health state is refreshed from the journal after the pass so a
+    /// record retained on an earlier pass that is now provably moot (cleared)
+    /// stops being reported as unresolved (P1-F).
+    pub(super) async fn reconcile_expired_transitions(&mut self) {
         if self.transition_recovery_running {
+            return;
+        }
+        self.transition_recovery_running = true;
+        let records = self.transition_journal.pending();
+        let now = Self::now();
+        for record in &records {
+            if record.expires_unix <= now
+                && self
+                    .reconcile_expired_transition_record(record.clone())
+                    .await
+                    .is_err()
+            {
+                self.record_transition_recovery_issue(&record.transition_id);
+            }
+        }
+        self.refresh_transition_recovery_health();
+        self.transition_recovery_running = false;
+    }
+
+    /// Refresh the bounded retained-expired health state to match the current
+    /// journal: every expired record still pending after the reconcile pass is
+    /// unresolved, and a record that was retained on an earlier pass but has
+    /// since been cleared (session closed, host TTL provably passed) must stop
+    /// being reported. The bounded list keeps the first `TRANSITION_HEALTH_RETAINED_CAP`
+    /// ids; the total is the current unresolved count, not a cumulative counter.
+    fn refresh_transition_recovery_health(&mut self) {
+        let now = Self::now();
+        let retained: Vec<String> = self
+            .transition_journal
+            .pending()
+            .into_iter()
+            .filter(|record| record.expires_unix <= now)
+            .map(|record| record.transition_id)
+            .collect();
+        self.transition_recovery_health.retained_expired_total = retained.len();
+        self.transition_recovery_health.retained_expired = retained
+            .into_iter()
+            .take(TRANSITION_HEALTH_RETAINED_CAP)
+            .collect();
+    }
+
+    async fn recover_sidecar_transitions(&mut self) -> IpcResult<()> {
+        // Expired records are reconciled first, non-blockingly: a stale row
+        // must never poison unrelated future sessions, and safe cleanup must
+        // not be prevented by a separate record's failure. If authoritative
+        // state cannot prove the record harmless it is retained fail-closed
+        // and surfaced in health — recovery continues.
+        self.reconcile_expired_transitions().await;
+        // Live records keep the fail-closed replay: an in-window transition
+        // that cannot be replayed aborts rather than converting ambiguity
+        // into success.
+        if self.transition_recovery_running {
+            // Another recovery pass owns the journal; the live replay is
+            // idempotent and will be performed by that owner.
             return Ok(());
         }
         self.transition_recovery_running = true;
         let records = self.transition_journal.pending();
+        let now = Self::now();
         for record in records {
-            let result = self.recover_transition_record(record).await;
-            if let Err(error) = result {
-                self.transition_recovery_running = false;
-                return Err(error);
+            if record.expires_unix > now {
+                let result = self.recover_transition_record(record).await;
+                if let Err(error) = result {
+                    self.transition_recovery_running = false;
+                    return Err(error);
+                }
             }
         }
         self.transition_recovery_running = false;
         Ok(())
+    }
+
+    /// Record a retained-expired transition journal issue in the bounded
+    /// health state (deduplicated by transition id).
+    fn record_transition_recovery_issue(&mut self, transition_id: &str) {
+        if self
+            .transition_recovery_health
+            .retained_expired
+            .iter()
+            .any(|id| id == transition_id)
+        {
+            return;
+        }
+        if self.transition_recovery_health.retained_expired.len() < TRANSITION_HEALTH_RETAINED_CAP {
+            self.transition_recovery_health
+                .retained_expired
+                .push(transition_id.to_string());
+        }
+        self.transition_recovery_health.retained_expired_total = self
+            .transition_recovery_health
+            .retained_expired_total
+            .saturating_add(1);
     }
 
     async fn recover_transition_record(
@@ -5031,13 +5450,9 @@ full_user_access/full_access for arbitrary commands",
         record: session_transition_journal::TransitionRecord,
     ) -> IpcResult<()> {
         if record.expires_unix <= Self::now() {
-            return Err(IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: format!(
-                    "expired sidecar transition journal record {}",
-                    record.transition_id
-                ),
-            });
+            // The host TTL passed while the record was queued: reconcile
+            // non-blockingly instead of aborting every other session.
+            return self.reconcile_expired_transition_record(record).await;
         }
         let terminal = matches!(
             record.kind,
@@ -5192,6 +5607,84 @@ full_user_access/full_access for arbitrary commands",
             }
         };
         let snapshot = self.sessions.clone();
+        if !terminal {
+            // P0-A review (crash window): the original handler mutated a
+            // preview session (controller principal, lease id, epoch, expiry,
+            // attached state), rotated the sidecar, journaled the transition,
+            // then committed the preview. A crash between the supervisor
+            // mutation / `Applied` journal write and that commit leaves the
+            // durable controller unchanged while the sidecar already belongs
+            // to the successor. Recovery therefore restores the FULL
+            // controller mutation recorded in the journal target — not only
+            // the sidecar binding — so the former controller cannot keep
+            // writing through the successor's host after the record is
+            // cleared. The exact recorded lease id is restored so remote
+            // write authorization (lease id + epoch) keeps working after
+            // restart.
+            //
+            // Defense in depth: fencing guarantees at most one in-flight
+            // record per session and recovery runs before any request, so the
+            // durable generation can never be ahead of the record target. If
+            // it ever is (crash-interleaved/foreign journal), the record is
+            // NOT applied (that would regress the authoritative session) and
+            // is cleared only when the durable binding is already at or past
+            // the target generation; a stale pre-transition binding keeps the
+            // record retained fail-closed.
+            let current = self.sessions.get(&record.session_id).map_err(session_err)?;
+            let durable_ahead = current.controller_epoch > record.target.controller_epoch;
+            let binding_stale = current
+                .sidecar_host
+                .as_ref()
+                .is_some_and(|binding| binding.controller_epoch < record.target.controller_epoch);
+            // `current` is a plain `&SessionInfo` (no lock guard); move it to
+            // end the borrow before touching the transition journal below.
+            let _ = current;
+            if durable_ahead {
+                if binding_stale {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "recovered sidecar transition {} for session {} is older than the \
+durable controller generation but its sidecar binding is still the pre-transition generation; \
+retained fail-closed — run `ownmesh doctor` or inspect {} ",
+                            record.transition_id,
+                            record.session_id,
+                            self.transition_journal_dir().display(),
+                        ),
+                    });
+                }
+                return self
+                    .transition_journal
+                    .clear(&record.transition_id)
+                    .map_err(|e| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: format!("clear already-superseded recovered transition: {e}"),
+                    });
+            }
+            self.sessions
+                .reconcile_controller_from_transition(
+                    &record.session_id,
+                    &record.target.principal,
+                    record
+                        .target
+                        .lease_id
+                        .as_deref()
+                        .ok_or_else(|| IpcError::Remote {
+                            code: app_error::INTERNAL,
+                            message: format!(
+                                "recovered sidecar transition {} for session {} is missing its \
+recorded lease id; retained fail-closed — run `ownmesh doctor` or inspect {} ",
+                                record.transition_id,
+                                record.session_id,
+                                self.transition_journal_dir().display(),
+                            ),
+                        })?,
+                    record.target.controller_epoch,
+                    record.target.binding_expires_unix,
+                    record.target.controller_attached,
+                )
+                .map_err(session_err)?;
+        }
         if let Some(binding) = binding {
             self.sessions
                 .set_sidecar_host_binding(&record.session_id, Some(binding))
@@ -5219,6 +5712,235 @@ full_user_access/full_access for arbitrary commands",
                 code: app_error::INTERNAL,
                 message: format!("clear recovered transition journal: {e}"),
             })
+    }
+
+    /// Authoritative proof that every sidecar referenced by an expired
+    /// transition record is dead (P0-A review).
+    ///
+    /// Returns `Ok(true)` only when death is proven for **every** binding the
+    /// record can touch (the old binding and, when present, the distinct
+    /// successor binding), `Ok(false)` when a live process or supervisor-
+    /// tracked host was found (the record must be retained), and `Err` when
+    /// no proof could be produced (indeterminate → retain fail-closed;
+    /// ambiguity is never converted into success).
+    ///
+    /// Two independent authoritative sources, combined across all bindings:
+    ///
+    /// 1. **OS process proof.** For each binding that carries the attested
+    ///    child identity (`child_pid` + `child_process_birth`), ask the OS
+    ///    whether that exact process still exists. `process_birth_id`
+    ///    returns `Ok(None)` only when the OS confirmed the PID no longer
+    ///    exists; a reused PID reports a different birth, which equally
+    ///    proves the original child is gone. A matching birth means that
+    ///    sidecar is still live → retain (never contradicted by the
+    ///    supervisor). An inspection error is indeterminate and falls
+    ///    through to the supervisor probe.
+    /// 2. **Supervisor proof.** When any referenced binding is provisional
+    ///    (no attested pid/birth) or its OS inspection was indeterminate,
+    ///    the live supervisor is the authoritative registry: it removes a
+    ///    host only after its termination succeeds and retries failed
+    ///    terminations (`sweep_expired`), so a session the supervisor does
+    ///    not track proves no sidecar can be live under it. A probe failure
+    ///    (supervisor down/restarting) is indeterminate → fail closed.
+    ///
+    /// P0-B review: proving only the *first* available child identity is
+    /// insufficient. If the old binding's PID is dead (or reused with a
+    /// different birth) while a distinct successor binding is live — or the
+    /// supervisor still tracks a host for this session — clearing the
+    /// record would orphan that sidecar. Every referenced binding must be
+    /// covered before the row is cleared.
+    async fn prove_expired_sidecar_dead(
+        &self,
+        record: &session_transition_journal::TransitionRecord,
+    ) -> Result<bool, String> {
+        // Every binding this record can touch: old + (when present) new.
+        let bindings = std::iter::once(&record.old_binding).chain(record.new_binding.iter());
+        // True when at least one referenced binding still lacks OS proof of
+        // death (provisional identity or indeterminate inspection), so the
+        // supervisor probe is required before the row may be cleared.
+        let mut need_supervisor = false;
+        for binding in bindings {
+            if let Some((pid, expected_birth)) = binding.child_pid.zip(binding.child_process_birth)
+            {
+                match ownmesh_ipc::process_birth_id(pid) {
+                    // OS-confirmed gone, or the PID was reused by a different
+                    // process: the original child is provably dead.
+                    Ok(None) => {}
+                    Ok(Some(birth)) if birth != expected_birth => {}
+                    // The attested child is still live: that is authoritative
+                    // and never contradicted by a supervisor probe (fail-
+                    // closed).
+                    Ok(Some(_)) => return Ok(false),
+                    // Indeterminate OS inspection: fall through to the
+                    // supervisor probe as a second authoritative source.
+                    Err(_) => need_supervisor = true,
+                }
+            } else {
+                // Provisional binding: no OS identity to prove death with.
+                need_supervisor = true;
+            }
+        }
+        if need_supervisor {
+            if let Some(supervisor) = self.supervisor.as_ref() {
+                return match supervisor.host_live(&record.session_id).await {
+                    Ok(live) => Ok(!live),
+                    Err(error) => Err(format!("supervisor liveness probe failed: {error}")),
+                };
+            }
+            return Err(
+                "sidecar has no attested child pid and the session supervisor is not connected"
+                    .into(),
+            );
+        }
+        Ok(true)
+    }
+
+    /// Reconcile a transition journal record whose host TTL has expired.
+    ///
+    /// The record is cleared only when authoritative state proves both that
+    /// the intent is moot and that no live sidecar can be orphaned:
+    ///
+    /// - the record's `expires_unix` covers every binding it references
+    ///   (journal validation enforces `expires_unix >= host_expires_unix`;
+    ///   this function re-checks defensively so a crash-interleaved or
+    ///   inconsistent record can never be cleared without that proof);
+    /// - [`Self::prove_expired_sidecar_dead`] proves the referenced sidecar
+    ///   is dead (OS process proof, or supervisor liveness probe for
+    ///   provisional bindings) — expiry alone is never treated as proof of
+    ///   termination, because a failed sweep/terminate could otherwise leave
+    ///   an orphaned sidecar running after its journal record was cleared;
+    /// - the session no longer exists (`NotFound`): no controller can be
+    ///   granted and no host is affected;
+    /// - the session is `Closed` and its current `sidecar_host` (which
+    ///   `SessionManager::close` deliberately leaves intact) is not a live
+    ///   host referenced by this record.
+    ///
+    /// When the session is still present and non-terminal the intent may
+    /// still matter, so the record is retained fail-closed (ambiguity is
+    /// never converted into success) and surfaced through the bounded
+    /// `transition_recovery_health` state instead of aborting every unrelated
+    /// future session.
+    async fn reconcile_expired_transition_record(
+        &mut self,
+        record: session_transition_journal::TransitionRecord,
+    ) -> IpcResult<()> {
+        // Authoritative proof that every host this record can touch is dead:
+        // `expires_unix` is the host-TTL bound and the supervisor sweeps
+        // hosts whose TTL passed. A record whose expiry precedes a referenced
+        // host's TTL is inconsistent — clearing it could strand a live
+        // sidecar, so it is retained fail-closed (never converted into
+        // success) and surfaced in health.
+        if record.expires_unix < record.old_binding.host_expires_unix
+            || record
+                .new_binding
+                .as_ref()
+                .is_some_and(|binding| record.expires_unix < binding.host_expires_unix)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "expired sidecar transition journal record {} has an inconsistent host-expiry \
+bound; retained for review — run `ownmesh doctor` or inspect {} ",
+                    record.transition_id,
+                    self.transition_journal_dir().display(),
+                ),
+            });
+        }
+        // P0-A review: never clear an expired record on time/session state
+        // alone — the referenced sidecar must be provably dead. A live child
+        // process or a supervisor-tracked host means the record stays, and an
+        // indeterminate probe stays fail-closed too.
+        match self.prove_expired_sidecar_dead(&record).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!(
+                        "expired sidecar transition journal record {} still references a live \
+sidecar (attested child process or supervisor-tracked host); retained for review — run \
+`ownmesh doctor` or inspect {} ",
+                        record.transition_id,
+                        self.transition_journal_dir().display(),
+                    ),
+                });
+            }
+            Err(message) => {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: format!(
+                        "expired sidecar transition journal record {} cannot prove its sidecar \
+terminated ({message}); retained fail-closed — run `ownmesh doctor` or inspect {} ",
+                        record.transition_id,
+                        self.transition_journal_dir().display(),
+                    ),
+                });
+            }
+        }
+        let current = match self.sessions.get(&record.session_id) {
+            Ok(current) => current,
+            // Session gone entirely + host TTL provably passed + the
+            // referenced sidecar is provably dead: the intent is moot.
+            // Clearing can never grant a controller or touch a live host.
+            Err(ownmesh_session::SessionError::NotFound) => {
+                return self
+                    .transition_journal
+                    .clear(&record.transition_id)
+                    .map_err(|e| IpcError::Remote {
+                        code: app_error::INTERNAL,
+                        message: format!("clear moot expired transition: {e}"),
+                    });
+            }
+            Err(error) => return Err(session_err(error)),
+        };
+        if current.state == SessionState::Closed {
+            // Terminal session: no controller can be granted; the referenced
+            // sidecar is provably dead. `SessionManager::close` leaves
+            // `sidecar_host` intact, so verify the session's current binding
+            // is not a live host referenced by this record before clearing.
+            if let Some(binding) = &current.sidecar_host {
+                let references_this_record = binding.host_nonce == record.old_binding.host_nonce
+                    || record
+                        .new_binding
+                        .as_ref()
+                        .is_some_and(|b| binding.host_nonce == b.host_nonce);
+                if references_this_record && binding.host_expires_unix > Self::now() {
+                    return Err(IpcError::Remote {
+                        code: app_error::CONFLICT,
+                        message: format!(
+                            "expired sidecar transition journal record {} references a still-live \
+host; retained for review — run `ownmesh doctor` or inspect {} ",
+                            record.transition_id,
+                            self.transition_journal_dir().display(),
+                        ),
+                    });
+                }
+            }
+            return self
+                .transition_journal
+                .clear(&record.transition_id)
+                .map_err(|e| IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("clear moot expired transition: {e}"),
+                });
+        }
+        // Session still present and non-terminal: retain fail-closed and tell
+        // the operator how to diagnose it. This is a per-record health issue,
+        // never a global abort.
+        Err(IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: format!(
+                "expired sidecar transition journal record {} (session {} still present) retained for review; \
+run `ownmesh doctor` or inspect {} ",
+                record.transition_id,
+                record.session_id,
+                self.transition_journal_dir().display(),
+            ),
+        })
+    }
+
+    /// Directory hosting the durable transition journal (for diagnostics).
+    fn transition_journal_dir(&self) -> PathBuf {
+        self.paths.state_dir.join("session-transitions")
     }
 
     fn handle_profile_list(&self, params: Option<Value>) -> IpcResult<Value> {
@@ -5595,6 +6317,15 @@ full_user_access/full_access for arbitrary commands",
     pub fn fail_op_journal_persist_on_nth_call_for_test(&self, nth: usize) {
         assert!(nth > 0);
         self.op_journal_persist_fault.store(nth, Ordering::SeqCst);
+    }
+
+    /// Fault the nth future op-journal *write* (after the stale-backup
+    /// removal, before the durable write) without touching the durable file.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn fail_op_journal_write_on_nth_call_for_test(&self, nth: usize) {
+        assert!(nth > 0);
+        self.op_journal_write_fault.store(nth, Ordering::SeqCst);
     }
 
     /// Fault the nth future approval persist without touching the durable file.
@@ -6038,8 +6769,132 @@ fn split_remote_principal(value: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Durable op-journal entry state classification (P0-B).
+///
+/// Completed is an *explicit, positive* marker only: either the compact
+/// `durable_receipt: true` encoding this version writes, the explicit
+/// `__ownmesh_operation_state == "completed"` value, or a legacy (pre-1.2.13)
+/// completed result body that carries positive proof of completion (a non-
+/// empty `operation_id` plus a recognizable completion field such as
+/// `decision`/`approval_required`/`review_id`). A JSON object with *no* state
+/// field and none of that proof — e.g. a truncated or hand-written `{}` — is
+/// **uncertain**, never completed: compacting or evicting it could hide an
+/// unfinished side effect. The exact `in_progress` marker, any other present
+/// state value (unknown/forward-version string, or non-string such as
+/// `null`/number/boolean), and any non-object top-level entry are also
+/// uncertain and must never be compacted, evicted, or replayed as a completed
+/// receipt.
+///
+/// ADR 0010 §1b requires every completed entry to carry the exact-once
+/// `operation_id` marker, so the `durable_receipt: true` and explicit
+/// `"completed"` markers only classify as completed together with a non-empty
+/// `operation_id`. A marker without one is malformed (hand-written or
+/// truncated): compacting or eventually evicting it would let a retried
+/// operation run as a brand-new side effect, so it stays uncertain and is
+/// never replayed, compacted, or pruned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpJournalEntryState {
+    /// `__ownmesh_operation_state == "in_progress"`: the exact-once marker.
+    InProgress,
+    /// A state field is present but not a value this version writes, or the
+    /// entry is not a JSON object, or the object carries no explicit
+    /// completed marker with the exact-once `operation_id`: fail closed
+    /// (forward-version / unknown / malformed / truncated).
+    Uncertain,
+    /// The entry is provably a completed receipt (explicit marker with a
+    /// non-empty `operation_id`, or legacy completed body with positive
+    /// completion proof).
+    Completed,
+}
+
+/// Non-empty exact-once `operation_id` (ADR 0010 §1b).
+fn has_exact_once_operation_id(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+}
+
+fn op_journal_entry_state(value: &Value) -> OpJournalEntryState {
+    // A non-object entry (null/array/string/number/boolean) has no state
+    // field by construction, but it is not a completed receipt this version
+    // writes either — classify it uncertain so it is never compacted,
+    // evicted, or replayed as completed (fail-closed).
+    let Some(object) = value.as_object() else {
+        return OpJournalEntryState::Uncertain;
+    };
+    match object.get(OP_JOURNAL_STATE_FIELD) {
+        None => {
+            // No state field: completed only when the entry carries an
+            // explicit positive marker *with the exact-once operation_id*
+            // (ADR 0010 §1b), or is a legacy completed result body with
+            // positive completion proof. A `durable_receipt: true` marker
+            // without an `operation_id` is malformed — compacting or
+            // evicting it could let a retry execute as a new side effect, so
+            // it stays uncertain. Anything else — including a bare `{}` —
+            // stays uncertain and is never pruned or replayed as completed.
+            if object.get("durable_receipt").and_then(Value::as_bool) == Some(true)
+                && has_exact_once_operation_id(object)
+            {
+                return OpJournalEntryState::Completed;
+            }
+            if legacy_completed_body(object) {
+                return OpJournalEntryState::Completed;
+            }
+            OpJournalEntryState::Uncertain
+        }
+        Some(field) => match field.as_str() {
+            Some(OP_JOURNAL_IN_PROGRESS) => OpJournalEntryState::InProgress,
+            // The explicit completed value this version writes always carries
+            // the exact-once `operation_id` (ADR 0010 §1b); a `"completed"`
+            // marker without one is malformed and stays uncertain.
+            Some("completed") if has_exact_once_operation_id(object) => {
+                OpJournalEntryState::Completed
+            }
+            // A present state field that is not the exact in-progress marker
+            // or the explicit completed value (including a non-string value
+            // such as null/number/boolean) is uncertain: it is not a
+            // completed receipt this version wrote.
+            Some(_) | None => OpJournalEntryState::Uncertain,
+        },
+    }
+}
+
+/// Positive completion proof for legacy (pre-1.2.13) result bodies: every
+/// completed entry this runtime ever wrote carries a non-empty `operation_id`
+/// plus a recognizable completion field (`decision`, `approval_required`, or
+/// a `review_id` receipt). Requiring this proof means a truncated or
+/// hand-written object is never promoted to a completed receipt.
+fn legacy_completed_body(object: &serde_json::Map<String, Value>) -> bool {
+    let has_operation_id = object
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    if !has_operation_id {
+        return false;
+    }
+    let has_decision = object
+        .get("decision")
+        .and_then(Value::as_str)
+        .is_some_and(|d| !d.is_empty());
+    let has_approval_flag = object
+        .get("approval_required")
+        .is_some_and(Value::is_boolean);
+    let has_review_id = object
+        .get("review_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty());
+    has_decision || has_approval_flag || has_review_id
+}
+
 fn is_op_journal_in_progress(value: &Value) -> bool {
-    value.get(OP_JOURNAL_STATE_FIELD).and_then(Value::as_str) == Some(OP_JOURNAL_IN_PROGRESS)
+    op_journal_entry_state(value) == OpJournalEntryState::InProgress
+}
+
+/// Fail-closed protection predicate: in-progress markers and unknown states
+/// are never compacted or evicted, and never replayed as completed.
+fn is_op_journal_uncertain(value: &Value) -> bool {
+    op_journal_entry_state(value) != OpJournalEntryState::Completed
 }
 
 /// Project a server-side [`ExecutablePin`] into policy grant/facts identity binding.
@@ -6192,7 +7047,19 @@ fn persistent_child_is_live(binding: &SidecarHostBinding) -> Result<bool, String
 #[allow(clippy::items_after_test_module)]
 mod device_binding_tests {
     use super::*;
-    use tempfile::tempdir;
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn authenticated_workspace_registry_contains_ids_and_policy_but_no_roots() {
@@ -6681,7 +7548,19 @@ mod device_binding_tests {
 mod transfer_runtime_tests {
     use super::*;
     use ownmesh_transfer::ChunkSink;
-    use tempfile::tempdir;
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     fn remote_client() -> ClientIdentity {
         ClientIdentity::new("client:remote:tenant_a:principal_a", "test")
@@ -7996,7 +8875,31 @@ fn policy_from_file(file: &PolicyFile) -> PolicyDocument {
 /// Hard ceilings for durable op-journal state (count + file bytes).
 const MAX_OP_JOURNAL_ENTRIES: usize = 4_096;
 const MAX_OP_JOURNAL_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// Per-entry durable value budget used by tests to build over-budget fixtures.
+#[cfg(test)]
 const MAX_OP_JOURNAL_VALUE_BYTES: usize = 64 * 1024;
+
+/// Completed op-journal receipts are retained for this long before they may
+/// be evicted at capacity, aligned with the control-plane idempotency window
+/// (`MCP_OPS_TOMBSTONE_TTL_MS` = 30 days). In-progress/uncertain markers are
+/// never evicted regardless of age.
+const OP_JOURNAL_COMPLETED_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+/// Marker field stamped on completed op-journal entries so the lifecycle can
+/// distinguish them from in-progress/uncertain markers.
+const OP_JOURNAL_COMPLETED_UNIX_FIELD: &str = "__ownmesh_completed_unix";
+/// Bounded health state for transition-journal recovery (P0-A): expired
+/// records retained fail-closed (session still present and non-terminal).
+#[derive(Debug, Clone, Default)]
+struct TransitionRecoveryHealth {
+    /// Unique transition ids retained fail-closed, capped for the health
+    /// surface.
+    retained_expired: Vec<String>,
+    /// Total unique retained-expired records (may exceed the bounded list).
+    retained_expired_total: usize,
+}
+
+/// Cap for the bounded health list of retained-expired transition records.
+const TRANSITION_HEALTH_RETAINED_CAP: usize = 16;
 
 /// Hard ceilings for durable grants / approvals / revoked-principal state.
 /// Stat-before-read + entry budgets keep startup fail-closed under oversized
@@ -8124,68 +9027,150 @@ fn load_or_init_workspaces(
     Ok(out)
 }
 
-fn load_op_journal(path: &Path) -> Result<HashMap<String, Value>, String> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
-    let meta = std::fs::metadata(path)
-        .map_err(|e| format!("failed to stat operation journal {}: {e}", path.display()))?;
-    if meta.len() as usize > MAX_OP_JOURNAL_FILE_BYTES {
+/// Path of the stale backup (`<primary>.bak`) an older writer or a crash
+/// between the backup copy and cleanup can leave behind.
+fn stale_op_journal_backup_path(path: &Path) -> PathBuf {
+    let mut bak = path.as_os_str().to_os_string();
+    bak.push(".bak");
+    PathBuf::from(bak)
+}
+
+/// Read a bounded journal file (primary or recovery backup) into parsed,
+/// bounded, compacted entries. `label` names the source in error messages.
+fn read_and_bound_op_journal(file: &Path, label: &str) -> Result<HashMap<String, Value>, String> {
+    // P0-B: a legacy (pre-1.2.13) journal may exceed the durable budget
+    // because completed entries retained large stdout/file bodies. Read it
+    // (bounded) so compaction can shrink it; only reject when the compacted
+    // result still exceeds the budget.
+    const MAX_LEGACY_READ_BYTES: u64 = MAX_OP_JOURNAL_FILE_BYTES as u64 * 4;
+    let meta = std::fs::metadata(file)
+        .map_err(|e| format!("failed to stat {label} {}: {e}", file.display()))?;
+    if meta.len() > MAX_LEGACY_READ_BYTES {
         return Err(format!(
-            "operation journal {} exceeds {MAX_OP_JOURNAL_FILE_BYTES} byte budget ({})",
-            path.display(),
+            "{label} {} exceeds {MAX_LEGACY_READ_BYTES} read budget ({})",
+            file.display(),
             meta.len()
         ));
     }
-    let raw = std::fs::read(path)
-        .map_err(|e| format!("failed to read operation journal {}: {e}", path.display()))?;
-    if raw.len() > MAX_OP_JOURNAL_FILE_BYTES {
-        return Err(format!(
-            "operation journal {} exceeds {MAX_OP_JOURNAL_FILE_BYTES} byte budget",
-            path.display()
-        ));
-    }
+    let raw = std::fs::read(file)
+        .map_err(|e| format!("failed to read {label} {}: {e}", file.display()))?;
     let parsed: HashMap<String, Value> = serde_json::from_slice(&raw)
-        .map_err(|e| format!("corrupt operation journal {}: {e}", path.display()))?;
+        .map_err(|e| format!("corrupt {label} {}: {e}", file.display()))?;
     bound_op_journal(parsed)
 }
 
-fn bound_op_journal(mut journal: HashMap<String, Value>) -> Result<HashMap<String, Value>, String> {
+fn load_op_journal(path: &Path) -> Result<HashMap<String, Value>, String> {
+    let bak = stale_op_journal_backup_path(path);
+    if !path.exists() {
+        // Primary missing but a backup survives (e.g. a crash in an older
+        // writer between its backup copy and the replace, or an external
+        // removal of the primary): the backup is the last-known durable
+        // journal and its exact-once receipts must not be silently dropped by
+        // starting empty — a retried operation would re-execute (P0-B review).
+        // Recover from it with the same bounded read + fail-closed compaction
+        // as the primary, persist the compacted form as the new primary, and
+        // remove the backup so the state is not double-counted on the next
+        // load. A corrupt/over-budget backup refuses startup with an
+        // actionable message instead of converting ambiguity into an empty
+        // journal.
+        if bak.exists() {
+            let journal = read_and_bound_op_journal(&bak, "op journal backup")?;
+            write_op_journal(path, &journal).map_err(|e| {
+                format!(
+                    "failed to persist recovered op journal {}: {e}",
+                    path.display()
+                )
+            })?;
+            // The promoted primary is durable, so a stale backup that cannot
+            // be removed is no longer the only copy — but it may still hold
+            // the pre-compaction large-body journal. Fail startup instead of
+            // leaving that sensitive copy behind while claiming it was
+            // removed (P0-B review).
+            remove_stale_op_journal_backup_fallible(path).map_err(|e| {
+                format!(
+                    "failed to remove recovered op journal backup {} after promoting the primary: \
+{e}; remove or repair the backup (it may hold a legacy large-body journal) and restart",
+                    stale_op_journal_backup_path(path).display()
+                )
+            })?;
+            return Ok(journal);
+        }
+        return Ok(HashMap::new());
+    }
+    let journal = read_and_bound_op_journal(path, "operation journal")?;
+    // P0-B review: remove a stale backup *before* the compacted write so a
+    // crash between the write and the cleanup cannot leave a legacy
+    // large-body copy on disk while the daemon is stopped. The primary is
+    // authoritative (it was just read), so the stale duplicate can be removed
+    // first; `write_op_journal` uses the no-backup atomic writer, so no new
+    // `.bak` is created. (The recovery path above — primary missing, backup
+    // is the only durable copy — must keep the backup until the recovered
+    // primary is durable, so its removal stays after the write.)
+    //
+    // P0-B review: the stale backup may hold the pre-compaction legacy
+    // journal with large stdout/file bodies. The compacted primary is about
+    // to be written, but running with the sensitive copy still on disk while
+    // claiming it was removed would be dishonest, and a later persist might
+    // never retry the cleanup. Fail startup with an actionable message
+    // instead (the same fail-closed contract as a compaction that cannot be
+    // persisted).
+    remove_stale_op_journal_backup_fallible(path).map_err(|e| {
+        format!(
+            "failed to remove stale op journal backup {} before writing the compacted primary: \
+{e}; remove or repair the backup (it may hold a legacy large-body journal) and restart",
+            stale_op_journal_backup_path(path).display()
+        )
+    })?;
+    // Persist the compacted result so legacy large bodies are not retained
+    // indefinitely on disk (P0-B). Fail-closed: if the compaction cannot be
+    // made durable, the load fails instead of returning a compacted in-memory
+    // view while the large bodies remain on disk — diagnostics would
+    // otherwise report the compacted state while the durable file is still
+    // over budget.
+    write_op_journal(path, &journal).map_err(|e| {
+        format!(
+            "failed to persist compacted operation journal {}: {e}; the journal remains over \
+budget on disk — free space or repair the journal before starting",
+            path.display()
+        )
+    })?;
+    Ok(journal)
+}
+
+fn bound_op_journal(journal: HashMap<String, Value>) -> Result<HashMap<String, Value>, String> {
     if journal.len() > MAX_OP_JOURNAL_ENTRIES {
         return Err(format!(
             "operation journal exceeds {MAX_OP_JOURNAL_ENTRIES} entry budget ({})",
             journal.len()
         ));
     }
-    for (key, value) in &mut journal {
-        let bytes = serde_json::to_vec(value)
-            .map_err(|e| format!("operation journal value serialize failed for {key}: {e}"))?;
-        if bytes.len() > MAX_OP_JOURNAL_VALUE_BYTES {
-            // Retain a compact non-retriable receipt so exact-once is preserved.
-            let status = value
-                .get("status")
-                .cloned()
-                .unwrap_or_else(|| json!("completed"));
-            let operation_id = value.get("operation_id").cloned();
-            let state = value.get(OP_JOURNAL_STATE_FIELD).cloned();
-            let mut compact = json!({
-                "durable_receipt": true,
-                "truncated": true,
-                "status": status,
-                "note": "op-journal entry exceeded durable value budget"
-            });
-            if let Some(obj) = compact.as_object_mut() {
-                if let Some(oid) = operation_id {
-                    obj.insert("operation_id".into(), oid);
-                }
-                if let Some(st) = state {
-                    obj.insert(OP_JOURNAL_STATE_FIELD.into(), st);
-                }
+    // P0-B: compact every provably-completed entry to an exact-once receipt
+    // (the same view as durable persistence) so legacy journals with large
+    // stdout/file bodies shrink at load instead of retaining them
+    // indefinitely. In-progress/uncertain markers are never compacted.
+    let mut journal = op_journal_durable_view(&journal);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for value in journal.values_mut() {
+        // Stamp legacy completed entries (pre-1.2.13) so the bounded lifecycle
+        // can age them for eviction; in-progress/unknown markers keep no stamp
+        // and are never evicted.
+        if op_journal_entry_state(value) == OpJournalEntryState::Completed
+            && value.get(OP_JOURNAL_COMPLETED_UNIX_FIELD).is_none()
+        {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(OP_JOURNAL_COMPLETED_UNIX_FIELD.into(), json!(now));
             }
-            *value = compact;
         }
     }
-    let encoded = serde_json::to_vec(&journal)
+    // Validate the size of the bytes the durable writer actually emits:
+    // `write_op_journal`/`persist_op_journal` serialize pretty JSON, so a
+    // compact-serialized check could pass while the pretty file exceeds the
+    // budget (P0-B review: a reproducible uncertain entry measured 4,194,285
+    // compact bytes vs 4,194,305 pretty bytes against the 4 MiB cap).
+    let encoded = serde_json::to_vec_pretty(&journal)
         .map_err(|e| format!("operation journal re-encode failed: {e}"))?;
     if encoded.len() > MAX_OP_JOURNAL_FILE_BYTES {
         return Err(format!(
@@ -8193,6 +9178,170 @@ fn bound_op_journal(mut journal: HashMap<String, Value>) -> Result<HashMap<Strin
         ));
     }
     Ok(journal)
+}
+
+/// Compacted durable view of an op journal: completed entries become exact-
+/// once receipts (identity + status only); in-progress/uncertain markers stay
+/// intact. Shared by [`DaemonRuntime::persist_op_journal`], the pressure
+/// estimate, and in-memory compaction so all views agree about durable size
+/// and state.
+fn op_journal_durable_view(journal: &HashMap<String, Value>) -> HashMap<String, Value> {
+    let mut out = HashMap::with_capacity(journal.len());
+    for (key, value) in journal {
+        // Unknown/forward-version states are kept verbatim (fail-closed): a
+        // compacted receipt could hide an unfinished side effect.
+        if op_journal_entry_state(value) != OpJournalEntryState::Completed {
+            out.insert(key.clone(), value.clone());
+            continue;
+        }
+        let mut status = value
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| json!("completed"));
+        // P0-B review: a `review.start` receipt stores the terminal manifest
+        // phase (`completed`/`failed`/`cancelled`) as `phase`, not `status`.
+        // A compacted failed/cancelled review must replay with the same
+        // terminal status — the old code defaulted a missing `status` to
+        // `completed`, hiding a failed review behind a completed receipt that
+        // the control plane then persisted as a successful operation result.
+        // The terminal `phase` is preserved on the compact receipt so replay
+        // consumers see the same phase as the first response.
+        let phase = value.get("phase").filter(|v| v.is_string()).cloned();
+        if let Some(phase_str) = phase.as_ref().and_then(Value::as_str) {
+            if matches!(phase_str, "completed" | "failed" | "cancelled")
+                && (phase_str != "completed" || value.get("status").is_none())
+            {
+                status = json!(phase_str);
+            }
+        }
+        let operation_id = value.get("operation_id").cloned();
+        let completed_unix = value.get(OP_JOURNAL_COMPLETED_UNIX_FIELD).cloned();
+        // `remote_payload_hash` is the review.start replay binding: an
+        // identical retry within the retention window must return the compact
+        // receipt, not an unauthorized binding mismatch (P0-B). It is a small
+        // additive field, so it is preserved on the receipt.
+        let remote_payload_hash = value.get("remote_payload_hash").cloned();
+        // `review_id` is the identifier `review.show`/`review.page` need to
+        // continue a review: an idempotent replay of `review.start` after
+        // compaction or restart must still return it, so it is preserved on
+        // the receipt (P0-B). `workspace_id` is the review's workspace
+        // binding and is equally small and additive.
+        let review_id = value.get("review_id").cloned();
+        let workspace_id = value.get("workspace_id").cloned();
+        // Continuation identifiers (review): compact receipts must keep the
+        // small identifiers a client needs to continue an operation whose
+        // response was lost after compaction/restart. `session.open` returns
+        // the generated session `id` and its controller lease at the top
+        // level; `session.attach`/`session.claim` return the session snapshot
+        // nested under `session` (whose `id`/`controller`/`controller_epoch`
+        // are what a retry needs to attach). These are all small bounded
+        // fields; large bodies (stdout/file content) are still dropped.
+        //
+        // P0-B review: the receipt preserves the *original field names* so
+        // the first and the replayed public responses are schema-stable — a
+        // top-level `id` stays `id` (never renamed to `session_id`, which
+        // would also mislabel non-session ids such as `workspace.add`'s
+        // `ws_...`), and an explicit top-level `session_id` stays
+        // `session_id`. `session.open` writes both (the handler adds
+        // `session_id` as an additive alias of `id`), so a replayed open
+        // returns the same shape as the first response.
+        let session_id = value
+            .get("id")
+            .filter(|v| v.is_string())
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .map(|s| json!(s));
+        let session_id_alias = value
+            .get("session_id")
+            .filter(|v| v.is_string())
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .map(|s| json!(s));
+        let controller_epoch = value
+            .get("controller_epoch")
+            .cloned()
+            .filter(|v| v.is_u64() || v.is_i64());
+        // The controller lease is a small object (principal, lease id, epoch,
+        // expiry); preserving it lets a retried `session.open`/`attach`
+        // continue with the same seat instead of failing to attach.
+        let controller = value.get("controller").filter(|v| v.is_object()).cloned();
+        // P0-B review: `session.renew`/`give`/`claim` return their controller
+        // lease at the top level as `lease`. The lease is a small bounded
+        // object (principal id, opaque lease id, epoch, expiry) — preserving
+        // it keeps a replayed remote mutation receipt schema-stable with the
+        // first response (a client that retries renew must see the actual
+        // extended expiry, never a bare `{session_id, workspace_id}`).
+        let lease = value.get("lease").filter(|v| v.is_object()).cloned();
+        // Nested `session` snapshot (session.attach/claim): bounded and small;
+        // the whole snapshot is preserved so the retry can continue the
+        // session. It never carries result bodies.
+        let session = value.get("session").filter(|v| v.is_object()).cloned();
+        // P0-B review: remote session mutation receipts (close/detach/
+        // terminate/give/claim) carry small terminal flags (`closed`,
+        // `detached`, `terminated`, `reconciled`, `live_pty`). Preserving
+        // them keeps a replayed mutation schema-stable with the first
+        // response — a replayed `session.close` must still say `closed`.
+        let terminal_flags: Vec<(&str, Value)> =
+            ["closed", "detached", "terminated", "reconciled", "live_pty"]
+                .into_iter()
+                .filter_map(|flag| {
+                    value
+                        .get(flag)
+                        .filter(|v| v.is_boolean() || v.is_number())
+                        .cloned()
+                        .map(|v| (flag, v))
+                })
+                .collect();
+        let mut compact = json!({
+            "durable_receipt": true,
+            "truncated": true,
+            "status": status,
+            "note": "op-journal entry compacted before durable persistence",
+        });
+        if let Some(object) = compact.as_object_mut() {
+            for (flag, v) in terminal_flags {
+                object.insert(flag.into(), v);
+            }
+            if let Some(oid) = operation_id {
+                object.insert("operation_id".into(), oid);
+            }
+            if let Some(cu) = completed_unix {
+                object.insert(OP_JOURNAL_COMPLETED_UNIX_FIELD.into(), cu);
+            }
+            if let Some(rph) = remote_payload_hash {
+                object.insert("remote_payload_hash".into(), rph);
+            }
+            if let Some(rid) = review_id {
+                object.insert("review_id".into(), rid);
+            }
+            if let Some(ws) = workspace_id {
+                object.insert("workspace_id".into(), ws);
+            }
+            if let Some(ph) = phase {
+                object.insert("phase".into(), ph);
+            }
+            if let Some(sid) = session_id {
+                object.insert("id".into(), sid);
+            }
+            if let Some(sid) = session_id_alias {
+                object.insert("session_id".into(), sid);
+            }
+            if let Some(epoch) = controller_epoch {
+                object.insert("controller_epoch".into(), epoch);
+            }
+            if let Some(ctl) = controller {
+                object.insert("controller".into(), ctl);
+            }
+            if let Some(ls) = lease {
+                object.insert("lease".into(), ls);
+            }
+            if let Some(session) = session {
+                object.insert("session".into(), session);
+            }
+        }
+        out.insert(key.clone(), compact);
+    }
+    out
 }
 
 fn read_bounded_state_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
@@ -8326,10 +9475,70 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
+/// Durable op-journal write with **no** `.bak` backup.
+///
+/// `ownmesh_config::atomic_write` preserves the previous file as `path.bak`
+/// before replacing it. For the op journal that previous file may be a legacy
+/// (pre-1.2.13) journal whose completed entries still carry large stdout/file
+/// bodies — exactly the content compaction exists to remove, and a crash
+/// between the backup and any cleanup could leave that sensitive copy behind
+/// indefinitely (P0-B privacy). The no-backup writer keeps the temp-file +
+/// rename atomicity and never duplicates the previous contents.
+fn write_op_journal<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let raw = serde_json::to_string_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    ownmesh_config::atomic_write_without_backup(path, raw.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+}
+
+/// Best-effort removal of a stale `path.bak` left by an older writer or a
+/// crash between the backup copy and its cleanup. Never fails the caller: the
+/// primary journal is already durably committed; doctor surfaces a lingering
+/// backup so the class is not reported healthy. Also retried on every
+/// successful persist so a transient lock cannot retain the backup forever.
+fn remove_stale_op_journal_backup(path: &Path) {
+    if let Err(e) = remove_stale_op_journal_backup_fallible(path) {
+        eprintln!(
+            "warning: failed to remove stale op journal backup {}: {e}",
+            stale_op_journal_backup_path(path).display()
+        );
+    }
+}
+
+/// Fallible removal of a stale `path.bak`; `NotFound` is success. The load
+/// path uses this to fail startup when a stale backup cannot be removed:
+/// the backup may hold the pre-compaction legacy journal with large
+/// stdout/file bodies, and running with it on disk while claiming the body
+/// copy is removed would be dishonest (P0-B privacy, review). The operator
+/// fixes permissions/locks and restarts.
+fn remove_stale_op_journal_backup_fallible(path: &Path) -> std::io::Result<()> {
+    let bak = stale_op_journal_backup_path(path);
+    match std::fs::remove_file(&bak) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod broker_intent_tests {
     use super::*;
-    use tempfile::tempdir;
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     fn fixture_executable() -> PathBuf {
         #[cfg(target_os = "linux")]
@@ -8370,6 +9579,7 @@ mod broker_intent_tests {
                 max_output_bytes: Some(4_096),
                 elevated: true,
                 executable_pin: Some(pin),
+                invocation_pin: None,
             },
         )
     }
@@ -8623,6 +9833,44 @@ mod broker_intent_tests {
         );
     }
 
+    /// P1-D review: `handle_exec` must reject a structured program that
+    /// cannot be resolved to a launchable file, fail-closed, instead of
+    /// silently falling back to a bare-name spawn whose OS PATH lookup can
+    /// disagree with profile detection/review pinning (detect-ready then
+    /// spawn-bare-name inconsistency). The error names the program and the
+    /// remedy.
+    #[tokio::test]
+    async fn structured_exec_unresolvable_program_fails_closed_before_authorization() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let client = ClientIdentity::new("exec-resolution-test", "test");
+        let missing = temp.path().join("no-such-ownmesh-tool");
+        let err = runtime
+            .dispatch(
+                methods::OPS_EXEC,
+                Some(json!({
+                    "program": missing.display().to_string(),
+                    "args": [],
+                    "kind": "structured",
+                    "workspace_id": "ws_default",
+                })),
+                &client,
+            )
+            .await
+            .expect_err("unresolvable structured program must fail closed");
+        assert!(
+            err.to_string().contains("could not be resolved"),
+            "actionable resolution failure expected: {err}"
+        );
+        // No op-journal receipt was created: nothing was authorized or run.
+        assert!(
+            runtime.op_journal.is_empty(),
+            "no side-effect receipt may exist"
+        );
+    }
+
     #[test]
     fn uncertain_broker_write_is_non_retriable_conflict() {
         let error = DaemonRuntime::broker_client_error(BrokerV2ClientError::ExecutionUncertain(
@@ -8673,5 +9921,3583 @@ mod broker_intent_tests {
         assert_eq!(result["stdout"], "ok");
         assert_eq!(result["truncated"], true);
         assert_eq!(result["replayed"], false);
+    }
+}
+
+#[cfg(test)]
+mod journal_lifecycle_tests {
+    use super::*;
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
+
+    /// A PID the OS confirms does not exist on every supported platform
+    /// (2e9 exceeds the Linux `pid_max` default and the macOS/Windows PID
+    /// space, and never matches a short-lived CI process), so
+    /// `ownmesh_ipc::process_birth_id` proves the child is gone.
+    const DEAD_TEST_PID: u32 = 2_000_000_000;
+
+    /// A transition record whose host TTL has provably passed and whose
+    /// referenced sidecar carries a confirmed-dead child identity, so
+    /// reconcile can clear it once session state is moot.
+    fn expired_record(transition_id: &str, session_id: &str, now: i64) -> TransitionRecord {
+        TransitionRecord {
+            transition_id: transition_id.into(),
+            kind: TransitionKind::Claim,
+            phase: TransitionPhase::Intent,
+            session_id: session_id.into(),
+            device_id: "dev_test".into(),
+            workspace_id: "ws_default".into(),
+            authenticated_principal: "owner".into(),
+            old_binding: SidecarHostBinding {
+                device_id: "dev_test".into(),
+                workspace_id: "ws_default".into(),
+                owner_principal: "owner".into(),
+                host_nonce: "nonce_old".into(),
+                controller_epoch: 1,
+                binding_expires_unix: now - 20,
+                host_expires_unix: now - 10,
+                child_pid: Some(DEAD_TEST_PID),
+                child_process_birth: Some(1),
+            },
+            target: TransitionTarget {
+                principal: "owner".into(),
+                controller_epoch: 2,
+                binding_expires_unix: now - 20,
+                controller_attached: true,
+                lease_id: Some("lease_expired".into()),
+                terminal: false,
+            },
+            new_binding: None,
+            created_unix: now - 3600,
+            expires_unix: now - 10,
+        }
+    }
+
+    /// A non-terminal `Applied` give record whose target seat and successor
+    /// binding are recorded, for the crash-window recovery tests below.
+    fn applied_give_record(transition_id: &str, session_id: &str, now: i64) -> TransitionRecord {
+        TransitionRecord {
+            transition_id: transition_id.into(),
+            kind: TransitionKind::Give,
+            phase: TransitionPhase::Applied,
+            session_id: session_id.into(),
+            device_id: "dev_test".into(),
+            workspace_id: "ws_default".into(),
+            authenticated_principal: "owner_a".into(),
+            old_binding: SidecarHostBinding {
+                device_id: "dev_test".into(),
+                workspace_id: "ws_default".into(),
+                owner_principal: "owner_a".into(),
+                host_nonce: "nonce_old".into(),
+                controller_epoch: 1,
+                binding_expires_unix: now - 20,
+                host_expires_unix: now + 2000,
+                child_pid: None,
+                child_process_birth: None,
+            },
+            target: TransitionTarget {
+                principal: "owner_b".into(),
+                controller_epoch: 2,
+                binding_expires_unix: now + 1500,
+                controller_attached: true,
+                lease_id: Some("lease_b".into()),
+                terminal: false,
+            },
+            new_binding: Some(SidecarHostBinding {
+                device_id: "dev_test".into(),
+                workspace_id: "ws_default".into(),
+                owner_principal: "owner_b".into(),
+                host_nonce: "nonce_new".into(),
+                controller_epoch: 2,
+                binding_expires_unix: now + 1500,
+                host_expires_unix: now + 2000,
+                child_pid: None,
+                child_process_birth: None,
+            }),
+            created_unix: now - 300,
+            expires_unix: now + 2000,
+        }
+    }
+
+    /// Runtime with exactly one session; `closed` decides its terminal state.
+    fn runtime_with_session(closed: bool) -> (tempfile::TempDir, DaemonRuntime, String) {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        let info = runtime
+            .sessions
+            .open(SessionKind::Pty, "journal-test", "owner", now, None)
+            .unwrap();
+        if closed {
+            runtime.sessions.close(&info.id).unwrap();
+        }
+        (dir, runtime, info.id)
+    }
+
+    /// P0-A acceptance: the affected session stays fail-closed while its
+    /// transition record is unresolved — `session.attach` (controller role) and
+    /// the other controller-mutating handlers are fenced, while an unrelated
+    /// session remains fully usable. Clearing the record restores access.
+    #[tokio::test]
+    async fn ambiguous_transition_fences_controller_mutation_of_affected_session() {
+        let (_dir, mut runtime, sid) = runtime_with_session(false);
+        let now = DaemonRuntime::now();
+        // A retained (expired, ambiguous) transition record for the session.
+        let record = expired_record("tr_fence", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+        let local = ClientIdentity::new("owner", "test");
+
+        // session.attach(role=controller) is fenced with an actionable error.
+        let err = runtime
+            .handle_session_attach(
+                Some(json!({ "id": sid.clone(), "role": "controller" })),
+                &local,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "controller attach must be fenced: {err}"
+        );
+
+        // session.attach(role=observer) from the current controller would
+        // release the controller lease — also a controller mutation, fenced.
+        let err = runtime
+            .handle_session_attach(
+                Some(json!({ "id": sid.clone(), "role": "observer" })),
+                &local,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "controller-downgrading observer attach must be fenced: {err}"
+        );
+
+        // session.claim is fenced the same way.
+        let err = runtime
+            .handle_session_claim(Some(json!({ "id": sid.clone() })), &local)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "session.claim must be fenced: {err}"
+        );
+
+        // session.close is fenced: an ambiguous close/detach/give intent must
+        // not be overwritten by a different terminal transition while the
+        // record is unresolved.
+        let err = runtime
+            .handle_session_close(Some(json!({ "id": sid.clone() })), &local)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "session.close must be fenced: {err}"
+        );
+
+        // session.terminate is fenced the same way (single-session path).
+        let err = runtime
+            .handle_session_terminate(Some(json!({ "id": sid.clone() })), &local)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "session.terminate must be fenced: {err}"
+        );
+
+        // session.terminate(all) must not bypass the journal for a session
+        // with an unresolved record.
+        let err = runtime
+            .handle_session_terminate(Some(json!({ "all": true })), &local)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "session.terminate all must be fenced: {err}"
+        );
+
+        // session.write is fenced: input must not be delivered against a
+        // possibly-stale sidecar binding while the transition is unresolved.
+        let err = runtime
+            .handle_session_write(Some(json!({ "id": sid.clone(), "data": "x" })), &local)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "session.write must be fenced: {err}"
+        );
+
+        // session.resize is fenced the same way.
+        let err = runtime
+            .handle_session_resize(
+                Some(json!({ "id": sid.clone(), "cols": 80, "rows": 24 })),
+                &local,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved sidecar transition"),
+            "session.resize must be fenced: {err}"
+        );
+
+        // An unrelated session is not fenced: after releasing its (creator)
+        // controller lease, a controller attach succeeds.
+        let other = runtime
+            .sessions
+            .open(SessionKind::Pty, "fence-unrelated", "owner", now, None)
+            .expect("open unrelated session")
+            .id;
+        runtime
+            .sessions
+            .release_controller(&other, "owner", now)
+            .expect("release creator lease");
+        let ok = runtime
+            .handle_session_attach(
+                Some(json!({ "id": other.clone(), "role": "controller" })),
+                &local,
+            )
+            .expect("unrelated controller attach must succeed");
+        assert_eq!(ok["role"], "controller");
+
+        // Clearing the ambiguous record restores controller access.
+        runtime
+            .transition_journal
+            .clear("tr_fence")
+            .expect("clear record");
+        runtime
+            .sessions
+            .release_controller(&sid, "owner", now)
+            .expect("release creator lease");
+        let ok = runtime
+            .handle_session_attach(
+                Some(json!({ "id": sid.clone(), "role": "controller" })),
+                &local,
+            )
+            .expect("controller attach must succeed after the record is resolved");
+        assert_eq!(ok["role"], "controller");
+
+        // After the record is resolved, write/resize are no longer fenced:
+        // the error becomes the genuine no-live-host conflict, never the
+        // fence (proves the fence is the only thing blocking delivery).
+        let err = runtime
+            .handle_session_write(Some(json!({ "id": sid.clone(), "data": "x" })), &local)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("unresolved sidecar transition"),
+            "write must not be fenced after the record is resolved: {err}"
+        );
+        let err = runtime
+            .handle_session_resize(
+                Some(json!({ "id": sid.clone(), "cols": 80, "rows": 24 })),
+                &local,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("unresolved sidecar transition"),
+            "resize must not be fenced after the record is resolved: {err}"
+        );
+    }
+
+    /// P0-A crash-window regression: a crash after the supervisor mutation and
+    /// the `Applied` journal write but before the `SessionManager` commit
+    /// leaves the durable controller unchanged while the sidecar already
+    /// belongs to the successor. Recovery must apply the FULL recorded
+    /// controller mutation (principal, lease id, epoch, expiry) — not only
+    /// the sidecar binding — so the former controller cannot keep writing
+    /// through the successor's host after the record is cleared.
+    #[tokio::test]
+    async fn recovered_applied_give_restores_full_controller_seat_not_only_binding() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        let info = runtime
+            .sessions
+            .open_with(
+                SessionKind::Pty,
+                "crash-window",
+                "owner_a",
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("ws_default".into()),
+            )
+            .unwrap();
+        let sid = info.id.clone();
+        // Durable state as of the crash: controller owner_a (epoch 1) and the
+        // pre-transition sidecar binding. The journal holds an Applied give
+        // to owner_b whose commit never completed.
+        let record = applied_give_record("tr_crash_give", &sid, now);
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&sid, Some(record.old_binding.clone()))
+            .unwrap();
+        runtime
+            .transition_journal
+            .begin(record.clone())
+            .expect("begin record");
+
+        runtime
+            .recover_transition_record(record)
+            .await
+            .expect("recovery must reconcile the full controller mutation");
+
+        let recovered = runtime.sessions.get(&sid).unwrap();
+        assert_eq!(
+            recovered
+                .controller
+                .as_ref()
+                .map(|c| c.principal_id.as_str()),
+            Some("owner_b"),
+            "recovery must install the recorded successor principal"
+        );
+        assert_eq!(
+            recovered.controller.as_ref().map(|c| c.lease_id.as_str()),
+            Some("lease_b"),
+            "recovery must restore the exact recorded lease id"
+        );
+        assert_eq!(
+            recovered.controller.as_ref().map(|c| c.epoch),
+            Some(2),
+            "recovery must restore the recorded controller epoch"
+        );
+        assert_eq!(
+            recovered.controller.as_ref().map(|c| c.expires_unix),
+            Some(now + 1500),
+            "recovery must restore the recorded lease expiry"
+        );
+        assert_eq!(recovered.controller_epoch, 2);
+        let binding = recovered.sidecar_host.as_ref().expect("successor binding");
+        assert_eq!(binding.owner_principal, "owner_b");
+        assert_eq!(binding.host_nonce, "nonce_new");
+        assert_eq!(binding.controller_epoch, 2);
+
+        // The former controller is no longer authorized — its write cannot
+        // reach the successor's sidecar. The successor's seat authorizes.
+        assert!(
+            runtime
+                .sessions
+                .authorize_stdin(&sid, "owner_a", now)
+                .is_err(),
+            "the stale former controller must not remain authorized"
+        );
+        runtime
+            .sessions
+            .authorize_stdin(&sid, "owner_b", now)
+            .expect("the recorded successor must be authorized");
+        runtime
+            .sessions
+            .authorize_controller_lease(&sid, "owner_b", "lease_b", 2, now)
+            .expect("remote write authorization must keep working with the restored lease");
+        assert!(
+            runtime
+                .sessions
+                .authorize_controller_lease(&sid, "owner_b", "lease_b", 2, now)
+                .is_ok(),
+            "lease authorization must not be poisoned by recovery"
+        );
+
+        // The full public write path refuses the stale controller too.
+        let err = runtime
+            .handle_session_write(
+                Some(json!({ "id": sid.clone(), "data": "x" })),
+                &ClientIdentity::new("owner_a", "test"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("unresolved sidecar transition")
+                && (err.to_string().contains("not controller")
+                    || err.to_string().contains("observer cannot write")),
+            "stale former controller write must fail authorization, not the fence: {err}"
+        );
+
+        // The record is cleared: the ambiguity is resolved, not retained.
+        assert!(
+            runtime.transition_journal.pending().is_empty(),
+            "a fully reconciled Applied record must be cleared"
+        );
+    }
+
+    /// P0-A defense in depth: recovery must never regress a durable
+    /// controller generation that is already newer than the journal record
+    /// target. A superseded record is cleared without touching the session;
+    /// a superseded record whose durable binding is still the stale
+    /// pre-transition generation is retained fail-closed.
+    #[tokio::test]
+    async fn recovered_record_never_regresses_a_newer_durable_generation() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        let info = runtime
+            .sessions
+            .open_with(
+                SessionKind::Pty,
+                "crash-window-ahead",
+                "owner_a",
+                now,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("ws_default".into()),
+            )
+            .unwrap();
+        let sid = info.id.clone();
+        // Durable generation advances past the journal record (owner_c,
+        // epoch 3) while the journal still holds an older Applied give
+        // (target epoch 2). The durable binding is already the newer
+        // generation — the record is redundant and must be cleared without
+        // mutating the session.
+        runtime
+            .sessions
+            .give_controller(&sid, "owner_a", "owner_b", now)
+            .unwrap();
+        runtime
+            .sessions
+            .give_controller(&sid, "owner_b", "owner_c", now)
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(
+                &sid,
+                Some(SidecarHostBinding {
+                    device_id: "dev_test".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "owner_c".into(),
+                    host_nonce: "nonce_newest".into(),
+                    controller_epoch: 3,
+                    binding_expires_unix: now + 3600,
+                    host_expires_unix: now + 3600,
+                    child_pid: None,
+                    child_process_birth: None,
+                }),
+            )
+            .unwrap();
+        let record = applied_give_record("tr_superseded", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record.clone())
+            .expect("begin record");
+        runtime
+            .recover_transition_record(record)
+            .await
+            .expect("a superseded record must be reconciled without mutating the session");
+        let recovered = runtime.sessions.get(&sid).unwrap();
+        assert_eq!(
+            recovered.controller_epoch, 3,
+            "recovery must not regress the generation"
+        );
+        assert_eq!(
+            recovered
+                .controller
+                .as_ref()
+                .map(|c| c.principal_id.as_str()),
+            Some("owner_c")
+        );
+        assert_eq!(
+            recovered
+                .sidecar_host
+                .as_ref()
+                .map(|b| b.host_nonce.as_str()),
+            Some("nonce_newest")
+        );
+        assert!(runtime.transition_journal.pending().is_empty());
+
+        // The same durable-ahead state with a STALE pre-transition binding
+        // must be retained fail-closed, never cleared into a mismatch.
+        let stale_record = applied_give_record("tr_stale_binding", &sid, now);
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&sid, Some(stale_record.old_binding.clone()))
+            .unwrap();
+        runtime
+            .transition_journal
+            .begin(stale_record.clone())
+            .expect("begin stale record");
+        let err = runtime
+            .recover_transition_record(stale_record)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("retained fail-closed"),
+            "stale-binding superseded record must be retained fail-closed: {err}"
+        );
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "the stale-binding record must still be pending"
+        );
+    }
+
+    /// P0-A regression: the old code hard-failed `recover_sidecar_transitions`
+    /// on ANY expired record, poisoning every future session. An expired
+    /// record whose session is provably `Closed` must be reconciled (cleared)
+    /// and recovery must succeed.
+    #[tokio::test]
+    async fn expired_transition_record_for_closed_session_is_reconciled_not_poisoning() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_poison_closed", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+        assert_eq!(runtime.transition_journal.pending().len(), 1);
+
+        runtime
+            .recover_sidecar_transitions()
+            .await
+            .expect("recovery must not abort on an expired record");
+
+        assert!(
+            runtime.transition_journal.pending().is_empty(),
+            "the expired record for a closed session must be cleared"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired_total, 0,
+            "nothing was retained fail-closed"
+        );
+        // A brand-new unrelated session still opens without any journal error.
+        runtime
+            .sessions
+            .open(SessionKind::Pty, "after-recovery", "owner", now, None)
+            .expect("unrelated session open must succeed");
+    }
+
+    /// P0-A: a session that no longer exists at all is equally provably moot
+    /// once the host TTL has passed — the record is cleared, not fatal.
+    #[tokio::test]
+    async fn expired_transition_record_for_missing_session_is_cleared() {
+        let (_dir, mut runtime, _sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_poison_missing", "ses_gone", now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+        runtime
+            .recover_sidecar_transitions()
+            .await
+            .expect("recovery must not abort");
+        assert!(runtime.transition_journal.pending().is_empty());
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 0);
+    }
+
+    /// P0-A/P1-F: a failed durable `clear` (persist fault) must not make the
+    /// daemon report the stale row as gone. The in-memory journal is rolled
+    /// back, so `refresh_transition_recovery_health` still surfaces the
+    /// retained-expired record instead of reporting no pending transition
+    /// until restart while the durable stale row remains.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_transition_clear_keeps_health_consistent_with_durable_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_clear_fault", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+        // Make the journal directory read-only so the durable removal fails.
+        let journal_dir = runtime.transition_journal_dir();
+        std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        runtime.reconcile_expired_transitions().await;
+        std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The failed clear rolled back: the in-memory journal still has the
+        // record and health still reports it as retained-expired — the daemon
+        // must not claim the durable stale row is gone.
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "in-memory journal must keep the record after a failed durable clear"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired_total, 1,
+            "health must still surface the retained-expired record"
+        );
+        // The durable file still contains the record.
+        let reopened = SessionTransitionJournal::open(&journal_dir).unwrap();
+        assert_eq!(
+            reopened.pending().len(),
+            1,
+            "durable row must survive the failed clear"
+        );
+        // A later successful reconcile (durable write possible again) clears
+        // it and health follows.
+        runtime.reconcile_expired_transitions().await;
+        assert!(runtime.transition_journal.pending().is_empty());
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 0);
+    }
+
+    /// P0-A: an expired record whose session is still present and non-terminal
+    /// is retained fail-closed (never converted into success), surfaced in
+    /// health, and must NOT block unrelated future sessions.
+    #[tokio::test]
+    async fn expired_uncertain_record_is_retained_and_surfaced_not_global_abort() {
+        let (_dir, mut runtime, sid) = runtime_with_session(false);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_poison_uncertain", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        runtime
+            .recover_sidecar_transitions()
+            .await
+            .expect("recovery continues past a retained record");
+
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "fail-closed retention"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired_total, 1,
+            "health must surface the retained record"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired[0],
+            "tr_poison_uncertain"
+        );
+        // An unrelated session still opens — no global poison pill.
+        runtime
+            .sessions
+            .open(SessionKind::Pty, "after-retained", "owner", now, None)
+            .expect("unrelated session open must succeed");
+    }
+
+    /// P0-A acceptance 3: one bad record must not prevent independent safe
+    /// cleanup. A live record that cannot be replayed (no supervisor) aborts
+    /// fail-closed, but the expired record was already reconciled first.
+    #[tokio::test]
+    async fn expired_cleanup_happens_before_live_replay_abort() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let expired = expired_record("tr_expired_first", &sid, now);
+        let mut live = expired_record("tr_live_second", "ses_unrelated", now);
+        live.expires_unix = now + 3600;
+        live.created_unix = now - 1;
+        live.target.binding_expires_unix = now + 60;
+        live.old_binding.binding_expires_unix = now + 60;
+        live.old_binding.host_expires_unix = now + 600;
+        runtime
+            .transition_journal
+            .begin(expired)
+            .expect("begin expired");
+        runtime.transition_journal.begin(live).expect("begin live");
+
+        // A live record that cannot be replayed aborts fail-closed (its host
+        // may still be live, so ambiguity must never become success).
+        runtime
+            .recover_sidecar_transitions()
+            .await
+            .expect_err("live replay must fail closed without authoritative state");
+        // …but the expired record was already safely cleared first.
+        let pending = runtime.transition_journal.pending();
+        assert_eq!(pending.len(), 1, "only the live record remains");
+        assert_eq!(pending[0].transition_id, "tr_live_second");
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 0);
+    }
+
+    /// P0-A acceptance 1/5: the shared expired-only reconcile pass used by
+    /// diagnosis and daemon startup clears provably-moot records and retains
+    /// ambiguous ones fail-closed, exactly like the supervisor path — so
+    /// `system.diagnose` reflects post-recovery state instead of hiding an
+    /// expired poison-pill record behind `overall=healthy`.
+    #[tokio::test]
+    async fn reconcile_expired_transitions_is_used_by_diagnosis_and_is_safe() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_reconcile_closed", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+        // A live record is untouched by the expired-only pass (it belongs to
+        // the supervisor replay path and must not fail a diagnosis).
+        let mut live = expired_record("tr_reconcile_live", "ses_other", now);
+        live.expires_unix = now + 3600;
+        live.created_unix = now - 1;
+        live.target.binding_expires_unix = now + 60;
+        live.old_binding.binding_expires_unix = now + 60;
+        live.old_binding.host_expires_unix = now + 600;
+        runtime
+            .transition_journal
+            .begin(live)
+            .expect("begin live record");
+
+        runtime.reconcile_expired_transitions().await;
+
+        let pending = runtime.transition_journal.pending();
+        assert_eq!(pending.len(), 1, "only the live record remains");
+        assert_eq!(pending[0].transition_id, "tr_reconcile_live");
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 0);
+    }
+
+    /// P0-A acceptance 2: the expired-only pass never converts ambiguity into
+    /// success — an expired record whose session is still non-terminal stays
+    /// retained and is surfaced in the bounded health state.
+    #[tokio::test]
+    async fn reconcile_expired_transitions_retains_ambiguous_records_fail_closed() {
+        let (_dir, mut runtime, sid) = runtime_with_session(false);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_reconcile_ambiguous", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert_eq!(runtime.transition_journal.pending().len(), 1);
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 1);
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired[0],
+            "tr_reconcile_ambiguous"
+        );
+    }
+
+    /// P0-A review (orphan protection): an expired record whose referenced
+    /// sidecar is *still live* — attested child process with a matching birth
+    /// — is retained even when the session is `Closed`, and surfaced in
+    /// health. Expiry plus session state alone must never clear a journal
+    /// record while the sidecar it references could still be running.
+    #[tokio::test]
+    async fn expired_record_with_live_attested_child_is_retained_not_cleared() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let mut record = expired_record("tr_live_child", &sid, now);
+        let pid = std::process::id();
+        let birth = ownmesh_ipc::process_birth_id(pid)
+            .expect("this test process is live and inspectable")
+            .expect("this test process must have a birth witness");
+        record.old_binding.child_pid = Some(pid);
+        record.old_binding.child_process_birth = Some(birth);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "a live attested sidecar must keep the record retained"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired_total, 1,
+            "health must surface the retained record"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired[0],
+            "tr_live_child"
+        );
+    }
+
+    /// P0-A review: an expired record whose binding carries no attested child
+    /// identity and whose supervisor is not connected cannot be proven moot —
+    /// the sidecar might still be running under an orphaned supervisor
+    /// instance. The record stays retained fail-closed (never cleared) and is
+    /// surfaced in health; a later reconcile after the supervisor connects can
+    /// clear it via the supervisor liveness probe.
+    #[tokio::test]
+    async fn expired_record_without_attestation_and_supervisor_is_retained_fail_closed() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let mut record = expired_record("tr_no_proof", &sid, now);
+        record.old_binding.child_pid = None;
+        record.old_binding.child_process_birth = None;
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "indeterminate proof must never clear the record"
+        );
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 1);
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired[0],
+            "tr_no_proof"
+        );
+    }
+
+    /// P0-A review: when an expired record's binding carries no attested child
+    /// identity, the connected supervisor's liveness probe is the authoritative
+    /// proof. A session the supervisor does not track (never spawned, or
+    /// removed only after successful termination) is provably moot and is
+    /// cleared once session state is terminal.
+    #[tokio::test]
+    async fn expired_record_without_pid_is_cleared_when_supervisor_has_no_live_host() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let sidecar_root = paths.state_dir.join("session-supervisor");
+        let (supervisor_server, _) =
+            ownmesh_session_host::SupervisorIpcServer::new(&sidecar_root, &paths.runtime_dir)
+                .unwrap();
+        let endpoint = supervisor_server.endpoint().clone();
+        let server = Arc::clone(supervisor_server.server());
+        let server_task = tokio::spawn(async move { server.serve().await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let management =
+            read_management_credential(supervisor_server.credential_state_dir()).unwrap();
+        let supervisor =
+            SupervisorClient::bootstrap(endpoint, paths.runtime_dir.clone(), management)
+                .await
+                .unwrap();
+        runtime.supervisor = Some(supervisor);
+
+        let sid = {
+            let info = runtime
+                .sessions
+                .open(
+                    SessionKind::Pty,
+                    "probe-clear",
+                    "owner",
+                    DaemonRuntime::now(),
+                    None,
+                )
+                .unwrap();
+            runtime.sessions.close(&info.id).unwrap();
+            info.id
+        };
+        let now = DaemonRuntime::now();
+        let mut record = expired_record("tr_probe_clear", &sid, now);
+        record.old_binding.child_pid = None;
+        record.old_binding.child_process_birth = None;
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert!(
+            runtime.transition_journal.pending().is_empty(),
+            "the supervisor probe proves no live sidecar; the moot record clears"
+        );
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 0);
+        supervisor_server.server().request_shutdown();
+        server_task.await.unwrap();
+    }
+
+    /// P0-A: reconcile must never clear an expired record without
+    /// authoritative proof that every host it references is dead. A
+    /// crash-interleaved record whose expiry precedes its host TTL is
+    /// retained fail-closed even when the session is `Closed`, and surfaced
+    /// in health — never converted into a moot cleanup.
+    #[tokio::test]
+    async fn expired_record_with_inconsistent_host_bound_is_retained_fail_closed() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let mut record = expired_record("tr_bad_bound", &sid, now);
+        // Inconsistent: the record expired before its host TTL, so the host
+        // may still be alive. A real `begin` rejects this; the defensive
+        // reconcile check must too.
+        record.old_binding.host_expires_unix = now + 3600;
+        runtime
+            .transition_journal
+            .insert_unvalidated_for_test(record.clone());
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "inconsistent record must be retained fail-closed"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired_total, 1,
+            "health must surface the retained record"
+        );
+        // Unrelated sessions still open — no global poison pill.
+        runtime
+            .sessions
+            .open(SessionKind::Pty, "after-bad-bound", "owner", now, None)
+            .expect("unrelated session open must succeed");
+    }
+
+    /// P0-A: a `Closed` session whose `sidecar_host` (left intact by
+    /// `SessionManager::close`) still references a live host from the record
+    /// must not be cleared — the record is retained fail-closed and surfaced
+    /// in health.
+    #[tokio::test]
+    async fn closed_session_with_live_referenced_host_is_retained_fail_closed() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_live_host", &sid, now);
+        // The session still carries a sidecar binding with the record's host
+        // nonce, and that host is still within its TTL.
+        let live = SidecarHostBinding {
+            device_id: "dev_test".into(),
+            workspace_id: "ws_default".into(),
+            owner_principal: "owner".into(),
+            host_nonce: "nonce_old".into(),
+            controller_epoch: 1,
+            binding_expires_unix: now - 20,
+            host_expires_unix: now + 3600,
+            child_pid: None,
+            child_process_birth: None,
+        };
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&sid, Some(live))
+            .expect("set binding");
+        runtime
+            .transition_journal
+            .insert_unvalidated_for_test(record.clone());
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "record referencing a still-live host must be retained"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired_total, 1,
+            "health must surface the retained record"
+        );
+    }
+
+    /// P1-F: retained transition health is refreshed from the journal, not
+    /// append-only. A record retained on an earlier pass (session still
+    /// non-terminal) that is later provably moot (session closed) is cleared
+    /// by the next pass and must stop being reported as unresolved.
+    #[tokio::test]
+    async fn retained_transition_health_is_cleared_when_record_resolves() {
+        let (_dir, mut runtime, sid) = runtime_with_session(false);
+        let now = DaemonRuntime::now();
+        let record = expired_record("tr_resolves_later", &sid, now);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        // Pass 1: session still non-terminal → retained fail-closed.
+        runtime.reconcile_expired_transitions().await;
+        assert_eq!(runtime.transition_journal.pending().len(), 1);
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 1);
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired[0],
+            "tr_resolves_later"
+        );
+
+        // The session becomes terminal; pass 2 must clear the record and the
+        // health state must stop reporting it.
+        runtime.sessions.close(&sid).expect("close session");
+        runtime.reconcile_expired_transitions().await;
+        assert!(
+            runtime.transition_journal.pending().is_empty(),
+            "provably-moot record must be cleared"
+        );
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired_total, 0,
+            "resolved record must not stay in health"
+        );
+        assert!(runtime
+            .transition_recovery_health
+            .retained_expired
+            .is_empty());
+    }
+
+    /// P0-B: a completed result larger than the durable value budget persists
+    /// as a compact exact-once receipt, and the in-memory map is compacted to
+    /// the same receipt after durable persistence so large result bodies are
+    /// never retained indefinitely in memory either. Replay returns the
+    /// receipt (never a re-execution); the caller holds the full result only
+    /// for the immediate response.
+    #[test]
+    fn large_completed_result_persists_compacted_and_replays_receipt_in_session() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let key = Some("prin\u{1f}op_large".to_string());
+        runtime
+            .begin_idempotent(key.as_ref(), "op_large_1")
+            .expect("begin marker");
+        let big_stdout = "x".repeat(MAX_OP_JOURNAL_VALUE_BYTES + 4096);
+        let body = json!({
+            "approval_required": false,
+            "operation_id": "op_large_1",
+            "result": { "stdout": big_stdout },
+            "replayed": false,
+            "decision": "allow",
+        });
+        runtime
+            .store_idempotent(key.as_ref(), &body)
+            .expect("store completed");
+
+        // In-session replay returns the compact receipt, not the huge body:
+        // bounded memory, exact-once preserved (never a re-execution).
+        let replayed = runtime
+            .lookup_idempotent(key.as_ref())
+            .expect("lookup")
+            .expect("entry present");
+        assert_eq!(replayed["durable_receipt"], true);
+        assert_eq!(replayed["truncated"], true);
+        assert!(
+            replayed.get("result").is_none(),
+            "in-memory replay must be the compact receipt"
+        );
+
+        // The durable file carries only the compact receipt.
+        let raw = std::fs::read_to_string(paths.state_dir.join("op-journal.json")).unwrap();
+        let durable: HashMap<String, Value> = serde_json::from_str(&raw).unwrap();
+        let durable_entry = durable.get(key.as_deref().unwrap()).expect("durable key");
+        assert_eq!(durable_entry["durable_receipt"], true);
+        assert_eq!(durable_entry["truncated"], true);
+        assert!(
+            durable_entry.get("stdout").is_none(),
+            "no body in durable state"
+        );
+        assert_eq!(durable_entry["operation_id"], "op_large_1");
+        assert!(durable_entry
+            .get(OP_JOURNAL_COMPLETED_UNIX_FIELD)
+            .and_then(Value::as_i64)
+            .is_some_and(|stamp| stamp > 0));
+        assert!(
+            raw.len() < MAX_OP_JOURNAL_VALUE_BYTES * 2,
+            "durable file must stay small"
+        );
+    }
+
+    /// P0-B: unknown/forward-version op-journal states are fail-closed —
+    /// never compacted, never evicted, never replayed as a completed receipt.
+    #[test]
+    fn unknown_op_journal_state_is_fail_closed() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let key = "prin\u{1f}op_future";
+        let now = DaemonRuntime::now();
+        // A forward-version marker a newer release might write.
+        let future = json!({
+            OP_JOURNAL_STATE_FIELD: "phase_two",
+            "operation_id": "op_future_1",
+            "result": { "stdout": "body-must-survive" },
+            OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+        });
+        runtime.op_journal.insert(key.into(), future.clone());
+
+        // Replay is refused, exactly like an in-progress marker.
+        let err = runtime
+            .lookup_idempotent(Some(&key.to_string()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("uncertain"),
+            "unknown state must refuse replay: {err}"
+        );
+
+        // Eviction must never touch it, even though it looks ancient.
+        let evicted = runtime
+            .evict_expired_completed_op_journal_entries()
+            .expect("eviction");
+        assert_eq!(evicted, 0, "unknown state must never be evicted");
+        let kept = runtime.op_journal.get(key).expect("still present");
+        assert_eq!(
+            kept.get("result")
+                .and_then(|v| v.get("stdout"))
+                .and_then(Value::as_str),
+            Some("body-must-survive"),
+            "unknown state body must never be compacted away"
+        );
+
+        // The durable view keeps it verbatim too.
+        let durable = op_journal_durable_view(&runtime.op_journal);
+        let durable_entry = durable.get(key).expect("durable present");
+        assert_eq!(
+            durable_entry
+                .get("result")
+                .and_then(|v| v.get("stdout"))
+                .and_then(Value::as_str),
+            Some("body-must-survive")
+        );
+
+        // And it survives a reload from disk verbatim (bound_op_journal).
+        runtime.persist_op_journal().expect("persist");
+        let loaded = load_op_journal(&paths.state_dir.join("op-journal.json")).unwrap();
+        let reloaded = loaded.get(key).expect("loaded");
+        assert_eq!(
+            reloaded
+                .get("result")
+                .and_then(|v| v.get("stdout"))
+                .and_then(Value::as_str),
+            Some("body-must-survive"),
+            "reload must keep unknown-state bodies fail-closed"
+        );
+    }
+
+    /// P0-B: a present-but-malformed state field (`null`, number, boolean) is
+    /// *not* a completed receipt this version wrote — it must be classified
+    /// uncertain (fail-closed), never compacted, never evicted, and never
+    /// replayed as completed. The old classifier treated any non-string
+    /// present value as `Completed`, which could hide an unfinished side
+    /// effect behind a compacted receipt.
+    #[test]
+    fn malformed_op_journal_state_is_fail_closed() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        let cases = [
+            ("prin\u{1f}op_null_state".to_string(), json!(null)),
+            ("prin\u{1f}op_number_state".to_string(), json!(7)),
+            ("prin\u{1f}op_bool_state".to_string(), json!(true)),
+        ];
+        for (key, state) in &cases {
+            let entry = json!({
+                OP_JOURNAL_STATE_FIELD: state,
+                "operation_id": format!("op_{key}"),
+                "result": { "stdout": "body-must-survive" },
+                OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+            });
+            assert_eq!(
+                op_journal_entry_state(&entry),
+                OpJournalEntryState::Uncertain,
+                "present non-string state must be uncertain: {key}"
+            );
+            runtime.op_journal.insert(key.clone(), entry);
+        }
+
+        // Replay is refused for every malformed state, exactly like an
+        // in-progress marker.
+        for (key, _) in &cases {
+            let err = runtime.lookup_idempotent(Some(key)).unwrap_err();
+            assert!(
+                err.to_string().contains("uncertain"),
+                "malformed state must refuse replay: {key}: {err}"
+            );
+        }
+
+        // Eviction must never touch them, even though they look ancient.
+        let evicted = runtime
+            .evict_expired_completed_op_journal_entries()
+            .expect("eviction");
+        assert_eq!(evicted, 0, "malformed state must never be evicted");
+
+        // The durable view keeps them verbatim (never compacted away).
+        let durable = op_journal_durable_view(&runtime.op_journal);
+        for (key, _) in &cases {
+            let durable_entry = durable.get(key).expect("durable present");
+            assert_eq!(
+                durable_entry
+                    .get("result")
+                    .and_then(|v| v.get("stdout"))
+                    .and_then(Value::as_str),
+                Some("body-must-survive"),
+                "malformed state body must never be compacted away: {key}"
+            );
+        }
+
+        // And they survive a reload from disk verbatim.
+        runtime.persist_op_journal().expect("persist");
+        let loaded = load_op_journal(&paths.state_dir.join("op-journal.json")).unwrap();
+        for (key, _) in &cases {
+            let reloaded = loaded.get(key).expect("loaded");
+            assert_eq!(
+                reloaded
+                    .get("result")
+                    .and_then(|v| v.get("stdout"))
+                    .and_then(Value::as_str),
+                Some("body-must-survive"),
+                "reload must keep malformed-state bodies fail-closed: {key}"
+            );
+        }
+    }
+
+    /// P0-B: after a restart, replay returns the compact durable receipt —
+    /// exact-once is preserved honestly (no re-execution, documented receipt).
+    #[test]
+    fn replay_after_restart_returns_compact_receipt() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let key = Some("prin\u{1f}op_restart".to_string());
+        {
+            let mut runtime = DaemonRuntime::open(&paths).unwrap();
+            runtime
+                .begin_idempotent(key.as_ref(), "op_restart_1")
+                .unwrap();
+            let body = json!({
+                "approval_required": false,
+                "operation_id": "op_restart_1",
+                "result": { "stdout": "kept in memory only" },
+                "replayed": false,
+                "decision": "allow",
+            });
+            runtime.store_idempotent(key.as_ref(), &body).unwrap();
+        }
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let replayed = runtime
+            .lookup_idempotent(key.as_ref())
+            .expect("lookup")
+            .expect("entry present");
+        assert_eq!(replayed["durable_receipt"], true);
+        assert_eq!(replayed["truncated"], true);
+        assert_eq!(replayed["operation_id"], "op_restart_1");
+        assert!(
+            replayed.get("result").is_none(),
+            "restart replay must be the compact receipt"
+        );
+    }
+
+    /// P0-B / control-plane retention-window synchronization: a completed
+    /// receipt older than the documented idempotency window
+    /// (`OP_JOURNAL_COMPLETED_TTL_SECS` = the control plane's 30-day
+    /// tombstone TTL) must not be replayed — the CP hard-deletes its
+    /// tombstone and dispatches the retry as a *new* operation, so returning
+    /// the stale receipt would silently replace the caller's fresh
+    /// operation. In-progress/uncertain markers never age out, and a young
+    /// completed receipt still replays.
+    #[test]
+    fn completed_receipt_expires_at_the_documented_window_but_uncertain_never_does() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+
+        // Ancient completed receipt: lookup must not replay it and must drop it.
+        let ancient_key = "prin\u{1f}op_ancient_lookup".to_string();
+        runtime.op_journal.insert(
+            ancient_key.clone(),
+            json!({
+                "durable_receipt": true,
+                "truncated": true,
+                "status": "completed",
+                "operation_id": "op_ancient_lookup",
+                OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+            }),
+        );
+        assert!(
+            runtime
+                .lookup_idempotent(Some(&ancient_key))
+                .expect("lookup")
+                .is_none(),
+            "a completed receipt past the retention window must not be replayed"
+        );
+        assert!(
+            !runtime.op_journal.contains_key(&ancient_key),
+            "the expired receipt must be removed from the journal"
+        );
+        let durable: HashMap<String, Value> = serde_json::from_str(
+            &std::fs::read_to_string(paths.state_dir.join("op-journal.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !durable.contains_key(&ancient_key),
+            "the expired receipt must not remain durable"
+        );
+
+        // Ancient in-progress marker: NEVER expires (fail-closed — an
+        // uncertain outcome must not become retriable).
+        let in_progress_key = "prin\u{1f}op_stale_inflight".to_string();
+        runtime.op_journal.insert(
+            in_progress_key.clone(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                "operation_id": "op_stale_inflight",
+                OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 10,
+            }),
+        );
+        let err = runtime
+            .lookup_idempotent(Some(&in_progress_key))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("in-progress"),
+            "ancient in-progress marker must stay refused, not expired: {err}"
+        );
+        assert!(
+            runtime.op_journal.contains_key(&in_progress_key),
+            "ancient in-progress marker must not be removed"
+        );
+
+        // Unknown/forward-version state: never expired.
+        let unknown_key = "prin\u{1f}op_stale_unknown".to_string();
+        runtime.op_journal.insert(
+            unknown_key.clone(),
+            json!({
+                "operation_id": "op_stale_unknown",
+                "result": { "stdout": "body-must-survive" },
+                OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 10,
+            }),
+        );
+        let err = runtime.lookup_idempotent(Some(&unknown_key)).unwrap_err();
+        assert!(err.to_string().contains("uncertain"), "{err}");
+        assert!(runtime.op_journal.contains_key(&unknown_key));
+
+        // Young completed receipt: still replayed (within the window).
+        let young_key = "prin\u{1f}op_young".to_string();
+        runtime.op_journal.insert(
+            young_key.clone(),
+            json!({
+                "durable_receipt": true,
+                "truncated": true,
+                "status": "completed",
+                "operation_id": "op_young",
+                OP_JOURNAL_COMPLETED_UNIX_FIELD: now - 60,
+            }),
+        );
+        let replayed = runtime
+            .lookup_idempotent(Some(&young_key))
+            .expect("lookup")
+            .expect("young receipt present");
+        assert_eq!(replayed["operation_id"], "op_young");
+
+        // Full restart path: after a reload, the expired receipt is not
+        // returned either (the loaded journal is compacted, so the ancient
+        // receipt would only survive if the window check were skipped).
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        runtime.op_journal.insert(
+            "prin\u{1f}op_ancient_2".into(),
+            json!({
+                "durable_receipt": true,
+                "truncated": true,
+                "status": "completed",
+                "operation_id": "op_ancient_2",
+                OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 5,
+            }),
+        );
+        assert!(
+            runtime
+                .lookup_idempotent(Some(&"prin\u{1f}op_ancient_2".to_string()))
+                .expect("lookup")
+                .is_none(),
+            "expired receipt must never replay after restart either"
+        );
+    }
+
+    /// P0-B: in-progress/uncertain markers are never compacted, never evicted,
+    /// and replay of an in-progress key stays refused (exact-once preserved).
+    #[test]
+    fn in_progress_markers_survive_compaction_and_eviction() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let key = Some("prin\u{1f}op_inflight".to_string());
+        runtime
+            .begin_idempotent(key.as_ref(), "op_inflight_1")
+            .expect("begin marker");
+        // Plant an ancient completed receipt directly to force eviction.
+        let old = json!({
+            "durable_receipt": true,
+            "truncated": true,
+            "status": "completed",
+            "operation_id": "op_ancient",
+            OP_JOURNAL_COMPLETED_UNIX_FIELD: DaemonRuntime::now() - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+        });
+        runtime
+            .op_journal
+            .insert("prin\u{1f}op_ancient".into(), old);
+
+        let evicted = runtime
+            .evict_expired_completed_op_journal_entries()
+            .expect("eviction");
+        assert_eq!(evicted, 1, "only the old completed receipt is evicted");
+        assert!(
+            runtime.op_journal_key_is_in_progress_for_test("op_inflight"),
+            "in-progress marker must survive eviction"
+        );
+        assert!(
+            !runtime.has_op_journal_key_for_test("op_ancient"),
+            "old completed receipt removed"
+        );
+        // The durable file keeps the in-progress marker verbatim (no compaction).
+        let raw = std::fs::read_to_string(paths.state_dir.join("op-journal.json")).unwrap();
+        let durable: HashMap<String, Value> = serde_json::from_str(&raw).unwrap();
+        let marker = durable.get(key.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            marker.get(OP_JOURNAL_STATE_FIELD).and_then(Value::as_str),
+            Some(OP_JOURNAL_IN_PROGRESS)
+        );
+        // Replay of an in-progress key stays refused.
+        let err = runtime.lookup_idempotent(key.as_ref()).unwrap_err();
+        assert!(err.to_string().contains("in-progress"), "{err}");
+    }
+
+    /// P0-B: near capacity, only old completed receipts are evicted; a fresh
+    /// side-effect key is still accepted afterwards.
+    #[test]
+    fn near_capacity_evicts_old_completed_before_accepting_new_keys() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        // Fill to the entry cap with ancient completed receipts.
+        let now = DaemonRuntime::now();
+        for i in 0..MAX_OP_JOURNAL_ENTRIES {
+            let key = format!("prin\u{1f}op_fill_{i}");
+            let old = json!({
+                "durable_receipt": true,
+                "truncated": true,
+                "status": "completed",
+                "operation_id": format!("op_fill_{i}"),
+                OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+            });
+            runtime.op_journal.insert(key, old);
+        }
+        assert_eq!(runtime.op_journal.len(), MAX_OP_JOURNAL_ENTRIES);
+
+        let key = Some("prin\u{1f}op_new_1".to_string());
+        runtime
+            .begin_idempotent(key.as_ref(), "op_new_1")
+            .expect("eviction makes room for a new side-effect key");
+        assert!(runtime.has_op_journal_key_for_test("op_new_1"));
+        assert!(
+            runtime.op_journal.len() < MAX_OP_JOURNAL_ENTRIES,
+            "old completed receipts evicted"
+        );
+    }
+
+    /// P0-B: at the durable *byte* cap, `maybe_make_op_journal_room` evicts
+    /// only old completed receipts (never uncertain/in-progress entries) and
+    /// a new side-effect key is still accepted. The exact durable-byte
+    /// estimate — the same pretty-serialized view persistence writes — is
+    /// what triggers the eviction, so the real 4 MiB budget is never
+    /// silently exceeded while the estimate still claims headroom.
+    #[test]
+    fn byte_cap_evicts_old_completed_before_accepting_new_keys() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        // A large uncertain entry (kept verbatim fail-closed, never evicted)
+        // plus old completed receipts: the durable view exceeds the byte cap.
+        let big_body = "u".repeat(4_000_000);
+        runtime.op_journal.insert(
+            "prin\u{1f}op_uncertain_big".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: "phase_two",
+                "operation_id": "op_uncertain_big",
+                "result": { "stdout": big_body },
+            }),
+        );
+        for i in 0..2000 {
+            let key = format!("prin\u{1f}op_old_{i}");
+            runtime.op_journal.insert(
+                key,
+                json!({
+                    "durable_receipt": true,
+                    "truncated": true,
+                    "status": "completed",
+                    "operation_id": format!("op_old_{i}"),
+                    OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+                }),
+            );
+        }
+        assert!(
+            runtime.op_journal_durable_byte_estimate() >= MAX_OP_JOURNAL_FILE_BYTES,
+            "fixture must exceed the durable byte budget"
+        );
+        let key = Some("prin\u{1f}op_new_byte".to_string());
+        runtime
+            .begin_idempotent(key.as_ref(), "op_new_byte")
+            .expect("eviction makes byte room for a new side-effect key");
+        assert!(runtime.has_op_journal_key_for_test("op_new_byte"));
+        // The uncertain entry is preserved verbatim (never evicted).
+        assert!(runtime.has_op_journal_key_for_test("prin\u{1f}op_uncertain_big"));
+        // The old completed receipts were evicted.
+        assert!(!runtime.has_op_journal_key_for_test("prin\u{1f}op_old_0"));
+        // The durable file is under the budget again.
+        let on_disk = std::fs::metadata(paths.state_dir.join("op-journal.json"))
+            .unwrap()
+            .len() as usize;
+        assert!(
+            on_disk < MAX_OP_JOURNAL_FILE_BYTES,
+            "durable file must be under budget after eviction, got {on_disk}"
+        );
+    }
+
+    /// P0-B review (near-capacity behavior): a journal that is still *under*
+    /// the durable byte budget, but where the incoming in-progress marker
+    /// would push the serialized file over it, must evict expired completed
+    /// receipts instead of refusing the new side-effect key with a byte-budget
+    /// failure. This pins the bounded lifecycle: long-lived normal operation
+    /// prunes terminal receipts proactively rather than hitting the hard cap,
+    /// and the refusal path is reserved for genuinely non-evictable pressure.
+    #[test]
+    fn near_byte_cap_evicts_before_the_incoming_marker_insert() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        // A few expired completed receipts that ARE evictable. They are added
+        // BEFORE the body is sized so the linear size computation below
+        // accounts for them.
+        for i in 0..4 {
+            runtime.op_journal.insert(
+                format!("prin\u{1f}op_near_old_{i}"),
+                json!({
+                    "durable_receipt": true,
+                    "truncated": true,
+                    "status": "completed",
+                    "operation_id": format!("op_near_old_{i}"),
+                    OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+                }),
+            );
+        }
+        // A large uncertain entry is kept verbatim (fail-closed, never
+        // evicted). Size it so the current durable estimate lands within one
+        // marker's worth of the byte cap: inserting the marker would exceed
+        // the budget, but evicting the old completed receipts frees room.
+        runtime.op_journal.insert(
+            "prin\u{1f}op_near_uncertain".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: "phase_two",
+                "operation_id": "op_near_uncertain",
+                "result": { "stdout": "x" },
+            }),
+        );
+        let base = runtime.op_journal_durable_byte_estimate();
+        // Empirical marginal serialized cost of one extra in-progress marker
+        // entry in the pretty-printed durable view (the standalone-object size
+        // overestimates because map framing and the trailing newline are
+        // shared).
+        let mut probe = runtime.op_journal.clone();
+        probe.insert(
+            "prin\u{1f}op_near_probe".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                "operation_id": "op_probe",
+            }),
+        );
+        let marginal = serde_json::to_vec_pretty(&op_journal_durable_view(&probe))
+            .unwrap()
+            .len()
+            .saturating_sub(base);
+        assert!(marginal > 0, "marker marginal size must be positive");
+        // The durable size is linear in the body length (plain 'x' characters
+        // need no JSON escaping): size = constant + body_len, where the
+        // constant covers framing and the four receipt entries. Target the
+        // current estimate exactly one byte under the projected cap so the
+        // incoming marker pushes the durable file over it.
+        let constant = base.saturating_sub(1).saturating_sub(2);
+        let body_len = (MAX_OP_JOURNAL_FILE_BYTES + 1)
+            .saturating_sub(marginal)
+            .saturating_sub(constant)
+            .saturating_sub(1);
+        runtime.op_journal.insert(
+            "prin\u{1f}op_near_uncertain".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: "phase_two",
+                "operation_id": "op_near_uncertain",
+                "result": { "stdout": "x".repeat(body_len) },
+            }),
+        );
+        let current = runtime.op_journal_durable_byte_estimate();
+        assert!(
+            current < MAX_OP_JOURNAL_FILE_BYTES,
+            "fixture must be under the byte cap, got {current}"
+        );
+        let mut projected = runtime.op_journal.clone();
+        projected.insert(
+            "prin\u{1f}op_near_new".to_string(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                "operation_id": "op_near_new",
+            }),
+        );
+        let projected_bytes = serde_json::to_vec_pretty(&op_journal_durable_view(&projected))
+            .unwrap()
+            .len();
+        assert!(
+            projected_bytes >= MAX_OP_JOURNAL_FILE_BYTES,
+            "fixture must be within one marker of the byte cap (current {current}, projected {projected_bytes})"
+        );
+        // The near-capacity journal must accept the new side-effect key by
+        // evicting the expired receipts — previously it refused with a
+        // byte-budget persist failure even though receipts were evictable.
+        runtime
+            .begin_idempotent(
+                Some("prin\u{1f}op_near_new".to_string()).as_ref(),
+                "op_near_new",
+            )
+            .expect("near-capacity journal with evictable receipts must accept a new key");
+        assert!(runtime.has_op_journal_key_for_test("op_near_new"));
+        // The uncertain entry is preserved verbatim; the expired receipts were
+        // evicted; the durable file is under budget again.
+        assert!(runtime.has_op_journal_key_for_test("prin\u{1f}op_near_uncertain"));
+        assert!(!runtime.has_op_journal_key_for_test("prin\u{1f}op_near_old_0"));
+        let on_disk = std::fs::metadata(paths.state_dir.join("op-journal.json"))
+            .unwrap()
+            .len() as usize;
+        assert!(
+            on_disk < MAX_OP_JOURNAL_FILE_BYTES,
+            "durable file must be under budget after near-capacity eviction, got {on_disk}"
+        );
+    }
+
+    /// P0-B: at capacity with nothing evictable (all in-progress), new
+    /// side-effect keys are refused fail-closed — never evicting an uncertain
+    /// outcome to make room.
+    #[test]
+    fn at_capacity_with_only_in_progress_refuses_new_keys() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        for i in 0..MAX_OP_JOURNAL_ENTRIES {
+            let key = format!("prin\u{1f}op_busy_{i}");
+            let marker = json!({
+                OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                "operation_id": format!("op_busy_{i}"),
+            });
+            runtime.op_journal.insert(key, marker);
+        }
+        let err = runtime
+            .begin_idempotent(Some("prin\u{1f}op_extra".to_string()).as_ref(), "op_extra")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("capacity"),
+            "must refuse at capacity: {err}"
+        );
+        assert_eq!(runtime.op_journal.len(), MAX_OP_JOURNAL_ENTRIES);
+    }
+
+    /// P0-B: an eviction persist fault rolls back the in-memory eviction so
+    /// the durable file stays authoritative (no partial lifecycle).
+    #[test]
+    fn eviction_persist_fault_rolls_back_in_memory() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        let key = "prin\u{1f}op_faulty";
+        let old = json!({
+            "durable_receipt": true,
+            "truncated": true,
+            "status": "completed",
+            "operation_id": "op_faulty",
+            OP_JOURNAL_COMPLETED_UNIX_FIELD: now - OP_JOURNAL_COMPLETED_TTL_SECS - 1,
+        });
+        runtime.op_journal.insert(key.into(), old);
+        // Fault the next op-journal persist (eviction's own write).
+        runtime.fail_op_journal_persist_on_nth_call_for_test(1);
+        let err = runtime
+            .evict_expired_completed_op_journal_entries()
+            .expect_err("persist fault must fail eviction");
+        assert!(err.to_string().contains("fault-injected"), "{err}");
+        assert!(
+            runtime.op_journal.contains_key(key),
+            "in-memory eviction must roll back on persist failure"
+        );
+    }
+
+    /// P0-B: a legacy (pre-1.2.13) op journal with large completed bodies is
+    /// compacted at load AND the compacted result is persisted back to disk, so
+    /// large stdout/file bodies are not retained indefinitely. In-progress
+    /// markers stay verbatim.
+    #[test]
+    fn legacy_op_journal_is_compacted_and_persisted_at_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let big_body = "x".repeat(80 * 1024);
+        let legacy = serde_json::json!({
+            "prin\u{1f}op_done": {
+                "status": "completed",
+                "operation_id": "op_done",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "result": { "stdout": big_body }
+            },
+            "prin\u{1f}op_busy": {
+                "__ownmesh_operation_state": "in_progress",
+                "operation_id": "op_busy"
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let journal = load_op_journal(&path).expect("legacy journal loads");
+        // Completed entry is a compact receipt (no result body).
+        let done = journal.get("prin\u{1f}op_done").unwrap();
+        assert_eq!(
+            done.get("durable_receipt").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(done.get("result").is_none(), "large body must be compacted");
+        assert!(
+            done.get(OP_JOURNAL_COMPLETED_UNIX_FIELD).is_some(),
+            "legacy completed entry stamped for the bounded lifecycle"
+        );
+        // In-progress marker stays verbatim.
+        let busy = journal.get("prin\u{1f}op_busy").unwrap();
+        assert_eq!(
+            busy.get(OP_JOURNAL_STATE_FIELD).and_then(Value::as_str),
+            Some(OP_JOURNAL_IN_PROGRESS)
+        );
+        // The durable file was rewritten compacted (P0-B finding: load must
+        // persist the compaction, not only compact in memory).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.len() < 4 * 1024,
+            "durable file must be compacted after load, got {} bytes",
+            raw.len()
+        );
+        let durable: HashMap<String, Value> = serde_json::from_str(&raw).unwrap();
+        assert!(
+            durable
+                .get("prin\u{1f}op_done")
+                .unwrap()
+                .get("result")
+                .is_none(),
+            "durable file must not retain the large body"
+        );
+    }
+
+    /// P0-B: a legacy journal above the durable byte budget is still loaded
+    /// when compaction brings it under budget (bounded read), instead of being
+    /// rejected before compaction.
+    #[test]
+    fn legacy_op_journal_above_budget_is_compacted_not_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let big_body = "y".repeat(5 * 1024 * 1024);
+        let legacy = serde_json::json!({
+            "prin\u{1f}op_huge": {
+                "status": "completed",
+                "operation_id": "op_huge",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "result": { "stdout": big_body }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > MAX_OP_JOURNAL_FILE_BYTES as u64,
+            "fixture must exceed the durable budget"
+        );
+        let journal = load_op_journal(&path).expect("over-budget legacy journal compacts at load");
+        assert_eq!(journal.len(), 1);
+        assert_eq!(
+            journal
+                .get("prin\u{1f}op_huge")
+                .unwrap()
+                .get("durable_receipt")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    /// P0-B: the durable byte estimate must match the real persisted file
+    /// exactly (same pretty-serialized durable view `persist_op_journal`
+    /// writes). The old per-entry sum omitted JSON framing and pretty-print
+    /// overhead, so eviction and `system.diagnose` under-reported pressure
+    /// and the real file could hit the hard 4 MiB cap while the estimate
+    /// still claimed headroom.
+    #[test]
+    fn op_journal_durable_byte_estimate_matches_persisted_file() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        // A mix of completed receipts (with a >64KiB result body that must be
+        // compacted away) and in-progress markers, so the estimate covers both
+        // the compacted view and the verbatim uncertain entries.
+        let big_body = "z".repeat(80 * 1024);
+        for i in 0..8 {
+            let key = format!("prin\u{1f}op_est_{i}");
+            runtime.op_journal.insert(
+                key,
+                json!({
+                    "status": "completed",
+                    "operation_id": format!("op_est_{i}"),
+                    "approval_required": false,
+                    "replayed": false,
+                    "decision": "allow",
+                    "result": { "stdout": big_body },
+                    OP_JOURNAL_COMPLETED_UNIX_FIELD: now - 1,
+                }),
+            );
+        }
+        runtime.op_journal.insert(
+            "prin\u{1f}op_est_busy".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                "operation_id": "op_est_busy",
+            }),
+        );
+        let estimate = runtime.op_journal_durable_byte_estimate();
+        runtime.persist_op_journal().expect("persist");
+        let on_disk = std::fs::metadata(paths.state_dir.join("op-journal.json"))
+            .unwrap()
+            .len() as usize;
+        assert_eq!(
+            estimate, on_disk,
+            "durable byte estimate must equal the persisted file size (estimate {estimate}, file {on_disk})"
+        );
+        // The estimate is the compacted view: the >64KiB bodies are not
+        // retained in durable state.
+        assert!(
+            estimate < 8 * 1024,
+            "compacted durable view must stay small, got {estimate} bytes"
+        );
+        // The in-progress marker is preserved verbatim in the durable view.
+        let durable = op_journal_durable_view(&runtime.op_journal);
+        assert_eq!(
+            durable
+                .get("prin\u{1f}op_est_busy")
+                .and_then(|v| v.get(OP_JOURNAL_STATE_FIELD))
+                .and_then(Value::as_str),
+            Some(OP_JOURNAL_IN_PROGRESS)
+        );
+    }
+
+    /// P0-B: the compact receipt preserves `remote_payload_hash` so an
+    /// identical `review.start` retry within the retention window replays the
+    /// receipt instead of failing the payload binding check.
+    #[test]
+    fn op_journal_durable_view_preserves_remote_payload_hash() {
+        let mut journal = HashMap::new();
+        journal.insert(
+            "prin\u{1f}op_review".into(),
+            json!({
+                "status": "completed",
+                "operation_id": "op_review",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "remote_payload_hash": "a".repeat(64),
+                "result": { "stdout": "review output" }
+            }),
+        );
+        let view = op_journal_durable_view(&journal);
+        let receipt = view.get("prin\u{1f}op_review").unwrap();
+        assert_eq!(
+            receipt.get("remote_payload_hash").and_then(Value::as_str),
+            Some("a".repeat(64).as_str()),
+            "replay binding must survive compaction"
+        );
+        assert!(receipt.get("result").is_none());
+    }
+
+    /// P0-B: a compacted `review.start` receipt must preserve `review_id` —
+    /// `review.show`/`review.page` need it to continue the review, so an
+    /// idempotent replay after compaction or restart must still return it.
+    #[test]
+    fn op_journal_durable_view_preserves_review_id() {
+        let mut journal = HashMap::new();
+        journal.insert(
+            "prin\u{1f}op_review".into(),
+            json!({
+                "status": "completed",
+                "operation_id": "op_review",
+                "review_id": "rev_abc123",
+                "workspace_id": "ws_default",
+                "remote_payload_hash": "a".repeat(64),
+                "result": { "stdout": "review output" }
+            }),
+        );
+        let view = op_journal_durable_view(&journal);
+        let receipt = view.get("prin\u{1f}op_review").unwrap();
+        assert_eq!(
+            receipt.get("review_id").and_then(Value::as_str),
+            Some("rev_abc123"),
+            "review.show/page identifier must survive compaction"
+        );
+        assert_eq!(
+            receipt.get("workspace_id").and_then(Value::as_str),
+            Some("ws_default"),
+            "workspace binding must survive compaction"
+        );
+        assert!(receipt.get("result").is_none());
+
+        // Full lifecycle: store, persist, reload, replay — the review_id
+        // stays on the receipt so the client can continue the review.
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let key = Some("prin\u{1f}op_review_lifecycle".to_string());
+        {
+            let mut runtime = DaemonRuntime::open(&paths).unwrap();
+            runtime
+                .begin_idempotent(key.as_ref(), "op_review_1")
+                .unwrap();
+            let body = json!({
+                "approval_required": false,
+                "operation_id": "op_review_1",
+                "review_id": "rev_lifecycle_1",
+                "workspace_id": "ws_default",
+                "result": { "stdout": "kept in memory only" },
+                "replayed": false,
+                "decision": "allow",
+            });
+            runtime.store_idempotent(key.as_ref(), &body).unwrap();
+        }
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let replayed = runtime
+            .lookup_idempotent(key.as_ref())
+            .expect("lookup")
+            .expect("entry present");
+        assert_eq!(replayed["durable_receipt"], true);
+        assert_eq!(
+            replayed.get("review_id").and_then(Value::as_str),
+            Some("rev_lifecycle_1"),
+            "restart replay must keep the review identifier"
+        );
+        assert!(replayed.get("result").is_none());
+    }
+
+    /// P0-B regression (review): the completed `review.start` journal entry is
+    /// the serialized `ReviewManifest`, which stores the control-plane id as
+    /// `remote_operation_id` — NOT the `operation_id` exact-once marker that
+    /// `begin_idempotent` writes and the compaction classifier requires. An
+    /// entry without `operation_id` was classified uncertain: compaction
+    /// refused to shrink it (retaining pins/argv durably) and a retried
+    /// `review.start` after restart/response-loss received an in-progress/
+    /// uncertain CONFLICT instead of the documented receipt. The handler now
+    /// stamps `operation_id` onto the body before `store_idempotent`; this
+    /// test proves the real manifest shape classifies, compacts, and replays.
+    #[test]
+    fn review_manifest_receipt_classifies_compacts_and_replays() {
+        // The exact body `handle_review_start` stores: `finish()` returns the
+        // manifest, the handler adds `remote_payload_hash` and (after the
+        // fix) `operation_id`.
+        let manifest = review_fixture_manifest();
+        let mut without_operation_id = serde_json::to_value(manifest.clone()).unwrap();
+        if let Some(object) = without_operation_id.as_object_mut() {
+            object.insert("remote_payload_hash".into(), json!("a".repeat(64)));
+        }
+        // Fail-closed regression: the pre-fix shape must NEVER be treated as
+        // a completed receipt (that is what made a finished review replay as
+        // an uncertain conflict).
+        assert_eq!(
+            op_journal_entry_state(&without_operation_id),
+            OpJournalEntryState::Uncertain,
+            "ReviewManifest body without the exact-once operation_id must stay uncertain"
+        );
+        assert!(
+            !op_journal_durable_view(&HashMap::from([(
+                "prin\u{1f}op_review_real".to_string(),
+                without_operation_id.clone()
+            )]))
+            .get("prin\u{1f}op_review_real")
+            .unwrap()
+            .get("durable_receipt")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+            "pre-fix body must not be compacted (would hide the unfinished state)"
+        );
+
+        // Post-fix shape: `operation_id` is stamped, so the entry is a
+        // provably-completed receipt and compacts to a bounded receipt that
+        // preserves the continuation identifiers (`review_id`, `workspace_id`,
+        // `remote_payload_hash`) while dropping pins/argv/result metadata.
+        let mut completed = serde_json::to_value(manifest.clone()).unwrap();
+        if let Some(object) = completed.as_object_mut() {
+            object.insert("operation_id".into(), json!("op_review_real_1"));
+            object.insert("remote_payload_hash".into(), json!("a".repeat(64)));
+        }
+        assert_eq!(
+            op_journal_entry_state(&completed),
+            OpJournalEntryState::Completed,
+            "operation_id + review_id is a completed receipt"
+        );
+        let view = op_journal_durable_view(&HashMap::from([(
+            "prin\u{1f}op_review_real".to_string(),
+            completed.clone(),
+        )]));
+        let receipt = view.get("prin\u{1f}op_review_real").unwrap();
+        assert_eq!(receipt["durable_receipt"], true);
+        assert_eq!(
+            receipt.get("review_id").and_then(Value::as_str),
+            Some("rev_manifest_1"),
+            "review.show/page identifier must survive compaction"
+        );
+        assert_eq!(
+            receipt.get("workspace_id").and_then(Value::as_str),
+            Some("ws_default"),
+            "workspace binding must survive compaction"
+        );
+        assert_eq!(
+            receipt.get("remote_payload_hash").and_then(Value::as_str),
+            Some("a".repeat(64).as_str()),
+            "replay binding must survive compaction"
+        );
+        assert_eq!(
+            receipt.get("operation_id").and_then(Value::as_str),
+            Some("op_review_real_1")
+        );
+        assert!(
+            receipt.get("command").is_none(),
+            "pinned argv must not survive compaction"
+        );
+        assert!(receipt.get("tests").is_none(), "test pins must not survive");
+
+        // Full lifecycle through the journal: begin marker, store the real
+        // manifest body, replay in-session and after a restart.
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let key = Some("prin\u{1f}op_review_lifecycle_real".to_string());
+        {
+            let mut runtime = DaemonRuntime::open(&paths).unwrap();
+            runtime
+                .begin_idempotent(key.as_ref(), "op_review_real_1")
+                .unwrap();
+            runtime.store_idempotent(key.as_ref(), &completed).unwrap();
+            // In-session replay: the receipt, never a conflict, never a
+            // re-execution, and never the full manifest body.
+            let replayed = runtime
+                .lookup_idempotent(key.as_ref())
+                .expect("lookup")
+                .expect("entry present");
+            assert_eq!(replayed["durable_receipt"], true);
+            assert_eq!(
+                replayed.get("review_id").and_then(Value::as_str),
+                Some("rev_manifest_1")
+            );
+            assert!(replayed.get("command").is_none());
+        }
+        // Restart: bound_op_journal compacts the completed entry at load and
+        // the replay still returns the receipt with the continuation ids.
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let replayed = runtime
+            .lookup_idempotent(key.as_ref())
+            .expect("lookup after restart")
+            .expect("entry present after restart");
+        assert_eq!(replayed["durable_receipt"], true);
+        assert_eq!(
+            replayed.get("review_id").and_then(Value::as_str),
+            Some("rev_manifest_1"),
+            "restart replay must keep the review identifier"
+        );
+        assert_eq!(
+            replayed.get("remote_payload_hash").and_then(Value::as_str),
+            Some("a".repeat(64).as_str())
+        );
+        assert!(replayed.get("result").is_none());
+    }
+
+    /// A `ReviewManifest` in the exact serialized shape `handle_review_start`
+    /// persists (pins, cursors, control-plane ids).
+    fn review_fixture_manifest() -> ReviewManifest {
+        let pin = ExecutablePin {
+            path: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            content_sha256: sha256_hex(b"fixture"),
+            len: 7,
+            device: None,
+            inode: None,
+            policy_kind: "structured".into(),
+        };
+        ReviewManifest {
+            review_id: "rev_manifest_1".into(),
+            device_id: "dev_test".into(),
+            workspace_id: "ws_default".into(),
+            repo_root: std::env::temp_dir().to_string_lossy().into_owned(),
+            head_oid: "0".repeat(40),
+            principal: "client:local:test".into(),
+            phase: ReviewPhase::Completed,
+            command: Some(ReviewCommand {
+                program: "/bin/true".into(),
+                args: vec!["--version".into()],
+                timeout_ms: 1000,
+                invocation_pin: None,
+                pin: pin.clone(),
+            }),
+            tests: vec![TestRequest {
+                program: "/bin/true".into(),
+                args: vec![],
+                timeout_ms: 1000,
+                invocation_pin: None,
+                pin,
+            }],
+            remote_operation_id: Some("op_review_remote_1".into()),
+            remote_payload_hash: Some("a".repeat(64)),
+            status_cursor: 0,
+            diff_cursor: 0,
+            result_sha256: Some("b".repeat(64)),
+            created_unix: 1_000_000,
+            expires_unix: 1_000_000 + 3600,
+        }
+    }
+
+    /// P0-B continuation identifiers: compact receipts must keep the small
+    /// identifiers a client needs to continue an operation whose response was
+    /// lost after compaction/restart. `session.open` returns the generated
+    /// session `id` and its controller lease at the top level;
+    /// `session.attach`/`session.claim` return the session snapshot nested
+    /// under `session`. Dropping them would make a retried `session.open` /
+    /// `session.attach` unable to continue the session.
+    #[test]
+    fn op_journal_durable_view_preserves_session_continuation_identifiers() {
+        // session.open-shaped completed entry (SessionInfo serialized at the
+        // top level, plus a large stdout body that must still be dropped).
+        let mut journal = HashMap::new();
+        journal.insert(
+            "prin\u{1f}op_session_open".into(),
+            json!({
+                "status": "completed",
+                "operation_id": "op_session_open_1",
+                "id": "sess_abc123",
+                "kind": "pty",
+                "state": "running",
+                "controller": {
+                    "principal_id": "p1",
+                    "lease_id": "lease_1",
+                    "epoch": 3,
+                    "expires_unix": 1_900_000_000,
+                },
+                "controller_epoch": 3,
+                "workspace_id": "ws_default",
+                "live_pty": true,
+                "decision": "allow",
+                "stdout": "x".repeat(200_000),
+            }),
+        );
+        let view = op_journal_durable_view(&journal);
+        let receipt = view.get("prin\u{1f}op_session_open").unwrap();
+        // P0-B review: the receipt preserves the *original field name* — a
+        // top-level `id` stays `id` (never renamed to `session_id`), so the
+        // first and the replayed public responses are schema-stable.
+        assert_eq!(
+            receipt.get("id").and_then(Value::as_str),
+            Some("sess_abc123"),
+            "session.open generated session id must survive compaction under its original field name"
+        );
+        assert_eq!(
+            receipt
+                .get("controller")
+                .and_then(|v| v.get("lease_id"))
+                .and_then(Value::as_str),
+            Some("lease_1"),
+            "session.open controller lease must survive compaction"
+        );
+        assert_eq!(
+            receipt.get("controller_epoch").and_then(Value::as_u64),
+            Some(3),
+            "controller epoch must survive compaction"
+        );
+        assert!(
+            receipt.get("stdout").is_none(),
+            "large stdout body must still be dropped"
+        );
+
+        // session.attach-shaped completed entry: the continuation identifiers
+        // live inside the nested `session` snapshot.
+        let mut journal = HashMap::new();
+        journal.insert(
+            "prin\u{1f}op_session_attach".into(),
+            json!({
+                "status": "completed",
+                "operation_id": "op_session_attach_1",
+                "session": {
+                    "id": "sess_attach_9",
+                    "kind": "pty",
+                    "state": "running",
+                    "controller": { "principal_id": "p1", "lease_id": "lease_9", "epoch": 5, "expires_unix": 1_900_000_000 },
+                    "controller_epoch": 5,
+                    "workspace_id": "ws_default",
+                },
+                "principal": "p1",
+                "role": "controller",
+                "read_only": false,
+                "workspace_id": "ws_default",
+                "live_pty": true,
+                "readers": ["p1"],
+                "decision": "allow",
+                "result": { "content": "y".repeat(200_000) },
+            }),
+        );
+        let view = op_journal_durable_view(&journal);
+        let receipt = view.get("prin\u{1f}op_session_attach").unwrap();
+        let session = receipt
+            .get("session")
+            .expect("nested session snapshot kept");
+        assert_eq!(
+            session.get("id").and_then(Value::as_str),
+            Some("sess_attach_9"),
+            "nested session id must survive compaction"
+        );
+        assert_eq!(
+            session
+                .get("controller")
+                .and_then(|v| v.get("lease_id"))
+                .and_then(Value::as_str),
+            Some("lease_9"),
+            "nested controller lease must survive compaction"
+        );
+        assert!(
+            receipt.get("result").is_none(),
+            "large result body must still be dropped"
+        );
+
+        // An `id` that is not a bounded string (e.g. a numeric id or a
+        // 100 KiB blob) must never be copied onto the receipt.
+        let mut journal = HashMap::new();
+        journal.insert(
+            "prin\u{1f}op_weird_id".into(),
+            json!({
+                "status": "completed",
+                "operation_id": "op_weird_id_1",
+                "id": "x".repeat(100_000),
+                "decision": "allow",
+                "result": { "stdout": "z" },
+            }),
+        );
+        let view = op_journal_durable_view(&journal);
+        let receipt = view.get("prin\u{1f}op_weird_id").unwrap();
+        assert!(
+            receipt.get("id").is_none() && receipt.get("session_id").is_none(),
+            "oversized id must not be copied onto the receipt: {receipt:?}"
+        );
+        assert!(receipt.get("result").is_none());
+    }
+
+    /// P0-B / MCP contract regression (review High): `session.open` is a
+    /// side-effect operation (it spawns a PTY host or a persistent sidecar),
+    /// but the handler used to bypass the device idempotency journal
+    /// entirely — a retried open with the same caller idempotency key created
+    /// a *second* session. The handler now reserves the exact-once marker
+    /// before the session record is created and stores a compacted receipt
+    /// (session id + controller lease preserved) on success, so a retry after
+    /// response loss or restart continues the original session.
+    #[tokio::test]
+    async fn session_open_with_idempotency_key_is_exact_once() {
+        // `kind=process` keeps the test hermetic: no PTY/sidecar spawn, but
+        // the exact-once journal path is identical to a live open.
+        async fn open(
+            runtime: &mut DaemonRuntime,
+            client: &ClientIdentity,
+            title: &str,
+            key: &str,
+        ) -> IpcResult<Value> {
+            runtime
+                .dispatch(
+                    session_methods::OPEN,
+                    Some(json!({
+                        "title": title,
+                        "kind": "process",
+                        "idempotency_key": key,
+                    })),
+                    client,
+                )
+                .await
+        }
+
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        let local = ClientIdentity::new("client:local:test", "test");
+
+        // First open with a caller idempotency key creates the session.
+        let first = open(&mut runtime, &local, "exact-once", "idem_open_exact")
+            .await
+            .expect("first session.open");
+        let first_id = first
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("session id")
+            .to_string();
+        // P0-B review: the first response carries the additive `session_id`
+        // alias so the first and the replayed public responses are
+        // schema-stable (the control plane reads `session_id` at the top
+        // level of the result).
+        assert_eq!(
+            first.get("session_id").and_then(Value::as_str),
+            Some(first_id.as_str()),
+            "first session.open must expose the additive session_id alias: {first}"
+        );
+        assert_eq!(runtime.sessions.list().len(), 1);
+
+        // A retry with the same key must replay the receipt (with the
+        // original session id), never spawn a second session.
+        let retry = open(&mut runtime, &local, "exact-once", "idem_open_exact")
+            .await
+            .expect("replayed session.open");
+        assert_eq!(retry["replayed"], true, "{retry}");
+        assert_eq!(
+            retry.get("session_id").and_then(Value::as_str),
+            Some(first_id.as_str()),
+            "replay must continue the original session"
+        );
+        assert_eq!(
+            retry.get("id").and_then(Value::as_str),
+            Some(first_id.as_str()),
+            "replay must keep the original field name `id` (schema-stable with the first response): {retry}"
+        );
+        assert_eq!(
+            runtime.sessions.list().len(),
+            1,
+            "a retried open must not create a duplicate session"
+        );
+
+        // A different key opens a different session.
+        let other = open(&mut runtime, &local, "exact-once-other", "idem_open_other")
+            .await
+            .expect("second session.open");
+        let other_id = other
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("session id")
+            .to_string();
+        assert_ne!(other_id, first_id);
+        assert_eq!(runtime.sessions.list().len(), 2);
+
+        // Replay after restart: the compacted receipt survives and still
+        // returns the original session id (no duplicate PTY after crash).
+        drop(runtime);
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        let after_restart = open(&mut runtime, &local, "exact-once", "idem_open_exact")
+            .await
+            .expect("replay after restart");
+        assert_eq!(after_restart["replayed"], true, "{after_restart}");
+        assert_eq!(
+            after_restart.get("session_id").and_then(Value::as_str),
+            Some(first_id.as_str()),
+            "restart replay must keep the original session id"
+        );
+        assert_eq!(
+            after_restart.get("id").and_then(Value::as_str),
+            Some(first_id.as_str()),
+            "restart replay must keep the original field name `id`: {after_restart}"
+        );
+        assert_eq!(
+            runtime.sessions.list().len(),
+            2,
+            "no third session after restart"
+        );
+
+        // Local opens without a key stay unjournaled (unchanged behavior):
+        // each call still creates its own session.
+        let unkeyed = open(&mut runtime, &local, "unkeyed", "")
+            .await
+            .expect("unkeyed open");
+        let unkeyed_id = unkeyed
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("session id")
+            .to_string();
+        assert_ne!(unkeyed_id, first_id);
+        assert_ne!(unkeyed_id, other_id);
+        assert_eq!(runtime.sessions.list().len(), 3);
+    }
+
+    /// P0-B: a JSON object with *no* explicit completed marker — e.g. a
+    /// truncated or hand-written `{}` — is uncertain, never completed. The
+    /// old classifier treated any object without a state field as completed,
+    /// so a malformed entry could be compacted/evicted/replayed as a receipt,
+    /// masking an unfinished side effect.
+    #[test]
+    fn unmarked_op_journal_object_is_fail_closed() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let cases = [
+            ("prin\u{1f}op_bare_empty".to_string(), json!({})),
+            (
+                "prin\u{1f}op_status_only".to_string(),
+                json!({ "status": "completed" }),
+            ),
+            (
+                "prin\u{1f}op_result_only".to_string(),
+                json!({ "result": { "stdout": "body" } }),
+            ),
+        ];
+        for (key, value) in &cases {
+            assert_eq!(
+                op_journal_entry_state(value),
+                OpJournalEntryState::Uncertain,
+                "unmarked object must be uncertain: {key}"
+            );
+            runtime.op_journal.insert(key.clone(), value.clone());
+        }
+
+        // Replay is refused for every unmarked object (exact-once preserved).
+        for (key, _) in &cases {
+            let err = runtime.lookup_idempotent(Some(key)).unwrap_err();
+            assert!(
+                err.to_string().contains("uncertain"),
+                "unmarked object must refuse replay: {key}: {err}"
+            );
+        }
+
+        // Eviction must never touch them, even without an age stamp.
+        let evicted = runtime
+            .evict_expired_completed_op_journal_entries()
+            .expect("eviction");
+        assert_eq!(evicted, 0, "unmarked objects must never be evicted");
+        assert_eq!(runtime.op_journal.len(), cases.len());
+
+        // The durable view keeps them verbatim (never compacted away).
+        let view = op_journal_durable_view(&runtime.op_journal);
+        for (key, value) in &cases {
+            assert_eq!(
+                view.get(key),
+                Some(value),
+                "unmarked object must survive the durable view verbatim: {key}"
+            );
+        }
+
+        // And they survive a reload from disk verbatim.
+        runtime.persist_op_journal().expect("persist");
+        let loaded = load_op_journal(&paths.state_dir.join("op-journal.json")).unwrap();
+        for (key, value) in &cases {
+            assert_eq!(
+                loaded.get(key),
+                Some(value),
+                "reload must keep unmarked objects fail-closed: {key}"
+            );
+        }
+
+        // A legacy completed body (pre-1.2.13 gate_and_run shape) is
+        // positively proven completed and migrates: it is stamped and
+        // compacted, so a real upgrade shrinks instead of stalling.
+        let legacy = json!({
+            "approval_required": false,
+            "operation_id": "op_legacy_1",
+            "result": { "stdout": "old body" },
+            "replayed": false,
+            "decision": "allow",
+        });
+        assert_eq!(
+            op_journal_entry_state(&legacy),
+            OpJournalEntryState::Completed,
+            "legacy completed body must migrate to a receipt"
+        );
+        // …but a legacy body without an operation_id is not provably
+        // completed and stays uncertain.
+        let no_operation_id = json!({ "decision": "allow" });
+        assert_eq!(
+            op_journal_entry_state(&no_operation_id),
+            OpJournalEntryState::Uncertain,
+            "completion proof without operation_id stays fail-closed"
+        );
+    }
+
+    /// ADR 0010 §1b / review: completed markers must carry the exact-once
+    /// `operation_id`. A `durable_receipt: true` marker or an explicit
+    /// `__ownmesh_operation_state == "completed"` value *without* an
+    /// `operation_id` is malformed (hand-written or truncated): compacting or
+    /// eventually evicting it would let a retried operation execute as a new
+    /// side effect. It must stay uncertain — never replayed, never compacted,
+    /// never evicted.
+    #[test]
+    fn completed_markers_without_operation_id_are_fail_closed() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let cases = [
+            (
+                "prin\u{1f}op_receipt_no_id".to_string(),
+                json!({
+                    "durable_receipt": true,
+                    "truncated": true,
+                    "status": "completed",
+                }),
+            ),
+            (
+                "prin\u{1f}op_state_no_id".to_string(),
+                json!({ OP_JOURNAL_STATE_FIELD: "completed" }),
+            ),
+            (
+                "prin\u{1f}op_state_empty_id".to_string(),
+                json!({
+                    OP_JOURNAL_STATE_FIELD: "completed",
+                    "operation_id": "",
+                }),
+            ),
+        ];
+        for (key, value) in &cases {
+            assert_eq!(
+                op_journal_entry_state(value),
+                OpJournalEntryState::Uncertain,
+                "completed marker without an operation_id must be uncertain: {key}"
+            );
+            runtime.op_journal.insert(key.clone(), value.clone());
+        }
+
+        // Replay is refused: a retried operation must never be told its side
+        // effect completed when the receipt is not provably a receipt.
+        for (key, _) in &cases {
+            let err = runtime.lookup_idempotent(Some(key)).unwrap_err();
+            assert!(
+                err.to_string().contains("uncertain"),
+                "malformed marker must refuse replay: {key}: {err}"
+            );
+        }
+
+        // Eviction never touches them, even with an ancient age stamp.
+        let now = DaemonRuntime::now();
+        for (key, value) in &cases {
+            let mut value = value.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(OP_JOURNAL_COMPLETED_UNIX_FIELD.into(), json!(now - 100_000));
+            }
+            runtime.op_journal.insert(key.clone(), value);
+        }
+        let evicted = runtime
+            .evict_expired_completed_op_journal_entries()
+            .expect("eviction");
+        assert_eq!(evicted, 0, "malformed markers must never be evicted");
+        assert_eq!(runtime.op_journal.len(), cases.len());
+
+        // The durable view keeps them verbatim (never compacted away).
+        let view = op_journal_durable_view(&runtime.op_journal);
+        for (key, value) in &cases {
+            let durable = view.get(key).expect("marker survives durable view");
+            assert_eq!(
+                durable.get("durable_receipt"),
+                value.get("durable_receipt"),
+                "marker must survive the durable view verbatim: {key}"
+            );
+            assert_eq!(
+                durable.get(OP_JOURNAL_STATE_FIELD),
+                value.get(OP_JOURNAL_STATE_FIELD),
+                "marker must survive the durable view verbatim: {key}"
+            );
+        }
+
+        // A genuine receipt (durable_receipt + operation_id) still replays.
+        let good = json!({
+            "durable_receipt": true,
+            "truncated": true,
+            "status": "completed",
+            "operation_id": "op_genuine",
+            OP_JOURNAL_COMPLETED_UNIX_FIELD: now,
+        });
+        assert_eq!(
+            op_journal_entry_state(&good),
+            OpJournalEntryState::Completed,
+            "receipt with its exact-once operation_id is completed"
+        );
+        runtime
+            .op_journal
+            .insert("prin\u{1f}op_genuine".into(), good);
+        let replayed = runtime
+            .lookup_idempotent(Some(&"prin\u{1f}op_genuine".to_string()))
+            .expect("lookup")
+            .expect("genuine receipt replays");
+        assert_eq!(replayed["operation_id"], "op_genuine");
+    }
+
+    /// P0-B: a top-level entry that is not a JSON object (`null`, array,
+    /// string, number, boolean) has no state field by construction, but it is
+    /// not a completed receipt this version writes either. The old classifier
+    /// treated any value without a state field as `Completed`, so a malformed
+    /// top-level entry could be compacted/evicted/replayed as a receipt —
+    /// hiding an unfinished side effect. It must be classified uncertain
+    /// (fail-closed) instead.
+    #[test]
+    fn non_object_op_journal_entries_are_fail_closed() {
+        let cases = [
+            json!(null),
+            json!([1, 2, 3]),
+            json!("just a string"),
+            json!(42),
+            json!(true),
+        ];
+        for value in &cases {
+            assert_eq!(
+                op_journal_entry_state(value),
+                OpJournalEntryState::Uncertain,
+                "non-object entry must be uncertain: {value}"
+            );
+            assert!(
+                is_op_journal_uncertain(value),
+                "non-object entry must never be treated as a completed receipt: {value}"
+            );
+        }
+
+        // The durable view keeps them verbatim (never compacted away).
+        let mut journal = HashMap::new();
+        for (i, value) in cases.iter().enumerate() {
+            journal.insert(format!("prin\u{1f}op_bad_{i}"), value.clone());
+        }
+        let view = op_journal_durable_view(&journal);
+        for (i, value) in cases.iter().enumerate() {
+            let key = format!("prin\u{1f}op_bad_{i}");
+            assert_eq!(
+                view.get(&key),
+                Some(value),
+                "non-object entry must survive the durable view verbatim: {key}"
+            );
+        }
+
+        // Replay is refused for every non-object entry, exactly like an
+        // in-progress marker.
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        for (i, value) in cases.iter().enumerate() {
+            let key = format!("prin\u{1f}op_bad_{i}");
+            runtime.op_journal.insert(key.clone(), value.clone());
+            let err = runtime.lookup_idempotent(Some(&key)).unwrap_err();
+            assert!(
+                err.to_string().contains("uncertain"),
+                "non-object entry must refuse replay: {key}: {err}"
+            );
+        }
+
+        // Eviction must never touch them, even though they have no age stamp.
+        let evicted = runtime
+            .evict_expired_completed_op_journal_entries()
+            .expect("eviction");
+        assert_eq!(evicted, 0, "non-object entries must never be evicted");
+        assert_eq!(runtime.op_journal.len(), cases.len());
+
+        // And they survive a reload from disk verbatim (bound_op_journal).
+        runtime.persist_op_journal().expect("persist");
+        let loaded = load_op_journal(&paths.state_dir.join("op-journal.json")).unwrap();
+        for (i, value) in cases.iter().enumerate() {
+            let key = format!("prin\u{1f}op_bad_{i}");
+            assert_eq!(
+                loaded.get(&key),
+                Some(value),
+                "reload must keep non-object entries fail-closed: {key}"
+            );
+        }
+    }
+
+    /// P0-B privacy: compaction at load must not leave the pre-compaction
+    /// legacy journal (with large stdout/file bodies) behind in
+    /// `op-journal.json.bak`. `atomic_write` preserves the previous file as
+    /// `.bak` before replacing it; the op-journal write path removes the
+    /// stale backup so a legacy large-body journal cannot linger on disk
+    /// indefinitely.
+    #[test]
+    fn legacy_op_journal_compaction_removes_stale_bak() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let big_body = "z".repeat(80 * 1024);
+        let legacy = serde_json::json!({
+            "prin\u{1f}op_done": {
+                "status": "completed",
+                "operation_id": "op_done",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "result": { "stdout": big_body }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let bak = dir.path().join("op-journal.json.bak");
+        // Simulate a prior atomic_write that left a stale backup holding the
+        // legacy large-body journal (the exact privacy leak being fixed).
+        std::fs::write(&bak, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let journal = load_op_journal(&path).expect("legacy journal loads and compacts");
+        assert_eq!(journal.len(), 1);
+        assert!(
+            !bak.exists(),
+            "stale .bak holding the legacy large-body journal must be removed"
+        );
+        // The durable file is the compacted receipt, not the large body.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.len() < 4 * 1024,
+            "durable file must be compacted after load, got {} bytes",
+            raw.len()
+        );
+
+        // A later persist also leaves no stale backup behind.
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime
+            .begin_idempotent(Some("prin\u{1f}op_bak".to_string()).as_ref(), "op_bak")
+            .expect("begin marker");
+        runtime
+            .store_idempotent(
+                Some("prin\u{1f}op_bak".to_string()).as_ref(),
+                &json!({
+                    "approval_required": false,
+                    "operation_id": "op_bak",
+                    "result": { "stdout": "x".repeat(80 * 1024) },
+                    "replayed": false,
+                    "decision": "allow",
+                }),
+            )
+            .expect("store");
+        let journal_path = paths.state_dir.join("op-journal.json");
+        let bak_path = paths.state_dir.join("op-journal.json.bak");
+        assert!(
+            !bak_path.exists(),
+            "persist must not leave a stale .bak behind"
+        );
+        let raw = std::fs::read_to_string(&journal_path).unwrap();
+        assert!(
+            !raw.contains("x".repeat(80 * 1024).as_str()),
+            "durable file must not retain the large result body"
+        );
+    }
+
+    /// P0-B review (privacy): a stale backup that cannot be removed must fail
+    /// startup instead of running with the pre-compaction large-body journal
+    /// still on disk while the load claims it was removed. A directory at the
+    /// backup path makes `remove_file` fail deterministically on every
+    /// platform (the same class as a locked/ACL-protected file).
+    #[test]
+    fn unremovable_stale_bak_fails_load_fail_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let big_body = "z".repeat(80 * 1024);
+        let legacy = serde_json::json!({
+            "prin\u{1f}op_done": {
+                "status": "completed",
+                "operation_id": "op_done",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "result": { "stdout": big_body }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let bak = dir.path().join("op-journal.json.bak");
+        std::fs::create_dir(&bak).unwrap();
+
+        let err = load_op_journal(&path).unwrap_err();
+        assert!(
+            err.contains("failed to remove stale op journal backup"),
+            "unremovable stale backup must fail startup with an actionable message: {err}"
+        );
+        // The primary is untouched (no half-compacted state), and the legacy
+        // large body is still on disk — the operator must resolve the backup
+        // before the daemon starts; the failure is never converted into a
+        // silent "healthy" load.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("z".repeat(80 * 1024).as_str()),
+            "a failed load must not modify the primary"
+        );
+    }
+
+    /// P0-B review: when the primary op journal is missing but a backup
+    /// survives (a crash in an older writer between its backup copy and the
+    /// replace, or an external removal of the primary), the backup is the
+    /// last-known durable journal: its exact-once receipts must not be
+    /// silently dropped by starting empty — a retried operation would
+    /// re-execute. `load_op_journal` recovers from the backup, persists the
+    /// compacted form as the new primary, and removes the backup so the
+    /// state is not double-counted.
+    #[test]
+    fn missing_primary_op_journal_recovers_from_stale_bak() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let bak = dir.path().join("op-journal.json.bak");
+        let big_body = "z".repeat(80 * 1024);
+        let legacy = serde_json::json!({
+            "prin\u{1f}op_done": {
+                "status": "completed",
+                "operation_id": "op_done",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "result": { "stdout": big_body }
+            },
+            "prin\u{1f}op_inflight": {
+                "__ownmesh_operation_state": "in_progress",
+                "operation_id": "op_inflight",
+                "result": { "stdout": "pending body" }
+            }
+        });
+        assert!(!path.exists());
+        std::fs::write(&bak, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let journal = load_op_journal(&path).expect("recovery from backup must succeed");
+        // Both the completed receipt and the in-progress marker survive.
+        assert_eq!(journal.len(), 2);
+        let done = journal.get("prin\u{1f}op_done").expect("completed receipt");
+        assert_eq!(done["durable_receipt"], true);
+        assert_eq!(done["operation_id"], "op_done");
+        assert!(journal["prin\u{1f}op_inflight"]["__ownmesh_operation_state"] == "in_progress");
+        // The recovered state is the new primary and the backup is gone.
+        assert!(
+            !bak.exists(),
+            "recovered backup must be removed after promotion"
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("durable_receipt"),
+            "primary must hold the compacted recovery journal"
+        );
+        assert!(
+            !raw.contains("z".repeat(80 * 1024).as_str()),
+            "recovered primary must not retain the large legacy body"
+        );
+        // A reload reads the promoted primary (no double-count, no re-recovery).
+        let reloaded = load_op_journal(&path).unwrap();
+        assert_eq!(reloaded.len(), 2);
+    }
+
+    /// P0-B review: a corrupt/over-budget backup with a missing primary is
+    /// never converted into an empty journal — starting empty would bypass
+    /// the exact-once receipts the backup may hold. The load fails closed
+    /// with an actionable message.
+    #[test]
+    fn missing_primary_with_corrupt_bak_fails_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let bak = dir.path().join("op-journal.json.bak");
+        std::fs::write(&bak, br#"{"broken"#).unwrap();
+
+        let err = load_op_journal(&path).unwrap_err();
+        assert!(
+            err.contains("op journal backup") && err.contains("corrupt"),
+            "corrupt backup must fail closed with an actionable message: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "a failed recovery must not fabricate an empty primary"
+        );
+        // A fresh install with no primary and no backup is still empty.
+        let fresh = dir.path().join("fresh-op-journal.json");
+        let empty = load_op_journal(&fresh).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    /// P0-B review: `load_op_journal` must be durably fail-closed. If the
+    /// compaction cannot be persisted, the load fails instead of returning a
+    /// compacted in-memory view while the legacy large bodies remain on disk
+    /// — diagnostics would otherwise report the compacted state while the
+    /// durable file is still over budget.
+    #[cfg(unix)]
+    #[test]
+    fn load_op_journal_fails_closed_when_compaction_persist_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("op-journal.json");
+        let big_body = "x".repeat(80 * 1024);
+        let legacy = serde_json::json!({
+            "prin\u{1f}op_done": {
+                "status": "completed",
+                "operation_id": "op_done",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "result": { "stdout": big_body }
+            }
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        // Make the journal directory read-only so the compaction persist fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = load_op_journal(&path).unwrap_err();
+        assert!(
+            err.contains("failed to persist compacted operation journal"),
+            "load must fail closed with an actionable message: {err}"
+        );
+        // The durable file still holds the legacy large body: the failed
+        // compaction wrote nothing, and the in-memory view never diverged
+        // from the durable file.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("x".repeat(80 * 1024).as_str()),
+            "failed compaction must not have rewritten the durable file"
+        );
+    }
+
+    /// P0-B review: the stale `.bak` is removed *before* the compacted write,
+    /// so a crash between the write and the cleanup cannot leave a legacy
+    /// large-body copy on disk while the daemon is stopped. The fault hook
+    /// fires after the stale-backup removal and before the durable write:
+    /// when the write then fails, the backup is already gone and the primary
+    /// remains authoritative (the failed write wrote nothing, so no exact-once
+    /// receipt was lost).
+    #[test]
+    fn stale_bak_is_removed_before_compaction_write() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let runtime = DaemonRuntime::open(&paths).unwrap();
+        let primary = paths.state_dir.join("op-journal.json");
+        let bak = paths.state_dir.join("op-journal.json.bak");
+        // Simulate a prior atomic_write that left a stale backup holding a
+        // legacy large-body journal (the exact privacy leak being fixed), and
+        // a primary that exists (the authoritative state).
+        let big_body = "z".repeat(80 * 1024);
+        let legacy = serde_json::json!({
+            "prin\u{1f}op_done": {
+                "status": "completed",
+                "operation_id": "op_done",
+                "approval_required": false,
+                "replayed": false,
+                "decision": "allow",
+                "result": { "stdout": big_body }
+            }
+        });
+        std::fs::write(&primary, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        std::fs::write(&bak, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        // Fault the write (after the stale-backup removal, before the durable
+        // write). The persist fails, but the backup must already be gone.
+        runtime.fail_op_journal_write_on_nth_call_for_test(1);
+        let err = runtime.persist_op_journal().unwrap_err();
+        let err_message = match &err {
+            ownmesh_ipc::IpcError::Remote { message, .. } => message.clone(),
+            other => format!("{other:?}"),
+        };
+        assert!(
+            err_message.contains("fault-injected op journal write"),
+            "write fault must fire: {err:?}"
+        );
+        assert!(
+            !bak.exists(),
+            "stale .bak must be removed before the write so a crash between the write and the \
+cleanup cannot leave the legacy large-body copy behind"
+        );
+        // The primary is authoritative and unchanged (the failed write wrote
+        // nothing), so no exact-once receipt was lost.
+        let raw = std::fs::read_to_string(&primary).unwrap();
+        assert!(
+            raw.contains(big_body.as_str()),
+            "primary must remain authoritative and unchanged after the failed write"
+        );
+    }
+
+    /// P0-B review: the byte-budget check must use the pretty-serialized
+    /// size the durable writer actually emits. A journal whose compact form
+    /// fits the budget but whose pretty form exceeds it must be rejected —
+    /// otherwise the file written to disk would exceed the cap the check
+    /// validated (a reproducible uncertain entry measured 4,194,285 compact
+    /// bytes vs 4,194,305 pretty bytes against the 4 MiB cap).
+    #[test]
+    fn bound_op_journal_rejects_pretty_oversize_even_when_compact_fits() {
+        // In-progress/uncertain markers are kept verbatim by compaction, so
+        // a journal of them can be sized to land compact-under/pretty-over
+        // the budget. The compact/pretty difference is pure JSON framing
+        // (whitespace), independent of payload content, so measure the
+        // framing constant once and solve for the body size deterministically
+        // instead of searching.
+        let mut journal = HashMap::new();
+        for i in 0..100 {
+            journal.insert(
+                format!("prin\u{1f}op_uncertain_{i}"),
+                json!({
+                    OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                    "operation_id": format!("op_uncertain_{i}"),
+                    "payload": "",
+                }),
+            );
+        }
+        let base_compact = serde_json::to_vec(&journal).unwrap().len();
+        let base_pretty = serde_json::to_vec_pretty(&journal).unwrap().len();
+        let overhead = base_pretty - base_compact;
+        assert!(
+            overhead > 0 && overhead < MAX_OP_JOURNAL_FILE_BYTES / 2,
+            "fixture framing overhead must be sane: {overhead}"
+        );
+        // compact(B) = base_compact + 100*B; pretty(B) = compact(B) + overhead.
+        // Target compact = budget - overhead/2 so pretty lands over the budget.
+        let target_compact = MAX_OP_JOURNAL_FILE_BYTES - overhead / 2;
+        let body_len = (target_compact - base_compact) / 100;
+        let body = "u".repeat(body_len);
+        for i in 0..100 {
+            journal.insert(
+                format!("prin\u{1f}op_uncertain_{i}"),
+                json!({
+                    OP_JOURNAL_STATE_FIELD: OP_JOURNAL_IN_PROGRESS,
+                    "operation_id": format!("op_uncertain_{i}"),
+                    "payload": body,
+                }),
+            );
+        }
+        let compact = serde_json::to_vec(&journal).unwrap().len();
+        let pretty = serde_json::to_vec_pretty(&journal).unwrap().len();
+        assert!(
+            compact < MAX_OP_JOURNAL_FILE_BYTES && pretty > MAX_OP_JOURNAL_FILE_BYTES,
+            "fixture must land compact-under/pretty-over the budget (compact {compact}, pretty {pretty})"
+        );
+        assert!(
+            bound_op_journal(journal).is_err(),
+            "pretty-oversize journal must be rejected even when compact fits"
+        );
+    }
+
+    /// P0-B review (High): an expired transition record whose *old* binding's
+    /// child is provably dead must NOT be cleared while a distinct successor
+    /// binding (`new_binding`) is live. The old proof checked only the first
+    /// available child identity and returned early, orphaning the live
+    /// successor. Every referenced binding must be covered before the row is
+    /// cleared.
+    #[tokio::test]
+    async fn expired_record_with_live_successor_binding_is_retained_fail_closed() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let mut record = expired_record("tr_live_successor", &sid, now);
+        let live_pid = std::process::id();
+        let live_birth = ownmesh_ipc::process_birth_id(live_pid)
+            .expect("the test process attests its own birth id")
+            .expect("the test process is live");
+        let mut successor = record.old_binding.clone();
+        successor.host_nonce = "nonce_successor".into();
+        successor.controller_epoch = 2;
+        successor.child_pid = Some(live_pid);
+        successor.child_process_birth = Some(live_birth);
+        record.new_binding = Some(successor);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "a live successor binding must retain the expired record"
+        );
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 1);
+        assert_eq!(
+            runtime.transition_recovery_health.retained_expired[0],
+            "tr_live_successor"
+        );
+    }
+
+    /// P0-B review (High): when the old binding's child is dead but the
+    /// distinct successor binding is provisional (no attested pid) and no
+    /// supervisor is connected to prove it dead, the record must be retained
+    /// fail-closed. The old proof returned `Ok(true)` from the first
+    /// (dead) binding alone and cleared the row without any proof for the
+    /// successor.
+    #[tokio::test]
+    async fn expired_record_with_provisional_successor_and_no_supervisor_is_retained() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let mut record = expired_record("tr_provisional_successor", &sid, now);
+        let mut successor = record.old_binding.clone();
+        successor.host_nonce = "nonce_successor".into();
+        successor.controller_epoch = 2;
+        successor.child_pid = None;
+        successor.child_process_birth = None;
+        record.new_binding = Some(successor);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+        // No supervisor connected: the successor's death cannot be proved.
+        assert!(runtime.supervisor.is_none());
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert_eq!(
+            runtime.transition_journal.pending().len(),
+            1,
+            "an unproven successor must retain the expired record (ambiguity is never success)"
+        );
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 1);
+    }
+
+    /// P0-B review (High): when *both* referenced bindings carry confirmed-dead
+    /// child identities, the expired record is provably moot and clears even
+    /// though a successor binding is present — coverage of every referenced
+    /// binding is what matters, not a blanket retention.
+    #[tokio::test]
+    async fn expired_record_with_dead_successor_binding_is_cleared() {
+        let (_dir, mut runtime, sid) = runtime_with_session(true);
+        let now = DaemonRuntime::now();
+        let mut record = expired_record("tr_dead_successor", &sid, now);
+        let mut successor = record.old_binding.clone();
+        successor.host_nonce = "nonce_successor".into();
+        successor.controller_epoch = 2;
+        successor.child_pid = Some(DEAD_TEST_PID);
+        successor.child_process_birth = Some(2);
+        record.new_binding = Some(successor);
+        runtime
+            .transition_journal
+            .begin(record)
+            .expect("begin record");
+
+        runtime.reconcile_expired_transitions().await;
+
+        assert!(
+            runtime.transition_journal.pending().is_empty(),
+            "both referenced bindings provably dead: the moot record clears"
+        );
+        assert_eq!(runtime.transition_recovery_health.retained_expired_total, 0);
+    }
+
+    /// P0-B review (Medium): a compacted `review.start` receipt must replay
+    /// with the same terminal status/phase as the first response. The old
+    /// durable view read only `status` (absent on a review body) and defaulted
+    /// it to `completed`, so a compacted failed/cancelled review was persisted
+    /// by the control plane as a successful operation result. The terminal
+    /// `phase` is preserved and `status` is derived from it.
+    #[test]
+    fn op_journal_durable_view_preserves_terminal_review_phase_and_status() {
+        let mut journal = HashMap::new();
+        journal.insert(
+            "prin\u{1f}op_review_failed".into(),
+            json!({
+                "review_id": "rev_failed_1",
+                "phase": "failed",
+                "operation_id": "op_review_failed_1",
+                "remote_payload_hash": "a".repeat(64),
+                "workspace_id": "ws_default",
+            }),
+        );
+        journal.insert(
+            "prin\u{1f}op_review_cancelled".into(),
+            json!({
+                "review_id": "rev_cancelled_1",
+                "phase": "cancelled",
+                "operation_id": "op_review_cancelled_1",
+                "remote_payload_hash": "a".repeat(64),
+            }),
+        );
+        journal.insert(
+            "prin\u{1f}op_review_completed".into(),
+            json!({
+                "review_id": "rev_completed_1",
+                "phase": "completed",
+                "operation_id": "op_review_completed_1",
+                "remote_payload_hash": "a".repeat(64),
+            }),
+        );
+        let view = op_journal_durable_view(&journal);
+        let failed = view.get("prin\u{1f}op_review_failed").unwrap();
+        assert_eq!(
+            failed.get("status").and_then(Value::as_str),
+            Some("failed"),
+            "failed review must replay as failed, not completed: {failed}"
+        );
+        assert_eq!(
+            failed.get("phase").and_then(Value::as_str),
+            Some("failed"),
+            "terminal phase must be preserved on the compact receipt: {failed}"
+        );
+        assert_eq!(
+            failed.get("review_id").and_then(Value::as_str),
+            Some("rev_failed_1"),
+            "review_id continuation must survive compaction"
+        );
+        let cancelled = view.get("prin\u{1f}op_review_cancelled").unwrap();
+        assert_eq!(
+            cancelled.get("status").and_then(Value::as_str),
+            Some("cancelled"),
+            "cancelled review must replay as cancelled: {cancelled}"
+        );
+        let completed = view.get("prin\u{1f}op_review_completed").unwrap();
+        assert_eq!(
+            completed.get("status").and_then(Value::as_str),
+            Some("completed")
+        );
+        // All three remain provably-completed receipts (replayable); only the
+        // status/phase wording differs.
+        for key in [
+            "prin\u{1f}op_review_failed",
+            "prin\u{1f}op_review_cancelled",
+            "prin\u{1f}op_review_completed",
+        ] {
+            assert_eq!(
+                op_journal_entry_state(view.get(key).unwrap()),
+                OpJournalEntryState::Completed,
+                "{key} must remain a completed receipt"
+            );
+        }
+    }
+
+    /// P0-B review (Medium): `session.renew`/`give`/`claim` return their
+    /// controller lease at the top level as `lease`; the compact receipt must
+    /// preserve it so a replayed remote mutation is schema-stable with the
+    /// first response (a client retrying renew must see the actual extended
+    /// expiry).
+    #[test]
+    fn op_journal_durable_view_preserves_top_level_lease() {
+        let journal = HashMap::from([(
+            "prin\u{1f}op_renew_1".to_string(),
+            json!({
+                "status": "completed",
+                "operation_id": "op_renew_1",
+                "approval_required": false,
+                "decision": "allow",
+                "session_id": "ses_renew_1",
+                "workspace_id": "ws_default",
+                "lease": {
+                    "principal_id": "client:remote:t:p",
+                    "lease_id": "lease_renew_1",
+                    "epoch": 4,
+                    "expires_unix": 1_700_000_000,
+                },
+                "result": { "stdout": "x".repeat(80 * 1024) },
+            }),
+        )]);
+        let view = op_journal_durable_view(&journal);
+        let receipt = view.get("prin\u{1f}op_renew_1").unwrap();
+        assert_eq!(receipt["durable_receipt"], true);
+        assert_eq!(
+            receipt["lease"]["expires_unix"].as_i64(),
+            Some(1_700_000_000),
+            "the extended lease expiry must survive compaction: {receipt}"
+        );
+        assert_eq!(receipt["lease"]["lease_id"].as_str(), Some("lease_renew_1"));
+        assert_eq!(receipt["lease"]["epoch"].as_u64(), Some(4));
+        assert!(
+            receipt.get("result").is_none(),
+            "large result body must still be dropped"
+        );
+    }
+
+    /// P0-B review (High): a remote `session.renew` retried with the same
+    /// signed operation key must replay its first receipt — it must never
+    /// extend the lease a second time. The transport injects the key, but the
+    /// handler previously discarded it.
+    #[tokio::test]
+    async fn session_renew_is_exact_once_with_remote_idempotency_key() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        let now = DaemonRuntime::now();
+        let remote_principal = "client:remote:tenant_test:principal_test";
+        let info = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "renew-exact-once",
+                remote_principal,
+                now,
+                None,
+            )
+            .unwrap();
+        let lease = runtime
+            .sessions
+            .get(&info.id)
+            .unwrap()
+            .controller
+            .clone()
+            .unwrap();
+        let remote = ClientIdentity::new(remote_principal, "agent");
+        let params = json!({
+            "id": info.id,
+            "lease_id": lease.lease_id,
+            "controller_epoch": lease.epoch,
+            "ttl_secs": 60,
+            "idempotency_key": "idem_renew_exact_1",
+        });
+
+        let first = runtime
+            .handle_session_renew(Some(params.clone()), &remote)
+            .await
+            .expect("first renew");
+        let first_expiry = first["lease"]["expires_unix"].as_i64().unwrap();
+        let first_lease_id = first["lease"]["lease_id"].as_str().unwrap().to_string();
+        assert!(first_expiry > now);
+        assert_eq!(runtime.sessions.list().len(), 1);
+
+        // Retry with the same key: replay the receipt; the lease is not
+        // extended a second time and the sidecar nonce is not rotated twice.
+        let retry = runtime
+            .handle_session_renew(Some(params), &remote)
+            .await
+            .expect("replayed renew");
+        assert_eq!(retry["replayed"], true, "{retry}");
+        assert_eq!(
+            retry["lease"]["expires_unix"].as_i64(),
+            Some(first_expiry),
+            "replay must return the first (already-extended) expiry: {retry}"
+        );
+        assert_eq!(
+            retry["lease"]["lease_id"].as_str(),
+            Some(first_lease_id.as_str())
+        );
+        assert_eq!(
+            runtime
+                .sessions
+                .get(&info.id)
+                .unwrap()
+                .controller
+                .as_ref()
+                .unwrap()
+                .expires_unix,
+            first_expiry,
+            "the lease must not be extended a second time"
+        );
+
+        // A different key renews again (extends from the current expiry).
+        let other = runtime
+            .handle_session_renew(
+                Some(json!({
+                    "id": info.id,
+                    "lease_id": lease.lease_id,
+                    "controller_epoch": lease.epoch,
+                    "ttl_secs": 60,
+                    "idempotency_key": "idem_renew_exact_2",
+                })),
+                &remote,
+            )
+            .await
+            .expect("second renew");
+        assert!(
+            other.get("replayed").is_none(),
+            "a brand-new operation has no replayed marker: {other}"
+        );
+        assert!(
+            other["lease"]["expires_unix"].as_i64().unwrap() >= first_expiry,
+            "a new operation extends the lease from the current expiry (same-second timestamps may be equal)"
+        );
+
+        // Local IPC (no key) is unchanged: each call renews.
+        let local = ClientIdentity::new(remote_principal, "local");
+        let local_params = json!({
+            "id": info.id,
+            "lease_id": lease.lease_id,
+            "controller_epoch": lease.epoch,
+            "ttl_secs": 60,
+        });
+        let local_renew = runtime
+            .handle_session_renew(Some(local_params.clone()), &local)
+            .await
+            .expect("local renew without key");
+        assert!(local_renew.get("replayed").is_none());
+        let local_renew2 = runtime
+            .handle_session_renew(Some(local_params), &local)
+            .await
+            .expect("second local renew without key");
+        assert!(local_renew2.get("replayed").is_none());
+    }
+
+    /// P0-B review (High): `session.close` is a terminal side-effect mutation
+    /// (it terminates the sidecar). A retried remote close with the same key
+    /// must replay the first receipt instead of re-running the close (which
+    /// would fail as a stale lease CAS) or issuing a second termination.
+    #[tokio::test]
+    async fn session_close_is_exact_once_with_remote_idempotency_key() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        let now = DaemonRuntime::now();
+        let remote_principal = "client:remote:tenant_test:principal_close";
+        let info = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "close-exact-once",
+                remote_principal,
+                now,
+                None,
+            )
+            .unwrap();
+        let lease = runtime
+            .sessions
+            .get(&info.id)
+            .unwrap()
+            .controller
+            .clone()
+            .unwrap();
+        let remote = ClientIdentity::new(remote_principal, "agent");
+        let params = json!({
+            "id": info.id,
+            "lease_id": lease.lease_id,
+            "controller_epoch": lease.epoch,
+            "idempotency_key": "idem_close_exact_1",
+        });
+
+        let first = runtime
+            .handle_session_close(Some(params.clone()), &remote)
+            .await
+            .expect("first close");
+        assert_eq!(first["closed"], true);
+        assert_eq!(
+            runtime.sessions.get(&info.id).unwrap().state,
+            SessionState::Closed
+        );
+        // Retry with the same key: replay the receipt. Without the journal,
+        // the retry would fail `authorize_controller_lease` (the seat is gone)
+        // or, worse, re-run the close path.
+        let retry = runtime
+            .handle_session_close(Some(params), &remote)
+            .await
+            .expect("replayed close");
+        assert_eq!(retry.get("replayed").and_then(Value::as_bool), Some(true));
+        assert_eq!(retry["closed"], true);
+        assert_eq!(
+            retry.get("session_id").and_then(Value::as_str),
+            Some(info.id.as_str())
+        );
+        assert_eq!(
+            runtime.sessions.get(&info.id).unwrap().state,
+            SessionState::Closed,
+            "the retry must not reopen or double-close"
+        );
+    }
+
+    /// P0-B review (Medium): `session.open` consults its idempotency receipt
+    /// before workspace preflight, so a retry after response loss still
+    /// returns the original receipt when the workspace was removed
+    /// (preflight would otherwise fail on the retry).
+    #[tokio::test]
+    async fn session_open_retry_replays_before_workspace_preflight() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullUserAccess));
+        let local = ClientIdentity::new("client:local:test", "test");
+
+        // First open with a caller idempotency key creates the session.
+        let first = runtime
+            .dispatch(
+                session_methods::OPEN,
+                Some(json!({
+                    "title": "preflight-replay",
+                    "kind": "process",
+                    "idempotency_key": "idem_open_preflight_1",
+                })),
+                &local,
+            )
+            .await
+            .expect("first session.open");
+        let first_id = first["id"].as_str().unwrap().to_string();
+
+        // Removing the (default) workspace registry entry does not exist here,
+        // so simulate the preflight failure the fix must bypass: a workspace
+        // that is no longer registered. The replay happens before the
+        // workspace resolution, so it still succeeds.
+        runtime.workspaces.clear();
+        let retry = runtime
+            .dispatch(
+                session_methods::OPEN,
+                Some(json!({
+                    "title": "preflight-replay",
+                    "kind": "process",
+                    "idempotency_key": "idem_open_preflight_1",
+                })),
+                &local,
+            )
+            .await
+            .expect("replayed session.open must bypass removed-workspace preflight");
+        assert_eq!(retry["replayed"], true, "{retry}");
+        assert_eq!(
+            retry.get("id").and_then(Value::as_str),
+            Some(first_id.as_str()),
+            "replay must continue the original session"
+        );
+
+        // A NEW open (different key) fails preflight fail-closed and leaves no
+        // journal marker (preflight errors never poison a key).
+        let err = runtime
+            .dispatch(
+                session_methods::OPEN,
+                Some(json!({
+                    "title": "preflight-new",
+                    "kind": "process",
+                    "workspace_id": "ws_default",
+                    "idempotency_key": "idem_open_preflight_2",
+                })),
+                &local,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("workspace"),
+            "new open with an unregistered workspace must fail: {err}"
+        );
+        // The failed preflight did not reserve a marker for the new key.
+        assert!(
+            runtime
+                .lookup_idempotent(Some(&principal_journal_key(
+                    &local.client_name,
+                    "idem_open_preflight_2"
+                )))
+                .is_ok()
+                && runtime
+                    .lookup_idempotent(Some(&principal_journal_key(
+                        &local.client_name,
+                        "idem_open_preflight_2"
+                    )))
+                    .unwrap()
+                    .is_none(),
+            "preflight failure must not leave an in-progress marker"
+        );
+    }
+
+    /// P0-B review (Medium): `persist_op_journal` must fail closed (rolling
+    /// back the in-memory mutation) when a stale `.bak` cannot be removed
+    /// before the compacted write — otherwise compaction "succeeds" while the
+    /// pre-compaction large-body journal remains on disk, exactly the privacy
+    /// class that only startup used to refuse.
+    #[test]
+    fn unremovable_stale_bak_fails_persist_fail_closed() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let key = "prin\u{1f}op_bakfail_1".to_string();
+        // The primary must exist so the pre-write removal path runs; the
+        // begin marker persists it.
+        runtime
+            .begin_idempotent(Some(&key), "op_bakfail_1")
+            .expect("begin marker");
+        assert!(paths.state_dir.join("op-journal.json").exists());
+        // An unremovable stale backup (a directory at the .bak path makes
+        // remove_file fail deterministically on every platform).
+        let bak = paths.state_dir.join("op-journal.json.bak");
+        std::fs::create_dir(&bak).unwrap();
+
+        let err = runtime
+            .store_idempotent(
+                Some(&key),
+                &json!({
+                    "approval_required": false,
+                    "operation_id": "op_bakfail_1",
+                    "result": { "stdout": "z".repeat(80 * 1024) },
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to remove stale op journal backup"),
+            "unremovable stale backup must fail the persist with an actionable message: {err}"
+        );
+        // The in-memory entry is rolled back to the fail-closed marker (never
+        // a claim of completed while the large body remains on disk).
+        assert!(
+            is_op_journal_in_progress(runtime.op_journal.get(&key).unwrap()),
+            "a failed persist must restore the in-progress marker, not a completed receipt"
+        );
+        // The primary is untouched (no half-compacted state).
+        let raw = std::fs::read_to_string(paths.state_dir.join("op-journal.json")).unwrap();
+        assert!(
+            !raw.contains("z".repeat(80 * 1024).as_str()),
+            "failed persist must not write anything"
+        );
+
+        // Resolve the blocker; the same store now succeeds and compacts.
+        std::fs::remove_dir(&bak).unwrap();
+        runtime
+            .store_idempotent(
+                Some(&key),
+                &json!({
+                    "approval_required": false,
+                    "operation_id": "op_bakfail_1",
+                    "result": { "stdout": "z".repeat(80 * 1024) },
+                }),
+            )
+            .expect("store after resolving the backup");
+        let raw = std::fs::read_to_string(paths.state_dir.join("op-journal.json")).unwrap();
+        assert!(
+            !raw.contains("z".repeat(80 * 1024).as_str()),
+            "successful persist must compact the large body away"
+        );
     }
 }

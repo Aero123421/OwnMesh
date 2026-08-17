@@ -80,9 +80,13 @@ impl OwnMeshPaths {
 
     /// Ensure config/state/runtime/cache directories exist.
     ///
+    /// Directories are created owner-only on Unix so the layout is valid under
+    /// any umask; the daemon custody attestation rejects group/world-writable
+    /// ancestors.
+    ///
     /// # Errors
     ///
-    /// Returns IO errors from `create_dir_all`.
+    /// Returns IO errors from directory creation.
     pub fn ensure_layout(&self) -> ConfigResult<()> {
         for dir in [
             &self.config_dir,
@@ -91,13 +95,36 @@ impl OwnMeshPaths {
             &self.cache_dir,
             &self.keystore_dir(),
         ] {
-            std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
+            create_dir_owner_only(dir).map_err(|source| ConfigError::Io {
                 path: Some(dir.clone()),
                 source,
             })?;
         }
         Ok(())
     }
+}
+
+/// Create a directory tree with owner-only permissions on Unix, independent of
+/// the process umask.
+///
+/// OwnMesh's config/state/runtime/cache directories hold credentials and
+/// custody-validated state. The daemon's custody attestation rejects
+/// group/world-writable ancestors (`validate_parent_custody` in ownmesh-ipc),
+/// so a umask such as `002` that makes `create_dir_all` produce `0775`
+/// directories would otherwise prevent the daemon from starting. Creating the
+/// tree with mode `0700` keeps the layout correct-by-construction; existing
+/// directories are left untouched (their ownership is attested separately).
+#[cfg(unix)]
+fn create_dir_owner_only(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(dir)
+}
+
+#[cfg(not(unix))]
+fn create_dir_owner_only(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -236,5 +263,60 @@ mod tests {
         paths.ensure_layout().unwrap();
         assert!(paths.config_file().starts_with(dir.path()));
         assert!(paths.keystore_dir().exists());
+    }
+
+    /// Regression: `ensure_layout` must create owner-only directories even
+    /// under the most permissive umask (000). The daemon custody attestation
+    /// rejects group/world-writable ancestors, so a umask-dependent layout
+    /// would prevent startup on systems with umask 002/000.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_layout_is_owner_only_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "OWNMESH_LAYOUT_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Parent: re-run this exact test in a child whose umask is 000 so
+            // `create_dir_all` would produce 0777 directories if the layout
+            // creation were umask-dependent.
+            let exe = std::env::current_exe().expect("current test executable");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(
+                    "umask 000; exec \"$0\" --exact \
+                     paths::tests::ensure_layout_is_owner_only_under_permissive_umask \
+                     --nocapture",
+                )
+                .arg(exe)
+                .env(CHILD, "1")
+                .output()
+                .expect("run umask-000 child");
+            assert!(
+                output.status.success(),
+                "umask-000 child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Child: umask is 000 here.
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        for d in [
+            &paths.config_dir,
+            &paths.state_dir,
+            &paths.runtime_dir,
+            &paths.cache_dir,
+            &paths.keystore_dir(),
+        ] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "{} must be owner-only under umask 000, got mode {:o}",
+                d.display(),
+                mode
+            );
+        }
     }
 }

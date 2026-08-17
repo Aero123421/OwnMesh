@@ -18,6 +18,7 @@ import {
   compactPublicEnvelope,
   makeEnvelope,
   sanitizeMcpArgs,
+  normalizeSystemDiagnosis,
 } from "./mcp.ts";
 import {
   applyMcpOperationResult,
@@ -759,6 +760,463 @@ test("durable system diagnosis drops non-contract Agent fields", async () => {
   assert.equal(record?.data.recommendation, "select_workspace");
   assert.doesNotMatch(JSON.stringify(record?.data), /must-not-persist|C:\\\\secret|argv/);
 });
+test("system diagnosis folds device-local journal and discovery health into overall", () => {
+  const device = {
+    agent_version: "1.2.13",
+    protocol_version: "ownmesh.device/1.0",
+    created_at: "2026-08-13T00:00:00Z",
+  };
+  const observedAt = "2026-08-13T00:00:00Z";
+  const check = (id: string, state: string, status: "pass" | "warn" = "pass") => ({
+    id, status, state,
+    provenance: ["policy", "workspace", "sessions"].includes(id)
+      ? "authoritative"
+      : "observed",
+    observed_at: observedAt,
+  });
+  const baseChecks = [
+    check("policy", "allow"), check("workspace", "bound_enforced"),
+    check("daemon", "running"), check("session_supervisor", "not_required"),
+    { ...check("sessions", "healthy"), count: 0, nonterminal_count: 0, stale_count: 0 },
+  ];
+
+  // A poisoned transition journal lifts overall away from healthy.
+  const poisoned = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: {
+        transition: { status: "fail", pending: 2, expired_pending: 2, retained_unresolved: 1 },
+        op_journal: { status: "ok", entries: 3, in_progress: 0 },
+      },
+      profile_discovery: { status: "ok", notes: [] },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(poisoned.overall, "transition_journal_issues");
+  assert.equal(poisoned.recommendation, "run_local_doctor");
+  const transition = (poisoned.journals as Record<string, unknown>).transition as Record<string, unknown>;
+  assert.equal(transition.status, "fail");
+  assert.equal(transition.retained_unresolved, 1);
+
+  // Critical op-journal pressure.
+  const pressured = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: { transition: { status: "ok" }, op_journal: { status: "critical", entries: 4096, in_progress: 1 } },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(pressured.overall, "op_journal_pressure");
+  assert.equal(pressured.recommendation, "run_local_doctor");
+
+  // P1-F: uncertain op-journal entries (unknown/forward-version or malformed
+  // state the device runtime refuses to replay/compact/evict) lift overall
+  // away from healthy even though the status is only `warn` — warn-level
+  // *pressure* alone intentionally does not.
+  const uncertain = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: { transition: { status: "ok" }, op_journal: { status: "warn", entries: 1, in_progress: 0, uncertain: 1 } },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(uncertain.overall, "op_journal_uncertain");
+  assert.equal(uncertain.recommendation, "run_local_doctor");
+  const opJournalOut = (uncertain.journals as Record<string, unknown>).op_journal as Record<string, unknown>;
+  assert.equal(opJournalOut.uncertain, 1);
+
+  // Warn-level pressure alone (no uncertain entries) stays healthy overall.
+  const warnPressure = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: { transition: { status: "ok" }, op_journal: { status: "warn", entries: 2500, in_progress: 0, uncertain: 0 } },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(warnPressure.overall, "healthy");
+  assert.equal(
+    ((warnPressure.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
+    "warn",
+  );
+
+  // Profile-discovery failure.
+  const discovery = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      profile_discovery: { status: "warn", notes: ["user-local bin dir not searched"] },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(discovery.overall, "profile_discovery_issues");
+  assert.equal(discovery.recommendation, "run_local_doctor");
+  assert.deepEqual(
+    (discovery.profile_discovery as Record<string, unknown>).notes,
+    ["user-local bin dir not searched"],
+  );
+
+  // Old Agents (no fields) stay healthy and additive fields default to ok —
+  // no schema version bump, no exfiltration surface.
+  const legacy = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.5", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      path: "C:\\secret",
+      credential: "must-not-persist",
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(legacy.overall, "healthy", "absent additive fields must not fail the diagnosis");
+  assert.equal(
+    ((legacy.journals as Record<string, unknown>).transition as Record<string, unknown>).status,
+    "ok",
+  );
+  assert.equal(
+    ((legacy.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
+    "ok",
+  );
+  const json = JSON.stringify(legacy);
+  assert.doesNotMatch(json, /must-not-persist|C:\\secret/);
+
+  // P1-F: a present-but-malformed status (wrong type or unrecognized string)
+  // must be surfaced as `malformed` and lift `overall` away from healthy —
+  // never normalized to "ok" (which would hide device-side corruption from
+  // newer agents). Additive fields still never leak arbitrary keys.
+  const malformed = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: {
+        transition: { status: "bogus", path: "C:\\secret", credential: "x" },
+        op_journal: { status: 42 },
+      },
+      profile_discovery: { status: "bogus", notes: ["ok", "leak", 42, "ok2"] },
+      path: "C:\\secret",
+      credential: "must-not-persist",
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(
+    malformed.overall,
+    "transition_journal_issues",
+    "malformed transition status must not be normalized to healthy",
+  );
+  assert.equal(malformed.recommendation, "run_local_doctor");
+  assert.equal(
+    ((malformed.journals as Record<string, unknown>).transition as Record<string, unknown>).status,
+    "malformed",
+  );
+  assert.equal(
+    ((malformed.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
+    "malformed",
+  );
+  const malformedJson = JSON.stringify(malformed);
+  assert.doesNotMatch(malformedJson, /must-not-persist|C:\\secret/);
+  assert.equal(((malformed.profile_discovery as { notes: unknown[] }).notes).length, 3);
+
+  // P1-F/redaction: free-form profile notes are redacted before exposure or
+  // persistence — a semi-trusted device must not be able to inject secrets,
+  // credential assignments, or user-home paths into the normalized diagnosis
+  // or the persisted operation record. Credential-assignment lines are
+  // dropped entirely; embedded assignments, space-delimited bearer
+  // credentials, and user-home paths are replaced with `[REDACTED]`; benign
+  // notes pass through; every persisted note stays bounded (up to 160 chars)
+  // and the note list is capped at 8 entries.
+  const notes = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      profile_discovery: {
+        status: "warn",
+        notes: [
+          "token=sk-secret1234",
+          "AWS_SECRET_ACCESS_KEY: x",
+          "-----BEGIN RSA PRIVATE KEY-----\nMIIEpQIBAAKCAQEA...",
+          "installed at /home/tonakai/.local/bin/codex",
+          "note mentions token=sk-inline999 in passing",
+          "Bearer sk-secret123",
+          "authorization eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+          "ok note",
+        ],
+      },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  const notesOut = ((notes.profile_discovery as { notes: unknown[] }).notes) as string[];
+  assert.equal(
+    notesOut.length,
+    5,
+    "credential-assignment notes are dropped; path/embedded/space-delimited secrets are redacted and kept; benign notes pass through",
+  );
+  const notesJson = JSON.stringify(notesOut);
+  assert.doesNotMatch(
+    notesJson,
+    /sk-secret1234|aks-secret5678|sk-inline999|sk-secret123|eyJhbGci|MIIEpQIBAAKCAQEA|tonakai/,
+    "secrets must not persist",
+  );
+  assert.match(notesJson, /\[REDACTED\]/);
+  assert.match(notesJson, /ok note/);
+  for (const note of notesOut) {
+    assert.ok(note.length <= 160, "each redacted note stays bounded");
+  }
+  // The whole normalized payload must also stay free of the secrets.
+  assert.doesNotMatch(JSON.stringify(notes), /sk-secret1234|aks-secret5678|sk-inline999|sk-secret123|eyJhbGci/);
+
+  // Benign prose that merely mentions a credential word must survive
+  // redaction: only token-like values after a credential marker are replaced.
+  const benign = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      profile_discovery: {
+        status: "warn",
+        notes: ["the token was refreshed", "api key rotated"],
+      },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  const benignJson = JSON.stringify(
+    (benign.profile_discovery as { notes: unknown[] }).notes,
+  );
+  assert.match(
+    benignJson,
+    /token was refreshed/,
+    "benign prose mentioning a credential word must survive redaction",
+  );
+  assert.match(
+    benignJson,
+    /api key rotated/,
+    "short plain words after a credential marker are not secrets",
+  );
+
+  // P1-F review (marker-plus-filler bypass): a token-like value separated from
+  // its credential marker by short filler words (`token is <opaque>`, `api key
+  // was <opaque>`) must be redacted too — previously only the immediately
+  // following token was matched, so `token is sk-…` passed the opaque value
+  // through unchanged and contradicted the documented redaction claim.
+  const fillerNotes = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      profile_discovery: {
+        status: "warn",
+        notes: [
+          "token is sk-abcdefghijklmnopqrstuvwxyz012345",
+          "api key was AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPp",
+          "the bearer token for the device is eyJhbGciOiJIUzI1NiJ9.morepayload.extra",
+          "password happens to be: secret-inline-value",
+        ],
+      },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  const fillerNotesOut = ((fillerNotes.profile_discovery as { notes: unknown[] })
+    .notes) as string[];
+  const fillerJson = JSON.stringify(fillerNotesOut);
+  assert.doesNotMatch(
+    fillerJson,
+    /sk-abcdefghijklmnopqrstuvwxyz012345|AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPp|eyJhbGciOiJIUzI1NiJ9|secret-inline-value/,
+    "marker-plus-filler forms must not leak an opaque credential value",
+  );
+  assert.match(
+    fillerJson,
+    /\[REDACTED\]/,
+    "marker-plus-filler forms must be replaced with [REDACTED]",
+  );
+  for (const note of fillerNotesOut) {
+    assert.ok(note.length <= 160, "each redacted note stays bounded");
+  }
+  assert.doesNotMatch(
+    JSON.stringify(fillerNotes),
+    /sk-abcdefghijklmnopqrstuvwxyz012345|AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPp|eyJhbGciOiJIUzI1NiJ9/,
+    "the whole normalized payload must stay free of filler-form secrets",
+  );
+
+  // P1-F: a *present-but-null* status field is a malformed value, not an
+  // absent field — it must be surfaced as `malformed` and lift `overall` away
+  // from healthy instead of being normalized to `ok`.
+  const nullStatus = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: {
+        transition: { status: null },
+        op_journal: { status: null },
+      },
+      profile_discovery: { status: null },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(
+    nullStatus.overall,
+    "transition_journal_issues",
+    "present-null transition status must not be normalized to healthy",
+  );
+  assert.equal(
+    ((nullStatus.journals as Record<string, unknown>).transition as Record<string, unknown>).status,
+    "malformed",
+  );
+  assert.equal(
+    ((nullStatus.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
+    "malformed",
+  );
+  assert.equal(
+    (nullStatus.profile_discovery as { status: string }).status,
+    "malformed",
+  );
+  assert.equal(nullStatus.recommendation, "run_local_doctor");
+
+  // P1-F: a *present but incomplete* subtree is an incomplete payload from a
+  // newer Agent, not a legacy omission — `{journals:{transition:{}}}`,
+  // `{journals:{}}`, and `{profile_discovery:{}}` must be surfaced as
+  // `malformed` and lift `overall` away from healthy instead of normalizing
+  // to `ok` (which would hide device-side corruption). Only the *whole*
+  // subtree being absent (no `journals`/`profile_discovery` key at all) is a
+  // legacy omission and stays `ok`.
+  const incomplete = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: { transition: {}, op_journal: {} },
+      profile_discovery: {},
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(
+    incomplete.overall,
+    "transition_journal_issues",
+    "incomplete transition subtree must not be normalized to healthy",
+  );
+  assert.equal(
+    ((incomplete.journals as Record<string, unknown>).transition as Record<string, unknown>).status,
+    "malformed",
+  );
+  assert.equal(
+    ((incomplete.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
+    "malformed",
+  );
+  assert.equal(
+    (incomplete.profile_discovery as { status: string }).status,
+    "malformed",
+  );
+  assert.equal(incomplete.recommendation, "run_local_doctor");
+
+  // A present-but-empty `journals` object (no transition/op_journal keys at
+  // all) is equally incomplete: the Agent claims the journals subtree exists
+  // but provides no typed status.
+  const emptyJournals = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: {},
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(
+    emptyJournals.overall,
+    "transition_journal_issues",
+    "present-but-empty journals subtree must not be normalized to healthy",
+  );
+  assert.equal(
+    ((emptyJournals.journals as Record<string, unknown>).transition as Record<string, unknown>).status,
+    "malformed",
+  );
+  assert.equal(
+    ((emptyJournals.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
+    "malformed",
+  );
+
+  // P1-F/redaction: Windows user-home paths (`C:\Users\Alice\...` and the
+  // relative `\Users\Alice\...` form) are redacted exactly like POSIX
+  // `/home/alice` paths — a semi-trusted device must not be able to name a
+  // host account through a Windows-style note.
+  const winNotes = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      profile_discovery: {
+        status: "warn",
+        notes: [
+          "installed at C:\\Users\\Alice\\AppData\\Local\\codex",
+          "config under \\Users\\Bob\\AppData\\Roaming\\claude",
+          "ok note",
+        ],
+      },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  const winNotesOut = ((winNotes.profile_discovery as { notes: unknown[] }).notes) as string[];
+  const winNotesJson = JSON.stringify(winNotesOut);
+  assert.doesNotMatch(
+    winNotesJson,
+    /Alice|Bob/,
+    "Windows user-home account names must be redacted",
+  );
+  assert.match(winNotesJson, /\[REDACTED\]/);
+  assert.match(winNotesJson, /ok note/);
+  assert.doesNotMatch(JSON.stringify(winNotes), /Alice|Bob/);
+});
+
 
 test("approval round-trip: ask → human approve metadata → completed result", async () => {
   const { store, token } = await authed();
@@ -940,6 +1398,89 @@ test("session_open routes to device room", async () => {
   const sc = body.result!.structuredContent!;
   assert.equal(sc.status, "completed");
   assert.equal(sc.session_id, "ses_test1");
+});
+
+test("session_open envelope session_id is normalized from the device result", async () => {
+  // P0-B review: the device result carries the session id as an explicit
+  // `session_id` field (session.open writes it as an additive alias of `id`,
+  // and the compacted replay preserves both field names). The control plane
+  // must populate the envelope's session_id identically for the first and the
+  // replayed response — reading the explicit `session_id` from the result,
+  // never a generic `id` (which other operations such as workspace.add use
+  // for a different identifier).
+  const { store, token } = await authed();
+  const deviceId = "dev_mcp_sess_norm_01abcdef";
+  const room = new DeviceRoomHarness(deviceId);
+  connectTestAgent(room);
+  const router = createHarnessRouter({
+    inject: (_id, op) => {
+      const r = room.router.injectOperation(op);
+      if (r.status !== "routed_to_device") return r;
+      return {
+        status: "routed_to_device",
+        detail: {
+          status: "completed",
+          // No top-level session_id: the device envelope carries it inside
+          // the result (the real agent transport shape).
+          result: { id: "ses_norm_1", session_id: "ses_norm_1", state: "running" },
+        },
+      };
+    },
+  });
+  const { body } = await callTool(
+    store,
+    token,
+    "ownmesh_session_open",
+    {
+      device_id: deviceId,
+      program: "bash",
+      title: "t",
+      idempotency_key: "idem_session_norm_1",
+    },
+    router,
+  );
+  const sc = body.result!.structuredContent!;
+  assert.equal(sc.status, "completed");
+  assert.equal(sc.session_id, "ses_norm_1");
+  assert.equal((sc.data as { id?: unknown }).id, "ses_norm_1");
+});
+
+test("workspace_add result id is not mislabeled as a session id", async () => {
+  // P0-B review: a generic top-level `id` (workspace.add returns `ws_...`)
+  // must never populate the envelope's session_id — only the explicit
+  // `session_id` field is read.
+  const { store, token } = await authed();
+  const deviceId = "dev_mcp_wsadd_01abcdef";
+  const room = new DeviceRoomHarness(deviceId);
+  connectTestAgent(room);
+  const router = createHarnessRouter({
+    inject: (_id, op) => {
+      const r = room.router.injectOperation(op);
+      if (r.status !== "routed_to_device") return r;
+      return {
+        status: "routed_to_device",
+        detail: {
+          status: "completed",
+          result: { id: "ws_abc123", created: true, activation_state: "device_local" },
+        },
+      };
+    },
+  });
+  const { body } = await callTool(
+    store,
+    token,
+    "ownmesh_workspace_add",
+    {
+      device_id: deviceId,
+      path: "/tmp/ws",
+      idempotency_key: "idem_wsadd_1",
+    },
+    router,
+  );
+  const sc = body.result!.structuredContent!;
+  assert.equal(sc.status, "completed");
+  assert.equal(sc.session_id, null);
+  assert.equal((sc.data as { id?: unknown }).id, "ws_abc123");
 });
 
 test("session renew and detach expose exact lease-bound idempotent tools", () => {

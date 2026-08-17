@@ -1821,7 +1821,30 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   /** Create-only: refuses to overwrite an existing operation_id or idempotency binding. */
+  /**
+   * Hard-delete tombstones whose 30-day idempotency window has closed, so an
+   * expired key becomes reusable as a fresh operation instead of blocking on a
+   * stale tombstone forever. Runs before any existing-row lookup on the claim
+   * and put paths; `enforceMcpOperationQuota` also prunes them at capacity.
+   */
+  private expireExpiredMcpTombstones(tenantId: string): void {
+    const now = Date.now();
+    for (const op of [...this.mcpOperations.values()]) {
+      if (
+        op.tenant_id === tenantId &&
+        op.status === "tombstone" &&
+        mcpOpAgeMs(op, now) > MCP_OPS_TOMBSTONE_TTL_MS
+      ) {
+        this.mcpOperations.delete(op.operation_id);
+      }
+    }
+  }
+
   async putMcpOperation(op: McpOperationRecord): Promise<void> {
+    // P0-B review: expire closed-window tombstones before the existing-row
+    // lookup so a key whose 30-day window ended can be minted fresh instead of
+    // throwing mcp_operation_idempotency_exists forever.
+    this.expireExpiredMcpTombstones(op.tenant_id);
     if (this.mcpOperations.has(op.operation_id)) {
       throw new Error(`mcp_operation_exists:${op.operation_id}`);
     }
@@ -1902,6 +1925,11 @@ export class MemoryStore implements ControlPlaneStore {
     | { outcome: "created"; op: McpOperationRecord }
     | { outcome: "existing"; op: McpOperationRecord }
   > {
+    // P0-B review: expire closed-window tombstones before the existing-row
+    // lookup. A tombstone older than MCP_OPS_TOMBSTONE_TTL_MS must not be
+    // returned as `existing` indefinitely — the documented lifecycle hard-
+    // deletes it and dispatches a retry as a new operation.
+    this.expireExpiredMcpTombstones(op.tenant_id);
     // Synchronous check+insert window (no await) so concurrent MemoryStore
     // callers cannot both observe absence and both insert.
     if (op.idempotency_key) {
@@ -4039,12 +4067,36 @@ export class SqlStore implements ControlPlaneStore {
     return row ? rowToMcpOperation(row) : null;
   }
 
+  /**
+   * Hard-delete tombstones whose 30-day idempotency window has closed, so an
+   * expired key becomes reusable as a fresh operation instead of blocking on a
+   * stale tombstone forever. Runs before any existing-row lookup on the claim
+   * path; `enforceMcpOperationQuota` also prunes them at capacity.
+   */
+  private async expireExpiredMcpTombstones(tenantId: string): Promise<void> {
+    const tombstoneCutoff = new Date(
+      Date.now() - MCP_OPS_TOMBSTONE_TTL_MS,
+    ).toISOString();
+    await this.db
+      .prepare(
+        `DELETE FROM mcp_operations
+         WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?`,
+      )
+      .bind(tenantId, tombstoneCutoff)
+      .run();
+  }
+
   async claimMcpOperationByIdempotency(
     op: McpOperationRecord,
   ): Promise<
     | { outcome: "created"; op: McpOperationRecord }
     | { outcome: "existing"; op: McpOperationRecord }
   > {
+    // P0-B review: expire closed-window tombstones before the existing-row
+    // lookup. A tombstone older than MCP_OPS_TOMBSTONE_TTL_MS must not be
+    // returned as `existing` indefinitely — the documented lifecycle hard-
+    // deletes it and dispatches a retry as a new operation.
+    await this.expireExpiredMcpTombstones(op.tenant_id);
     // Idempotent reuse must not be blocked by quota pressure on other keys.
     if (op.idempotency_key) {
       const existing = await this.getMcpOperationByIdempotency({

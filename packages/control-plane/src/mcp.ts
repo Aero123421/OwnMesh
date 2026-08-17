@@ -1845,6 +1845,96 @@ function diagnosisText(value: unknown, max = 64): string | null {
   return /[\u0000-\u001f\u007f]/.test(value) ? null : value;
 }
 
+/**
+ * Credential-ish marker used to redact free-form diagnosis notes before they
+ * are exposed or persisted. The device payload is only semi-trusted: a
+ * compromised or buggy Agent could stuff secrets, credential assignments, or
+ * user-home paths into its notes, which the Control Plane would otherwise
+ * persist and relay. Lines that are credential assignments or private-key PEM
+ * blocks are dropped; embedded `name=value` credential assignments and
+ * user-home paths are replaced with `[REDACTED]`.
+ */
+const CREDENTIAL_NOTE_MARKER =
+  /(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|api[_-]?key|session[_-]?secret|private[_-]?key|authorization|bearer|password|passwd|secret|credential|token|key)/i;
+
+/**
+ * A whitespace-delimited value that looks like a credential token: contains a
+ * token separator (`-`, `_`, `.`, `/`, `+`, `=`) or is a long opaque
+ * alphanumeric run (e.g. a JWT payload). Short plain words ("was",
+ * "refreshed", "installed") are never treated as secrets, so benign prose
+ * like "the token was refreshed" survives redaction.
+ */
+const TOKEN_LIKE_VALUE =
+  /(?:[A-Za-z0-9_\-./+=]*[_.\-\/+=][A-Za-z0-9_\-./+=]*|[A-Za-z0-9]{16,})/;
+
+/**
+ * Short plain words that may sit between a credential marker and its value in
+ * prose ("token is <value>", "api key was <value>", "password happens to be:
+ * <value>"). Filler is bounded so marker-plus-filler forms cannot smuggle an
+ * opaque value past the space-delimited redaction, while benign prose whose
+ * trailing word is not token-like ("the token was refreshed", "the key to
+ * success is persistence") still survives because the trailing word is not a
+ * credential-shaped value.
+ */
+const CREDENTIAL_NOTE_FILLER = /(?:\s+[A-Za-z]{1,12}){0,5}/;
+
+/**
+ * Redact a free-form diagnosis note (secret/path/env-safe, bounded). Returns
+ * `null` when the value is not a usable note after redaction.
+ */
+function redactDiagnosisNote(value: unknown): string | null {
+  // Accept a slightly larger pre-redaction window so a note that is mostly
+  // redaction boilerplate still fits the exposed 160-char cap.
+  const text = diagnosisText(value, 512);
+  if (text === null) return null;
+  const REDACTED = "[REDACTED]";
+  // Drop credential-assignment lines and private-key PEM blocks entirely.
+  const kept = text.split(/\r?\n/).filter((line) => {
+    const trimmed = line.trim();
+    if (/^-----begin[^-]*private key/i.test(trimmed)) return false;
+    return !CREDENTIAL_NOTE_MARKER.test(trimmed) || !/^[^\s=]+\s*[:=]\s*\S/.test(trimmed);
+  });
+  let redacted = kept.join("\n");
+  // Replace embedded credential assignments anywhere (`token=abc`, `KEY: xyz`,
+  // `token: is sk-…`). Up to two short filler words may separate the marker
+  // from the value after the `:`/`=` so a value cannot hide behind prose
+  // (`token: was set to abc` redacts through the first non-space token, the
+  // same conservative posture as the plain assignment form).
+  redacted = redacted.replace(
+    new RegExp(
+      `\\b${CREDENTIAL_NOTE_MARKER.source}(?:'s)?\\s*[:=]\\s*(?:[A-Za-z]{1,12}\\s+){0,2}[^\\s,;]+`,
+      "gi",
+    ),
+    REDACTED,
+  );
+  // Replace space-delimited credential values (`Bearer sk-secret123`,
+  // `authorization eyJ...`) when the value looks like a token, so a
+  // semi-trusted device cannot exfiltrate a bearer credential through a
+  // diagnosis note that is not assignment-shaped. Marker-plus-filler forms
+  // (`token is <long-opaque-value>`, `api key was <value>`, `password happens
+  // to be: <value>`) are covered too: up to five short filler words and an
+  // optional `:`/`=` may sit between the marker and the value, and filler
+  // never lets a token-like value past the redaction. Benign prose whose
+  // trailing word is not token-like ("the token was refreshed") still
+  // survives.
+  redacted = redacted.replace(
+    new RegExp(
+      `\\b${CREDENTIAL_NOTE_MARKER.source}(?:'s)?${CREDENTIAL_NOTE_FILLER.source}\\s*(?:[:=]\\s*)?(${TOKEN_LIKE_VALUE.source})`,
+      "gi",
+    ),
+    REDACTED,
+  );
+  // Replace user-home path prefixes that would name a host account. POSIX
+  // (`/home/alice`, `/Users/alice`) and Windows (`C:\Users\Alice`, `\Users\Alice`)
+  // forms are both covered; the drive letter is optional so a relative
+  // `\Users\Alice` path is redacted too. The match stops at the first path
+  // separator, so the account name is always removed even when the note
+  // continues with deeper path components.
+  redacted = redacted.replace(/\/(?:home|Users)\/[^/\s]+/gi, REDACTED);
+  redacted = redacted.replace(/(?:[A-Za-z]:)?\\Users\\[^\\\s]+/gi, REDACTED);
+  return diagnosisText(redacted, 160);
+}
+
 function diagnosisAgentVersion(value: unknown): string | null {
   const text = diagnosisText(value, 32);
   return text && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(text)
@@ -1979,24 +2069,73 @@ export function normalizeSystemDiagnosis(
   const stateFor = (id: string) => String(checks.find((check) => check.id === id)?.state || "");
   const sessionsCheck = checks.find((check) => check.id === "sessions");
   const staleCount = Number(sessionsCheck?.stale_count || 0);
+  // Additive device-local journal / discovery fields (P0-A/P0-B/P1-F): old
+  // Agents omit them; new Agents expose typed status. They never replace the
+  // check-id contract — they only lift `overall` away from an unconditional
+  // `healthy` when the device reports a real failure.
+  const transitionStatus = diagnosisNestedStatus(source, ["journals", "transition", "status"], ["ok", "warn", "fail"]);
+  const opJournalStatus = diagnosisNestedStatus(source, ["journals", "op_journal", "status"], ["ok", "warn", "critical"]);
+  const profileDiscoveryStatus = diagnosisNestedStatus(
+    source,
+    ["profile_discovery", "status"],
+    ["ok", "warn"],
+  );
+  const journals = source?.journals && typeof source.journals === "object" && !Array.isArray(source.journals)
+    ? source.journals as Record<string, unknown>
+    : undefined;
+  const transition = journals && typeof journals.transition === "object" && !Array.isArray(journals.transition)
+    ? journals.transition as Record<string, unknown>
+    : undefined;
+  const opJournal = journals && typeof journals.op_journal === "object" && !Array.isArray(journals.op_journal)
+    ? journals.op_journal as Record<string, unknown>
+    : undefined;
+  // P1-F: entries the device runtime refuses to replay/compact/evict (unknown
+  // forward-version state, malformed state values, or non-object entries) are
+  // fail-closed state. The device reports them as `uncertain` with a `warn`
+  // status; the normalizer must lift `overall` away from `healthy` for them,
+  // even though warn-level *pressure* alone intentionally does not.
+  const opJournalUncertain = opJournal && Number.isSafeInteger(opJournal.uncertain)
+    ? Number(opJournal.uncertain) > 0
+    : false;
+  const profileDiscovery = source?.profile_discovery && typeof source.profile_discovery === "object" && !Array.isArray(source.profile_discovery)
+    ? source.profile_discovery as Record<string, unknown>
+    : undefined;
+  const countField = (value: unknown, max = 1_000_000): number | undefined =>
+    Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= max ? Number(value) : undefined;
+  const profileNotes = Array.isArray(profileDiscovery?.notes)
+    ? (profileDiscovery.notes as unknown[])
+        .slice(0, 8)
+        .map(redactDiagnosisNote)
+        .filter((n): n is string => n !== null)
+    : [];
   const overall = stateFor("daemon") === "lockdown"
     ? "lockdown"
     : stateFor("session_supervisor") === "unavailable"
       ? "supervisor_unavailable"
-      : sessionsCheck?.state === "stale" || staleCount > 0
-        ? "stale_sessions"
-        : stateFor("workspace") === "unbound_enforced"
-          ? "workspace_selection_required"
-          : "healthy";
+      : transitionStatus === "fail" || transitionStatus === "malformed"
+        ? "transition_journal_issues"
+        : opJournalUncertain
+          ? "op_journal_uncertain"
+          : opJournalStatus === "critical" || opJournalStatus === "malformed"
+            ? "op_journal_pressure"
+            : profileDiscoveryStatus === "warn" || profileDiscoveryStatus === "malformed"
+              ? "profile_discovery_issues"
+              : sessionsCheck?.state === "stale" || staleCount > 0
+                ? "stale_sessions"
+                : stateFor("workspace") === "unbound_enforced"
+                  ? "workspace_selection_required"
+                  : "healthy";
   const recommendation = overall === "lockdown"
     ? "unlock_locally"
     : overall === "supervisor_unavailable"
       ? "restart_session_supervisor"
-      : overall === "stale_sessions"
-        ? "reconcile_stale_sessions"
-        : overall === "workspace_selection_required"
-          ? "select_workspace"
-          : "none";
+      : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues"
+        ? "run_local_doctor"
+        : overall === "stale_sessions"
+          ? "reconcile_stale_sessions"
+          : overall === "workspace_selection_required"
+            ? "select_workspace"
+            : "none";
   return {
     schema: SYSTEM_DIAGNOSIS_SCHEMA,
     overall,
@@ -2009,7 +2148,72 @@ export function normalizeSystemDiagnosis(
     },
     checks: [enrollment, routeCheck, ...checks],
     recommendation,
+    // Additive allowlisted device-local journal/discovery health (present only
+    // when the Agent reports it; never a log/path/env exfiltration surface).
+    journals: {
+      transition: {
+        status: transitionStatus,
+        ...(transition?.pending !== undefined ? { pending: countField(transition.pending, 64) } : {}),
+        ...(transition?.expired_pending !== undefined ? { expired_pending: countField(transition.expired_pending, 64) } : {}),
+        ...(transition?.retained_unresolved !== undefined
+          ? { retained_unresolved: countField(transition.retained_unresolved, 1_000_000) }
+          : {}),
+      },
+      op_journal: {
+        status: opJournalStatus,
+        ...(opJournal?.entries !== undefined ? { entries: countField(opJournal.entries, 1_000_000) } : {}),
+        ...(opJournal?.in_progress !== undefined ? { in_progress: countField(opJournal.in_progress, 1_000_000) } : {}),
+        ...(opJournal?.uncertain !== undefined ? { uncertain: countField(opJournal.uncertain, 1_000_000) } : {}),
+      },
+    },
+    profile_discovery: {
+      status: profileDiscoveryStatus,
+      notes: profileNotes,
+    },
   };
+}
+
+/**
+ * Allowlisted status value at a nested path in the device payload. Returns
+ * `"ok"` only when the *whole subtree* is absent (older Agents omit it
+ * entirely, so mixed-version deployments stay healthy until the Agent proves
+ * otherwise). A present subtree with a missing leaf — e.g. `{journals:{}}` or
+ * `{journals:{transition:{}}}` — is an *incomplete* payload from a newer
+ * Agent and returns `"malformed"` so device-side corruption is surfaced
+ * instead of normalized to healthy (P1-F). A present but malformed value —
+ * `null`, a wrong type, or an unrecognized status string — also returns
+ * `"malformed"`. Only a fixed path may be read — never arbitrary keys.
+ */
+function diagnosisNestedStatus(
+  source: Record<string, unknown> | null | undefined,
+  path: string[],
+  allowed: string[],
+): string {
+  let current: unknown = source;
+  for (let i = 0; i < path.length; i++) {
+    const key = path[i];
+    if (current === undefined) {
+      // Reached only when the previous lookup returned undefined: the first
+      // missing key means the whole subtree is absent (legacy omission → ok);
+      // a missing key deeper in a present subtree is an incomplete payload
+      // from a newer Agent → malformed.
+      return i === 0 ? "ok" : "malformed";
+    }
+    // A present-but-null intermediate (e.g. `journals: null`) is a malformed
+    // value, not an absent field: the Agent claims the subtree exists.
+    if (current === null) return "malformed";
+    if (typeof current !== "object" || Array.isArray(current)) return "malformed";
+    const next = (current as Record<string, unknown>)[key];
+    if (next === undefined) {
+      // The first missing key is a legacy omission (the whole subtree is
+      // absent); a missing leaf inside a present subtree is an incomplete
+      // payload and must be surfaced as malformed, never normalized to ok.
+      return i === 0 ? "ok" : "malformed";
+    }
+    current = next;
+  }
+  if (current === null) return "malformed";
+  return typeof current === "string" && allowed.includes(current) ? current : "malformed";
 }
 
 /**
@@ -6409,7 +6613,18 @@ export async function handleMcp(
         data: data as Record<string, unknown>,
         truncated,
         next_cursor,
-        session_id: detail.session_id ? String(detail.session_id) : null,
+        // P0-B review: the device result carries the session id as an
+        // explicit `session_id` field (session.open writes it as an additive
+        // alias of `id`, and the compacted replay preserves both field
+        // names), so the envelope's session_id is populated identically for
+        // the first and the replayed response. Only the explicit
+        // `session_id` field is read — never a generic `id`, which other
+        // operations (e.g. workspace.add) use for a different identifier.
+        session_id: detail.session_id
+          ? String(detail.session_id)
+          : typeof (data as { session_id?: unknown }).session_id === "string"
+            ? String((data as { session_id: string }).session_id)
+            : null,
         correlation_id: correlation,
         warnings: injectWarnings,
       });

@@ -33,6 +33,7 @@ ownmesh-policy = { path = "../ownmesh-policy" }
 ownmesh-profiles = { path = "../ownmesh-profiles" }
 ownmesh-protocol = { path = "../ownmesh-protocol" }
 ownmesh-session = { path = "../ownmesh-session" }
+ownmesh-transition-journal = { path = "../ownmesh-transition-journal" }
 ownmesh-session-host = { path = "../ownmesh-session-host" }
 ownmesh-transfer = { path = "../ownmesh-transfer" }
 ring = "0.17.14"
@@ -67,6 +68,9 @@ rustix = { version = "1", default-features = false, features = ["process"] }
 ownmesh-broker = { path = "../ownmesh-broker" }
 
 [dev-dependencies]
+ownmesh-transition-journal = { path = "../ownmesh-transition-journal", features = [
+    "test-support",
+] }
 tempfile = "3.15.0"
 tokio = { version = "1.43.0", features = [
     "fs",

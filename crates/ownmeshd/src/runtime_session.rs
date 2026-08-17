@@ -12,12 +12,13 @@
 use super::{
     app_error, base64_standard, default_shell_command, fs_err, is_remote_runtime_principal, json,
     normalize_handoff_target, official_adapter_spec, parse_adapter_event_page, parse_params,
-    persistent_child_is_live, preset_name, reject_spoofed_principal, session_err, sha256_hex,
-    AdapterDialect, ClientIdentity, DaemonRuntime, Deserialize, HostIoMode, IpcError, IpcResult,
-    LiveHost, NativeResume, OperationFacts, Path, ProfileRegistry, PtyCommand, PtySize,
-    SessionKind, SessionState, SessionStreamKind, SidecarHostBinding, SupervisorCommand,
-    SupervisorEnv, SupervisorSpawnRequest, SystemDiagnoseParams, TransitionKind, TransitionPhase,
-    TransitionRecord, TransitionTarget, Value,
+    persistent_child_is_live, preset_name, principal_journal_key, reject_spoofed_principal,
+    session_err, sha256_hex, AdapterDialect, ClientIdentity, DaemonRuntime, Deserialize,
+    HostIoMode, IpcError, IpcResult, LiveHost, NativeResume, OperationFacts, Path, PathBuf,
+    ProfileRegistry, PtyCommand, PtySize, SessionKind, SessionState, SessionStreamKind,
+    SidecarHostBinding, SupervisorCommand, SupervisorEnv, SupervisorSpawnRequest,
+    SystemDiagnoseParams, TransitionKind, TransitionPhase, TransitionRecord, TransitionTarget,
+    Value, OP_JOURNAL_STATE_FIELD,
 };
 
 /// Structured sidecar pages are capped below the durable MCP result budget.
@@ -26,6 +27,92 @@ use super::{
 const MAX_STRUCTURED_SIDECAR_PAGE_BYTES: usize = 48 * 1024;
 
 impl DaemonRuntime {
+    /// Exact-once journaling for remote session mutations (P0-B review / MCP
+    /// contract): the Agent transport injects the signed operation key into every
+    /// mapped method, so a retried remote `session.renew`/`detach`/`give`/
+    /// `claim`/`close`/`terminate` must replay its first receipt instead of
+    /// applying the mutation a second time (extending the lease twice, rotating
+    /// the sidecar nonce again, or re-closing an already-terminal session).
+    ///
+    /// Returns `Some(receipt)` when the key already holds a completed receipt
+    /// (the caller returns it immediately, `replayed: true`), and `None` when the
+    /// caller should proceed with the mutation. An in-progress/uncertain marker
+    /// propagates the fail-closed CONFLICT from [`Self::lookup_idempotent`] — a
+    /// retry is never silently re-applied. Local IPC callers that send no key
+    /// (`journal_key == None`) are unchanged.
+    fn remote_mutation_receipt(
+        &mut self,
+        journal_key: Option<&String>,
+    ) -> IpcResult<Option<Value>> {
+        let Some(key) = journal_key else {
+            return Ok(None);
+        };
+        match self.lookup_idempotent(Some(key))? {
+            Some(mut previous) => {
+                if let Some(object) = previous.as_object_mut() {
+                    object.insert("replayed".into(), json!(true));
+                }
+                Ok(Some(previous))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the exact-once receipt for a completed remote session mutation
+    /// (P0-B review / ADR 0010 §1b): stamp the exact-once `operation_id` and
+    /// the explicit terminal marker this version writes. A session mutation
+    /// body (renew/detach/give/claim/close/terminate) never carries a
+    /// decision/approval/review proof, so without the explicit marker the
+    /// compaction classifier would leave it uncertain and a retried mutation
+    /// would be refused as in-progress/uncertain. `store_idempotent` then
+    /// compacts it to a bounded receipt preserving the small continuation
+    /// fields (`session_id`, `workspace_id`, `lease`).
+    fn store_session_mutation_receipt(
+        &mut self,
+        journal_key: Option<&String>,
+        operation_id: &str,
+        mut body: Value,
+    ) -> IpcResult<Value> {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("operation_id".into(), json!(operation_id));
+            object.insert(OP_JOURNAL_STATE_FIELD.into(), json!("completed"));
+        }
+        self.store_idempotent(journal_key, &body)?;
+        Ok(body)
+    }
+
+    /// Fence controller-mutating operations on a session with a retained,
+    /// unresolved sidecar transition record.
+    ///
+    /// P0-A recovery deliberately does not abort every unrelated session for
+    /// one bad row, but the *affected* session must stay fail-closed: an
+    /// ambiguous claim/detach/give/renew/close/terminate intent must not be
+    /// overwritten by a different controller change while it is unresolved.
+    /// Only the supervisor replay path (which validates the record against
+    /// the sidecar) may mutate controller state for such a session; handlers
+    /// that change who holds the controller, its binding, or the session's
+    /// terminal state (close/terminate), and handlers that deliver input to
+    /// the sidecar (write/resize) are fenced with an actionable error instead
+    /// of silently proceeding against a possibly-stale binding.
+    fn fence_ambiguous_transition(&self, session_id: &str) -> IpcResult<()> {
+        if self
+            .transition_journal
+            .pending()
+            .iter()
+            .any(|record| record.session_id == session_id)
+        {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "session {session_id} has an unresolved sidecar transition journal record; \
+operations are fenced until it is resolved — run `ownmesh doctor` or inspect {}",
+                    self.transition_journal_dir().display(),
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) async fn handle_system_diagnose(
         &mut self,
         params: Option<Value>,
@@ -68,9 +155,15 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn execute_system_diagnose(
-        &self,
+        &mut self,
         params: &SystemDiagnoseParams,
     ) -> IpcResult<Value> {
+        // P0-A/P1-F: reconcile provably-moot expired transition records first so
+        // the observation reflects post-recovery state. Live in-window records
+        // are untouched (they belong to the supervisor replay path); expired
+        // records that cannot be safely cleared stay fail-closed and are
+        // reported below instead of being hidden behind `overall=healthy`.
+        self.reconcile_expired_transitions().await;
         let observed_at = ownmesh_domain::Timestamp::now().to_rfc3339();
         let now = Self::now();
         let sessions = self.sessions.list();
@@ -137,6 +230,38 @@ impl DaemonRuntime {
             }
         };
         let stale_sessions = registry_stale_sessions + supervisor_host_stale;
+        // P0-A: transition-journal health. Pending records are an early signal;
+        // retained-expired records are fail-closed state that must not be
+        // reported as healthy.
+        let transition_pending = self.transition_journal.pending();
+        let transition_expired_pending = transition_pending
+            .iter()
+            .filter(|record| record.expires_unix <= now)
+            .count();
+        let transition_retained_unresolved = self.transition_recovery_health.retained_expired_total;
+        // P0-B: op-journal pressure against the durable (compacted) budget.
+        let op_journal_entries = self.op_journal.len();
+        let op_journal_durable_bytes = self.op_journal_durable_byte_estimate();
+        let op_journal_in_progress = self
+            .op_journal
+            .values()
+            .filter(|value| super::is_op_journal_in_progress(value))
+            .count();
+        // P1-F: entries the runtime refuses to replay/compact/evict (unknown
+        // forward-version state, malformed state values, or non-object
+        // entries) are fail-closed state and must not be reported healthy.
+        // Only the `Uncertain` variant counts — the exact in-progress marker
+        // is a normal, expected state during an operation.
+        let op_journal_uncertain = self
+            .op_journal
+            .values()
+            .filter(|value| {
+                super::op_journal_entry_state(value) == super::OpJournalEntryState::Uncertain
+            })
+            .count();
+        // P1-D/P1-F: profile discovery canary — user-local bin dirs that exist
+        // but are not searched mean installed CLIs appear not-installed.
+        let profile_discovery = profile_discovery_health();
         Ok(system_diagnosis_payload(
             &observed_at,
             SystemDiagnosisFacts {
@@ -150,6 +275,14 @@ impl DaemonRuntime {
                 session_count: sessions.len(),
                 nonterminal_sessions,
                 stale_sessions,
+                transition_pending: transition_pending.len(),
+                transition_expired_pending,
+                transition_retained_unresolved,
+                op_journal_entries,
+                op_journal_durable_bytes,
+                op_journal_in_progress,
+                op_journal_uncertain,
+                profile_discovery,
             },
         ))
     }
@@ -195,9 +328,37 @@ impl DaemonRuntime {
             cwd: Option<String>,
             #[serde(default)]
             workspace_id: Option<String>,
+            /// Caller idempotency key (the Agent transport injects the signed
+            /// operation key). Presence enables the exact-once device journal:
+            /// a retried `session.open` replays the original session receipt
+            /// instead of spawning a duplicate PTY/sidecar (P0-B / MCP
+            /// contract). Local IPC callers that send no key are unchanged.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        // Exact-once device journal replay (P0-B / MCP `session.open`
+        // contract): consult the receipt *before* workspace/profile/executable
+        // preflight so a retried open after response loss continues the
+        // original session even when the workspace was removed or the profile
+        // tool is no longer installed (the first operation already ran and
+        // its receipt is principal-namespaced proof of that). An
+        // in-progress/uncertain marker stays fail-closed. The durable marker
+        // itself is still reserved only after preflight, so a preflight
+        // failure on a *new* operation never poisons the key.
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&client.client_name, key));
+        if let Some(previous) = self.lookup_idempotent(journal_key.as_ref())? {
+            let mut replayed = previous;
+            if let Some(object) = replayed.as_object_mut() {
+                object.insert("replayed".into(), json!(true));
+            }
+            return Ok(replayed);
+        }
         // Restricted presets cannot confine an interactive shell/process tree to
         // registered workspace roots. session.open is classified as command
         // execution: deny PTY/shell launch until OS process confinement exists
@@ -389,6 +550,49 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             None
         };
+        // P1-C: resolve the session argv through the shared executable resolver
+        // before creating the session record, so detection, launch, and the
+        // stored record never disagree. Windows batch shims (`name.cmd`/
+        // `name.bat`) are rewritten to the documented `cmd.exe /e:ON /v:OFF
+        // /d /s /c call <script> <args>` form because `CreateProcess` cannot
+        // exec batch files directly; Unix requires a launchable file (exec
+        // bit). A program that cannot be resolved fails closed with an
+        // actionable error instead of reaching the spawner as a bare name
+        // that guesses differently.
+        let command = match command {
+            Some(argv) if !argv.is_empty() => {
+                match ownmesh_exec::resolve_spawn_argv(
+                    &argv[0],
+                    &argv[1..],
+                    cwd.as_deref().map(Path::new),
+                ) {
+                    Ok(resolved) => Some(resolved),
+                    Err(ownmesh_exec::SpawnResolveError::CmdUnsafeArgument) => {
+                        return Err(IpcError::Remote {
+                            code: app_error::INVALID_PARAMS,
+                            message: format!(
+                                "program `{}` resolves to a Windows batch shim, but one of the \
+requested arguments contains characters cmd.exe would reinterpret (quotes, %, !, or unquoted \
+metacharacters like & | < > ( ) ^); use the structured command.run interface or adjust the \
+arguments so the exact argv can be launched",
+                                argv[0]
+                            ),
+                        });
+                    }
+                    Err(ownmesh_exec::SpawnResolveError::NotFound) => {
+                        return Err(IpcError::Remote {
+                            code: app_error::INVALID_PARAMS,
+                            message: format!(
+                                "program `{}` could not be resolved to a launchable executable \
+(check PATH and user-local CLI dirs); install it or use an explicit path",
+                                argv[0]
+                            ),
+                        });
+                    }
+                }
+            }
+            other => other,
+        };
         // Own a live PTY for interactive sessions (E5) and profile PTY fallback (E6).
         // Process-only kinds stay metadata until structured adapters stream events.
         // Failure to spawn is fail-closed so ChatGPT never sees a fake echo-only session.
@@ -412,6 +616,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             None
         };
+        // Once the marker exists, every later error deliberately leaves it in
+        // place: retrying an uncertain external side effect is less safe than
+        // requiring operator reconciliation (same posture as `gate_and_run`).
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         let snapshot = self.sessions.clone();
         let info = self
             .sessions
@@ -680,7 +892,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                         obj.insert("profile".into(), meta);
                     }
                 }
-                return Ok(value);
+                return self.store_session_open_receipt(journal_key.as_ref(), &operation_id, value);
             }
             match LiveHost::spawn(&pty_cmd, size) {
                 Ok(host) => {
@@ -712,7 +924,11 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                             obj.insert("profile".into(), meta);
                         }
                     }
-                    return Ok(value);
+                    return self.store_session_open_receipt(
+                        journal_key.as_ref(),
+                        &operation_id,
+                        value,
+                    );
                 }
                 Err(err) => {
                     self.sessions = snapshot;
@@ -734,6 +950,44 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 obj.insert("profile".into(), meta);
             }
         }
+        self.store_session_open_receipt(journal_key.as_ref(), &operation_id, value)
+    }
+
+    /// Persist the exact-once receipt for a completed `session.open` (P0-B /
+    /// MCP contract): the journal entry carries the generated session id and
+    /// controller lease so a retried open after response loss/restart
+    /// continues the original session; `store_idempotent` compacts completed
+    /// entries to bounded receipts (see `op_journal_durable_view`).
+    /// `operation_id` is the exact-once marker written by `begin_idempotent`;
+    /// without it the completed entry would be classified uncertain and the
+    /// replay would be refused. When no idempotency key was supplied
+    /// (`journal_key == None`) this is a no-op, so local IPC behavior is
+    /// unchanged.
+    fn store_session_open_receipt(
+        &mut self,
+        journal_key: Option<&String>,
+        operation_id: &str,
+        mut value: Value,
+    ) -> IpcResult<Value> {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("operation_id".into(), json!(operation_id));
+            // The compaction classifier treats an entry as a provably-
+            // completed receipt only with the explicit terminal marker this
+            // version writes (the legacy heuristic additionally requires a
+            // decision/approval/review proof, which a session open never
+            // carries). Without the marker the completed open would stay
+            // uncertain and a retry would be refused.
+            object.insert(OP_JOURNAL_STATE_FIELD.into(), json!("completed"));
+            // P0-B review: additive `session_id` alias of the generated
+            // `id` so the first and the compacted-replay responses are
+            // schema-stable (the control plane reads `session_id` at the
+            // top level of the result; the compact receipt preserves both
+            // field names).
+            if let Some(id) = object.get("id").cloned() {
+                object.insert("session_id".into(), id);
+            }
+        }
+        self.store_idempotent(journal_key, &value)?;
         Ok(value)
     }
 
@@ -908,6 +1162,24 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
+        // P0-A fail-closed fencing: an unresolved sidecar transition record
+        // for this session means a claim/detach/give intent is ambiguous.
+        // Controller claims, handoffs and lease mutations must not race that
+        // ambiguity — only the supervisor replay path may mutate the
+        // controller for such a session. Observer-only attaches never mutate
+        // controller state unless the same principal currently holds the
+        // controller lease (released on downgrade), so the fence applies
+        // exactly when the attach would change who holds the controller.
+        let controller_mutation = if read_only {
+            self.sessions
+                .is_controller(&p.id, &principal, now)
+                .map_err(session_err)?
+        } else {
+            true
+        };
+        if controller_mutation {
+            self.fence_ambiguous_transition(&p.id)?;
+        }
         if read_only {
             // Reattachment keeps an existing reader in observer mode. Session id
             // alone is never an invitation, and observer attach never grants
@@ -962,19 +1234,47 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             principal: Option<String>,
             #[serde(default)]
             workspace_id: Option<String>,
+            /// Agent transport operation key; enables the exact-once journal.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        let principal = client.client_name.clone();
+        // Exact-once remote mutation (P0-B review): a retried claim after
+        // response loss replays the first receipt instead of re-claiming an
+        // already-held seat or rotating the sidecar nonce again.
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&principal, key));
+        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
+            return Ok(replayed);
+        }
         let now = self.prepare_session_access()?;
         // Only an existing reader may claim a released/expired controller lease.
         self.require_reader(&p.id, &client.client_name, now)?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
-        let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
+        // Fence controller-claim/transfer/lease mutations while an
+        // unresolved sidecar transition record exists for this session
+        // (P0-A): the recorded intent must not be overwritten by a different
+        // controller change.
+        self.fence_ambiguous_transition(&p.id)?;
         let mut preview = self.sessions.clone();
         let lease = preview
             .claim_controller(&p.id, principal, now)
             .map_err(session_err)?;
+        // The durable exact-once marker is reserved only after every local
+        // preflight passed; any later error deliberately leaves it in place
+        // (fail-closed: a retry must not re-apply an uncertain sidecar
+        // claim — same posture as `gate_and_run`).
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         if let Some(old_binding) = self
             .sessions
             .get(&p.id)
@@ -998,6 +1298,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: lease.epoch,
                     binding_expires_unix: lease.expires_unix,
                     controller_attached: true,
+                    lease_id: Some(lease.lease_id.clone()),
                     terminal: false,
                 },
                 new_binding: None,
@@ -1072,7 +1373,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             self.sessions = preview;
             self.commit_sessions(snapshot)?;
         }
-        Ok(json!({ "lease": lease, "session_id": p.id, "workspace_id": bound_ws }))
+        let body = json!({
+            "lease": lease,
+            "session_id": p.id,
+            "workspace_id": bound_ws,
+            // Additive exact-once marker (ADR 0010 §1b).
+            "operation_id": operation_id,
+        });
+        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
     }
 
     pub(super) fn handle_session_release(
@@ -1100,6 +1408,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let principal = client.client_name.clone();
         let snapshot = self.sessions.clone();
+        self.fence_ambiguous_transition(&p.id)?;
         self.sessions
             .release_controller(&p.id, &principal, now)
             .map_err(session_err)?;
@@ -1125,11 +1434,27 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             principal: Option<String>,
             #[serde(default)]
             workspace_id: Option<String>,
+            /// Agent transport operation key; enables the exact-once journal.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        let principal = client.client_name.clone();
+        // Exact-once remote mutation (P0-B review): a retried renew after
+        // response loss replays the first receipt instead of extending the
+        // lease and rotating the sidecar nonce a second time.
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&principal, key));
+        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
+            return Ok(replayed);
+        }
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        self.fence_ambiguous_transition(&p.id)?;
         let snapshot = self.sessions.clone();
         let mut preview = self.sessions.clone();
         let lease = preview
@@ -1142,6 +1467,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 p.ttl_secs,
             )
             .map_err(session_err)?;
+        // The durable exact-once marker is reserved only after every local
+        // preflight passed; any later error deliberately leaves it in place
+        // (fail-closed: a retry must not re-apply an uncertain sidecar
+        // renewal — same posture as `gate_and_run`).
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         if let Some(old_binding) = self
             .sessions
             .get(&p.id)
@@ -1170,6 +1504,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: lease.epoch,
                     binding_expires_unix: lease.expires_unix,
                     controller_attached: true,
+                    lease_id: Some(lease.lease_id.clone()),
                     terminal: false,
                 },
                 new_binding: None,
@@ -1232,7 +1567,16 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             self.sessions = preview;
             self.commit_sessions(snapshot)?;
         }
-        Ok(json!({ "lease": lease, "session_id": p.id, "workspace_id": bound_ws }))
+        let body = json!({
+            "lease": lease,
+            "session_id": p.id,
+            "workspace_id": bound_ws,
+            // Additive exact-once marker: the compaction classifier treats an
+            // entry as a completed receipt only when it carries the
+            // `operation_id` written by `begin_idempotent` (ADR 0010 §1b).
+            "operation_id": operation_id,
+        });
+        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
     }
 
     /// Explicitly detach the current controller while retaining the PTY and its
@@ -1252,11 +1596,28 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             principal: Option<String>,
             #[serde(default)]
             workspace_id: Option<String>,
+            /// Agent transport operation key; enables the exact-once journal.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
         reject_spoofed_principal(p.principal.as_deref(), &client.client_name)?;
+        let principal = client.client_name.clone();
+        // Exact-once remote mutation (P0-B review): a retried detach after
+        // response loss replays the first receipt instead of attempting to
+        // release an already-released seat (which would fail as a stale
+        // lease CAS) or rotating the sidecar nonce again.
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&principal, key));
+        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
+            return Ok(replayed);
+        }
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        self.fence_ambiguous_transition(&p.id)?;
         let snapshot = self.sessions.clone();
         let mut preview = self.sessions.clone();
         preview
@@ -1268,6 +1629,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 now,
             )
             .map_err(session_err)?;
+        // The durable exact-once marker is reserved only after every local
+        // preflight passed; any later error deliberately leaves it in place
+        // (fail-closed: a retry must not re-apply an uncertain sidecar
+        // detach — same posture as `gate_and_run`).
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         if let Some(old_binding) = self
             .sessions
             .get(&p.id)
@@ -1294,6 +1664,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: next_epoch,
                     binding_expires_unix: old_binding.binding_expires_unix,
                     controller_attached: false,
+                    lease_id: Some(p.lease_id.clone()),
                     terminal: false,
                 },
                 new_binding: None,
@@ -1350,12 +1721,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             self.sessions = preview;
             self.commit_sessions(snapshot)?;
         }
-        Ok(json!({
+        let body = json!({
             "detached": true,
             "session_id": p.id,
             "workspace_id": bound_ws,
             "live_pty": self.live_hosts.contains_key(&p.id),
-        }))
+            // Additive exact-once marker (ADR 0010 §1b).
+            "operation_id": operation_id,
+        });
+        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
     }
 
     pub(super) async fn handle_session_give(
@@ -1375,6 +1749,9 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             lease_id: Option<String>,
             #[serde(default)]
             controller_epoch: Option<u64>,
+            /// Agent transport operation key; enables the exact-once journal.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
         // give requires from == authenticated identity (spoofed from is rejected).
@@ -1389,8 +1766,22 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 });
             }
         }
+        let principal = client.client_name.clone();
+        // Exact-once remote mutation (P0-B review): a retried give after
+        // response loss replays the first receipt instead of re-running the
+        // handoff (which would fail once the seat already moved) or rotating
+        // the sidecar nonce again.
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&principal, key));
+        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
+            return Ok(replayed);
+        }
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        self.fence_ambiguous_transition(&p.id)?;
         let from = client.client_name.clone();
         if is_remote_runtime_principal(&from) {
             let lease_id = p
@@ -1417,6 +1808,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         let lease = preview
             .give_controller(&p.id, &from, to, now)
             .map_err(session_err)?;
+        // The durable exact-once marker is reserved only after every local
+        // preflight passed; any later error deliberately leaves it in place
+        // (fail-closed: a retry must not re-apply an uncertain handoff).
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         if let Some(old_binding) = self
             .sessions
             .get(&p.id)
@@ -1450,6 +1849,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: lease.epoch,
                     binding_expires_unix: lease.expires_unix,
                     controller_attached: true,
+                    lease_id: Some(lease.lease_id.clone()),
                     terminal: false,
                 },
                 new_binding: None,
@@ -1518,7 +1918,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             .map_err(session_err)?
             .into_iter()
             .collect();
-        Ok(json!({ "lease": lease, "readers": readers, "workspace_id": bound_ws }))
+        let body = json!({
+            "lease": lease,
+            "readers": readers,
+            "workspace_id": bound_ws,
+            // Additive exact-once marker (ADR 0010 §1b).
+            "operation_id": operation_id,
+        });
+        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
     }
 
     /// A failed supervisor RPC is not proof that its child died.  We only
@@ -1630,8 +2037,24 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             controller_epoch: Option<u64>,
             #[serde(default)]
             workspace_id: Option<String>,
+            /// Agent transport operation key; enables the exact-once journal.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
+        let principal = client.client_name.clone();
+        // Exact-once remote mutation (P0-B review): a retried close after
+        // response loss replays the first receipt instead of re-running the
+        // terminal transition (which would fail as a stale lease CAS) or
+        // issuing a second sidecar termination.
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&principal, key));
+        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
+            return Ok(replayed);
+        }
         let now = self.prepare_session_access()?;
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
         let remote = is_remote_runtime_principal(&client.client_name);
@@ -1654,6 +2077,11 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             self.require_controller(&p.id, &client.client_name, now)?;
         }
+        // P0-A fail-closed fencing: an unresolved sidecar transition record
+        // for this session means a claim/detach/give/close/terminate intent
+        // is ambiguous. Closing must not race that ambiguity — only the
+        // supervisor replay path may mutate the session's terminal state.
+        self.fence_ambiguous_transition(&p.id)?;
         let _ = self.drain_live_output_into_session(&p.id);
         let snapshot = self.sessions.clone();
         let mut preview = self.sessions.clone();
@@ -1668,6 +2096,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 message: "session has no active controller".into(),
             })?;
         preview.close(&p.id).map_err(session_err)?;
+        // The durable exact-once marker is reserved only after every local
+        // preflight passed; any later error deliberately leaves it in place
+        // (fail-closed: a retry must not re-apply an uncertain sidecar
+        // termination). Every success path below stores the completed receipt.
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         if let Some(old_binding) = self
             .sessions
             .get(&p.id)
@@ -1684,12 +2121,19 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             let binding = self.verified_sidecar_binding_from(&p.id, &old_binding)?;
             if self.ensure_remote_supervisor().await.is_err() {
                 self.reconcile_terminal_after_supervisor_failure(&p.id, TransitionKind::Close)?;
-                return Ok(json!({
+                let reconciled = json!({
                     "closed": true,
                     "reconciled": true,
                     "session_id": p.id,
                     "workspace_id": bound_ws,
-                }));
+                    // Additive exact-once marker (ADR 0010 §1b).
+                    "operation_id": operation_id,
+                });
+                return self.store_session_mutation_receipt(
+                    journal_key.as_ref(),
+                    &operation_id,
+                    reconciled,
+                );
             }
             // Reattachment may have just completed cleanup of an interrupted
             // open. Treat the caller's retry as the same successful close;
@@ -1697,20 +2141,34 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             // false conflict.
             match self.sessions.get(&p.id) {
                 Ok(current) if current.sidecar_host.is_none() => {
-                    return Ok(json!({
+                    let reconciled = json!({
                         "closed": true,
                         "reconciled": true,
                         "session_id": p.id,
                         "workspace_id": bound_ws,
-                    }));
+                        // Additive exact-once marker (ADR 0010 §1b).
+                        "operation_id": operation_id,
+                    });
+                    return self.store_session_mutation_receipt(
+                        journal_key.as_ref(),
+                        &operation_id,
+                        reconciled,
+                    );
                 }
                 Err(ownmesh_session::SessionError::NotFound) => {
-                    return Ok(json!({
+                    let reconciled = json!({
                         "closed": true,
                         "reconciled": true,
                         "session_id": p.id,
                         "workspace_id": bound_ws,
-                    }));
+                        // Additive exact-once marker (ADR 0010 §1b).
+                        "operation_id": operation_id,
+                    });
+                    return self.store_session_mutation_receipt(
+                        journal_key.as_ref(),
+                        &operation_id,
+                        reconciled,
+                    );
                 }
                 Ok(_) => {}
                 Err(error) => return Err(session_err(error)),
@@ -1729,6 +2187,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: active.epoch,
                     binding_expires_unix: active.expires_unix,
                     controller_attached: true,
+                    lease_id: Some(active.lease_id.clone()),
                     terminal: true,
                 },
                 new_binding: None,
@@ -1774,7 +2233,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             self.commit_sessions(snapshot)?;
             self.stop_live_host(&p.id);
         }
-        Ok(json!({ "closed": true, "session_id": p.id, "workspace_id": bound_ws }))
+        let body = json!({
+            "closed": true,
+            "session_id": p.id,
+            "workspace_id": bound_ws,
+            // Additive exact-once marker (ADR 0010 §1b).
+            "operation_id": operation_id,
+        });
+        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
     }
 
     pub(super) async fn handle_session_terminate(
@@ -1798,8 +2264,24 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             lease_id: Option<String>,
             #[serde(default)]
             controller_epoch: Option<u64>,
+            /// Agent transport operation key; enables the exact-once journal.
+            #[serde(default)]
+            idempotency_key: Option<String>,
         }
         let p: P = parse_params(params)?;
+        let principal = client.client_name.clone();
+        // Exact-once remote mutation (P0-B review): a retried terminate after
+        // response loss replays the first receipt instead of re-running the
+        // terminal transition (which would fail as a stale lease CAS) or
+        // issuing a second sidecar termination.
+        let journal_key = p
+            .idempotency_key
+            .as_ref()
+            .filter(|key| !key.is_empty())
+            .map(|key| principal_journal_key(&principal, key));
+        if let Some(replayed) = self.remote_mutation_receipt(journal_key.as_ref())? {
+            return Ok(replayed);
+        }
         let now = self.prepare_session_access()?;
         if p.all {
             if is_remote_runtime_principal(&client.client_name) {
@@ -1821,6 +2303,11 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 })
                 .map(|info| info.id)
                 .collect();
+            // P0-A fail-closed fencing: mass-terminate must not bypass the
+            // transition journal for a session with an unresolved record.
+            for id in &controlled {
+                self.fence_ambiguous_transition(id)?;
+            }
             let mut drained = Vec::new();
             for id in &controlled {
                 let _ = self.drain_live_output_into_session(id);
@@ -1869,6 +2356,11 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
         } else {
             self.require_controller(&id, &client.client_name, now)?;
         }
+        // P0-A fail-closed fencing: an unresolved sidecar transition record
+        // for this session means a claim/detach/give/close/terminate intent
+        // is ambiguous. Terminating must not race that ambiguity — only the
+        // supervisor replay path may mutate the session's terminal state.
+        self.fence_ambiguous_transition(&id)?;
         let _ = self.drain_live_output_into_session(&id);
         let snapshot = self.sessions.clone();
         let mut preview = self.sessions.clone();
@@ -1883,6 +2375,15 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 message: "session has no active controller".into(),
             })?;
         preview.terminate(&id).map_err(session_err)?;
+        // The durable exact-once marker is reserved only after every local
+        // preflight passed; any later error deliberately leaves it in place
+        // (fail-closed: a retry must not re-apply an uncertain sidecar
+        // termination). Every success path below stores the completed receipt.
+        let operation_id = self
+            .active_remote_operation_id
+            .clone()
+            .unwrap_or_else(|| Self::new_id("op_"));
+        self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
         if let Some(old_binding) = self
             .sessions
             .get(&id)
@@ -1899,12 +2400,19 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             let binding = self.verified_sidecar_binding_from(&id, &old_binding)?;
             if self.ensure_remote_supervisor().await.is_err() {
                 self.reconcile_terminal_after_supervisor_failure(&id, TransitionKind::Terminate)?;
-                return Ok(json!({
+                let reconciled = json!({
                     "terminated": 1,
                     "reconciled": true,
                     "session_id": id,
                     "workspace_id": bound_ws,
-                }));
+                    // Additive exact-once marker (ADR 0010 §1b).
+                    "operation_id": operation_id,
+                });
+                return self.store_session_mutation_receipt(
+                    journal_key.as_ref(),
+                    &operation_id,
+                    reconciled,
+                );
             }
             // Interrupted-open recovery may have acknowledged termination and
             // closed this row while reconnecting the supervisor. Complete the
@@ -1915,20 +2423,34 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     let recovered_snapshot = self.sessions.clone();
                     self.sessions.terminate(&id).map_err(session_err)?;
                     self.commit_sessions(recovered_snapshot)?;
-                    return Ok(json!({
+                    let reconciled = json!({
                         "terminated": 1,
                         "reconciled": true,
                         "session_id": id,
                         "workspace_id": bound_ws,
-                    }));
+                        // Additive exact-once marker (ADR 0010 §1b).
+                        "operation_id": operation_id,
+                    });
+                    return self.store_session_mutation_receipt(
+                        journal_key.as_ref(),
+                        &operation_id,
+                        reconciled,
+                    );
                 }
                 Err(ownmesh_session::SessionError::NotFound) => {
-                    return Ok(json!({
+                    let reconciled = json!({
                         "terminated": 1,
                         "reconciled": true,
                         "session_id": id,
                         "workspace_id": bound_ws,
-                    }));
+                        // Additive exact-once marker (ADR 0010 §1b).
+                        "operation_id": operation_id,
+                    });
+                    return self.store_session_mutation_receipt(
+                        journal_key.as_ref(),
+                        &operation_id,
+                        reconciled,
+                    );
                 }
                 Ok(_) => {}
                 Err(error) => return Err(session_err(error)),
@@ -1947,6 +2469,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                     controller_epoch: active.epoch,
                     binding_expires_unix: active.expires_unix,
                     controller_attached: true,
+                    lease_id: Some(active.lease_id.clone()),
                     terminal: true,
                 },
                 new_binding: None,
@@ -1993,7 +2516,14 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             self.commit_sessions(snapshot)?;
             self.stop_live_host(&id);
         }
-        Ok(json!({ "terminated": 1, "session_id": id, "workspace_id": bound_ws }))
+        let body = json!({
+            "terminated": 1,
+            "session_id": id,
+            "workspace_id": bound_ws,
+            // Additive exact-once marker (ADR 0010 §1b).
+            "operation_id": operation_id,
+        });
+        self.store_session_mutation_receipt(journal_key.as_ref(), &operation_id, body)
     }
 
     pub(super) async fn handle_session_replay(
@@ -2234,6 +2764,12 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
                 .map_err(session_err)?;
         }
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        // P0-A fail-closed fencing: an unresolved sidecar transition record
+        // for this session means a claim/detach/give/close/terminate intent
+        // is ambiguous. Delivering input against a possibly-stale sidecar
+        // binding must not race that ambiguity — only the supervisor replay
+        // path may mutate the session's controller/binding state.
+        self.fence_ambiguous_transition(&p.id)?;
         // Validate sequence before side effects; advance only with the durable commit.
         if p.input_seq.is_none() && is_remote_runtime_principal(&principal) {
             return Err(IpcError::Remote {
@@ -2419,6 +2955,12 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
             self.require_controller(&p.id, &client.client_name, now)?;
         }
         let bound_ws = self.require_session_workspace(&p.id, p.workspace_id.as_deref())?;
+        // P0-A fail-closed fencing: an unresolved sidecar transition record
+        // for this session means a claim/detach/give/close/terminate intent
+        // is ambiguous. Resizing against a possibly-stale sidecar binding
+        // must not race that ambiguity — only the supervisor replay path may
+        // mutate the session's controller/binding state.
+        self.fence_ambiguous_transition(&p.id)?;
         if p.resize_seq.is_none() && is_remote_runtime_principal(&client.client_name) {
             return Err(IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
@@ -2517,7 +3059,7 @@ within a registered workspace, or switch access mode to full_user_access/full_ac
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SystemDiagnosisFacts {
     lockdown: bool,
     workspace_state: &'static str,
@@ -2526,6 +3068,85 @@ struct SystemDiagnosisFacts {
     session_count: usize,
     nonterminal_sessions: usize,
     stale_sessions: usize,
+    transition_pending: usize,
+    transition_expired_pending: usize,
+    transition_retained_unresolved: usize,
+    op_journal_entries: usize,
+    op_journal_durable_bytes: usize,
+    op_journal_in_progress: usize,
+    op_journal_uncertain: usize,
+    profile_discovery: (&'static str, Vec<String>),
+}
+
+/// Profile-discovery health canary (P1-D/P1-F): runs official profile
+/// discovery against the daemon's deterministic search (system PATH +
+/// user-local dirs) and compares it with the bare system PATH. Notes are
+/// emitted when:
+///
+/// - user-local bin dirs exist but are not searched (would report installed
+///   CLIs as not-installed);
+/// - an official profile resolves only through user-local dirs, i.e. a login
+///   shell would find it but the bare service PATH would not (detected-vs-
+///   login mismatch).
+///
+/// Discovery never spawns version probes: observation must not run binaries.
+/// Returns `(status, notes)` with status `ok` or `warn`.
+fn profile_discovery_health() -> (&'static str, Vec<String>) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    profile_discovery_health_with(home.as_deref(), std::env::var_os("PATH").as_deref())
+}
+
+/// Pure core of [`profile_discovery_health`]; parameters keep the comparison
+/// unit-testable without mutating the process environment.
+fn profile_discovery_health_with(
+    home: Option<&Path>,
+    path_var: Option<&std::ffi::OsStr>,
+) -> (&'static str, Vec<String>) {
+    let mut notes = Vec::new();
+    if cfg!(windows) {
+        // Windows user bins are already reachable through the inherited user
+        // PATH; no separate user-local discovery step exists there.
+        return ("ok", notes);
+    }
+    let Some(home) = home else {
+        notes
+            .push("HOME unset on this Unix daemon; user-local CLI discovery is unavailable".into());
+        return ("warn", notes);
+    };
+    let system_dirs: Vec<PathBuf> = std::env::split_paths(path_var.unwrap_or_default()).collect();
+    let user_dirs = ownmesh_exec::user_cli_search_dirs(Some(home));
+    let full_dirs: Vec<PathBuf> = {
+        let mut dirs = system_dirs.clone();
+        for dir in &user_dirs {
+            if !dirs.contains(dir) {
+                dirs.push(dir.clone());
+            }
+        }
+        dirs
+    };
+    let registry = ProfileRegistry::with_official();
+    for profile in registry.list() {
+        let id = &profile.id;
+        let via_system = registry
+            .resolve_binary_in_dirs(id, &system_dirs)
+            .ok()
+            .flatten();
+        let via_full = registry
+            .resolve_binary_in_dirs(id, &full_dirs)
+            .ok()
+            .flatten();
+        if via_full.is_some() && via_system.is_none() {
+            notes.push(format!(
+                "official profile `{id}` resolves only through user-local search dirs, not the \
+service PATH; a login shell finds it but the daemon service would report it not-installed"
+            ));
+        }
+    }
+    if notes.is_empty() {
+        ("ok", notes)
+    } else {
+        ("warn", notes)
+    }
 }
 
 fn workspace_diagnosis_state(bound: bool, enforce_workspace: bool) -> &'static str {
@@ -2545,10 +3166,63 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     } else {
         "unavailable"
     };
+    // P0-A: expired records that survived reconciliation are fail-closed
+    // state (the journal could not prove them harmless), and must not be
+    // reported as healthy. Live pending records are only an early signal.
+    let transition_status =
+        if facts.transition_retained_unresolved > 0 || facts.transition_expired_pending > 0 {
+            "fail"
+        } else if facts.transition_pending > 0 {
+            "warn"
+        } else {
+            "ok"
+        };
+    // P0-B: op-journal pressure before capacity becomes operationally critical.
+    // Integer-only threshold math (no f64 casts on usize).
+    let entries_at_warn = super::MAX_OP_JOURNAL_ENTRIES.saturating_mul(6).div_ceil(10);
+    let bytes_at_warn = super::MAX_OP_JOURNAL_FILE_BYTES
+        .saturating_mul(6)
+        .div_ceil(10);
+    // P1-F: uncertain entries (unknown/forward-version state, malformed state
+    // values, or non-object entries) are fail-closed state the runtime refuses
+    // to replay, compact, or evict. They must never be reported healthy, even
+    // when the journal is far below capacity.
+    //
+    // P0-B review: durable `in_progress` markers are equally actionable. The
+    // daemon is single-op-at-a-time, so by the time a diagnosis runs any
+    // marker still in the journal belongs to an operation that never reached
+    // `store_idempotent` — a failed or crashed run whose outcome is uncertain
+    // and whose key is permanently non-replayable (fail-closed by design).
+    // Reporting that as a plain healthy journal hid the stuck marker behind a
+    // pass result.
+    let op_status = if facts.op_journal_entries >= super::MAX_OP_JOURNAL_ENTRIES
+        || facts.op_journal_durable_bytes >= super::MAX_OP_JOURNAL_FILE_BYTES
+    {
+        "critical"
+    } else if facts.op_journal_uncertain > 0
+        || facts.op_journal_in_progress > 0
+        || facts.op_journal_entries >= entries_at_warn
+        || facts.op_journal_durable_bytes >= bytes_at_warn
+    {
+        "warn"
+    } else {
+        "ok"
+    };
+    let (profile_status, profile_notes) = &facts.profile_discovery;
     let overall = if facts.lockdown {
         "lockdown"
     } else if supervisor_state == "unavailable" {
         "supervisor_unavailable"
+    } else if transition_status == "fail" {
+        "transition_journal_issues"
+    } else if op_status == "critical" {
+        "op_journal_pressure"
+    } else if facts.op_journal_uncertain > 0 {
+        "op_journal_uncertain"
+    } else if facts.op_journal_in_progress > 0 {
+        "op_journal_in_progress"
+    } else if *profile_status == "warn" {
+        "profile_discovery_issues"
     } else if facts.stale_sessions > 0 {
         "stale_sessions"
     } else if facts.workspace_state == "unbound_enforced" {
@@ -2559,6 +3233,11 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     let recommendation = match overall {
         "lockdown" => "unlock_locally",
         "supervisor_unavailable" => "restart_session_supervisor",
+        "transition_journal_issues"
+        | "op_journal_pressure"
+        | "op_journal_uncertain"
+        | "op_journal_in_progress"
+        | "profile_discovery_issues" => "run_local_doctor",
         "stale_sessions" => "reconcile_stale_sessions",
         "workspace_selection_required" => "select_workspace",
         _ => "none",
@@ -2606,13 +3285,37 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "stale_count": facts.stale_sessions,
             },
         ],
+        "journals": {
+            "transition": {
+                "status": transition_status,
+                "pending": facts.transition_pending,
+                "expired_pending": facts.transition_expired_pending,
+                "retained_unresolved": facts.transition_retained_unresolved,
+            },
+            "op_journal": {
+                "status": op_status,
+                "entries": facts.op_journal_entries,
+                "max_entries": super::MAX_OP_JOURNAL_ENTRIES,
+                "durable_bytes": facts.op_journal_durable_bytes,
+                "max_bytes": super::MAX_OP_JOURNAL_FILE_BYTES,
+                "in_progress": facts.op_journal_in_progress,
+                "uncertain": facts.op_journal_uncertain,
+            },
+        },
+        "profile_discovery": {
+            "status": profile_status,
+            "notes": profile_notes,
+        },
         "recommendation": recommendation,
     })
 }
 
 #[cfg(test)]
 mod system_diagnosis_tests {
-    use super::{system_diagnosis_payload, workspace_diagnosis_state, SystemDiagnosisFacts};
+    use super::{
+        profile_discovery_health_with, system_diagnosis_payload, workspace_diagnosis_state,
+        SystemDiagnosisFacts,
+    };
 
     #[test]
     fn workspace_diagnosis_is_a_fixed_redacted_boundary_state() {
@@ -2625,57 +3328,109 @@ mod system_diagnosis_tests {
         );
     }
 
+    /// P1-D/P1-F: the profile-discovery health canary actually runs official
+    /// profile discovery (no version probes) and compares the bare service
+    /// PATH with the daemon's full search — a login-shell-installed CLI that
+    /// only resolves through user-local dirs must be surfaced, not healthy.
+    #[cfg(not(windows))]
+    #[test]
+    fn profile_discovery_health_runs_official_discovery_and_compares_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(&codex, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&codex, perms).unwrap();
+        }
+        let system_only = std::ffi::OsString::from("/usr/bin:/bin");
+        let (status, notes) = profile_discovery_health_with(Some(home.path()), Some(&system_only));
+        assert_eq!(status, "warn");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("codex") && n.contains("user-local")),
+            "user-local-only resolution must be surfaced: {notes:?}"
+        );
+        // The login-like full search (user dirs appended) finds it, so the
+        // note is about the service PATH mismatch, not a missing binary.
+        assert!(
+            notes.iter().all(|n| !n.contains("not searched")),
+            "existing user dirs are searched: {notes:?}"
+        );
+
+        // With the bin dir on the daemon PATH the same home is healthy.
+        let full = std::ffi::OsString::from(format!("/usr/bin:/bin:{}", bin.display()));
+        let (status, notes) = profile_discovery_health_with(Some(home.path()), Some(&full));
+        assert_eq!(status, "ok", "{notes:?}");
+
+        // HOME unset → warn (discovery unavailable).
+        let (status, _) = profile_discovery_health_with(None, Some(&system_only));
+        assert_eq!(status, "warn");
+    }
+
+    /// Windows inherits user-level CLI directories through PATH and has no
+    /// Unix HOME-local search supplement, so the Unix mismatch canary is not
+    /// applicable and must not emit a false warning.
+    #[cfg(windows)]
+    #[test]
+    fn profile_discovery_health_skips_unix_user_local_canary_on_windows() {
+        let (status, notes) = profile_discovery_health_with(None, None);
+        assert_eq!(status, "ok");
+        assert!(notes.is_empty());
+    }
+
     #[test]
     fn common_device_local_states_are_typed_and_redacted() {
+        let healthy_facts = || SystemDiagnosisFacts {
+            lockdown: false,
+            workspace_state: "bound_enforced",
+            supervisor_required: false,
+            supervisor_available: true,
+            session_count: 0,
+            nonterminal_sessions: 0,
+            stale_sessions: 0,
+            transition_pending: 0,
+            transition_expired_pending: 0,
+            transition_retained_unresolved: 0,
+            op_journal_entries: 0,
+            op_journal_durable_bytes: 0,
+            op_journal_in_progress: 0,
+            op_journal_uncertain: 0,
+            profile_discovery: ("ok", vec![]),
+        };
         let cases = [
+            (healthy_facts(), "healthy", "none"),
             (
                 SystemDiagnosisFacts {
-                    lockdown: false,
-                    workspace_state: "bound_enforced",
-                    supervisor_required: false,
-                    supervisor_available: true,
-                    session_count: 0,
-                    nonterminal_sessions: 0,
-                    stale_sessions: 0,
-                },
-                "healthy",
-                "none",
-            ),
-            (
-                SystemDiagnosisFacts {
-                    lockdown: false,
-                    workspace_state: "bound_full_access",
                     supervisor_required: true,
                     supervisor_available: false,
                     session_count: 1,
                     nonterminal_sessions: 1,
-                    stale_sessions: 0,
+                    ..healthy_facts()
                 },
                 "supervisor_unavailable",
                 "restart_session_supervisor",
             ),
             (
                 SystemDiagnosisFacts {
-                    lockdown: false,
                     workspace_state: "unbound_full_access",
-                    supervisor_required: false,
-                    supervisor_available: true,
                     session_count: 1,
                     nonterminal_sessions: 1,
                     stale_sessions: 1,
+                    ..healthy_facts()
                 },
                 "stale_sessions",
                 "reconcile_stale_sessions",
             ),
             (
                 SystemDiagnosisFacts {
-                    lockdown: false,
                     workspace_state: "unbound_enforced",
-                    supervisor_required: false,
-                    supervisor_available: true,
-                    session_count: 0,
-                    nonterminal_sessions: 0,
-                    stale_sessions: 0,
+                    ..healthy_facts()
                 },
                 "workspace_selection_required",
                 "select_workspace",
@@ -2700,6 +3455,216 @@ mod system_diagnosis_tests {
                     "leaked forbidden field: {serialized}"
                 );
             }
+        }
+    }
+
+    /// P0-A/P0-B/P1-F: a poisoned transition journal, dangerous op-journal
+    /// pressure and profile-discovery failures must each move `overall` away
+    /// from `healthy` with an actionable recommendation, while the 5 check ids
+    /// stay stable (additive top-level fields only).
+    #[test]
+    fn journal_and_discovery_issues_are_not_reported_healthy() {
+        let healthy = SystemDiagnosisFacts {
+            lockdown: false,
+            workspace_state: "bound_enforced",
+            supervisor_required: false,
+            supervisor_available: true,
+            session_count: 0,
+            nonterminal_sessions: 0,
+            stale_sessions: 0,
+            transition_pending: 0,
+            transition_expired_pending: 0,
+            transition_retained_unresolved: 0,
+            op_journal_entries: 0,
+            op_journal_durable_bytes: 0,
+            op_journal_in_progress: 0,
+            op_journal_uncertain: 0,
+            profile_discovery: ("ok", vec![]),
+        };
+
+        // Retained-expired transition records → fail, actionable.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                transition_pending: 2,
+                transition_expired_pending: 2,
+                transition_retained_unresolved: 1,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "transition_journal_issues");
+        assert_eq!(value["recommendation"], "run_local_doctor");
+        assert_eq!(value["journals"]["transition"]["status"], "fail");
+        assert_eq!(value["journals"]["transition"]["retained_unresolved"], 1);
+
+        // P0-A/P1-F: an *expired pending* record alone (survived a reconcile
+        // pass) must also leave `healthy` — never an unconditional
+        // healthy/recommendation=none result.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                transition_pending: 1,
+                transition_expired_pending: 1,
+                transition_retained_unresolved: 0,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "transition_journal_issues");
+        assert_eq!(value["recommendation"], "run_local_doctor");
+        assert_eq!(value["journals"]["transition"]["status"], "fail");
+        assert_eq!(value["journals"]["transition"]["expired_pending"], 1);
+
+        // Live pending transitions (still in-window) are only a warning and
+        // never flip `overall` away from healthy on their own.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                transition_pending: 1,
+                transition_expired_pending: 0,
+                transition_retained_unresolved: 0,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["journals"]["transition"]["status"], "warn");
+        assert_eq!(value["overall"], "healthy");
+
+        // Critical op-journal pressure → fail, actionable.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: super::super::MAX_OP_JOURNAL_ENTRIES,
+                op_journal_durable_bytes: super::super::MAX_OP_JOURNAL_FILE_BYTES,
+                op_journal_in_progress: 1,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "op_journal_pressure");
+        assert_eq!(value["recommendation"], "run_local_doctor");
+        assert_eq!(value["journals"]["op_journal"]["status"], "critical");
+        assert_eq!(value["journals"]["op_journal"]["in_progress"], 1);
+
+        // Warn-level pressure stays healthy overall but is exposed.
+        let warn_entries = super::super::MAX_OP_JOURNAL_ENTRIES
+            .saturating_mul(6)
+            .div_ceil(10)
+            + 1;
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: warn_entries,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["journals"]["op_journal"]["status"], "warn");
+
+        // P1-F: uncertain entries (unknown/forward-version state, malformed
+        // state values, or non-object entries) are fail-closed state the
+        // runtime refuses to replay/compact/evict. They must never be reported
+        // healthy, even far below capacity.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: 1,
+                op_journal_uncertain: 1,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "op_journal_uncertain");
+        assert_eq!(value["recommendation"], "run_local_doctor");
+        assert_eq!(value["journals"]["op_journal"]["status"], "warn");
+        assert_eq!(value["journals"]["op_journal"]["uncertain"], 1);
+
+        // P0-B review: a durable in-progress marker means an operation never
+        // reached its completed receipt (failed or crashed after reserving
+        // the key). Its outcome is uncertain and the key is permanently
+        // non-replayable, so it must NOT be reported healthy — the daemon is
+        // single-op-at-a-time, so a diagnosis cannot observe a genuinely
+        // in-flight operation's marker.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: 1,
+                op_journal_in_progress: 1,
+                op_journal_uncertain: 0,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "op_journal_in_progress");
+        assert_eq!(value["recommendation"], "run_local_doctor");
+        assert_eq!(value["journals"]["op_journal"]["status"], "warn");
+        assert_eq!(value["journals"]["op_journal"]["in_progress"], 1);
+        assert_eq!(value["journals"]["op_journal"]["uncertain"], 0);
+        // It stays distinct from the uncertain class.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_entries: 1,
+                op_journal_in_progress: 1,
+                op_journal_uncertain: 1,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "op_journal_uncertain");
+
+        // Profile-discovery failure → not healthy.
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "profile_discovery_issues");
+        assert_eq!(value["recommendation"], "run_local_doctor");
+        assert_eq!(value["profile_discovery"]["status"], "warn");
+
+        // All-clear stays healthy with ok journal states.
+        let value = system_diagnosis_payload("2026-08-13T00:00:00Z", healthy);
+        assert_eq!(value["overall"], "healthy");
+        assert_eq!(value["journals"]["transition"]["status"], "ok");
+        assert_eq!(value["journals"]["op_journal"]["status"], "ok");
+        assert_eq!(value["profile_discovery"]["status"], "ok");
+        assert_eq!(value["checks"].as_array().map(Vec::len), Some(5));
+    }
+
+    /// The health payload must stay a fixed allowlisted surface: no
+    /// credentials, argv, cwd, environment or raw paths even with issues set.
+    #[test]
+    fn journal_issue_payload_stays_redacted_and_bounded() {
+        let facts = SystemDiagnosisFacts {
+            lockdown: false,
+            workspace_state: "bound_enforced",
+            supervisor_required: false,
+            supervisor_available: true,
+            session_count: 0,
+            nonterminal_sessions: 0,
+            stale_sessions: 0,
+            transition_pending: 1,
+            transition_expired_pending: 1,
+            transition_retained_unresolved: 1,
+            op_journal_entries: super::super::MAX_OP_JOURNAL_ENTRIES,
+            op_journal_durable_bytes: super::super::MAX_OP_JOURNAL_FILE_BYTES,
+            op_journal_in_progress: 0,
+            op_journal_uncertain: 0,
+            profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
+        };
+        let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
+        let serialized = value.to_string();
+        assert!(serialized.len() < 16 * 1024, "payload must stay bounded");
+        for forbidden in [
+            "credential",
+            "command",
+            "argv",
+            "environment",
+            "cwd",
+            "path",
+            "stdout",
+            "stderr",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "leaked forbidden field: {serialized}"
+            );
         }
     }
 }
