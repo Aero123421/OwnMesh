@@ -247,6 +247,35 @@ fn run_serve(
 ) -> Result<(), ExitCode> {
     let sid = session_id.unwrap_or_else(|| format!("ses_local_{}", std::process::id()));
     let program = program.unwrap_or_else(default_shell);
+    // P1-C: resolve through the shared executable resolver so the standalone
+    // helper agrees with daemon session launch, profile detection and command
+    // execution. Windows batch shims are rewritten to the documented
+    // `cmd.exe /e:ON /v:OFF /d /s /c call ...` form (CreateProcess cannot
+    // exec .cmd/.bat directly); unresolved programs fail closed with the
+    // actionable cause instead of reaching the PTY spawner as a bare name.
+    let (program, args) = match ownmesh_exec::resolve_spawn_argv(
+        &program,
+        &args,
+        cwd.as_deref().map(std::path::Path::new),
+    ) {
+        Ok(resolved) if !resolved.is_empty() => (resolved[0].clone(), resolved[1..].to_vec()),
+        Ok(_) => return Err(ExitCode::UsageConfig),
+        Err(ownmesh_exec::SpawnResolveError::CmdUnsafeArgument) => {
+            eprintln!(
+                "program `{program}` resolves to a batch shim whose arguments cmd.exe cannot \
+represent safely (quotes, %, !, or unquoted metacharacters); adjust the arguments or use an \
+explicit executable"
+            );
+            return Err(ExitCode::UsageConfig);
+        }
+        Err(ownmesh_exec::SpawnResolveError::NotFound) => {
+            eprintln!(
+                "program `{program}` could not be resolved to a launchable executable (check PATH \
+and user-local CLI dirs); install it or use an explicit path"
+            );
+            return Err(ExitCode::UsageConfig);
+        }
+    };
     let cmd = PtyCommand {
         program,
         args,
@@ -482,7 +511,18 @@ mod tests {
     use ownmesh_ipc::{reject_unknown_handler, AuthGate, IpcBus, IpcServer, ServerConfig};
     use ownmesh_session::{PtyBackend, PtyCommand, PtySize, SessionState};
     use std::sync::Arc;
-    use tempfile::tempdir;
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn restore_without_enter_is_ok() {
@@ -557,7 +597,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(result, Err(ExitCode::Internal));
+        // P1-C: the shared resolver rejects the unresolved program with an
+        // actionable usage error *before* any spawn attempt, so no session
+        // record can ever be persisted for a phantom process.
+        assert_eq!(result, Err(ExitCode::UsageConfig));
         assert!(!dir.path().join("sessions/sessions.json").exists());
     }
 

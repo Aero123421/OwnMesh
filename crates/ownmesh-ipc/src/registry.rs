@@ -2260,16 +2260,32 @@ fn validate_state_dir_owner(state_dir: &Path, require_protected: bool) -> IpcRes
 fn validate_parent_custody(state_dir: &Path) -> IpcResult<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let expected = rustix::process::geteuid().as_raw();
+    // v1.2.13 review (ADR 0011 update): custody is byte-for-byte strict —
+    // every state/config ancestor must be owned by the daemon's uid or host
+    // root. A systemd `--user` service that forces a user namespace
+    // (`PrivateUsers=yes`, or the filesystem namespacing directives that
+    // implicitly enable it) reports *every* host uid outside the namespace
+    // — host root and every other host user alike — as the overflow uid
+    // 65534, so the daemon cannot distinguish a host-root-owned system
+    // directory from an attacker-owned one inside that namespace. Accepting
+    // the overflow uid would let a foreign-owned 0755/01777 ancestor pass
+    // (its owner can replace the daemon's state directory), weakening the
+    // A5 cross-user boundary. The shipped user unit therefore does not force
+    // a user namespace (ADR 0011), and the overflow uid is never accepted
+    // here; a drop-in that re-introduces `PrivateUsers=yes` fails closed at
+    // startup with `ancestor is owned by untrusted uid 65534` and is
+    // disclosed by `ownmesh doctor`.
     let mut child = state_dir;
     while let Some(parent) = child.parent() {
         if parent == child || parent.as_os_str().is_empty() {
             break;
         }
         let parent_metadata = parent_custody_metadata(parent)?;
-        if parent_metadata.uid() != expected && parent_metadata.uid() != 0 {
+        let parent_uid = parent_metadata.uid();
+        if !ancestor_owner_is_trusted(parent_uid, expected) {
             return Err(IpcError::Unauthorized(format!(
                 "credential state ancestor is owned by untrusted uid {}: {}",
-                parent_metadata.uid(),
+                parent_uid,
                 parent.display()
             )));
         }
@@ -2294,6 +2310,17 @@ fn validate_parent_custody(state_dir: &Path) -> IpcResult<()> {
         child = parent;
     }
     Ok(())
+}
+
+/// The only ancestor owners custody trusts: the daemon's own uid and host
+/// root. The kernel overflow uid (65534) is *never* trusted as a stand-in
+/// for "host uid outside the namespace" — inside a user namespace it is the
+/// only visible representation of every host uid outside the mapping, host
+/// root and attacker alike, so accepting it would let a foreign-owned
+/// ancestor pass (v1.2.13 review; ADR 0011).
+#[cfg(unix)]
+fn ancestor_owner_is_trusted(parent_uid: u32, expected: u32) -> bool {
+    parent_uid == expected || parent_uid == 0
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -2384,7 +2411,18 @@ fn is_trusted_macos_var_alias(path: &Path) -> IpcResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn threat_model_doc_is_present() {
@@ -2394,6 +2432,33 @@ mod tests {
             src.contains("same OS user") || src.contains("same-uid") || src.contains("same uid")
         );
         assert!(src.contains("read owner-only") || src.contains("read owner"));
+    }
+
+    /// v1.2.13 review regression: the overflow uid 65534 — the only visible
+    /// representation of *every* host uid outside a user namespace's
+    /// mapping, host root and attacker alike — must never be accepted as an
+    /// ancestor owner. A systemd `--user` service that forces a user
+    /// namespace reports a foreign-owned 0755/01777 ancestor as 65534, and
+    /// its owner can replace the daemon's state directory (A5 cross-user
+    /// boundary). The shipped unit therefore does not force a user namespace
+    /// (ADR 0011) and custody stays byte-for-byte strict.
+    #[cfg(unix)]
+    #[test]
+    fn overflow_uid_is_never_an_accepted_ancestor_owner() {
+        let expected = rustix::process::geteuid().as_raw();
+        assert!(ancestor_owner_is_trusted(expected, expected), "own uid");
+        assert!(ancestor_owner_is_trusted(0, expected), "host root");
+        // The overflow uid is trusted only in the degenerate case where the
+        // daemon itself runs as uid 65534; it must never be accepted as a
+        // stand-in for "some host uid outside the namespace".
+        assert_eq!(
+            ancestor_owner_is_trusted(65_534, expected),
+            expected == 65_534,
+            "overflow uid must not be accepted as an external host uid"
+        );
+        // A foreign uid (another host user) is rejected.
+        let foreign = if expected == 1000 { 1001 } else { 1000 };
+        assert!(!ancestor_owner_is_trusted(foreign, expected));
     }
 
     #[test]

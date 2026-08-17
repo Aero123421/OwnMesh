@@ -691,5 +691,7 @@ fn doctor_input_from_local(
             update_network_off: cfg.update.mode == "off",
         },
         service: ServiceObservation::default(),
+        journals: ownmesh_diagnostics::JournalsObservation::default(),
+        profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
     }
 }

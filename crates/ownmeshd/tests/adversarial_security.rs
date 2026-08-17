@@ -44,7 +44,18 @@ use runtime::{runtime_handler, session_methods, DaemonRuntime, WorkspaceEntry};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::tempdir;
+/// Owner-only tempdir: `tempfile` respects the process umask, and the daemon
+/// custody attestation rejects group/world-writable ancestors, so tests pin
+/// mode 0700 to stay umask-independent.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
 use tokio::sync::Mutex;
 
 fn now_unix() -> i64 {
@@ -538,6 +549,135 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
         !shell_marker.exists(),
         "the swapped shell alias must never be reopened or executed"
     );
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
+
+/// P0-B review (Medium/high): generic `command.run` must retain the
+/// *invocation* path (resolved but not canonicalized) for proxy executables
+/// such as rustup's `cargo` (whose argv[0] filename drives dispatch) while
+/// pinning the canonical backing path for identity. The old code replaced the
+/// request program with the canonical backing, so a rustup-style proxy would
+/// spawn the backing binary under the wrong argv[0] and fail. Review pinning
+/// already keeps both paths (`invocation_pin`/`pin`); command execution must
+/// not disagree. The swap test above proves the pinned canonical fallback is
+/// still used when the invocation changes.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn command_run_retains_invocation_path_and_pins_both_identities() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    let client = named_client(endpoint, paths.runtime_dir.clone(), "ownmesh");
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask structured, deny raw".into()),
+            rules: vec![
+                PolicyRule {
+                    id: "deny-raw".into(),
+                    decision: Decision::Deny,
+                    priority: 100,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("raw_shell".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "ask-structured".into(),
+                    decision: Decision::Ask,
+                    priority: 10,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("structured".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+            ],
+        });
+    }
+
+    // A rustup-style proxy: a symlink whose *name* carries the dispatch
+    // semantics, backing a real native binary.
+    let alias = dir.path().join("cargo-proxy");
+    symlink("/bin/echo", &alias).unwrap();
+
+    let pending = client
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": alias.to_string_lossy(),
+                "args": ["--version"],
+                "idempotency_key": "invocation-path-retain-1",
+            })),
+        )
+        .await
+        .expect("enqueue structured command");
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    {
+        let guard = runtime.lock().await;
+        let record = guard
+            .approvals
+            .get(&approval_id)
+            .expect("deferred approval record");
+        let runtime::PendingRequest::Exec(params) = &record.request else {
+            panic!("expected an Exec request");
+        };
+        // The invocation path (the symlink name) is retained as the spawn
+        // program so argv[0]-driven proxy dispatch keeps working — it is
+        // never canonicalized away to the backing binary.
+        assert_eq!(
+            params.program,
+            alias.to_string_lossy(),
+            "command.run must keep the invocation path, not canonicalize it away"
+        );
+        // The invocation path is pinned separately…
+        let invocation_pin = params
+            .invocation_pin
+            .as_ref()
+            .expect("invocation pin must be set");
+        assert_eq!(invocation_pin.path, alias.to_string_lossy());
+        assert_eq!(invocation_pin.policy_kind, "structured");
+        // …and the canonical backing is pinned separately for identity.
+        let backing_pin = params
+            .executable_pin
+            .as_ref()
+            .expect("backing pin must be set");
+        assert_ne!(
+            backing_pin.path,
+            alias.to_string_lossy(),
+            "the backing pin must point at the canonical target, not the alias"
+        );
+        assert!(std::path::Path::new(&backing_pin.path).is_absolute());
+        assert_eq!(backing_pin.policy_kind, "structured");
+    }
+
+    // Deny the deferred approval so nothing runs.
+    let human = ClientIdentity::new(format!("user:{}", current_os_user_id()), "0.1.0");
+    {
+        let mut guard = runtime.lock().await;
+        guard
+            .dispatch(
+                methods::APPROVAL_DENY,
+                Some(json!({ "id": approval_id })),
+                &human,
+            )
+            .await
+            .expect("deny deferred approval");
+    }
 
     server.request_shutdown();
     let _ = handle.await;

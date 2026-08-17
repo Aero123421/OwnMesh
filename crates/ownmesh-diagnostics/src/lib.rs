@@ -28,6 +28,11 @@ pub const fn crate_name() -> &'static str {
     env!("CARGO_PKG_NAME")
 }
 
+/// Op-journal hard caps mirrored from ownmeshd (doctor must not depend on the
+/// daemon crate). Completed receipts are compacted and evicted at 30 days.
+const OP_JOURNAL_MAX_ENTRIES: usize = 4_096;
+const OP_JOURNAL_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Crate version string from Cargo package metadata.
 #[must_use]
 pub const fn crate_version() -> &'static str {
@@ -292,6 +297,107 @@ pub struct ServiceObservation {
     pub running: Option<bool>,
     pub unit_path: Option<String>,
     pub message: Option<String>,
+    /// Effective service hardening disclosure (Linux systemd --user units).
+    pub hardening: Option<ServiceHardeningObservation>,
+}
+
+/// Effective hardening of an installed systemd --user unit as observed
+/// read-only from the unit file plus drop-ins (values only, never content).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // serializable DTO: one bool per directive
+pub struct ServiceHardeningObservation {
+    pub no_new_privileges: bool,
+    /// Per-user-safe baseline directives from the shipped unit (P1-E).
+    pub umask_set: bool,
+    pub restrict_suidsgid: bool,
+    pub restrict_realtime: bool,
+    pub lock_personality: bool,
+    /// Seccomp guards from the shipped baseline unit (P1-E): available in
+    /// user services without a user namespace.
+    pub system_call_architectures: bool,
+    pub restrict_namespaces: bool,
+    pub capability_bounding_set: bool,
+    /// Any directive that forces a user namespace in a per-user service
+    /// (`PrivateUsers=yes` or the filesystem namespacing directives
+    /// `ProtectSystem=`/`ProtectHome=`/`ReadWritePaths=`/`PrivateTmp=`/
+    /// `ProtectKernelTunables=`/`ProtectControlGroups=`/`ProtectHostname=`/…).
+    /// Inside the namespace every host uid outside the mapping — host root
+    /// and every other host user alike — appears as the overflow uid 65534,
+    /// so OwnMesh custody validation cannot verify real ownership and the
+    /// daemon fails to start with `ancestor is owned by untrusted uid 65534`
+    /// (v1.2.13 review, ADR 0011). Disclosed as start-breaking, never
+    /// counted as baseline.
+    pub user_namespace_forcing: bool,
+    pub read_only_hierarchy: bool,
+    /// `PrivateUsers=yes` present (forces the user namespace; see
+    /// [`ServiceHardeningObservation::user_namespace_forcing`]).
+    pub private_users: bool,
+    pub protect_system_full: bool,
+    pub private_tmp: bool,
+    pub protect_proc: bool,
+    /// `ProtectKernelTunables=yes` present (forces the user namespace).
+    pub protect_kernel_tunables: bool,
+    /// `ProtectControlGroups=yes|private|strict` present (forces the user
+    /// namespace).
+    pub protect_control_groups: bool,
+    /// `ProtectHostname=yes` present (forces the user namespace).
+    pub protect_hostname: bool,
+    /// `ReadWritePaths=` present with a non-empty list (forces the user
+    /// namespace).
+    pub read_write_paths_set: bool,
+    /// Start-breaking --user directives (CapabilityBoundingSet=/ProtectClock=/
+    /// ProtectKernelLogs=/ProtectKernelModules=; 218/CAPABILITIES on v259).
+    pub start_breaking_directives: bool,
+    /// The unit file is masked (empty or symlink to /dev/null).
+    pub masked: bool,
+    pub summary: String,
+}
+
+/// Read-only observation of durable daemon journals (P0-A/P0-B). Only counts
+/// and sizes are surfaced — never entry content or result bodies.
+#[derive(Debug, Clone, Default)]
+pub struct JournalsObservation {
+    /// Pending transition-journal records (any phase), from the journal file.
+    pub transition_pending: usize,
+    /// Pending records whose host TTL has expired (poison-pill class).
+    pub transition_expired: usize,
+    pub transition_read_error: Option<String>,
+    /// Op-journal entries and in-progress (uncertain) markers.
+    pub op_journal_entries: usize,
+    pub op_journal_in_progress: usize,
+    /// Entries the runtime refuses to replay/compact/evict (unknown
+    /// forward-version state, malformed state values, or non-object entries).
+    /// Fail-closed state that must never be reported healthy (P1-F).
+    pub op_journal_uncertain: usize,
+    /// Durable op-journal file size in bytes (already compacted post-fix).
+    pub op_journal_durable_bytes: usize,
+    /// Stale `op-journal.json.bak` size in bytes, when present. The backup is
+    /// created by the shared atomic writer *before* the replace, so a crash or
+    /// a failed cleanup can leave the pre-compaction file (with full result
+    /// bodies) behind even though the primary journal is compacted; doctor
+    /// surfaces it so the class is not reported healthy (P0-B). `None` when
+    /// no backup file exists.
+    pub op_journal_backup_bytes: Option<usize>,
+    pub op_journal_read_error: Option<String>,
+}
+
+/// Read-only observation of official-profile discovery (P1-D/P1-F): runs the
+/// deterministic search (system PATH + user-local dirs) and compares it with
+/// the bare system PATH. Never spawns version probes — observation must not
+/// run binaries.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileDiscoveryObservation {
+    /// Official profiles that resolve only through user-local search dirs,
+    /// i.e. a login shell would find them but a systemd user service with a
+    /// system-only PATH would report them not-installed.
+    pub user_local_only: Vec<String>,
+    /// User-local bin dirs that exist on disk but are absent from PATH
+    /// (would report installed CLIs as not-installed).
+    pub existing_dirs_not_searched: Vec<String>,
+    /// `HOME` is unset, so the deterministic user-local search could not be
+    /// evaluated at all. This is a discovery-health issue, not a healthy
+    /// result: installed user CLIs may be reported not-installed.
+    pub home_unavailable: bool,
 }
 
 /// Full set of doctor inputs gathered by the CLI (read-only observations).
@@ -304,6 +410,8 @@ pub struct DoctorInput {
     pub control_plane: ControlPlaneObservation,
     pub privacy_policy: PrivacyPolicyObservation,
     pub service: ServiceObservation,
+    pub journals: JournalsObservation,
+    pub profile_discovery: ProfileDiscoveryObservation,
 }
 
 /// True for built-in presets that deny `command.run` / `session.open`.
@@ -671,6 +779,249 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         ));
     }
 
+    // Effective service hardening (P1-E / v1.2.13 review): local overrides
+    // that disable the meaningful guards, force a user namespace (which
+    // hides real uids and makes custody validation unsound), re-introduce
+    // unexpected filesystem/visibility directives, or add a start-breaking
+    // directive must be disclosed instead of claiming an unmodified
+    // baseline. A masked unit is disclosed first: the daemon is not running
+    // under the shipped unit at all.
+    if let Some(h) = &input.service.hardening {
+        if h.masked {
+            checks.push(DoctorCheck::warn(
+                "service.hardening",
+                "the systemd user unit is masked (empty file or symlink to /dev/null, systemd.unit(5)); \
+the daemon is not running under the shipped unit — remove the mask and re-run `ownmesh service install`",
+            ));
+        } else if h.start_breaking_directives {
+            checks.push(DoctorCheck::warn(
+                "service.hardening",
+                "effective unit sets a directive an unprivileged --user service cannot apply \
+(CapabilityBoundingSet=/ProtectClock=/ProtectKernelLogs=/ProtectKernelModules=; startup fails \
+with status 218/CAPABILITIES on systemd v259 even under PrivateUsers=yes); re-run `ownmesh \
+service install` to restore the supported unit",
+            ));
+        } else if h.user_namespace_forcing {
+            checks.push(DoctorCheck::warn(
+                "service.hardening",
+                "effective unit forces a user namespace (PrivateUsers=yes or the filesystem \
+namespacing directives ProtectSystem/ProtectHome/ReadWritePaths/PrivateTmp/\
+ProtectKernelTunables/ProtectControlGroups/ProtectHostname/...); inside it every host uid \
+outside the namespace — host root and every other host user alike — appears as the overflow \
+uid 65534, so OwnMesh custody validation cannot verify real ownership and the daemon fails to \
+start with `ancestor is owned by untrusted uid 65534`; re-run `ownmesh service install` to \
+restore the supported unit",
+            ));
+        } else if !h.no_new_privileges
+            || !h.umask_set
+            || !h.restrict_suidsgid
+            || !h.restrict_realtime
+            || !h.lock_personality
+            || !h.system_call_architectures
+            || !h.restrict_namespaces
+            || !h.protect_proc
+        {
+            checks.push(DoctorCheck::warn(
+                "service.hardening",
+                "a local override weakened the shipped hardening (NoNewPrivileges/UMask/\
+RestrictSUIDSGID/RestrictRealtime/LockPersonality/SystemCallArchitectures/RestrictNamespaces/\
+ProtectProc=invisible); re-run `ownmesh service install` to restore the supported unit",
+            ));
+        } else if h.capability_bounding_set {
+            checks.push(DoctorCheck::warn(
+                "service.hardening",
+                "effective unit sets CapabilityBoundingSet=, which an unprivileged --user service cannot apply (startup fails with status 218/CAPABILITIES); re-run `ownmesh service install` to restore the supported unit",
+            ));
+        } else if h.read_only_hierarchy {
+            checks.push(DoctorCheck::warn(
+                "service.hardening",
+                "effective unit hardening makes parts of the user/workspace hierarchy read-only; this can conflict with registered workspaces",
+            ));
+        } else {
+            checks.push(DoctorCheck::pass(
+                "service.hardening",
+                "effective unit hardening baseline applied",
+            ));
+        }
+    }
+
+    // Durable journals (P0-A/P0-B): a pending/expired transition record or
+    // dangerous op-journal pressure must never coexist with an unconditional
+    // healthy result. Only counts/sizes are reported — never entry content.
+    if let Some(error) = &input.journals.transition_read_error {
+        checks.push(DoctorCheck::warn(
+            "journals.transition",
+            format!("transition journal unreadable: {error}"),
+        ));
+    } else if input.journals.transition_expired > 0 {
+        checks.push(DoctorCheck::fail(
+            "journals.transition",
+            format!(
+                "{} expired sidecar transition record(s) pending; sessions may fail closed until reconciled",
+                input.journals.transition_expired
+            ),
+        ));
+    } else if input.journals.transition_pending > 0 {
+        checks.push(DoctorCheck::warn(
+            "journals.transition",
+            format!(
+                "{} pending sidecar transition record(s) (none expired)",
+                input.journals.transition_pending
+            ),
+        ));
+    } else {
+        checks.push(DoctorCheck::pass(
+            "journals.transition",
+            "no pending sidecar transition records",
+        ));
+    }
+
+    let op_at_capacity = input.journals.op_journal_entries >= OP_JOURNAL_MAX_ENTRIES
+        || input.journals.op_journal_durable_bytes >= OP_JOURNAL_MAX_BYTES;
+    let op_warn_entries = (OP_JOURNAL_MAX_ENTRIES as u64 * 6) / 10;
+    let op_warn_bytes = (OP_JOURNAL_MAX_BYTES as u64 * 6) / 10;
+    let op_warn = input.journals.op_journal_entries as u64 >= op_warn_entries
+        || input.journals.op_journal_durable_bytes as u64 >= op_warn_bytes;
+    let op_pressure = if op_at_capacity {
+        Some("critical")
+    } else if op_warn {
+        Some("warn")
+    } else {
+        None
+    };
+    if let Some(error) = &input.journals.op_journal_read_error {
+        checks.push(DoctorCheck::warn(
+            "journals.op_journal",
+            format!("op journal unreadable: {error}"),
+        ));
+    } else if let Some(bak_bytes) = input.journals.op_journal_backup_bytes {
+        // P0-B: the shared atomic writer copies the previous file to
+        // `op-journal.json.bak` *before* the replace, so a crash or a failed
+        // cleanup can leave the pre-compaction journal (with full result
+        // bodies) behind even though the primary journal is compacted. While
+        // it exists, doctor surfaces it instead of reporting the journal
+        // healthy; the daemon removes the stale backup on the next
+        // load/persist (and the v1.2.13 writer no longer creates one).
+        checks.push(DoctorCheck::warn(
+            "journals.op_journal",
+            format!(
+                "stale op-journal backup present (op-journal.json.bak, {bak_bytes} bytes); it may \
+hold pre-compaction result bodies — restarting ownmeshd removes it, or delete it manually",
+            ),
+        ));
+    } else if input.journals.op_journal_uncertain > 0 {
+        // P1-F: entries the runtime refuses to replay/compact/evict (unknown
+        // forward-version state, malformed state values, or non-object
+        // entries) are fail-closed state; reporting the journal as okay would
+        // hide an uncertain outcome behind a healthy result.
+        checks.push(DoctorCheck::warn(
+            "journals.op_journal",
+            format!(
+                "{} uncertain op-journal entr{} (unknown/forward-version or malformed state) that the \
+runtime refuses to replay, compact, or evict; run `ownmesh doctor` after checking the journal",
+                input.journals.op_journal_uncertain,
+                if input.journals.op_journal_uncertain == 1 { "y" } else { "ies" },
+            ),
+        ));
+    } else if let Some(pressure) = op_pressure {
+        let hint = if pressure == "critical" {
+            "new side-effect operations will be refused until completed receipts age out (eviction at capacity, 30d+)"
+        } else {
+            "op journal approaching capacity; old completed receipts are evicted only at capacity (30d+)"
+        };
+        checks.push(DoctorCheck::warn(
+            "journals.op_journal",
+            format!(
+                "op journal pressure {pressure} ({} entries, {} durable bytes; {hint})",
+                input.journals.op_journal_entries, input.journals.op_journal_durable_bytes
+            ),
+        ));
+    } else if input.journals.op_journal_in_progress > 0 {
+        // P0-B review: a durable `in_progress` marker is permanently
+        // non-replayable (the runtime refuses to replay, compact, or evict
+        // it), so an operation that crashed or failed after reserving its key
+        // can never be retried. Reporting the journal as a plain pass hid
+        // that stuck outcome behind a healthy result; surface it with an
+        // actionable note instead. An operation genuinely in flight while
+        // doctor runs is the same durable shape, so the message says so.
+        checks.push(DoctorCheck::warn(
+            "journals.op_journal",
+            format!(
+                "{} durable in-progress op-journal marker(s) present; the referenced operation \
+outcome is uncertain and its key is permanently non-replayable until reconciled (an operation \
+truly in flight while doctor runs is expected to show this briefly) — run `ownmesh doctor` \
+after the operation finishes or reconcile the marker manually",
+                input.journals.op_journal_in_progress
+            ),
+        ));
+    } else {
+        checks.push(DoctorCheck::pass(
+            "journals.op_journal",
+            format!(
+                "op journal ok ({} entries, {} durable bytes, {} in-progress)",
+                input.journals.op_journal_entries,
+                input.journals.op_journal_durable_bytes,
+                input.journals.op_journal_in_progress
+            ),
+        ));
+    }
+
+    // Official-profile discovery (P1-D/P1-F): installed CLIs that only
+    // resolve through user-local dirs (or dirs that exist but are not
+    // searched) must be surfaced instead of an unconditional healthy result.
+    // A missing `HOME` means the user-local search could not be evaluated at
+    // all — that is a discovery-health issue, not a healthy result.
+    let discovery_warned = !input.profile_discovery.user_local_only.is_empty()
+        || !input
+            .profile_discovery
+            .existing_dirs_not_searched
+            .is_empty()
+        || input.profile_discovery.home_unavailable;
+    if discovery_warned {
+        let mut detail = String::new();
+        if input.profile_discovery.home_unavailable {
+            detail.push_str(
+                "HOME is unset, so the deterministic user-local CLI search could not be evaluated; \
+installed user CLIs may be reported not-installed",
+            );
+        }
+        if !input.profile_discovery.user_local_only.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str("official profile(s) resolve only through user-local search dirs, not the service PATH: ");
+            detail.push_str(&input.profile_discovery.user_local_only.join(", "));
+        }
+        if !input
+            .profile_discovery
+            .existing_dirs_not_searched
+            .is_empty()
+        {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str("user-local bin dir(s) exist but are not searched: ");
+            detail.push_str(
+                &input
+                    .profile_discovery
+                    .existing_dirs_not_searched
+                    .join(", "),
+            );
+        }
+        checks.push(DoctorCheck::warn(
+            "profiles.discovery",
+            format!(
+                "official profile discovery mismatch — {detail}; a login shell finds these, a \
+daemon service with the bare system PATH reports them not-installed"
+            ),
+        ));
+    } else {
+        checks.push(DoctorCheck::pass(
+            "profiles.discovery",
+            "official profile discovery consistent with service PATH",
+        ));
+    }
+
     DoctorReport::from_checks(
         if input.binary.cli_version.is_empty() {
             crate_version().to_string()
@@ -877,6 +1228,136 @@ mod tests {
         assert!(appears_redacted(&s));
     }
 
+    /// P0-A/P0-B: run_doctor must surface poisoned transition-journal and
+    /// op-journal pressure state instead of an unconditional healthy result.
+    #[test]
+    fn doctor_surfaces_journal_health() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.13".into();
+
+        // Healthy journals → pass rows.
+        let report = run_doctor(&input);
+        let transition = report
+            .checks
+            .iter()
+            .find(|c| c.id == "journals.transition")
+            .unwrap();
+        assert_eq!(transition.status, CheckStatus::Pass, "{report:?}");
+        let op = report
+            .checks
+            .iter()
+            .find(|c| c.id == "journals.op_journal")
+            .unwrap();
+        assert_eq!(op.status, CheckStatus::Pass, "{report:?}");
+
+        // Expired transition record → fail.
+        input.journals.transition_pending = 2;
+        input.journals.transition_expired = 1;
+        let report = run_doctor(&input);
+        let transition = report
+            .checks
+            .iter()
+            .find(|c| c.id == "journals.transition")
+            .unwrap();
+        assert_eq!(transition.status, CheckStatus::Fail, "{report:?}");
+        assert!(!report.ok);
+
+        // Critical op-journal pressure → warn with actionable hint.
+        input.journals.transition_pending = 0;
+        input.journals.transition_expired = 0;
+        input.journals.op_journal_entries = OP_JOURNAL_MAX_ENTRIES;
+        input.journals.op_journal_durable_bytes = OP_JOURNAL_MAX_BYTES;
+        let report = run_doctor(&input);
+        let op = report
+            .checks
+            .iter()
+            .find(|c| c.id == "journals.op_journal")
+            .unwrap();
+        assert_eq!(op.status, CheckStatus::Warn, "{report:?}");
+        assert!(op.message.contains("pressure"));
+        assert!(op.message.contains("30d"), "{}", op.message);
+
+        // P1-F: uncertain entries (unknown/forward-version state, malformed
+        // state values, or non-object entries) must be surfaced, never
+        // reported as an okay journal — even far below capacity.
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.13".into();
+        input.journals.op_journal_entries = 1;
+        input.journals.op_journal_uncertain = 1;
+        let report = run_doctor(&input);
+        let op = report
+            .checks
+            .iter()
+            .find(|c| c.id == "journals.op_journal")
+            .unwrap();
+        assert_eq!(op.status, CheckStatus::Warn, "{report:?}");
+        assert!(
+            op.message.contains("uncertain"),
+            "uncertain entries must be surfaced: {}",
+            op.message
+        );
+        assert_eq!(report.outcome, DoctorOutcome::Warn, "{report:?}");
+    }
+
+    /// P1-D/P1-F: run_doctor must surface user-local-only official profiles
+    /// and existing-but-unsearched user bin dirs instead of an unconditional
+    /// healthy result.
+    #[test]
+    fn doctor_surfaces_profile_discovery_mismatch() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.13".into();
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "profiles.discovery")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Pass, "{report:?}");
+
+        input.profile_discovery = ProfileDiscoveryObservation {
+            user_local_only: vec!["codex".into(), "pi".into()],
+            existing_dirs_not_searched: vec!["~/.local/bin".into()],
+            home_unavailable: false,
+        };
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "profiles.discovery")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
+        assert!(check.message.contains("codex"));
+        assert!(check.message.contains("pi"));
+        assert!(check.message.contains("~/.local/bin"));
+        assert!(check.message.contains("not-installed"));
+
+        // The serialized report must stay redacted (profile ids are fixed
+        // official ids — no user data or tokens).
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(appears_redacted(&json));
+    }
+
+    /// P1-F: a missing `HOME` must surface as a profile-discovery health
+    /// issue instead of silently producing a healthy observation.
+    #[test]
+    fn doctor_surfaces_missing_home_in_profile_discovery() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.13".into();
+        input.profile_discovery.home_unavailable = true;
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "profiles.discovery")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
+        assert!(
+            check.message.contains("HOME is unset"),
+            "actionable message expected: {check:?}"
+        );
+        assert_eq!(report.outcome, DoctorOutcome::Warn, "{report:?}");
+    }
+
     #[test]
     fn report_never_embeds_raw_tokens_in_messages() {
         let mut input = DoctorInput::default();
@@ -888,5 +1369,328 @@ mod tests {
         assert!(json.contains("redacted") || json.contains("present"));
         assert!(!json.contains("eyJ"));
         assert!(appears_redacted(&json));
+    }
+
+    /// P1-E / v1.2.13 review: doctor must disclose effective service
+    /// hardening, including degraded local overrides and user-namespace-
+    /// forcing directives, instead of claiming an unmodified baseline.
+    #[test]
+    fn doctor_discloses_degraded_service_hardening() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.13".into();
+        input.service.platform = "linux".into();
+        input.service.supported = true;
+        input.service.installed = true;
+
+        // Baseline: pass (no start-breaking or degraded directives). The
+        // v1.2.13 baseline does NOT force a user namespace (ADR 0011).
+        input.service.hardening = Some(ServiceHardeningObservation {
+            no_new_privileges: true,
+            umask_set: true,
+            restrict_suidsgid: true,
+            restrict_realtime: true,
+            lock_personality: true,
+            system_call_architectures: true,
+            restrict_namespaces: true,
+            capability_bounding_set: false,
+            user_namespace_forcing: false,
+            read_only_hierarchy: false,
+            private_users: false,
+            protect_system_full: false,
+            private_tmp: false,
+            protect_proc: true,
+            protect_kernel_tunables: false,
+            protect_control_groups: false,
+            protect_hostname: false,
+            read_write_paths_set: false,
+            start_breaking_directives: false,
+            masked: false,
+            summary: "baseline".into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service.hardening")
+            .expect("hardening check row");
+        assert_eq!(check.status, CheckStatus::Pass, "{report:?}");
+
+        // The shipped baseline omits `CapabilityBoundingSet=` by design
+        // (systemd.exec(5): an unset option leaves the bounding set
+        // unmodified, and an unprivileged --user service cannot apply any
+        // value — startup fails with status 218/CAPABILITIES). Doctor must
+        // NOT warn on the clean shipped unit.
+        input.service.hardening = Some(ServiceHardeningObservation {
+            no_new_privileges: true,
+            umask_set: true,
+            restrict_suidsgid: true,
+            restrict_realtime: true,
+            lock_personality: true,
+            system_call_architectures: true,
+            restrict_namespaces: true,
+            capability_bounding_set: false,
+            user_namespace_forcing: false,
+            read_only_hierarchy: false,
+            private_users: false,
+            protect_system_full: false,
+            private_tmp: false,
+            protect_proc: true,
+            protect_kernel_tunables: false,
+            protect_control_groups: false,
+            protect_hostname: false,
+            read_write_paths_set: false,
+            start_breaking_directives: false,
+            masked: false,
+            summary: "shipped baseline without CapabilityBoundingSet".into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service.hardening")
+            .expect("hardening check row");
+        assert_eq!(
+            check.status,
+            CheckStatus::Pass,
+            "clean shipped unit must not warn: {report:?}"
+        );
+
+        // A unit that re-adds `CapabilityBoundingSet=` is start-breaking in a
+        // --user service (status 218/CAPABILITIES): doctor must warn even
+        // when every baseline guard is intact.
+        input.service.hardening = Some(ServiceHardeningObservation {
+            no_new_privileges: true,
+            umask_set: true,
+            restrict_suidsgid: true,
+            restrict_realtime: true,
+            lock_personality: true,
+            system_call_architectures: true,
+            restrict_namespaces: true,
+            capability_bounding_set: true,
+            user_namespace_forcing: false,
+            read_only_hierarchy: false,
+            private_users: false,
+            protect_system_full: false,
+            private_tmp: false,
+            protect_proc: true,
+            protect_kernel_tunables: false,
+            protect_control_groups: false,
+            protect_hostname: false,
+            read_write_paths_set: false,
+            start_breaking_directives: true,
+            masked: false,
+            summary: "local override adds CapabilityBoundingSet=".into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service.hardening")
+            .expect("hardening check row");
+        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
+        assert!(
+            check.message.contains("CapabilityBoundingSet="),
+            "{}",
+            check.message
+        );
+
+        // NoNewPrivileges disabled by a local override: warn.
+        input.service.hardening = Some(ServiceHardeningObservation {
+            no_new_privileges: false,
+            umask_set: true,
+            restrict_suidsgid: true,
+            restrict_realtime: true,
+            lock_personality: true,
+            system_call_architectures: true,
+            restrict_namespaces: true,
+            capability_bounding_set: false,
+            user_namespace_forcing: false,
+            read_only_hierarchy: false,
+            private_users: false,
+            protect_system_full: false,
+            private_tmp: false,
+            protect_proc: true,
+            protect_kernel_tunables: false,
+            protect_control_groups: false,
+            protect_hostname: false,
+            read_write_paths_set: false,
+            start_breaking_directives: false,
+            masked: false,
+            summary: "disabled".into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service.hardening")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
+        assert!(check.message.contains("weakened"));
+
+        // A drop-in disabling only RestrictSUIDSGID must also warn.
+        input.service.hardening = Some(ServiceHardeningObservation {
+            no_new_privileges: true,
+            umask_set: true,
+            restrict_suidsgid: false,
+            restrict_realtime: true,
+            lock_personality: true,
+            system_call_architectures: true,
+            restrict_namespaces: true,
+            capability_bounding_set: false,
+            user_namespace_forcing: false,
+            read_only_hierarchy: false,
+            private_users: false,
+            protect_system_full: false,
+            private_tmp: false,
+            protect_proc: true,
+            protect_kernel_tunables: false,
+            protect_control_groups: false,
+            protect_hostname: false,
+            read_write_paths_set: false,
+            start_breaking_directives: false,
+            masked: false,
+            summary: "restrict_suidsgid disabled".into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service.hardening")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
+        assert!(check.message.contains("weakened"));
+
+        // A drop-in re-adding a user-namespace-forcing directive
+        // (PrivateUsers=yes) must be disclosed as start-breaking with the
+        // custody consequence: inside the namespace every host uid outside
+        // the mapping appears as the overflow uid 65534, so the daemon
+        // fails to start (v1.2.13 review, ADR 0011).
+        input.service.hardening = Some(ServiceHardeningObservation {
+            no_new_privileges: true,
+            umask_set: true,
+            restrict_suidsgid: true,
+            restrict_realtime: true,
+            lock_personality: true,
+            system_call_architectures: true,
+            restrict_namespaces: true,
+            capability_bounding_set: false,
+            user_namespace_forcing: true,
+            read_only_hierarchy: false,
+            private_users: true,
+            protect_system_full: false,
+            private_tmp: false,
+            protect_proc: true,
+            protect_kernel_tunables: false,
+            protect_control_groups: false,
+            protect_hostname: false,
+            read_write_paths_set: false,
+            start_breaking_directives: false,
+            masked: false,
+            summary: "local override adds PrivateUsers=yes".into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service.hardening")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
+        assert!(
+            check.message.contains("user namespace"),
+            "userns-forcing must be disclosed with the custody consequence: {check:?}"
+        );
+        assert!(
+            check.message.contains("ownmesh service install"),
+            "actionable remediation expected: {check:?}"
+        );
+
+        // A drop-in disabling only ProtectProc=invisible (or another
+        // process-level guard) while every other baseline guard is intact
+        // must also warn — a wrong value of those is part of the doctor
+        // predicate.
+        for (field, label) in [
+            ("protect_proc", "ProtectProc=default"),
+            ("umask_set", "UMask cleared"),
+            ("restrict_realtime", "RestrictRealtime=no"),
+            ("lock_personality", "LockPersonality=no"),
+        ] {
+            let mut base = ServiceHardeningObservation {
+                no_new_privileges: true,
+                umask_set: true,
+                restrict_suidsgid: true,
+                restrict_realtime: true,
+                lock_personality: true,
+                system_call_architectures: true,
+                restrict_namespaces: true,
+                capability_bounding_set: false,
+                user_namespace_forcing: false,
+                read_only_hierarchy: false,
+                private_users: false,
+                protect_system_full: false,
+                private_tmp: false,
+                protect_proc: true,
+                protect_kernel_tunables: false,
+                protect_control_groups: false,
+                protect_hostname: false,
+                read_write_paths_set: false,
+                start_breaking_directives: false,
+                masked: false,
+                summary: format!("local override: {label}"),
+            };
+            match field {
+                "protect_proc" => base.protect_proc = false,
+                "umask_set" => base.umask_set = false,
+                "restrict_realtime" => base.restrict_realtime = false,
+                _ => base.lock_personality = false,
+            }
+            input.service.hardening = Some(base);
+            let report = run_doctor(&input);
+            let check = report
+                .checks
+                .iter()
+                .find(|c| c.id == "service.hardening")
+                .unwrap();
+            assert_eq!(check.status, CheckStatus::Warn, "{field}: {report:?}");
+            assert!(
+                check.message.contains("weakened"),
+                "{field} must warn as weakened: {check:?}"
+            );
+        }
+
+        // Legacy user-namespace-forcing directives: warn with remediation.
+        input.service.hardening = Some(ServiceHardeningObservation {
+            no_new_privileges: true,
+            umask_set: true,
+            restrict_suidsgid: true,
+            restrict_realtime: true,
+            lock_personality: true,
+            system_call_architectures: true,
+            restrict_namespaces: true,
+            capability_bounding_set: true,
+            user_namespace_forcing: true,
+            read_only_hierarchy: true,
+            private_users: false,
+            protect_system_full: false,
+            private_tmp: false,
+            protect_proc: false,
+            protect_kernel_tunables: false,
+            protect_control_groups: false,
+            protect_hostname: false,
+            read_write_paths_set: false,
+            start_breaking_directives: true,
+            masked: false,
+            summary: "legacy unit".into(),
+        });
+        let report = run_doctor(&input);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "service.hardening")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn, "{report:?}");
+        assert!(
+            check.message.contains("ownmesh service install"),
+            "actionable remediation expected: {check:?}"
+        );
     }
 }

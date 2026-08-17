@@ -1334,6 +1334,102 @@ test("idempotency tombstones are retained under quota until 30-day window closes
   assert.ok(MCP_OPS_TOMBSTONE_TTL_MS > MCP_OPS_RESULT_TTL_MS);
 });
 
+/**
+ * P0-B review (lazy tombstone expiry): a tombstone older than the 30-day
+ * idempotency window must be hard-deleted before the existing-row lookup, so a
+ * same-key retry is dispatched as a fresh operation instead of returning the
+ * stale tombstone as `existing` forever. Both store implementations previously
+ * returned the existing row before running quota cleanup, which could block
+ * reuse of an expired key indefinitely.
+ */
+test("expired idempotency tombstones are hard-deleted so the key becomes reusable", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_expired_${store.kind}`;
+    const principal = "prin_expired";
+    const device = "dev_expired";
+    const ancient = new Date(Date.now() - MCP_OPS_RESULT_TTL_MS - 60_000).toISOString();
+
+    // Completed op bound to the key, aged past the result TTL so the next
+    // quota pass compacts it to an idempotency tombstone.
+    await store.putMcpOperation({
+      operation_id: "op_expired_1",
+      tenant_id: tenant,
+      principal_id: principal,
+      device_id: device,
+      tool: "ownmesh_fs_write",
+      status: "completed",
+      summary: "done",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      payload_hash: "ph_expired_1",
+      idempotency_key: "idem_expired_1",
+      action: { tool: "ownmesh_fs_write" },
+      policy_authority: "ownmesh_device",
+      created_at: ancient,
+      updated_at: ancient,
+    });
+    // Trigger quota compaction to a tombstone with a same-tenant fresh op.
+    await store.putMcpOperation({
+      operation_id: "op_expired_trigger",
+      tenant_id: tenant,
+      principal_id: principal,
+      device_id: device,
+      tool: "ownmesh_fs_stat",
+      status: "pending",
+      summary: "trigger",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_expired_trigger",
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    const tombstone = await store.getMcpOperation("op_expired_1");
+    assert.ok(tombstone, `${store.kind}: op must still exist as a tombstone`);
+    assert.equal(tombstone.status, "tombstone");
+    // Age the tombstone past the 30-day hard-delete window.
+    await store.updateMcpOperation("op_expired_1", {
+      updated_at: new Date(Date.now() - MCP_OPS_TOMBSTONE_TTL_MS - 60_000).toISOString(),
+    });
+    // Same-key claim must now mint a FRESH operation, not return the stale
+    // tombstone as `existing` forever.
+    const claim = await store.claimMcpOperationByIdempotency({
+      operation_id: "op_expired_retry",
+      tenant_id: tenant,
+      principal_id: principal,
+      device_id: device,
+      tool: "ownmesh_fs_write",
+      status: "pending",
+      summary: "retry",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_expired_1",
+      action: { tool: "ownmesh_fs_write" },
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    assert.equal(
+      claim.outcome,
+      "created",
+      `${store.kind}: an expired tombstone must not block key reuse forever`,
+    );
+    assert.equal(claim.op.operation_id, "op_expired_retry");
+    // The old tombstone is gone.
+    assert.equal(await store.getMcpOperation("op_expired_1"), null);
+  }
+});
+
 test("dispatch outbox survives large write claim (~300 KiB) and redelivers after crash", async () => {
   const store = new MemoryStore();
   const token = await seedAuthed(store);

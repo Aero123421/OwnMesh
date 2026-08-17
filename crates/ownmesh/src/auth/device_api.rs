@@ -353,14 +353,47 @@ pub(crate) fn is_generic_device_name(name: &str) -> bool {
         || lower == format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Pure hostname fallback chain: `COMPUTERNAME` env → `HOSTNAME` env → OS
+/// nodename → hostname files.  Each source is sanitized and the first valid
+/// result wins, so a `unknown-host`/`localhost`/empty value from one source
+/// cannot poison the chain (P2-G).
+fn hostname_from_sources(
+    computername: Option<String>,
+    hostname_env: Option<String>,
+    nodename: Option<String>,
+    hostname_files: &[String],
+) -> Option<String> {
+    let sanitized = |raw: Option<String>| raw.and_then(sanitize_hostname);
+    sanitized(computername)
+        .or_else(|| sanitized(hostname_env))
+        .or_else(|| sanitized(nodename))
+        .or_else(|| {
+            for raw in hostname_files {
+                if let Some(name) = sanitize_hostname(raw.clone()) {
+                    return Some(name);
+                }
+            }
+            None
+        })
+}
+
 fn hostname_string() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .and_then(sanitize_hostname)
-        .or_else(os_nodename)
-        .or_else(read_hostname_file)
-        .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+    hostname_from_sources(
+        std::env::var("COMPUTERNAME").ok(),
+        std::env::var("HOSTNAME").ok(),
+        os_nodename(),
+        &read_hostname_file_sources(),
+    )
+    .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+/// Contents of the standard Unix hostname files, best-effort (empty list when
+/// absent or unreadable).
+fn read_hostname_file_sources() -> Vec<String> {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect()
 }
 
 fn sanitize_hostname(raw: String) -> Option<String> {
@@ -393,17 +426,6 @@ fn os_nodename() -> Option<String> {
     {
         None
     }
-}
-
-fn read_hostname_file() -> Option<String> {
-    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
-        if let Ok(raw) = std::fs::read_to_string(path) {
-            if let Some(name) = sanitize_hostname(raw) {
-                return Some(name);
-            }
-        }
-    }
-    None
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -496,5 +518,72 @@ mod device_metadata_tests {
             std::env::consts::ARCH
         )));
         assert!(!is_generic_device_name("tonakai-linux"));
+    }
+
+    /// P2-G: the fallback chain must not depend on the CI host's real
+    /// hostname, and a bad value from one source must never poison the rest.
+    #[test]
+    fn hostname_fallback_chain_is_priority_ordered_and_poison_free() {
+        // COMPUTERNAME wins when valid (case preserved).
+        assert_eq!(
+            hostname_from_sources(
+                Some("DESKTOP-XYZ".into()),
+                Some("ignored".into()),
+                None,
+                &[],
+            ),
+            Some("DESKTOP-XYZ".into())
+        );
+        // COMPUTERNAME invalid → HOSTNAME env.
+        assert_eq!(
+            hostname_from_sources(
+                Some("unknown-host".into()),
+                Some("r5000g".into()),
+                None,
+                &[],
+            ),
+            Some("r5000g".into())
+        );
+        // Env sources invalid/absent → OS nodename.
+        assert_eq!(
+            hostname_from_sources(None, Some("localhost".into()), Some("mybox".into()), &[]),
+            Some("mybox".into())
+        );
+        // All previous invalid → hostname files, first valid wins.
+        assert_eq!(
+            hostname_from_sources(
+                None,
+                None,
+                Some("(none)".into()),
+                &["unknown-host\n".into(), "r5000g\n".into()],
+            ),
+            Some("r5000g".into())
+        );
+        // FQDN is truncated to the first label.
+        assert_eq!(
+            hostname_from_sources(None, Some("box.example.test".into()), None, &[]),
+            Some("box".into())
+        );
+        // Everything invalid → None (caller applies the OS-arch fallback).
+        assert_eq!(
+            hostname_from_sources(
+                Some("unknown-host".into()),
+                Some("localhost".into()),
+                Some("(none)".into()),
+                &["unknown-host".into()],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_hostname_rejects_generic_and_empty_names() {
+        assert_eq!(sanitize_hostname(String::new()), None);
+        assert_eq!(sanitize_hostname("   ".into()), None);
+        assert_eq!(sanitize_hostname("unknown-host".into()), None);
+        assert_eq!(sanitize_hostname("UNKNOWN-HOST".into()), None);
+        assert_eq!(sanitize_hostname("localhost".into()), None);
+        assert_eq!(sanitize_hostname("(none)".into()), None);
+        assert_eq!(sanitize_hostname("r5000g".into()), Some("r5000g".into()));
     }
 }

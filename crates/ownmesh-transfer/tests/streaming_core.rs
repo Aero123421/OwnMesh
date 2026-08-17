@@ -8,7 +8,19 @@ use sha2::{Digest, Sha256};
 use std::io::Cursor;
 use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempfile::tempdir;
+
+/// Owner-only tempdir: `tempfile` respects the process umask, and the daemon
+/// custody attestation rejects group/world-writable ancestors, so tests pin
+/// mode 0700 to stay umask-independent.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))

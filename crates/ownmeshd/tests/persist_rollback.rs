@@ -33,7 +33,18 @@ use runtime::{session_methods, DaemonRuntime};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
-use tempfile::tempdir;
+/// Owner-only tempdir: `tempfile` respects the process umask, and the daemon
+/// custody attestation rejects group/world-writable ancestors, so tests pin
+/// mode 0700 to stay umask-independent.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
 
 fn client(name: &str) -> ClientIdentity {
     ClientIdentity::new(name, "0.1.0")

@@ -3979,10 +3979,22 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use ownmesh_identity::verify_from_public_key_hex;
-    use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn agent_url_preserves_issuer_path_and_uses_secure_scheme() {
@@ -4594,7 +4606,6 @@ mod tests {
         let server_device = device.clone();
         let server_origin = issuer.clone();
         let server_credential = credential.to_owned();
-        let expected_started_result = seeded_result.clone();
         let replay_target = target.clone();
         let redeliver_expired_raw = expired_raw.clone();
         let redeliver_legacy_raw = legacy_raw.clone();
@@ -4773,7 +4784,21 @@ mod tests {
                     .await;
                     let reconciled = receive_test_envelope(&mut socket).await;
                     assert_eq!(reconciled.correlation_id.as_deref(), Some("op_bind_test"));
-                    assert_eq!(reconciled.payload, expected_started_result);
+                    // P0-B: the authoritative replay answers with the compact
+                    // exact-once receipt (workspace-bound, `replayed: true`),
+                    // never a re-execution and never the stale full body.
+                    assert_eq!(reconciled.payload["status"], "completed");
+                    assert_eq!(reconciled.payload["operation_id"], "op_bind_test");
+                    assert_eq!(reconciled.payload["result"]["durable_receipt"], true);
+                    assert_eq!(reconciled.payload["result"]["truncated"], true);
+                    assert_eq!(reconciled.payload["result"]["replayed"], true);
+                    assert_eq!(reconciled.payload["result"]["workspace_id"], "ws_default");
+                    assert_eq!(reconciled.payload["result"]["operation_id"], "op_bind_test");
+                    assert!(
+                        reconciled.payload["result"].get("bytes_written").is_none()
+                            && reconciled.payload["result"].get("path").is_none(),
+                        "redelivery must not replay the full body: {reconciled:?}"
+                    );
                     assert_eq!(
                         std::fs::read_to_string(&replay_target).unwrap(),
                         "sentinel after first execution"

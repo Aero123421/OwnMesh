@@ -795,7 +795,12 @@ Full Access preset では broker request を自動 allow できる。ただし b
 - Control Plane から Device への delivery は at-least-once とみなす。
 - 全 write operation は `operation_id` と `idempotency_key` を持つ。
 - Device は完了済み operation をローカル journal で重複排除する。
-- 同じ operation を再受信しても再実行せず、保存済み結果を返す。
+- 同じ operation を再受信しても再実行せず、保存済みレシート(要約)を返す。
+- 端末ローカル journal の完了済みレシートの保存期間は 30 日で、
+  容量逼迫時および再実行パス上で 30 日を超えたレシートは削除される
+  (ADR-0010、Control Plane の 30 日 tombstone ウィンドウと一致)。
+  実行中/結果不明のマーカーは決して削除されない。保存期間外に再受信された
+  operation は新規操作として扱われ、古いレシートは返されない。
 
 ## 9.5 Offline
 

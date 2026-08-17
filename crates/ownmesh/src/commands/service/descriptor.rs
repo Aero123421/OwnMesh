@@ -41,6 +41,52 @@ impl ServicePaths {
 ///
 /// Docs: https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html
 /// User units: https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#User%20Unit%20Search%20Path
+/// Sandboxing semantics: systemd.exec(5) documents that the filesystem
+/// namespacing directives (`ProtectSystem=`, `ProtectHome=`, `ReadWritePaths=`,
+/// `ReadOnlyPaths=`, `InaccessiblePaths=`, `PrivateTmp=`, `PrivateDevices=`,
+/// `ProtectKernelTunables=`, `ProtectControlGroups=`, `ProtectClock=`,
+/// `ProtectHostname=`, `BindPaths=`, `TemporaryFileSystem=`, …) are *only*
+/// available for system services, or for services in per-user instances of the
+/// service manager **in which case `PrivateUsers=` is implicitly enabled**
+/// (systemd NEWS v254: “They now imply PrivateUsers=yes, … processes/files
+/// will appear as owned by 'nobody' in the user unit”; the exact option set is
+/// `exec_context_need_unprivileged_private_users()` / `exec_needs_cap_sys_admin()`
+/// in systemd's src/core/execute.c, which differs across releases).
+///
+/// That user namespace maps **every** host uid outside the namespace — host
+/// root and every other host user alike — to the overflow uid 65534 and omits
+/// the root mapping in per-user instances, so OwnMesh custody validation
+/// cannot distinguish a host-root-owned system directory from an
+/// attacker-owned one inside it. Accepting the overflow uid would let a
+/// foreign-owned 0755/01777 ancestor pass and its owner could replace the
+/// daemon's state directory (A5 cross-user boundary; v1.2.13 review). The
+/// shipped unit therefore does **not** force a user namespace, and custody
+/// validation stays byte-for-byte strict (every state/config ancestor must be
+/// owned by the daemon's uid or host root; see ADR 0011). A local drop-in
+/// that re-adds `PrivateUsers=yes` or the namespacing directives fails closed
+/// at startup with `ancestor is owned by untrusted uid 65534` and is
+/// disclosed by `ownmesh doctor`.
+///
+/// Directive selection is empirical and version-qualified (verified with
+/// `systemd-run --user -p …` on systemd v259): `ProtectProc=invisible`
+/// (hidepid= on the unit's /proc instance) boots in a --user service without
+/// forcing a user namespace (uid_map stays `0 0 4294967295`); systemd.exec(5)
+/// documents it as system-only, so on versions where it is not applied it
+/// degrades to a no-op, never a boot failure. `ProtectClock=`,
+/// `ProtectKernelLogs=`, `ProtectKernelModules=` and any
+/// `CapabilityBoundingSet=` value fail user-service startup with exit status
+/// 218/CAPABILITIES on systemd v259 *even under* `PrivateUsers=yes` (verified
+/// empirically; systemd's exit-status table documents 218 as “Failed to drop
+/// capabilities”), so they are omitted — on other systemd versions/kernels
+/// they may apply, but a unit that breaks boot on current Ubuntu cannot be
+/// the shipped default. `ProtectHome=` is omitted because a read-only home
+/// conflicts with the registered-workspace model.
+/// `MemoryDenyWriteExecute=yes` is omitted because it breaks JIT runtimes
+/// (Node/V8) that spawned sessions rely on. `RestrictNamespaces=yes` blocks
+/// namespace-creation syscalls for the whole service including sessions; a
+/// session that needs them (rootless podman, docker, unshare, bwrap) can be
+/// enabled with a local drop-in that sets `RestrictNamespaces=no` —
+/// `ownmesh doctor` discloses the effective unit.
 #[must_use]
 #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 pub fn render_systemd_user_unit(paths: &ServicePaths) -> String {
@@ -64,10 +110,64 @@ Environment=OWNMESH_STATE_DIR="{state}"
 Environment=OWNMESH_RUNTIME_DIR="{runtime}"
 # User-level only — never elevate.
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths="{config}" "{state}" "{runtime}"
-PrivateTmp=true
+# v1.2.13 reconciled --user sandbox (ADR 0011). This is a SCOPED
+# reconciliation, not a complete OS-level sandbox: the unit provides
+# process-level and proc-visibility confinement only, and deliberately
+# provides NO filesystem confinement (no ProtectSystem=/ProtectHome=/
+# ReadWritePaths=/PrivateTmp=; no systemd workspace allow-list — filesystem
+# governance is the daemon's own custody validation plus the
+# registered-workspace model). systemd.exec(5) documents
+# that the filesystem namespacing directives (ProtectSystem=/ProtectHome=/
+# ReadWritePaths=/PrivateTmp=/ProtectKernelTunables=/ProtectControlGroups=/
+# ProtectHostname=/…) are only available for system services, or for
+# per-user services in which case PrivateUsers= is implicitly enabled
+# (systemd NEWS v254; the exact option set is
+# exec_context_need_unprivileged_private_users() /
+# exec_needs_cap_sys_admin() in systemd's src/core/execute.c, and it differs
+# across releases). That user namespace maps every host uid outside the
+# namespace — host root and every other host user alike — to the overflow
+# uid 65534, so OwnMesh custody validation cannot distinguish a
+# host-root-owned system directory from an attacker-owned one inside it.
+# Accepting the overflow uid would let a foreign-owned 0755/01777 ancestor
+# pass and its owner could replace the daemon's state directory (A5
+# cross-user boundary), so the shipped unit does NOT force a user namespace
+# and custody stays byte-for-byte strict. A local drop-in that re-adds
+# PrivateUsers=yes or the namespacing directives fails closed at startup
+# with `ancestor is owned by untrusted uid 65534` and is disclosed by
+# `ownmesh doctor`.
+#
+# Shipped hardening (all available in an unprivileged --user service
+# without a user namespace):
+#   * ProtectProc=invisible — hidepid= on the unit's /proc instance
+#     (verified to boot on systemd v259; systemd.exec(5) documents it as
+#     system-only, so on versions where it is not applied it degrades to a
+#     no-op, never a boot failure).
+#   * Process-level guards: UMask=0077, RestrictSUIDSGID=true,
+#     RestrictRealtime=true, LockPersonality=true,
+#     SystemCallArchitectures=native, RestrictNamespaces=yes.
+#
+# Version/privilege-qualified omissions (verified empirically on systemd
+# v259, unprivileged --user): `ProtectClock=`, `ProtectKernelLogs=`,
+# `ProtectKernelModules=` and any `CapabilityBoundingSet=` value (including
+# the empty set) fail startup with exit status 218/CAPABILITIES even under
+# PrivateUsers=yes, because applying them needs capabilities the --user
+# manager does not have (systemd.exec(5) documents that an unset
+# CapabilityBoundingSet= leaves the bounding set unmodified; the login
+# session's set is inherited unchanged). `ProtectHome=` is omitted because
+# a read-only home conflicts with the registered-workspace model;
+# `MemoryDenyWriteExecute=yes` is omitted because it breaks JIT runtimes
+# (Node/V8) that spawned sessions rely on. `RestrictNamespaces=yes` blocks
+# namespace-creation syscalls for the whole service including sessions; a
+# session that needs them (rootless podman, docker, unshare, bwrap) can be
+# enabled with a local drop-in that sets `RestrictNamespaces=no` —
+# `ownmesh doctor` discloses the effective unit.
+ProtectProc=invisible
+UMask=0077
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictNamespaces=yes
 
 [Install]
 WantedBy=default.target
@@ -262,6 +362,139 @@ mod tests {
         assert!(unit.contains("NoNewPrivileges=true"));
         assert!(!unit.to_ascii_lowercase().contains("usersystem"));
         assert!(!unit.contains("User=root"));
+    }
+
+    /// v1.2.13 regression (ADR 0011 update): the shipped user unit must NOT
+    /// force a user namespace. The filesystem namespacing directives
+    /// (PrivateUsers=yes, ProtectSystem=full, PrivateTmp=yes,
+    /// ProtectKernelTunables=yes, ProtectControlGroups=yes,
+    /// ProtectHostname=yes, ReadWritePaths=, …) implicitly enable
+    /// `PrivateUsers=` in a per-user service (systemd NEWS v254;
+    /// systemd.exec(5)), which maps every host uid outside the namespace —
+    /// host root and every other host user alike — to the overflow uid
+    /// 65534. OwnMesh custody validation cannot distinguish a
+    /// host-root-owned system directory from an attacker-owned one inside
+    /// that namespace, so accepting the overflow uid would let a
+    /// foreign-owned 0755/01777 ancestor pass and its owner could replace
+    /// the daemon's state directory (A5 cross-user boundary). The unit must
+    /// keep the process-level guards and ProtectProc=invisible, and must not
+    /// ship any directive that forces the user namespace.
+    #[test]
+    fn systemd_unit_keeps_no_userns_sandbox_with_process_guards() {
+        let (_dir, sp) = sample_paths();
+        let unit = render_systemd_user_unit(&sp);
+        // The process-level guards and ProtectProc=invisible must be present.
+        for directive in [
+            "ProtectProc=invisible",
+            "NoNewPrivileges=true",
+            "UMask=0077",
+            "RestrictSUIDSGID=true",
+            "RestrictRealtime=true",
+            "LockPersonality=true",
+            "SystemCallArchitectures=native",
+            "RestrictNamespaces=yes",
+        ] {
+            assert!(
+                unit.lines().any(|line| line.trim_start() == directive),
+                "unit must keep {directive}:
+{unit}"
+            );
+        }
+        // The unit must not force a user namespace: any of these directives
+        // implicitly enables PrivateUsers= in a per-user service, hiding real
+        // uids and making custody validation unsound (v1.2.13 review).
+        for directive in [
+            "PrivateUsers=",
+            "ProtectSystem=",
+            "ProtectHome=",
+            "ReadWritePaths=",
+            "ReadOnlyPaths=",
+            "InaccessiblePaths=",
+            "PrivateTmp=",
+            "ProtectKernelTunables=",
+            "ProtectControlGroups=",
+            "ProtectHostname=",
+            "PrivateDevices=",
+            "BindPaths=",
+            "TemporaryFileSystem=",
+        ] {
+            let present_as_directive = unit
+                .lines()
+                .any(|line| line.trim_start().starts_with(directive));
+            assert!(
+                !present_as_directive,
+                "unit must not ship userns-forcing directive {directive}:
+{unit}"
+            );
+        }
+        // Version/privilege-qualified omissions: these fail a --user service
+        // with 218/CAPABILITIES on systemd v259 even under PrivateUsers=yes
+        // (verified empirically; systemd.exec(5) exit-status table).
+        for directive in [
+            "ProtectClock=",
+            "ProtectKernelLogs=",
+            "ProtectKernelModules=",
+            "CapabilityBoundingSet=",
+        ] {
+            let present_as_directive = unit
+                .lines()
+                .any(|line| line.trim_start().starts_with(directive));
+            assert!(
+                !present_as_directive,
+                "unit must not ship start-breaking directive {directive} on v259:
+{unit}"
+            );
+        }
+        // MemoryDenyWriteExecute= breaks JIT runtimes spawned sessions rely on.
+        assert!(
+            !unit
+                .lines()
+                .any(|line| line.trim_start().starts_with("MemoryDenyWriteExecute=")),
+            "unit must not ship MemoryDenyWriteExecute=:
+{unit}"
+        );
+        // The comment must cite systemd.exec(5) and the v259 qualification so
+        // a future edit cannot silently re-introduce broken directives.
+        assert!(
+            unit.contains("systemd.exec(5)") && unit.contains("v259"),
+            "unit comments must cite systemd.exec(5) and the empirical version:
+{unit}"
+        );
+    }
+
+    /// P1-E review (registered-workspace reconciliation): the shipped unit
+    /// must never restrict the user/workspace hierarchy. Workspaces are
+    /// dynamically registered anywhere under the user's home, so the unit
+    /// must not ship `ProtectHome=`/`ReadOnlyPaths=`/`InaccessiblePaths=`/
+    /// `ProtectSystem=` (all of which would also force the user namespace and
+    /// break custody, see ADR 0011), and the unit comment must document that
+    /// filesystem governance is the daemon's custody validation plus the
+    /// registered-workspace model.
+    #[test]
+    fn systemd_unit_keeps_registered_workspace_model_writable() {
+        let (_dir, sp) = sample_paths();
+        let unit = render_systemd_user_unit(&sp);
+        for directive in [
+            "ProtectHome=",
+            "ProtectSystem=",
+            "ReadOnlyPaths=",
+            "InaccessiblePaths=",
+            "ReadWritePaths=",
+        ] {
+            let present = unit
+                .lines()
+                .any(|line| line.trim_start().starts_with(directive));
+            assert!(
+                !present,
+                "unit must not confine the registered-workspace hierarchy with {directive}:\n{unit}"
+            );
+        }
+        // The comment must state the workspace-model reconciliation so a
+        // future edit cannot silently re-introduce home-restricting directives.
+        assert!(
+            unit.contains("registered-workspace model"),
+            "unit comments must document the registered-workspace reconciliation:\n{unit}"
+        );
     }
 
     #[test]

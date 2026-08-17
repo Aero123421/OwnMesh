@@ -2,6 +2,86 @@
 
 ## Unreleased
 
+## v1.2.13 — Runtime reliability and cross-platform repair
+
+- Expired sidecar transition journal records are reconciled non-blockingly
+  instead of poisoning every future session; a record is cleared only when
+  session/supervisor state and an OS-level or supervisor liveness probe prove
+  every referenced predecessor/successor sidecar is dead, and retained
+  fail-closed with a health surface otherwise. A failed supervisor sweep no
+  longer untracks a live host.
+- Completed op-journal entries are compacted to exact-once durable receipts
+  before persistence; terminal receipts have a bounded 30-day lifecycle and a
+  lingering pre-compaction `.bak` is removed *before* the compacted write
+  (so a crash between the write and the cleanup cannot leave a legacy
+  large-body copy behind; the backup is recovered from if the primary is
+  missing, and an unremovable stale backup at load refuses startup
+  fail-closed with an actionable message; runtime persistence also fails
+  closed and rolls back its in-memory mutation). Completed markers without the
+  exact-once `operation_id` are classified uncertain (never replayed,
+  compacted, or evicted). Compact receipts keep the original field names
+  (`id` stays `id`, plus an additive `session_id` alias for `session.open`),
+  so the first and the replayed public responses are schema-stable.
+- Op-journal near-capacity eviction is proactive: the byte-pressure projection
+  includes the incoming in-progress marker, so a journal within one marker's
+  worth of the 4 MiB cap evicts expired completed receipts *before* inserting
+  the marker instead of refusing the new side-effect key with a byte-budget
+  failure while eligible receipts sat unused. Control Plane idempotency
+  tombstones past the 30-day hard-delete window are expired *before* the
+  existing-row lookup, so a closed-window key is minted as a fresh operation
+  instead of returning `existing` forever.
+- Windows executable resolution follows PATHEXT semantics everywhere:
+  npm-style extensionless shims never beat an invocable `.exe/.cmd/.bat`
+  sibling, batch shims run through the pinned absolute `cmd.exe`, and default
+  interactive sessions resolve the shell through the same shared resolver.
+  Generic command execution retains proxy invocation paths while separately
+  pinning their canonical backing executable.
+  Default PTY shells fail closed: an unresolvable `$SHELL`/bare `cmd.exe` is
+  never handed to a spawner (the absolute system `cmd.exe` or `/bin/sh` is
+  used instead), and the live PTY spawner re-resolves and rejects
+  unresolvable programs with the exact reason. Unix uses `portable-pty` 0.9 so
+  macOS children start with cleared inherited signal masks; Windows remains on
+  0.8.1 because 0.9 enables `PSEUDOCONSOLE_INHERIT_CURSOR`, whose `ESC[6n`
+  handshake blocks an unattended ConPTY before command output. Darwin
+  termination snapshots descendants by controlling TTY, PTY
+  session, and ancestry. It first freezes the dedicated TTY, preventing a
+  waiting parent shell from running its next command when a leaf exits, then
+  directly kills the snapshot and the frozen TTY remainder around the leader
+  signal (Apple `pkill` has no `-s sid` selector). Bounded
+  confirmation checks both the child handle and exact PID state in the process
+  table; an absent PID confirms exit, a zombie is
+  authoritatively reaped, and Darwin's `P_WEXIT` (`E`) state is accepted as
+  committed to kernel exit without a potentially blocking synchronous wait;
+  every ordinary live/observation-error state remains fail-closed.
+- Linux user-CLI discovery covers `~/.local/bin`, Cargo, Nix, npm-global and
+  NVM node bins without sourcing shell startup files; service PATH mismatch is
+  surfaced in diagnostics.
+- The shipped systemd user unit is reconciled with OwnMesh custody and
+  registered workspaces without disabling hardening — this is **process-level
+  and proc-visibility** hardening only; the unit deliberately provides no
+  `ProtectSystem=`-style filesystem confinement or systemd workspace
+  allow-list (every filesystem namespacing directive would force
+  `PrivateUsers=yes` in a per-user service and hide real uids, breaking
+  byte-for-byte custody validation; ADR 0011). The daemon also reads
+  `/proc/self/uid_map` at startup and logs an actionable warning when the
+  effective unit has placed it inside a user namespace that hides real host
+  uids (custody still fails closed; the warning explains cause and
+  remediation). Doctor discloses degraded
+  service protection and honors `SYSTEMD_UNIT_PATH` replace semantics (a
+  unit outside the effective search path is never reported as loaded).
+- `system.diagnose`/`ownmesh doctor` no longer report `healthy` alongside
+  poisoned transition journals, dangerous op-journal pressure, or official
+  profile-discovery failures; durable in-progress operation markers are shown
+  as warnings. Remote session mutations are exactly-once, completed review
+  receipts preserve failed/cancelled phase, and completed session/review
+  retries are looked up before mutable local preflight. Error mapping preserves the actionable cause
+  (Win32 error 193, missing profile executables, journal repair hints).
+  Free-form diagnosis-note redaction also covers marker-plus-filler forms
+  (`token is <long-opaque-value>`, `api key was <value>`), not just
+  assignment/space-delimited shapes.
+- Linux enrollment uses the OS hostname instead of `unknown-host` when
+  environment variables are absent.
+
 ## v1.2.12 — Workspace activation and transfer expiry
 
 - Newly registered workspaces stay `pending_activation` until the Agent

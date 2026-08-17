@@ -1047,6 +1047,67 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Recovery-only primitive: restore the *full* controller mutation a
+    /// sidecar transition handler applied to its preview session but could
+    /// not commit before a crash.
+    ///
+    /// The normal claim/give/renew/detach handlers mutate a preview session
+    /// (principal, lease id, epoch, expiry, attached state), rotate the
+    /// sidecar, durably journal the transition, then commit the preview. A
+    /// crash between the supervisor mutation / `Applied` journal write and
+    /// the commit leaves the durable session controller unchanged while the
+    /// sidecar already belongs to the successor. Recovery replays or reads
+    /// the recorded transition and must apply the same controller seat here
+    /// — otherwise the former controller stays authorized and its
+    /// `session.write` could reach the successor's sidecar through the
+    /// updated binding (P0-A review, crash window).
+    ///
+    /// `attached == false` (exact detach) installs no successor: the
+    /// released principal becomes an observer, the seat is cleared, and the
+    /// session returns to `Detached`, mirroring
+    /// [`Self::detach_controller_lease`]. `attached == true` installs the
+    /// recorded successor seat verbatim (the exact `lease_id` the handler
+    /// minted, so remote write authorization keeps working after restart)
+    /// and moves the session to `Running`, mirroring
+    /// [`Self::claim_controller`].
+    pub fn reconcile_controller_from_transition(
+        &mut self,
+        id: &str,
+        principal: &str,
+        lease_id: &str,
+        epoch: u64,
+        expires_unix: i64,
+        attached: bool,
+    ) -> SessionResult<()> {
+        let s = self.sessions.get_mut(id).ok_or(SessionError::NotFound)?;
+        if s.info.state == SessionState::Closed {
+            return Err(SessionError::Closed);
+        }
+        if !attached {
+            if !s.info.observers.iter().any(|o| o == principal) {
+                s.info.observers.push(principal.to_string());
+            }
+            s.info.controller = None;
+            s.info.state = SessionState::Detached;
+            s.info.controller_epoch = epoch;
+            return Ok(());
+        }
+        // Attach: the recorded principal must not stay an observer of its
+        // own seat (mirrors claim/give), and the successor lease is
+        // installed verbatim with the exact generation.
+        s.info.observers.retain(|o| o != principal);
+        let lease = ControllerLease {
+            principal_id: principal.to_string(),
+            lease_id: lease_id.to_string(),
+            epoch,
+            expires_unix,
+        };
+        s.info.controller = Some(lease);
+        s.info.controller_epoch = epoch;
+        s.info.state = SessionState::Running;
+        Ok(())
+    }
+
     pub fn set_native_session_id(
         &mut self,
         id: &str,
