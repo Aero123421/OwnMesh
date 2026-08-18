@@ -1896,11 +1896,15 @@ mod tests {
     fn dropping_session_kills_child_before_it_can_continue() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("child-survived");
+        let marker_s = marker.to_string_lossy().replace('\\', "/");
+        // Keep the write window past Darwin's bounded teardown confirmation
+        // (up to five seconds). A 1s child vs 1.3s wait races on loaded GHA
+        // macOS runners: Drop can still be signalling while sleep 1 finishes.
         let command = PtyCommand {
             program: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
-                format!("sleep 1; printf survived > {}", marker.display()),
+                format!("sleep 8; printf survived > '{marker_s}'"),
             ],
             cwd: None,
             env: vec![],
@@ -1908,7 +1912,7 @@ mod tests {
 
         let session = spawn_portable(&command, PtySize::default()).expect("spawn PTY child");
         drop(session);
-        std::thread::sleep(Duration::from_millis(1_300));
+        std::thread::sleep(Duration::from_millis(9_000));
 
         assert!(
             !marker.exists(),
