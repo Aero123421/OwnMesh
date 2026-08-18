@@ -56,7 +56,7 @@ use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
     classify_from_request_in_dir, pin_executable, resolve_executable_invocation_path,
     resolve_executable_path, run_command_cancellable, verify_executable_pin, CommandKind,
-    ExecutablePin, IdempotencyJournal, RunRequest, RunResult,
+    ExecutablePin, IdempotencyJournal, RunRequest, RunResult, HARD_MAX_TIMEOUT_MS,
 };
 use ownmesh_fs::{
     git_diff, git_head_oid, git_status, looks_sensitive, GitDiffOpts, GitStatusOpts, WorkspaceRoot,
@@ -106,7 +106,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -395,6 +394,9 @@ pub struct ExecParams {
     pub max_output_bytes: Option<usize>,
     #[serde(default)]
     pub elevated: bool,
+    /// MCP `detach: true`: no wall-clock process timeout; concurrent jobs are bounded.
+    #[serde(default)]
+    pub detach: bool,
     /// Server-computed executable identity pin (device/inode/digest). Client values overwritten.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_pin: Option<ExecutablePin>,
@@ -701,6 +703,37 @@ pub struct DaemonRuntime {
 }
 
 const MAX_CACHED_DESTINATION_TRANSFERS: usize = 256;
+/// Concurrent detached `command.run` jobs per daemon. Fail-closed when full.
+const MAX_DETACHED_COMMANDS: usize = 4;
+static DETACHED_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct DetachedCommandGuard;
+
+impl Drop for DetachedCommandGuard {
+    fn drop(&mut self) {
+        DETACHED_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn acquire_detached_slot() -> IpcResult<DetachedCommandGuard> {
+    loop {
+        let n = DETACHED_IN_FLIGHT.load(Ordering::SeqCst);
+        if n >= MAX_DETACHED_COMMANDS {
+            return Err(IpcError::Remote {
+                code: app_error::CONFLICT,
+                message: format!(
+                    "detached command cap reached ({MAX_DETACHED_COMMANDS}); wait for an in-flight detached job to finish or cancel one"
+                ),
+            });
+        }
+        if DETACHED_IN_FLIGHT
+            .compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Ok(DetachedCommandGuard);
+        }
+    }
+}
 
 struct CachedDestinationTransfer {
     epoch: u64,
@@ -2094,6 +2127,12 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // separately pinned. Do not reopen the original symlink/PATH alias.
         let kind = CommandKind::parse_requested(p.kind.as_deref());
 
+        let _detached_guard = if p.detach {
+            Some(acquire_detached_slot()?)
+        } else {
+            None
+        };
+
         // Elevated execution has no local fallback.  Only the custody-attested
         // Linux v2 broker path below may spawn with privilege.
         if p.elevated {
@@ -2102,12 +2141,23 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 .as_object_mut()
                 .expect("broker result serializes as an object")
                 .insert("workspace_id".into(), json!(p.workspace_id));
+            if p.detach {
+                result
+                    .as_object_mut()
+                    .expect("broker result serializes as an object")
+                    .insert("detached".into(), json!(true));
+            }
             return Ok(result);
         }
         // Spawn mode follows the client request shape (argv vs shell-string).
         // Policy already used server-side classification in handle_exec.
         // Hard ceilings are enforced here even if a caller bypasses MCP schema.
-        let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
+        // Detached commands have no wall-clock kill; cancel still process-tree kills.
+        let timeout_ms = if p.detach {
+            None
+        } else {
+            Some(p.timeout_ms.unwrap_or(30_000).clamp(1, HARD_MAX_TIMEOUT_MS))
+        };
         // Keep a single durable hop under the control-plane data_json budget
         // (~256 KiB) after JSON framing. Larger captures require an explicit
         // smaller max or a future spool cursor — never one giant unbounded JSON.
@@ -2120,7 +2170,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             cwd: p.cwd.as_ref().map(PathBuf::from),
             env,
             stdin: None,
-            timeout_ms: Some(timeout_ms),
+            timeout_ms,
             max_output_bytes,
             idempotency_key: p.idempotency_key.clone(),
         };
@@ -2156,6 +2206,12 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             .as_object_mut()
             .expect("command result serializes as an object")
             .insert("workspace_id".into(), json!(p.workspace_id));
+        if p.detach {
+            value
+                .as_object_mut()
+                .expect("command result serializes as an object")
+                .insert("detached".into(), json!(true));
+        }
         Ok(value)
     }
 
@@ -2475,7 +2531,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 "remote operation expires before broker handoff",
             ));
         }
-        let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, 300_000);
+        let timeout_ms = p.timeout_ms.unwrap_or(30_000).clamp(1, HARD_MAX_TIMEOUT_MS);
         let max_output_bytes = p.max_output_bytes.unwrap_or(128 * 1024).clamp(1, 200_000);
         let workspace_id = p
             .workspace_id
@@ -3532,6 +3588,7 @@ path or install the tool so detection and execution agree",
                     timed_out: false,
                     duration_ms: 0,
                     truncated: false,
+                    pid: None,
                     replayed: false,
                 },
             );
@@ -3573,6 +3630,7 @@ path or install the tool so detection and execution agree",
                         timed_out: false,
                         duration_ms: 0,
                         truncated: false,
+                        pid: None,
                         replayed: false,
                     },
                 )

@@ -3225,6 +3225,8 @@ fn bound_result_object(value: Value) -> Value {
             "duration_ms",
             "replayed",
             "cancelled",
+            "detached",
+            "pid",
             "signal_delivered",
             "workspace_id",
             "workspace_version",

@@ -172,6 +172,11 @@ Remote mutation keys are caller-selected and mandatory so a retry cannot create
 a second operation. A remote target that is unavailable fails as remote; it is
 never executed on the machine running the CLI.
 
+`ownmesh_command_run` with `detach: true` dispatches a process without the
+synchronous timeout clamp. Poll `ownmesh_get_operation` (optionally with
+`wait_ms`) for completion. Synchronous `timeout_ms` is operator-capped by
+Worker env `MCP_MAX_TIMEOUT_MS` (default 300s, hard ceiling 1 hour).
+
 Device labels are replaced by the supplied bounded label set. Rename and label
 updates are owner-scoped and reject revoked devices. Transfer paths are
 workspace-relative. Replacement requires `overwrite_expected_sha256` matching

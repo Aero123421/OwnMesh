@@ -7,6 +7,8 @@ import {
   MCP_TOOLS,
   MCP_PROTOCOL_VERSION,
   MCP_GET_OPERATION_WAIT_SATURATED_WARNING,
+  MCP_COMMAND_TIMEOUT_DETACH_HINT,
+  MCP_COMMAND_TIMEOUT_DETACH_WARNING,
   OFFICIAL_PROFILE_CATALOG,
   OperationTracker,
   handleMcp,
@@ -139,7 +141,9 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   const runProps = run.inputSchema.properties as Record<string, unknown>;
   const shellProps = shell.inputSchema.properties as Record<string, unknown>;
   assert.equal((runProps.elevated as { default?: boolean }).default, false);
+  assert.equal((runProps.detach as { default?: boolean }).default, false);
   assert.equal(shellProps.elevated, undefined);
+  assert.equal(shellProps.detach, undefined);
 
   const diagnose = MCP_TOOLS.find((t) => t.name === "ownmesh_system_diagnose")!;
   const diagnoseProps = diagnose.inputSchema.properties as Record<
@@ -394,6 +398,42 @@ test("elevated structured command is normalized and exact-action-bound", async (
   assert.equal((plain.bound_action.facts as Record<string, unknown>).elevated, false);
   assert.equal((privileged.bound_action.facts as Record<string, unknown>).elevated, true);
   assert.equal((privileged.payload.arguments as Record<string, unknown>).elevated, true);
+});
+
+test("detached structured command is normalized and exact-action-bound", async () => {
+  const base = { device_id: "dev_detach", program: "/bin/true", idempotency_key: "idem_detach" };
+  const ordinary = sanitizeMcpArgs(base, "ownmesh_command_run");
+  const detached = sanitizeMcpArgs({ ...base, detach: true }, "ownmesh_command_run");
+  const alias = sanitizeMcpArgs({ ...base, detach: true }, "ownmesh_run_command");
+  const stripped = sanitizeMcpArgs({ ...base, detach: true }, "ownmesh_command_shell");
+  assert.equal(ordinary.detach, undefined);
+  assert.equal(sanitizeMcpArgs({ ...base, detach: false }, "ownmesh_command_run").detach, undefined);
+  assert.equal(detached.detach, true);
+  assert.equal(alias.detach, true);
+  assert.equal(stripped.detach, undefined);
+
+  const make = (args: Record<string, unknown>) => buildDeviceOperation({
+    toolName: "ownmesh_command_run", args, operationId: "op_detach", deviceId: "dev_detach",
+    principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 7,
+    expiresAt: "2099-01-01T00:00:00.000Z", oauthClientId: "client_mcp",
+  });
+  const [plain, detachedOp] = await Promise.all([make(ordinary), make(detached)]);
+  assert.notEqual(plain.payload_hash, detachedOp.payload_hash);
+  assert.equal((plain.bound_action.facts as Record<string, unknown>).detach, undefined);
+  assert.equal((detachedOp.bound_action.facts as Record<string, unknown>).detach, true);
+  assert.equal((detachedOp.payload.arguments as Record<string, unknown>).detach, true);
+});
+
+test("timed-out command results include a detach hint", () => {
+  const env = compactPublicEnvelope(makeEnvelope({
+    operation_id: "op_timeout_hint",
+    status: "completed",
+    summary: "command finished",
+    data: { timed_out: true, exit_code: null, stdout: "", stderr: "timed out" },
+  }));
+  assert.equal(env.data.timed_out, true);
+  assert.equal(env.data.hint, MCP_COMMAND_TIMEOUT_DETACH_HINT);
+  assert.ok(env.warnings.includes(MCP_COMMAND_TIMEOUT_DETACH_WARNING));
 });
 
 test("session open canonically exposes explicit profile adapter inputs", () => {
@@ -2006,6 +2046,39 @@ test("get_operation lazily expires legacy D1-only pending rows without clobberin
     const terminal = await callTool(store, token, "ownmesh_get_operation", { operation_id: "op_legacy_terminal" });
     assert.equal(terminal.body.result!.structuredContent!.status, "completed");
     assert.deepEqual((await store.getMcpOperation("op_legacy_terminal"))?.data, { entries: [] });
+  } finally {
+    (Date as unknown as { now: () => number }).now = originalNow;
+  }
+});
+
+test("get_operation does not expire detached running commands", async () => {
+  const originalNow = Date.now;
+  const now = 1_800_000_000_000;
+  (Date as unknown as { now: () => number }).now = () => now;
+  try {
+    const { store, token } = await authed();
+    const expiresAt = new Date(now - 1).toISOString();
+    await store.putMcpOperation({
+      operation_id: "op_detached_running",
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      tool: "ownmesh_command_run",
+      status: "running",
+      summary: "detached command routed; poll ownmesh_get_operation for completion",
+      data: { detached: true },
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      expires_at: expiresAt,
+      action: { facts: { detach: true } },
+      policy_authority: "ownmesh_device",
+      created_at: new Date(now - 60_000).toISOString(),
+      updated_at: new Date(now - 60_000).toISOString(),
+    });
+    const got = await callTool(store, token, "ownmesh_get_operation", { operation_id: "op_detached_running" });
+    assert.equal(got.body.result!.structuredContent!.status, "running");
+    assert.equal((await store.getMcpOperation("op_detached_running"))?.status, "running");
   } finally {
     (Date as unknown as { now: () => number }).now = originalNow;
   }

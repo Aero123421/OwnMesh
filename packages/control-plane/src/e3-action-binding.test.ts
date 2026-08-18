@@ -23,6 +23,9 @@ import {
   MCP_MAX_OUTPUT_BYTES,
   MCP_MAX_READ_BYTES,
   MCP_MAX_TIMEOUT_MS,
+  MCP_MAX_TIMEOUT_MS_DEFAULT,
+  MCP_MAX_TIMEOUT_MS_HARD_CEILING,
+  parseMcpMaxTimeoutMs,
   DISPATCH_OUTBOX_KEY,
   type OperationRouter,
 } from "./mcp.ts";
@@ -1434,6 +1437,29 @@ test("expired idempotency tombstones are hard-deleted so the key becomes reusabl
     // The old tombstone is gone.
     assert.equal(await store.getMcpOperation("op_expired_1"), null);
   }
+});
+
+test("MCP_MAX_TIMEOUT_MS env parsing fails closed to the documented default", () => {
+  assert.equal(parseMcpMaxTimeoutMs(undefined), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs(""), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs("nope"), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs(0), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs(-4), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs("8"), 8);
+  assert.equal(parseMcpMaxTimeoutMs(8), 8);
+  assert.equal(parseMcpMaxTimeoutMs(String(MCP_MAX_TIMEOUT_MS_HARD_CEILING + 1)), MCP_MAX_TIMEOUT_MS_HARD_CEILING);
+  assert.equal(MCP_MAX_TIMEOUT_MS, MCP_MAX_TIMEOUT_MS_DEFAULT);
+});
+
+test("sanitizeMcpArgs clamps timeout_ms to the operator-configured ceiling", () => {
+  const defaulted = sanitizeMcpArgs({ timeout_ms: 999_999_999 }, "ownmesh_command_run");
+  assert.equal(defaulted.timeout_ms, MCP_MAX_TIMEOUT_MS_DEFAULT);
+  const raised = sanitizeMcpArgs(
+    { timeout_ms: 999_999_999 },
+    "ownmesh_command_run",
+    { maxTimeoutMs: MCP_MAX_TIMEOUT_MS_HARD_CEILING },
+  );
+  assert.equal(raised.timeout_ms, MCP_MAX_TIMEOUT_MS_HARD_CEILING);
 });
 
 test("MCP_OPS_MAX_PER_TENANT env parsing fails closed to the documented default", () => {

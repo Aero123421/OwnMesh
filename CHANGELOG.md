@@ -18,6 +18,14 @@
   that hash at preflight and publish. Blind `force`/`overwrite` remains
   rejected. `ownmesh transfer plan --overwrite-expected-sha256` exposes the
   same bound.
+- `ownmesh_command_run` / `ownmesh_run_command` accept `detach: true` so a
+  long-running command is dispatched without the synchronous timeout clamp
+  and is not terminalized by the five-minute poll expiry. Completion is
+  retrieved with `ownmesh_get_operation`. Concurrent detached jobs per device
+  are capped fail-closed. The synchronous `timeout_ms` clamp is configurable
+  via Worker env `MCP_MAX_TIMEOUT_MS` (default 300000, hard ceiling 3600000).
+  Timed-out synchronous commands include hint
+  `use detach:true or a session for long-running commands`.
 
 ## v1.2.13 — Runtime reliability and cross-platform repair
 

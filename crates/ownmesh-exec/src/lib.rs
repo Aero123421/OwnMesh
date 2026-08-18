@@ -1200,8 +1200,10 @@ fn default_max_output() -> usize {
 
 /// Absolute ceiling for captured stdout+stderr (bytes).
 pub const HARD_MAX_OUTPUT_BYTES: usize = 1_000_000;
-/// Absolute ceiling for wall-clock timeout (ms).
-pub const HARD_MAX_TIMEOUT_MS: u64 = 300_000;
+/// Absolute ceiling for wall-clock timeout (ms). Matches control-plane
+/// `MCP_MAX_TIMEOUT_MS_HARD_CEILING` so an operator-raised Worker clamp can
+/// still be enforced fail-closed on the device.
+pub const HARD_MAX_TIMEOUT_MS: u64 = 3_600_000;
 
 /// Captured command result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1218,6 +1220,9 @@ pub struct RunResult {
     pub timed_out: bool,
     pub duration_ms: u64,
     pub truncated: bool,
+    /// OS process id observed after spawn (absent on journal replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     /// True when served from the idempotency journal.
     #[serde(default)]
     pub replayed: bool,
@@ -1903,6 +1908,7 @@ pub async fn run_command_cancellable(
     let mut child = cmd
         .spawn()
         .map_err(|source| ExecError::Spawn(describe_spawn_error(&req.program, &source)))?;
+    let pid = child.id();
 
     if let Some(input) = &capped.stdin {
         if let Some(mut stdin) = child.stdin.take() {
@@ -1951,6 +1957,7 @@ pub async fn run_command_cancellable(
             timed_out: true,
             duration_ms: start.elapsed().as_millis() as u64,
             truncated,
+            pid,
             replayed: false,
         }
     } else {
@@ -1963,6 +1970,7 @@ pub async fn run_command_cancellable(
             timed_out: false,
             duration_ms: start.elapsed().as_millis() as u64,
             truncated,
+            pid,
             replayed: false,
         }
     };

@@ -93,8 +93,29 @@ const workspaceProp = {
       "Registered workspace id for workspace-relative work. Use null only with an absolute Full Access path; that path is deliberately not attributed to a workspace. workspace_id and workspace_root_enforcement are independent of access_preset.",
   },
 };
-/** Hard server-side ceilings (schema maximums are not authority alone). */
-export const MCP_MAX_TIMEOUT_MS = 300_000;
+/** Default Worker `vars.MCP_MAX_TIMEOUT_MS` when the env var is absent or invalid. */
+export const MCP_MAX_TIMEOUT_MS_DEFAULT = 300_000;
+/** Documented env-var name; value is the deploy default, not a hard-coded cap. */
+export const MCP_MAX_TIMEOUT_MS = MCP_MAX_TIMEOUT_MS_DEFAULT;
+/** Absolute ceiling so a typo cannot pin a Worker/device for unbounded wall time. */
+export const MCP_MAX_TIMEOUT_MS_HARD_CEILING = 3_600_000;
+export const MCP_COMMAND_TIMEOUT_DETACH_HINT =
+  "use detach:true or a session for long-running commands";
+export const MCP_COMMAND_TIMEOUT_DETACH_WARNING = "mcp_command_timeout_detach_hint";
+/**
+ * Parse `MCP_MAX_TIMEOUT_MS` from Worker env / handle options.
+ * Invalid, empty, or non-positive values fail closed to the documented default.
+ */
+export function parseMcpMaxTimeoutMs(raw?: number | string | null): number {
+  if (raw === undefined || raw === null || raw === "") {
+    return MCP_MAX_TIMEOUT_MS_DEFAULT;
+  }
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (!Number.isSafeInteger(n) || n < 1) {
+    return MCP_MAX_TIMEOUT_MS_DEFAULT;
+  }
+  return Math.min(n, MCP_MAX_TIMEOUT_MS_HARD_CEILING);
+}
 /** Cloudflare-safe production fast-path wait; never follows the command timeout. */
 export const MCP_SYNC_WAIT_MS = 1_000;
 /**
@@ -140,8 +161,9 @@ const execBoundProps = {
   timeout_ms: {
     type: "integer",
     minimum: 1,
-    maximum: MCP_MAX_TIMEOUT_MS,
-    description: "Wall-clock timeout (server-capped)",
+    maximum: MCP_MAX_TIMEOUT_MS_HARD_CEILING,
+    description:
+      "Wall-clock timeout for synchronous commands (server-capped by MCP_MAX_TIMEOUT_MS; default 300000, hard ceiling 3600000). Ignored when detach is true.",
   },
   max_output_bytes: {
     type: "integer",
@@ -164,6 +186,15 @@ const elevatedCommandProp = {
     type: "boolean",
     default: false,
     description: "Request broker-mediated elevation (Linux only; fail-closed unless installed)",
+  },
+};
+
+const detachCommandProp = {
+  detach: {
+    type: "boolean",
+    default: false,
+    description:
+      "Dispatch the process without the synchronous timeout clamp or 5-minute poll expiry. The MCP call returns as soon as the operation is routed; retrieve completion via ownmesh_get_operation. Concurrent detached jobs per device are bounded fail-closed.",
   },
 };
 
@@ -657,7 +688,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_command_run",
     description:
-      "Run one bounded non-interactive process with an exact program and argv. Use session_open for interactive or long-lived processes.",
+      "Run one bounded non-interactive process with an exact program and argv. For commands that may exceed the synchronous timeout or five-minute dispatch envelope, set detach:true and retrieve completion with ownmesh_get_operation. Use session_open for interactive processes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -673,6 +704,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         async: operationAsyncProp,
         ...execBoundProps,
         ...elevatedCommandProp,
+        ...detachCommandProp,
       },
       required: ["device_id", "workspace_id", "program", "idempotency_key"],
     },
@@ -703,6 +735,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         async: operationAsyncProp,
         ...execBoundProps,
         ...elevatedCommandProp,
+        ...detachCommandProp,
       },
       required: ["device_id", "workspace_id", "program", "idempotency_key"],
     },
@@ -2466,6 +2499,18 @@ const EXPIRABLE_OPERATION_STATUSES = [
   "cancel_requested",
 ];
 
+function isDetachedCommandOperation(tracked: TrackedOperation): boolean {
+  const data = tracked.data || {};
+  if (data.detached === true) return true;
+  const action = tracked.action && typeof tracked.action === "object" && !Array.isArray(tracked.action)
+    ? (tracked.action as Record<string, unknown>)
+    : null;
+  const facts = action?.facts && typeof action.facts === "object" && !Array.isArray(action.facts)
+    ? (action.facts as Record<string, unknown>)
+    : null;
+  return facts?.detach === true;
+}
+
 /**
  * Lazy recovery for durable rows whose Room correlation was lost before an
  * expiry reconciliation could run. This executes only after the caller has
@@ -2481,7 +2526,8 @@ async function reconcileExpiredOperationOnPoll(
   if (
     !EXPIRABLE_OPERATION_STATUSES.includes(tracked.status) ||
     !Number.isFinite(expiresMs) ||
-    expiresMs > Date.now()
+    expiresMs > Date.now() ||
+    isDetachedCommandOperation(tracked)
   ) return tracked;
 
   const updated = await store.updateMcpOperation(
@@ -3063,6 +3109,18 @@ export function compactPublicEnvelope(
       .slice(0, 8)
       .map((warning) => boundedPublicText(warning, "warning", 256));
   }
+  if (data.timed_out === true) {
+    publicEnvelope.data = {
+      ...data,
+      hint: MCP_COMMAND_TIMEOUT_DETACH_HINT,
+    };
+    if (!publicEnvelope.warnings.includes(MCP_COMMAND_TIMEOUT_DETACH_WARNING)) {
+      publicEnvelope.warnings = [
+        ...publicEnvelope.warnings,
+        MCP_COMMAND_TIMEOUT_DETACH_WARNING,
+      ].slice(0, 8);
+    }
+  }
 
   if (includeDiagnostics) {
     const diagnostics: NonNullable<PublicOwnMeshResultEnvelope["diagnostics"]> = {
@@ -3185,10 +3243,15 @@ export type McpHandleOptions = {
    * Bounded authoritative-result wait. The production entrypoint supplies the
    * fixed Cloudflare-safe cap; direct unit callers may omit it for an immediate path.
    */
-  waitForDeviceMs?: number;
-  /** Best-effort live DeviceRoom observation; never used for authorization. */
-  presenceForDevice?: (device: DeviceRecord) => Promise<"online" | "offline" | "unknown">;
-};
+    waitForDeviceMs?: number;
+    /**
+     * Operator-configured synchronous command timeout clamp (`MCP_MAX_TIMEOUT_MS`).
+     * Schema maximum is the hard ceiling; this value is the runtime authority.
+     */
+    maxTimeoutMs?: number;
+    /** Best-effort live DeviceRoom observation; never used for authorization. */
+    presenceForDevice?: (device: DeviceRecord) => Promise<"online" | "offline" | "unknown">;
+  };
 
 function mintApprovalUrl(issuer: string | undefined, operationId: string): string | undefined {
   const base = (issuer || "").replace(/\/$/, "");
@@ -3523,6 +3586,7 @@ export function allowedMcpArgKeys(toolName: string): Set<string> {
 export function sanitizeMcpArgs(
   args: Record<string, unknown>,
   toolName?: string,
+  opts?: { maxTimeoutMs?: number },
 ): Record<string, unknown> {
   const allow = toolName ? allowedMcpArgKeys(toolName) : null;
   const out: Record<string, unknown> = {};
@@ -3539,7 +3603,7 @@ export function sanitizeMcpArgs(
       delete out[key];
     }
   };
-  clampInt("timeout_ms", 1, MCP_MAX_TIMEOUT_MS);
+  clampInt("timeout_ms", 1, parseMcpMaxTimeoutMs(opts?.maxTimeoutMs));
   clampInt("max_output_bytes", 1, MCP_MAX_OUTPUT_BYTES);
   clampInt("max_entries", 1, MCP_MAX_LIST_ENTRIES);
   clampInt("max_bytes", 1, MCP_MAX_READ_BYTES);
@@ -3562,6 +3626,13 @@ export function sanitizeMcpArgs(
   // malformed values never coerce to privilege.
   if (toolName === "ownmesh_command_run" || toolName === "ownmesh_run_command") {
     out.elevated = out.elevated === true;
+    // Absence and explicit false bind to the same non-detached action so
+    // existing in-flight command hashes stay stable.
+    if (out.detach === true) {
+      out.detach = true;
+    } else {
+      delete out.detach;
+    }
   }
   return out;
 }
@@ -5847,7 +5918,7 @@ export async function handleMcp(
     }
     const diagnosisDevice = name === "ownmesh_system_diagnose" ? routedDevice : null;
 
-    const safeArgs = sanitizeMcpArgs(args, name);
+    const safeArgs = sanitizeMcpArgs(args, name, { maxTimeoutMs: opts.maxTimeoutMs });
     if (ADMIN_MCP_TOOL_NAMES.has(name)) {
       const validationError = validateAdminToolArgs(name, safeArgs);
       if (validationError) {
@@ -6059,6 +6130,8 @@ export async function handleMcp(
       }
     }
     const wantAsync = safeArgs.async === true;
+    const wantDetach = safeArgs.detach === true;
+    const skipSyncWait = wantAsync || wantDetach;
     const opType = normalizeOpType(name);
     const isMutating = tool.risk === "write" || tool.risk === "exec";
     const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
@@ -6123,7 +6196,11 @@ export async function handleMcp(
         operation_id: operationId,
         status: "pending",
         device_id: deviceId,
-        summary: wantAsync ? "operation accepted (async)" : "routing to device",
+        summary: wantDetach
+          ? "detached command routed; poll ownmesh_get_operation for completion"
+          : wantAsync
+            ? "operation accepted (async)"
+            : "routing to device",
         data: withDispatchOutbox(
           {
             tool: name,
@@ -6133,6 +6210,7 @@ export async function handleMcp(
             oauth_client_id: deviceOp.oauth_client_id,
             claim_version: deviceOp.claim_version,
             expires_at: deviceOp.expires_at,
+            ...(wantDetach ? { detached: true } : {}),
           },
           dispatchOutbox,
         ),
@@ -6335,7 +6413,7 @@ export async function handleMcp(
           }
         }
       }
-      if (!wantAsync) {
+      if (!skipSyncWait) {
         replayed = await waitForAuthoritativeCompletion(
           store,
           tracker,
@@ -6828,7 +6906,7 @@ export async function handleMcp(
       approval_url: env.approval_url,
       approval_id: env.approval_id,
     });
-    if (!wantAsync) {
+    if (!skipSyncWait) {
       finalOp = await waitForAuthoritativeCompletion(
         store,
         tracker,
