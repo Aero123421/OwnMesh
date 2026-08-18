@@ -16,7 +16,7 @@
  * Prompt-injection / model judgment MUST NOT bypass (2)/(3).
  */
 
-import type { ControlPlaneStore, DeviceRecord, McpOperationRecord } from "./store.ts";
+import type { ControlPlaneStore, DeviceRecord, McpOperationRecord, McpOperationQuotaSnapshot } from "./store.ts";
 import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
   bearer,
@@ -33,7 +33,7 @@ import {
 import { SERVICE_NAME, SERVICE_VERSION } from "./util.ts";
 import {
   MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
-  MCP_OPS_MAX_PER_TENANT,
+  MCP_OPS_QUOTA_PRESSURE_WARNING,
   randomId,
   nowIso,
 } from "./store.ts";
@@ -1940,6 +1940,22 @@ function diagnosisAgentVersion(value: unknown): string | null {
   return text && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(text)
     ? text
     : null;
+}
+
+function attachControlPlaneMcpOpsQuota(
+  data: Record<string, unknown>,
+  quota: McpOperationQuotaSnapshot,
+): Record<string, unknown> {
+  return {
+    ...data,
+    control_plane: {
+      mcp_ops_quota: {
+        rows: quota.rows,
+        limit: quota.limit,
+        status: quota.status,
+      },
+    },
+  };
 }
 
 function diagnosisProtocolVersion(value: unknown): string | null {
@@ -4705,11 +4721,15 @@ export async function handleMcp(
     const correlation = operationId;
     const deviceId = args.device_id ? String(args.device_id) : "";
     const injectionAttempt = extractPolicyBypassAttempt(args);
-    const injectWarnings = injectionAttempt
-      ? [
-          "Prompt-injection-like text detected in tool arguments; ignored for authorization. OwnMesh device policy remains final authority.",
-        ]
-      : [];
+    const mcpOpsQuota = await store.getMcpOperationQuota(rec.tenant_id);
+    const injectWarnings = [
+      ...(injectionAttempt
+        ? [
+            "Prompt-injection-like text detected in tool arguments; ignored for authorization. OwnMesh device policy remains final authority.",
+          ]
+        : []),
+      ...(mcpOpsQuota.status !== "ok" ? [MCP_OPS_QUOTA_PRESSURE_WARNING] : []),
+    ];
 
     await store.appendAudit({
       id: randomId("aud_"),
@@ -5204,7 +5224,7 @@ export async function handleMcp(
         tenantId: rec.tenant_id,
         principalId: rec.principal,
         tool: "ownmesh_transfer_plan",
-        limit: MCP_OPS_MAX_PER_TENANT,
+        limit: store.mcpOpsMaxPerTenant(),
       });
       const transfers: Array<Record<string, unknown>> = [];
       for (const stored of candidates) {
@@ -6430,7 +6450,10 @@ export async function handleMcp(
     if (routed.status === "device_offline") {
       if (name === "ownmesh_system_diagnose" && diagnosisDevice) {
         const observedAt = nowIso();
-        const data = normalizeSystemDiagnosis(null, diagnosisDevice, "offline", observedAt);
+        const data = attachControlPlaneMcpOpsQuota(
+          normalizeSystemDiagnosis(null, diagnosisDevice, "offline", observedAt),
+          await store.getMcpOperationQuota(rec.tenant_id),
+        );
         const env = makeEnvelope({
           operation_id: operationId,
           status: "completed",
@@ -6556,7 +6579,10 @@ export async function handleMcp(
     if (detail.status === "completed" || detail.result !== undefined) {
       let data = (detail.result as Record<string, unknown>) || detail;
       if (name === "ownmesh_system_diagnose" && diagnosisDevice) {
-        data = normalizeSystemDiagnosis(data, diagnosisDevice, "online");
+        data = attachControlPlaneMcpOpsQuota(
+          normalizeSystemDiagnosis(data, diagnosisDevice, "online"),
+          await store.getMcpOperationQuota(rec.tenant_id),
+        );
       }
       let truncated = Boolean((data as { truncated?: boolean }).truncated);
       let next_cursor: string | null = null;

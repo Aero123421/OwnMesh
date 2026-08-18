@@ -25,8 +25,8 @@ import {
   DeviceRoomHarness,
   type DeviceEnvelope,
 } from "./device-room.ts";
-import { MemoryStore } from "./store.ts";
-import { randomId } from "./util.ts";
+import { MemoryStore, MCP_OPS_QUOTA_PRESSURE_WARNING } from "./store.ts";
+import { randomId, nowIso } from "./util.ts";
 import { __test } from "./index.ts";
 
 async function authed(scope = "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device") {
@@ -150,6 +150,60 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   assert.equal(list.annotations.readOnlyHint, true);
   assert.equal(list.annotations.idempotentHint, true);
   assert.equal(list.annotations.openWorldHint, false);
+});
+
+test("MCP ops quota pressure is warned and exposed on system diagnose", async () => {
+  const store = new MemoryStore({ mcpOpsMaxPerTenant: 10 });
+  await store.ensureBootstrap();
+  const tok = await store.issueTokens(
+    "client_mcp",
+    "prin_dev",
+    "ownmesh.read ownmesh.write ownmesh.exec ownmesh.session ownmesh.device",
+  );
+  const token = tok.access_token;
+  for (let i = 0; i < 6; i++) {
+    await store.putMcpOperation({
+      operation_id: `op_pressure_${i}`,
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      device_id: "dev_pressure",
+      tool: "ownmesh_fs_stat",
+      status: "completed",
+      summary: "fill",
+      data: { i },
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: `idem_pressure_${i}`,
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+  }
+  const listed = await callTool(store, token, "ownmesh_list_devices", {});
+  const listedEnv = listed.body.result?.structuredContent as { warnings?: string[] } | undefined;
+  assert.ok(
+    listedEnv?.warnings?.includes(MCP_OPS_QUOTA_PRESSURE_WARNING),
+    `expected pressure warning, got ${JSON.stringify(listedEnv?.warnings)}`,
+  );
+
+  const diagnose = await callTool(
+    store,
+    token,
+    "ownmesh_system_diagnose",
+    { device_id: "dev_pressure", workspace_id: null, async: true },
+    { async routeToDevice() { return { status: "device_offline" }; } },
+  );
+  const diag = diagnose.body.result?.structuredContent as {
+    warnings?: string[];
+    data?: { control_plane?: { mcp_ops_quota?: { rows?: number; limit?: number; status?: string } } };
+  } | undefined;
+  assert.ok(diag?.warnings?.includes(MCP_OPS_QUOTA_PRESSURE_WARNING));
+  const quota = diag?.data?.control_plane?.mcp_ops_quota;
+  assert.equal(quota?.limit, 10);
+  assert.ok((quota?.rows ?? 0) >= 6);
+  assert.equal(quota?.status, "warn");
 });
 
 test("workspace-scoped tools bind the selected workspace", async () => {

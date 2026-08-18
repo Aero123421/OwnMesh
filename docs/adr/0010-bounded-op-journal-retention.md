@@ -19,14 +19,16 @@ for terminal receipts, and the failure mode was invisible to `system.diagnose`
 and `ownmesh doctor`.
 
 The control plane bounds its own replay retention on a different, staged
-schedule: MCP operation results are compacted to idempotency tombstones after
-7 days (`MCP_OPS_RESULT_TTL_MS`) and those tombstones are hard-deleted 30
-days after tombstoning (`MCP_OPS_TOMBSTONE_TTL_MS`, which also resets
-`updated_at`), i.e. roughly 37 days after completion. The device window and
-the control-plane window are therefore **not identical**; the honest
-statement is that the control plane retains the idempotency key strictly
-longer than the device's 30-day receipt window, so a device receipt never
-outlives the key the control plane could replay against.
+schedule: MCP operation results with an idempotency key are compacted to
+tombstones after 7 days (`MCP_OPS_RESULT_TTL_MS`) and those tombstones are
+hard-deleted 30 days after tombstoning (`MCP_OPS_TOMBSTONE_TTL_MS`, which
+also resets `updated_at`), i.e. roughly 37 days after completion. Keyless
+terminal rows are hard-deleted at the 7-day result TTL because they bind no
+replay key. The device window and the control-plane window are therefore
+**not identical**; the honest statement is that the control plane retains a
+keyed idempotency receipt strictly longer than the device's 30-day receipt
+window, so a device receipt never outlives the key the control plane could
+replay against.
 
 ## Decision
 
