@@ -321,6 +321,20 @@ function pendingDeadlineMs(p: PendingOperation): number {
   return p.created_at + (p.live_only ? LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS : PENDING_TTL_MS);
 }
 
+/**
+ * Detached `command.run` keeps Device Room correlation until `expires_at`.
+ * Do not mark these `live_only`: that flag skips Agent redelivery, which
+ * detached commands still need (spawn is journal-deduped on the device).
+ */
+function isDetachedCommandPending(p: PendingOperation): boolean {
+  const payload = p.payload;
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.capability !== "command.run") return false;
+  const args = payload.arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+  return (args as Record<string, unknown>).detach === true;
+}
+
 type ApprovalDecisionBinding = {
   target_operation_id: string;
   decision: "approve" | "deny";
@@ -854,9 +868,13 @@ export class DeviceRoomRouter {
       // A live-only tombstone has no bearer to replay and exists solely to
       // correlate a genuine long-running transfer result. Its bounded transfer
       // expiry, rather than the ordinary 15-minute dispatch TTL, controls it.
-      const staleByTtl = !p.live_only && (
-        !Number.isFinite(p.created_at) || now - p.created_at > PENDING_TTL_MS
-      );
+      // Detached command.run is the other long-lived pending shape: skip the
+      // 15-minute TTL, but still expire at expires_at (24h dispatch cap).
+      const detached = isDetachedCommandPending(p);
+      const staleByTtl =
+        !p.live_only &&
+        (!Number.isFinite(p.created_at) ||
+          (!detached && now - p.created_at > PENDING_TTL_MS));
       const staleByExpiry = Number.isFinite(expMs) && expMs <= now;
       if (staleByTtl || staleByExpiry) {
         this.pending.delete(key);

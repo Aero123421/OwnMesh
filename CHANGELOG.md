@@ -20,12 +20,13 @@
   same bound.
 - `ownmesh_command_run` / `ownmesh_run_command` accept `detach: true` so a
   long-running command is dispatched without the synchronous timeout clamp
-  and is not terminalized by the five-minute poll expiry. Completion is
-  retrieved with `ownmesh_get_operation`. Concurrent detached jobs per device
-  are capped fail-closed. The synchronous `timeout_ms` clamp is configurable
-  via Worker env `MCP_MAX_TIMEOUT_MS` (default 300000, hard ceiling 3600000).
-  Timed-out synchronous commands include hint
-  `use detach:true or a session for long-running commands`.
+  or the five-minute dispatch / poll expiry. Device Room keeps the pending
+  correlation past the ordinary 15-minute TTL; the hard cap is 24 hours or
+  cancel. Completion is retrieved with `ownmesh_get_operation`. Concurrent
+  detached jobs per device are capped fail-closed. The synchronous
+  `timeout_ms` clamp is configurable via Worker env `MCP_MAX_TIMEOUT_MS`
+  (default 300000, hard ceiling 3600000). Timed-out synchronous commands
+  include hint `use detach:true or a session for long-running commands`.
 - An unreadable, over-budget, or unremovable-backup op-journal no longer
   refuses `ownmeshd` startup. The daemon starts read-only (`OWNMESH_E_JOURNAL_DEGRADED`
   for side effects) and surfaces `journal_degraded` in `system_diagnose` /
@@ -33,10 +34,12 @@
   --i-understand-replay-risk`.
 - Bounded tool grants (`grant_type: "bounded_tool"`) lift policy **Ask** only
   for an explicit tool allowlist, optional workspace, TTL ≤ 4 hours, and
-  optional max-use count. Deny still wins, including recommended/workspace_only
-  `command.run`. Minting is the same fresh-passkey admin path as policy preset
-  (`ownmesh grants mint` / `ownmesh_grants_mint`). Revoke and lockdown are
-  local tightening. See ADR 0012.
+  optional max-use count. Matching requires the mint device id and the
+  request's canonical tool plus capability/kind; a client-supplied tool name
+  cannot lift a different capability. Deny still wins, including
+  recommended/workspace_only `command.run`. Minting is the same fresh-passkey
+  admin path as policy preset (`ownmesh grants mint` / `ownmesh_grants_mint`).
+  Revoke and lockdown are local tightening. See ADR 0012.
 - `/approve` lists pending operations for an authenticated human session.
   Selected sets are bound by a v2 presence cookie whose commitment is SHA-256
   of server-looked-up `operation_id:payload_hash` lines (max 32). Each decision

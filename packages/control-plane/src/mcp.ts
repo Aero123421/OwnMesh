@@ -110,6 +110,14 @@ export const MCP_COMMAND_TIMEOUT_DETACH_HINT =
   "use detach:true or a session for long-running commands";
 export const MCP_COMMAND_TIMEOUT_DETACH_WARNING = "mcp_command_timeout_detach_hint";
 /**
+ * Detached `command_run` correlation ceiling. Replaces the ordinary five-minute
+ * dispatch / poll expiry so a long job can still be observed, while remaining
+ * a hard cap (same 24h bound as live transfer tombstones). Cancel still wins.
+ */
+export const MCP_DETACHED_OPERATION_TTL_MS = 24 * 60 * 60 * 1000;
+/** Ordinary MCP dispatch envelope used when `detach` is not set. */
+export const MCP_DISPATCH_EXPIRES_MS = 5 * 60_000;
+/**
  * Parse `MCP_MAX_TIMEOUT_MS` from Worker env / handle options.
  * Invalid, empty, or non-positive values fail closed to the documented default.
  */
@@ -201,7 +209,7 @@ const detachCommandProp = {
     type: "boolean",
     default: false,
     description:
-      "Dispatch the process without the synchronous timeout clamp or 5-minute poll expiry. The MCP call returns as soon as the operation is routed; retrieve completion via ownmesh_get_operation. Concurrent detached jobs per device are bounded fail-closed.",
+      "Dispatch the process without the synchronous timeout clamp or the five-minute dispatch expiry. Correlation lasts until cancel or the detached TTL (24h). The MCP call returns as soon as the operation is routed; retrieve completion via ownmesh_get_operation. Concurrent detached jobs per device are bounded fail-closed.",
   },
 };
 
@@ -769,7 +777,7 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_command_run",
     description:
-      "Run one bounded non-interactive process with an exact program and argv. For commands that may exceed the synchronous timeout or five-minute dispatch envelope, set detach:true and retrieve completion with ownmesh_get_operation. Use session_open for interactive processes.",
+      "Run one bounded non-interactive process with an exact program and argv. For commands that may exceed the synchronous timeout or five-minute dispatch envelope, set detach:true (correlation lasts until cancel or 24h) and retrieve completion with ownmesh_get_operation. Use session_open for interactive processes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2634,22 +2642,13 @@ const EXPIRABLE_OPERATION_STATUSES = [
   "cancel_requested",
 ];
 
-function isDetachedCommandOperation(tracked: TrackedOperation): boolean {
-  const data = tracked.data || {};
-  if (data.detached === true) return true;
-  const action = tracked.action && typeof tracked.action === "object" && !Array.isArray(tracked.action)
-    ? (tracked.action as Record<string, unknown>)
-    : null;
-  const facts = action?.facts && typeof action.facts === "object" && !Array.isArray(action.facts)
-    ? (action.facts as Record<string, unknown>)
-    : null;
-  return facts?.detach === true;
-}
-
 /**
  * Lazy recovery for durable rows whose Room correlation was lost before an
  * expiry reconciliation could run. This executes only after the caller has
  * passed owner/tenant validation in ownmesh_get_operation.
+ *
+ * Detached commands use a longer `expires_at` (24h) at dispatch; once that
+ * hard cap elapses they terminalize here the same way as ordinary ops.
  */
 async function reconcileExpiredOperationOnPoll(
   store: ControlPlaneStore,
@@ -2661,8 +2660,7 @@ async function reconcileExpiredOperationOnPoll(
   if (
     !EXPIRABLE_OPERATION_STATUSES.includes(tracked.status) ||
     !Number.isFinite(expiresMs) ||
-    expiresMs > Date.now() ||
-    isDetachedCommandOperation(tracked)
+    expiresMs > Date.now()
   ) return tracked;
 
   const updated = await store.updateMcpOperation(
@@ -6281,7 +6279,9 @@ export async function handleMcp(
     const skipSyncWait = wantAsync || wantDetach;
     const opType = normalizeOpType(name);
     const isMutating = tool.risk === "write" || tool.risk === "exec";
-    const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+    const expiresAt = new Date(
+      Date.now() + (wantDetach ? MCP_DETACHED_OPERATION_TTL_MS : MCP_DISPATCH_EXPIRES_MS),
+    ).toISOString();
     const claimVersion = 1;
 
     // Side-effect tools require an explicit caller idempotency key so a lost MCP

@@ -54,6 +54,9 @@ document evaluation:
   `command_run` grant the document must Ask, not Deny.
 - **Ask only.** A matching unexpired grant with remaining uses converts Ask to
   Allow for that principal, device, optional workspace, and listed tool.
+  The request's canonical tool must also agree with the operation
+  capability/kind (a client-supplied tool name cannot lift a different
+  capability). Matching is fail-closed without the mint device id.
 - Each Allow-via-grant consumes one use when `max_uses` is set; persist failure
   refuses the operation (fail-closed) rather than allowing an uncounted use.
 - Lockdown clears **all** stored grants (temporary and bounded) as part of

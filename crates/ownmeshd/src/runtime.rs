@@ -1827,7 +1827,14 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         } else {
             principal_id
         };
-        evaluate_with_grants(&self.policy, facts, &self.grants, Self::now(), principal)
+        evaluate_with_grants(
+            &self.policy,
+            facts,
+            &self.grants,
+            Self::now(),
+            principal,
+            self.active_remote_device_id.as_deref(),
+        )
     }
 
     fn consume_bounded_grant_use(
@@ -2019,16 +2026,9 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         }
 
         let mut facts = facts;
-        if facts
-            .tool
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(str::is_empty)
-        {
-            if let Some(tool) = pending_request_tool(&request) {
-                facts.tool = Some(tool.to_owned());
-            }
-        }
+        // Always bind the grant tool from the pending request. A stale or
+        // caller-supplied facts.tool must not lift a different capability.
+        facts.tool = pending_request_tool(&request).map(str::to_owned);
 
         let mut verdict = self.evaluate(&facts, &requester_principal);
         // ChatGPT does not provide a cryptographic confirmation attestation.

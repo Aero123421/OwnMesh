@@ -1080,6 +1080,10 @@ fn temporary_grant_matches(
 /// deny added after a grant was issued takes effect immediately instead of
 /// waiting for the grant to expire. Bounded tool grants never run unless the
 /// document decided Ask.
+///
+/// `device_id` is the verified active remote device. Bounded tool grants match
+/// only that mint device (fail-closed when absent or mismatched). Temporary
+/// grants ignore it.
 #[must_use]
 pub fn evaluate_with_grants(
     doc: &PolicyDocument,
@@ -1087,6 +1091,7 @@ pub fn evaluate_with_grants(
     grants: &[StoredGrant],
     now_unix: i64,
     principal_id: &str,
+    device_id: Option<&str>,
 ) -> PolicyVerdict {
     let verdict = evaluate(doc, facts);
     if verdict.decision == Decision::Deny {
@@ -1112,7 +1117,7 @@ pub fn evaluate_with_grants(
         let StoredGrant::BoundedTool(g) = grant else {
             continue;
         };
-        if !bounded_tool_grant_matches(g, facts, principal_id, now_unix) {
+        if !bounded_tool_grant_matches(g, facts, principal_id, now_unix, device_id) {
             continue;
         }
         return PolicyVerdict {
@@ -1129,11 +1134,18 @@ fn bounded_tool_grant_matches(
     facts: &OperationFacts,
     principal_id: &str,
     now_unix: i64,
+    device_id: Option<&str>,
 ) -> bool {
     if grant.validate().is_err() {
         return false;
     }
     if grant.principal_id != principal_id || grant.expires_unix <= now_unix {
+        return false;
+    }
+    let Some(active_device) = device_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if grant.device_id.trim() != active_device {
         return false;
     }
     if grant.max_uses.is_some_and(|max| grant.uses >= max) {
@@ -1159,25 +1171,26 @@ fn bounded_tool_grant_matches(
         .any(|listed| canonical_bounded_tool(listed) == Some(tool))
 }
 
-/// Tool name used to match a bounded grant against operation facts.
+/// Canonical tool used to match a bounded grant against operation facts.
+///
+/// Requires an explicit canonical `facts.tool` that agrees with capability and
+/// kind. Capability-only fallback is refused so a `command_run` grant cannot
+/// lift a `filesystem.write` Ask that carries a stale or caller-supplied tool.
 #[must_use]
 pub fn facts_bounded_tool(facts: &OperationFacts) -> Option<&'static str> {
-    if let Some(tool) = facts.tool.as_deref() {
-        if let Some(canonical) = canonical_bounded_tool(tool) {
-            return Some(canonical);
+    let tool = facts.tool.as_deref().and_then(canonical_bounded_tool)?;
+    let capability = facts.capability.as_str();
+    let matches_capability = match tool {
+        "command_run" => capability == "command.run" && !temporary_grant_forbids_kind(&facts.kind),
+        "command_shell" => capability == "command.run" && temporary_grant_forbids_kind(&facts.kind),
+        "fs_list" | "fs_stat" | "fs_read" | "git_status" | "git_diff" => {
+            capability == "filesystem.read"
         }
-    }
-    match facts.capability.as_str() {
-        "command.run"
-            if facts.kind.eq_ignore_ascii_case("raw_shell")
-                || facts.kind.eq_ignore_ascii_case("raw") =>
-        {
-            Some("command_shell")
-        }
-        "command.run" => Some("command_run"),
-        "logs.read" => Some("logs_query"),
-        _ => None,
-    }
+        "fs_write" | "fs_delete" => capability == "filesystem.write",
+        "logs_query" => capability == "logs.read",
+        _ => false,
+    };
+    matches_capability.then_some(tool)
 }
 
 /// Summarize rule counts by decision (for UI).
@@ -1335,7 +1348,7 @@ mod tests {
             &facts,
         )
         .expect("scoped filesystem grant is issuable")]);
-        let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
+        let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1", None);
         assert_eq!(v.decision, Decision::Allow);
         assert!(v.reason.contains("temporary grant"), "{}", v.reason);
     }
@@ -1378,7 +1391,8 @@ mod tests {
                     &allowed(inside, "ws_default"),
                     &grants,
                     1_700_000_000,
-                    "user-1"
+                    "user-1",
+                    None,
                 )
                 .decision,
                 Decision::Allow,
@@ -1396,7 +1410,8 @@ mod tests {
                     &allowed(outside, "ws_default"),
                     &grants,
                     1_700_000_000,
-                    "user-1"
+                    "user-1",
+                    None,
                 )
                 .decision,
                 Decision::Allow,
@@ -1409,7 +1424,8 @@ mod tests {
                 &allowed("proj/src", "ws_other"),
                 &grants,
                 1_700_000_000,
-                "user-1"
+                "user-1",
+                None,
             )
             .decision,
             Decision::Allow,
@@ -1520,6 +1536,7 @@ mod tests {
             &[StoredGrant::from(forged)],
             1_700_000_000,
             "user-1",
+            None,
         );
         assert_ne!(
             v.decision,
@@ -1713,7 +1730,7 @@ mod tests {
                 },
             ),
         ] {
-            let v = evaluate_with_grants(&doc, &facts, &grants, 1, "agent-1");
+            let v = evaluate_with_grants(&doc, &facts, &grants, 1, "agent-1", None);
             assert_ne!(
                 v.decision,
                 Decision::Allow,
@@ -1764,14 +1781,15 @@ mod tests {
             }],
         };
 
-        let v = evaluate_with_grants(&doc, &approved, &grants, 1_700_000_000, "user-1");
+        let v = evaluate_with_grants(&doc, &approved, &grants, 1_700_000_000, "user-1", None);
         assert_eq!(v.decision, Decision::Deny, "{v:?}");
         assert!(!v.reason.contains("temporary grant"), "{}", v.reason);
 
         // A grant still lifts an Ask — that is the feature it exists for.
         let ask_only = preset_document(AccessPreset::WorkspaceOnly);
         assert_eq!(
-            evaluate_with_grants(&ask_only, &approved, &grants, 1_700_000_000, "user-1").decision,
+            evaluate_with_grants(&ask_only, &approved, &grants, 1_700_000_000, "user-1", None)
+                .decision,
             Decision::Allow
         );
     }
@@ -1906,7 +1924,14 @@ mod tests {
             ..Default::default()
         };
         let ask = preset_document(AccessPreset::WorkspaceOnly);
-        let lifted = evaluate_with_grants(&ask, &facts, &grants, 1_700_000_000, "user-1");
+        let lifted = evaluate_with_grants(
+            &ask,
+            &facts,
+            &grants,
+            1_700_000_000,
+            "user-1",
+            Some("dev_1"),
+        );
         assert_eq!(lifted.decision, Decision::Allow, "{lifted:?}");
         assert!(
             lifted.reason.contains("bounded tool grant"),
@@ -1930,7 +1955,14 @@ mod tests {
                 description: Some("deny writes".into()),
             }],
         };
-        let denied = evaluate_with_grants(&deny, &facts, &grants, 1_700_000_000, "user-1");
+        let denied = evaluate_with_grants(
+            &deny,
+            &facts,
+            &grants,
+            1_700_000_000,
+            "user-1",
+            Some("dev_1"),
+        );
         assert_eq!(denied.decision, Decision::Deny, "{denied:?}");
     }
 
@@ -1975,7 +2007,95 @@ mod tests {
             &grants,
             1_700_000_000,
             "user-1",
+            Some("dev_1"),
         );
         assert_eq!(v.decision, Decision::Deny, "{v:?}");
+    }
+
+    #[test]
+    fn bounded_tool_grant_requires_matching_tool_capability_and_device() {
+        let grant = sample_bounded_grant(&["command_run"], None);
+        let grants = vec![StoredGrant::from(grant)];
+        let ask = preset_document(AccessPreset::WorkspaceOnly);
+        let write_with_command_tool = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("out.txt".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            tool: Some("command_run".into()),
+            ..Default::default()
+        };
+        let mismatched_tool = evaluate_with_grants(
+            &ask,
+            &write_with_command_tool,
+            &grants,
+            1_700_000_000,
+            "user-1",
+            Some("dev_1"),
+        );
+        assert_eq!(
+            mismatched_tool.decision,
+            Decision::Ask,
+            "command_run grant must not lift a filesystem.write Ask: {mismatched_tool:?}"
+        );
+
+        let write_without_tool = OperationFacts {
+            tool: None,
+            ..write_with_command_tool.clone()
+        };
+        let missing_tool = evaluate_with_grants(
+            &ask,
+            &write_without_tool,
+            &grants,
+            1_700_000_000,
+            "user-1",
+            Some("dev_1"),
+        );
+        assert_eq!(
+            missing_tool.decision,
+            Decision::Ask,
+            "capability-only facts must not match a bounded tool grant: {missing_tool:?}"
+        );
+
+        let fs_grant = vec![StoredGrant::from(sample_bounded_grant(&["fs_write"], None))];
+        let write = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("out.txt".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            tool: Some("fs_write".into()),
+            ..Default::default()
+        };
+        let wrong_device = evaluate_with_grants(
+            &ask,
+            &write,
+            &fs_grant,
+            1_700_000_000,
+            "user-1",
+            Some("dev_other"),
+        );
+        assert_eq!(
+            wrong_device.decision,
+            Decision::Ask,
+            "bounded grant must not lift on another device: {wrong_device:?}"
+        );
+        let no_device =
+            evaluate_with_grants(&ask, &write, &fs_grant, 1_700_000_000, "user-1", None);
+        assert_eq!(
+            no_device.decision,
+            Decision::Ask,
+            "bounded grant must not lift without a verified device id: {no_device:?}"
+        );
+        let lifted = evaluate_with_grants(
+            &ask,
+            &write,
+            &fs_grant,
+            1_700_000_000,
+            "user-1",
+            Some("dev_1"),
+        );
+        assert_eq!(lifted.decision, Decision::Allow, "{lifted:?}");
     }
 }

@@ -9,6 +9,7 @@ import {
   MCP_GET_OPERATION_WAIT_SATURATED_WARNING,
   MCP_COMMAND_TIMEOUT_DETACH_HINT,
   MCP_COMMAND_TIMEOUT_DETACH_WARNING,
+  MCP_DETACHED_OPERATION_TTL_MS,
   OFFICIAL_PROFILE_CATALOG,
   OperationTracker,
   handleMcp,
@@ -2077,13 +2078,13 @@ test("get_operation lazily expires legacy D1-only pending rows without clobberin
   }
 });
 
-test("get_operation does not expire detached running commands", async () => {
+test("get_operation does not expire detached running commands before the detached TTL", async () => {
   const originalNow = Date.now;
   const now = 1_800_000_000_000;
   (Date as unknown as { now: () => number }).now = () => now;
   try {
     const { store, token } = await authed();
-    const expiresAt = new Date(now - 1).toISOString();
+    const expiresAt = new Date(now + MCP_DETACHED_OPERATION_TTL_MS).toISOString();
     await store.putMcpOperation({
       operation_id: "op_detached_running",
       tenant_id: "ten_default",
@@ -2105,6 +2106,43 @@ test("get_operation does not expire detached running commands", async () => {
     const got = await callTool(store, token, "ownmesh_get_operation", { operation_id: "op_detached_running" });
     assert.equal(got.body.result!.structuredContent!.status, "running");
     assert.equal((await store.getMcpOperation("op_detached_running"))?.status, "running");
+  } finally {
+    (Date as unknown as { now: () => number }).now = originalNow;
+  }
+});
+
+test("get_operation expires detached commands after the detached TTL", async () => {
+  const originalNow = Date.now;
+  const now = 1_800_000_000_000;
+  (Date as unknown as { now: () => number }).now = () => now;
+  try {
+    const { store, token } = await authed();
+    const expiresAt = new Date(now - 1).toISOString();
+    await store.putMcpOperation({
+      operation_id: "op_detached_expired",
+      tenant_id: "ten_default",
+      principal_id: "prin_dev",
+      tool: "ownmesh_command_run",
+      status: "running",
+      summary: "detached command routed; poll ownmesh_get_operation for completion",
+      data: { detached: true },
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      expires_at: expiresAt,
+      action: { facts: { detach: true } },
+      policy_authority: "ownmesh_device",
+      created_at: new Date(now - MCP_DETACHED_OPERATION_TTL_MS - 1).toISOString(),
+      updated_at: new Date(now - 60_000).toISOString(),
+    });
+    const got = await callTool(store, token, "ownmesh_get_operation", { operation_id: "op_detached_expired" });
+    assert.equal(got.body.result!.structuredContent!.status, "failed");
+    assert.equal(
+      ((got.body.result!.structuredContent!.data as { error?: { code?: string } }).error?.code),
+      "OWNMESH_E_OPERATION_EXPIRED",
+    );
+    assert.equal((await store.getMcpOperation("op_detached_expired"))?.status, "failed");
   } finally {
     (Date as unknown as { now: () => number }).now = originalNow;
   }

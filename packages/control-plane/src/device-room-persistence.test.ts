@@ -357,6 +357,52 @@ test("pending TTL and hard cap are force-pruned", () => {
   assert.ok(router.pending.size > 0);
 });
 
+test("detached command pending skips the 15-minute TTL until expires_at", () => {
+  const router = new DeviceRoomRouter("dev_detach_pending_01", {
+    sendToSession: () => true,
+    sendToRole: () => 0,
+  });
+  const now = Date.now();
+  const detachedPayload = {
+    operation_contract: "ownmesh.operation/1.0",
+    operation_id: "op_detached_pending",
+    capability: "command.run",
+    arguments: { action: "command.run", detach: true, program: "/bin/sleep" },
+  };
+  router.pending.set("detached_live", {
+    correlation_id: "detached_live",
+    type: "command.run",
+    from_session: "cls_1",
+    created_at: now - PENDING_TTL_MS - 1,
+    expires_at: new Date(now + LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS).toISOString(),
+    payload: detachedPayload,
+  });
+  router.pending.set("detached_expired", {
+    correlation_id: "detached_expired",
+    type: "command.run",
+    from_session: "cls_1",
+    created_at: now - PENDING_TTL_MS - 1,
+    expires_at: new Date(now - 1).toISOString(),
+    payload: {
+      ...detachedPayload,
+      operation_id: "op_detached_expired",
+    },
+  });
+  router.pending.set("ordinary_stale", {
+    correlation_id: "ordinary_stale",
+    type: "ownmesh_fs_list",
+    from_session: "cls_1",
+    created_at: now - PENDING_TTL_MS - 1,
+    expires_at: new Date(now + LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS).toISOString(),
+    payload: { capability: "filesystem.read", arguments: {} },
+  });
+
+  router.pruneExpiredPending(now);
+  assert.equal(router.pending.has("detached_live"), true, "detached command stays correlatable past the 15-minute dispatch TTL");
+  assert.equal(router.pending.has("detached_expired"), false, "detached command still expires at expires_at");
+  assert.equal(router.pending.has("ordinary_stale"), false, "ordinary pending still uses the 15-minute TTL");
+});
+
 test("operation.request rejects when pending hard cap reached", async () => {
   const deviceId = "dev_pend_limit_01ab";
   const room = new DeviceRoomHarness(deviceId);
