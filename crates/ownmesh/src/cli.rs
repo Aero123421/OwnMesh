@@ -161,6 +161,14 @@ pub struct DoctorArgs {
     /// Never touch the network, even with --check-network in a shell alias.
     #[arg(long)]
     pub offline: bool,
+
+    /// Archive an unreadable op-journal and restore from a valid backup, or start empty. Local-only; requires `--i-understand-replay-risk`.
+    #[arg(long)]
+    pub repair_journal: bool,
+
+    /// Confirm that discarding an unreadable op-journal accepts bounded replay risk for in-flight keys.
+    #[arg(long)]
+    pub i_understand_replay_risk: bool,
 }
 
 /// `ownmesh login` arguments.

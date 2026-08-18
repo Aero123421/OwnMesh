@@ -3579,6 +3579,11 @@ async fn dispatch_remote_operation(
                             | ownmesh_ipc::app_error::TOKEN_REVOKED
                             | ownmesh_ipc::app_error::LOCKDOWN => "OWNMESH_E_AUTHORIZATION",
                             ownmesh_ipc::app_error::INVALID_PARAMS => "OWNMESH_E_INVALID_ARGUMENT",
+                            ownmesh_ipc::app_error::CONFLICT
+                                if message.starts_with("OWNMESH_E_JOURNAL_DEGRADED") =>
+                            {
+                                "OWNMESH_E_JOURNAL_DEGRADED"
+                            }
                             ownmesh_ipc::app_error::CONFLICT => "OWNMESH_E_CONFLICT",
                             _ => "OWNMESH_E_INTERNAL",
                         };
@@ -3875,6 +3880,11 @@ async fn dispatch_remote_operation(
                         ownmesh_ipc::app_error::METHOD_NOT_FOUND => "OWNMESH_E_UNSUPPORTED_SURFACE",
                         ownmesh_ipc::app_error::PLATFORM_UNSUPPORTED => {
                             "OWNMESH_E_PLATFORM_UNSUPPORTED"
+                        }
+                        ownmesh_ipc::app_error::CONFLICT
+                            if message.starts_with("OWNMESH_E_JOURNAL_DEGRADED") =>
+                        {
+                            "OWNMESH_E_JOURNAL_DEGRADED"
                         }
                         ownmesh_ipc::app_error::CONFLICT => "OWNMESH_E_CONFLICT",
                         _ => "OWNMESH_E_INTERNAL",

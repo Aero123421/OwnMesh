@@ -890,9 +890,11 @@ ProtectProc=invisible); re-run `ownmesh service install` to restore the supporte
         None
     };
     if let Some(error) = &input.journals.op_journal_read_error {
-        checks.push(DoctorCheck::warn(
+        checks.push(DoctorCheck::fail(
             "journals.op_journal",
-            format!("op journal unreadable: {error}"),
+            format!(
+                "op journal unreadable: {error}; daemon starts read-only. Repair locally with `ownmesh doctor --repair-journal --i-understand-replay-risk`"
+            ),
         ));
     } else if let Some(bak_bytes) = input.journals.op_journal_backup_bytes {
         // P0-B: the shared atomic writer copies the previous file to
@@ -1297,6 +1299,20 @@ mod tests {
             op.message
         );
         assert_eq!(report.outcome, DoctorOutcome::Warn, "{report:?}");
+
+        let mut unreadable = DoctorInput::default();
+        unreadable.binary.cli_version = "1.2.13".into();
+        unreadable.journals.op_journal_read_error = Some("corrupt primary".into());
+        let report = run_doctor(&unreadable);
+        let op = report
+            .checks
+            .iter()
+            .find(|c| c.id == "journals.op_journal")
+            .unwrap();
+        assert_eq!(op.status, CheckStatus::Fail, "{report:?}");
+        assert!(op.message.contains("read-only"), "{}", op.message);
+        assert!(op.message.contains("--repair-journal"), "{}", op.message);
+        assert_eq!(report.outcome, DoctorOutcome::Error, "{report:?}");
     }
 
     /// P1-D/P1-F: run_doctor must surface user-local-only official profiles

@@ -29,7 +29,7 @@ mod runtime;
 use ownmesh_config::{save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_ipc::{app_error, methods, ClientIdentity, IpcError};
 use ownmesh_policy::{preset_document, AccessPreset};
-use runtime::{session_methods, DaemonRuntime};
+use runtime::{ops_methods, session_methods, DaemonRuntime};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
@@ -306,8 +306,8 @@ async fn open_session(rt: &mut DaemonRuntime, who: &str, title: &str) -> String 
         .to_owned()
 }
 
-#[test]
-fn corrupt_op_journal_fails_closed_on_runtime_open() {
+#[tokio::test]
+async fn corrupt_op_journal_starts_degraded_read_only() {
     let dir = tempdir().unwrap();
     let paths = OwnMeshPaths::for_base(dir.path());
     paths.ensure_layout().unwrap();
@@ -317,11 +317,30 @@ fn corrupt_op_journal_fails_closed_on_runtime_open() {
     )
     .unwrap();
 
-    let err = match DaemonRuntime::open(&paths) {
-        Ok(_) => panic!("corrupt journal must not be forgotten"),
-        Err(err) => err,
-    };
-    assert!(err.contains("operation journal"), "{err}");
+    let mut rt = DaemonRuntime::open(&paths).expect("corrupt journal must start degraded, not refuse startup");
+    let diagnose = rt
+        .dispatch(ops_methods::SYSTEM_DIAGNOSE, Some(json!({ "workspace_id": null })), &client("local"))
+        .await
+        .expect("diagnose stays up");
+    assert_eq!(diagnose["overall"], "journal_degraded");
+    assert_eq!(diagnose["journals"]["op_journal"]["status"], "degraded");
+    rt.dispatch(methods::STATUS, None, &client("local"))
+        .await
+        .expect("status stays up while journal is degraded");
+    let err = rt
+        .dispatch(
+            methods::OPS_EXEC,
+            Some(json!({ "program": "true", "idempotency_key": "k" })),
+            &client("local"),
+        )
+        .await
+        .expect_err("side effects must fail closed while degraded");
+    match err {
+        IpcError::Remote { message, .. } => {
+            assert!(message.contains("OWNMESH_E_JOURNAL_DEGRADED"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]

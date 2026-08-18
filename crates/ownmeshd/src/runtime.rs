@@ -625,6 +625,10 @@ pub struct DaemonRuntime {
     pub(crate) approvals: HashMap<String, ApprovalRecord>,
     /// Completed operation results keyed by client idempotency key.
     op_journal: HashMap<String, Value>,
+    /// Set when `op-journal.json` could not be loaded/compacted/persisted.
+    /// Side-effect operations are refused; reads stay up. Never treated as a
+    /// healthy empty journal.
+    op_journal_degraded: Option<String>,
     exec_journal: IdempotencyJournal,
     lockdown: bool,
     revoked_clients: RevokedClients,
@@ -715,6 +719,28 @@ impl Drop for DetachedCommandGuard {
     }
 }
 
+fn journal_degraded_error(reason: &str) -> IpcError {
+    IpcError::Remote {
+        code: app_error::CONFLICT,
+        message: format!(
+            "OWNMESH_E_JOURNAL_DEGRADED: side effects are refused because the op-journal could not be loaded ({reason}). Repair locally with `ownmesh doctor --repair-journal --i-understand-replay-risk` then restart ownmeshd"
+        ),
+    }
+}
+
+fn pending_request_is_journal_read_only(request: &PendingRequest) -> bool {
+    matches!(
+        request,
+        PendingRequest::FsList(_)
+            | PendingRequest::FsStat(_)
+            | PendingRequest::FsRead(_)
+            | PendingRequest::LogsQuery(_)
+            | PendingRequest::GitStatus(_)
+            | PendingRequest::GitDiff(_)
+            | PendingRequest::SystemDiagnose(_)
+    )
+}
+
 fn acquire_detached_slot() -> IpcResult<DetachedCommandGuard> {
     loop {
         let n = DETACHED_IN_FLIGHT.load(Ordering::SeqCst);
@@ -777,7 +803,11 @@ impl DaemonRuntime {
         if !log_path.exists() {
             std::fs::write(&log_path, b"").map_err(|e| e.to_string())?;
         }
-        let op_journal = load_op_journal(&paths.state_dir.join("op-journal.json"))?;
+        let (op_journal, op_journal_degraded) =
+            match load_op_journal(&paths.state_dir.join("op-journal.json")) {
+                Ok(journal) => (journal, None),
+                Err(reason) => (HashMap::new(), Some(reason)),
+            };
         let grants = load_grants(&paths.state_dir.join("grants.json"))?;
         let approvals = load_approvals(&paths.state_dir.join("approvals.json"))?;
         let lockdown = paths.state_dir.join("lockdown.flag").exists();
@@ -824,6 +854,7 @@ impl DaemonRuntime {
             grants,
             approvals,
             op_journal,
+            op_journal_degraded,
             exec_journal,
             lockdown,
             revoked_clients,
@@ -902,6 +933,9 @@ impl DaemonRuntime {
     }
 
     fn persist_op_journal(&self) -> IpcResult<()> {
+        if let Some(reason) = &self.op_journal_degraded {
+            return Err(journal_degraded_error(reason));
+        }
         #[cfg(test)]
         self.maybe_inject_persist_fault(&self.op_journal_persist_fault, "op journal")?;
         // Completed entries are compacted to exact-once receipts before
@@ -943,7 +977,7 @@ impl DaemonRuntime {
         // closed (rolling back the in-memory mutation in `store_idempotent`/
         // `begin_idempotent`) instead of claiming compaction succeeded while
         // the sensitive copy remains on disk — the same fail-closed contract
-        // as the load path (which refuses startup). The operator resolves the
+        // as the load path (which starts degraded read-only). The operator resolves the
         // lock/permission and retries; doctor surfaces the backup while it
         // exists.
         if primary.exists() {
@@ -1561,6 +1595,46 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         Ok(())
     }
 
+    fn check_journal_degraded(&self, method: &str) -> IpcResult<()> {
+        let Some(reason) = &self.op_journal_degraded else {
+            return Ok(());
+        };
+        const ALLOWED: &[&str] = &[
+            methods::DAEMON_UNLOCK,
+            methods::ADMIN_DAEMON_UNLOCK_REQUEST,
+            methods::APPROVAL_LIST,
+            methods::APPROVAL_SHOW,
+            methods::POLICY_SHOW,
+            methods::POLICY_VALIDATE,
+            methods::POLICY_EXPLAIN,
+            methods::STATUS,
+            methods::PING,
+            methods::OPS_FS_LIST,
+            methods::OPS_FS_STAT,
+            methods::OPS_FS_READ,
+            methods::OPS_LOGS_QUERY,
+            methods::PROFILE_LIST,
+            methods::PROFILE_SCAN,
+            methods::PROFILE_SHOW,
+            methods::TRANSFER_STATUS,
+            methods::TRANSFER_LIST,
+            ops_methods::SYSTEM_DIAGNOSE,
+            ops_methods::GIT_STATUS,
+            ops_methods::GIT_DIFF,
+            ops_methods::WORKSPACE_LIST,
+            ops_methods::WORKSPACE_SHOW,
+            ops_methods::LOGS_LIST_PROVIDERS,
+            ops_methods::REVIEW_SHOW,
+            ops_methods::REVIEW_PAGE,
+            session_methods::LIST,
+            session_methods::SHOW,
+        ];
+        if ALLOWED.contains(&method) {
+            return Ok(());
+        }
+        Err(journal_degraded_error(reason))
+    }
+
     fn check_pending_request_lockdown(&self, request: &PendingRequest) -> IpcResult<()> {
         if matches!(request, PendingRequest::AdminDaemonUnlock(_)) && !self.lockdown {
             return Err(IpcError::Remote {
@@ -1938,6 +2012,9 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 })
             }
             Decision::Ask => {
+                if let Some(reason) = &self.op_journal_degraded {
+                    return Err(journal_degraded_error(reason));
+                }
                 let approval_id = Self::new_id("apr_");
                 let rec = ApprovalRecord {
                     id: approval_id.clone(),
@@ -1982,6 +2059,21 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 }))
             }
             Decision::Allow => {
+                if self.op_journal_degraded.is_some() && pending_request_is_journal_read_only(&request)
+                {
+                    let result = self.execute_request(&request).await?;
+                    return Ok(json!({
+                        "approval_required": false,
+                        "operation_id": operation_id,
+                        "result": result,
+                        "replayed": false,
+                        "decision": "allow",
+                        "reason": verdict.reason,
+                    }));
+                }
+                if let Some(reason) = &self.op_journal_degraded {
+                    return Err(journal_degraded_error(reason));
+                }
                 self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
                 // Once the durable marker exists, every execution/finalization error
                 // deliberately leaves it in place. Retrying an uncertain external
@@ -5075,6 +5167,7 @@ path or install the tool so detection and execution agree",
             });
         }
         self.check_lockdown(method)?;
+        self.check_journal_degraded(method)?;
         match method {
             methods::OPS_EXEC => self.handle_exec(params, client).await,
             methods::OPS_FS_LIST => self.handle_fs_list(params, client).await,
@@ -9130,9 +9223,9 @@ fn load_op_journal(path: &Path) -> Result<HashMap<String, Value>, String> {
         // Recover from it with the same bounded read + fail-closed compaction
         // as the primary, persist the compacted form as the new primary, and
         // remove the backup so the state is not double-counted on the next
-        // load. A corrupt/over-budget backup refuses startup with an
-        // actionable message instead of converting ambiguity into an empty
-        // journal.
+        // load. A corrupt/over-budget backup starts the daemon in degraded
+        // read-only mode with an actionable repair hint instead of converting
+        // ambiguity into a healthy empty journal.
         if bak.exists() {
             let journal = read_and_bound_op_journal(&bak, "op journal backup")?;
             write_op_journal(path, &journal).map_err(|e| {

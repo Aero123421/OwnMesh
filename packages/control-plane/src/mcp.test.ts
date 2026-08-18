@@ -919,6 +919,24 @@ test("system diagnosis folds device-local journal and discovery health into over
   assert.equal(pressured.overall, "op_journal_pressure");
   assert.equal(pressured.recommendation, "run_local_doctor");
 
+  const degraded = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.13", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+      journals: { transition: { status: "ok" }, op_journal: { status: "degraded", entries: 0, in_progress: 0, degraded: true } },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(degraded.overall, "journal_degraded");
+  assert.equal(degraded.recommendation, "repair_op_journal_locally");
+  const degradedJournal = (degraded.journals as Record<string, unknown>).op_journal as Record<string, unknown>;
+  assert.equal(degradedJournal.status, "degraded");
+  assert.equal(degradedJournal.degraded, true);
+
   // P1-F: uncertain op-journal entries (unknown/forward-version or malformed
   // state the device runtime refuses to replay/compact/evict) lift overall
   // away from healthy even though the status is only `warn` — warn-level

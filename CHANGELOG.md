@@ -26,6 +26,11 @@
   via Worker env `MCP_MAX_TIMEOUT_MS` (default 300000, hard ceiling 3600000).
   Timed-out synchronous commands include hint
   `use detach:true or a session for long-running commands`.
+- An unreadable, over-budget, or unremovable-backup op-journal no longer
+  refuses `ownmeshd` startup. The daemon starts read-only (`OWNMESH_E_JOURNAL_DEGRADED`
+  for side effects) and surfaces `journal_degraded` in `system_diagnose` /
+  `ownmesh doctor`. Local repair is `ownmesh doctor --repair-journal
+  --i-understand-replay-risk`.
 
 ## v1.2.13 — Runtime reliability and cross-platform repair
 

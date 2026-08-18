@@ -2143,7 +2143,7 @@ export function normalizeSystemDiagnosis(
   // check-id contract — they only lift `overall` away from an unconditional
   // `healthy` when the device reports a real failure.
   const transitionStatus = diagnosisNestedStatus(source, ["journals", "transition", "status"], ["ok", "warn", "fail"]);
-  const opJournalStatus = diagnosisNestedStatus(source, ["journals", "op_journal", "status"], ["ok", "warn", "critical"]);
+  const opJournalStatus = diagnosisNestedStatus(source, ["journals", "op_journal", "status"], ["ok", "warn", "critical", "degraded"]);
   const profileDiscoveryStatus = diagnosisNestedStatus(
     source,
     ["profile_discovery", "status"],
@@ -2181,7 +2181,9 @@ export function normalizeSystemDiagnosis(
     ? "lockdown"
     : stateFor("session_supervisor") === "unavailable"
       ? "supervisor_unavailable"
-      : transitionStatus === "fail" || transitionStatus === "malformed"
+      : opJournalStatus === "degraded" || opJournal?.degraded === true
+        ? "journal_degraded"
+        : transitionStatus === "fail" || transitionStatus === "malformed"
         ? "transition_journal_issues"
         : opJournalUncertain
           ? "op_journal_uncertain"
@@ -2198,7 +2200,9 @@ export function normalizeSystemDiagnosis(
     ? "unlock_locally"
     : overall === "supervisor_unavailable"
       ? "restart_session_supervisor"
-      : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues"
+      : overall === "journal_degraded"
+        ? "repair_op_journal_locally"
+        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues"
         ? "run_local_doctor"
         : overall === "stale_sessions"
           ? "reconcile_stale_sessions"
@@ -2233,6 +2237,7 @@ export function normalizeSystemDiagnosis(
         ...(opJournal?.entries !== undefined ? { entries: countField(opJournal.entries, 1_000_000) } : {}),
         ...(opJournal?.in_progress !== undefined ? { in_progress: countField(opJournal.in_progress, 1_000_000) } : {}),
         ...(opJournal?.uncertain !== undefined ? { uncertain: countField(opJournal.uncertain, 1_000_000) } : {}),
+        ...(opJournal?.degraded === true || opJournalStatus === "degraded" ? { degraded: true } : {}),
       },
     },
     profile_discovery: {

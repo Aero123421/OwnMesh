@@ -282,6 +282,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 op_journal_durable_bytes,
                 op_journal_in_progress,
                 op_journal_uncertain,
+                op_journal_degraded: self.op_journal_degraded.is_some(),
                 profile_discovery,
             },
         ))
@@ -3075,6 +3076,7 @@ struct SystemDiagnosisFacts {
     op_journal_durable_bytes: usize,
     op_journal_in_progress: usize,
     op_journal_uncertain: usize,
+    op_journal_degraded: bool,
     profile_discovery: (&'static str, Vec<String>),
 }
 
@@ -3195,7 +3197,9 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     // and whose key is permanently non-replayable (fail-closed by design).
     // Reporting that as a plain healthy journal hid the stuck marker behind a
     // pass result.
-    let op_status = if facts.op_journal_entries >= super::MAX_OP_JOURNAL_ENTRIES
+    let op_status = if facts.op_journal_degraded {
+        "degraded"
+    } else if facts.op_journal_entries >= super::MAX_OP_JOURNAL_ENTRIES
         || facts.op_journal_durable_bytes >= super::MAX_OP_JOURNAL_FILE_BYTES
     {
         "critical"
@@ -3213,6 +3217,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "lockdown"
     } else if supervisor_state == "unavailable" {
         "supervisor_unavailable"
+    } else if facts.op_journal_degraded {
+        "journal_degraded"
     } else if transition_status == "fail" {
         "transition_journal_issues"
     } else if op_status == "critical" {
@@ -3233,6 +3239,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     let recommendation = match overall {
         "lockdown" => "unlock_locally",
         "supervisor_unavailable" => "restart_session_supervisor",
+        "journal_degraded" => "repair_op_journal_locally",
         "transition_journal_issues"
         | "op_journal_pressure"
         | "op_journal_uncertain"
@@ -3300,6 +3307,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "max_bytes": super::MAX_OP_JOURNAL_FILE_BYTES,
                 "in_progress": facts.op_journal_in_progress,
                 "uncertain": facts.op_journal_uncertain,
+                "degraded": facts.op_journal_degraded,
             },
         },
         "profile_discovery": {
@@ -3401,6 +3409,7 @@ mod system_diagnosis_tests {
             op_journal_durable_bytes: 0,
             op_journal_in_progress: 0,
             op_journal_uncertain: 0,
+            op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
         };
         let cases = [
@@ -3479,6 +3488,7 @@ mod system_diagnosis_tests {
             op_journal_durable_bytes: 0,
             op_journal_in_progress: 0,
             op_journal_uncertain: 0,
+            op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
         };
 
@@ -3574,6 +3584,18 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["op_journal"]["status"], "warn");
         assert_eq!(value["journals"]["op_journal"]["uncertain"], 1);
 
+        let value = system_diagnosis_payload(
+            "2026-08-13T00:00:00Z",
+            SystemDiagnosisFacts {
+                op_journal_degraded: true,
+                ..healthy.clone()
+            },
+        );
+        assert_eq!(value["overall"], "journal_degraded");
+        assert_eq!(value["recommendation"], "repair_op_journal_locally");
+        assert_eq!(value["journals"]["op_journal"]["status"], "degraded");
+        assert_eq!(value["journals"]["op_journal"]["degraded"], true);
+
         // P0-B review: a durable in-progress marker means an operation never
         // reached its completed receipt (failed or crashed after reserving
         // the key). Its outcome is uncertain and the key is permanently
@@ -3586,6 +3608,7 @@ mod system_diagnosis_tests {
                 op_journal_entries: 1,
                 op_journal_in_progress: 1,
                 op_journal_uncertain: 0,
+            op_journal_degraded: false,
                 ..healthy.clone()
             },
         );
@@ -3646,6 +3669,7 @@ mod system_diagnosis_tests {
             op_journal_durable_bytes: super::super::MAX_OP_JOURNAL_FILE_BYTES,
             op_journal_in_progress: 0,
             op_journal_uncertain: 0,
+            op_journal_degraded: false,
             profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
         };
         let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);

@@ -71,18 +71,22 @@ replay against.
     never evicted, and never replayed as completed. Legacy journals still
     migrate: provably-completed bodies are stamped and compacted at load;
     everything else stays fail-closed.
-1b. **Load-time compaction is durably fail-closed.** The compacted journal
-    is persisted at load; if that persist fails, the daemon refuses to
-    start with an actionable message instead of running with a compacted
-    in-memory view while the legacy large bodies remain on disk (which
-    would let diagnostics report healthy while the durable file is still
-    over budget). A stale `op-journal.json.bak` that cannot be removed
-    (locked/ACL-protected) also refuses startup with an actionable message:
-    it may hold the pre-compaction large-body journal, and running with
-    that sensitive copy on disk while claiming it was removed would be
-    dishonest. The byte-budget check validates the pretty-serialized
-    size the durable writer actually emits, so a journal whose compact form
-    fits the budget but whose pretty form exceeds it is rejected.
+1b. **Load-time compaction is durably fail-closed for *side effects*.** The
+    compacted journal is persisted at load. If that persist fails, a stale
+    `op-journal.json.bak` cannot be removed, or the primary/backup is
+    corrupt/over-budget, the daemon **starts in degraded read-only mode**
+    rather than refusing startup entirely. Side-effect operations
+    (`write`/`exec`/session mutation/transfer/policy mutation) fail closed
+    with `OWNMESH_E_JOURNAL_DEGRADED` and a local repair hint. Read-only
+    surfaces (`status`, `doctor`, `fs_read`/`fs_list`/`fs_stat`,
+    `system_diagnose`) stay up and report `journals.op_journal.status =
+    degraded` / overall `journal_degraded`. The in-memory journal is empty
+    and is **not** treated as a healthy empty journal. Repair is local-only
+    (`ownmesh doctor --repair-journal --i-understand-replay-risk`): it
+    archives the unreadable file, restores a valid backup when one exists,
+    or writes an empty journal after explicit confirmation. Automatic
+    remote repair is out of scope. The byte-budget check still validates
+    the pretty-serialized size the durable writer actually emits.
 2. **Terminal receipts have an explicit bounded lifecycle.** Every completed
    entry carries `__ownmesh_completed_unix`. When the journal is at capacity
    (entries or durable bytes), only completed entries older than **30 days**
@@ -103,10 +107,12 @@ replay against.
    additive `journals.op_journal` field (entries / durable bytes vs caps,
    in-progress count, uncertain count, warn ≥ 60% and critical at cap
    statuses) and `ownmesh doctor` gains a read-only `journals.op_journal`
-   check. New additive overall values (`op_journal_pressure`,
-   `op_journal_uncertain`, `transition_journal_issues`,
+   check. New additive overall values (`journal_degraded`,
+   `op_journal_pressure`, `op_journal_uncertain`, `transition_journal_issues`,
    `profile_discovery_issues`) may appear; the 5-check id contract is
-   unchanged. Entries the runtime refuses to replay/compact/evict (unknown
+   unchanged. An unreadable journal reports `journals.op_journal.status =
+   degraded` and overall `journal_degraded` instead of refusing daemon
+   startup. Entries the runtime refuses to replay/compact/evict (unknown
    forward-version state, malformed state values, or non-object entries) are
    counted as uncertain and never reported healthy. The Control Plane
    redacts free-form profile-discovery notes (credential assignments

@@ -1,4 +1,5 @@
-//! `ownmesh doctor` — fully read-only diagnostics.
+//! `ownmesh doctor` — diagnostics. Inspection is read-only; `--repair-journal`
+//! is an explicit local mutation that requires `--i-understand-replay-risk`.
 
 use crate::cli::{Cli, DoctorArgs};
 use crate::commands::service::{self, ServiceStatusSnapshot};
@@ -308,6 +309,64 @@ fn sanitize_doctor_message(msg: &str) -> String {
         out = out.replace(url, &redact_control_plane_url(url));
     }
     out
+}
+
+fn repair_op_journal_files(paths: &OwnMeshPaths) -> Result<String, String> {
+    let primary = paths.state_dir.join("op-journal.json");
+    let bak = paths.state_dir.join("op-journal.json.bak");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let archive = |src: &Path, kind: &str| -> Result<PathBuf, String> {
+        for n in 0..32 {
+            let dest = paths.state_dir.join(if n == 0 {
+                format!("op-journal.json.{kind}-{stamp}")
+            } else {
+                format!("op-journal.json.{kind}-{stamp}-{n}")
+            });
+            if dest.exists() {
+                continue;
+            }
+            fs::rename(src, &dest)
+                .map_err(|e| format!("failed to archive {}: {e}", src.display()))?;
+            return Ok(dest);
+        }
+        Err(format!("failed to archive {}: no unique name", src.display()))
+    };
+
+    let mut archived = Vec::new();
+    if primary.exists() {
+        archived.push(archive(&primary, "corrupt")?);
+    }
+    if bak.exists() {
+        match fs::read(&bak) {
+            Ok(raw) if raw.len() <= 4 * 1024 * 1024 && serde_json::from_slice::<serde_json::Value>(&raw).is_ok() => {
+                fs::copy(&bak, &primary)
+                    .map_err(|e| format!("failed to restore op-journal from backup: {e}"))?;
+                let _ = fs::remove_file(&bak);
+                return Ok(format!(
+                    "restored op-journal.json from backup; archived unreadable primary as {}. Restart ownmeshd.",
+                    archived
+                        .first()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none)".into())
+                ));
+            }
+            _ => {
+                archived.push(archive(&bak, "corrupt-bak")?);
+            }
+        }
+    }
+    fs::write(&primary, b"{}").map_err(|e| format!("failed to write empty op-journal: {e}"))?;
+    Ok(format!(
+        "wrote an empty op-journal.json after archiving unreadable files ({}). In-flight keys may replay. Restart ownmeshd.",
+        archived
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn observe_daemon(paths: &OwnMeshPaths) -> DaemonObservation {
@@ -754,12 +813,50 @@ pub fn exit_for_report(report: &DoctorReport) -> ExitCode {
     }
 }
 
-/// CLI entrypoint — never mutates config, credentials, or services.
+/// CLI entrypoint. Inspection does not mutate config, credentials, or services.
+/// `--repair-journal` is the only mutating path and is local-only.
 pub fn run_doctor_cmd(cli: &Cli, args: &DoctorArgs) -> Result<(), ExitCode> {
     let paths = OwnMeshPaths::discover().map_err(|err| {
         eprintln!("doctor: path error: {err}");
         ExitCode::UsageConfig
     })?;
+    if args.repair_journal {
+        if !args.i_understand_replay_risk {
+            eprintln!(
+                "doctor: --repair-journal requires --i-understand-replay-risk (discarding an unreadable journal accepts bounded replay risk)"
+            );
+            return Err(ExitCode::UsageConfig);
+        }
+        if observe_daemon(&paths).running == Some(true) {
+            eprintln!(
+                "doctor: stop ownmeshd before repairing the op-journal (local-only; no remote repair)"
+            );
+            return Err(ExitCode::Conflict);
+        }
+        match repair_op_journal_files(&paths) {
+            Ok(message) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "ok": true,
+                            "repair": "op_journal",
+                            "message": message,
+                        })
+                    );
+                    crate::commands::fail::note_envelope_emitted();
+                } else {
+                    println!("{message}");
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("doctor: {err}");
+                return Err(ExitCode::Internal);
+            }
+        }
+    }
     // Intentionally do NOT ensure_layout / create dirs — doctor is read-only.
     let report = collect_doctor_report(&paths, args, env!("CARGO_PKG_VERSION"));
 
@@ -818,6 +915,8 @@ mod tests {
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -839,6 +938,8 @@ mod tests {
             &DoctorArgs {
                 check_network: true,
                 offline: true,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -887,6 +988,8 @@ mod tests {
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1021,6 +1124,8 @@ mod tests {
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1183,6 +1288,8 @@ mod tests {
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1219,6 +1326,8 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1264,6 +1373,8 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "1.2.3",
         );
@@ -1303,6 +1414,8 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1420,6 +1533,8 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1472,6 +1587,8 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1537,6 +1654,8 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             &DoctorArgs {
                 check_network: false,
                 offline: false,
+                repair_journal: false,
+                i_understand_replay_risk: false,
             },
             "test",
         );
@@ -1551,6 +1670,49 @@ base_url = "https://USER:s3cretTOKEN@cp.example.test/path?access_token=abc#frag"
             "malformed markers must be surfaced: {}",
             op.message
         );
+    }
+
+    #[test]
+    fn repair_journal_restores_valid_backup_and_otherwise_writes_empty() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let primary = paths.state_dir.join("op-journal.json");
+        let bak = paths.state_dir.join("op-journal.json.bak");
+        std::fs::write(&primary, br#"{"broken""#).unwrap();
+        std::fs::write(&bak, b"{}").unwrap();
+        let restored = repair_op_journal_files(&paths).expect("restore from backup");
+        assert!(restored.contains("restored"), "{restored}");
+        let body = std::fs::read_to_string(&primary).unwrap();
+        assert_eq!(body.trim(), "{}");
+        assert!(!bak.exists(), "valid backup is consumed after restore");
+
+        std::fs::write(&primary, br#"{"broken""#).unwrap();
+        let emptied = repair_op_journal_files(&paths).expect("empty journal after archive");
+        assert!(emptied.contains("empty"), "{emptied}");
+        assert_eq!(std::fs::read_to_string(&primary).unwrap(), "{}");
+    }
+
+    #[test]
+    fn repair_journal_requires_confirmation_flag() {
+        let cli = Cli::try_parse_from(["ownmesh", "doctor", "--repair-journal"])
+            .expect("repair flag must parse");
+        let crate::cli::Commands::Doctor(args) = cli.command.expect("doctor command") else {
+            panic!("expected doctor command");
+        };
+        assert!(args.repair_journal);
+        assert!(!args.i_understand_replay_risk);
+        let confirmed = Cli::try_parse_from([
+            "ownmesh",
+            "doctor",
+            "--repair-journal",
+            "--i-understand-replay-risk",
+        ])
+        .expect("confirmation flag must parse");
+        let crate::cli::Commands::Doctor(confirmed) = confirmed.command.expect("doctor") else {
+            panic!("expected doctor command");
+        };
+        assert!(confirmed.i_understand_replay_risk);
     }
 
     /// P1-F: a transition journal with an unsupported `version` (the daemon's
