@@ -155,6 +155,8 @@ pub struct SetupArgs {
 }
 
 /// `ownmesh doctor` arguments.
+// Independent command-line switches, not persistent product state.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Parser)]
 pub struct DoctorArgs {
     /// Probe the configured control plane over the network (off by default).

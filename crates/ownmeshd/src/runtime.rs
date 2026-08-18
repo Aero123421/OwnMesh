@@ -1614,9 +1614,6 @@ retry — refusing the persist rather than claiming compaction succeeded while t
     }
 
     fn check_journal_degraded(&self, method: &str) -> IpcResult<()> {
-        let Some(reason) = &self.op_journal_degraded else {
-            return Ok(());
-        };
         const ALLOWED: &[&str] = &[
             methods::DAEMON_UNLOCK,
             methods::ADMIN_DAEMON_UNLOCK_REQUEST,
@@ -1650,6 +1647,9 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             session_methods::LIST,
             session_methods::SHOW,
         ];
+        let Some(reason) = &self.op_journal_degraded else {
+            return Ok(());
+        };
         if ALLOWED.contains(&method) {
             return Ok(());
         }
@@ -2023,7 +2023,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             .tool
             .as_deref()
             .map(str::trim)
-            .is_none_or(|value| value.is_empty())
+            .is_none_or(str::is_empty)
         {
             if let Some(tool) = pending_request_tool(&request) {
                 facts.tool = Some(tool.to_owned());
@@ -3035,11 +3035,6 @@ path or install the tool so detection and execution agree",
 
     fn transfer_error(error: TransferError) -> IpcError {
         let code = match error {
-            TransferError::DestinationExists
-            | TransferError::DestinationMissing
-            | TransferError::DestinationHashMismatch { .. }
-            | TransferError::Replay
-            | TransferError::Gap => app_error::CONFLICT,
             TransferError::InvalidBinding(_)
             | TransferError::InvalidPlan(_)
             | TransferError::ChunkTooLarge
@@ -3047,7 +3042,12 @@ path or install the tool so detection and execution agree",
             | TransferError::ChunkHashMismatch
             | TransferError::Overflow => app_error::INVALID_PARAMS,
             TransferError::PlatformUnsupported => app_error::PLATFORM_UNSUPPORTED,
-            TransferError::SourceChanged
+            TransferError::DestinationExists
+            | TransferError::DestinationMissing
+            | TransferError::DestinationHashMismatch { .. }
+            | TransferError::Replay
+            | TransferError::Gap
+            | TransferError::SourceChanged
             | TransferError::HashMismatch
             | TransferError::StaleFence
             | TransferError::Terminal

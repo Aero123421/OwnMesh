@@ -3070,6 +3070,7 @@ arguments so the exact argv can be launched",
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 struct SystemDiagnosisFacts {
     lockdown: bool,
