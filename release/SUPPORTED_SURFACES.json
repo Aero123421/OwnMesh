@@ -19,7 +19,7 @@
     "approval list/show/watch/approve/deny (typed decisions; fresh browser passkey for mutations; /approve inbox + batch set commitment; deny-all without passkey)",
     "policy show/validate/explain/preset/rule mutation (typed admin actions; fresh browser passkey approval)",
     "grants list/show/revoke/mint (bounded tool grants lift Ask only; mint is fresh-passkey admin; revoke/lockdown are local tightening)",
-    "transfer plan/send/list/status/cancel (authenticated control-plane MCP; immutable no-overwrite plans; idempotency keys required for mutations)",
+    "transfer plan/send/list/status/cancel (authenticated control-plane MCP; destination replace only with overwrite_expected_sha256; no blind force; idempotency keys required for mutations)",
     "mcp serve --stdio (authenticated configured issuer; bounded JSONL bridge)",
     "service install/start/stop/restart/status/uninstall (user-level ownmeshd autostart only)",
     "privileged broker install/status/uninstall (networkless native lifecycle: Linux systemd, macOS launchd, Windows SCM; native release receipts tracked separately)",

@@ -38,7 +38,8 @@ in the full specification or every optional native package/signing format.
 - Fresh-passkey authorization for sensitive admin mutations. Decisions are
   bound to the exact operation and are consumed exactly once.
 - Authenticated, resumable, bounded device-to-device transfer with explicit
-  plan/send/list/status/cancel commands and no overwrite fallback.
+  plan/send/list/status/cancel commands. Destination replace requires
+  `overwrite_expected_sha256`; there is no blind overwrite/force fallback.
 - `ownmesh mcp serve --stdio`, a bounded JSONL bridge that uses the configured
   issuer and OS credential store without printing secrets or diagnostics to
   stdout.

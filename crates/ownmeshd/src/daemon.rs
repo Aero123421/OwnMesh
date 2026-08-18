@@ -2575,6 +2575,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grants_mint_recovery_approve_uses_enqueued_device_and_principal() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::WorkspaceOnly));
+
+        let remote_op = "op_mcp_grants_mint_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let asked = rt
+            .dispatch_cancellable_bound_with_generation(
+                methods::ADMIN_GRANTS_MINT_REQUEST,
+                Some(json!({
+                    "tools": ["fs_write"],
+                    "ttl_seconds": 60,
+                    "idempotency_key": "mint-recovery-1",
+                    "principal_id": "client:forged",
+                    "device_id": "dev_forged",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+                Some(chrono_lite_unix_now() + 300),
+                Some("a".repeat(64)),
+                Some("dev_mint_1".into()),
+                Some(7),
+            )
+            .await
+            .expect("mint ask");
+        assert_eq!(asked["approval_required"], true, "{asked}");
+        let approval_id = asked["approval_id"].as_str().unwrap().to_owned();
+
+        let approved = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "target_payload_hash": "a".repeat(64),
+                "decision": "approve",
+                "approver_principal": "prin_owner",
+            })))
+            .await
+            .expect("mint approve");
+        assert_eq!(approved["approval_decision_applied"], true, "{approved}");
+        assert_eq!(approved["replayed"], false, "{approved}");
+        let grant = &approved["result"]["grant"];
+        assert_eq!(grant["grant_type"], "bounded_tool");
+        assert_eq!(
+            grant["principal_id"].as_str().unwrap(),
+            "client:remote:ten_test:prin_chat"
+        );
+        assert_eq!(grant["device_id"], "dev_mint_1");
+        assert_ne!(grant["principal_id"], "client:forged");
+        assert_ne!(grant["device_id"], "dev_forged");
+    }
+
+    #[tokio::test]
     async fn remote_ask_expired_binding_rejects_recovery_approve() {
         let dir = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(dir.path());

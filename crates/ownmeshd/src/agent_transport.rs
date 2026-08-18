@@ -116,6 +116,14 @@ pub struct AgentTransportConfig {
     /// preflight and deliberately never enter AgentTransportState or logs.
     preflight_ephemerals: Arc<Mutex<HashMap<String, PreflightEphemeral>>>,
     state_path: PathBuf,
+    /// Completions whose live-loop `finish_tx` was gone (Agent reconnect).
+    /// The next live loop absorbs these before redelivery so a detached
+    /// command can still publish its terminal result.
+    orphan_completions: Arc<std::sync::Mutex<Vec<CompletedReply>>>,
+    orphan_notify: Arc<tokio::sync::Notify>,
+    /// In-process operation.request tasks. Survives Agent reconnect so a live
+    /// detached spawn is not re-entered as a journal CONFLICT.
+    in_process_dispatches: Arc<Mutex<HashSet<String>>>,
 }
 
 struct PreflightEphemeral {
@@ -848,6 +856,9 @@ pub fn configured_transport(
         credential: envelope.credential().clone(),
         key: Arc::new(key),
         preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+        orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+        orphan_notify: Arc::new(tokio::sync::Notify::new()),
+        in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
         state_path: paths.state_dir.join(TRANSPORT_STATE_FILE),
     }))
 }
@@ -1257,6 +1268,42 @@ fn compact_completed_reply(reply: CompletedReply) -> CompletedReply {
     completion_receipt(&reply)
 }
 
+impl AgentTransportConfig {
+    fn remember_orphan_completion(&self, completed: CompletedReply) {
+        let compact = compact_completed_reply(completed);
+        if let Ok(mut orphans) = self.orphan_completions.lock() {
+            orphans.retain(|row| row.correlation_id != compact.correlation_id);
+            if orphans.len() >= MAX_COMPLETED_REPLIES {
+                orphans.remove(0);
+            }
+            orphans.push(compact);
+        }
+        self.orphan_notify.notify_one();
+    }
+
+    fn take_orphan_completions(&self) -> Vec<CompletedReply> {
+        self.orphan_completions
+            .lock()
+            .map(|mut orphans| orphans.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
+
+fn absorb_orphan_completions(
+    config: &AgentTransportConfig,
+    state: &mut AgentTransportState,
+) -> Result<Vec<CompletedReply>, String> {
+    let drained = config.take_orphan_completions();
+    if drained.is_empty() {
+        return Ok(Vec::new());
+    }
+    for completed in &drained {
+        state.remember_completed(completed.clone());
+    }
+    state.save(&config.state_path)?;
+    Ok(drained)
+}
+
 fn completion_receipt(reply: &CompletedReply) -> CompletedReply {
     let status = reply
         .payload
@@ -1426,6 +1473,9 @@ async fn connect_and_run(
         remote_routing_enabled = runtime.is_some(),
         "Agent WebSocket authenticated and ready"
     );
+    for completed in absorb_orphan_completions(config, state)? {
+        send_cached_result(&mut socket, config, state, &completed).await?;
+    }
     live_loop(&mut socket, config, runtime, state, shutdown).await
 }
 
@@ -1690,7 +1740,7 @@ async fn live_loop(
     // Bounded queue + semaphore: slow WSS consumers must not grow RSS without limit.
     let (finish_tx, mut finish_rx) = mpsc::channel::<FinishedRemoteOp>(MAX_COMPLETION_QUEUE);
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REMOTE_OPS));
-    let active_dispatches = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let active_dispatches = Arc::clone(&config.in_process_dispatches);
 
     // Do not replay the Agent-local crash outbox on reconnect. DeviceRoom owns
     // the authoritative pending/cancel state and redelivers only after applying
@@ -1726,6 +1776,11 @@ async fn live_loop(
                 state.remember_completed(finished.completed.clone());
                 state.save(&config.state_path)?;
                 send_cached_result(socket, config, state, &finished.completed).await?;
+            }
+            () = config.orphan_notify.notified() => {
+                for completed in absorb_orphan_completions(config, state)? {
+                    send_cached_result(socket, config, state, &completed).await?;
+                }
             }
             message = socket.next() => {
                 let message = message
@@ -1936,6 +1991,7 @@ async fn handle_live_frame(
                 .correlation_id
                 .as_deref()
                 .ok_or_else(|| "operation.request requires correlation_id".to_owned())?;
+            absorb_orphan_completions(config, state)?;
             if let Some(completed) = state.completed(correlation).cloned() {
                 return send_cached_result(socket, config, state, &completed).await;
             }
@@ -2196,7 +2252,18 @@ async fn handle_live_frame(
                 };
                 // Backpressure: wait for the live loop to drain rather than drop
                 // or grow an unbounded queue while the WebSocket consumer is slow.
-                let _ = finish_tx.send(FinishedRemoteOp { completed }).await;
+                // If the live loop is gone (Agent reconnect), park the result so
+                // the next session can publish it instead of mapping a still-running
+                // journal marker to OWNMESH_E_CONFLICT.
+                if finish_tx
+                    .send(FinishedRemoteOp {
+                        completed: completed.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    transfer_config.remember_orphan_completion(completed);
+                }
                 let mut active = active_dispatches.lock().await;
                 active.remove(&correlation_owned);
             });
@@ -4096,6 +4163,9 @@ mod tests {
             credential: SecretString::new("redacted-test-credential"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -4126,6 +4196,40 @@ mod tests {
     }
 
     #[test]
+    fn orphan_completion_is_absorbed_into_transport_state() {
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_orphan").unwrap();
+        let config = AgentTransportConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            ws_url: agent_connect_url("http://127.0.0.1:1", device.as_str()).unwrap(),
+            origin: "http://127.0.0.1:1".into(),
+            device_id: device.clone(),
+            credential: SecretString::new("redacted-test-credential"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        config.remember_orphan_completion(CompletedReply {
+            correlation_id: "op_orphan".into(),
+            operation_id: "op_orphan".into(),
+            payload: json!({ "status": "completed", "result": { "ok": true } }),
+        });
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        let drained = absorb_orphan_completions(&config, &mut state).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(state.completed("op_orphan").is_some());
+        assert_eq!(
+            absorb_orphan_completions(&config, &mut state)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
     fn operation_request_persists_pending_outbox_across_crash_reload() {
         let dir = tempdir().unwrap();
         let device = DeviceId::parse("dev_outbox").unwrap();
@@ -4137,6 +4241,9 @@ mod tests {
             credential: SecretString::new("redacted-test-credential"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -4213,6 +4320,9 @@ mod tests {
             credential: SecretString::new("redacted-test-credential"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -4324,6 +4434,9 @@ mod tests {
             credential: SecretString::new("dcred_failed_send"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let (mut socket, _) = tokio_tungstenite::connect_async(config.ws_url.as_str())
@@ -4387,6 +4500,9 @@ mod tests {
             credential: SecretString::new("dcred_cancel_reconnect"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let runtime_dir = tempdir().unwrap();
@@ -4503,6 +4619,9 @@ mod tests {
             credential: SecretString::new(credential),
             key: Arc::new(key),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let runtime_dir = tempdir().unwrap();

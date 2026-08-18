@@ -380,6 +380,14 @@ pub struct AdminGrantsMintParams {
     #[serde(default)]
     pub workspace_id: Option<String>,
     pub idempotency_key: String,
+    /// Server-stamped at enqueue from the verified remote principal.
+    /// Client-supplied values are overwritten and never treated as authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    /// Server-stamped at enqueue from the verified remote device id.
+    /// Client-supplied values are overwritten and never treated as authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4426,22 +4434,26 @@ path or install the tool so detection and execution agree",
                 message: "tools must list at least one canonical tool".into(),
             });
         }
-        let principal_id = self
-            .active_remote_principal
-            .clone()
-            .filter(|value| !value.trim().is_empty())
+        let principal_id = params
+            .principal_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
                 message: "bounded grant mint requires the verified remote principal".into(),
-            })?;
-        let device_id = self
-            .active_remote_device_id
-            .clone()
-            .filter(|value| !value.trim().is_empty())
+            })?
+            .to_owned();
+        let device_id = params
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
                 message: "bounded grant mint requires the verified device id".into(),
-            })?;
+            })?
+            .to_owned();
         let workspace_id = params
             .workspace_id
             .as_deref()
@@ -4489,8 +4501,29 @@ path or install the tool so detection and execution agree",
         params: Option<Value>,
         client: &ClientIdentity,
     ) -> IpcResult<Value> {
-        let params: AdminGrantsMintParams = parse_params(params)?;
+        let mut params: AdminGrantsMintParams = parse_params(params)?;
         validate_admin_idempotency_key(&params.idempotency_key)?;
+        // Stamp identity from the live verified remote dispatch, then persist it
+        // on the approval record. Recovery approve does not restore
+        // `active_remote_*`, so execute must not reread those fields.
+        let principal_id = self
+            .active_remote_principal
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "bounded grant mint requires the verified remote principal".into(),
+            })?;
+        let device_id = self
+            .active_remote_device_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "bounded grant mint requires the verified device id".into(),
+            })?;
+        params.principal_id = Some(principal_id);
+        params.device_id = Some(device_id);
         self.enqueue_bound_admin_request(
             "admin.grants.mint",
             "Fresh passkey approval is required to mint a bounded tool grant.",
