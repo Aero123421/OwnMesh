@@ -317,9 +317,14 @@ async fn corrupt_op_journal_starts_degraded_read_only() {
     )
     .unwrap();
 
-    let mut rt = DaemonRuntime::open(&paths).expect("corrupt journal must start degraded, not refuse startup");
+    let mut rt = DaemonRuntime::open(&paths)
+        .expect("corrupt journal must start degraded, not refuse startup");
     let diagnose = rt
-        .dispatch(ops_methods::SYSTEM_DIAGNOSE, Some(json!({ "workspace_id": null })), &client("local"))
+        .dispatch(
+            ops_methods::SYSTEM_DIAGNOSE,
+            Some(json!({ "workspace_id": null })),
+            &client("local"),
+        )
         .await
         .expect("diagnose stays up");
     let diagnosis = diagnose.get("result").unwrap_or(&diagnose);

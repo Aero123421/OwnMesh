@@ -15,7 +15,7 @@
 )]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
@@ -755,12 +755,12 @@ impl BoundedToolGrant {
         if self.tools.is_empty() || self.tools.len() > MAX_BOUNDED_TOOL_GRANT_TOOLS {
             return Err("bounded tool grant must list 1-8 canonical tools".into());
         }
-        let mut seen = BTreeMap::new();
+        let mut seen = BTreeSet::new();
         for tool in &self.tools {
             let canonical = canonical_bounded_tool(tool).ok_or_else(|| {
                 format!("bounded tool grant lists unknown or wildcard tool {tool}")
             })?;
-            if seen.insert(canonical, ()).is_some() {
+            if !seen.insert(canonical) {
                 return Err(format!(
                     "bounded tool grant lists duplicate tool {canonical}"
                 ));
@@ -1328,10 +1328,13 @@ mod tests {
             workspace_id: Some("ws_default".into()),
             ..Default::default()
         };
-        let grants = as_stored(vec![
-                temporary_grant_from_facts("g-fs".into(), "user-1".into(), 9_999_999_999, &facts)
-                    .expect("scoped filesystem grant is issuable"),
-            ]);
+        let grants = as_stored(vec![temporary_grant_from_facts(
+            "g-fs".into(),
+            "user-1".into(),
+            9_999_999_999,
+            &facts,
+        )
+        .expect("scoped filesystem grant is issuable")]);
         let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
         assert_eq!(v.decision, Decision::Allow);
         assert!(v.reason.contains("temporary grant"), "{}", v.reason);
@@ -1905,7 +1908,11 @@ mod tests {
         let ask = preset_document(AccessPreset::WorkspaceOnly);
         let lifted = evaluate_with_grants(&ask, &facts, &grants, 1_700_000_000, "user-1");
         assert_eq!(lifted.decision, Decision::Allow, "{lifted:?}");
-        assert!(lifted.reason.contains("bounded tool grant"), "{}", lifted.reason);
+        assert!(
+            lifted.reason.contains("bounded tool grant"),
+            "{}",
+            lifted.reason
+        );
 
         let deny = PolicyDocument {
             preset: AccessPreset::Custom,

@@ -553,9 +553,7 @@ impl DaemonRuntime {
             p.content_sha256.clone(),
         )
         .map_err(Self::transfer_error)?
-        .with_overwrite_expected_sha256(parse_optional_content_hash(
-            p.overwrite_expected_sha256,
-        )?)
+        .with_overwrite_expected_sha256(parse_optional_content_hash(p.overwrite_expected_sha256)?)
         .map_err(Self::transfer_error)?;
         if plan.plan_sha256() != p.plan_sha256 {
             return Err(IpcError::Remote {
@@ -958,10 +956,7 @@ impl DaemonRuntime {
             .transfer_store
             .acquire(&plan, Self::now() as u64, authority.expires_at_unix)
             .map_err(Self::transfer_error)?;
-        match self
-            .transfer_store
-            .publish_completed(&plan, &workspace)
-        {
+        match self.transfer_store.publish_completed(&plan, &workspace) {
             Ok(()) | Err(ownmesh_transfer::TransferError::DestinationExists) => {
                 let mut artifact = workspace
                     .open_verified_transfer_artifact_read(Path::new(

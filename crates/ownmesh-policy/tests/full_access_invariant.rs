@@ -34,6 +34,7 @@ fn facts(cap: &str, kind: &str, elevated: bool) -> OperationFacts {
         tags: vec![],
         executable_identity: None,
         workspace_id: None,
+        tool: None,
     }
 }
 

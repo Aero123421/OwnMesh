@@ -51,7 +51,9 @@ pub fn dispatch_grants(cli: &Cli, cmd: &GrantsCmd) -> Result<(), ExitCode> {
                     });
                     Ok(())
                 }
-                Err(err) if ipc_exit_code(&err) == ExitCode::DeviceOffline => Err(emit_ipc_err(cli, &err)),
+                Err(err) if ipc_exit_code(&err) == ExitCode::DeviceOffline => {
+                    Err(emit_ipc_err(cli, &err))
+                }
                 Err(err) => Err(emit_ipc_err(cli, &err)),
             }
         }

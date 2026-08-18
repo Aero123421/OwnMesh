@@ -521,10 +521,7 @@ impl TransferPlan {
     /// # Errors
     ///
     /// Returns [`TransferError::InvalidPlan`] when the hash is not 64 lowercase hex.
-    pub fn with_overwrite_expected_sha256(
-        mut self,
-        hash: Option<String>,
-    ) -> TransferResult<Self> {
+    pub fn with_overwrite_expected_sha256(mut self, hash: Option<String>) -> TransferResult<Self> {
         if let Some(value) = &hash {
             validate_hash(value, "overwrite_expected_sha256")?;
         }

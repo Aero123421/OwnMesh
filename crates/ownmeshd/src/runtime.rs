@@ -69,16 +69,15 @@ use ownmesh_ipc::{
 use ownmesh_logs::{
     register_builtin_providers, BuiltinProviderConfig, LogCursor, LogError, LogRegistry,
 };
+#[cfg(test)]
+use ownmesh_policy::TemporaryGrant;
 use ownmesh_policy::{
     canonical_bounded_tool, evaluate_with_grants, full_access_has_no_hidden_restrictive_rules,
     preset_document, temporary_grant_from_facts, temporary_grant_requires_operation_binding,
     AccessPreset, BoundedToolGrant, BoundedToolGrantType, Decision, ExecutableIdentityBinding,
-    OperationFacts, PolicyDocument, PolicyRule, StoredGrant,
-    MAX_BOUNDED_TOOL_GRANT_TTL_SECS, MAX_BOUNDED_TOOL_GRANT_USES, TAG_READS_SENSITIVE_LOCATION,
-    TAG_WRITES_SENSITIVE_LOCATION,
+    OperationFacts, PolicyDocument, PolicyRule, StoredGrant, MAX_BOUNDED_TOOL_GRANT_TTL_SECS,
+    MAX_BOUNDED_TOOL_GRANT_USES, TAG_READS_SENSITIVE_LOCATION, TAG_WRITES_SENSITIVE_LOCATION,
 };
-#[allow(unused_imports)]
-use ownmesh_policy::TemporaryGrant;
 use ownmesh_profiles::{
     official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
     ProfileStatus,
@@ -2128,7 +2127,8 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 }))
             }
             Decision::Allow => {
-                if self.op_journal_degraded.is_some() && pending_request_is_journal_read_only(&request)
+                if self.op_journal_degraded.is_some()
+                    && pending_request_is_journal_read_only(&request)
                 {
                     let result = self.execute_request(&request).await?;
                     return Ok(json!({
@@ -4399,9 +4399,7 @@ path or install the tool so detection and execution agree",
         if params.ttl_seconds < 1 || params.ttl_seconds > MAX_BOUNDED_TOOL_GRANT_TTL_SECS {
             return Err(IpcError::Remote {
                 code: app_error::INVALID_PARAMS,
-                message: format!(
-                    "ttl_seconds must be 1..={MAX_BOUNDED_TOOL_GRANT_TTL_SECS}"
-                ),
+                message: format!("ttl_seconds must be 1..={MAX_BOUNDED_TOOL_GRANT_TTL_SECS}"),
             });
         }
         if let Some(max_uses) = params.max_uses {

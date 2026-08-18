@@ -332,7 +332,10 @@ fn repair_op_journal_files(paths: &OwnMeshPaths) -> Result<String, String> {
                 .map_err(|e| format!("failed to archive {}: {e}", src.display()))?;
             return Ok(dest);
         }
-        Err(format!("failed to archive {}: no unique name", src.display()))
+        Err(format!(
+            "failed to archive {}: no unique name",
+            src.display()
+        ))
     };
 
     let mut archived = Vec::new();
@@ -341,7 +344,10 @@ fn repair_op_journal_files(paths: &OwnMeshPaths) -> Result<String, String> {
     }
     if bak.exists() {
         match fs::read(&bak) {
-            Ok(raw) if raw.len() <= 4 * 1024 * 1024 && serde_json::from_slice::<serde_json::Value>(&raw).is_ok() => {
+            Ok(raw)
+                if raw.len() <= 4 * 1024 * 1024
+                    && serde_json::from_slice::<serde_json::Value>(&raw).is_ok() =>
+            {
                 fs::copy(&bak, &primary)
                     .map_err(|e| format!("failed to restore op-journal from backup: {e}"))?;
                 let _ = fs::remove_file(&bak);

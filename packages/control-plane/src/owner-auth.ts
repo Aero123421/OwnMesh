@@ -177,11 +177,6 @@ function validOperationId(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
 }
 
-function approvalOperationId(target: string, issuer: string): string | null {
-  const selection = parseApprovalTarget(target, issuer);
-  return selection?.kind === "single" ? selection.operationId : null;
-}
-
 /** Canonical lowercase SHA-256 hex, or null when the value is not a payload hash. */
 export function payloadHashForCommitment(value: unknown): string | null {
   if (typeof value !== "string" || !PAYLOAD_HASH_RE.test(value)) return null;

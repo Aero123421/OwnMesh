@@ -709,8 +709,11 @@ fn publish_retained_file_to_parent(
         if name.is_empty() {
             return Err(FsError::InvalidPath("empty transfer destination".into()));
         }
-        let (mut buffer, total) =
-            file_link_information_buffer(parent.as_raw_handle() as HANDLE, &name, replace_if_exists)?;
+        let (mut buffer, total) = file_link_information_buffer(
+            parent.as_raw_handle() as HANDLE,
+            &name,
+            replace_if_exists,
+        )?;
         unsafe {
             let mut io_status: IO_STATUS_BLOCK = std::mem::zeroed();
             let status = NtSetInformationFile(

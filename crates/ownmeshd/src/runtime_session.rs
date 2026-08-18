@@ -3618,7 +3618,7 @@ mod system_diagnosis_tests {
                 op_journal_entries: 1,
                 op_journal_in_progress: 1,
                 op_journal_uncertain: 0,
-            op_journal_degraded: false,
+                op_journal_degraded: false,
                 ..healthy.clone()
             },
         );
