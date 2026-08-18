@@ -169,6 +169,9 @@ pub struct OperationFacts {
     /// workspaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+    /// Canonical tool name for bounded-grant matching (`command_run`, `fs_write`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 /// Single policy rule.
@@ -676,6 +679,220 @@ pub struct TemporaryGrant {
     pub workspace_id: Option<String>,
 }
 
+/// Canonical MCP/CLI tool names a bounded tool grant may list.
+///
+/// No wildcards and no risk-class buckets. `command_run` is admitted here on
+/// purpose: this type is the standing exception that [`TemporaryGrant`] refuses.
+pub const BOUNDED_TOOL_GRANT_TOOLS: &[&str] = &[
+    "command_run",
+    "command_shell",
+    "fs_list",
+    "fs_stat",
+    "fs_read",
+    "fs_write",
+    "fs_delete",
+    "logs_query",
+    "git_status",
+    "git_diff",
+];
+
+/// Discriminator stored on every bounded tool grant row.
+pub const BOUNDED_TOOL_GRANT_TYPE: &str = "bounded_tool";
+
+/// Hard ceiling for bounded tool grant TTL (4 hours).
+pub const MAX_BOUNDED_TOOL_GRANT_TTL_SECS: i64 = 4 * 60 * 60;
+
+/// Maximum distinct tools on one bounded grant.
+pub const MAX_BOUNDED_TOOL_GRANT_TOOLS: usize = 8;
+
+/// Optional max-use ceiling.
+pub const MAX_BOUNDED_TOOL_GRANT_USES: u32 = 10_000;
+
+/// Discriminator enum so `grant_type` cannot be a free-form string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundedToolGrantType {
+    BoundedTool,
+}
+
+/// Passkey-minted, time- and use-bounded overlay that lifts **Ask only**.
+///
+/// Distinct from [`TemporaryGrant`]: this type may list `command_run`, carries
+/// a mandatory `grant_type`, and never matches a document Deny.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedToolGrant {
+    pub grant_type: BoundedToolGrantType,
+    pub id: String,
+    pub principal_id: String,
+    pub device_id: String,
+    pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub expires_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub uses: u32,
+    pub minted_at_unix: i64,
+}
+
+impl BoundedToolGrant {
+    /// Fail-closed field checks used at mint and at load.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.grant_type != BoundedToolGrantType::BoundedTool {
+            return Err("bounded tool grant requires grant_type bounded_tool".into());
+        }
+        if self.id.trim().is_empty() || self.id.len() > 128 {
+            return Err("bounded tool grant id is invalid".into());
+        }
+        if self.principal_id.trim().is_empty() || self.principal_id.len() > 512 {
+            return Err("bounded tool grant principal is invalid".into());
+        }
+        if self.device_id.trim().is_empty() || self.device_id.len() > 256 {
+            return Err("bounded tool grant device_id is invalid".into());
+        }
+        if self.tools.is_empty() || self.tools.len() > MAX_BOUNDED_TOOL_GRANT_TOOLS {
+            return Err("bounded tool grant must list 1-8 canonical tools".into());
+        }
+        let mut seen = BTreeMap::new();
+        for tool in &self.tools {
+            let canonical = canonical_bounded_tool(tool).ok_or_else(|| {
+                format!("bounded tool grant lists unknown or wildcard tool {tool}")
+            })?;
+            if seen.insert(canonical, ()).is_some() {
+                return Err(format!(
+                    "bounded tool grant lists duplicate tool {canonical}"
+                ));
+            }
+        }
+        if let Some(workspace) = &self.workspace_id {
+            if workspace.trim().is_empty() || workspace.len() > 128 {
+                return Err("bounded tool grant workspace_id is invalid".into());
+            }
+        }
+        if self.expires_unix <= 0 {
+            return Err("bounded tool grant expiry is invalid".into());
+        }
+        if let Some(max_uses) = self.max_uses {
+            if max_uses == 0 || max_uses > MAX_BOUNDED_TOOL_GRANT_USES {
+                return Err("bounded tool grant max_uses is invalid".into());
+            }
+            if self.uses > max_uses {
+                return Err("bounded tool grant uses exceed max_uses".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Remaining uses, if capped.
+    #[must_use]
+    pub fn remaining_uses(&self) -> Option<u32> {
+        self.max_uses.map(|max| max.saturating_sub(self.uses))
+    }
+}
+
+/// Device-local `grants.json` row. Unknown `grant_type` values fail closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum StoredGrant {
+    BoundedTool(BoundedToolGrant),
+    Temporary(TemporaryGrant),
+}
+
+impl<'de> Deserialize<'de> for StoredGrant {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("grant_type") {
+            None => TemporaryGrant::deserialize(value)
+                .map(Self::Temporary)
+                .map_err(serde::de::Error::custom),
+            Some(serde_json::Value::String(kind)) if kind == BOUNDED_TOOL_GRANT_TYPE => {
+                let grant =
+                    BoundedToolGrant::deserialize(value).map_err(serde::de::Error::custom)?;
+                grant.validate().map_err(serde::de::Error::custom)?;
+                Ok(Self::BoundedTool(grant))
+            }
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "unknown grant_type {other}"
+            ))),
+        }
+    }
+}
+
+impl From<TemporaryGrant> for StoredGrant {
+    fn from(grant: TemporaryGrant) -> Self {
+        Self::Temporary(grant)
+    }
+}
+
+impl From<BoundedToolGrant> for StoredGrant {
+    fn from(grant: BoundedToolGrant) -> Self {
+        Self::BoundedTool(grant)
+    }
+}
+
+impl StoredGrant {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::BoundedTool(grant) => &grant.id,
+            Self::Temporary(grant) => &grant.id,
+        }
+    }
+
+    #[must_use]
+    pub fn as_temporary(&self) -> Option<&TemporaryGrant> {
+        match self {
+            Self::Temporary(grant) => Some(grant),
+            Self::BoundedTool(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_bounded_tool(&self) -> Option<&BoundedToolGrant> {
+        match self {
+            Self::BoundedTool(grant) => Some(grant),
+            Self::Temporary(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_bounded_tool_mut(&mut self) -> Option<&mut BoundedToolGrant> {
+        match self {
+            Self::BoundedTool(grant) => Some(grant),
+            Self::Temporary(_) => None,
+        }
+    }
+}
+
+/// Canonicalize a caller-supplied tool name to the bounded-grant allowlist.
+#[must_use]
+pub fn canonical_bounded_tool(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('*') || trimmed.contains('.') {
+        return None;
+    }
+    let stripped = trimmed
+        .strip_prefix("ownmesh_")
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let canonical = match stripped.as_str() {
+        "run_command" => "command_run",
+        "run_shell" => "command_shell",
+        "list_files" => "fs_list",
+        "read_file" => "fs_read",
+        "write_file" => "fs_write",
+        "delete_file" => "fs_delete",
+        other => other,
+    };
+    BOUNDED_TOOL_GRANT_TOOLS
+        .iter()
+        .copied()
+        .find(|tool| *tool == canonical)
+}
+
 /// Capabilities whose grants are meaningless without a path scope.
 ///
 /// A `filesystem.*` grant with no recorded path would authorize every path the
@@ -856,17 +1073,18 @@ fn temporary_grant_matches(
     true
 }
 
-/// Evaluate with temporary grants that force Allow when still valid.
+/// Evaluate with stored grants that force Allow when still valid.
 ///
 /// A grant may only lift an `Ask`. An explicit `Deny` rule outranks every grant
 /// (specification §7.7: explicit deny precedes explicit ask and allow), so a
 /// deny added after a grant was issued takes effect immediately instead of
-/// waiting for the grant to expire.
+/// waiting for the grant to expire. Bounded tool grants never run unless the
+/// document decided Ask.
 #[must_use]
 pub fn evaluate_with_grants(
     doc: &PolicyDocument,
     facts: &OperationFacts,
-    grants: &[TemporaryGrant],
+    grants: &[StoredGrant],
     now_unix: i64,
     principal_id: &str,
 ) -> PolicyVerdict {
@@ -874,7 +1092,10 @@ pub fn evaluate_with_grants(
     if verdict.decision == Decision::Deny {
         return verdict;
     }
-    for g in grants {
+    for grant in grants {
+        let StoredGrant::Temporary(g) = grant else {
+            continue;
+        };
         if !temporary_grant_matches(g, facts, principal_id, now_unix) {
             continue;
         }
@@ -884,7 +1105,79 @@ pub fn evaluate_with_grants(
             reason: format!("temporary grant {}", g.id),
         };
     }
+    if verdict.decision != Decision::Ask {
+        return verdict;
+    }
+    for grant in grants {
+        let StoredGrant::BoundedTool(g) = grant else {
+            continue;
+        };
+        if !bounded_tool_grant_matches(g, facts, principal_id, now_unix) {
+            continue;
+        }
+        return PolicyVerdict {
+            decision: Decision::Allow,
+            matched_rule_id: Some(g.id.clone()),
+            reason: format!("bounded tool grant {}", g.id),
+        };
+    }
     verdict
+}
+
+fn bounded_tool_grant_matches(
+    grant: &BoundedToolGrant,
+    facts: &OperationFacts,
+    principal_id: &str,
+    now_unix: i64,
+) -> bool {
+    if grant.validate().is_err() {
+        return false;
+    }
+    if grant.principal_id != principal_id || grant.expires_unix <= now_unix {
+        return false;
+    }
+    if grant.max_uses.is_some_and(|max| grant.uses >= max) {
+        return false;
+    }
+    if let Some(workspace) = grant.workspace_id.as_deref() {
+        match facts
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(facts_workspace) if facts_workspace == workspace => {}
+            _ => return false,
+        }
+    }
+    let Some(tool) = facts_bounded_tool(facts) else {
+        return false;
+    };
+    grant
+        .tools
+        .iter()
+        .any(|listed| canonical_bounded_tool(listed) == Some(tool))
+}
+
+/// Tool name used to match a bounded grant against operation facts.
+#[must_use]
+pub fn facts_bounded_tool(facts: &OperationFacts) -> Option<&'static str> {
+    if let Some(tool) = facts.tool.as_deref() {
+        if let Some(canonical) = canonical_bounded_tool(tool) {
+            return Some(canonical);
+        }
+    }
+    match facts.capability.as_str() {
+        "command.run"
+            if facts.kind.eq_ignore_ascii_case("raw_shell")
+                || facts.kind.eq_ignore_ascii_case("raw") =>
+        {
+            Some("command_shell")
+        }
+        "command.run" => Some("command_run"),
+        "logs.read" => Some("logs_query"),
+        _ => None,
+    }
 }
 
 /// Summarize rule counts by decision (for UI).
@@ -905,6 +1198,10 @@ pub fn decision_histogram(doc: &PolicyDocument) -> BTreeMap<&'static str, usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn as_stored(grants: Vec<TemporaryGrant>) -> Vec<StoredGrant> {
+        grants.into_iter().map(StoredGrant::from).collect()
+    }
 
     #[test]
     fn full_access_allows_everything_without_hidden_deny() {
@@ -1031,11 +1328,10 @@ mod tests {
             workspace_id: Some("ws_default".into()),
             ..Default::default()
         };
-        let grants =
-            vec![
+        let grants = as_stored(vec![
                 temporary_grant_from_facts("g-fs".into(), "user-1".into(), 9_999_999_999, &facts)
                     .expect("scoped filesystem grant is issuable"),
-            ];
+            ]);
         let v = evaluate_with_grants(&doc, &facts, &grants, 1_700_000_000, "user-1");
         assert_eq!(v.decision, Decision::Allow);
         assert!(v.reason.contains("temporary grant"), "{}", v.reason);
@@ -1055,13 +1351,13 @@ mod tests {
             workspace_id: Some("ws_default".into()),
             ..Default::default()
         };
-        let grants = vec![temporary_grant_from_facts(
+        let grants = as_stored(vec![temporary_grant_from_facts(
             "g-scope".into(),
             "user-1".into(),
             9_999_999_999,
             &approved,
         )
-        .expect("scoped grant")];
+        .expect("scoped grant")]);
 
         let allowed = |path: &str, workspace: &str| OperationFacts {
             capability: "filesystem.write".into(),
@@ -1215,7 +1511,13 @@ mod tests {
             path: Some("anything/at/all".into()),
             ..Default::default()
         };
-        let v = evaluate_with_grants(&doc, &facts, &[forged], 1_700_000_000, "user-1");
+        let v = evaluate_with_grants(
+            &doc,
+            &facts,
+            &[StoredGrant::from(forged)],
+            1_700_000_000,
+            "user-1",
+        );
         assert_ne!(
             v.decision,
             Decision::Allow,
@@ -1301,7 +1603,7 @@ mod tests {
         let gawk_id = sample_identity(gawk, "ee".repeat(32).as_str());
 
         // Fully "bound" legacy/forged rows that older builds would have accepted.
-        let grants = vec![
+        let grants = as_stored(vec![
             TemporaryGrant {
                 id: "legacy-unbound".into(),
                 capability: "command.run".into(),
@@ -1357,7 +1659,7 @@ mod tests {
                 }),
                 workspace_id: None,
             },
-        ];
+        ]);
 
         // Same pinned python3.12 identity with argv changed from --version to -c payload.
         for (label, facts) in [
@@ -1434,13 +1736,13 @@ mod tests {
             workspace_id: Some("ws_default".into()),
             ..Default::default()
         };
-        let grants = vec![temporary_grant_from_facts(
+        let grants = as_stored(vec![temporary_grant_from_facts(
             "g-deny".into(),
             "user-1".into(),
             9_999_999_999,
             &approved,
         )
-        .expect("scoped grant")];
+        .expect("scoped grant")]);
 
         let doc = PolicyDocument {
             preset: AccessPreset::Custom,
@@ -1569,5 +1871,104 @@ mod tests {
         )
         .expect("spaces are part of a valid filename");
         assert_eq!(spaced.path_prefix.as_deref(), Some(" proj"));
+    }
+
+    fn sample_bounded_grant(tools: &[&str], max_uses: Option<u32>) -> BoundedToolGrant {
+        BoundedToolGrant {
+            grant_type: BoundedToolGrantType::BoundedTool,
+            id: "grant_bounded_1".into(),
+            principal_id: "user-1".into(),
+            device_id: "dev_1".into(),
+            tools: tools.iter().map(|t| (*t).to_string()).collect(),
+            workspace_id: Some("ws_default".into()),
+            expires_unix: 9_999_999_999,
+            max_uses,
+            uses: 0,
+            minted_at_unix: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn bounded_tool_grant_lifts_ask_not_deny() {
+        let grant = sample_bounded_grant(&["fs_write"], Some(2));
+        grant.validate().expect("valid grant");
+        let grants = vec![StoredGrant::from(grant)];
+        let facts = OperationFacts {
+            capability: "filesystem.write".into(),
+            kind: "file".into(),
+            path: Some("out.txt".into()),
+            workspace_relative: true,
+            workspace_id: Some("ws_default".into()),
+            tool: Some("fs_write".into()),
+            ..Default::default()
+        };
+        let ask = preset_document(AccessPreset::WorkspaceOnly);
+        let lifted = evaluate_with_grants(&ask, &facts, &grants, 1_700_000_000, "user-1");
+        assert_eq!(lifted.decision, Decision::Allow, "{lifted:?}");
+        assert!(lifted.reason.contains("bounded tool grant"), "{}", lifted.reason);
+
+        let deny = PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: None,
+            rules: vec![PolicyRule {
+                id: "deny-writes".into(),
+                decision: Decision::Deny,
+                priority: 0,
+                capability: "filesystem.write".into(),
+                when_elevated: None,
+                when_kind: None,
+                path_prefix: None,
+                program_equals: None,
+                when_tag: None,
+                description: Some("deny writes".into()),
+            }],
+        };
+        let denied = evaluate_with_grants(&deny, &facts, &grants, 1_700_000_000, "user-1");
+        assert_eq!(denied.decision, Decision::Deny, "{denied:?}");
+    }
+
+    #[test]
+    fn bounded_tool_grant_refuses_wildcards_and_unknown_types() {
+        assert!(canonical_bounded_tool("command.*").is_none());
+        assert!(canonical_bounded_tool("*").is_none());
+        assert!(canonical_bounded_tool("ownmesh_command_run") == Some("command_run"));
+        let unknown = serde_json::json!([{
+            "grant_type": "standing_allow",
+            "id": "g1",
+            "principal_id": "user-1",
+            "expires_unix": 9_999_999_999
+        }]);
+        let err = serde_json::from_value::<Vec<StoredGrant>>(unknown).expect_err("unknown type");
+        assert!(err.to_string().contains("grant_type"), "{err}");
+
+        let legacy = serde_json::json!([{
+            "id": "g-legacy",
+            "capability": "logs.read",
+            "principal_id": "user-1",
+            "expires_unix": 9_999_999_999
+        }]);
+        let loaded: Vec<StoredGrant> = serde_json::from_value(legacy).expect("legacy temporary");
+        assert!(loaded[0].as_temporary().is_some());
+    }
+
+    #[test]
+    fn recommended_command_run_deny_is_not_lifted_by_bounded_grant() {
+        let grant = sample_bounded_grant(&["command_run"], None);
+        let grants = vec![StoredGrant::from(grant)];
+        let facts = OperationFacts {
+            capability: "command.run".into(),
+            kind: "structured".into(),
+            program: Some("true".into()),
+            tool: Some("command_run".into()),
+            ..Default::default()
+        };
+        let v = evaluate_with_grants(
+            &preset_document(AccessPreset::Recommended),
+            &facts,
+            &grants,
+            1_700_000_000,
+            "user-1",
+        );
+        assert_eq!(v.decision, Decision::Deny, "{v:?}");
     }
 }

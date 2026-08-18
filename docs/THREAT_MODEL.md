@@ -59,6 +59,8 @@
 | Workspace custody (E4) | v1.2 | Workspace-relative path authority and ACL | `control-plane/migrations/0011_workspace_acl.sql` |
 | Windows daemon (E8) | v1.2 | LocalSystem SCM service + SID-bound named pipe | `ownmesh-broker/src/windows*.rs` |
 | Resumable transfer (E9) | v1.2 | `TransferRoom` DO, ephemeral proofs, chunk resumption | `control-plane/src/transfer-room.ts`, `ownmeshd/src/transfer_crypto.rs` |
+| Bounded tool grants | unreleased | Distinct `grant_type: "bounded_tool"` overlay; Ask-only lift; Deny wins; passkey mint | `ownmesh-policy`, `ownmeshd` grants IPC, ADR 0012 |
+| Batch approval presence | unreleased | v2 set commitment over server-side payload hashes; deny-all without passkey | `control-plane/src/owner-auth.ts`, `mcp.ts`, ADR 0012 |
 
 Each is exercised by the adversarial suites listed in
 [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md); this table
@@ -70,7 +72,7 @@ the release notes for the evidence split.
 | Adversary | Goals | Primary controls |
 | --- | --- | --- |
 | A1 Remote unauthenticated | Reach device tools without OAuth | Worker authn, no public device admin API without token |
-| A2 Stolen OAuth access token | Call MCP / device ops until expiry | Short TTL, audience/scope binding, revoke |
+| A2 Stolen OAuth access token | Call MCP / device ops until expiry | Short TTL, audience/scope binding, revoke; stolen token can revoke grants (tightening) but cannot mint them or approve |
 | A3 Stolen refresh token | Mint new access tokens | Rotation + reuse detection, keychain storage |
 | A4 Prompt-injection (model/tool args) | “Always allow”, forge approval | Device policy is final; injection strings inert for authz |
 | A5 Local cross-user | User B drives User A’s daemon | OS-attested peer credentials + pipe/socket ACL; per-client credential for privileged IPC methods |

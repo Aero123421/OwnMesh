@@ -359,6 +359,8 @@ export const MCP_OPS_MAX_PER_TENANT_DEFAULT = 20_000;
 export const MCP_OPS_MAX_PER_TENANT = MCP_OPS_MAX_PER_TENANT_DEFAULT;
 /** Absolute ceiling so a typo cannot unbounded-grow `mcp_operations`. */
 export const MCP_OPS_MAX_PER_TENANT_HARD_CEILING = 1_000_000;
+/** Pending-approval inbox bound (one passkey-bound set cannot exceed this). */
+export const PENDING_APPROVAL_LIST_LIMIT = 32;
 /** Warn (and surface `mcp_ops_quota_pressure`) at this fraction of the cap. */
 export const MCP_OPS_QUOTA_PRESSURE_RATIO = 0.6;
 export const MCP_OPS_QUOTA_PRESSURE_WARNING = "mcp_ops_quota_pressure";
@@ -798,6 +800,15 @@ export interface ControlPlaneStore {
     tenantId: string;
     principalId: string;
     tool: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]>;
+  /**
+   * Newest-first pending human approvals for one principal/tenant.
+   * Caller still authorizes each row; this is not an approval decision.
+   */
+  listPendingMcpApprovals(opts: {
+    tenantId: string;
+    principalId: string;
     limit?: number;
   }): Promise<McpOperationRecord[]>;
   /**
@@ -1980,6 +1991,32 @@ export class MemoryStore implements ControlPlaneStore {
     return [...this.mcpOperations.values()]
       .filter((op) => op.tenant_id === opts.tenantId && op.principal_id === opts.principalId && op.tool === opts.tool)
       .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id))
+      .slice(0, limit)
+      .map((op) => ({
+        ...op,
+        data: { ...op.data },
+        warnings: [...op.warnings],
+        action: op.action ? { ...op.action } : op.action,
+      }));
+  }
+  async listPendingMcpApprovals(opts: {
+    tenantId: string;
+    principalId: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(PENDING_APPROVAL_LIST_LIMIT, Math.trunc(opts.limit ?? PENDING_APPROVAL_LIST_LIMIT)));
+    return [...this.mcpOperations.values()]
+      .filter(
+        (op) =>
+          op.tenant_id === opts.tenantId &&
+          op.principal_id === opts.principalId &&
+          op.status === "approval_required" &&
+          op.approval_required,
+      )
+      .sort(
+        (left, right) =>
+          right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id),
+      )
       .slice(0, limit)
       .map((op) => ({
         ...op,
@@ -4180,6 +4217,25 @@ export class SqlStore implements ControlPlaneStore {
       .bind(opts.tenantId, opts.principalId, opts.tool, limit)
       .all<Record<string, unknown>>();
     return (rows.results || []).map(rowToMcpOperation);
+  }
+
+  async listPendingMcpApprovals(opts: {
+    tenantId: string;
+    principalId: string;
+    limit?: number;
+  }): Promise<McpOperationRecord[]> {
+    const limit = Math.max(1, Math.min(PENDING_APPROVAL_LIST_LIMIT, Math.trunc(opts.limit ?? PENDING_APPROVAL_LIST_LIMIT)));
+    const rows = await this.db
+      .prepare(
+        `SELECT * FROM mcp_operations
+         WHERE tenant_id = ? AND principal_id = ? AND status = 'approval_required'
+         ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
+      )
+      .bind(opts.tenantId, opts.principalId, limit)
+      .all<Record<string, unknown>>();
+    return (rows.results || [])
+      .map(rowToMcpOperation)
+      .filter((op) => op.approval_required);
   }
 
   async getMcpOperationByIdempotency(opts: {

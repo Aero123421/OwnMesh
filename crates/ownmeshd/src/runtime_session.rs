@@ -262,7 +262,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
         // P1-D/P1-F: profile discovery canary — user-local bin dirs that exist
         // but are not searched mean installed CLIs appear not-installed.
         let profile_discovery = profile_discovery_health();
-        Ok(system_diagnosis_payload(
+        let mut payload = system_diagnosis_payload(
             &observed_at,
             SystemDiagnosisFacts {
                 lockdown: self.lockdown,
@@ -285,7 +285,17 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 op_journal_degraded: self.op_journal_degraded.is_some(),
                 profile_discovery,
             },
-        ))
+        );
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "grants".into(),
+                json!({
+                    "bounded_tool": self.grants.iter().filter(|g| g.as_bounded_tool().is_some()).count(),
+                    "temporary": self.grants.iter().filter(|g| g.as_temporary().is_some()).count(),
+                }),
+            );
+        }
+        Ok(payload)
     }
 
     pub(super) async fn handle_session_open(

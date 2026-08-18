@@ -1967,13 +1967,14 @@ test("production-path: worker /approve is implemented (auth required, not 501)",
       "self_approval_forbidden",
     );
 
-    // Independent human browser auth, missing operation_id → 400 (handler is live).
+    // Independent human browser auth, no operation_id → pending inbox (handler is live).
     const authNoOp = await worker.fetch(
       new Request(`${ISSUER}/approve`),
       env(store),
       ctx,
     );
-    assert.equal(authNoOp.status, 400);
+    assert.equal(authNoOp.status, 200);
+    assert.match(await authNoOp.text(), /Review pending operations/);
     assert.notEqual(authNoOp.status, 501);
   });
 });

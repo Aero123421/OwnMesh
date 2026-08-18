@@ -84,6 +84,14 @@ pub mod methods {
     pub const ADMIN_DAEMON_UNLOCK_REQUEST: &str = "admin.daemon_unlock.request";
     pub const ADMIN_TOKEN_REVOKE_REQUEST: &str = "admin.token_revoke.request";
     pub const ADMIN_APPROVAL_BRIDGE_REQUEST: &str = "admin.approval_bridge.request";
+    pub const ADMIN_GRANTS_MINT_REQUEST: &str = "admin.grants_mint.request";
+
+    /// List device-local grants (temporary + bounded tool).
+    pub const GRANTS_LIST: &str = "grants.list";
+    /// Show one grant by id.
+    pub const GRANTS_SHOW: &str = "grants.show";
+    /// Revoke one grant immediately (tightening; local IPC).
+    pub const GRANTS_REVOKE: &str = "grants.revoke";
 
     /// Daemon-managed credential lifecycle (fixed management client only).
     pub const CREDENTIAL_PROVISION: &str = "credential.provision";

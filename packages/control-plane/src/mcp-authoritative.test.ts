@@ -1219,8 +1219,9 @@ test("worker /approve no longer returns 501; requires auth", async () => {
       { AUTH_PROVIDER: authProvider },
       ctx,
     );
-    // Implemented: missing operation_id → 400 (not 501 stub)
-    assert.equal(authNoOp.status, 400);
+    // Implemented: authenticated inbox lists pending approvals (not 501 stub)
+    assert.equal(authNoOp.status, 200);
+    assert.match(await authNoOp.text(), /Review pending operations/);
     assert.notEqual(authNoOp.status, 501);
   } finally {
     __setTestStore(null);

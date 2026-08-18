@@ -80,6 +80,9 @@ pub enum Commands {
     /// Policy inspection and editing.
     #[command(subcommand)]
     Policy(PolicyCmd),
+    /// Device-local grants (bounded tool grants and temporary overlays).
+    #[command(subcommand)]
+    Grants(GrantsCmd),
     /// Peer-to-peer transfer.
     #[command(subcommand)]
     Transfer(TransferCmd),
@@ -552,6 +555,41 @@ pub enum PolicyCmd {
         /// Workspace in which the path is resolved (default workspace when omitted).
         #[arg(long)]
         workspace_id: Option<String>,
+    },
+}
+
+/// `ownmesh grants` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum GrantsCmd {
+    /// List device-local grants.
+    List,
+    /// Show one grant.
+    Show {
+        /// Grant id.
+        id: String,
+    },
+    /// Revoke one grant immediately.
+    Revoke {
+        /// Grant id.
+        id: String,
+    },
+    /// Mint a passkey-approved bounded tool grant (Ask-only lift, TTL ≤ 4h).
+    Mint {
+        /// Canonical tool name (repeatable). No wildcards.
+        #[arg(long = "tool", required = true)]
+        tools: Vec<String>,
+        /// Lifetime in seconds (1..=14400).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=14_400))]
+        ttl_seconds: i64,
+        /// Optional max uses.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        max_uses: Option<u32>,
+        /// Optional workspace id.
+        #[arg(long)]
+        workspace_id: Option<String>,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
 }
 

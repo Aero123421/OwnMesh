@@ -31,6 +31,18 @@
   for side effects) and surfaces `journal_degraded` in `system_diagnose` /
   `ownmesh doctor`. Local repair is `ownmesh doctor --repair-journal
   --i-understand-replay-risk`.
+- Bounded tool grants (`grant_type: "bounded_tool"`) lift policy **Ask** only
+  for an explicit tool allowlist, optional workspace, TTL ≤ 4 hours, and
+  optional max-use count. Deny still wins, including recommended/workspace_only
+  `command.run`. Minting is the same fresh-passkey admin path as policy preset
+  (`ownmesh grants mint` / `ownmesh_grants_mint`). Revoke and lockdown are
+  local tightening. See ADR 0012.
+- `/approve` lists pending operations for an authenticated human session.
+  Selected sets are bound by a v2 presence cookie whose commitment is SHA-256
+  of server-looked-up `operation_id:payload_hash` lines (max 32). Each decision
+  is still consumed per operation. Deny-all of the listed pending set requires
+  session + CSRF + same-origin, not a passkey. Notification channels never
+  carry approval authority.
 
 ## v1.2.13 — Runtime reliability and cross-platform repair
 

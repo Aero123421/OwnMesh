@@ -70,10 +70,12 @@ use ownmesh_logs::{
     register_builtin_providers, BuiltinProviderConfig, LogCursor, LogError, LogRegistry,
 };
 use ownmesh_policy::{
-    evaluate_with_grants, full_access_has_no_hidden_restrictive_rules, preset_document,
-    temporary_grant_from_facts, temporary_grant_requires_operation_binding, AccessPreset, Decision,
-    ExecutableIdentityBinding, OperationFacts, PolicyDocument, PolicyRule, TemporaryGrant,
-    TAG_READS_SENSITIVE_LOCATION, TAG_WRITES_SENSITIVE_LOCATION,
+    canonical_bounded_tool, evaluate_with_grants, full_access_has_no_hidden_restrictive_rules,
+    preset_document, temporary_grant_from_facts, temporary_grant_requires_operation_binding,
+    AccessPreset, BoundedToolGrant, BoundedToolGrantType, Decision, ExecutableIdentityBinding,
+    OperationFacts, PolicyDocument, PolicyRule, StoredGrant, TemporaryGrant,
+    MAX_BOUNDED_TOOL_GRANT_TTL_SECS, MAX_BOUNDED_TOOL_GRANT_USES, TAG_READS_SENSITIVE_LOCATION,
+    TAG_WRITES_SENSITIVE_LOCATION,
 };
 use ownmesh_profiles::{
     official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
@@ -276,6 +278,7 @@ pub enum PendingRequest {
     AdminDaemonUnlock(AdminDaemonUnlockParams),
     AdminTokenRevoke(AdminTokenRevokeParams),
     AdminApprovalBridge(AdminApprovalBridgeParams),
+    AdminGrantsMint(AdminGrantsMintParams),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +366,18 @@ pub struct AdminApprovalBridgeParams {
     pub temporary_grant: bool,
     #[serde(default)]
     pub grant_seconds: Option<i64>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminGrantsMintParams {
+    pub tools: Vec<String>,
+    pub ttl_seconds: i64,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub idempotency_key: String,
 }
 
@@ -621,7 +636,7 @@ pub struct DaemonRuntime {
     /// Explicit local setup choice: authenticated, exact-bound remote MCP
     /// invocation may satisfy a policy Ask. Defaults fail-closed to false.
     delegate_remote_mcp: bool,
-    grants: Vec<TemporaryGrant>,
+    grants: Vec<StoredGrant>,
     pub(crate) approvals: HashMap<String, ApprovalRecord>,
     /// Completed operation results keyed by client idempotency key.
     op_journal: HashMap<String, Value>,
@@ -1584,6 +1599,8 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::POLICY_VALIDATE,
             methods::STATUS,
             methods::PING,
+            methods::GRANTS_LIST,
+            methods::GRANTS_SHOW,
             ops_methods::SYSTEM_DIAGNOSE,
         ];
         if self.lockdown && !ALLOWED.contains(&method) {
@@ -1618,6 +1635,9 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::PROFILE_SHOW,
             methods::TRANSFER_STATUS,
             methods::TRANSFER_LIST,
+            methods::GRANTS_LIST,
+            methods::GRANTS_SHOW,
+            methods::GRANTS_REVOKE,
             ops_methods::SYSTEM_DIAGNOSE,
             ops_methods::GIT_STATUS,
             ops_methods::GIT_DIFF,
@@ -1809,6 +1829,40 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         evaluate_with_grants(&self.policy, facts, &self.grants, Self::now(), principal)
     }
 
+    fn consume_bounded_grant_use(
+        &mut self,
+        verdict: &ownmesh_policy::PolicyVerdict,
+    ) -> IpcResult<()> {
+        if verdict.decision != Decision::Allow {
+            return Ok(());
+        }
+        let Some(grant_id) = verdict.matched_rule_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(index) = self
+            .grants
+            .iter()
+            .position(|grant| grant.as_bounded_tool().is_some_and(|g| g.id == grant_id))
+        else {
+            return Ok(());
+        };
+        let needs_count = self.grants[index]
+            .as_bounded_tool()
+            .is_some_and(|g| g.max_uses.is_some());
+        if !needs_count {
+            return Ok(());
+        }
+        let snapshot = self.grants.clone();
+        if let Some(grant) = self.grants[index].as_bounded_tool_mut() {
+            grant.uses = grant.uses.saturating_add(1);
+        }
+        if let Err(e) = self.persist_grants() {
+            self.grants = snapshot;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn lookup_idempotent(&mut self, key: Option<&String>) -> IpcResult<Option<Value>> {
         let Some(key) = key else {
             return Ok(None);
@@ -1963,6 +2017,18 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             return Ok(replayed);
         }
 
+        let mut facts = facts;
+        if facts
+            .tool
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|value| value.is_empty())
+        {
+            if let Some(tool) = pending_request_tool(&request) {
+                facts.tool = Some(tool.to_owned());
+            }
+        }
+
         let mut verdict = self.evaluate(&facts, &requester_principal);
         // ChatGPT does not provide a cryptographic confirmation attestation.
         // A user may nevertheless configure the local device to treat the
@@ -1979,6 +2045,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             verdict.decision = Decision::Allow;
             verdict.reason = format!("{}; remote MCP delegation configured", verdict.reason);
         }
+        self.consume_bounded_grant_use(&verdict)?;
         // Prefer the control-plane operation id when present so Ask/Allow results
         // keep DeviceRoom correlation/operation_id binding. Local IPC keeps a
         // freshly minted id.
@@ -2130,6 +2197,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             PendingRequest::AdminTokenRevoke(p) => {
                 self.handle_token_revoke(Some(json!({ "principal": p.principal })))
             }
+            PendingRequest::AdminGrantsMint(p) => self.execute_admin_grants_mint(p),
             PendingRequest::AdminApprovalBridge(_) => Err(IpcError::Remote {
                 code: app_error::INTERNAL,
                 message: "approval bridge requires the authenticated approval executor".into(),
@@ -3933,6 +4001,7 @@ path or install the tool so detection and execution agree",
             PendingRequest::AdminDaemonUnlock(x) => Some(x.idempotency_key.clone()),
             PendingRequest::AdminTokenRevoke(x) => Some(x.idempotency_key.clone()),
             PendingRequest::AdminApprovalBridge(x) => Some(x.idempotency_key.clone()),
+            PendingRequest::AdminGrantsMint(x) => Some(x.idempotency_key.clone()),
         };
         // Same principal namespace as gate_and_run so approve + direct retry share one slot.
         let idem_key = raw_idem_key
@@ -4026,7 +4095,7 @@ path or install the tool so detection and execution agree",
             })
         });
         if let Some(grant) = pending_grant {
-            self.grants.push(grant);
+            self.grants.push(StoredGrant::Temporary(grant));
             if let Err(e) = self.persist_grants() {
                 self.approvals = approvals_before;
                 self.grants = grants_before;
@@ -4267,6 +4336,167 @@ path or install the tool so detection and execution agree",
             "workspace_root_enforcement_note":
                 "Independent of access_preset. When true, filesystem and command tools require a registered workspace. Full Access still allows an explicitly permitted absolute path only with workspace_id: null.",
         }))
+    }
+
+    fn handle_grants_list(&self) -> IpcResult<Value> {
+        Ok(json!({
+            "grants": self.grants,
+            "bounded_tool": self.grants.iter().filter(|g| g.as_bounded_tool().is_some()).count(),
+            "temporary": self.grants.iter().filter(|g| g.as_temporary().is_some()).count(),
+        }))
+    }
+
+    fn handle_grants_show(&self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse_params(params)?;
+        let grant = self
+            .grants
+            .iter()
+            .find(|grant| grant.id() == p.id)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("grant not found: {}", p.id),
+            })?;
+        Ok(json!({ "grant": grant }))
+    }
+
+    fn handle_grants_revoke(&mut self, params: Option<Value>) -> IpcResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            id: String,
+        }
+        let p: P = parse_params(params)?;
+        let snapshot = self.grants.clone();
+        let before = self.grants.len();
+        self.grants.retain(|grant| grant.id() != p.id);
+        if self.grants.len() == before {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("grant not found: {}", p.id),
+            });
+        }
+        if let Err(e) = self.persist_grants() {
+            self.grants = snapshot;
+            return Err(e);
+        }
+        self.append_audit(
+            "grants.revoke",
+            None,
+            None,
+            Some("deny"),
+            format!("revoked grant {}", p.id),
+        );
+        Ok(json!({ "revoked": p.id, "ok": true }))
+    }
+
+    fn execute_admin_grants_mint(&mut self, params: &AdminGrantsMintParams) -> IpcResult<Value> {
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        if params.ttl_seconds < 1 || params.ttl_seconds > MAX_BOUNDED_TOOL_GRANT_TTL_SECS {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!(
+                    "ttl_seconds must be 1..={MAX_BOUNDED_TOOL_GRANT_TTL_SECS}"
+                ),
+            });
+        }
+        if let Some(max_uses) = params.max_uses {
+            if max_uses == 0 || max_uses > MAX_BOUNDED_TOOL_GRANT_USES {
+                return Err(IpcError::Remote {
+                    code: app_error::INVALID_PARAMS,
+                    message: format!("max_uses must be 1..={MAX_BOUNDED_TOOL_GRANT_USES}"),
+                });
+            }
+        }
+        let mut tools = Vec::new();
+        for raw in &params.tools {
+            let canonical = canonical_bounded_tool(raw).ok_or_else(|| IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: format!("unsupported or wildcard tool {raw}"),
+            })?;
+            if !tools.contains(&canonical.to_string()) {
+                tools.push(canonical.to_string());
+            }
+        }
+        if tools.is_empty() {
+            return Err(IpcError::Remote {
+                code: app_error::INVALID_PARAMS,
+                message: "tools must list at least one canonical tool".into(),
+            });
+        }
+        let principal_id = self
+            .active_remote_principal
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "bounded grant mint requires the verified remote principal".into(),
+            })?;
+        let device_id = self
+            .active_remote_device_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::UNAUTHORIZED,
+                message: "bounded grant mint requires the verified device id".into(),
+            })?;
+        let workspace_id = params
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(workspace) = workspace_id.as_deref() {
+            let _ = self.workspace_for(Some(workspace))?;
+        }
+        let now = Self::now();
+        let grant = BoundedToolGrant {
+            grant_type: BoundedToolGrantType::BoundedTool,
+            id: Self::new_id("grant_"),
+            principal_id,
+            device_id,
+            tools,
+            workspace_id,
+            expires_unix: now.saturating_add(params.ttl_seconds),
+            max_uses: params.max_uses,
+            uses: 0,
+            minted_at_unix: now,
+        };
+        grant.validate().map_err(|message| IpcError::Remote {
+            code: app_error::INVALID_PARAMS,
+            message,
+        })?;
+        let snapshot = self.grants.clone();
+        self.grants.push(StoredGrant::BoundedTool(grant.clone()));
+        if let Err(e) = self.persist_grants() {
+            self.grants = snapshot;
+            return Err(e);
+        }
+        self.append_audit(
+            "grants.mint",
+            None,
+            None,
+            Some("allow"),
+            format!("minted bounded tool grant {}", grant.id),
+        );
+        Ok(json!({ "grant": grant, "ok": true }))
+    }
+
+    fn handle_admin_grants_mint_request(
+        &mut self,
+        params: Option<Value>,
+        client: &ClientIdentity,
+    ) -> IpcResult<Value> {
+        let params: AdminGrantsMintParams = parse_params(params)?;
+        validate_admin_idempotency_key(&params.idempotency_key)?;
+        self.enqueue_bound_admin_request(
+            "admin.grants.mint",
+            "Fresh passkey approval is required to mint a bounded tool grant.",
+            PendingRequest::AdminGrantsMint(params),
+            client,
+        )
     }
 
     fn handle_policy_preset(&mut self, params: Option<Value>) -> IpcResult<Value> {
@@ -4717,13 +4947,34 @@ path or install the tool so detection and execution agree",
 
     fn handle_lockdown(&mut self) -> IpcResult<Value> {
         let previous = self.lockdown;
+        let grants_before = self.grants.clone();
         self.lockdown = true;
+        self.grants.clear();
         if let Err(e) = self.persist_lockdown() {
             self.lockdown = previous;
+            self.grants = grants_before;
             return Err(e);
         }
-        self.append_audit("daemon.lockdown", None, None, Some("deny"), "lockdown on");
-        Ok(json!({ "lockdown": true }))
+        if let Err(e) = self.persist_grants() {
+            self.grants = grants_before;
+            self.lockdown = previous;
+            let rollback = self.persist_lockdown().err();
+            return Err(match rollback {
+                Some(rollback_err) => IpcError::Remote {
+                    code: app_error::INTERNAL,
+                    message: format!("{e}; also failed to restore lockdown flag: {rollback_err}"),
+                },
+                None => e,
+            });
+        }
+        self.append_audit(
+            "daemon.lockdown",
+            None,
+            None,
+            Some("deny"),
+            "lockdown on; grants cleared",
+        );
+        Ok(json!({ "lockdown": true, "grants_cleared": true }))
     }
 
     fn handle_unlock(&mut self) -> IpcResult<Value> {
@@ -5225,6 +5476,9 @@ path or install the tool so detection and execution agree",
             methods::POLICY_PRESET => self.handle_policy_preset(params),
             methods::POLICY_VALIDATE => self.handle_policy_validate(),
             methods::POLICY_EXPLAIN => self.handle_policy_explain(params),
+            methods::GRANTS_LIST => self.handle_grants_list(),
+            methods::GRANTS_SHOW => self.handle_grants_show(params),
+            methods::GRANTS_REVOKE => self.handle_grants_revoke(params),
             methods::DAEMON_LOCKDOWN => self.handle_lockdown(),
             methods::DAEMON_UNLOCK => self.handle_unlock(),
             methods::TOKEN_REVOKE => self.handle_token_revoke(params),
@@ -5245,6 +5499,9 @@ path or install the tool so detection and execution agree",
             }
             methods::ADMIN_APPROVAL_BRIDGE_REQUEST => {
                 self.handle_admin_approval_bridge_request(params, client)
+            }
+            methods::ADMIN_GRANTS_MINT_REQUEST => {
+                self.handle_admin_grants_mint_request(params, client)
             }
             session_methods::OPEN => self.handle_session_open(params, client).await,
             session_methods::LIST => self.handle_session_list(params, client),
@@ -6419,7 +6676,7 @@ run `ownmesh doctor` or inspect {} ",
     #[cfg(test)]
     #[allow(dead_code)]
     #[must_use]
-    pub fn grants_for_test(&self) -> &[TemporaryGrant] {
+    pub fn grants_for_test(&self) -> &[StoredGrant] {
         &self.grants
     }
 
@@ -6430,6 +6687,12 @@ run `ownmesh doctor` or inspect {} ",
     #[cfg(test)]
     #[allow(dead_code)]
     pub fn inject_grant_for_test(&mut self, grant: TemporaryGrant) {
+        self.grants.push(StoredGrant::Temporary(grant));
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn inject_stored_grant_for_test(&mut self, grant: StoredGrant) {
         self.grants.push(grant);
     }
 
@@ -6866,7 +7129,37 @@ fn pending_request_is_admin(request: &PendingRequest) -> bool {
             | PendingRequest::AdminDaemonUnlock(_)
             | PendingRequest::AdminTokenRevoke(_)
             | PendingRequest::AdminApprovalBridge(_)
+            | PendingRequest::AdminGrantsMint(_)
     )
+}
+
+fn pending_request_tool(request: &PendingRequest) -> Option<&'static str> {
+    match request {
+        PendingRequest::Exec(params) => {
+            let kind = params.policy_kind.as_deref().unwrap_or("");
+            if kind.eq_ignore_ascii_case("raw_shell") || kind.eq_ignore_ascii_case("raw") {
+                Some("command_shell")
+            } else {
+                Some("command_run")
+            }
+        }
+        PendingRequest::FsList(_) => Some("fs_list"),
+        PendingRequest::FsStat(_) => Some("fs_stat"),
+        PendingRequest::FsRead(_) => Some("fs_read"),
+        PendingRequest::FsWrite(_) => Some("fs_write"),
+        PendingRequest::FsDelete(_) => Some("fs_delete"),
+        PendingRequest::LogsQuery(_) => Some("logs_query"),
+        PendingRequest::GitStatus(_) => Some("git_status"),
+        PendingRequest::GitDiff(_) => Some("git_diff"),
+        PendingRequest::SystemDiagnose(_)
+        | PendingRequest::AdminPolicyPreset(_)
+        | PendingRequest::AdminPolicyRuleAdd(_)
+        | PendingRequest::AdminPolicyRuleRemove(_)
+        | PendingRequest::AdminDaemonUnlock(_)
+        | PendingRequest::AdminTokenRevoke(_)
+        | PendingRequest::AdminApprovalBridge(_)
+        | PendingRequest::AdminGrantsMint(_) => None,
+    }
 }
 
 fn validate_admin_idempotency_key(value: &str) -> IpcResult<()> {
@@ -9521,12 +9814,12 @@ fn read_bounded_state_file(path: &Path, max_bytes: usize, label: &str) -> Result
     Ok(raw)
 }
 
-fn load_grants(path: &Path) -> Result<Vec<TemporaryGrant>, String> {
+fn load_grants(path: &Path) -> Result<Vec<StoredGrant>, String> {
     let raw = read_bounded_state_file(path, MAX_GRANTS_FILE_BYTES, "grants state")?;
     if raw.is_empty() {
         return Ok(Vec::new());
     }
-    let grants: Vec<TemporaryGrant> = serde_json::from_slice(&raw)
+    let grants: Vec<StoredGrant> = serde_json::from_slice(&raw)
         .map_err(|e| format!("corrupt grants state {}: {e}", path.display()))?;
     if grants.len() > MAX_GRANTS_ENTRIES {
         return Err(format!(

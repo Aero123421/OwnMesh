@@ -6,6 +6,7 @@ mod config_cmd;
 pub(crate) mod device_cmd;
 mod doctor;
 mod exec;
+mod grants_cmd;
 pub(crate) mod fail;
 mod instance_cmd;
 mod ipc_util;
@@ -78,6 +79,7 @@ pub fn dispatch(cli: &Cli) -> Result<(), ExitCode> {
         Some(Commands::Profile(cmd)) => profile_cmd::dispatch_profile(cli, cmd),
         Some(Commands::Approval(cmd)) => approval::dispatch_approval(cli, cmd),
         Some(Commands::Policy(cmd)) => policy_cmd::dispatch_policy(cli, cmd),
+        Some(Commands::Grants(cmd)) => grants_cmd::dispatch_grants(cli, cmd),
         Some(Commands::Transfer(cmd)) => dispatch_transfer(cli, cmd),
         Some(Commands::Service(cmd)) => dispatch_service(cli, cmd),
         Some(Commands::Privileged(cmd)) => dispatch_privileged(cli, cmd),

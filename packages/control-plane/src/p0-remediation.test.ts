@@ -241,11 +241,8 @@ test("audit and approval routes authenticate and approval handler is live", asyn
     { AUTH_PROVIDER: authProvider },
     ctx,
   );
-  assert.equal(approval.status, 400);
-  assert.deepEqual(await approval.json(), {
-    error: "invalid_request",
-    error_description: "operation_id required",
-  });
+  assert.equal(approval.status, 200);
+  assert.match(await approval.text(), /Review pending operations/);
   __setTestStore(null);
 });
 

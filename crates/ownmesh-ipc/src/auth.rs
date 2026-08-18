@@ -728,6 +728,7 @@ pub fn human_operator_method(method: &str) -> bool {
             | methods::ADMIN_DAEMON_UNLOCK_REQUEST
             | methods::ADMIN_TOKEN_REVOKE_REQUEST
             | methods::ADMIN_APPROVAL_BRIDGE_REQUEST
+            | methods::ADMIN_GRANTS_MINT_REQUEST
     )
 }
 
@@ -1323,6 +1324,7 @@ mod tests {
             methods::ADMIN_DAEMON_UNLOCK_REQUEST,
             methods::ADMIN_TOKEN_REVOKE_REQUEST,
             methods::ADMIN_APPROVAL_BRIDGE_REQUEST,
+            methods::ADMIN_GRANTS_MINT_REQUEST,
         ] {
             assert!(
                 gate.authorize_method(method, &uncred_id).is_err(),
@@ -1340,6 +1342,9 @@ mod tests {
             methods::POLICY_SHOW,
             methods::APPROVAL_LIST,
             methods::DAEMON_LOCKDOWN,
+            methods::GRANTS_LIST,
+            methods::GRANTS_SHOW,
+            methods::GRANTS_REVOKE,
             "session.open",
             "session.write",
             "session.claim",

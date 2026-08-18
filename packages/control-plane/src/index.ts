@@ -47,11 +47,14 @@ import {
   handleOwnerPasskeyVerify,
   ownerAuthConfigured,
   ownerLoginRedirect,
+  ownerPresenceForCommitment,
   ownerPresenceForOperation,
   ownerPresenceRedirect,
   ownerPasskeyScript,
   ownerPrincipalFromRequest,
+  parseApprovalSelection,
   sameOriginBrowserPost,
+  approvalCommitmentForIds,
 } from "./owner-auth.ts";
 import {
   TransferRoom,
@@ -305,7 +308,7 @@ type BrowserAuthentication = {
 async function browserAuthentication(
   request: Request,
   env: Env,
-  freshOperationId?: string,
+  fresh?: { kind: "operation"; operationId: string } | { kind: "commitment"; commitment: string },
 ): Promise<BrowserAuthentication> {
   if (devBypass(env, request)) {
     const url = new URL(request.url);
@@ -318,10 +321,11 @@ async function browserAuthentication(
       cookie: request.headers.get("cookie") || "",
       "x-ownmesh-request-url": request.url,
     });
-    if (freshOperationId) {
+    if (fresh) {
       headers.set("x-ownmesh-auth-purpose", "approve");
-      headers.set("x-ownmesh-operation-id", freshOperationId);
       headers.set("x-ownmesh-require-fresh", "true");
+      if (fresh.kind === "operation") headers.set("x-ownmesh-operation-id", fresh.operationId);
+      if (fresh.kind === "commitment") headers.set("x-ownmesh-approval-commitment", fresh.commitment);
     }
     const response = await env.AUTH_PROVIDER.fetch(new Request("https://auth-provider/authenticate", {
       method: "POST",
@@ -337,7 +341,7 @@ async function browserAuthentication(
       if (body.principal_id && body.tenant_id) {
         return {
           principal: { id: body.principal_id, tenant_id: body.tenant_id, display_name: body.display_name },
-          fresh: !freshOperationId || body.fresh === true,
+          fresh: !fresh || body.fresh === true,
         };
       }
     }
@@ -345,10 +349,12 @@ async function browserAuthentication(
   const issuer = env.OAUTH_ISSUER || new URL(request.url).origin;
   const owner = await ownerPrincipalFromRequest(request, env, issuer);
   if (!owner) return { principal: null, fresh: false };
-  const fresh = freshOperationId
-    ? await ownerPresenceForOperation(request, env, issuer, owner, freshOperationId)
-    : true;
-  return { principal: owner, fresh };
+  const freshOk = !fresh
+    ? true
+    : fresh.kind === "operation"
+      ? await ownerPresenceForOperation(request, env, issuer, owner, fresh.operationId)
+      : await ownerPresenceForCommitment(request, env, issuer, owner, fresh.commitment);
+  return { principal: owner, fresh: freshOk };
 }
 
 function originAllowed(request: Request, env: Env, issuer: string): boolean {
@@ -768,25 +774,57 @@ export default {
         );
       }
 
-      const operationId = url.searchParams.get("operation_id") || "";
-      // The fresh-auth proof is bound to the URL operation. Do not let a POST
-      // move authority into an unverified body-only operation_id.
-      if (request.method === "POST" && !operationId) {
+      const selection = parseApprovalSelection(url);
+      if (selection.kind === "invalid") {
         return json(
-          { error: "invalid_request", error_description: "operation_id required in approval URL" },
+          { error: "invalid_request", error_description: selection.error },
           { status: 400, noStore: true },
         );
       }
-      const authentication = await browserAuthentication(request, env, operationId || undefined);
+
+      const requireFresh = selection.kind === "single" || selection.kind === "batch";
+      let freshBinding: { kind: "operation"; operationId: string } | { kind: "commitment"; commitment: string } | undefined;
+      if (selection.kind === "single") {
+        freshBinding = { kind: "operation", operationId: selection.operationId };
+      } else if (selection.kind === "batch") {
+        const commitment = await approvalCommitmentForIds(store, selection.operationIds);
+        if (!commitment) {
+          const session = await browserAuthentication(request, env);
+          if (!session.principal) {
+            if (request.method === "GET" && ownerAuthConfigured(env)) {
+              return ownerPresenceRedirect(request, issuer);
+            }
+            return json(
+              {
+                error: session.principal ? "fresh_authentication_required" : "unauthorized",
+                error_description: "approval requires recent user verification for this exact operation set",
+              },
+              { status: 401, noStore: true },
+            );
+          }
+          return json(
+            {
+              error: "invalid_request",
+              error_description: "batch approval requires pending operations with server-side payload hashes",
+            },
+            { status: 400, noStore: true },
+          );
+        }
+        freshBinding = { kind: "commitment", commitment };
+      }
+
+      const authentication = await browserAuthentication(request, env, freshBinding);
       const principal = authentication.principal;
-      if (!principal || !authentication.fresh) {
+      if (!principal || (requireFresh && !authentication.fresh)) {
         if (request.method === "GET" && ownerAuthConfigured(env)) {
-          return ownerPresenceRedirect(request, issuer);
+          return requireFresh ? ownerPresenceRedirect(request, issuer) : ownerLoginRedirect(request, issuer);
         }
         return json(
           {
             error: authentication.principal ? "fresh_authentication_required" : "unauthorized",
-            error_description: "approval requires recent user verification for this exact operation",
+            error_description: requireFresh
+              ? "approval requires recent user verification for this exact operation set"
+              : "approval inbox requires an independently authenticated human session",
           },
           { status: 401, noStore: true },
         );

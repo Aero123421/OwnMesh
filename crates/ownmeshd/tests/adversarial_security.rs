@@ -2554,6 +2554,7 @@ async fn production_filesystem_temporary_grant_still_works() {
         let guard = runtime.lock().await;
         assert_eq!(guard.grants_for_test().len(), 1);
         let grant = &guard.grants_for_test()[0];
+        let grant = grant.as_temporary().expect("temporary filesystem grant");
         assert_eq!(grant.capability, "filesystem.write");
         // The grant records the approved path. Before it did, `path_prefix` was
         // `None`, which the matcher reads as "every path".

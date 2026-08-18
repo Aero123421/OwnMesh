@@ -19,6 +19,13 @@
 import type { ControlPlaneStore, DeviceRecord, McpOperationRecord, McpOperationQuotaSnapshot } from "./store.ts";
 import { AUTH_PAGE_CSP, authPage } from "./auth-ui.ts";
 import {
+  approvalSelectionReturnTo,
+  issueApproveListCsrf,
+  parseApprovalSelection,
+  payloadHashForCommitment,
+  verifyApproveListCsrf,
+} from "./owner-auth.ts";
+import {
   bearer,
   BodyTooLargeError,
   hashCanonicalAction,
@@ -398,6 +405,80 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
       additionalProperties: false,
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_grants_mint",
+    description:
+      "Request a fresh-passkey-approved bounded tool grant. Lifts policy Ask only (Deny still wins). TTL is clamped to four hours. No tool wildcards.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        tools: {
+          type: "array",
+          minItems: 1,
+          maxItems: 8,
+          items: {
+            type: "string",
+            enum: [
+              "command_run",
+              "command_shell",
+              "fs_list",
+              "fs_stat",
+              "fs_read",
+              "fs_write",
+              "fs_delete",
+              "logs_query",
+              "git_status",
+              "git_diff",
+            ],
+          },
+        },
+        ttl_seconds: { type: "integer", minimum: 1, maximum: 14400 },
+        max_uses: { type: "integer", minimum: 1, maximum: 10000 },
+        workspace_id: { type: "string", minLength: 1, maxLength: 128 },
+        idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
+      },
+      required: ["device_id", "tools", "ttl_seconds", "idempotency_key"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: false },
+    scope: "ownmesh.device",
+    risk: "write",
+  },
+  {
+    name: "ownmesh_grants_list",
+    description: "List device-local temporary and bounded tool grants. Does not mint or extend grants.",
+    inputSchema: {
+      type: "object",
+      properties: { ...deviceProp },
+      required: ["device_id"],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: false,
+      idempotentHint: true,
+    },
+    scope: "ownmesh.read",
+    risk: "read",
+  },
+  {
+    name: "ownmesh_grants_revoke",
+    description: "Immediately revoke one device-local grant. Tightening only; minting still requires a fresh passkey.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...deviceProp,
+        id: { type: "string", minLength: 1, maxLength: 128 },
+      },
+      required: ["device_id", "id"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false, idempotentHint: true },
     scope: "ownmesh.device",
     risk: "write",
   },
@@ -1647,6 +1728,7 @@ const ADMIN_MCP_TOOL_NAMES = new Set([
   "ownmesh_daemon_unlock",
   "ownmesh_token_revoke",
   "ownmesh_request_approval",
+  "ownmesh_grants_mint",
 ]);
 
 async function mayAdministerDevice(
@@ -1722,6 +1804,40 @@ function validateAdminToolArgs(
       }
     } else if (args.grant_seconds !== undefined) {
       return "grant_seconds requires requested_decision=approve and temporary_grant=true";
+    }
+    return null;
+  }
+  if (name === "ownmesh_grants_mint") {
+    if (!Array.isArray(args.tools) || args.tools.length < 1 || args.tools.length > 8) {
+      return "tools must be 1-8 canonical names";
+    }
+    const allowed = new Set([
+      "command_run",
+      "command_shell",
+      "fs_list",
+      "fs_stat",
+      "fs_read",
+      "fs_write",
+      "fs_delete",
+      "logs_query",
+      "git_status",
+      "git_diff",
+    ]);
+    const seen = new Set<string>();
+    for (const tool of args.tools) {
+      if (typeof tool !== "string" || !allowed.has(tool) || seen.has(tool)) {
+        return "tools must be unique canonical names without wildcards";
+      }
+      seen.add(tool);
+    }
+    if (!Number.isSafeInteger(args.ttl_seconds) || Number(args.ttl_seconds) < 1 || Number(args.ttl_seconds) > 14400) {
+      return "ttl_seconds must be 1-14400";
+    }
+    if (args.max_uses !== undefined && (!Number.isSafeInteger(args.max_uses) || Number(args.max_uses) < 1 || Number(args.max_uses) > 10000)) {
+      return "max_uses must be 1-10000";
+    }
+    if (args.workspace_id !== undefined && !boundedText(args.workspace_id, 128)) {
+      return "invalid workspace_id";
     }
     return null;
   }
@@ -2243,6 +2359,20 @@ export function normalizeSystemDiagnosis(
     profile_discovery: {
       status: profileDiscoveryStatus,
       notes: profileNotes,
+    },
+    grants: {
+      bounded_tool: countField(
+        source?.grants && typeof source.grants === "object" && !Array.isArray(source.grants)
+          ? (source.grants as Record<string, unknown>).bounded_tool
+          : undefined,
+        4_096,
+      ) ?? 0,
+      temporary: countField(
+        source?.grants && typeof source.grants === "object" && !Array.isArray(source.grants)
+          ? (source.grants as Record<string, unknown>).temporary
+          : undefined,
+        4_096,
+      ) ?? 0,
     },
   };
 }
@@ -3385,6 +3515,12 @@ function toolCapability(toolName: string): string {
       return "admin.token.revoke";
     case "ownmesh_request_approval":
       return "admin.approval.bridge";
+    case "ownmesh_grants_mint":
+      return "admin.grants.mint";
+    case "ownmesh_grants_list":
+      return "grants.list";
+    case "ownmesh_grants_revoke":
+      return "grants.revoke";
     case "ownmesh_cancel_operation":
       return "operation.cancel";
     case "__transfer_artifact_get":
@@ -3475,6 +3611,12 @@ function toolAction(toolName: string): string {
       return "admin.token.revoke";
     case "ownmesh_request_approval":
       return "admin.approval.bridge";
+    case "ownmesh_grants_mint":
+      return "admin.grants.mint";
+    case "ownmesh_grants_list":
+      return "grants.list";
+    case "ownmesh_grants_revoke":
+      return "grants.revoke";
     case "ownmesh_list_profiles":
     case "ownmesh_profile_list":
       return "profile.list";
@@ -7022,6 +7164,654 @@ export async function authorizeMcpApprover(
  * GET: mint approval transaction + form. POST: consume once and route decision.
  * Approval is bound only to an independently authenticated human principal.
  */
+function approvalDecisionAlreadyBound(op: McpOperationRecord): boolean {
+  return typeof op.data?.approval_transaction_id === "string" && op.data.approval_transaction_id.trim() !== "";
+}
+
+function approvalOperationPreview(op: McpOperationRecord): string {
+  return op.action
+    ? escapeHtml(JSON.stringify(op.action, null, 2))
+    : escapeHtml(op.summary || "");
+}
+
+async function authorizeApprovalSession(
+  store: ControlPlaneStore,
+  principal: { id: string; tenant_id: string },
+): Promise<Response | null> {
+  const rec = await store.getPrincipal(principal.id);
+  if (!rec) {
+    return json({ error: "forbidden", error_description: "principal not registered" }, { status: 403 });
+  }
+  if (rec.tenant_id !== principal.tenant_id) {
+    return json({ error: "forbidden", error_description: "tenant mismatch" }, { status: 403 });
+  }
+  if (!isHumanApproverKind(rec.kind)) {
+    return json(
+      { error: "forbidden", error_description: "human principal required for approval" },
+      { status: 403 },
+    );
+  }
+  return null;
+}
+
+async function loadBatchApprovalOps(
+  store: ControlPlaneStore,
+  principal: { id: string; tenant_id: string },
+  authSource: ApproveAuthSource,
+  operationIds: string[],
+): Promise<{ ops: McpOperationRecord[] } | { response: Response }> {
+  const ops: McpOperationRecord[] = [];
+  for (const operationId of operationIds) {
+    const op = await store.getMcpOperation(operationId);
+    if (!op) {
+      return { response: json({ error: "not_found" }, { status: 404 }) };
+    }
+    const denied = await authorizeMcpApprover(store, principal, op, authSource);
+    if (denied) return { response: denied };
+    if (op.status !== "approval_required") {
+      return {
+        response: json(
+          {
+            error: "conflict",
+            error_description: "operation is not awaiting approval",
+            status: op.status,
+            operation_id: op.operation_id,
+          },
+          { status: 409 },
+        ),
+      };
+    }
+    if (approvalDecisionAlreadyBound(op)) {
+      return {
+        response: json(
+          {
+            error: "conflict",
+            error_description: "approval decision already delivered; awaiting device result",
+            status: op.status,
+            operation_id: op.operation_id,
+          },
+          { status: 409 },
+        ),
+      };
+    }
+    if (!payloadHashForCommitment(op.payload_hash)) {
+      return {
+        response: json(
+          {
+            error: "invalid_request",
+            error_description: "payload_hash required for batch approval",
+            operation_id: op.operation_id,
+          },
+          { status: 400 },
+        ),
+      };
+    }
+    ops.push(op);
+  }
+  return { ops };
+}
+
+async function mintApprovalTransactionForOp(
+  store: ControlPlaneStore,
+  principal: { id: string; tenant_id: string },
+  op: McpOperationRecord,
+  csrfHash: string,
+): Promise<{ txId: string; txExpiresMs: number } | { response: Response }> {
+  const nowMs = Date.now();
+  let txExpiresMs = nowMs + 15 * 60 * 1000;
+  if (typeof op.expires_at === "string" && op.expires_at.trim() !== "") {
+    const targetMs = Date.parse(op.expires_at);
+    if (Number.isFinite(targetMs)) {
+      if (targetMs <= nowMs) {
+        return {
+          response: json(
+            {
+              error: "expired",
+              error_description: "original operation expires_at elapsed; re-authorize the action",
+              operation_id: op.operation_id,
+              expires_at: op.expires_at,
+            },
+            { status: 409 },
+          ),
+        };
+      }
+      txExpiresMs = Math.min(txExpiresMs, targetMs);
+    }
+  }
+  const txId = randomId("apr_");
+  await store.putMcpApprovalTransaction({
+    id: txId,
+    csrf_hash: csrfHash,
+    operation_id: op.operation_id,
+    principal_id: principal.id,
+    tenant_id: principal.tenant_id,
+    device_id: op.device_id,
+    expires_at: txExpiresMs,
+    consumed: false,
+    created_at: nowIso(),
+  });
+  return { txId, txExpiresMs };
+}
+
+async function completeApprovalPost(
+  req: Request,
+  store: ControlPlaneStore,
+  opts: ApproveHandleOptions,
+  input: {
+    decision: "approve" | "deny";
+    transactionId: string;
+    csrfToken: string;
+    expectedOperationId?: string;
+    allowedOperationIds?: Set<string>;
+    preferJson?: boolean;
+  },
+): Promise<Response> {
+  const principal = opts.principal;
+  const authSource: ApproveAuthSource = opts.authSource ?? "browser";
+  const ct = req.headers.get("content-type") || "";
+  const { decision, transactionId, csrfToken } = input;
+
+  // Durable one-time decision: atomic consume+outbox → claim → deliver → finalize.
+  // Never report ok:true before successful delivery + authoritative transition.
+  // Approver principal is the authenticated human only (not client body).
+  const started = await store.beginMcpApprovalOutbox(
+    transactionId,
+    await sha256Hex(csrfToken),
+    principal.id,
+    decision,
+  );
+  if (!started) {
+    return json(
+      { error: "invalid_request", error_description: "invalid, expired, or already used approval transaction" },
+      { status: 400 },
+    );
+  }
+  if (started.status === "already_delivered") {
+    // Duplicate path: return authoritative state without re-delivery.
+    const doneOp = await store.getMcpOperation(started.outbox.operation_id);
+    return json(
+      {
+        error: "invalid_request",
+        error_description: "invalid, expired, or already used approval transaction",
+        authoritative: true,
+        operation_id: started.outbox.operation_id,
+        decision: started.outbox.decision,
+        status: doneOp?.status,
+        delivery_status: started.outbox.delivery_status,
+      },
+      { status: 400 },
+    );
+  }
+
+  const { outbox, tx } = started;
+  if (tx.tenant_id !== principal.tenant_id || outbox.tenant_id !== principal.tenant_id) {
+    return json({ error: "forbidden", error_description: "tenant mismatch" }, { status: 403 });
+  }
+  // Transaction must stay bound to the authenticated human (replay/TOCTOU).
+  if (tx.principal_id !== principal.id || outbox.principal_id !== principal.id) {
+    return json({ error: "forbidden", error_description: "approver mismatch" }, { status: 403 });
+  }
+
+  const op = await store.getMcpOperation(outbox.operation_id);
+  if (!op) {
+    return json({ error: "not_found", error_description: "operation not found" }, { status: 404 });
+  }
+  const denied = await authorizeMcpApprover(store, principal, op, authSource);
+  if (denied) return denied;
+  const approver = await store.getPrincipal(principal.id);
+  const approverCredentialGeneration = Number(approver?.credential_generation);
+  if (!Number.isSafeInteger(approverCredentialGeneration) || approverCredentialGeneration < 1) {
+    return json({ error: "forbidden", error_description: "approver credential generation unavailable" }, { status: 403 });
+  }
+  if (input.expectedOperationId && input.expectedOperationId !== op.operation_id) {
+    return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
+  }
+  if (input.allowedOperationIds && !input.allowedOperationIds.has(op.operation_id)) {
+    return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
+  }
+  // Delivery retry keeps op in approval_required until finalize succeeds.
+  if (op.status !== "approval_required" && started.status === "created") {
+    return json(
+      { error: "conflict", error_description: "operation already decided" },
+      { status: 409 },
+    );
+  }
+
+  // Exclusive pending→delivering claim prevents concurrent routes/duplicate delivery.
+  // Stale delivering claims (lease expired) may be reclaimed for retry.
+  // Claim issues owner token+version; only that owner may release/finalize.
+  const claimed = await store.claimMcpApprovalOutboxDelivery(outbox.id);
+  if (!claimed) {
+    const current = await store.getMcpApprovalOutbox(outbox.id);
+    const opNow = await store.getMcpOperation(outbox.operation_id);
+    if (current?.delivery_status === "delivered") {
+      return json(
+        {
+          error: "invalid_request",
+          error_description: "invalid, expired, or already used approval transaction",
+          authoritative: true,
+          operation_id: outbox.operation_id,
+          decision: current.decision,
+          status: opNow?.status,
+          delivery_status: "delivered",
+        },
+        { status: 400 },
+      );
+    }
+    return json(
+      {
+        error: "conflict",
+        error_description: "approval delivery already in progress or completed",
+        authoritative: true,
+        operation_id: outbox.operation_id,
+        decision: current?.decision ?? outbox.decision,
+        status: opNow?.status,
+        delivery_status: current?.delivery_status ?? "delivering",
+        retryable: current?.delivery_status === "pending",
+      },
+      { status: 409 },
+    );
+  }
+
+  // Gate/route/finalize under try/catch/finally so a thrown DO/D1 error never
+  // leaks a live delivering claim (release → pending, attempts+1, last_error).
+  // release/finalize require the claim owner credentials issued above.
+  const claimToken = claimed.claim_token ?? "";
+  const claimVersion = Number(claimed.claim_version ?? 0);
+  let route: { status: string; detail?: unknown } | undefined;
+  let claimSettled = false;
+  let releaseError: string | undefined;
+  try {
+    if (op.status !== "approval_required") {
+      // A stale lease can outlive a fast device result (or cancellation). The
+      // terminal authoritative operation proves there is nothing left to
+      // deliver; reconcile the outbox without routing the decision again.
+      const reconciled = await store.finalizeMcpApprovalDelivery(
+        claimed.id,
+        claimToken,
+        claimVersion,
+      );
+      if (reconciled) {
+        claimSettled = true;
+        return json(
+          {
+            error: "conflict",
+            error_description: "operation already decided",
+            authoritative: true,
+            operation_id: reconciled.operation_id,
+            status: reconciled.status,
+            decision: claimed.decision,
+            delivery_status: "delivered",
+          },
+          { status: 409 },
+        );
+      }
+      throw new Error("approval_reconciliation_failed");
+    }
+
+    const deviceId = claimed.device_id || op.device_id;
+    if (deviceId && opts.routeToDevice) {
+      const gate = await store.assertDeviceOperableForMcp(
+        deviceId,
+        principal.id,
+        principal.tenant_id,
+      );
+      if (!gate.ok) {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          gate.error,
+        );
+        claimSettled = true;
+        return json(
+          {
+            error: gate.error,
+            error_description: "device not operable for approval delivery",
+            retryable: true,
+            operation_id: op.operation_id,
+            delivery_status: "pending",
+          },
+          { status: 403 },
+        );
+      }
+      if (
+        ADMIN_MCP_TOOL_NAMES.has(op.tool) &&
+        !(await mayAdministerDevice(store, deviceId, principal.tenant_id, principal.id))
+      ) {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          "device_admin_required",
+        );
+        claimSettled = true;
+        return json(
+          {
+            error: "device_admin_required",
+            error_description: "administrator role changed before approval delivery",
+            retryable: true,
+            operation_id: op.operation_id,
+            delivery_status: "pending",
+          },
+          { status: 403 },
+        );
+      }
+      // Fresh operation identity for the decision notification so it cannot collide
+      // with the original operation's correlation tombstone after approval_required.
+      // Prefer the device-issued approval_id (from OWNMESH_E_APPROVAL_REQUIRED) so
+      // ownmeshd can resolve the deferred request; fall back to outbox id only when
+      // the device id was never recorded (lookup then uses target_operation_id).
+      const decisionOpId = randomId("op_");
+      const deviceApprovalId =
+        (op.approval_id && String(op.approval_id).trim()) ||
+        (op.data && typeof op.data === "object" && (op.data as { approval_id?: unknown }).approval_id != null
+          ? String((op.data as { approval_id: unknown }).approval_id)
+          : "") ||
+        claimed.id;
+      const existingDecision = op.data?.approval_decision;
+      const existingTransaction = op.data?.approval_transaction_id;
+      if (
+        (existingDecision !== undefined && existingDecision !== decision) ||
+        (existingTransaction !== undefined && existingTransaction !== claimed.id)
+      ) {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          "approval_decision_binding_conflict",
+        );
+        claimSettled = true;
+        return json(
+          {
+            error: "conflict",
+            error_description: "a different approval decision is already bound to this operation",
+            operation_id: op.operation_id,
+            delivery_status: "pending",
+          },
+          { status: 409 },
+        );
+      }
+      const prepared = await patchOp(
+        store,
+        defaultOpTracker,
+        op.operation_id,
+        {
+          summary: "human decision bound; delivering to device",
+          data: {
+            ...(op.data || {}),
+            approval_decision: decision,
+            approval_transaction_id: claimed.id,
+            approval_device_id: deviceApprovalId,
+          },
+        },
+        ["approval_required"],
+        op.data || {},
+      );
+      if (!prepared) {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          "approval_decision_binding_cas_failed",
+        );
+        claimSettled = true;
+        return json(
+          {
+            error: "conflict",
+            error_description: "operation changed before approval delivery",
+            authoritative: true,
+            operation_id: op.operation_id,
+            delivery_status: "pending",
+          },
+          { status: 409 },
+        );
+      }
+
+      // E3: bind the recovery decision to the original exact action + expiry.
+      // A newly minted browser tx must not resurrect a stale deferred request.
+      const nowMs = Date.now();
+      const targetExpiresAt =
+        typeof op.expires_at === "string" && op.expires_at.trim() !== ""
+          ? String(op.expires_at)
+          : null;
+      if (targetExpiresAt) {
+        const targetMs = Date.parse(targetExpiresAt);
+        if (Number.isFinite(targetMs) && targetMs <= nowMs) {
+          await store.releaseMcpApprovalOutboxClaim(
+            claimed.id,
+            claimToken,
+            claimVersion,
+            "target_operation_expired",
+          );
+          claimSettled = true;
+          return json(
+            {
+              error: "expired",
+              error_description:
+                "original operation expires_at elapsed; re-authorize the action",
+              operation_id: op.operation_id,
+              expires_at: targetExpiresAt,
+              retryable: false,
+            },
+            { status: 409 },
+          );
+        }
+      }
+      // Decision envelope lifetime: short default, never past original action or tx.
+      const decisionDefaultMs = nowMs + 60_000;
+      let decisionExpiresMs = decisionDefaultMs;
+      if (targetExpiresAt) {
+        const t = Date.parse(targetExpiresAt);
+        if (Number.isFinite(t)) decisionExpiresMs = Math.min(decisionExpiresMs, t);
+      }
+      // Approval transaction expires_at is epoch ms (bound at GET mint).
+      if (typeof tx.expires_at === "number" && Number.isFinite(tx.expires_at)) {
+        decisionExpiresMs = Math.min(decisionExpiresMs, tx.expires_at);
+      }
+      if (decisionExpiresMs <= nowMs) {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          "decision_window_expired",
+        );
+        claimSettled = true;
+        return json(
+          {
+            error: "expired",
+            error_description: "approval decision window elapsed",
+            operation_id: op.operation_id,
+            retryable: false,
+          },
+          { status: 409 },
+        );
+      }
+      const decisionExpiresAt = nowIso(decisionExpiresMs);
+      const targetPayloadHash =
+        typeof op.payload_hash === "string" && op.payload_hash.trim() !== ""
+          ? String(op.payload_hash)
+          : null;
+      const decisionClaimVersion = Number(claimed.claim_version ?? 1);
+      const decisionArgs: Record<string, unknown> = {
+        action: "approval.decision",
+        target_operation_id: op.operation_id,
+        decision,
+        approval_id: deviceApprovalId,
+        target_tool: op.tool || "",
+      };
+      if (targetPayloadHash) decisionArgs.target_payload_hash = targetPayloadHash;
+      if (targetExpiresAt) decisionArgs.target_expires_at = targetExpiresAt;
+
+      // Facts mirror arguments (minus action) so Agent recompute_action_facts matches.
+      // Approver principal/tenant live on bound_action top-level (not facts).
+      const decisionFacts: Record<string, unknown> = {
+        target_operation_id: op.operation_id,
+        decision,
+        approval_id: deviceApprovalId,
+        target_tool: op.tool || "",
+      };
+      if (targetPayloadHash) decisionFacts.target_payload_hash = targetPayloadHash;
+      if (targetExpiresAt) decisionFacts.target_expires_at = targetExpiresAt;
+
+      const boundAction: Record<string, unknown> = {
+        capability: "approval.decision",
+        action: "approval.decision",
+        tool: "ownmesh_approval_decision",
+        device_id: deviceId,
+        principal_id: principal.id,
+        tenant_id: principal.tenant_id,
+        principal_credential_generation: approverCredentialGeneration,
+        oauth_client_id: null,
+        workspace_id: op.workspace_id ?? null,
+        facts: decisionFacts,
+        operation_id: decisionOpId,
+        expires_at: decisionExpiresAt,
+        claim_version: decisionClaimVersion,
+        // Immutable linkage to the deferred target (also in facts for Agent match).
+        outbox_id: claimed.id,
+      };
+      const payloadHash = await hashCanonicalAction(boundAction);
+
+      route = await opts.routeToDevice(deviceId, {
+        type: "approval.decision",
+        payload: {
+          // Strict ownmesh.operation/1.0 request shape only — deny_unknown_fields
+          // rejects top-level decision/approval_id mirrors on the Agent parser.
+          operation_contract: OPERATION_CONTRACT_V1,
+          operation_id: decisionOpId,
+          capability: "approval.decision",
+          idempotency_key: claimed.id || decisionOpId,
+          payload_hash: payloadHash,
+          authorization: { bound_action: boundAction },
+          arguments: decisionArgs,
+          ...(op.workspace_id ? { workspace_id: op.workspace_id } : {}),
+        },
+        correlation_id: decisionOpId,
+        expires_at: decisionExpiresAt,
+        claim_version: decisionClaimVersion,
+      });
+      if (route.status !== "routed_to_device") {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          `route_status=${route.status}`,
+        );
+        claimSettled = true;
+        // Decision remains durable in outbox; op stays approval_required for retry.
+        return json(
+          {
+            error: "delivery_failed",
+            error_description: "approval decision not delivered to device",
+            retryable: true,
+            operation_id: op.operation_id,
+            delivery_status: "pending",
+            route,
+          },
+          { status: 503 },
+        );
+      }
+    }
+
+    // Authoritative CAS only after successful delivery (or no device route needed).
+    const updated = await store.finalizeMcpApprovalDelivery(
+      claimed.id,
+      claimToken,
+      claimVersion,
+    );
+    if (!updated) {
+      // Lost finalize race — surface authoritative state without claiming success.
+      claimSettled = true;
+      const opNow = await store.getMcpOperation(outbox.operation_id);
+      const boxNow = await store.getMcpApprovalOutbox(claimed.id);
+      return json(
+        {
+          error: "conflict",
+          error_description: "operation already decided or outbox not delivering",
+          authoritative: true,
+          retryable: boxNow?.delivery_status === "pending",
+          operation_id: op.operation_id,
+          status: opNow?.status,
+          decision: boxNow?.decision ?? claimed.decision,
+          delivery_status: boxNow?.delivery_status,
+        },
+        { status: 409 },
+      );
+    }
+
+    // Delivered — claim is no longer live.
+    claimSettled = true;
+
+    await store.appendAudit({
+      id: randomId("aud_"),
+      tenant_id: principal.tenant_id,
+      principal_id: principal.id,
+      device_id: updated.device_id,
+      kind: "mcp.approval",
+      summary: `decision=${decision}`,
+      created_at: nowIso(),
+      meta: {
+        operation_id: updated.operation_id,
+        decision,
+        transaction_id: tx.id,
+        outbox_id: outbox.id,
+        route_status: route?.status,
+        retry: started.status === "pending_retry",
+      },
+    });
+
+    const accept = req.headers.get("accept") || "";
+    if (input.preferJson || accept.includes("application/json") || ct.includes("application/json")) {
+      return json({
+        ok: true,
+        operation_id: updated.operation_id,
+        decision,
+        status: updated.status,
+        route,
+      });
+    }
+    return html(authPage({
+      title: "Decision delivered — OwnMesh",
+      eyebrow: "Operation approval",
+      heading: decision === "approve" ? "Approval sent to device" : "Denial sent to device",
+      intro: "The exact-bound decision was delivered. The device result is authoritative.",
+      body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(updated.operation_id)}</code></dd><dt>Status</dt><dd>${escapeHtml(updated.status)}</dd></dl><p class="note">Keep the CLI open while OwnMesh waits for the device result. Local device policy remains the final authority.</p>`,
+      footer: "You can close this tab",
+    }), {
+      noStore: true,
+      headers: { "content-security-policy": AUTH_PAGE_CSP },
+    });
+  } catch (err) {
+    releaseError =
+      err instanceof Error ? err.message.slice(0, 500) : "delivery_error";
+    // No success response on thrown DO/D1 failure.
+    return json(
+      {
+        error: "delivery_failed",
+        error_description: "approval decision not delivered to device",
+        retryable: true,
+        operation_id: op.operation_id,
+        delivery_status: "pending",
+      },
+      { status: 503 },
+    );
+  } finally {
+    if (!claimSettled) {
+      try {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          releaseError ?? "delivery_error",
+        );
+      } catch {
+        // Best-effort release; avoid masking the original failure.
+      }
+    }
+  }
+}
+
 export async function handleApprove(
   req: Request,
   store: ControlPlaneStore,
@@ -7031,6 +7821,79 @@ export async function handleApprove(
   const issuer = (opts.issuer || url.origin).replace(/\/$/, "");
   const principal = opts.principal;
   const authSource: ApproveAuthSource = opts.authSource ?? "browser";
+  const selection = parseApprovalSelection(url);
+  if (selection.kind === "invalid") {
+    return json({ error: "invalid_request", error_description: selection.error }, { status: 400, noStore: true });
+  }
+
+  if (req.method === "GET" && selection.kind === "list") {
+    const sessionDenied = await authorizeApprovalSession(store, principal);
+    if (sessionDenied) return sessionDenied;
+    const pending = (await store.listPendingMcpApprovals({
+      tenantId: principal.tenant_id,
+      principalId: principal.id,
+    })).filter((op) => !approvalDecisionAlreadyBound(op));
+    const csrf = issueApproveListCsrf();
+    const rows = pending.length
+      ? pending.map((op) => {
+        const hash = payloadHashForCommitment(op.payload_hash);
+        const selectable = Boolean(hash);
+        return `<label class="row"><input type="checkbox" name="ids" value="${escapeHtml(op.operation_id)}" ${selectable ? "checked" : "disabled"}><span><code>${escapeHtml(op.operation_id)}</code> · <code>${escapeHtml(op.tool || "")}</code> · <code>${escapeHtml(op.device_id || "")}</code>${selectable ? "" : " · missing payload hash"}</span></label>`;
+      }).join("")
+      : `<p class="note">No operations are waiting for approval.</p>`;
+    const page = authPage({
+      title: "Pending approvals — OwnMesh",
+      eyebrow: "Local policy escalation",
+      heading: "Review pending operations",
+      intro: "Select a set to approve with one passkey assertion, or deny all pending operations. Denial does not execute anything.",
+      body: `<form method="get" action="/approve">${rows}<div class="actions"><button class="primary" type="submit"${pending.length ? "" : " disabled"}>Review selected</button></div></form><form method="post" action="/approve"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf.token)}"><input type="hidden" name="decision" value="deny_all"><div class="actions"><button class="danger" type="submit"${pending.length ? "" : " disabled"}>Deny all pending</button></div></form><p class="note">Approve still requires a fresh passkey bound to the exact selected set. Notification channels never carry approval authority.</p>`,
+      footer: new URL(issuer).host,
+    });
+    return html(page, {
+      status: 200,
+      noStore: true,
+      headers: {
+        "content-security-policy": AUTH_PAGE_CSP,
+        "set-cookie": csrf.header,
+      },
+    });
+  }
+
+  if (req.method === "GET" && selection.kind === "batch") {
+    const loaded = await loadBatchApprovalOps(store, principal, authSource, selection.operationIds);
+    if ("response" in loaded) return loaded.response;
+    const csrf = randomToken("csrf_");
+    const csrfHash = await sha256Hex(csrf);
+    const minted: Array<{ op: McpOperationRecord; txId: string }> = [];
+    for (const op of loaded.ops) {
+      if (op.device_id) {
+        const gate = await store.assertDeviceOperableForMcp(op.device_id, principal.id, principal.tenant_id);
+        if (!gate.ok) {
+          return json({ error: gate.error, device_id: op.device_id, operation_id: op.operation_id }, { status: 403 });
+        }
+      }
+      const tx = await mintApprovalTransactionForOp(store, principal, op, csrfHash);
+      if ("response" in tx) return tx.response;
+      minted.push({ op, txId: tx.txId });
+    }
+    const rows = minted.map(({ op, txId }) =>
+      `<li><code>${escapeHtml(op.operation_id)}</code> · <code>${escapeHtml(op.tool || "")}</code><pre>${approvalOperationPreview(op)}</pre><input type="hidden" name="transaction_id" value="${escapeHtml(txId)}"></li>`
+    ).join("");
+    const action = approvalSelectionReturnTo(selection);
+    const page = authPage({
+      title: "Approve selected operations — OwnMesh",
+      eyebrow: "Local policy escalation",
+      heading: "Review the exact selected set",
+      intro: "This passkey assertion is bound to the selected operations and their payload hashes. Each decision is consumed once.",
+      body: `<form method="post" action="${escapeHtml(action)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}"><ol>${rows}</ol><p class="note">The set cannot be edited here; changing membership requires a new assertion.</p><div class="actions"><button class="primary" name="decision" value="approve" type="submit">Approve all selected</button><button class="danger" name="decision" value="deny" type="submit">Deny all selected</button></div></form>`,
+      footer: new URL(issuer).host,
+    });
+    return html(page, {
+      status: 200,
+      noStore: true,
+      headers: { "content-security-policy": AUTH_PAGE_CSP },
+    });
+  }
 
   if (req.method === "POST") {
     if (opts.originAllowed === false) {
@@ -7041,12 +7904,23 @@ export async function handleApprove(
     let transactionId = "";
     let csrfToken = "";
     let operationId = url.searchParams.get("operation_id") || "";
+    let transactionIds: string[] = [];
     if (ct.includes("application/json")) {
       const body = await readRequestJsonLimited<Record<string, unknown>>(req);
       decision = String(body.decision || "");
       transactionId = String(body.transaction_id || "");
       csrfToken = String(body.csrf_token || "");
-      if (body.operation_id) operationId = String(body.operation_id);
+      if (Array.isArray(body.transaction_ids)) {
+        transactionIds = body.transaction_ids.map((value) => String(value)).filter(Boolean);
+      } else if (transactionId) {
+        transactionIds = [transactionId];
+      }
+      // URL remains authoritative for the bound set. Ignore client-supplied ids/hashes.
+      void body.ids;
+      void body.operation_ids;
+      void body.payload_hash;
+      void body.commitment;
+      if (selection.kind === "single" && body.operation_id) operationId = String(body.operation_id);
       // Intentionally ignore client-supplied approver identity fields.
       void body.approver_principal_id;
       void body.approver_id;
@@ -7056,11 +7930,126 @@ export async function handleApprove(
       decision = String(form.get("decision") || "");
       transactionId = String(form.get("transaction_id") || "");
       csrfToken = String(form.get("csrf_token") || "");
-      if (form.get("operation_id")) operationId = String(form.get("operation_id"));
+      transactionIds = form.getAll("transaction_id").map((value) => String(value)).filter(Boolean);
+      if (!transactionIds.length && transactionId) transactionIds = [transactionId];
+      if (selection.kind === "single" && form.get("operation_id")) operationId = String(form.get("operation_id"));
       // Intentionally ignore client-supplied approver identity fields.
       void form.get("approver_principal_id");
       void form.get("approver_id");
       void form.get("principal_id");
+    }
+    if (decision === "deny_all") {
+      if (selection.kind !== "list") {
+        return json({ error: "invalid_request", error_description: "deny_all applies to the pending inbox" }, { status: 400 });
+      }
+      if (!verifyApproveListCsrf(req, csrfToken)) {
+        return json({ error: "csrf_failed" }, { status: 403, noStore: true });
+      }
+      const sessionDenied = await authorizeApprovalSession(store, principal);
+      if (sessionDenied) return sessionDenied;
+      const pending = (await store.listPendingMcpApprovals({
+        tenantId: principal.tenant_id,
+        principalId: principal.id,
+      })).filter((op) => !approvalDecisionAlreadyBound(op));
+      const results: Array<{ operation_id: string; ok: boolean; status: number; error?: string }> = [];
+      for (const op of pending) {
+        const denied = await authorizeMcpApprover(store, principal, op, authSource);
+        if (denied) {
+          results.push({ operation_id: op.operation_id, ok: false, status: denied.status, error: "forbidden" });
+          continue;
+        }
+        const csrf = randomToken("csrf_");
+        const minted = await mintApprovalTransactionForOp(store, principal, op, await sha256Hex(csrf));
+        if ("response" in minted) {
+          results.push({ operation_id: op.operation_id, ok: false, status: minted.response.status, error: "mint_failed" });
+          continue;
+        }
+        const delivered = await completeApprovalPost(req, store, opts, {
+          decision: "deny",
+          transactionId: minted.txId,
+          csrfToken: csrf,
+          expectedOperationId: op.operation_id,
+          preferJson: true,
+        });
+        const payload = delivered.headers.get("content-type")?.includes("application/json")
+          ? await delivered.clone().json().catch(() => null) as { ok?: boolean; error?: string } | null
+          : null;
+        results.push({
+          operation_id: op.operation_id,
+          ok: delivered.ok && payload?.ok === true,
+          status: delivered.status,
+          error: payload?.error,
+        });
+      }
+      const accept = req.headers.get("accept") || "";
+      if (accept.includes("application/json") || ct.includes("application/json")) {
+        return json({ ok: results.every((row) => row.ok), decision: "deny_all", results });
+      }
+      const body = results.length
+        ? `<ul>${results.map((row) => `<li><code>${escapeHtml(row.operation_id)}</code> — ${row.ok ? "denied" : escapeHtml(row.error || "failed")}</li>`).join("")}</ul>`
+        : `<p class="note">No pending operations.</p>`;
+      return html(authPage({
+        title: "Pending operations denied — OwnMesh",
+        eyebrow: "Operation approval",
+        heading: "Denial recorded",
+        intro: "Deny-all does not execute device actions. Each listed operation was denied independently.",
+        body,
+        footer: "You can close this tab",
+      }), {
+        noStore: true,
+        headers: { "content-security-policy": AUTH_PAGE_CSP },
+      });
+    }
+    if (selection.kind === "batch") {
+      if (decision !== "approve" && decision !== "deny") {
+        return json({ error: "invalid_request", error_description: "decision must be approve or deny" }, { status: 400 });
+      }
+      if (!csrfToken || transactionIds.length !== selection.operationIds.length) {
+        return json({ error: "invalid_request", error_description: "batch approval requires one transaction per selected operation" }, { status: 400 });
+      }
+      const loaded = await loadBatchApprovalOps(store, principal, authSource, selection.operationIds);
+      if ("response" in loaded) return loaded.response;
+      const allowed = new Set(selection.operationIds);
+      const results: Array<{ operation_id: string; ok: boolean; status: number; error?: string }> = [];
+      for (const txId of transactionIds) {
+        const delivered = await completeApprovalPost(req, store, opts, {
+          decision,
+          transactionId: txId,
+          csrfToken,
+          allowedOperationIds: allowed,
+          preferJson: true,
+        });
+        const payload = delivered.headers.get("content-type")?.includes("application/json")
+          ? await delivered.clone().json().catch(() => null) as { ok?: boolean; error?: string; operation_id?: string } | null
+          : null;
+        results.push({
+          operation_id: payload?.operation_id || txId,
+          ok: delivered.ok && payload?.ok === true,
+          status: delivered.status,
+          error: payload?.error,
+        });
+      }
+      const accept = req.headers.get("accept") || "";
+      if (accept.includes("application/json") || ct.includes("application/json")) {
+        return json({ ok: results.every((row) => row.ok), decision, results });
+      }
+      const allOk = results.every((row) => row.ok);
+      return html(authPage({
+        title: allOk ? "Decisions delivered — OwnMesh" : "Approval delivery incomplete — OwnMesh",
+        eyebrow: "Operation approval",
+        heading: allOk
+          ? (decision === "approve" ? "Approvals sent to devices" : "Denials sent to devices")
+          : "Some decisions were not delivered",
+        intro: "Each selected operation is consumed independently. Device results remain authoritative.",
+        body: `<ul>${results.map((row) => `<li><code>${escapeHtml(row.operation_id)}</code> — ${row.ok ? "delivered" : escapeHtml(row.error || "failed")}</li>`).join("")}</ul>`,
+        footer: "You can close this tab",
+      }), {
+        noStore: true,
+        headers: { "content-security-policy": AUTH_PAGE_CSP },
+      });
+    }
+    if (selection.kind === "list") {
+      return json({ error: "invalid_request", error_description: "pending inbox POST must be deny_all" }, { status: 400 });
     }
     if (decision !== "approve" && decision !== "deny") {
       return json({ error: "invalid_request", error_description: "decision must be approve or deny" }, { status: 400 });
@@ -7069,502 +8058,12 @@ export async function handleApprove(
       return json({ error: "invalid_request", error_description: "missing approval transaction" }, { status: 400 });
     }
 
-    // Durable one-time decision: atomic consume+outbox → claim → deliver → finalize.
-    // Never report ok:true before successful delivery + authoritative transition.
-    // Approver principal is the authenticated human only (not client body).
-    const started = await store.beginMcpApprovalOutbox(
-      transactionId,
-      await sha256Hex(csrfToken),
-      principal.id,
+    return completeApprovalPost(req, store, opts, {
       decision,
-    );
-    if (!started) {
-      return json(
-        { error: "invalid_request", error_description: "invalid, expired, or already used approval transaction" },
-        { status: 400 },
-      );
-    }
-    if (started.status === "already_delivered") {
-      // Duplicate path: return authoritative state without re-delivery.
-      const doneOp = await store.getMcpOperation(started.outbox.operation_id);
-      return json(
-        {
-          error: "invalid_request",
-          error_description: "invalid, expired, or already used approval transaction",
-          authoritative: true,
-          operation_id: started.outbox.operation_id,
-          decision: started.outbox.decision,
-          status: doneOp?.status,
-          delivery_status: started.outbox.delivery_status,
-        },
-        { status: 400 },
-      );
-    }
-
-    const { outbox, tx } = started;
-    if (tx.tenant_id !== principal.tenant_id || outbox.tenant_id !== principal.tenant_id) {
-      return json({ error: "forbidden", error_description: "tenant mismatch" }, { status: 403 });
-    }
-    // Transaction must stay bound to the authenticated human (replay/TOCTOU).
-    if (tx.principal_id !== principal.id || outbox.principal_id !== principal.id) {
-      return json({ error: "forbidden", error_description: "approver mismatch" }, { status: 403 });
-    }
-
-    const op = await store.getMcpOperation(outbox.operation_id);
-    if (!op) {
-      return json({ error: "not_found", error_description: "operation not found" }, { status: 404 });
-    }
-    const denied = await authorizeMcpApprover(store, principal, op, authSource);
-    if (denied) return denied;
-    const approver = await store.getPrincipal(principal.id);
-    const approverCredentialGeneration = Number(approver?.credential_generation);
-    if (!Number.isSafeInteger(approverCredentialGeneration) || approverCredentialGeneration < 1) {
-      return json({ error: "forbidden", error_description: "approver credential generation unavailable" }, { status: 403 });
-    }
-    if (operationId && operationId !== op.operation_id) {
-      return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
-    }
-    // Delivery retry keeps op in approval_required until finalize succeeds.
-    if (op.status !== "approval_required" && started.status === "created") {
-      return json(
-        { error: "conflict", error_description: "operation already decided" },
-        { status: 409 },
-      );
-    }
-
-    // Exclusive pending→delivering claim prevents concurrent routes/duplicate delivery.
-    // Stale delivering claims (lease expired) may be reclaimed for retry.
-    // Claim issues owner token+version; only that owner may release/finalize.
-    const claimed = await store.claimMcpApprovalOutboxDelivery(outbox.id);
-    if (!claimed) {
-      const current = await store.getMcpApprovalOutbox(outbox.id);
-      const opNow = await store.getMcpOperation(outbox.operation_id);
-      if (current?.delivery_status === "delivered") {
-        return json(
-          {
-            error: "invalid_request",
-            error_description: "invalid, expired, or already used approval transaction",
-            authoritative: true,
-            operation_id: outbox.operation_id,
-            decision: current.decision,
-            status: opNow?.status,
-            delivery_status: "delivered",
-          },
-          { status: 400 },
-        );
-      }
-      return json(
-        {
-          error: "conflict",
-          error_description: "approval delivery already in progress or completed",
-          authoritative: true,
-          operation_id: outbox.operation_id,
-          decision: current?.decision ?? outbox.decision,
-          status: opNow?.status,
-          delivery_status: current?.delivery_status ?? "delivering",
-          retryable: current?.delivery_status === "pending",
-        },
-        { status: 409 },
-      );
-    }
-
-    // Gate/route/finalize under try/catch/finally so a thrown DO/D1 error never
-    // leaks a live delivering claim (release → pending, attempts+1, last_error).
-    // release/finalize require the claim owner credentials issued above.
-    const claimToken = claimed.claim_token ?? "";
-    const claimVersion = Number(claimed.claim_version ?? 0);
-    let route: { status: string; detail?: unknown } | undefined;
-    let claimSettled = false;
-    let releaseError: string | undefined;
-    try {
-      if (op.status !== "approval_required") {
-        // A stale lease can outlive a fast device result (or cancellation). The
-        // terminal authoritative operation proves there is nothing left to
-        // deliver; reconcile the outbox without routing the decision again.
-        const reconciled = await store.finalizeMcpApprovalDelivery(
-          claimed.id,
-          claimToken,
-          claimVersion,
-        );
-        if (reconciled) {
-          claimSettled = true;
-          return json(
-            {
-              error: "conflict",
-              error_description: "operation already decided",
-              authoritative: true,
-              operation_id: reconciled.operation_id,
-              status: reconciled.status,
-              decision: claimed.decision,
-              delivery_status: "delivered",
-            },
-            { status: 409 },
-          );
-        }
-        throw new Error("approval_reconciliation_failed");
-      }
-
-      const deviceId = claimed.device_id || op.device_id;
-      if (deviceId && opts.routeToDevice) {
-        const gate = await store.assertDeviceOperableForMcp(
-          deviceId,
-          principal.id,
-          principal.tenant_id,
-        );
-        if (!gate.ok) {
-          await store.releaseMcpApprovalOutboxClaim(
-            claimed.id,
-            claimToken,
-            claimVersion,
-            gate.error,
-          );
-          claimSettled = true;
-          return json(
-            {
-              error: gate.error,
-              error_description: "device not operable for approval delivery",
-              retryable: true,
-              operation_id: op.operation_id,
-              delivery_status: "pending",
-            },
-            { status: 403 },
-          );
-        }
-        if (
-          ADMIN_MCP_TOOL_NAMES.has(op.tool) &&
-          !(await mayAdministerDevice(store, deviceId, principal.tenant_id, principal.id))
-        ) {
-          await store.releaseMcpApprovalOutboxClaim(
-            claimed.id,
-            claimToken,
-            claimVersion,
-            "device_admin_required",
-          );
-          claimSettled = true;
-          return json(
-            {
-              error: "device_admin_required",
-              error_description: "administrator role changed before approval delivery",
-              retryable: true,
-              operation_id: op.operation_id,
-              delivery_status: "pending",
-            },
-            { status: 403 },
-          );
-        }
-        // Fresh operation identity for the decision notification so it cannot collide
-        // with the original operation's correlation tombstone after approval_required.
-        // Prefer the device-issued approval_id (from OWNMESH_E_APPROVAL_REQUIRED) so
-        // ownmeshd can resolve the deferred request; fall back to outbox id only when
-        // the device id was never recorded (lookup then uses target_operation_id).
-        const decisionOpId = randomId("op_");
-        const deviceApprovalId =
-          (op.approval_id && String(op.approval_id).trim()) ||
-          (op.data && typeof op.data === "object" && (op.data as { approval_id?: unknown }).approval_id != null
-            ? String((op.data as { approval_id: unknown }).approval_id)
-            : "") ||
-          claimed.id;
-        const existingDecision = op.data?.approval_decision;
-        const existingTransaction = op.data?.approval_transaction_id;
-        if (
-          (existingDecision !== undefined && existingDecision !== decision) ||
-          (existingTransaction !== undefined && existingTransaction !== claimed.id)
-        ) {
-          await store.releaseMcpApprovalOutboxClaim(
-            claimed.id,
-            claimToken,
-            claimVersion,
-            "approval_decision_binding_conflict",
-          );
-          claimSettled = true;
-          return json(
-            {
-              error: "conflict",
-              error_description: "a different approval decision is already bound to this operation",
-              operation_id: op.operation_id,
-              delivery_status: "pending",
-            },
-            { status: 409 },
-          );
-        }
-        const prepared = await patchOp(
-          store,
-          defaultOpTracker,
-          op.operation_id,
-          {
-            summary: "human decision bound; delivering to device",
-            data: {
-              ...(op.data || {}),
-              approval_decision: decision,
-              approval_transaction_id: claimed.id,
-              approval_device_id: deviceApprovalId,
-            },
-          },
-          ["approval_required"],
-          op.data || {},
-        );
-        if (!prepared) {
-          await store.releaseMcpApprovalOutboxClaim(
-            claimed.id,
-            claimToken,
-            claimVersion,
-            "approval_decision_binding_cas_failed",
-          );
-          claimSettled = true;
-          return json(
-            {
-              error: "conflict",
-              error_description: "operation changed before approval delivery",
-              authoritative: true,
-              operation_id: op.operation_id,
-              delivery_status: "pending",
-            },
-            { status: 409 },
-          );
-        }
-
-        // E3: bind the recovery decision to the original exact action + expiry.
-        // A newly minted browser tx must not resurrect a stale deferred request.
-        const nowMs = Date.now();
-        const targetExpiresAt =
-          typeof op.expires_at === "string" && op.expires_at.trim() !== ""
-            ? String(op.expires_at)
-            : null;
-        if (targetExpiresAt) {
-          const targetMs = Date.parse(targetExpiresAt);
-          if (Number.isFinite(targetMs) && targetMs <= nowMs) {
-            await store.releaseMcpApprovalOutboxClaim(
-              claimed.id,
-              claimToken,
-              claimVersion,
-              "target_operation_expired",
-            );
-            claimSettled = true;
-            return json(
-              {
-                error: "expired",
-                error_description:
-                  "original operation expires_at elapsed; re-authorize the action",
-                operation_id: op.operation_id,
-                expires_at: targetExpiresAt,
-                retryable: false,
-              },
-              { status: 409 },
-            );
-          }
-        }
-        // Decision envelope lifetime: short default, never past original action or tx.
-        const decisionDefaultMs = nowMs + 60_000;
-        let decisionExpiresMs = decisionDefaultMs;
-        if (targetExpiresAt) {
-          const t = Date.parse(targetExpiresAt);
-          if (Number.isFinite(t)) decisionExpiresMs = Math.min(decisionExpiresMs, t);
-        }
-        // Approval transaction expires_at is epoch ms (bound at GET mint).
-        if (typeof tx.expires_at === "number" && Number.isFinite(tx.expires_at)) {
-          decisionExpiresMs = Math.min(decisionExpiresMs, tx.expires_at);
-        }
-        if (decisionExpiresMs <= nowMs) {
-          await store.releaseMcpApprovalOutboxClaim(
-            claimed.id,
-            claimToken,
-            claimVersion,
-            "decision_window_expired",
-          );
-          claimSettled = true;
-          return json(
-            {
-              error: "expired",
-              error_description: "approval decision window elapsed",
-              operation_id: op.operation_id,
-              retryable: false,
-            },
-            { status: 409 },
-          );
-        }
-        const decisionExpiresAt = nowIso(decisionExpiresMs);
-        const targetPayloadHash =
-          typeof op.payload_hash === "string" && op.payload_hash.trim() !== ""
-            ? String(op.payload_hash)
-            : null;
-        const decisionClaimVersion = Number(claimed.claim_version ?? 1);
-        const decisionArgs: Record<string, unknown> = {
-          action: "approval.decision",
-          target_operation_id: op.operation_id,
-          decision,
-          approval_id: deviceApprovalId,
-          target_tool: op.tool || "",
-        };
-        if (targetPayloadHash) decisionArgs.target_payload_hash = targetPayloadHash;
-        if (targetExpiresAt) decisionArgs.target_expires_at = targetExpiresAt;
-
-        // Facts mirror arguments (minus action) so Agent recompute_action_facts matches.
-        // Approver principal/tenant live on bound_action top-level (not facts).
-        const decisionFacts: Record<string, unknown> = {
-          target_operation_id: op.operation_id,
-          decision,
-          approval_id: deviceApprovalId,
-          target_tool: op.tool || "",
-        };
-        if (targetPayloadHash) decisionFacts.target_payload_hash = targetPayloadHash;
-        if (targetExpiresAt) decisionFacts.target_expires_at = targetExpiresAt;
-
-        const boundAction: Record<string, unknown> = {
-          capability: "approval.decision",
-          action: "approval.decision",
-          tool: "ownmesh_approval_decision",
-          device_id: deviceId,
-          principal_id: principal.id,
-          tenant_id: principal.tenant_id,
-          principal_credential_generation: approverCredentialGeneration,
-          oauth_client_id: null,
-          workspace_id: op.workspace_id ?? null,
-          facts: decisionFacts,
-          operation_id: decisionOpId,
-          expires_at: decisionExpiresAt,
-          claim_version: decisionClaimVersion,
-          // Immutable linkage to the deferred target (also in facts for Agent match).
-          outbox_id: claimed.id,
-        };
-        const payloadHash = await hashCanonicalAction(boundAction);
-
-        route = await opts.routeToDevice(deviceId, {
-          type: "approval.decision",
-          payload: {
-            // Strict ownmesh.operation/1.0 request shape only — deny_unknown_fields
-            // rejects top-level decision/approval_id mirrors on the Agent parser.
-            operation_contract: OPERATION_CONTRACT_V1,
-            operation_id: decisionOpId,
-            capability: "approval.decision",
-            idempotency_key: claimed.id || decisionOpId,
-            payload_hash: payloadHash,
-            authorization: { bound_action: boundAction },
-            arguments: decisionArgs,
-            ...(op.workspace_id ? { workspace_id: op.workspace_id } : {}),
-          },
-          correlation_id: decisionOpId,
-          expires_at: decisionExpiresAt,
-          claim_version: decisionClaimVersion,
-        });
-        if (route.status !== "routed_to_device") {
-          await store.releaseMcpApprovalOutboxClaim(
-            claimed.id,
-            claimToken,
-            claimVersion,
-            `route_status=${route.status}`,
-          );
-          claimSettled = true;
-          // Decision remains durable in outbox; op stays approval_required for retry.
-          return json(
-            {
-              error: "delivery_failed",
-              error_description: "approval decision not delivered to device",
-              retryable: true,
-              operation_id: op.operation_id,
-              delivery_status: "pending",
-              route,
-            },
-            { status: 503 },
-          );
-        }
-      }
-
-      // Authoritative CAS only after successful delivery (or no device route needed).
-      const updated = await store.finalizeMcpApprovalDelivery(
-        claimed.id,
-        claimToken,
-        claimVersion,
-      );
-      if (!updated) {
-        // Lost finalize race — surface authoritative state without claiming success.
-        claimSettled = true;
-        const opNow = await store.getMcpOperation(outbox.operation_id);
-        const boxNow = await store.getMcpApprovalOutbox(claimed.id);
-        return json(
-          {
-            error: "conflict",
-            error_description: "operation already decided or outbox not delivering",
-            authoritative: true,
-            retryable: boxNow?.delivery_status === "pending",
-            operation_id: op.operation_id,
-            status: opNow?.status,
-            decision: boxNow?.decision ?? claimed.decision,
-            delivery_status: boxNow?.delivery_status,
-          },
-          { status: 409 },
-        );
-      }
-
-      // Delivered — claim is no longer live.
-      claimSettled = true;
-
-      await store.appendAudit({
-        id: randomId("aud_"),
-        tenant_id: principal.tenant_id,
-        principal_id: principal.id,
-        device_id: updated.device_id,
-        kind: "mcp.approval",
-        summary: `decision=${decision}`,
-        created_at: nowIso(),
-        meta: {
-          operation_id: updated.operation_id,
-          decision,
-          transaction_id: tx.id,
-          outbox_id: outbox.id,
-          route_status: route?.status,
-          retry: started.status === "pending_retry",
-        },
-      });
-
-      const accept = req.headers.get("accept") || "";
-      if (accept.includes("application/json") || ct.includes("application/json")) {
-        return json({
-          ok: true,
-          operation_id: updated.operation_id,
-          decision,
-          status: updated.status,
-          route,
-        });
-      }
-      return html(authPage({
-        title: "Decision delivered — OwnMesh",
-        eyebrow: "Operation approval",
-        heading: decision === "approve" ? "Approval sent to device" : "Denial sent to device",
-        intro: "The exact-bound decision was delivered. The device result is authoritative.",
-        body: `<dl class="meta"><dt>Operation</dt><dd><code>${escapeHtml(updated.operation_id)}</code></dd><dt>Status</dt><dd>${escapeHtml(updated.status)}</dd></dl><p class="note">Keep the CLI open while OwnMesh waits for the device result. Local device policy remains the final authority.</p>`,
-        footer: "You can close this tab",
-      }), {
-        noStore: true,
-        headers: { "content-security-policy": AUTH_PAGE_CSP },
-      });
-    } catch (err) {
-      releaseError =
-        err instanceof Error ? err.message.slice(0, 500) : "delivery_error";
-      // No success response on thrown DO/D1 failure.
-      return json(
-        {
-          error: "delivery_failed",
-          error_description: "approval decision not delivered to device",
-          retryable: true,
-          operation_id: op.operation_id,
-          delivery_status: "pending",
-        },
-        { status: 503 },
-      );
-    } finally {
-      if (!claimSettled) {
-        try {
-          await store.releaseMcpApprovalOutboxClaim(
-            claimed.id,
-            claimToken,
-            claimVersion,
-            releaseError ?? "delivery_error",
-          );
-        } catch {
-          // Best-effort release; avoid masking the original failure.
-        }
-      }
-    }
+      transactionId,
+      csrfToken,
+      expectedOperationId: operationId || undefined,
+    });
   }
 
   if (req.method !== "GET") {

@@ -2752,7 +2752,10 @@ fn map_request_to_method(
             }
             methods::ADMIN_APPROVAL_BRIDGE_REQUEST
         }
+        ("admin.grants.mint", "admin.grants.mint") => methods::ADMIN_GRANTS_MINT_REQUEST,
         ("policy.show", "policy.show" | "ownmesh_policy_show" | "show") => methods::POLICY_SHOW,
+        ("grants.list", "grants.list" | "ownmesh_grants_list") => methods::GRANTS_LIST,
+        ("grants.revoke", "grants.revoke" | "ownmesh_grants_revoke") => methods::GRANTS_REVOKE,
         ("filesystem.read", "fs.list" | "ownmesh_fs_list" | "ownmesh_list_files") => {
             methods::OPS_FS_LIST
         }

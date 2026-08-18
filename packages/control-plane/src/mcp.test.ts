@@ -160,6 +160,14 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   const getOp = MCP_TOOLS.find((t) => t.name === "ownmesh_get_operation")!;
   const getOpProps = getOp.inputSchema.properties as Record<string, { maximum?: number }>;
   assert.equal(getOpProps.wait_ms?.maximum, 25_000);
+
+  const mint = MCP_TOOLS.find((t) => t.name === "ownmesh_grants_mint")!;
+  assert.equal(mint.scope, "ownmesh.device");
+  assert.equal(mint.annotations.readOnlyHint, false);
+  const listGrants = MCP_TOOLS.find((t) => t.name === "ownmesh_grants_list")!;
+  assert.equal(listGrants.annotations.readOnlyHint, true);
+  const revoke = MCP_TOOLS.find((t) => t.name === "ownmesh_grants_revoke")!;
+  assert.equal(revoke.annotations.readOnlyHint, false);
 });
 
 test("MCP ops quota pressure is warned and exposed on system diagnose", async () => {
