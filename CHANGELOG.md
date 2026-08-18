@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.2.14 — Detached commands, hashed overwrite, bounded grants
+
 - Durable MCP operation quota is configurable via Worker env
   `MCP_OPS_MAX_PER_TENANT` (default 20_000). Tool responses warn with
   `mcp_ops_quota_pressure` at ≥ 60% occupancy, `ownmesh_system_diagnose`
