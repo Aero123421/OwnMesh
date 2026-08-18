@@ -32,8 +32,12 @@ import {
   MCP_OPS_MAX_DATA_JSON_BYTES,
   MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
   MCP_OPS_MAX_PER_TENANT,
+  MCP_OPS_MAX_PER_TENANT_DEFAULT,
+  MCP_OPS_MAX_PER_TENANT_HARD_CEILING,
+  MCP_OPS_QUOTA_PRESSURE_RATIO,
   MCP_OPS_RESULT_TTL_MS,
   MCP_OPS_TOMBSTONE_TTL_MS,
+  parseMcpOpsMaxPerTenant,
   boundClientVisibleOperationData,
   boundMcpOperationRecord,
   type SqlDatabase,
@@ -84,12 +88,12 @@ function adaptSqlite(db: DatabaseSync): SqlDatabase {
   };
 }
 
-function openSqlStore(): SqlStore {
+function openSqlStore(opts?: { mcpOpsMaxPerTenant?: number }): SqlStore {
   const db = new DatabaseSync(":memory:");
   for (const f of readdirSync(migrationsDir).filter((x) => x.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(migrationsDir, f), "utf8"));
   }
-  return new SqlStore(adaptSqlite(db), "sqlite");
+  return new SqlStore(adaptSqlite(db), "sqlite", opts);
 }
 
 async function seedAuthed(store: MemoryStore | SqlStore, principal = "prin_dev") {
@@ -795,7 +799,8 @@ test("command env is normalized into canonical action facts", async () => {
 });
 
 test("durable MCP operation records bound oversized data and enforce tenant quota", async () => {
-  const store = new MemoryStore();
+  const quotaCap = 8;
+  const store = new MemoryStore({ mcpOpsMaxPerTenant: quotaCap });
   await store.ensureBootstrap();
   const huge = "x".repeat(MCP_OPS_MAX_DATA_JSON_BYTES + 1024);
   const bounded = boundMcpOperationRecord({
@@ -832,7 +837,7 @@ test("durable MCP operation records bound oversized data and enforce tenant quot
   assert.equal((bounded.data as { path?: string }).path, "big.txt");
   assert.equal(bounded.next_cursor, "off_160000");
 
-  for (let i = 0; i < MCP_OPS_MAX_PER_TENANT; i++) {
+  for (let i = 0; i < quotaCap; i++) {
     await store.putMcpOperation({
       operation_id: `op_q_${i}`,
       tenant_id: "ten_quota",
@@ -1236,7 +1241,8 @@ test("dispatch_uncertain: pending outbox is redelivered on identical retry", asy
 });
 
 test("idempotency tombstones are retained under quota until 30-day window closes", async () => {
-  const store = new MemoryStore();
+  const quotaCap = 8;
+  const store = new MemoryStore({ mcpOpsMaxPerTenant: quotaCap });
   await store.ensureBootstrap();
   const tenant = "ten_tomb";
   const principal = "prin_tomb";
@@ -1244,7 +1250,7 @@ test("idempotency tombstones are retained under quota until 30-day window closes
   const now = Date.now();
 
   // Fill tenant to capacity with completed ops aged >7d so they compact to tombstones.
-  for (let i = 0; i < MCP_OPS_MAX_PER_TENANT; i++) {
+  for (let i = 0; i < quotaCap; i++) {
     const created = new Date(now - MCP_OPS_RESULT_TTL_MS - 60_000).toISOString();
     await store.putMcpOperation({
       operation_id: `op_tomb_${i}`,
@@ -1427,6 +1433,177 @@ test("expired idempotency tombstones are hard-deleted so the key becomes reusabl
     assert.equal(claim.op.operation_id, "op_expired_retry");
     // The old tombstone is gone.
     assert.equal(await store.getMcpOperation("op_expired_1"), null);
+  }
+});
+
+test("MCP_OPS_MAX_PER_TENANT env parsing fails closed to the documented default", () => {
+  assert.equal(parseMcpOpsMaxPerTenant(undefined), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant(""), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant("nope"), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant(0), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant(-4), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant("8"), 8);
+  assert.equal(parseMcpOpsMaxPerTenant(8), 8);
+  assert.equal(parseMcpOpsMaxPerTenant(String(MCP_OPS_MAX_PER_TENANT_HARD_CEILING + 1)), MCP_OPS_MAX_PER_TENANT_HARD_CEILING);
+  assert.equal(MCP_OPS_MAX_PER_TENANT, MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(MCP_OPS_QUOTA_PRESSURE_RATIO, 0.6);
+});
+
+test("configured tenant quota is the cap used by both stores", async () => {
+  const quotaCap = 3;
+  for (const store of [
+    new MemoryStore({ mcpOpsMaxPerTenant: quotaCap }),
+    openSqlStore({ mcpOpsMaxPerTenant: quotaCap }),
+  ] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_cfg_${store.kind}`;
+    assert.equal(store.mcpOpsMaxPerTenant(), quotaCap);
+    for (let i = 0; i < quotaCap; i++) {
+      await store.putMcpOperation({
+        operation_id: `op_cfg_${store.kind}_${i}`,
+        tenant_id: tenant,
+        principal_id: "prin_cfg",
+        device_id: "dev_cfg",
+        tool: "ownmesh_fs_stat",
+        status: "completed",
+        summary: "fill",
+        data: { i },
+        truncated: false,
+        next_cursor: null,
+        approval_required: false,
+        warnings: [],
+        idempotency_key: `idem_cfg_${i}`,
+        policy_authority: "ownmesh_device",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+    }
+    const quota = await store.getMcpOperationQuota(tenant);
+    assert.equal(quota.rows, quotaCap);
+    assert.equal(quota.limit, quotaCap);
+    assert.equal(quota.status, "critical");
+    await assert.rejects(
+      () =>
+        store.putMcpOperation({
+          operation_id: `op_cfg_${store.kind}_overflow`,
+          tenant_id: tenant,
+          principal_id: "prin_cfg",
+          device_id: "dev_cfg",
+          tool: "ownmesh_fs_stat",
+          status: "pending",
+          summary: "overflow",
+          data: {},
+          truncated: false,
+          next_cursor: null,
+          approval_required: false,
+          warnings: [],
+          idempotency_key: "idem_cfg_overflow",
+          policy_authority: "ownmesh_device",
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        }),
+      /mcp_operation_quota_exceeded/,
+    );
+  }
+});
+
+test("keyless terminal rows are hard-deleted at result TTL instead of tombstoned", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_keyless_${store.kind}`;
+    const ancient = new Date(Date.now() - MCP_OPS_RESULT_TTL_MS - 60_000).toISOString();
+    await store.putMcpOperation({
+      operation_id: "op_keyless_old",
+      tenant_id: tenant,
+      principal_id: "prin_keyless",
+      device_id: "dev_keyless",
+      tool: "ownmesh_fs_read",
+      status: "completed",
+      summary: "read page",
+      data: { content: "x" },
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: null,
+      policy_authority: "ownmesh_device",
+      created_at: ancient,
+      updated_at: ancient,
+    });
+    await store.putMcpOperation({
+      operation_id: "op_keyed_old",
+      tenant_id: tenant,
+      principal_id: "prin_keyless",
+      device_id: "dev_keyless",
+      tool: "ownmesh_fs_write",
+      status: "completed",
+      summary: "write",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_keyed_old",
+      payload_hash: "ph_keyed",
+      policy_authority: "ownmesh_device",
+      created_at: ancient,
+      updated_at: ancient,
+    });
+    await store.putMcpOperation({
+      operation_id: "op_keyless_trigger",
+      tenant_id: tenant,
+      principal_id: "prin_keyless",
+      device_id: "dev_keyless",
+      tool: "ownmesh_fs_stat",
+      status: "pending",
+      summary: "trigger compact",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_keyless_trigger",
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    assert.equal(
+      await store.getMcpOperation("op_keyless_old"),
+      null,
+      `${store.kind}: keyless terminal row must not occupy a tombstone slot`,
+    );
+    const keyed = await store.getMcpOperation("op_keyed_old");
+    assert.ok(keyed, `${store.kind}: keyed receipt must remain`);
+    assert.equal(keyed.status, "tombstone");
+    assert.equal(keyed.idempotency_key, "idem_keyed_old");
+  }
+});
+
+test("legacy keyless tombstones are purged on compact", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_legacy_ts_${store.kind}`;
+    await store.putMcpOperation({
+      operation_id: "op_legacy_keyless_ts",
+      tenant_id: tenant,
+      principal_id: "prin_legacy",
+      device_id: "dev_legacy",
+      tool: "ownmesh_fs_read",
+      status: "tombstone",
+      summary: "tombstone: result TTL expired; idempotency retained",
+      data: { tombstone: true },
+      truncated: true,
+      next_cursor: null,
+      approval_required: false,
+      warnings: ["durable_result_tombstoned"],
+      idempotency_key: null,
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    const quota = await store.getMcpOperationQuota(tenant);
+    assert.equal(quota.rows, 0, `${store.kind}: keyless tombstone must be dropped immediately`);
+    assert.equal(await store.getMcpOperation("op_legacy_keyless_ts"), null);
   }
 });
 

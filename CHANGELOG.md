@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Durable MCP operation quota is configurable via Worker env
+  `MCP_OPS_MAX_PER_TENANT` (default 20_000). Tool responses warn with
+  `mcp_ops_quota_pressure` at ≥ 60% occupancy, `ownmesh_system_diagnose`
+  reports `control_plane.mcp_ops_quota`, and keyless terminal rows are
+  hard-deleted at the 7-day result TTL instead of occupying a 30-day
+  idempotency tombstone. Fail-closed `OWNMESH_E_MCP_OP_QUOTA` and keyed
+  receipt retention are unchanged.
+
 ## v1.2.13 — Runtime reliability and cross-platform repair
 
 - Expired sidecar transition journal records are reconciled non-blockingly

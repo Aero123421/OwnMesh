@@ -353,7 +353,59 @@ export type McpApprovalTransaction = {
 export const MCP_APPROVAL_OUTBOX_CLAIM_LEASE_MS = 30_000;
 
 /** Per-tenant durable MCP operation budgets (D1 / Memory). */
-export const MCP_OPS_MAX_PER_TENANT = 2_000;
+/** Default Worker `vars.MCP_OPS_MAX_PER_TENANT` when the env var is absent or invalid. */
+export const MCP_OPS_MAX_PER_TENANT_DEFAULT = 20_000;
+/** Documented env-var name; value is the deploy default, not a hard-coded cap. */
+export const MCP_OPS_MAX_PER_TENANT = MCP_OPS_MAX_PER_TENANT_DEFAULT;
+/** Absolute ceiling so a typo cannot unbounded-grow `mcp_operations`. */
+export const MCP_OPS_MAX_PER_TENANT_HARD_CEILING = 1_000_000;
+/** Warn (and surface `mcp_ops_quota_pressure`) at this fraction of the cap. */
+export const MCP_OPS_QUOTA_PRESSURE_RATIO = 0.6;
+export const MCP_OPS_QUOTA_PRESSURE_WARNING = "mcp_ops_quota_pressure";
+
+export type McpOpsStoreOptions = {
+  mcpOpsMaxPerTenant?: number | string | null;
+};
+
+export type McpOperationQuotaStatus = "ok" | "warn" | "critical";
+
+export type McpOperationQuotaSnapshot = {
+  rows: number;
+  limit: number;
+  status: McpOperationQuotaStatus;
+};
+
+/**
+ * Parse `MCP_OPS_MAX_PER_TENANT` from Worker env / store options.
+ * Invalid, empty, or non-positive values fail closed to the documented default.
+ */
+export function parseMcpOpsMaxPerTenant(raw?: number | string | null): number {
+  if (raw === undefined || raw === null || raw === "") {
+    return MCP_OPS_MAX_PER_TENANT_DEFAULT;
+  }
+  const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+  if (!Number.isSafeInteger(n) || n < 1) {
+    return MCP_OPS_MAX_PER_TENANT_DEFAULT;
+  }
+  return Math.min(n, MCP_OPS_MAX_PER_TENANT_HARD_CEILING);
+}
+
+export function mcpOpsQuotaStatus(count: number, limit: number): McpOperationQuotaStatus {
+  if (!(limit > 0) || !(count >= 0)) return "ok";
+  if (count >= limit) return "critical";
+  if (count >= Math.ceil(limit * MCP_OPS_QUOTA_PRESSURE_RATIO)) return "warn";
+  return "ok";
+}
+
+export function snapshotMcpOperationQuota(count: number, limit: number): McpOperationQuotaSnapshot {
+  const rows = Math.max(0, Math.trunc(count));
+  const cap = Math.max(1, Math.trunc(limit));
+  return { rows, limit: cap, status: mcpOpsQuotaStatus(rows, cap) };
+}
+
+function hasMcpIdempotencyReceipt(op: { idempotency_key?: string | null }): boolean {
+  return typeof op.idempotency_key === "string" && op.idempotency_key.length > 0;
+}
 /** Hard cap on serialized client-visible operation data_json (results / metadata). */
 export const MCP_OPS_MAX_DATA_JSON_BYTES = 256_000;
 /**
@@ -721,6 +773,14 @@ export interface ControlPlaneStore {
 
   appendAudit(event: AuditEvent): Promise<void>;
   listAudit(tenantId: string, limit?: number): Promise<AuditEvent[]>;
+
+  /** Effective per-tenant `mcp_operations` row cap (Worker env or default). */
+  mcpOpsMaxPerTenant(): number;
+  /**
+   * Occupancy after TTL compaction. Unexpired keyed receipts are never evicted
+   * here; this is a read of current rows versus the configured cap.
+   */
+  getMcpOperationQuota(tenantId: string): Promise<McpOperationQuotaSnapshot>;
 
   /**
    * Create-only MCP operation insert (authoritative).
@@ -1225,6 +1285,7 @@ const DEFAULT_TENANT = "ten_default";
 
 export class MemoryStore implements ControlPlaneStore {
   readonly kind = "memory" as const;
+  private readonly mcpOpsLimit: number;
   clients = new Map<string, OAuthClientRecord>();
   ownerPasskeys = new Map<string, OwnerPasskeyRecord>();
   ownerAuthChallenges = new Map<string, OwnerAuthChallenge>();
@@ -1251,6 +1312,20 @@ export class MemoryStore implements ControlPlaneStore {
   workspaceMembers = new Set<string>();
   audits: AuditEvent[] = [];
   migrations = new Set<string>();
+
+  constructor(opts?: McpOpsStoreOptions) {
+    this.mcpOpsLimit = parseMcpOpsMaxPerTenant(opts?.mcpOpsMaxPerTenant);
+  }
+
+  mcpOpsMaxPerTenant(): number {
+    return this.mcpOpsLimit;
+  }
+
+  async getMcpOperationQuota(tenantId: string): Promise<McpOperationQuotaSnapshot> {
+    this.compactMcpOperations(tenantId);
+    const rows = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId).length;
+    return snapshotMcpOperationQuota(rows, this.mcpOpsLimit);
+  }
 
   async ensureBootstrap(): Promise<void> {
     if (!this.principals.has("prin_dev")) {
@@ -1783,18 +1858,32 @@ export class MemoryStore implements ControlPlaneStore {
       .reverse();
   }
 
-  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
-  private enforceMcpOperationQuota(tenantId: string): void {
+  /**
+   * Compact expired terminal rows. Keyed receipts become 30-day tombstones;
+   * keyless rows (and leftover keyless tombstones) are hard-deleted at result TTL
+   * because they protect no idempotency binding.
+   */
+  private compactMcpOperations(tenantId: string): void {
     const now = Date.now();
     const tenantOps = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
     for (const op of tenantOps) {
       const age = mcpOpAgeMs(op, now);
-      // Only hard-delete tombstones past the full idempotency window (30d).
+      const keyed = hasMcpIdempotencyReceipt(op);
+      // Keyless tombstones protect nothing; drop them immediately.
+      if (op.status === "tombstone" && !keyed) {
+        this.mcpOperations.delete(op.operation_id);
+        continue;
+      }
+      // Only hard-delete keyed tombstones past the full idempotency window (30d).
       if (op.status === "tombstone" && age > MCP_OPS_TOMBSTONE_TTL_MS) {
         this.mcpOperations.delete(op.operation_id);
         continue;
       }
       if (isTerminalMcpStatus(op.status) && op.status !== "tombstone" && age > MCP_OPS_RESULT_TTL_MS) {
+        if (!keyed) {
+          this.mcpOperations.delete(op.operation_id);
+          continue;
+        }
         this.mcpOperations.set(op.operation_id, {
           ...op,
           status: "tombstone",
@@ -1812,12 +1901,17 @@ export class MemoryStore implements ControlPlaneStore {
         });
       }
     }
+  }
+
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private enforceMcpOperationQuota(tenantId: string): void {
+    this.compactMcpOperations(tenantId);
     const remaining = [...this.mcpOperations.values()].filter((o) => o.tenant_id === tenantId);
-    if (remaining.length < MCP_OPS_MAX_PER_TENANT) return;
+    if (remaining.length < this.mcpOpsLimit) return;
     // E3: never evict unexpired idempotency receipts under quota pressure.
     // Only hard-expired tombstones (already removed above) free capacity; otherwise
     // reject new distinct operations fail-closed.
-    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${this.mcpOpsLimit}`);
   }
 
   /** Create-only: refuses to overwrite an existing operation_id or idempotency binding. */
@@ -1830,11 +1924,9 @@ export class MemoryStore implements ControlPlaneStore {
   private expireExpiredMcpTombstones(tenantId: string): void {
     const now = Date.now();
     for (const op of [...this.mcpOperations.values()]) {
-      if (
-        op.tenant_id === tenantId &&
-        op.status === "tombstone" &&
-        mcpOpAgeMs(op, now) > MCP_OPS_TOMBSTONE_TTL_MS
-      ) {
+      if (op.tenant_id !== tenantId || op.status !== "tombstone") continue;
+      const keyed = hasMcpIdempotencyReceipt(op);
+      if (!keyed || mcpOpAgeMs(op, now) > MCP_OPS_TOMBSTONE_TTL_MS) {
         this.mcpOperations.delete(op.operation_id);
       }
     }
@@ -1881,7 +1973,7 @@ export class MemoryStore implements ControlPlaneStore {
     tool: string;
     limit?: number;
   }): Promise<McpOperationRecord[]> {
-    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    const limit = Math.max(1, Math.min(this.mcpOpsLimit, Math.trunc(opts.limit ?? this.mcpOpsLimit)));
     return [...this.mcpOperations.values()]
       .filter((op) => op.tenant_id === opts.tenantId && op.principal_id === opts.principalId && op.tool === opts.tool)
       .sort((left, right) => right.created_at.localeCompare(left.created_at) || right.operation_id.localeCompare(left.operation_id))
@@ -2522,12 +2614,27 @@ export interface SqlStatement {
 export class SqlStore implements ControlPlaneStore {
   readonly kind: "d1" | "sqlite";
   private db: SqlDatabase;
+  private readonly mcpOpsLimit: number;
   /** plaintext access/refresh kept only for the lifetime of this isolate when issued here.
    * Lookups always go through hash in SQL. For getAccess we need the plaintext from the
    * Authorization header — we hash it and look up. */
-  constructor(db: SqlDatabase, kind: "d1" | "sqlite" = "d1") {
+  constructor(db: SqlDatabase, kind: "d1" | "sqlite" = "d1", opts?: McpOpsStoreOptions) {
     this.db = db;
     this.kind = kind;
+    this.mcpOpsLimit = parseMcpOpsMaxPerTenant(opts?.mcpOpsMaxPerTenant);
+  }
+
+  mcpOpsMaxPerTenant(): number {
+    return this.mcpOpsLimit;
+  }
+
+  async getMcpOperationQuota(tenantId: string): Promise<McpOperationQuotaSnapshot> {
+    await this.compactMcpOperations(tenantId);
+    const countRow = await this.db
+      .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
+      .bind(tenantId)
+      .first<{ c: number }>();
+    return snapshotMcpOperationQuota(Number(countRow?.c ?? 0), this.mcpOpsLimit);
   }
 
   async ensureBootstrap(): Promise<void> {
@@ -3916,22 +4023,38 @@ export class SqlStore implements ControlPlaneStore {
     return res.results || [];
   }
 
-  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
-  private async enforceMcpOperationQuota(tenantId: string): Promise<void> {
+  /**
+   * Compact expired terminal rows. Keyed receipts become 30-day tombstones;
+   * keyless rows (and leftover keyless tombstones) are hard-deleted.
+   */
+  private async compactMcpOperations(tenantId: string): Promise<void> {
     const now = Date.now();
     const resultCutoff = new Date(now - MCP_OPS_RESULT_TTL_MS).toISOString();
     const tombstoneCutoff = new Date(now - MCP_OPS_TOMBSTONE_TTL_MS).toISOString();
 
-    // Hard-delete ancient tombstones first (idempotency window closed).
+    // Drop keyless tombstones (no binding) and keyed tombstones past the 30d window.
     await this.db
       .prepare(
         `DELETE FROM mcp_operations
-         WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?`,
+         WHERE tenant_id = ? AND status = 'tombstone'
+           AND (idempotency_key IS NULL OR idempotency_key = '' OR updated_at < ?)`,
       )
       .bind(tenantId, tombstoneCutoff)
       .run();
 
-    // Compact terminal results past TTL into idempotency tombstones.
+    // Hard-delete keyless terminal results past TTL — they occupy quota for no replay benefit.
+    await this.db
+      .prepare(
+        `DELETE FROM mcp_operations
+         WHERE tenant_id = ?
+           AND status IN ('completed','failed','denied','cancelled','device_offline')
+           AND updated_at < ?
+           AND (idempotency_key IS NULL OR idempotency_key = '')`,
+      )
+      .bind(tenantId, resultCutoff)
+      .run();
+
+    // Compact keyed terminal results past TTL into idempotency tombstones.
     // Keep payload_hash/idempotency_key columns; clear large result bodies only.
     await this.db
       .prepare(
@@ -3944,22 +4067,29 @@ export class SqlStore implements ControlPlaneStore {
              updated_at = ?
          WHERE tenant_id = ?
            AND status IN ('completed','failed','denied','cancelled','device_offline')
-           AND updated_at < ?`,
+           AND updated_at < ?
+           AND idempotency_key IS NOT NULL
+           AND idempotency_key != ''`,
       )
       .bind(new Date(now).toISOString(), tenantId, resultCutoff)
       .run();
+  }
+
+  /** Compact expired terminal rows; preserve idempotency keys as tombstones. */
+  private async enforceMcpOperationQuota(tenantId: string): Promise<void> {
+    await this.compactMcpOperations(tenantId);
 
     const countRow = await this.db
       .prepare(`SELECT COUNT(*) AS c FROM mcp_operations WHERE tenant_id = ?`)
       .bind(tenantId)
       .first<{ c: number }>();
     const count = Number(countRow?.c ?? 0);
-    if (count < MCP_OPS_MAX_PER_TENANT) return;
+    if (count < this.mcpOpsLimit) return;
 
     // E3: never evict unexpired idempotency receipts (including <30d tombstones)
     // under quota pressure. Ancient tombstones were already hard-deleted above;
     // remaining overflow must fail closed rather than enable side-effect replay.
-    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${MCP_OPS_MAX_PER_TENANT}`);
+    throw new Error(`mcp_operation_quota_exceeded:tenant=${tenantId}:max=${this.mcpOpsLimit}`);
   }
 
   /** Create-only INSERT. Conflict (existing operation_id) fails — never REPLACE. */
@@ -4037,7 +4167,7 @@ export class SqlStore implements ControlPlaneStore {
     tool: string;
     limit?: number;
   }): Promise<McpOperationRecord[]> {
-    const limit = Math.max(1, Math.min(MCP_OPS_MAX_PER_TENANT, Math.trunc(opts.limit ?? MCP_OPS_MAX_PER_TENANT)));
+    const limit = Math.max(1, Math.min(this.mcpOpsLimit, Math.trunc(opts.limit ?? this.mcpOpsLimit)));
     const rows = await this.db
       .prepare(
         `SELECT * FROM mcp_operations
@@ -4080,7 +4210,8 @@ export class SqlStore implements ControlPlaneStore {
     await this.db
       .prepare(
         `DELETE FROM mcp_operations
-         WHERE tenant_id = ? AND status = 'tombstone' AND updated_at < ?`,
+         WHERE tenant_id = ? AND status = 'tombstone'
+           AND (idempotency_key IS NULL OR idempotency_key = '' OR updated_at < ?)`,
       )
       .bind(tenantId, tombstoneCutoff)
       .run();
@@ -5346,8 +5477,15 @@ export class MissingD1Error extends Error {
   }
 }
 
-export function createStore(env: { DB?: D1Database }): ControlPlaneStore {
-  if (env.DB) return new SqlStore(env.DB as unknown as SqlDatabase, "d1");
+export function createStore(env: {
+  DB?: D1Database;
+  MCP_OPS_MAX_PER_TENANT?: string;
+}): ControlPlaneStore {
+  if (env.DB) {
+    return new SqlStore(env.DB as unknown as SqlDatabase, "d1", {
+      mcpOpsMaxPerTenant: env.MCP_OPS_MAX_PER_TENANT,
+    });
+  }
   throw new MissingD1Error();
 }
 

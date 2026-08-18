@@ -82,6 +82,7 @@ export interface Env {
   ALLOW_DYNAMIC_CLIENT_REGISTRATION?: string;
   OWNMESH_ALLOWED_ORIGINS?: string;
   OWNMESH_DEVICE_ROUTE_TIMEOUT_MS?: string;
+  MCP_OPS_MAX_PER_TENANT?: string;
   AUTH_RATE_LIMITER?: RateLimitBinding;
   MCP_RATE_LIMITER?: RateLimitBinding;
   AUTH_IP_RATE_LIMITER?: RateLimitBinding;
