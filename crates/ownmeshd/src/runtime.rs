@@ -73,10 +73,12 @@ use ownmesh_policy::{
     canonical_bounded_tool, evaluate_with_grants, full_access_has_no_hidden_restrictive_rules,
     preset_document, temporary_grant_from_facts, temporary_grant_requires_operation_binding,
     AccessPreset, BoundedToolGrant, BoundedToolGrantType, Decision, ExecutableIdentityBinding,
-    OperationFacts, PolicyDocument, PolicyRule, StoredGrant, TemporaryGrant,
+    OperationFacts, PolicyDocument, PolicyRule, StoredGrant,
     MAX_BOUNDED_TOOL_GRANT_TTL_SECS, MAX_BOUNDED_TOOL_GRANT_USES, TAG_READS_SENSITIVE_LOCATION,
     TAG_WRITES_SENSITIVE_LOCATION,
 };
+#[allow(unused_imports)]
+use ownmesh_policy::TemporaryGrant;
 use ownmesh_profiles::{
     official_adapter_spec, parse_adapter_event_page, AdapterDialect, NativeResume, ProfileRegistry,
     ProfileStatus,
@@ -10024,6 +10026,7 @@ mod broker_intent_tests {
                 idempotency_key: Some("idempotent_elevated_1".into()),
                 max_output_bytes: Some(4_096),
                 elevated: true,
+                detach: false,
                 executable_pin: Some(pin),
                 invocation_pin: None,
             },

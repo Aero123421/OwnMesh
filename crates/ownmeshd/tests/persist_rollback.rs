@@ -322,11 +322,12 @@ async fn corrupt_op_journal_starts_degraded_read_only() {
         .dispatch(ops_methods::SYSTEM_DIAGNOSE, Some(json!({ "workspace_id": null })), &client("local"))
         .await
         .expect("diagnose stays up");
-    assert_eq!(diagnose["overall"], "journal_degraded");
-    assert_eq!(diagnose["journals"]["op_journal"]["status"], "degraded");
-    rt.dispatch(methods::STATUS, None, &client("local"))
+    let diagnosis = diagnose.get("result").unwrap_or(&diagnose);
+    assert_eq!(diagnosis["overall"], "journal_degraded");
+    assert_eq!(diagnosis["journals"]["op_journal"]["status"], "degraded");
+    rt.dispatch(methods::POLICY_SHOW, None, &client("local"))
         .await
-        .expect("status stays up while journal is degraded");
+        .expect("policy.show stays up while journal is degraded");
     let err = rt
         .dispatch(
             methods::OPS_EXEC,

@@ -827,7 +827,7 @@ pub fn run_doctor_cmd(cli: &Cli, args: &DoctorArgs) -> Result<(), ExitCode> {
             );
             return Err(ExitCode::UsageConfig);
         }
-        if observe_daemon(&paths).running == Some(true) {
+        if observe_daemon(&paths).reachable {
             eprintln!(
                 "doctor: stop ownmeshd before repairing the op-journal (local-only; no remote repair)"
             );

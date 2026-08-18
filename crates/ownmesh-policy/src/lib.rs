@@ -793,7 +793,7 @@ impl BoundedToolGrant {
 }
 
 /// Device-local `grants.json` row. Unknown `grant_type` values fail closed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum StoredGrant {
     BoundedTool(BoundedToolGrant),
@@ -1936,7 +1936,7 @@ mod tests {
             "grant_type": "standing_allow",
             "id": "g1",
             "principal_id": "user-1",
-            "expires_unix": 9_999_999_999
+            "expires_unix": 1_700_000_000
         }]);
         let err = serde_json::from_value::<Vec<StoredGrant>>(unknown).expect_err("unknown type");
         assert!(err.to_string().contains("grant_type"), "{err}");
@@ -1945,7 +1945,7 @@ mod tests {
             "id": "g-legacy",
             "capability": "logs.read",
             "principal_id": "user-1",
-            "expires_unix": 9_999_999_999
+            "expires_unix": 1_700_000_000
         }]);
         let loaded: Vec<StoredGrant> = serde_json::from_value(legacy).expect("legacy temporary");
         assert!(loaded[0].as_temporary().is_some());
