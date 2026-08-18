@@ -24,7 +24,10 @@
   correlation past the ordinary 15-minute TTL; the hard cap is 24 hours or
   cancel. Agent reconnect does not start a second spawn of an in-process
   job (that would fail the op-journal as CONFLICT); if the live loop is
-  gone the completion is parked and published on the next session.
+  gone the completion is parked and published on the next session. Every
+  live-loop turn publishes every parked row (not only the inbound
+  correlation), so a dropped `Notify` wakeup cannot strand a detached
+  result until the 24h expiry.
   Completion is retrieved with `ownmesh_get_operation`. Concurrent
   detached jobs per device are capped fail-closed. The synchronous
   `timeout_ms` clamp is configurable via Worker env `MCP_MAX_TIMEOUT_MS`

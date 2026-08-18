@@ -1304,6 +1304,27 @@ fn absorb_orphan_completions(
     Ok(drained)
 }
 
+/// Persist parked reconnect completions and publish every row. Callers must
+/// not drop the returned list: a different inbound correlation must still
+/// send every parked `operation.result`.
+async fn publish_orphan_completions(
+    socket: &mut AgentSocket,
+    config: &AgentTransportConfig,
+    state: &mut AgentTransportState,
+) -> Result<Vec<CompletedReply>, String> {
+    let drained = absorb_orphan_completions(config, state)?;
+    for completed in &drained {
+        send_cached_result(socket, config, state, completed).await?;
+    }
+    Ok(drained)
+}
+
+fn orphan_already_published(correlation: &str, published: &[CompletedReply]) -> bool {
+    published
+        .iter()
+        .any(|row| row.correlation_id == correlation)
+}
+
 fn completion_receipt(reply: &CompletedReply) -> CompletedReply {
     let status = reply
         .payload
@@ -1473,9 +1494,7 @@ async fn connect_and_run(
         remote_routing_enabled = runtime.is_some(),
         "Agent WebSocket authenticated and ready"
     );
-    for completed in absorb_orphan_completions(config, state)? {
-        send_cached_result(&mut socket, config, state, &completed).await?;
-    }
+    publish_orphan_completions(&mut socket, config, state).await?;
     live_loop(&mut socket, config, runtime, state, shutdown).await
 }
 
@@ -1750,6 +1769,9 @@ async fn live_loop(
     // stable correlation with a fresh message id/sequence.
 
     loop {
+        // Drain before select! so a Notify wakeup dropped by a competing
+        // branch cannot strand a detached completion until the next handshake.
+        publish_orphan_completions(socket, config, state).await?;
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1778,9 +1800,7 @@ async fn live_loop(
                 send_cached_result(socket, config, state, &finished.completed).await?;
             }
             () = config.orphan_notify.notified() => {
-                for completed in absorb_orphan_completions(config, state)? {
-                    send_cached_result(socket, config, state, &completed).await?;
-                }
+                // Wake only; the next loop turn drains and publishes every row.
             }
             message = socket.next() => {
                 let message = message
@@ -1991,8 +2011,11 @@ async fn handle_live_frame(
                 .correlation_id
                 .as_deref()
                 .ok_or_else(|| "operation.request requires correlation_id".to_owned())?;
-            absorb_orphan_completions(config, state)?;
+            let absorbed = publish_orphan_completions(socket, config, state).await?;
             if let Some(completed) = state.completed(correlation).cloned() {
+                if orphan_already_published(correlation, &absorbed) {
+                    return Ok(());
+                }
                 return send_cached_result(socket, config, state, &completed).await;
             }
             // Duplicate / crash-resume: recover the immutable envelope from the outbox.
@@ -2197,6 +2220,8 @@ async fn handle_live_frame(
 
             // In-process exact-once: do not start a second side effect while one runs
             // (Duplicate redelivery or crash-outbox resume during the same session).
+            // Skip is safe only because the original task parks its completion
+            // and live_loop publishes every parked row on each turn.
             {
                 let mut active = active_dispatches.lock().await;
                 if !active.insert(correlation.to_owned()) {
@@ -4227,6 +4252,45 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn absorb_orphan_completions_returns_every_parked_row() {
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_orphan_all").unwrap();
+        let config = AgentTransportConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            ws_url: agent_connect_url("http://127.0.0.1:1", device.as_str()).unwrap(),
+            origin: "http://127.0.0.1:1".into(),
+            device_id: device.clone(),
+            credential: SecretString::new("redacted-test-credential"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        config.remember_orphan_completion(CompletedReply {
+            correlation_id: "op_a".into(),
+            operation_id: "op_a".into(),
+            payload: json!({ "status": "completed" }),
+        });
+        config.remember_orphan_completion(CompletedReply {
+            correlation_id: "op_b".into(),
+            operation_id: "op_b".into(),
+            payload: json!({ "status": "completed" }),
+        });
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        let drained = absorb_orphan_completions(&config, &mut state).unwrap();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().any(|row| row.correlation_id == "op_a"));
+        assert!(drained.iter().any(|row| row.correlation_id == "op_b"));
+        assert!(state.completed("op_a").is_some());
+        assert!(state.completed("op_b").is_some());
+        assert!(orphan_already_published("op_a", &drained));
+        assert!(orphan_already_published("op_b", &drained));
+        assert!(!orphan_already_published("op_other", &drained));
     }
 
     #[test]
