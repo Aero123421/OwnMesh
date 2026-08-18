@@ -279,6 +279,45 @@ fn part_cancel_only_deletes_its_own_private_part_and_publish_refuses_overwrite()
 }
 
 #[test]
+fn publish_replace_requires_exact_destination_hash_and_is_atomic() {
+    let dir = tempdir().unwrap();
+    let plan = make_plan(b"hello").with_overwrite_expected_sha256(Some(digest(b"do not replace"))).unwrap();
+    let store = JournalStore::open(dir.path().join("state"), JournalLimits::default()).unwrap();
+    let mut sink = PartFileSink::create(&store, &plan, 1, 0).unwrap();
+    let mut receiver = TransferReceiver::new(plan.clone(), "owner-a", 1, 1, u64::MAX).unwrap();
+    receiver
+        .receive(&mut sink, TransferChunk::new(0, 0, b"hello".to_vec()).unwrap())
+        .unwrap();
+    drop(sink);
+    let journal = receiver.journal_snapshot();
+    let lease = store.acquire(&plan, 1, u64::MAX).unwrap();
+    store.save(&lease, &journal).unwrap();
+    let destination = dir.path().join("output.bin");
+    std::fs::write(&destination, b"wrong prior").unwrap();
+    let mismatch = store
+        .publish_completed(&plan, &full_access_workspace(dir.path()))
+        .unwrap_err();
+    assert!(
+        matches!(
+            mismatch,
+            TransferError::DestinationHashMismatch { ref expected, ref actual }
+                if expected == &digest(b"do not replace") && actual == &digest(b"wrong prior")
+        ),
+        "{mismatch:?}"
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), b"wrong prior");
+    std::fs::write(&destination, b"do not replace").unwrap();
+    store
+        .publish_completed(&plan, &full_access_workspace(dir.path()))
+        .unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"hello");
+    store
+        .publish_completed(&plan, &full_access_workspace(dir.path()))
+        .expect("replay after successful replace must keep the new artifact");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"hello");
+}
+
+#[test]
 fn published_receipt_cleanup_removes_only_the_exact_generation_part() {
     let dir = tempdir().unwrap();
     let (store, plan, part) = persist_published_receipt(dir.path(), b"published", 1);

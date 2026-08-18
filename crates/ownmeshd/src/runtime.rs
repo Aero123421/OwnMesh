@@ -2817,9 +2817,11 @@ path or install the tool so detection and execution agree",
 
     fn transfer_error(error: TransferError) -> IpcError {
         let code = match error {
-            TransferError::DestinationExists | TransferError::Replay | TransferError::Gap => {
-                app_error::CONFLICT
-            }
+            TransferError::DestinationExists
+            | TransferError::DestinationMissing
+            | TransferError::DestinationHashMismatch { .. }
+            | TransferError::Replay
+            | TransferError::Gap => app_error::CONFLICT,
             TransferError::InvalidBinding(_)
             | TransferError::InvalidPlan(_)
             | TransferError::ChunkTooLarge

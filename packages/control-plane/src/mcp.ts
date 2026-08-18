@@ -1542,6 +1542,11 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
         source_workspace_id: str, destination_workspace_id: str,
         source_path: str, destination_path: str,
         ttl_seconds: { type: "integer", minimum: 60, maximum: 86_400, default: 3600, description: "Immutable transfer-plan lifetime; connection tickets remain <=60 seconds." },
+        overwrite_expected_sha256: {
+          type: "string",
+          pattern: "^[a-f0-9]{64}$",
+          description: "If set, the destination file must exist and match this SHA-256 at plan, preflight, and publish. Replacement is content-bound; there is no blind force/overwrite flag.",
+        },
         idempotency_key: { type: "string", minLength: 1, maxLength: 256 },
       },
       required: ["source_device_id", "destination_device_id", "source_workspace_id", "destination_workspace_id", "source_path", "destination_path", "idempotency_key"],
@@ -3953,6 +3958,7 @@ export type TransferPlanMeta = {
   source_plan_id?: string;
   source_size_bytes?: number;
   source_sha256?: string;
+  overwrite_expected_sha256?: string;
   send_idempotency_key?: string;
   source_send_revalidate_operation_id?: string;
   failure_phase?: string;
@@ -4023,6 +4029,7 @@ function transferMeta(data: Record<string, unknown> | null | undefined): Transfe
   if (value.cleanup_generation !== undefined && (!Number.isSafeInteger(value.cleanup_generation) || Number(value.cleanup_generation) < 0)) return null;
   if (value.source_size_bytes !== undefined && (!Number.isSafeInteger(value.source_size_bytes) || Number(value.source_size_bytes) < 0)) return null;
   if (value.source_sha256 !== undefined && (typeof value.source_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.source_sha256))) return null;
+  if (value.overwrite_expected_sha256 !== undefined && (typeof value.overwrite_expected_sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.overwrite_expected_sha256))) return null;
   if (value.source_send_revalidate_operation_id !== undefined && !transferText(value.source_send_revalidate_operation_id)) return null;
   if (value.failure_phase !== undefined && !(TRANSFER_STATES as readonly string[]).includes(String(value.failure_phase))) return null;
   return value as unknown as TransferPlanMeta;
@@ -4059,6 +4066,7 @@ function publicTransferMeta(meta: TransferPlanMeta, opts?: {
     source_device_id: meta.source_device_id, destination_device_id: meta.destination_device_id,
     source_workspace_id: meta.source_workspace_id, destination_workspace_id: meta.destination_workspace_id,
     plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: meta.expires_at,
+    ...(meta.overwrite_expected_sha256 ? { overwrite_expected_sha256: meta.overwrite_expected_sha256 } : {}),
     ...(opts?.operationId ? { operation_id: opts.operationId } : {}),
     ...((nextAction === "poll" || nextAction === "wait_for_source" || nextAction === "wait_for_destination")
       ? { poll_after_ms: TRANSFER_POLL_AFTER_MS } : {}),
@@ -4105,6 +4113,7 @@ function immutableTransferGrantAction(meta: TransferPlanMeta, contentSha256: str
     source_workspace_version: meta.source_workspace_version, destination_workspace_version: meta.destination_workspace_version,
     content_sha256: contentSha256, size_bytes: sizeBytes,
     expires_at: meta.expires_at,
+    ...(meta.overwrite_expected_sha256 ? { overwrite_expected_sha256: meta.overwrite_expected_sha256 } : {}),
   };
 }
 
@@ -4169,6 +4178,7 @@ async function buildTransferStartOperation(opts: {
     workspace_id: workspaceId, workspace_version: workspaceVersion, epoch: meta.epoch, fence: meta.fence,
     grant_id: meta.transfer_id, grant_operation_id: meta.transfer_id,
     grant_payload_sha256: opts.grantPayloadHash, grant_expires_at_unix: Math.floor(Date.parse(meta.expires_at) / 1000),
+    ...(meta.overwrite_expected_sha256 ? { overwrite_expected_sha256: meta.overwrite_expected_sha256 } : {}),
   };
   const canonical = {
     ...finalTransferAction(meta, meta.source_sha256!, meta.source_size_bytes!),
@@ -4570,6 +4580,7 @@ async function buildTransferPreflightOperation(opts: {
     coordinator_request_id: opts.operationId, workspace_version: workspaceVersion,
   };
   if (!source) args.plan_sha256 = m.plan_sha256;
+  if (!source && m.overwrite_expected_sha256) args.overwrite_expected_sha256 = m.overwrite_expected_sha256;
   // A second source preflight is the final plan reconstruction boundary.  It
   // reopens and rehashes the file under the common send grant before its
   // cached ephemeral key is signed for the ticketable plan identity.
@@ -4903,10 +4914,16 @@ export async function handleMcp(
       const destinationDeviceId = transferText(args.destination_device_id);
       const sourceWorkspaceId = transferText(args.source_workspace_id);
       const destinationWorkspaceId = transferText(args.destination_workspace_id);
-      const sourcePath = transferPath(args.source_path); const destinationPath = transferPath(args.destination_path);
+      const sourcePath = transferPath(args.source_path);       const destinationPath = transferPath(args.destination_path);
       const idem = transferText(args.idempotency_key);
       const ttlSeconds = args.ttl_seconds === undefined ? TRANSFER_DEFAULT_TTL_MS / 1000 : Number(args.ttl_seconds);
+      const overwriteExpected = args.overwrite_expected_sha256 === undefined
+        ? undefined
+        : (typeof args.overwrite_expected_sha256 === "string" && /^[a-f0-9]{64}$/.test(args.overwrite_expected_sha256)
+          ? args.overwrite_expected_sha256
+          : null);
       if (!sourceDeviceId || !destinationDeviceId || !sourceWorkspaceId || !destinationWorkspaceId || !sourcePath || !destinationPath || !idem || !Number.isSafeInteger(ttlSeconds) || ttlSeconds < TRANSFER_MIN_TTL_MS / 1000 || ttlSeconds > TRANSFER_MAX_TTL_MS / 1000) return mcpError(id, -32602, "invalid transfer plan arguments");
+      if (overwriteExpected === null) return mcpError(id, -32602, "overwrite_expected_sha256 must be 64 lowercase hex characters");
       if (sourceDeviceId === destinationDeviceId || idem.length > 256) return mcpError(id, -32602, "invalid transfer plan binding");
       const [source, destination, sourceWs, destinationWs] = await Promise.all([
         store.assertDeviceOperableForMcp(sourceDeviceId, rec.principal, rec.tenant_id),
@@ -4915,15 +4932,15 @@ export async function handleMcp(
         store.assertWorkspaceOperableForMcp(destinationWorkspaceId, destinationDeviceId, rec.principal, rec.tenant_id),
       ]);
       if (!source.ok || !destination.ok || !sourceWs.ok || !destinationWs.ok) return mcpError(id, -32004, "transfer_not_available");
-      const meta: TransferPlanMeta = { transfer_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, source_path: sourcePath, destination_path: destinationPath, source_workspace_version: sourceWs.workspace.version, destination_workspace_version: destinationWs.workspace.version, epoch: 1, fence: 1, ttl_seconds: ttlSeconds, expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(), state: "planned" };
-      const canonical = { capability: "transfer.plan", action: "transfer.plan", tool: name, principal_id: rec.principal, tenant_id: rec.tenant_id, principal_credential_generation: principalCredentialGeneration, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, facts: { source_path: sourcePath, destination_path: destinationPath, ttl_seconds: ttlSeconds } };
+      const meta: TransferPlanMeta = { transfer_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, source_path: sourcePath, destination_path: destinationPath, source_workspace_version: sourceWs.workspace.version, destination_workspace_version: destinationWs.workspace.version, epoch: 1, fence: 1, ttl_seconds: ttlSeconds, expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(), state: "planned", ...(overwriteExpected ? { overwrite_expected_sha256: overwriteExpected } : {}) };
+      const canonical = { capability: "transfer.plan", action: "transfer.plan", tool: name, principal_id: rec.principal, tenant_id: rec.tenant_id, principal_credential_generation: principalCredentialGeneration, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, facts: { source_path: sourcePath, destination_path: destinationPath, ttl_seconds: ttlSeconds, ...(overwriteExpected ? { overwrite_expected_sha256: overwriteExpected } : {}) } };
       const claimed = await store.claimMcpOperationByIdempotency({
         operation_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, tool: name, status: "pending", summary: "transfer plan created", data: { [TRANSFER_META_KEY]: meta }, truncated: false, next_cursor: null, approval_required: false, warnings: injectWarnings, correlation_id: correlation, payload_hash: await hashCanonicalAction(canonical), idempotency_key: idem, workspace_id: sourceWorkspaceId, expires_at: meta.expires_at, claim_version: 1, action: canonical, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso(),
       });
       const plan = trackedFromRecord(claimed.op); tracker.put(plan);
       const priorMeta = transferMeta(plan.data);
       if (!priorMeta || priorMeta.tenant_id !== rec.tenant_id || priorMeta.principal_id !== rec.principal) return mcpError(id, -32004, "transfer_not_available");
-      if (claimed.outcome === "existing" && (priorMeta.source_device_id !== sourceDeviceId || priorMeta.destination_device_id !== destinationDeviceId || priorMeta.source_workspace_id !== sourceWorkspaceId || priorMeta.destination_workspace_id !== destinationWorkspaceId || priorMeta.source_path !== sourcePath || priorMeta.destination_path !== destinationPath || priorMeta.ttl_seconds !== ttlSeconds)) return mcpError(id, -32602, "idempotency_key is bound to a different transfer plan");
+      if (claimed.outcome === "existing" && (priorMeta.source_device_id !== sourceDeviceId || priorMeta.destination_device_id !== destinationDeviceId || priorMeta.source_workspace_id !== sourceWorkspaceId || priorMeta.destination_workspace_id !== destinationWorkspaceId || priorMeta.source_path !== sourcePath || priorMeta.destination_path !== destinationPath || priorMeta.ttl_seconds !== ttlSeconds || priorMeta.overwrite_expected_sha256 !== overwriteExpected)) return mcpError(id, -32602, "idempotency_key is bound to a different transfer plan");
       return mcpResult(id, toolContent({ ...plan, data: { transfer: publicTransferMeta(priorMeta) } }));
     }
 

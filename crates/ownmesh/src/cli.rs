@@ -554,7 +554,7 @@ pub enum TransferCmd {
     Plan {
         /// Source workspace-relative path (no absolute paths, traversal, or backslashes).
         source: String,
-        /// Destination workspace-relative path (no overwrite/force mode exists).
+        /// Destination workspace-relative path. Existing destinations fail closed unless `--overwrite-expected-sha256` matches.
         dest: String,
         /// Source enrolled device id.
         #[arg(long)]
@@ -574,6 +574,9 @@ pub enum TransferCmd {
         /// Immutable plan lifetime in seconds (60–86400; default 3600).
         #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(60..=86_400))]
         ttl_seconds: u32,
+        /// SHA-256 of the existing destination file (64 lowercase hex). When set, replacement is allowed only if the destination matches this hash at preflight and publish. Blind force/overwrite is not available.
+        #[arg(long)]
+        overwrite_expected_sha256: Option<String>,
     },
     /// Start or resume a previously planned transfer. One call advances as far as
     /// authoritative state allows; the response includes typed next_action semantics.

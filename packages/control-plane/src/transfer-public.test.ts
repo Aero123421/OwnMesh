@@ -46,6 +46,12 @@ test("public transfer tools have strict schemas and plan stores no payload mater
   assert.equal(rejected.error?.message, "invalid transfer plan arguments");
   const unknown = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-3", overwrite: true });
   assert.equal(unknown.error?.message, "unknown transfer argument");
+  const badHash = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-4", overwrite_expected_sha256: "not-a-hash" });
+  assert.equal(badHash.error?.message, "overwrite_expected_sha256 must be 64 lowercase hex characters");
+  const bound = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-5", overwrite_expected_sha256: "ab".repeat(32) });
+  assert.equal((bound.result!.structuredContent!.data.transfer as Record<string, unknown>).overwrite_expected_sha256, "ab".repeat(32));
+  const rebound = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-5", overwrite_expected_sha256: "cd".repeat(32) });
+  assert.equal(rebound.error?.message, "idempotency_key is bound to a different transfer plan");
 });
 
 test("send dispatches only source authenticated preflight and cancel fences state", async () => {
@@ -529,6 +535,11 @@ test("durable plan grant identity survives epoch/fence advance but binds immutab
   const first = await transferGrantPayloadHash(meta, "a".repeat(64), 7);
   assert.equal(await transferGrantPayloadHash({ ...meta, epoch: 2, fence: 2 }, "a".repeat(64), 7), first);
   assert.notEqual(await transferGrantPayloadHash({ ...meta, destination_path: "out/other.bin" }, "a".repeat(64), 7), first);
+  assert.notEqual(
+    await transferGrantPayloadHash({ ...meta, overwrite_expected_sha256: "ab".repeat(32) }, "a".repeat(64), 7),
+    first,
+    "content-bound replacement must change the grant identity",
+  );
 });
 
 test("durable transfer-start outbox recursively excludes bearer, JTI, and ephemeral fields", () => {

@@ -320,6 +320,106 @@ impl WorkspaceRoot {
         })
     }
 
+    /// Publish a verified private transfer file over an existing destination
+    /// only when the destination currently hashes to `expected_sha256`.
+    /// A destination that already holds `new_sha256` is a no-op replay.
+    pub fn publish_retained_transfer_file_replace_if_hash(
+        &self,
+        rel: impl AsRef<Path>,
+        source: &File,
+        expected_sha256: &str,
+        new_sha256: &str,
+    ) -> FsResult<()> {
+        if self.enforce {
+            return custody::publish_retained_file_replace_if_hash(
+                self,
+                rel.as_ref(),
+                source,
+                expected_sha256,
+                new_sha256,
+            );
+        }
+        let destination = self.resolve(rel)?;
+        if !destination.exists() {
+            return Err(FsError::NotFound(destination));
+        }
+        let actual = hash_file(&destination)?;
+        if actual == new_sha256 {
+            return Ok(());
+        }
+        if actual != expected_sha256 {
+            return Err(FsError::HashMismatch {
+                path: destination,
+                expected: expected_sha256.to_string(),
+                actual,
+            });
+        }
+        let source_path = custody::final_path_of_handle(source).map_err(|source| FsError::Io {
+            path: Some(destination.clone()),
+            source,
+        })?;
+        let token = {
+            let mut hasher = Sha256::new();
+            hasher.update(destination.to_string_lossy().as_bytes());
+            hasher.update(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos().to_le_bytes())
+                    .unwrap_or([0; 16]),
+            );
+            hex::encode(hasher.finalize())
+        };
+        let tmp = match destination.parent() {
+            Some(parent) => parent.join(format!(
+                ".ownmesh-xfer-{}.tmp",
+                token.get(..16).unwrap_or(token.as_str())
+            )),
+            None => destination.with_extension(format!(
+                "ownmesh-xfer-{}.tmp",
+                token.get(..16).unwrap_or(token.as_str())
+            )),
+        };
+        fs::hard_link(source_path, &tmp).map_err(|source| FsError::Io {
+            path: Some(tmp.clone()),
+            source,
+        })?;
+        let actual_again = hash_file(&destination).map_err(|error| {
+            let _ = fs::remove_file(&tmp);
+            error
+        })?;
+        if actual_again != expected_sha256 {
+            let _ = fs::remove_file(&tmp);
+            return Err(FsError::HashMismatch {
+                path: destination,
+                expected: expected_sha256.to_string(),
+                actual: actual_again,
+            });
+        }
+        fs::rename(&tmp, &destination).map_err(|source| {
+            let _ = fs::remove_file(&tmp);
+            FsError::Io {
+                path: Some(destination.clone()),
+                source,
+            }
+        })
+    }
+
+    /// SHA-256 a workspace-relative regular file. Missing paths return [`FsError::NotFound`].
+    pub fn hash_regular_file(&self, rel: impl AsRef<Path>) -> FsResult<String> {
+        if self.enforce {
+            let (mut file, path) = custody::open_regular_file_read(self, rel.as_ref())?;
+            return custody::hash_open_file(&mut file, &path);
+        }
+        let path = self.resolve(rel)?;
+        if !path.exists() {
+            return Err(FsError::NotFound(path));
+        }
+        if !path.is_file() {
+            return Err(FsError::NotAFile(path));
+        }
+        hash_file(&path)
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root

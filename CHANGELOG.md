@@ -13,6 +13,11 @@
   long-poll until a terminal snapshot. Concurrent waiters per tenant are
   capped; excess calls return the current snapshot with
   `mcp_get_operation_wait_saturated` and do not persist that warning.
+- `ownmesh_transfer_plan` accepts optional `overwrite_expected_sha256`. When
+  set, destination replacement is allowed only if the existing file matches
+  that hash at preflight and publish. Blind `force`/`overwrite` remains
+  rejected. `ownmesh transfer plan --overwrite-expected-sha256` exposes the
+  same bound.
 
 ## v1.2.13 — Runtime reliability and cross-platform repair
 

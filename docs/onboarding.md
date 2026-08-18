@@ -174,7 +174,8 @@ never executed on the machine running the CLI.
 
 Device labels are replaced by the supplied bounded label set. Rename and label
 updates are owner-scoped and reject revoked devices. Transfer paths are
-workspace-relative; no overwrite/force mode exists.
+workspace-relative. Replacement requires `overwrite_expected_sha256` matching
+the current destination content; there is no blind overwrite/force mode.
 
 `ownmesh mcp serve --stdio` speaks bounded JSONL on stdin/stdout and forwards to
 the configured authenticated MCP issuer. Protocol replies are the only stdout
