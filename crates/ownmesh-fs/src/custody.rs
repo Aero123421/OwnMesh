@@ -627,10 +627,7 @@ pub(crate) fn publish_retained_file_replace_if_hash(
     expected_sha256: &str,
     new_sha256: &str,
 ) -> FsResult<()> {
-    let (mut dest, dest_path) = match open_regular_file_read(ws, rel) {
-        Ok(opened) => opened,
-        Err(err) => return Err(err),
-    };
+    let (mut dest, dest_path) = open_regular_file_read(ws, rel)?;
     let actual = hash_open_file(&mut dest, &dest_path)?;
     drop(dest);
     if actual == new_sha256 {

@@ -383,9 +383,8 @@ impl WorkspaceRoot {
             path: Some(tmp.clone()),
             source,
         })?;
-        let actual_again = hash_file(&destination).map_err(|error| {
+        let actual_again = hash_file(&destination).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
-            error
         })?;
         if actual_again != expected_sha256 {
             let _ = fs::remove_file(&tmp);
