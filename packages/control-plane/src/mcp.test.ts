@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   MCP_TOOLS,
   MCP_PROTOCOL_VERSION,
+  MCP_GET_OPERATION_WAIT_SATURATED_WARNING,
   OFFICIAL_PROFILE_CATALOG,
   OperationTracker,
   handleMcp,
@@ -19,6 +20,7 @@ import {
   makeEnvelope,
   sanitizeMcpArgs,
   normalizeSystemDiagnosis,
+  __setGetOperationWaiterCapForTest,
 } from "./mcp.ts";
 import {
   applyMcpOperationResult,
@@ -150,6 +152,10 @@ test("MCP catalog has annotations and separates shell from structured run", () =
   assert.equal(list.annotations.readOnlyHint, true);
   assert.equal(list.annotations.idempotentHint, true);
   assert.equal(list.annotations.openWorldHint, false);
+
+  const getOp = MCP_TOOLS.find((t) => t.name === "ownmesh_get_operation")!;
+  const getOpProps = getOp.inputSchema.properties as Record<string, { maximum?: number }>;
+  assert.equal(getOpProps.wait_ms?.maximum, 25_000);
 });
 
 test("MCP ops quota pressure is warned and exposed on system diagnose", async () => {
@@ -2002,5 +2008,105 @@ test("get_operation lazily expires legacy D1-only pending rows without clobberin
     assert.deepEqual((await store.getMcpOperation("op_legacy_terminal"))?.data, { entries: [] });
   } finally {
     (Date as unknown as { now: () => number }).now = originalNow;
+  }
+});
+
+test("get_operation wait_ms long-polls until a terminal snapshot or the wait window", async () => {
+  const { store, token } = await authed();
+  await store.putMcpOperation({
+    operation_id: "op_wait_complete",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    tool: "ownmesh_fs_stat",
+    status: "pending",
+    summary: "accepted",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  const waiting = callTool(store, token, "ownmesh_get_operation", {
+    operation_id: "op_wait_complete",
+    wait_ms: 1_500,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const marked = await store.updateMcpOperation(
+    "op_wait_complete",
+    { status: "completed", summary: "done", data: { ok: true } },
+    ["pending"],
+  );
+  assert.ok(marked);
+  const done = await waiting;
+  assert.equal(done.body.result?.structuredContent?.status, "completed");
+  assert.deepEqual(
+    (done.body.result?.structuredContent?.data as { ok?: boolean } | undefined),
+    { ok: true },
+  );
+
+  await store.putMcpOperation({
+    operation_id: "op_wait_timeout",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    tool: "ownmesh_fs_stat",
+    status: "pending",
+    summary: "still pending",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  const started = Date.now();
+  const timed = await callTool(store, token, "ownmesh_get_operation", {
+    operation_id: "op_wait_timeout",
+    wait_ms: 250,
+  });
+  const elapsed = Date.now() - started;
+  assert.equal(timed.body.result?.structuredContent?.status, "pending");
+  assert.ok(elapsed >= 200, `waited only ${elapsed}ms`);
+  assert.ok(elapsed < 1_200, `waited ${elapsed}ms`);
+});
+
+test("get_operation wait_ms saturates to an immediate snapshot with a warning", async () => {
+  const { store, token } = await authed();
+  await store.putMcpOperation({
+    operation_id: "op_wait_sat",
+    tenant_id: "ten_default",
+    principal_id: "prin_dev",
+    tool: "ownmesh_fs_stat",
+    status: "pending",
+    summary: "accepted",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: false,
+    warnings: [],
+    policy_authority: "ownmesh_device",
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+  __setGetOperationWaiterCapForTest(0);
+  try {
+    const started = Date.now();
+    const saturated = await callTool(store, token, "ownmesh_get_operation", {
+      operation_id: "op_wait_sat",
+      wait_ms: 2_000,
+    });
+    assert.ok(Date.now() - started < 400);
+    assert.equal(saturated.body.result?.structuredContent?.status, "pending");
+    assert.ok(
+      (saturated.body.result?.structuredContent?.warnings as string[] | undefined)
+        ?.includes(MCP_GET_OPERATION_WAIT_SATURATED_WARNING),
+    );
+    assert.deepEqual((await store.getMcpOperation("op_wait_sat"))?.warnings, []);
+  } finally {
+    __setGetOperationWaiterCapForTest();
   }
 });

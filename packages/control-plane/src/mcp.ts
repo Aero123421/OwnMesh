@@ -98,6 +98,14 @@ export const MCP_MAX_TIMEOUT_MS = 300_000;
 /** Cloudflare-safe production fast-path wait; never follows the command timeout. */
 export const MCP_SYNC_WAIT_MS = 1_000;
 /**
+ * Optional `ownmesh_get_operation.wait_ms` ceiling. Stays inside typical Worker
+ * / client request budgets so a waiter cannot pin an isolate for a command timeout.
+ */
+export const MCP_GET_OPERATION_WAIT_MAX_MS = 25_000;
+/** Isolate-local cap on concurrent get_operation waiters per tenant. */
+export const MCP_GET_OPERATION_WAITERS_MAX_PER_TENANT = 16;
+export const MCP_GET_OPERATION_WAIT_SATURATED_WARNING = "mcp_get_operation_wait_saturated";
+/**
  * Aggregate stdout+stderr budget for a single durable MCP result hop.
  * Kept under the 256 KiB durable data_json ceiling (with JSON framing).
  * Larger command output must be requested with a smaller cap or re-run is refused;
@@ -1463,12 +1471,19 @@ export const MCP_TOOLS: readonly McpToolDef[] = [
   {
     name: "ownmesh_get_operation",
     description:
-      "Poll compact status/result for a long-running or approval-gated operation. Set include_diagnostics only for bounded non-secret troubleshooting metadata.",
+      "Read compact status/result for a long-running or approval-gated operation. Optional wait_ms long-polls until a terminal snapshot or the wait window elapses. Set include_diagnostics only for bounded non-secret troubleshooting metadata.",
     inputSchema: {
       type: "object",
       properties: {
         operation_id: str,
         device_id: str,
+        wait_ms: {
+          type: "integer",
+          minimum: 0,
+          maximum: MCP_GET_OPERATION_WAIT_MAX_MS,
+          description:
+            "Optional long-poll window in milliseconds. 0 or omitted returns the current snapshot immediately. Clamped to 25000.",
+        },
         include_diagnostics: {
           type: "boolean",
           default: false,
@@ -2370,6 +2385,34 @@ const SYNC_WAIT_NON_TERMINAL = new Set([
   "cancel_requested",
 ]);
 const MCP_SYNC_WAIT_POLL_MS = 100;
+const getOperationWaitersByTenant = new Map<string, number>();
+let getOperationWaiterCap = MCP_GET_OPERATION_WAITERS_MAX_PER_TENANT;
+
+export function __setGetOperationWaiterCapForTest(cap?: number): void {
+  getOperationWaitersByTenant.clear();
+  getOperationWaiterCap =
+    typeof cap === "number" && Number.isSafeInteger(cap) && cap >= 0
+      ? cap
+      : MCP_GET_OPERATION_WAITERS_MAX_PER_TENANT;
+}
+
+function tryAcquireGetOperationWaiter(tenantId: string): boolean {
+  const held = getOperationWaitersByTenant.get(tenantId) ?? 0;
+  if (held >= getOperationWaiterCap) return false;
+  getOperationWaitersByTenant.set(tenantId, held + 1);
+  return true;
+}
+
+function releaseGetOperationWaiter(tenantId: string): void {
+  const held = getOperationWaitersByTenant.get(tenantId) ?? 0;
+  if (held <= 1) getOperationWaitersByTenant.delete(tenantId);
+  else getOperationWaitersByTenant.set(tenantId, held - 1);
+}
+
+function clampGetOperationWaitMs(raw: unknown): number {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return 0;
+  return Math.min(MCP_GET_OPERATION_WAIT_MAX_MS, Math.max(0, Math.floor(raw)));
+}
 
 /**
  * Briefly observe only the authoritative operation row. This helper never
@@ -2382,9 +2425,11 @@ async function waitForAuthoritativeCompletion(
   tracker: OperationTracker,
   initial: TrackedOperation,
   requestedMs: number | undefined,
+  maxMs = MCP_SYNC_WAIT_MS,
 ): Promise<TrackedOperation> {
+  const ceiling = Math.max(0, Math.floor(maxMs));
   const waitMs = typeof requestedMs === "number" && Number.isFinite(requestedMs)
-    ? Math.min(MCP_SYNC_WAIT_MS, Math.max(0, Math.floor(requestedMs)))
+    ? Math.min(ceiling, Math.max(0, Math.floor(requestedMs)))
     : 0;
   if (waitMs === 0 || !SYNC_WAIT_NON_TERMINAL.has(initial.status)) return initial;
 
@@ -2398,7 +2443,10 @@ async function waitForAuthoritativeCompletion(
     );
     try {
       const fresh = await loadOp(store, tracker, current.operation_id);
-      if (fresh) current = fresh;
+      if (fresh) {
+        const reconciled = await reconcileExpiredOperationOnPoll(store, tracker, fresh);
+        current = reconciled || fresh;
+      }
     } catch {
       break;
     }
@@ -5313,7 +5361,29 @@ export async function handleMcp(
           return mcpError(id, -32004, gate.error, { device_id: tracked.device_id, operation_id: oid });
         }
       }
-      return mcpResult(id, toolContent(tracked, args.include_diagnostics === true));
+      const waitMs = clampGetOperationWaitMs(args.wait_ms);
+      const waitWarnings: string[] = [];
+      if (waitMs > 0 && SYNC_WAIT_NON_TERMINAL.has(tracked.status)) {
+        if (tryAcquireGetOperationWaiter(rec.tenant_id)) {
+          try {
+            tracked = await waitForAuthoritativeCompletion(
+              store,
+              tracker,
+              tracked,
+              waitMs,
+              MCP_GET_OPERATION_WAIT_MAX_MS,
+            );
+          } finally {
+            releaseGetOperationWaiter(rec.tenant_id);
+          }
+        } else {
+          waitWarnings.push(MCP_GET_OPERATION_WAIT_SATURATED_WARNING);
+        }
+      }
+      const snapshot = waitWarnings.length
+        ? { ...tracked, warnings: [...(tracked.warnings || []), ...waitWarnings] }
+        : tracked;
+      return mcpResult(id, toolContent(snapshot, args.include_diagnostics === true));
     }
 
     if (name === "ownmesh_cancel_operation") {

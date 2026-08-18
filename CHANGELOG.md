@@ -9,6 +9,10 @@
   hard-deleted at the 7-day result TTL instead of occupying a 30-day
   idempotency tombstone. Fail-closed `OWNMESH_E_MCP_OP_QUOTA` and keyed
   receipt retention are unchanged.
+- `ownmesh_get_operation` accepts optional `wait_ms` (clamped to 25s) to
+  long-poll until a terminal snapshot. Concurrent waiters per tenant are
+  capped; excess calls return the current snapshot with
+  `mcp_get_operation_wait_saturated` and do not persist that warning.
 
 ## v1.2.13 — Runtime reliability and cross-platform repair
 
