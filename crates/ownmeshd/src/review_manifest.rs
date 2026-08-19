@@ -531,6 +531,9 @@ mod tests {
             len: 1,
             device: None,
             inode: None,
+            path_device: None,
+            path_inode: None,
+            link_target: None,
             policy_kind: "structured".into(),
         }
     }

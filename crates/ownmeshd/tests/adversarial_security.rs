@@ -56,6 +56,29 @@ fn tempdir() -> std::io::Result<tempfile::TempDir> {
     }
     Ok(dir)
 }
+
+#[cfg(unix)]
+fn compile_multicall_fixture(output_dir: &std::path::Path) -> std::path::PathBuf {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-fixtures/executable-multicall.rs");
+    let output = output_dir.join(if cfg!(windows) {
+        "ownmesh-security-multicall-fixture.exe"
+    } else {
+        "ownmesh-security-multicall-fixture"
+    });
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let status = std::process::Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("-C")
+        .arg("debuginfo=0")
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .expect("launch rustc for deterministic multicall fixture");
+    assert!(status.success(), "compile deterministic multicall fixture");
+    output
+}
 use tokio::sync::Mutex;
 
 fn now_unix() -> i64 {
@@ -540,15 +563,101 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
 
     std::fs::remove_file(&alias).unwrap();
     symlink("/bin/sh", &alias).unwrap();
-    // IPC approve is fail-closed; exercise pin revalidation via direct runtime dispatch.
-    let approved = direct_human_approve(&runtime, &approval_id, false, None)
+    // The approved action named this exact proxy entry. Retargeting it must
+    // fail closed; silently substituting the canonical backing changes argv0
+    // semantics and is not the action the human approved.
+    let denied = direct_human_approve(&runtime, &approval_id, false, None)
         .await
-        .expect("approval must execute the safely pinned canonical echo target");
-    assert_eq!(approved["approval_required"], false);
+        .expect_err("retargeted invocation must require fresh authorization");
+    match denied {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::EXECUTABLE_IDENTITY_DRIFT);
+            assert!(message.contains("OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"));
+        }
+        other => panic!("unexpected drift error: {other:?}"),
+    }
     assert!(
         !shell_marker.exists(),
         "the swapped shell alias must never be reopened or executed"
     );
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_delay_never_falls_back_to_multicall_backing_argv0() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    let client = named_client(endpoint, paths.runtime_dir.clone(), "ownmesh");
+    let backing = compile_multicall_fixture(dir.path());
+    let alias = dir.path().join("echo");
+    let canary = dir.path().join("unapproved-multicall-branch");
+    symlink(&backing, &alias).unwrap();
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask structured, deny raw".into()),
+            rules: vec![
+                PolicyRule {
+                    id: "deny-raw".into(),
+                    decision: Decision::Deny,
+                    priority: 100,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("raw_shell".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "ask-structured".into(),
+                    decision: Decision::Ask,
+                    priority: 10,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("structured".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+            ],
+        });
+    }
+
+    let pending = client
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": alias,
+                "args": ["shell", canary.to_string_lossy()],
+                "idempotency_key": "approval-multicall-recreate",
+            })),
+        )
+        .await
+        .expect("enqueue harmless echo proxy semantics");
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    // Same target and content, but a different proxy directory entry. The old
+    // fallback launched `backing` directly, changing argv0 and selecting the
+    // fixture's canary branch.
+    let recreated = dir.path().join("echo-recreated");
+    symlink(&backing, &recreated).unwrap();
+    std::fs::rename(&recreated, &alias).unwrap();
+    let denied = direct_human_approve(&runtime, &approval_id, false, None)
+        .await
+        .expect_err("recreated proxy must require fresh authorization");
+    assert_remote_code(denied, app_error::EXECUTABLE_IDENTITY_DRIFT);
+    assert!(!canary.exists(), "unapproved multicall branch must not run");
 
     server.request_shutdown();
     let _ = handle.await;
@@ -561,8 +670,8 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
 /// request program with the canonical backing, so a rustup-style proxy would
 /// spawn the backing binary under the wrong argv[0] and fail. Review pinning
 /// already keeps both paths (`invocation_pin`/`pin`); command execution must
-/// not disagree. The swap test above proves the pinned canonical fallback is
-/// still used when the invocation changes.
+/// not disagree. The swap test above proves a changed invocation is rejected
+/// instead of falling back to a different argv0.
 #[cfg(unix)]
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -608,10 +717,12 @@ async fn command_run_retains_invocation_path_and_pins_both_identities() {
         });
     }
 
-    // A rustup-style proxy: a symlink whose *name* carries the dispatch
-    // semantics, backing a real native binary.
-    let alias = dir.path().join("cargo-proxy");
-    symlink("/bin/echo", &alias).unwrap();
+    // A deterministic multicall proxy: the approved basename `echo` selects
+    // its harmless branch, while launching the backing under its own basename
+    // would interpret argv[1] as a subcommand selector.
+    let backing = compile_multicall_fixture(dir.path());
+    let alias = dir.path().join("echo");
+    symlink(&backing, &alias).unwrap();
 
     let pending = client
         .call(
@@ -619,7 +730,7 @@ async fn command_run_retains_invocation_path_and_pins_both_identities() {
             Some(json!({
                 "kind": "structured",
                 "program": alias.to_string_lossy(),
-                "args": ["--version"],
+                "args": ["normal-proxy"],
                 "idempotency_key": "invocation-path-retain-1",
             })),
         )
@@ -663,21 +774,23 @@ async fn command_run_retains_invocation_path_and_pins_both_identities() {
         );
         assert!(std::path::Path::new(&backing_pin.path).is_absolute());
         assert_eq!(backing_pin.policy_kind, "structured");
+        let facts = record.facts.as_ref().expect("approval facts");
+        assert_eq!(
+            facts
+                .invocation_identity
+                .as_ref()
+                .expect("invocation identity fact")
+                .path,
+            alias.to_string_lossy()
+        );
     }
 
-    // Deny the deferred approval so nothing runs.
-    let human = ClientIdentity::new(format!("user:{}", current_os_user_id()), "0.1.0");
-    {
-        let mut guard = runtime.lock().await;
-        guard
-            .dispatch(
-                methods::APPROVAL_DENY,
-                Some(json!({ "id": approval_id })),
-                &human,
-            )
-            .await
-            .expect("deny deferred approval");
-    }
+    let approved = direct_human_approve(&runtime, &approval_id, false, None)
+        .await
+        .expect("unchanged proxy invocation must run");
+    assert_eq!(approved["approval_required"], false);
+    assert_eq!(approved["result"]["exit_code"], 0);
+    assert_eq!(approved["result"]["stdout"], "normal-proxy\n");
 
     server.request_shutdown();
     let _ = handle.await;
@@ -2031,7 +2144,7 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
         .expect_err("content-swapped executable must fail closed");
     match denied {
         IpcError::Remote { code, message } => {
-            assert_eq!(code, app_error::POLICY_DENIED, "{message}");
+            assert_eq!(code, app_error::EXECUTABLE_IDENTITY_DRIFT, "{message}");
             let lower = message.to_ascii_lowercase();
             assert!(
                 lower.contains("identity")
@@ -2340,6 +2453,9 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
         len: 64,
         device: Some(1),
         inode: Some(2),
+        path_device: Some(1),
+        path_inode: Some(2),
+        link_target: None,
         policy_kind: kind.into(),
     };
     {

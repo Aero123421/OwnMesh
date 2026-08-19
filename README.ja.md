@@ -13,7 +13,7 @@ OwnMesh は AI オーケストレータでも、ベンダー管理の中央 SaaS
 
 ## ステータス
 
-**v1.2.15 正式安定版** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
+**v1.2.16 正式安定版** — Apache-2.0 モノレポ（Rust + Cloudflare Worker）。
 
 公開する CLI サーフェスに、意図的な未実装項目は残っていません。機械検査される
 正本は [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json)
@@ -30,6 +30,8 @@ OwnMesh は AI オーケストレータでも、ベンダー管理の中央 SaaS
 - device の enroll/list/show/rename/labels/key rotation/revoke。
 - ローカル実行と認証済み remote exec/session。remote mutation は明示的な
   idempotency key が必須で、ローカル実行へ黙ってフォールバックしません。
+- 承認済み command は invocation entry、backing executable、classification、
+  `argv[0]` を厳密に拘束し、実行ファイルの drift は spawn 前に拒否します。
 - 9種類の AI CLI profile と、scan/list/show/login/test/start/resume。
 - approval list/show/watch/approve/deny、policy の検査・preset・構造化 rule 更新、
   lockdown/unlock、token revoke。
@@ -167,7 +169,7 @@ minisign 署名、GitHub build provenance を生成します。
 実装済みです。Linux は root 実機 receipt 取得済みですが、macOS/Windows の
 native release receipt と、公開 MCP → installed Agent → broker の E8 receipt は
 未取得です。これらの経路を実機証明済みとは表現しません。Authenticode、Apple
-notarization、MSI/NSIS、macOS native package は v1.2.15 の対象外です。
+notarization、MSI/NSIS、macOS native package は v1.2.16 の対象外です。
 
 ChatGPT の動的登録、OAuth、passkey return、refresh、MCP link は手動の live
 互換 receipt があります。local workerd suite は再現可能ですが、外部 ChatGPT を
@@ -195,7 +197,7 @@ pnpm -r lint
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [ロードマップ](./docs/ROADMAP.md) — 次に何をやり、何をやらないか
-- [v1.2.15 release notes](./docs/RELEASE_NOTES_v1.2.15.md)
+- [v1.2.16 release notes](./docs/RELEASE_NOTES_v1.2.16.md)
 - [目標仕様](./OWNMESH_SPECIFICATION.ja.md) — 将来ロードマップの正本
 
 ## ライセンス

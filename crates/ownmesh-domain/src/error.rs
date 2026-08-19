@@ -91,6 +91,8 @@ pub enum ErrorCode {
     Authorization,
     #[serde(rename = "OWNMESH_E_POLICY_DENIED")]
     PolicyDenied,
+    #[serde(rename = "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT")]
+    ExecutableIdentityDrift,
 
     // exit 5
     #[serde(rename = "OWNMESH_E_DEVICE_OFFLINE")]
@@ -137,6 +139,7 @@ impl ErrorCode {
             Self::Authentication => "OWNMESH_E_AUTHENTICATION",
             Self::Authorization => "OWNMESH_E_AUTHORIZATION",
             Self::PolicyDenied => "OWNMESH_E_POLICY_DENIED",
+            Self::ExecutableIdentityDrift => "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT",
             Self::DeviceOffline => "OWNMESH_E_DEVICE_OFFLINE",
             Self::Timeout => "OWNMESH_E_TIMEOUT",
             Self::Cancelled => "OWNMESH_E_CANCELLED",
@@ -166,6 +169,7 @@ impl ErrorCode {
             "OWNMESH_E_AUTHENTICATION" => Ok(Self::Authentication),
             "OWNMESH_E_AUTHORIZATION" => Ok(Self::Authorization),
             "OWNMESH_E_POLICY_DENIED" => Ok(Self::PolicyDenied),
+            "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT" => Ok(Self::ExecutableIdentityDrift),
             "OWNMESH_E_DEVICE_OFFLINE" => Ok(Self::DeviceOffline),
             "OWNMESH_E_TIMEOUT" => Ok(Self::Timeout),
             "OWNMESH_E_CANCELLED" => Ok(Self::Cancelled),
@@ -194,7 +198,9 @@ impl ErrorCode {
             | Self::UnsupportedProtocol
             | Self::Config => ExitCode::UsageConfig,
             Self::Authentication => ExitCode::Authentication,
-            Self::Authorization | Self::PolicyDenied => ExitCode::Authorization,
+            Self::Authorization | Self::PolicyDenied | Self::ExecutableIdentityDrift => {
+                ExitCode::Authorization
+            }
             Self::DeviceOffline => ExitCode::DeviceOffline,
             Self::Timeout | Self::Cancelled | Self::Expired => ExitCode::TimeoutCancelled,
             Self::Conflict
@@ -382,6 +388,14 @@ mod tests {
         let err = DomainError::new(ErrorCode::Expired, "expired");
         assert_eq!(err.exit_code(), ExitCode::TimeoutCancelled);
         assert_eq!(err.code.as_str(), "OWNMESH_E_EXPIRED");
+    }
+
+    #[test]
+    fn executable_identity_drift_requires_fresh_authorization() {
+        let code = ErrorCode::parse("OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT").unwrap();
+        assert_eq!(code, ErrorCode::ExecutableIdentityDrift);
+        assert_eq!(code.exit_code(), ExitCode::Authorization);
+        assert!(!code.retryable());
     }
 
     #[test]
