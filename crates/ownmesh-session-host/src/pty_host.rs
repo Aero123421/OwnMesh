@@ -881,9 +881,11 @@ fn terminate_child_tree(
         {
             if let Some(pid) = known_pid.or_else(|| child.process_id()) {
                 match macos_process_state(pid) {
-                    Ok(MacosProcessState::Absent)
-                    | Ok(MacosProcessState::Zombie)
-                    | Ok(MacosProcessState::Exiting(_)) => return Ok(()),
+                    Ok(
+                        MacosProcessState::Absent
+                        | MacosProcessState::Zombie
+                        | MacosProcessState::Exiting(_),
+                    ) => return Ok(()),
                     Ok(MacosProcessState::Live(_)) | Err(_) => {}
                 }
             } else {
