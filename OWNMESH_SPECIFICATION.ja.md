@@ -2051,7 +2051,7 @@ agent -> server: ready(capabilities, profiles_summary)
 
 - Windows: `%APPDATA%\OwnMesh\config.toml`、state は `%LOCALAPPDATA%\OwnMesh`。
 - macOS: `~/Library/Application Support/OwnMesh/`。
-- Linux: `$XDG_CONFIG_HOME/ownmesh`、`$XDG_STATE_HOME/ownmesh`、`$XDG_RUNTIME_DIR/ownmesh`。
+- Linux: `$XDG_CONFIG_HOME/ownmesh`、`$XDG_STATE_HOME/ownmesh`、`$XDG_RUNTIME_DIR/ownmesh`（未設定時は owner-only の `/run/user/<uid>/ownmesh` が既にあればそれを使う）。
 
 ## 23.2 分離
 
