@@ -54,8 +54,9 @@ use ownmesh_broker_client::{
 use ownmesh_broker_client::{connect_and_execute_v2, connect_and_execute_v2_cancellable};
 use ownmesh_config::{load_policy, save_policy, OwnMeshPaths, PolicyFile};
 use ownmesh_exec::{
-    classify_from_request_in_dir, pin_executable, resolve_executable_invocation_path,
-    resolve_executable_path, run_command_cancellable, verify_executable_pin, CommandKind,
+    classify_from_request_in_dir, pin_executable, prepare_executable,
+    prepare_executable_with_interpreter, resolve_executable_invocation_path,
+    resolve_executable_path, run_prepared_command_cancellable, verify_executable_pin, CommandKind,
     ExecutablePin, IdempotencyJournal, RunRequest, RunResult, HARD_MAX_TIMEOUT_MS,
 };
 use ownmesh_fs::{
@@ -433,6 +434,11 @@ pub struct ExecParams {
     /// overwritten; absent for raw-shell/legacy requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_pin: Option<ExecutablePin>,
+    /// Server-computed identity of the platform shell used for raw-shell
+    /// requests. The command text remains in `program`; the prepared shell
+    /// object is the only image authorized to interpret it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_pin: Option<ExecutablePin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2216,86 +2222,55 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
     }
 
     async fn execute_exec(&mut self, p: &ExecParams, use_exec_journal: bool) -> IpcResult<Value> {
-        // P0-B review: decide the exact spawn path *before* re-classification.
-        // When the invocation path is pinned separately (proxy executables
-        // such as rustup's `cargo`, whose argv[0] filename drives dispatch),
-        // it is authoritative for the spawn only while it still matches its
-        // pin. A retargeted symlink between approval and spawn falls back to
-        // the pinned canonical backing (verified below) — the changed
-        // invocation is never reopened or executed, preserving the documented
-        // TOCTOU property that a swapped structured symlink must not become a
-        // shell.
         let cwd = p.cwd.as_deref().map(Path::new);
-        let execution_program = if let Some(invocation_pin) = &p.invocation_pin {
-            if verify_executable_pin(Path::new(&p.program), invocation_pin).is_ok() {
-                p.program.clone()
-            } else {
-                p.executable_pin
-                    .as_ref()
-                    .map(|pin| pin.path.clone())
-                    .unwrap_or_else(|| p.program.clone())
-            }
-        } else {
-            p.executable_pin
-                .as_ref()
-                .map(|pin| pin.path.clone())
-                .unwrap_or_else(|| p.program.clone())
-        };
-        // Re-resolve executable aliases immediately before execution. In
-        // particular, an approval delay must not let a previously structured
-        // symlink become a shell — the re-classification runs against the
-        // exact path that will be spawned, never the changed alias.
-        let current_kind =
-            classify_from_request_in_dir(p.kind.as_deref(), &execution_program, &p.args, cwd);
-        let approved_kind = CommandKind::parse_requested(p.policy_kind.as_deref());
-        if matches!(current_kind, CommandKind::RawShell)
-            && !matches!(approved_kind, CommandKind::RawShell)
-        {
-            return Err(IpcError::Remote {
-                code: app_error::POLICY_DENIED,
-                message: "command classification changed to raw_shell before execution; request must be re-authorized".into(),
-            });
-        }
-        // Fail closed when the pinned executable identity/content drifted (TOCTOU).
-        if let Some(pin) = &p.executable_pin {
-            let pin_path = Path::new(&pin.path);
-            // Prefer the pinned path; fall back to the request program only when equal.
-            let check_path = if p.program == pin.path {
-                Path::new(&p.program)
-            } else {
-                pin_path
-            };
-            if let Err(err) = verify_executable_pin(check_path, pin) {
-                return Err(IpcError::Remote {
-                    code: app_error::POLICY_DENIED,
-                    message: format!(
-                        "executable identity changed before execution; request must be re-authorized ({err})"
-                    ),
-                });
-            }
-            if current_kind.as_str() != pin.policy_kind {
-                return Err(IpcError::Remote {
-                    code: app_error::POLICY_DENIED,
-                    message:
-                        "command classification drifted from pinned policy_kind before execution"
-                            .into(),
-                });
-            }
-        } else if matches!(approved_kind, CommandKind::Structured)
-            && Path::new(&p.program).is_absolute()
-        {
-            // Structured absolute executables must always carry a pin after enqueue/allow.
-            return Err(IpcError::Remote {
-                code: app_error::POLICY_DENIED,
-                message:
-                    "structured executable missing identity pin; request must be re-authorized"
-                        .into(),
-            });
-        }
-        // `handle_exec` replaced argv executable aliases with the exact invocation
-        // path that was classified and pinned; the canonical backing identity is
-        // separately pinned. Do not reopen the original symlink/PATH alias.
         let kind = CommandKind::parse_requested(p.kind.as_deref());
+        let prepared = match kind {
+            CommandKind::Structured => {
+                let invocation = p.invocation_pin.as_ref().ok_or_else(|| IpcError::Remote {
+                    code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                    message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: structured invocation pin is missing; request must be re-authorized".into(),
+                })?;
+                let backing = p.executable_pin.as_ref().ok_or_else(|| IpcError::Remote {
+                    code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                    message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: structured backing pin is missing; request must be re-authorized".into(),
+                })?;
+                prepare_executable_with_interpreter(
+                    Path::new(&p.program),
+                    invocation,
+                    backing,
+                    p.shell_pin.as_ref(),
+                    Some(&self.paths.runtime_dir),
+                )
+            }
+            CommandKind::RawShell => {
+                let shell = p.shell_pin.as_ref().ok_or_else(|| IpcError::Remote {
+                    code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                    message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: raw-shell interpreter pin is missing; request must be re-authorized".into(),
+                })?;
+                prepare_executable(
+                    Path::new(&shell.path),
+                    shell,
+                    shell,
+                    Some(&self.paths.runtime_dir),
+                )
+            }
+        }
+        .map_err(|_| IpcError::Remote {
+            code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+            message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: invocation identity changed; request must be re-authorized".into(),
+        })?;
+        // Re-classify only after preparation has bound the exact approved
+        // invocation/backing object. Never substitute a canonical backing for
+        // a drifted proxy; any such drift has already returned the typed error.
+        let current_kind =
+            classify_from_request_in_dir(p.kind.as_deref(), &p.program, &p.args, cwd);
+        let approved_kind = CommandKind::parse_requested(p.policy_kind.as_deref());
+        if current_kind != approved_kind {
+            return Err(IpcError::Remote {
+                code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: command classification changed; request must be re-authorized".into(),
+            });
+        }
 
         let _detached_guard = if p.detach {
             Some(acquire_detached_slot()?)
@@ -2335,7 +2310,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         let env = sanitize_exec_env(&p.env)?;
         let req = RunRequest {
             kind,
-            program: execution_program,
+            program: p.program.clone(),
             args: p.args.clone(),
             cwd: p.cwd.as_ref().map(PathBuf::from),
             env,
@@ -2349,14 +2324,18 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // that transaction's in-memory rollback.
         let cancel = self.active_cancel.clone();
         let result: RunResult = if use_exec_journal {
-            Box::pin(run_command_cancellable(
+            Box::pin(run_prepared_command_cancellable(
                 &req,
+                prepared,
                 Some(&mut self.exec_journal),
                 cancel,
             ))
             .await
         } else {
-            Box::pin(run_command_cancellable(&req, None, cancel)).await
+            Box::pin(run_prepared_command_cancellable(
+                &req, prepared, None, cancel,
+            ))
+            .await
         }
         .map_err(|e| {
             let code = match &e {
@@ -2877,6 +2856,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         // Never trust client-supplied pins / policy classification.
         p.executable_pin = None;
         p.invocation_pin = None;
+        p.shell_pin = None;
         p.policy_kind = None;
         if p.elevated
             && (self.policy.preset != AccessPreset::FullAccess
@@ -2932,12 +2912,10 @@ full_user_access/full_access for arbitrary commands",
             }
         }
         let cwd = p.cwd.as_deref().map(Path::new);
+        let requested_kind = CommandKind::parse_requested(p.kind.as_deref());
         let mut structured_unresolvable = false;
         let mut pinned_invocation: Option<(PathBuf, PathBuf)> = None;
-        if matches!(
-            CommandKind::parse_requested(p.kind.as_deref()),
-            CommandKind::Structured
-        ) {
+        if matches!(requested_kind, CommandKind::Structured) {
             // P1-D review: resolve every structured program to its exact
             // launchable path. The old code silently fell back to the bare
             // name when resolution failed, and the Unix spawn path then ran
@@ -2996,23 +2974,22 @@ path or install the tool so detection and execution agree",
         // program that resolved but is *not* a native binary (shell/script
         // payload) was reclassified raw above and skips this block.
         if let Some((invocation, backing)) = pinned_invocation {
-            if matches!(kind, CommandKind::Structured) {
-                p.executable_pin =
-                    Some(pin_executable(Path::new(&backing), kind).map_err(|e| {
-                        IpcError::Remote {
-                            code: app_error::POLICY_DENIED,
-                            message: format!("unable to pin structured executable identity: {e}"),
-                        }
-                    })?);
-                p.invocation_pin =
-                    Some(pin_executable(Path::new(&invocation), kind).map_err(|e| {
-                        IpcError::Remote {
-                            code: app_error::POLICY_DENIED,
-                            message: format!("unable to pin structured invocation identity: {e}"),
-                        }
-                    })?);
-            }
-        } else if matches!(kind, CommandKind::Structured) {
+            p.executable_pin =
+                Some(
+                    pin_executable(Path::new(&backing), kind).map_err(|e| IpcError::Remote {
+                        code: app_error::POLICY_DENIED,
+                        message: format!("unable to pin executable identity: {e}"),
+                    })?,
+                );
+            p.invocation_pin = Some(pin_executable(Path::new(&invocation), kind).map_err(|e| {
+                IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!("unable to pin invocation identity: {e}"),
+                }
+            })?);
+        } else if matches!(requested_kind, CommandKind::Structured)
+            && matches!(kind, CommandKind::Structured)
+        {
             let program_path = Path::new(&p.program);
             if program_path.is_absolute() {
                 p.executable_pin =
@@ -3024,6 +3001,20 @@ path or install the tool so detection and execution agree",
                     );
             }
         }
+        if matches!(kind, CommandKind::RawShell) {
+            #[cfg(windows)]
+            let shell_path = PathBuf::from(ownmesh_exec::windows_system_cmd_exe(
+                std::env::var("SystemRoot").ok().as_deref(),
+            ));
+            #[cfg(not(windows))]
+            let shell_path = PathBuf::from("/bin/sh");
+            p.shell_pin = Some(pin_executable(&shell_path, CommandKind::RawShell).map_err(
+                |error| IpcError::Remote {
+                    code: app_error::POLICY_DENIED,
+                    message: format!("unable to pin raw-shell interpreter identity: {error}"),
+                },
+            )?);
+        }
         // Facts carry only server-computed pin identity — never client digests.
         let facts = OperationFacts {
             capability: "command.run".into(),
@@ -3033,7 +3024,16 @@ path or install the tool so detection and execution agree",
             path: p.cwd.clone(),
             workspace_relative: false,
             workspace_id: p.workspace_id.clone(),
-            executable_identity: p.executable_pin.as_ref().map(executable_identity_from_pin),
+            executable_identity: p
+                .executable_pin
+                .as_ref()
+                .or(p.shell_pin.as_ref())
+                .map(executable_identity_from_pin),
+            invocation_identity: p
+                .invocation_pin
+                .as_ref()
+                .or(p.shell_pin.as_ref())
+                .map(executable_identity_from_pin),
             ..Default::default()
         };
         let key = p.idempotency_key.clone();
@@ -3390,12 +3390,22 @@ path or install the tool so detection and execution agree",
         // local verdict wins before repository inspection or process execution.
         let mut aggregate = Decision::Allow;
         let mut reasons = Vec::new();
-        let mut review_programs: Vec<(&String, &ExecutablePin)> = Vec::new();
+        let mut review_programs: Vec<(&String, &ExecutablePin, &ExecutablePin)> = Vec::new();
         if let Some(command) = command.as_ref() {
-            review_programs.push((&command.program, &command.pin));
+            review_programs.push((
+                &command.program,
+                command.invocation_pin.as_ref().unwrap_or(&command.pin),
+                &command.pin,
+            ));
         }
-        review_programs.extend(tests.iter().map(|test| (&test.program, &test.pin)));
-        for (program, pin) in review_programs {
+        review_programs.extend(tests.iter().map(|test| {
+            (
+                &test.program,
+                test.invocation_pin.as_ref().unwrap_or(&test.pin),
+                &test.pin,
+            )
+        }));
+        for (program, invocation_pin, pin) in review_programs {
             let facts = OperationFacts {
                 capability: "command.run".into(),
                 kind: "structured".into(),
@@ -3403,6 +3413,7 @@ path or install the tool so detection and execution agree",
                 path: Some(repo_cwd.to_string_lossy().into_owned()),
                 workspace_relative: true,
                 executable_identity: Some(executable_identity_from_pin(pin)),
+                invocation_identity: Some(executable_identity_from_pin(invocation_pin)),
                 tags: vec!["review".into()],
                 ..Default::default()
             };
@@ -3737,22 +3748,29 @@ path or install the tool so detection and execution agree",
         cwd: &Path,
     ) -> (bool, bool, RunResult) {
         let invocation_pin = command.invocation_pin.as_ref().unwrap_or(&command.pin);
-        let revalidated = verify_executable_pin(Path::new(&command.program), invocation_pin)
-            .is_ok()
-            && verify_executable_pin(Path::new(&command.pin.path), &command.pin).is_ok()
-            && classify_from_request_in_dir(None, &command.program, &command.args, None)
-                == CommandKind::Structured
+        let classified = classify_from_request_in_dir(None, &command.program, &command.args, None)
+            == CommandKind::Structured
             && classify_from_request_in_dir(None, &command.pin.path, &command.args, None)
                 == CommandKind::Structured;
-        if !revalidated {
+        let prepared = if classified {
+            prepare_executable(
+                Path::new(&command.program),
+                invocation_pin,
+                &command.pin,
+                Some(&self.paths.runtime_dir),
+            )
+            .ok()
+        } else {
+            None
+        };
+        let Some(prepared) = prepared else {
             return (
                 false,
                 false,
                 RunResult {
                     exit_code: None,
                     stdout: String::new(),
-                    stderr: "executable pin revalidation failed; review command was not spawned"
-                        .into(),
+                    stderr: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: executable preparation failed; review command was not spawned".into(),
                     stdout_decoding: None,
                     stderr_decoding: None,
                     timed_out: false,
@@ -3762,7 +3780,7 @@ path or install the tool so detection and execution agree",
                     replayed: false,
                 },
             );
-        }
+        };
         let request = RunRequest {
             kind: CommandKind::Structured,
             program: command.program.clone(),
@@ -3774,7 +3792,9 @@ path or install the tool so detection and execution agree",
             max_output_bytes: 96 * 1024,
             idempotency_key: None,
         };
-        match run_command_cancellable(&request, None, self.active_cancel.clone()).await {
+        match run_prepared_command_cancellable(&request, prepared, None, self.active_cancel.clone())
+            .await
+        {
             Ok(result) => {
                 let cancelled = self
                     .active_cancel
@@ -7385,6 +7405,9 @@ fn executable_identity_from_pin(pin: &ExecutablePin) -> ExecutableIdentityBindin
         len: pin.len,
         device: pin.device,
         inode: pin.inode,
+        path_device: pin.path_device,
+        path_inode: pin.path_inode,
+        link_target: pin.link_target.clone(),
         policy_kind: pin.policy_kind.clone(),
     }
 }
@@ -10060,6 +10083,7 @@ mod broker_intent_tests {
                 detach: false,
                 executable_pin: Some(pin),
                 invocation_pin: None,
+                shell_pin: None,
             },
         )
     }
@@ -12487,6 +12511,9 @@ mod journal_lifecycle_tests {
             len: 7,
             device: None,
             inode: None,
+            path_device: None,
+            path_inode: None,
+            link_target: None,
             policy_kind: "structured".into(),
         };
         ReviewManifest {

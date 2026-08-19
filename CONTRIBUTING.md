@@ -57,13 +57,15 @@ python scripts/check_release_quality.py
 
 Workspace Rust lints forbid `unsafe_code` and enable Clippy `pedantic` (as warnings elevated to errors in CI via `-D warnings`).
 
-Three crates opt out of the `unsafe_code` forbid because they bind OS APIs
+Four crates opt out of the `unsafe_code` forbid because they bind OS APIs
 directly: `ownmesh-ipc` (peer credentials), `ownmesh-fs` (handle-based path
-custody), and `ownmesh-broker` (Windows SCM and token APIs). Each re-declares
+custody), `ownmesh-broker` (Windows SCM and token APIs), and `ownmesh-exec`
+(Windows code-page FFI plus the descriptor-bound Linux `pre_exec` handoff,
+[ADR 0013](./docs/adr/0013-prepared-executable-custody.md)). Each re-declares
 the workspace Clippy configuration so no lint coverage is lost, and each keeps
 its `unsafe` confined to the platform module named in its `Cargo.toml` comment.
-New `unsafe` outside those three crates is rejected by the compiler; adding a
-fourth exception requires an ADR.
+New `unsafe` outside those four crates is rejected by the compiler; adding a
+fifth exception requires an ADR.
 
 ## Project layout
 

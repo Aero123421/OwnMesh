@@ -57,6 +57,7 @@ export type ErrorCode =
   | "OWNMESH_E_AUTHENTICATION"
   | "OWNMESH_E_AUTHORIZATION"
   | "OWNMESH_E_POLICY_DENIED"
+  | "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"
   | "OWNMESH_E_DEVICE_OFFLINE"
   | "OWNMESH_E_TIMEOUT"
   | "OWNMESH_E_CANCELLED"
@@ -83,6 +84,7 @@ export function errorExitCode(code: ErrorCode): ExitCode {
       return 3;
     case "OWNMESH_E_AUTHORIZATION":
     case "OWNMESH_E_POLICY_DENIED":
+    case "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT":
       return 4;
     case "OWNMESH_E_DEVICE_OFFLINE":
       return 5;

@@ -417,4 +417,7 @@ pub mod app_error {
     /// A requested operation is intentionally unavailable on this OS because
     /// its required custody primitive is not implemented there.
     pub const PLATFORM_UNSUPPORTED: i64 = -32_014;
+    /// An approval-bound executable invocation/backing identity changed before
+    /// the OS image-open step. The caller must request a fresh authorization.
+    pub const EXECUTABLE_IDENTITY_DRIFT: i64 = -32_015;
 }

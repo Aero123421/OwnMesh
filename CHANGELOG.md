@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v1.2.16 — Prepared executable custody
+
+- Approval-bound command execution now retains the exact invocation entry,
+  canonical backing identity, classification, and `argv[0]`. Invocation or
+  backing drift returns `OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT`; the runtime no
+  longer substitutes a canonical backing path for a changed proxy.
+- Generic and review command spawn consume a non-cloneable prepared executable.
+  Linux uses a sealed anonymous image, macOS an owner-only verified snapshot,
+  and Windows target/proxy/ancestor handles held without write/delete sharing
+  until spawn completes. Raw shells prepare the selected interpreter too.
+- Deterministic cross-platform regression fixtures cover proxy deletion,
+  retarget/recreation, backing replacement, atomic and in-place content change,
+  parent-directory replacement, exact `argv[0]`, and zero canary side effects.
+- Executable entry identity is part of policy/approval facts, and the typed
+  drift error is aligned across Rust, IPC/CLI, TypeScript, and JSON schemas.
+  See ADR 0013.
+
 ## v1.2.15 — Service install remediator and runtime-dir alignment
 
 - Linux CLI/updater runtime discovery uses owner-only `/run/user/<uid>/ownmesh`

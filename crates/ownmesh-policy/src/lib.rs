@@ -81,18 +81,27 @@ pub enum AccessPreset {
 /// (those are never issued or matched).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutableIdentityBinding {
-    /// Canonical absolute path inspected when the pin was captured.
+    /// Exact absolute invocation or backing path inspected when captured.
     pub path: String,
     /// Hex SHA-256 of full file contents at pin time.
     pub content_sha256: String,
     /// Byte length at pin time.
     pub len: u64,
-    /// Platform file identity (Unix dev; Windows → None).
+    /// Platform volume/device identity (Unix dev; Windows volume serial).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<u64>,
-    /// Platform file identity (Unix ino; Windows → None).
+    /// Platform file identity (Unix inode; Windows file index).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inode: Option<u64>,
+    /// Identity of the invocation directory entry before following a proxy
+    /// symlink/reparse point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_inode: Option<u64>,
+    /// Exact recorded target for a proxy symlink/reparse point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
     /// Policy classification recorded with the pin (`structured` / `raw_shell`).
     pub policy_kind: String,
 }
@@ -119,12 +128,23 @@ impl ExecutableIdentityBinding {
         {
             return false;
         }
-        // When either side recorded device/inode, both must agree (fail closed on drift).
+        // When either side recorded an object or directory-entry identity, both
+        // must agree (fail closed on drift).
         if (self.device.is_some()
             || other.device.is_some()
             || self.inode.is_some()
-            || other.inode.is_some())
-            && (self.device != other.device || self.inode != other.inode)
+            || other.inode.is_some()
+            || self.path_device.is_some()
+            || other.path_device.is_some()
+            || self.path_inode.is_some()
+            || other.path_inode.is_some()
+            || self.link_target.is_some()
+            || other.link_target.is_some())
+            && (self.device != other.device
+                || self.inode != other.inode
+                || self.path_device != other.path_device
+                || self.path_inode != other.path_inode
+                || self.link_target != other.link_target)
         {
             return false;
         }
@@ -158,9 +178,14 @@ pub struct OperationFacts {
     pub workspace_relative: bool,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Server-captured executable identity (structured `command.run` only).
+    /// Server-captured backing executable or raw-shell interpreter identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_identity: Option<ExecutableIdentityBinding>,
+    /// Server-captured identity of the exact invocation path. This is distinct
+    /// from `executable_identity` when a proxy symlink dispatches by argv0
+    /// while sharing a canonical backing image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_identity: Option<ExecutableIdentityBinding>,
     /// Registered device workspace the path is resolved against.
     ///
     /// `path` for filesystem capabilities is workspace-relative, so the same
@@ -1326,8 +1351,27 @@ mod tests {
             len: 32,
             device: Some(1),
             inode: Some(2),
+            path_device: Some(1),
+            path_inode: Some(2),
+            link_target: None,
             policy_kind: "structured".into(),
         }
+    }
+
+    #[test]
+    fn executable_identity_binding_fails_closed_on_invocation_entry_drift() {
+        let approved = sample_identity("/usr/bin/tool", &"aa".repeat(32));
+        let mut recreated_entry = approved.clone();
+        recreated_entry.path_inode = Some(3);
+        assert!(!approved.matches(&recreated_entry));
+
+        let mut retargeted_proxy = approved.clone();
+        retargeted_proxy.link_target = Some("/opt/other-tool".into());
+        assert!(!approved.matches(&retargeted_proxy));
+
+        let mut incomplete_current = approved.clone();
+        incomplete_current.path_inode = None;
+        assert!(!approved.matches(&incomplete_current));
     }
 
     #[test]
@@ -1675,6 +1719,9 @@ mod tests {
                     len: 1,
                     device: None,
                     inode: None,
+                    path_device: None,
+                    path_inode: None,
+                    link_target: None,
                     policy_kind: "raw_shell".into(),
                 }),
                 workspace_id: None,

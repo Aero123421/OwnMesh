@@ -16,9 +16,15 @@
     clippy::needless_borrows_for_generic_args
 )]
 
+mod prepared;
+
+pub use prepared::{prepare_executable, prepare_executable_with_interpreter, PreparedExecutable};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -149,17 +155,29 @@ const SCRIPT_EXTENSIONS: &[&str] = &[
 /// cannot execute a different payload after human approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutablePin {
-    /// Canonical absolute path that was inspected.
+    /// Exact absolute invocation or backing path that was inspected.
     pub path: String,
     /// Hex SHA-256 of the full file contents at pin time.
     pub content_sha256: String,
     /// Byte length at pin time (fast reject before hashing).
     pub len: u64,
-    /// Platform file identity (Unix dev+ino; Windows unavailable → None).
+    /// Platform volume/device identity (Unix `st_dev`; Windows volume serial).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<u64>,
+    /// Platform file identity (Unix inode; Windows file index).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inode: Option<u64>,
+    /// Identity of the invocation directory entry before symlink/reparse
+    /// traversal. These fields bind proxy semantics as well as the target
+    /// image, so deleting and recreating an otherwise identical proxy still
+    /// requires re-authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_inode: Option<u64>,
+    /// Exact symlink/reparse target recorded for proxy invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
     /// Policy classification recorded with the pin (`structured` / `raw_shell`).
     pub policy_kind: String,
 }
@@ -271,15 +289,19 @@ pub const MAX_EXECUTABLE_PIN_BYTES: u64 = ownmesh_domain::MAX_STRUCTURED_EXECUTA
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Stream SHA-256 of a regular file up to `max_bytes` without unbounded allocation.
-fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResult<String> {
+fn hash_open_file_bounded(
+    file: &mut File,
+    display_path: &Path,
+    expected_len: u64,
+    max_bytes: u64,
+) -> ExecResult<String> {
     if expected_len > max_bytes {
         return Err(ExecError::ResourceLimit(format!(
             "executable exceeds {max_bytes} byte pin budget: {} ({expected_len} bytes)",
-            path.display()
+            display_path.display()
         )));
     }
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
@@ -292,7 +314,7 @@ fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResu
         if total > max_bytes {
             return Err(ExecError::ResourceLimit(format!(
                 "executable exceeded {max_bytes} byte pin budget while hashing: {}",
-                path.display()
+                display_path.display()
             )));
         }
         hasher.update(&buf[..n]);
@@ -305,27 +327,130 @@ fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResu
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn file_has_shebang(file: &mut File) -> ExecResult<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = [0_u8; 2];
+    let read = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(read == 2 && magic == *b"#!")
+}
+
+#[cfg(unix)]
+fn path_entry_identity(path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok((Some(metadata.dev()), Some(metadata.ino())))
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns a valid handle for the duration of the call and the
+    // output structure is fully initialized before it is read.
+    if unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            std::ptr::from_mut(&mut information),
+        )
+    } == 0
+    {
+        return Err(ExecError::Io(std::io::Error::last_os_error()));
+    }
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((
+        Some(u64::from(information.dwVolumeSerialNumber)),
+        Some(index),
+    ))
+}
+
+#[cfg(windows)]
+fn path_entry_identity(path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    windows_handle_identity(&file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_entry_identity(_path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    Ok((None, None))
+}
+
+#[cfg(unix)]
+fn open_file_identity(file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((Some(metadata.dev()), Some(metadata.ino())))
+}
+
+#[cfg(windows)]
+fn open_file_identity(file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    windows_handle_identity(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_file_identity(_file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    Ok((None, None))
+}
+
+fn current_link_target(path: &Path) -> ExecResult<Option<String>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(Some(
+            std::fs::read_link(path)?.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(None)
+}
+
 /// Capture device/inode/content digest for a structured executable path.
 ///
 /// # Errors
 ///
 /// Returns an error when the path cannot be read or is not a regular file.
 pub fn pin_executable(path: &Path, policy_kind: CommandKind) -> ExecResult<ExecutablePin> {
-    let meta = std::fs::metadata(path)?;
+    let (path_device, path_inode) = path_entry_identity(path)?;
+    let link_target = current_link_target(path)?;
+    let mut file = File::open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(ExecError::Journal(format!(
             "executable pin requires a regular file: {}",
             path.display()
         )));
     }
-    let content_sha256 = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES)?;
-    let (device, inode) = file_identity(&meta);
+    let content_sha256 =
+        hash_open_file_bounded(&mut file, path, meta.len(), MAX_EXECUTABLE_PIN_BYTES)?;
+    let (device, inode) = open_file_identity(&file)?;
+    if path_entry_identity(path)? != (path_device, path_inode)
+        || current_link_target(path)? != link_target
+    {
+        return Err(ExecError::Journal(
+            "executable invocation entry changed while pinning; retry authorization".into(),
+        ));
+    }
     Ok(ExecutablePin {
         path: path.to_string_lossy().into_owned(),
         content_sha256,
         len: meta.len(),
         device,
         inode,
+        path_device,
+        path_inode,
+        link_target,
         policy_kind: policy_kind.as_str().to_owned(),
     })
 }
@@ -336,9 +461,57 @@ pub fn pin_executable(path: &Path, policy_kind: CommandKind) -> ExecResult<Execu
 ///
 /// Returns [`ExecError::Journal`] describing the mismatch / IO failure.
 pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
-    let meta = std::fs::metadata(path).map_err(|e| {
+    verify_path_entry_pin(path, pin)?;
+    let mut file = File::open(path).map_err(|e| {
         ExecError::Journal(format!(
             "executable pin revalidation failed for {}: {e}",
+            path.display()
+        ))
+    })?;
+    verify_open_file_pin(&mut file, path, pin)?;
+    verify_path_entry_pin(path, pin)?;
+    Ok(())
+}
+
+fn verify_path_entry_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
+    let actual_link = current_link_target(path).map_err(|error| {
+        ExecError::Journal(format!(
+            "executable invocation entry revalidation failed for {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(any(unix, windows))]
+    if pin.path_device.is_none() || pin.path_inode.is_none() {
+        return Err(ExecError::Journal(
+            "legacy executable pin lacks invocation entry identity; request must be re-authorized"
+                .into(),
+        ));
+    }
+    let actual_identity = path_entry_identity(path).map_err(|error| {
+        ExecError::Journal(format!(
+            "executable invocation identity revalidation failed for {}: {error}",
+            path.display()
+        ))
+    })?;
+    if (pin.path_device.is_some() || pin.path_inode.is_some())
+        && actual_identity != (pin.path_device, pin.path_inode)
+    {
+        return Err(ExecError::Journal(
+            "executable invocation entry identity drifted; request must be re-authorized".into(),
+        ));
+    }
+    if actual_link != pin.link_target {
+        return Err(ExecError::Journal(
+            "executable invocation link target drifted; request must be re-authorized".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_open_file_pin(file: &mut File, path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
+    let meta = file.metadata().map_err(|e| {
+        ExecError::Journal(format!(
+            "executable handle revalidation failed for {}: {e}",
             path.display()
         ))
     })?;
@@ -355,7 +528,7 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
             meta.len()
         )));
     }
-    let (device, inode) = file_identity(&meta);
+    let (device, inode) = open_file_identity(file)?;
     if (pin.device.is_some() || pin.inode.is_some()) && (device != pin.device || inode != pin.inode)
     {
         return Err(ExecError::Journal(
@@ -363,12 +536,13 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
                 .into(),
         ));
     }
-    let digest = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
-        ExecError::Journal(format!(
-            "executable content revalidation failed for {}: {e}",
-            path.display()
-        ))
-    })?;
+    let digest =
+        hash_open_file_bounded(file, path, meta.len(), MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
+            ExecError::Journal(format!(
+                "executable content revalidation failed for {}: {e}",
+                path.display()
+            ))
+        })?;
     if digest != pin.content_sha256 {
         return Err(ExecError::Journal(
             "executable content digest drifted before execution; request must be re-authorized"
@@ -376,7 +550,7 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
         ));
     }
     if pin.policy_kind == CommandKind::Structured.as_str()
-        && (path_has_shebang(path) || path.to_str().is_some_and(script_extension))
+        && (file_has_shebang(file)? || path.to_str().is_some_and(script_extension))
     {
         // A structured pin must never point at a shell/script payload —
         // including a Windows batch shim (`.cmd`/`.bat`), whose file content
@@ -388,17 +562,6 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
         ));
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn file_identity(meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
-    use std::os::unix::fs::MetadataExt;
-    (Some(meta.dev()), Some(meta.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_identity(_meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
-    (None, None)
 }
 
 /// Windows no-extension candidate ordering following `PATHEXT` semantics.
@@ -1877,19 +2040,54 @@ pub async fn run_command(
 /// process tree without waiting for natural exit.
 pub async fn run_command_cancellable(
     req: &RunRequest,
+    journal: Option<&mut IdempotencyJournal>,
+    cancel: Option<watch::Receiver<bool>>,
+) -> ExecResult<RunResult> {
+    run_command_cancellable_inner(req, None, journal, cancel).await
+}
+
+/// Run a command from a consumed, handle-bound executable image.
+///
+/// Unlike [`run_command_cancellable`], this path never resolves `req.program`
+/// as the child image. For a structured request it is retained only as the
+/// approved `argv[0]`; for a raw-shell request it remains the approved command
+/// text while the prepared object is the pinned platform shell.
+pub async fn run_prepared_command_cancellable(
+    req: &RunRequest,
+    prepared: PreparedExecutable,
+    journal: Option<&mut IdempotencyJournal>,
+    cancel: Option<watch::Receiver<bool>>,
+) -> ExecResult<RunResult> {
+    run_command_cancellable_inner(req, Some(prepared), journal, cancel).await
+}
+
+fn capped_request(req: &RunRequest) -> RunRequest {
+    let mut capped = req.clone();
+    capped.max_output_bytes = req.max_output_bytes.clamp(1, HARD_MAX_OUTPUT_BYTES);
+    capped.timeout_ms = req.timeout_ms.map(|ms| ms.clamp(1, HARD_MAX_TIMEOUT_MS));
+    capped
+}
+
+async fn run_command_cancellable_inner(
+    req: &RunRequest,
+    prepared: Option<PreparedExecutable>,
     mut journal: Option<&mut IdempotencyJournal>,
     cancel: Option<watch::Receiver<bool>>,
 ) -> ExecResult<RunResult> {
     // Clamp untrusted ceilings before any allocation or spawn.
-    let max_output_bytes = req.max_output_bytes.clamp(1, HARD_MAX_OUTPUT_BYTES);
-    let timeout_ms = req.timeout_ms.map(|ms| ms.clamp(1, HARD_MAX_TIMEOUT_MS));
-    let mut capped = req.clone();
-    capped.max_output_bytes = max_output_bytes;
-    capped.timeout_ms = timeout_ms;
+    let capped = capped_request(req);
+    let max_output_bytes = capped.max_output_bytes;
 
     // Request validation/building has no external side effect and happens before
     // reserving the key. Spawn remains strictly after the durable marker.
-    let mut cmd = build_command(&capped)?;
+    let mut prepared_command = prepared
+        .map(|image| prepared::build_prepared_command(&capped, image))
+        .transpose()?;
+    let mut ordinary_command = if prepared_command.is_none() {
+        Some(build_command(&capped)?)
+    } else {
+        None
+    };
     if let (Some(key), Some(j)) = (capped.idempotency_key.as_deref(), journal.as_deref_mut()) {
         if let Some(prev) = j.get(key) {
             let mut replayed = prev.clone();
@@ -1905,9 +2103,19 @@ pub async fn run_command_cancellable(
     }
 
     let start = Instant::now();
-    let mut child = cmd
+    let command = if let Some(prepared) = prepared_command.as_mut() {
+        &mut prepared.command
+    } else {
+        ordinary_command
+            .as_mut()
+            .expect("ordinary command exists when no prepared image was supplied")
+    };
+    let mut child = command
         .spawn()
         .map_err(|source| ExecError::Spawn(describe_spawn_error(&req.program, &source)))?;
+    // Snapshot custody only needs to span the OS image-open step. Linux keeps
+    // the descriptor inside the pre-exec closure owned by `Command`.
+    drop(prepared_command);
     let pid = child.id();
 
     if let Some(input) = &capped.stdin {
