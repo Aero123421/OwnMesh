@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.2.15 — Service install remediator and runtime-dir alignment
+
 - Linux CLI/updater runtime discovery uses owner-only `/run/user/<uid>/ownmesh`
   when `XDG_RUNTIME_DIR` is unset, matching the systemd user unit instead of
   falling back to `state_dir/run`. Update worker and nested `ownmesh status`
@@ -17,6 +19,9 @@
   instead of reporting `ok: true`. The shipped user unit also sets
   `StartLimitBurst=5` / `StartLimitIntervalSec=30` so a custody-fail cannot
   restart every three seconds forever. See ADR 0011.
+- Darwin PTY terminate no longer treats a completed `try_wait` as proof of
+  death when the process table still shows the child live, and uses BSD
+  process-group kill syntax.
 
 ## v1.2.14 — Detached commands, hashed overwrite, bounded grants
 
