@@ -916,6 +916,7 @@ pub fn remove_ownmesh_generated_dropins(unit_path: &Path) -> Result<Vec<String>,
 }
 
 #[must_use]
+#[cfg(test)]
 pub fn remaining_userns_forcing_dropins(unit_path: &Path) -> Vec<String> {
     remaining_userns_forcing_dropins_in_dirs(
         unit_path,
@@ -1630,7 +1631,7 @@ fn systemd_user_default_search_dirs() -> Vec<PathBuf> {
 /// same-named files; different-named files apply in lexicographic order —
 /// mirroring systemd's merge semantics). Returns `None` when no unit file is
 /// found anywhere on the search path.
-#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+#[allow(dead_code)] // host search-path observer; probes use isolated or effective
 pub fn observe_unit_hardening(unit_path: &Path) -> Option<ServiceHardening> {
     observe_unit_hardening_in_dirs(unit_path, &systemd_user_search_dirs())
 }
