@@ -5,7 +5,7 @@ OwnMesh は Full Access を正式に提供するため、「操作を禁止す�
 **Threat model:** [`THREAT_MODEL.md`](./THREAT_MODEL.md)  
 **Evidence rule:** each checkbox lists automated tests and/or docs. `harden-07` locks invariants; waived feature depth is marked **W-***.
 
-Legend: ✅ covered by automated tests in v1.2.14 · ⚠ partial / best-effort · ⏸ waived feature depth (invariant may still be locked)
+Legend: ✅ covered by automated tests in v1.2.15 · ⚠ partial / best-effort · ⏸ waived feature depth (invariant may still be locked)
 
 ## 1. Identity と Token
 
