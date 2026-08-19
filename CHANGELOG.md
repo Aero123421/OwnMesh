@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Linux CLI/updater runtime discovery uses owner-only `/run/user/<uid>/ownmesh`
+  when `XDG_RUNTIME_DIR` is unset, matching the systemd user unit instead of
+  falling back to `state_dir/run`. Update worker and nested `ownmesh status`
+  children receive `OWNMESH_CONFIG_DIR` / `OWNMESH_STATE_DIR` /
+  `OWNMESH_RUNTIME_DIR` so a headless shell cannot health-check the wrong
+  socket. See #113.
+
 ## v1.2.14 — Detached commands, hashed overwrite, bounded grants
 
 - Durable MCP operation quota is configurable via Worker env

@@ -546,17 +546,22 @@ fn launch_detached_worker(
             ExitCode::Internal
         })?;
 
+    #[cfg(windows)]
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let spawn = Command::new(&worker)
+    let mut spawn_cmd = Command::new(&worker);
+    spawn_cmd
         .arg("__update-worker")
         .arg("--transaction-id")
         .arg(&transaction.id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-        .spawn();
+        .stderr(Stdio::null());
+    apply_ownmesh_path_env(&mut spawn_cmd, paths);
+    #[cfg(windows)]
+    spawn_cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let spawn = spawn_cmd.spawn();
     let mut child = match spawn {
         Ok(child) => child,
         Err(error) => {
@@ -919,10 +924,19 @@ fn verify_and_restart(
     Ok(())
 }
 
+fn apply_ownmesh_path_env(command: &mut Command, paths: &OwnMeshPaths) {
+    command.env("OWNMESH_CONFIG_DIR", &paths.config_dir);
+    command.env("OWNMESH_STATE_DIR", &paths.state_dir);
+    command.env("OWNMESH_RUNTIME_DIR", &paths.runtime_dir);
+}
+
 fn run_child(program: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    if let Ok(paths) = OwnMeshPaths::discover() {
+        apply_ownmesh_path_env(&mut command, &paths);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("start {}: {error}", program.display()))?;
     if output.status.success() {
@@ -1279,6 +1293,33 @@ mod tests {
     use clap::Parser;
     use ownmesh_update::network_check_allowed;
     use serde_json::Value;
+
+    #[test]
+    fn apply_ownmesh_path_env_pins_all_three_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut command = Command::new("ownmesh");
+        apply_ownmesh_path_env(&mut command, &paths);
+        let env = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("OWNMESH_CONFIG_DIR"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(paths.config_dir.as_os_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("OWNMESH_STATE_DIR"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(paths.state_dir.as_os_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("OWNMESH_RUNTIME_DIR"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(paths.runtime_dir.as_os_str())
+        );
+    }
 
     #[test]
     fn channel_parse_roundtrip_samples() {

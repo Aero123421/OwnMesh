@@ -215,6 +215,8 @@ fn default_runtime_dir() -> ConfigResult<PathBuf> {
     {
         if let Some(xdg) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
             Ok(PathBuf::from(xdg).join("ownmesh"))
+        } else if let Some(runtime) = linux_user_runtime_dir() {
+            Ok(runtime)
         } else {
             Ok(default_state_dir()?.join("run"))
         }
@@ -223,6 +225,32 @@ fn default_runtime_dir() -> ConfigResult<PathBuf> {
     {
         Ok(home_dir()?.join("ownmesh/run"))
     }
+}
+
+/// Owner-only `/run/user/<uid>` when `XDG_RUNTIME_DIR` is unset but the
+/// standard user-runtime directory already exists. Matches the systemd
+/// `--user` unit's `OWNMESH_RUNTIME_DIR` without requiring shell-profile
+/// edits.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_user_runtime_dir() -> Option<PathBuf> {
+    let uid = rustix::process::geteuid().as_raw();
+    let base = PathBuf::from("/run/user").join(uid.to_string());
+    if !trusted_linux_runtime_base(&base, uid) {
+        return None;
+    }
+    let ownmesh = base.join("ownmesh");
+    // Only switch when the systemd-style dir already exists so a headless
+    // install that baked state_dir/run into the unit keeps working.
+    ownmesh.is_dir().then_some(ownmesh)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn trusted_linux_runtime_base(path: &std::path::Path, expected_uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    meta.file_type().is_dir() && meta.uid() == expected_uid && meta.mode() & 0o077 == 0
 }
 
 fn default_cache_dir() -> ConfigResult<PathBuf> {
@@ -263,6 +291,33 @@ mod tests {
         paths.ensure_layout().unwrap();
         assert!(paths.config_file().starts_with(dir.path()));
         assert!(paths.keystore_dir().exists());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn trusted_linux_runtime_base_requires_owner_only_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let uid = rustix::process::geteuid().as_raw();
+        let mode = |bits| std::fs::Permissions::from_mode(bits);
+        std::fs::set_permissions(dir.path(), mode(0o700)).unwrap();
+        assert!(trusted_linux_runtime_base(dir.path(), uid));
+        std::fs::set_permissions(dir.path(), mode(0o755)).unwrap();
+        assert!(!trusted_linux_runtime_base(dir.path(), uid));
+        assert!(!trusted_linux_runtime_base(
+            &dir.path().join("missing"),
+            uid
+        ));
+        assert!(!trusted_linux_runtime_base(dir.path(), uid.wrapping_add(1)));
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, mode(0o700)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            !trusted_linux_runtime_base(&link, uid),
+            "a symlink must not count as the trusted runtime base"
+        );
     }
 
     /// Regression: `ensure_layout` must create owner-only directories even
