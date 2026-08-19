@@ -395,7 +395,7 @@ fn stage_verified_image(
         source.seek(SeekFrom::Start(0))?;
         let mut output = create_snapshot_file(&path)?;
         let mut total = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
         loop {
             let read = source.read(&mut buffer)?;
             if read == 0 {
@@ -431,9 +431,32 @@ fn stage_verified_image(
             ));
         }
         output.seek(SeekFrom::Start(0))?;
+        let staged_identity = open_file_identity(&output)?;
         let directory_handle = File::open(&directory)?;
         directory_handle.sync_all()?;
-        Ok((output, directory_handle))
+        // Do not retain a writable descriptor across posix_spawn. Apart from
+        // unnecessarily broad custody, Unix kernels may reject executing an
+        // image that this process still has open for writing (ETXTBSY).
+        drop(output);
+        let mut image = open_snapshot_file(&path)?;
+        if open_file_identity(&image)? != staged_identity {
+            return Err(ExecError::Journal(
+                "prepared executable snapshot identity changed while reopening read-only".into(),
+            ));
+        }
+        let reopened_digest = super::hash_open_file_bounded(
+            &mut image,
+            invocation_path,
+            backing_pin.len,
+            super::MAX_EXECUTABLE_PIN_BYTES,
+        )?;
+        if reopened_digest != backing_pin.content_sha256 {
+            return Err(ExecError::Journal(
+                "prepared executable snapshot changed while reopening read-only".into(),
+            ));
+        }
+        image.seek(SeekFrom::Start(0))?;
+        Ok((image, directory_handle))
     })();
     let (image, directory_handle) = match staged {
         Ok(handles) => handles,
@@ -455,10 +478,23 @@ fn stage_verified_image(
 fn create_snapshot_file(path: &Path) -> ExecResult<File> {
     use std::os::unix::fs::OpenOptionsExt;
     Ok(OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .mode(0o500)
         .open(path)?)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn open_snapshot_file(path: &Path) -> ExecResult<File> {
+    use rustix::fs::{open, Mode, OFlags};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| ExecError::Io(error.into()))?;
+    Ok(File::from(descriptor))
 }
 
 pub(super) struct PreparedCommand {
@@ -469,6 +505,10 @@ pub(super) struct PreparedCommand {
     _custody: PreparedImage,
 }
 
+#[cfg_attr(
+    not(any(target_os = "linux", windows)),
+    allow(clippy::unnecessary_wraps)
+)]
 pub(super) fn build_prepared_command(
     req: &RunRequest,
     prepared: PreparedExecutable,
@@ -492,15 +532,17 @@ pub(super) fn build_prepared_command(
             }
             let mut command = Command::new(&locked.launcher_path);
             if locked.batch_wrapper {
-                let argv = super::windows_batch_argv(&locked.invocation_path, &req.args)
-                    .map_err(|error| ExecError::Spawn(error.to_string()))?;
-                if argv.first().map(Path::new) != Some(locked.launcher_path.as_path()) {
+                let batch_command_args =
+                    super::windows_batch_argv(&locked.invocation_path, &req.args)
+                        .map_err(|error| ExecError::Spawn(error.to_string()))?;
+                if batch_command_args.first().map(Path::new) != Some(locked.launcher_path.as_path())
+                {
                     return Err(ExecError::Journal(
                         "prepared Windows batch launcher no longer matches its approved interpreter"
                             .into(),
                     ));
                 }
-                command.args(&argv[1..]);
+                command.args(&batch_command_args[1..]);
             } else {
                 command.args(&args);
             }
