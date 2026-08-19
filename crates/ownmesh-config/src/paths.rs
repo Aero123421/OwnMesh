@@ -250,7 +250,10 @@ fn trusted_linux_runtime_base(path: &std::path::Path, expected_uid: u32) -> bool
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
     };
-    meta.file_type().is_dir() && meta.uid() == expected_uid && meta.mode() & 0o077 == 0
+    if !meta.file_type().is_dir() || meta.uid() != expected_uid || meta.mode() & 0o077 != 0 {
+        return false;
+    }
+    true
 }
 
 fn default_cache_dir() -> ConfigResult<PathBuf> {
