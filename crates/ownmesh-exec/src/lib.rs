@@ -2113,9 +2113,11 @@ async fn run_command_cancellable_inner(
     let mut child = command
         .spawn()
         .map_err(|source| ExecError::Spawn(describe_spawn_error(&req.program, &source)))?;
-    // Snapshot custody only needs to span the OS image-open step. Linux keeps
-    // the descriptor inside the pre-exec closure owned by `Command`.
-    drop(prepared_command);
+    // Retain custody until the child exits. On macOS a shebang launch may
+    // return from posix_spawn before the interpreter has reopened the staged
+    // script path; deleting it immediately would turn an approved launch into
+    // a child-side ENOENT. Linux and Windows also benefit from the simpler
+    // invariant that every prepared handle outlives the launched process.
     let pid = child.id();
 
     if let Some(input) = &capped.stdin {
@@ -2132,6 +2134,7 @@ async fn run_command_cancellable_inner(
         collect_bounded_output(&mut child, max_output_bytes, timeout, cancel),
     )
     .await?;
+    drop(prepared_command);
 
     if cancelled {
         // Do not journal a cancelled attempt as a successful side effect; a

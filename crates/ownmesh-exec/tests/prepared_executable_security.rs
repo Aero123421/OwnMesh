@@ -29,6 +29,15 @@ fn request(program: &Path, args: &[&str]) -> RunRequest {
     }
 }
 
+fn false_program() -> &'static Path {
+    let bin = Path::new("/bin/false");
+    if bin.is_file() {
+        bin
+    } else {
+        Path::new("/usr/bin/false")
+    }
+}
+
 fn assert_prepare_refused(
     path: &Path,
     invocation: &ExecutablePin,
@@ -70,7 +79,7 @@ async fn replacement_after_preparation_cannot_change_the_executed_image() {
     let target = temp.path().join("approved-image");
     let replacement = temp.path().join("replacement-image");
     std::fs::copy("/bin/echo", &target).unwrap();
-    std::fs::copy("/bin/false", &replacement).unwrap();
+    std::fs::copy(false_program(), &replacement).unwrap();
     let alias = temp.path().join("approved-proxy");
     symlink(&target, &alias).unwrap();
     let (invocation, backing) = proxy_pins(&alias, CommandKind::Structured);
@@ -99,7 +108,7 @@ async fn in_place_write_after_preparation_cannot_change_the_executed_image() {
     // An open descriptor to the original inode is not enough on Unix: another
     // writer can mutate that inode. The prepared Linux memfd is sealed and the
     // macOS private snapshot is already independent before this write.
-    std::fs::copy("/bin/false", &target).unwrap();
+    std::fs::copy(false_program(), &target).unwrap();
     let result = run_prepared_command_cancellable(
         &request(&target, &["immutable-image-ran"]),
         prepared,
@@ -145,7 +154,7 @@ async fn parent_directory_replacement_after_preparation_is_harmless() {
 
     std::fs::rename(&parent, temp.path().join("moved-approved-parent")).unwrap();
     std::fs::create_dir(&parent).unwrap();
-    std::fs::copy("/bin/false", &target).unwrap();
+    std::fs::copy(false_program(), &target).unwrap();
     let result = run_prepared_command_cancellable(
         &request(&target, &["parent-custody-ran"]),
         prepared,
@@ -178,7 +187,7 @@ fn retargeted_proxy_is_refused_before_spawn() {
     let (invocation, backing) = proxy_pins(&alias, CommandKind::Structured);
 
     std::fs::remove_file(&alias).unwrap();
-    symlink("/bin/false", &alias).unwrap();
+    symlink(false_program(), &alias).unwrap();
     assert_prepare_refused(&alias, &invocation, &backing, temp.path());
 }
 
@@ -201,7 +210,7 @@ fn replaced_backing_is_refused_before_spawn() {
     let target = temp.path().join("mutable-backing");
     let replacement = temp.path().join("other-backing");
     std::fs::copy("/bin/echo", &target).unwrap();
-    std::fs::copy("/bin/false", &replacement).unwrap();
+    std::fs::copy(false_program(), &replacement).unwrap();
     let (invocation, backing) = proxy_pins(&target, CommandKind::Structured);
 
     std::fs::rename(&replacement, &target).unwrap();

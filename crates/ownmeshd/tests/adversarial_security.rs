@@ -57,6 +57,7 @@ fn tempdir() -> std::io::Result<tempfile::TempDir> {
     Ok(dir)
 }
 
+#[cfg(unix)]
 fn compile_multicall_fixture(output_dir: &std::path::Path) -> std::path::PathBuf {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-fixtures/executable-multicall.rs");
