@@ -89,7 +89,19 @@ impl Drop for PtySession {
             let child = child
                 .get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = terminate_child_tree(child.as_mut(), self.handle.pid);
+            let pid = self.handle.pid;
+            let _ = terminate_child_tree(child.as_mut(), pid);
+            // Drop must not leave a live child just because confirmation
+            // timed out. The known PID is ours for this process lifetime.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
 }
@@ -1918,30 +1930,51 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropping_session_kills_child_before_it_can_continue() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("child-survived");
-        let marker_s = marker.to_string_lossy().replace('\\', "/");
-        // Keep the write window past Darwin's bounded teardown confirmation
-        // (up to five seconds). A 1s child vs 1.3s wait races on loaded GHA
-        // macOS runners: Drop can still be signalling while sleep 1 finishes.
+        // `exec sleep` replaces the shell so there is no next command that can
+        // run if a descendant is torn down first. Assert the recorded PID is
+        // gone instead of waiting out a sleep window (that window is what
+        // made a failed Drop look like "child continued").
         let command = PtyCommand {
             program: "/bin/sh".into(),
-            args: vec![
-                "-c".into(),
-                format!("sleep 8; printf survived > '{marker_s}'"),
-            ],
+            args: vec!["-c".into(), "exec sleep 3600".into()],
             cwd: None,
             env: vec![],
         };
 
         let session = spawn_portable(&command, PtySize::default()).expect("spawn PTY child");
+        let pid = session
+            .handle
+            .pid
+            .expect("spawned PTY child must expose a pid");
         drop(session);
-        std::thread::sleep(Duration::from_millis(9_000));
 
-        assert!(
-            !marker.exists(),
-            "child continued running after session drop"
-        );
+        let mut gone = false;
+        for _ in 0..80 {
+            if !unix_pid_is_live(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "child pid {pid} still live after session drop");
+    }
+
+    #[cfg(unix)]
+    fn unix_pid_is_live(pid: u32) -> bool {
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.code() == Some(1) => false,
+            Ok(output) if output.status.success() => {
+                let state = String::from_utf8_lossy(&output.stdout);
+                let state = state.trim();
+                !state.starts_with('Z') && !state.chars().skip(1).any(|flag| flag == 'E')
+            }
+            _ => true,
+        }
     }
 
     #[test]
