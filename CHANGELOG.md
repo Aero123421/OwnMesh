@@ -21,7 +21,11 @@
   restart every three seconds forever. See ADR 0011.
 - Darwin PTY terminate no longer treats a completed `try_wait` as proof of
   death when the process table still shows the child live, and uses BSD
-  process-group kill syntax.
+  process-group kill syntax. `PtySession` drop now last-resort `SIGKILL`s
+  the recorded child after terminate.
+- Release publish installs the same hash-pinned minisign 0.11 linux binary
+  the installer already uses, instead of `apt-get install minisign` (which
+  can stall indefinitely on `ubuntu-latest`).
 
 ## v1.2.14 — Detached commands, hashed overwrite, bounded grants
 
