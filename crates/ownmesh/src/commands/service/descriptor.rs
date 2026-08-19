@@ -99,6 +99,9 @@ pub fn render_systemd_user_unit(paths: &ServicePaths) -> String {
 Description=OwnMesh user-level device agent (ownmeshd)
 Documentation=https://github.com/Aero123421/OwnMesh
 After=default.target
+# A fail-closed custody check must not restart every 3s forever.
+StartLimitIntervalSec=30
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -393,6 +396,8 @@ mod tests {
             "LockPersonality=true",
             "SystemCallArchitectures=native",
             "RestrictNamespaces=yes",
+            "StartLimitIntervalSec=30",
+            "StartLimitBurst=5",
         ] {
             assert!(
                 unit.lines().any(|line| line.trim_start() == directive),

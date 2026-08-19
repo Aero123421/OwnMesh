@@ -238,7 +238,8 @@ fn reconcile_user_namespace_sandbox() {
         ones (both appear as uid 65534) and will fail closed with `ancestor is owned by untrusted uid \
         65534` unless every state/config ancestor is owned by this daemon inside the namespace. \
         Remove the namespacing directives or the drop-in that adds them, then re-run \
-        `ownmesh service install`; `ownmesh doctor` discloses the effective unit."
+        `ownmesh service install` (it removes OwnMesh-generated leftovers; operator drop-ins \
+        must be deleted by hand); `ownmesh doctor` discloses the effective unit."
         );
     }
 }

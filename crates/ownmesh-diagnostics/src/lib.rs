@@ -810,7 +810,8 @@ ProtectKernelTunables/ProtectControlGroups/ProtectHostname/...); inside it every
 outside the namespace — host root and every other host user alike — appears as the overflow \
 uid 65534, so OwnMesh custody validation cannot verify real ownership and the daemon fails to \
 start with `ancestor is owned by untrusted uid 65534`; re-run `ownmesh service install` to \
-restore the supported unit",
+remove OwnMesh-generated leftovers (operator drop-ins that still force a user namespace must \
+be deleted by hand)",
             ));
         } else if !h.no_new_privileges
             || !h.umask_set
