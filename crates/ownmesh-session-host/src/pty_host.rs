@@ -769,8 +769,14 @@ fn kill_process_tree(pid: u32) {
             .stderr(std::process::Stdio::null())
             .status();
         // Negative PID = process group (session leader is usually its own PGID).
+        // BSD /bin/kill does not take GNU `--`; that form is Linux-only.
+        let group = format!("-{pid}");
+        #[cfg(target_os = "macos")]
+        let group_args: [&str; 2] = ["-KILL", &group];
+        #[cfg(not(target_os = "macos"))]
+        let group_args: [&str; 3] = ["-KILL", "--", &group];
         let _ = std::process::Command::new(kill_program)
-            .args(["-KILL", "--", &format!("-{pid}")])
+            .args(group_args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -869,6 +875,22 @@ fn terminate_child_tree(
     known_pid: Option<u32>,
 ) -> Result<(), String> {
     if matches!(child.try_wait(), Ok(Some(_))) {
+        // Darwin can report a completed wait while the PID is still live in
+        // the process table (concurrent PTY teardown). Trust the table.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(pid) = known_pid.or_else(|| child.process_id()) {
+                match macos_process_state(pid) {
+                    Ok(MacosProcessState::Absent)
+                    | Ok(MacosProcessState::Zombie)
+                    | Ok(MacosProcessState::Exiting(_)) => return Ok(()),
+                    Ok(MacosProcessState::Live(_)) | Err(_) => {}
+                }
+            } else {
+                return Ok(());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         return Ok(());
     }
 
