@@ -190,7 +190,25 @@ fn run_install(
         return Ok(());
     }
 
-    // Idempotent: if already installed with same exe, succeed after OS verify.
+    let unit_path = PathBuf::from(&plan.unit_path);
+    let mut removed_dropins = Vec::new();
+    if platform::is_systemd_unit_path(&plan.unit_path) {
+        let report =
+            platform::reconcile_ownmesh_generated_dropins(&unit_path).map_err(|error| {
+                eprintln!("service install: {error}");
+                ExitCode::Internal
+            })?;
+        removed_dropins = report.removed;
+        if !removed_dropins.is_empty() {
+            manager.reload_user_units().map_err(|error| {
+                eprintln!("service install: {error}");
+                ExitCode::Internal
+            })?;
+        }
+    }
+
+    // Matching exe/unit path is not enough: a leftover drop-in or stale
+    // descriptor can still hide host uids behind 65534.
     let recorded = read_service_record(paths);
     let existing = manager.probe().map_err(|error| {
         eprintln!("service install: {error}");
@@ -200,7 +218,18 @@ fn run_install(
         record.executable == service_paths.executable.canonical.display().to_string()
     });
     let descriptor_is_current = existing.unit_path.as_deref() == Some(plan.unit_path.as_str());
-    if existing.installed && same_recorded_executable && descriptor_is_current {
+    let unit_body_current = !platform::is_systemd_unit_path(&plan.unit_path)
+        || platform::systemd_unit_body_matches(&unit_path, &plan.descriptor_body);
+    let forcing = existing
+        .hardening
+        .as_ref()
+        .is_some_and(|hardening| hardening.user_namespace_forcing);
+    if existing.installed
+        && same_recorded_executable
+        && descriptor_is_current
+        && unit_body_current
+        && !forcing
+    {
         let record = UserServiceRecord {
             schema_version: 1,
             installed: true,
@@ -222,17 +251,27 @@ fn run_install(
                 "OS reports service not installed after idempotent install",
             );
         }
+        let reconciled = !removed_dropins.is_empty();
         let value = json!({
             "schema_version": 1,
             "ok": true,
             "action": "install",
-            "idempotent": true,
+            "idempotent": !reconciled,
+            "reconciled": reconciled,
+            "removed_dropins": removed_dropins,
             "platform": verified.platform,
             "installed": true,
             "unit_path": verified.unit_path,
         });
         emit_json_or_text(cli, &value, || {
-            println!("service already installed (idempotent ok)");
+            if reconciled {
+                println!("service install reconciled OwnMesh-generated drop-ins");
+                for name in &removed_dropins {
+                    println!("  removed: {name}");
+                }
+            } else {
+                println!("service already installed (idempotent ok)");
+            }
             if let Some(u) = &verified.unit_path {
                 println!("  unit: {u}");
             }
@@ -243,7 +282,7 @@ fn run_install(
     // A privileged-broker install may have introduced a root-pinned ownmeshd
     // image. Replace an older user descriptor instead of reporting a false
     // idempotent success with the previous executable.
-    if existing.installed {
+    if existing.installed && !same_recorded_executable {
         manager.uninstall().map_err(|e| {
             eprintln!("service install: replace old descriptor: {e}");
             ExitCode::Internal
@@ -266,6 +305,25 @@ fn run_install(
             "install completed but OS state does not show the service as installed",
         );
     }
+    if verified
+        .hardening
+        .as_ref()
+        .is_some_and(|hardening| hardening.user_namespace_forcing)
+    {
+        let remaining = manager.remaining_userns_forcing_dropins(&unit_path);
+        return fail(
+            cli,
+            "service install",
+            &format!(
+                "effective unit still forces a user namespace after install (remaining: {}). Delete those operator drop-ins, then re-run `ownmesh service install`; otherwise ownmeshd fails with `ancestor is owned by untrusted uid 65534`",
+                if remaining.is_empty() {
+                    "unknown override".to_string()
+                } else {
+                    remaining.join(", ")
+                }
+            ),
+        );
+    }
 
     let record = UserServiceRecord {
         schema_version: 1,
@@ -281,10 +339,14 @@ fn run_install(
         ExitCode::Internal
     })?;
 
+    let reconciled = !removed_dropins.is_empty();
     let value = json!({
         "schema_version": 1,
         "ok": true,
         "action": "install",
+        "idempotent": false,
+        "reconciled": reconciled,
+        "removed_dropins": removed_dropins,
         "platform": verified.platform,
         "installed": true,
         "unit_path": verified.unit_path,
@@ -297,6 +359,9 @@ fn run_install(
             println!("  unit: {u}");
         }
         println!("  exe: {}", record.executable);
+        for name in &removed_dropins {
+            println!("  removed: {name}");
+        }
     });
     Ok(())
 }
@@ -640,6 +705,266 @@ mod tests {
         assert!(!snap3.installed);
         // Idempotent uninstall
         manager.uninstall().unwrap();
+    }
+
+    fn generated_workspace_dropin() -> &'static str {
+        "# Generated by OwnMesh. Do not edit by hand.\n\
+[Service]\n\
+ReadWritePaths=\"/tmp/.tmpxhev0Y/config\" \"/tmp/.tmpxhev0Y/state\"\n"
+    }
+
+    fn write_unit_dropin(root: &Path, name: &str, body: &str) {
+        let dir = root.join("ownmesh-ownmeshd.service.d");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn install_reconciles_generated_readwritepaths_dropin() {
+        let dir = tempdir().unwrap();
+        let exe = touch_exe(
+            dir.path(),
+            if cfg!(windows) {
+                "ownmeshd.exe"
+            } else {
+                "ownmeshd"
+            },
+        );
+        let paths = OwnMeshPaths::for_base(dir.path().join("om"));
+        paths.ensure_layout().unwrap();
+        let service_paths = build_service_paths(Some(exe.to_str().unwrap()), &paths).unwrap();
+        let runner = ScriptedProcessRunner::default();
+        let root = dir.path().join("svc-root");
+        runner.set_root(root.clone());
+        let manager = ServiceManager::new(&runner);
+        manager.install(&service_paths).unwrap();
+
+        write_unit_dropin(
+            &root,
+            "10-ownmesh-workspaces.conf",
+            generated_workspace_dropin(),
+        );
+        write_unit_dropin(
+            &root,
+            "20-operator.conf",
+            "[Service]\nRestrictNamespaces=no\n",
+        );
+        assert!(
+            manager
+                .probe()
+                .unwrap()
+                .hardening
+                .unwrap()
+                .user_namespace_forcing
+        );
+
+        write_service_record(
+            &paths,
+            &UserServiceRecord {
+                schema_version: 1,
+                installed: true,
+                platform: "test".into(),
+                executable: service_paths.executable.canonical.display().to_string(),
+                unit_path: Some(root.join("ownmesh-ownmeshd.service").display().to_string()),
+                installed_at_unix: 1,
+                label: SERVICE_LABEL.into(),
+            },
+        )
+        .unwrap();
+
+        let cli = Cli {
+            json: false,
+            lang: None,
+            command: None,
+        };
+        let args = ServiceActionArgs {
+            dry_run: false,
+            executable: Some(exe.to_str().unwrap().to_string()),
+        };
+        run_install(&cli, &paths, &manager, &args).unwrap();
+
+        assert!(!root
+            .join("ownmesh-ownmeshd.service.d/10-ownmesh-workspaces.conf")
+            .exists());
+        assert!(root
+            .join("ownmesh-ownmeshd.service.d/20-operator.conf")
+            .exists());
+        let after = manager.probe().unwrap();
+        assert!(
+            !after.hardening.as_ref().unwrap().user_namespace_forcing,
+            "{after:?}"
+        );
+    }
+
+    #[test]
+    fn install_fails_closed_when_operator_dropin_still_forces_userns() {
+        let dir = tempdir().unwrap();
+        let exe = touch_exe(
+            dir.path(),
+            if cfg!(windows) {
+                "ownmeshd.exe"
+            } else {
+                "ownmeshd"
+            },
+        );
+        let paths = OwnMeshPaths::for_base(dir.path().join("om"));
+        paths.ensure_layout().unwrap();
+        let service_paths = build_service_paths(Some(exe.to_str().unwrap()), &paths).unwrap();
+        let runner = ScriptedProcessRunner::default();
+        let root = dir.path().join("svc-root");
+        runner.set_root(root.clone());
+        let manager = ServiceManager::new(&runner);
+        manager.install(&service_paths).unwrap();
+        write_unit_dropin(
+            &root,
+            "30-private-users.conf",
+            "[Service]\nPrivateUsers=yes\n",
+        );
+        write_service_record(
+            &paths,
+            &UserServiceRecord {
+                schema_version: 1,
+                installed: true,
+                platform: "test".into(),
+                executable: service_paths.executable.canonical.display().to_string(),
+                unit_path: Some(root.join("ownmesh-ownmeshd.service").display().to_string()),
+                installed_at_unix: 1,
+                label: SERVICE_LABEL.into(),
+            },
+        )
+        .unwrap();
+
+        let cli = Cli {
+            json: false,
+            lang: None,
+            command: None,
+        };
+        let args = ServiceActionArgs {
+            dry_run: false,
+            executable: Some(exe.to_str().unwrap().to_string()),
+        };
+        let err = run_install(&cli, &paths, &manager, &args).unwrap_err();
+        assert_eq!(err, ExitCode::Internal);
+        assert!(root
+            .join("ownmesh-ownmeshd.service.d/30-private-users.conf")
+            .exists());
+        assert_eq!(
+            platform::remaining_userns_forcing_dropins(&root.join("ownmesh-ownmeshd.service")),
+            vec!["30-private-users.conf".to_string()]
+        );
+    }
+
+    #[test]
+    fn install_rewrites_stale_userns_base_unit() {
+        let dir = tempdir().unwrap();
+        let exe = touch_exe(
+            dir.path(),
+            if cfg!(windows) {
+                "ownmeshd.exe"
+            } else {
+                "ownmeshd"
+            },
+        );
+        let paths = OwnMeshPaths::for_base(dir.path().join("om"));
+        paths.ensure_layout().unwrap();
+        let service_paths = build_service_paths(Some(exe.to_str().unwrap()), &paths).unwrap();
+        let runner = ScriptedProcessRunner::default();
+        let root = dir.path().join("svc-root");
+        runner.set_root(root.clone());
+        let manager = ServiceManager::new(&runner);
+        manager.install(&service_paths).unwrap();
+        let unit = root.join("ownmesh-ownmeshd.service");
+        fs::write(
+            &unit,
+            "[Unit]\nDescription=legacy\n[Service]\nType=simple\nExecStart=/bin/true\nRestart=on-failure\nRestartSec=3\nProtectSystem=strict\nProtectHome=read-only\nReadWritePaths=/tmp/a\nPrivateTmp=true\n",
+        )
+        .unwrap();
+        assert!(
+            manager
+                .probe()
+                .unwrap()
+                .hardening
+                .unwrap()
+                .user_namespace_forcing
+        );
+        write_service_record(
+            &paths,
+            &UserServiceRecord {
+                schema_version: 1,
+                installed: true,
+                platform: "test".into(),
+                executable: service_paths.executable.canonical.display().to_string(),
+                unit_path: Some(unit.display().to_string()),
+                installed_at_unix: 1,
+                label: SERVICE_LABEL.into(),
+            },
+        )
+        .unwrap();
+
+        let cli = Cli {
+            json: false,
+            lang: None,
+            command: None,
+        };
+        let args = ServiceActionArgs {
+            dry_run: false,
+            executable: Some(exe.to_str().unwrap().to_string()),
+        };
+        run_install(&cli, &paths, &manager, &args).unwrap();
+        let body = fs::read_to_string(&unit).unwrap();
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.trim_start().starts_with("ProtectSystem=")),
+            "{body}"
+        );
+        assert!(body.contains("StartLimitBurst=5"), "{body}");
+        assert!(
+            !manager
+                .probe()
+                .unwrap()
+                .hardening
+                .unwrap()
+                .user_namespace_forcing
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_generated_dropin_and_keeps_operator_file() {
+        let dir = tempdir().unwrap();
+        let exe = touch_exe(
+            dir.path(),
+            if cfg!(windows) {
+                "ownmeshd.exe"
+            } else {
+                "ownmeshd"
+            },
+        );
+        let paths = OwnMeshPaths::for_base(dir.path().join("om"));
+        paths.ensure_layout().unwrap();
+        let service_paths = build_service_paths(Some(exe.to_str().unwrap()), &paths).unwrap();
+        let runner = ScriptedProcessRunner::default();
+        let root = dir.path().join("svc-root");
+        runner.set_root(root.clone());
+        let manager = ServiceManager::new(&runner);
+        manager.install(&service_paths).unwrap();
+        write_unit_dropin(
+            &root,
+            "10-ownmesh-workspaces.conf",
+            generated_workspace_dropin(),
+        );
+        write_unit_dropin(
+            &root,
+            "20-operator.conf",
+            "[Service]\nRestrictNamespaces=no\n",
+        );
+        manager.uninstall().unwrap();
+        assert!(!root
+            .join("ownmesh-ownmeshd.service.d/10-ownmesh-workspaces.conf")
+            .exists());
+        assert!(root
+            .join("ownmesh-ownmeshd.service.d/20-operator.conf")
+            .exists());
     }
 
     #[test]
