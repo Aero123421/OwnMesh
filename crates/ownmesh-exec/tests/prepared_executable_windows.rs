@@ -72,7 +72,7 @@ async fn prepared_handle_blocks_replace_write_and_parent_rename_until_spawn() {
     .await
     .unwrap();
     assert_eq!(result.exit_code, Some(0));
-    assert_eq!(result.stdout, "windows-lock-ok\r\n");
+    assert_eq!(result.stdout, "windows-lock-ok\n");
 }
 
 #[tokio::test]
