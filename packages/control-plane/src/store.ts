@@ -1021,7 +1021,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0016). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0017). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -2691,7 +2691,7 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async schemaReadiness(): Promise<SchemaReadiness> {
-    // In-memory store always carries the full logical 0002–0008 schema.
+    // In-memory store always carries the full logical 0002–0017 schema.
     const checks = Object.fromEntries(
       Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, true]),
     ) as SchemaReadiness["checks"];
@@ -5466,7 +5466,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Probe 0002–0008 tables, required columns (SELECT projections), and indexes
+   * Probe 0002–0017 tables, required columns (SELECT projections), and indexes
    * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {

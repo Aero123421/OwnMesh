@@ -68,13 +68,13 @@ fn read_tar_gz(bytes: &[u8], os: &str) -> UpdateResult<BTreeMap<String, Vec<u8>>
     let mut archive = TarArchive::new(decoder);
     // Do not follow links; we reject link entry types explicitly below.
     archive.set_overwrite(false);
-    let mut entries = archive
-        .entries()
-        .map_err(|err| UpdateError::UnsafeArchive(format!("tar open: {err}")))?;
     // tar::Entries normally consumes GNU/PAX extension records internally and
     // exposes only the following logical member. Raw iteration is required so
     // every metadata byte reaches our bounded accounting path first.
-    entries.raw(true);
+    let entries = archive
+        .entries()
+        .map_err(|err| UpdateError::UnsafeArchive(format!("tar open: {err}")))?
+        .raw(true);
 
     let allowed = allowed_member_names(os);
     let mut out = BTreeMap::new();
@@ -288,7 +288,11 @@ fn read_tar_entry_bounded<R: Read>(
         )));
     }
 
-    let mut data = if retain { Vec::new() } else { Vec::with_capacity(0) };
+    let mut data = if retain {
+        Vec::new()
+    } else {
+        Vec::with_capacity(0)
+    };
     let mut buf = [0u8; 8 * 1024];
     let mut entry_read = 0u64;
     loop {
@@ -299,9 +303,9 @@ fn read_tar_entry_bounded<R: Read>(
             break;
         }
         let n = n as u64;
-        entry_read = entry_read.checked_add(n).ok_or_else(|| {
-            UpdateError::LimitExceeded("tar entry byte counter overflow".into())
-        })?;
+        entry_read = entry_read
+            .checked_add(n)
+            .ok_or_else(|| UpdateError::LimitExceeded("tar entry byte counter overflow".into()))?;
         if entry_read > per_entry_limit {
             return Err(UpdateError::LimitExceeded(format!(
                 "{label} exceeds per-entry limit {per_entry_limit} bytes"
@@ -312,9 +316,9 @@ fn read_tar_entry_bounded<R: Read>(
                 "{label} expanded past declared size {declared}"
             )));
         }
-        *total_uncompressed = total_uncompressed.checked_add(n).ok_or_else(|| {
-            UpdateError::LimitExceeded("archive byte counter overflow".into())
-        })?;
+        *total_uncompressed = total_uncompressed
+            .checked_add(n)
+            .ok_or_else(|| UpdateError::LimitExceeded("archive byte counter overflow".into()))?;
         if *total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
             return Err(UpdateError::LimitExceeded(format!(
                 "archive total uncompressed size exceeds {MAX_TOTAL_UNCOMPRESSED_BYTES} bytes"
@@ -423,7 +427,6 @@ fn safe_member_name(path: &Path) -> UpdateResult<String> {
     Ok(name)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,10 +457,7 @@ mod tests {
             EntryType::GNULongName,
             EntryType::GNULongLink,
         ] {
-            let archive = metadata_archive(
-                entry_type,
-                (MAX_TAR_METADATA_ENTRY_BYTES + 1) as usize,
-            );
+            let archive = metadata_archive(entry_type, (MAX_TAR_METADATA_ENTRY_BYTES + 1) as usize);
             let error = read_tar_gz(&archive, "linux").expect_err("metadata must be rejected");
             assert!(matches!(error, UpdateError::LimitExceeded(_)));
             let message = error.to_string();

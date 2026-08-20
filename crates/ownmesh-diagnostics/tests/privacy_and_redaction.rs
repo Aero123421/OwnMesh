@@ -22,9 +22,9 @@ use ownmesh_diagnostics::{
     prepare_support_bundle, redact_text, run_doctor, write_prepared_support_bundle,
     BinaryObservation, CheckStatus, ConfigObservation, ControlPlaneObservation,
     CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
-    DoctorInput, JournalsObservation,
-    PrivacyPolicyObservation, PublicDiagnosticEvent, PublicJournalHealth, PublicPlatformFacts,
-    PublicServiceFacts, ServiceObservation, SupportBundleError, SupportBundleInput,
+    DoctorInput, JournalsObservation, PrivacyPolicyObservation, PublicDiagnosticEvent,
+    PublicJournalHealth, PublicPlatformFacts, PublicServiceFacts, ServiceObservation,
+    SupportBundleError, SupportBundleInput,
 };
 
 fn base_input() -> DoctorInput {
@@ -187,15 +187,21 @@ fn support_input() -> SupportBundleInput {
     SupportBundleInput {
         doctor: run_doctor(&base_input()),
         platform: PublicPlatformFacts {
-            os: "linux".into(), arch: "x86_64".into(), ownmesh_version: "1.2.17".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ownmesh_version: "1.2.17".into(),
         },
         service: PublicServiceFacts {
-            platform: "systemd-user".into(), supported: true, installed: true,
-            running: Some(true), hardening_summary: Some("baseline active".into()),
+            platform: "systemd-user".into(),
+            supported: true,
+            installed: true,
+            running: Some(true),
+            hardening_summary: Some("baseline active".into()),
         },
         journal_health: PublicJournalHealth::default(),
         recent_events: vec![PublicDiagnosticEvent {
-            kind: "service".into(), message: "daemon ready".into(),
+            kind: "service".into(),
+            message: "daemon ready".into(),
         }],
     }
 }
@@ -224,7 +230,10 @@ fn support_bundle_is_typed_scanned_and_preview_bytes_are_exact_export() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
 
@@ -233,7 +242,10 @@ fn support_bundle_secret_scanner_fails_closed_without_echoing_secret() {
     let mut input = support_input();
     input.recent_events[0].message = "Authorization: Bearer super.secret.material".into();
     let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
-    assert_eq!(error, SupportBundleError::SuspiciousContent("recent_events".into()));
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
+    );
     let text = error.to_string();
     assert!(!text.contains("super.secret.material"));
 }
@@ -254,15 +266,13 @@ fn support_bundle_rejects_secret_query_parameters() {
 #[test]
 fn support_bundle_rejects_unlabeled_high_entropy_values() {
     let mut input = support_input();
-    input.recent_events[0].message =
-        "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7Go2Qw9Rx4Kp6".into();
+    input.recent_events[0].message = "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7Go2Qw9Rx4Kp6".into();
     let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
     assert_eq!(
         error,
         SupportBundleError::SuspiciousContent("recent_events".into())
     );
 }
-
 
 #[test]
 fn support_bundle_rejects_encoded_split_and_unicode_secret_forms() {
@@ -291,8 +301,7 @@ canary",
 #[test]
 fn support_bundle_rejects_base64_secret_containing_slash() {
     let mut input = support_input();
-    input.recent_events[0].message =
-        "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7/Go2Qw9Rx4Kp6".into();
+    input.recent_events[0].message = "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7/Go2Qw9Rx4Kp6".into();
     let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
     assert_eq!(
         error,

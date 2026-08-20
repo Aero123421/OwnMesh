@@ -163,7 +163,7 @@ test("SQL approved device code CAS permits exactly one concurrent consumer", asy
   const s = store(); await s.ensureBootstrap();
   await s.putDeviceCode({
     device_code: "dcode_race",
-    user_code: "ABCD-EFGH",
+    user_code: "BCDF-GHJK",
     client_id: "client_ownmesh_cli",
     scope: "ownmesh.read",
     verification_uri: "https://cp.test/oauth/device",
@@ -184,7 +184,7 @@ test("SQL device verification transaction CAS permits exactly one concurrent con
   const s = store(); await s.ensureBootstrap();
   await s.putDeviceCode({
     device_code: "dcode_vtx",
-    user_code: "WXYZ-UVST",
+    user_code: "WXZV-STPQ",
     client_id: "client_ownmesh_cli",
     scope: "ownmesh.read",
     verification_uri: "https://cp.test/oauth/device",
@@ -195,7 +195,7 @@ test("SQL device verification transaction CAS permits exactly one concurrent con
   await s.putDeviceVerificationTransaction({
     id: "vtx_race",
     csrf_hash: "csrf_hash_race",
-    user_code: "WXYZ-UVST",
+    user_code: "WXZV-STPQ",
     principal_id: "prin_dev",
     client_id: "client_ownmesh_cli",
     scope: "ownmesh.read",
@@ -209,7 +209,7 @@ test("SQL device verification transaction CAS permits exactly one concurrent con
   assert.equal(results.filter(Boolean).length, 1);
   const winner = results.find(Boolean)!;
   assert.equal(winner.consumed, true);
-  assert.equal(winner.user_code, "WXYZ-UVST");
+  assert.equal(winner.user_code, "WXZV-STPQ");
   const dc = await s.getDeviceCode("dcode_vtx");
   assert.equal(dc?.status, "approved");
   assert.equal(dc?.principal_id, "prin_dev");
@@ -219,7 +219,7 @@ test("SQL device verification transaction records an explicit denial", async () 
   const s = store(); await s.ensureBootstrap();
   await s.putDeviceCode({
     device_code: "dcode_denied",
-    user_code: "DENY-CODE",
+    user_code: "DNCZ-DFGH",
     client_id: "client_ownmesh_cli",
     scope: "ownmesh.read",
     verification_uri: "https://cp.test/oauth/device",
@@ -230,7 +230,7 @@ test("SQL device verification transaction records an explicit denial", async () 
   await s.putDeviceVerificationTransaction({
     id: "vtx_denied",
     csrf_hash: "csrf_hash_denied",
-    user_code: "DENY-CODE",
+    user_code: "DNCZ-DFGH",
     principal_id: "prin_dev",
     client_id: "client_ownmesh_cli",
     scope: "ownmesh.read",

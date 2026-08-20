@@ -7,8 +7,7 @@ use ownmesh_config::{redact_control_plane_url, OwnMeshPaths};
 use ownmesh_diagnostics::{
     appears_redacted, run_doctor, BinaryObservation, ConfigObservation, ControlPlaneObservation,
     CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
-    DoctorOutcome, DoctorReport,
-    PrivacyPolicyObservation, ServiceObservation,
+    DoctorOutcome, DoctorReport, PrivacyPolicyObservation, ServiceObservation,
 };
 use ownmesh_domain::ExitCode;
 use ownmesh_identity::{
@@ -318,7 +317,9 @@ fn observe_credential_store(paths: &OwnMeshPaths) -> CredentialStoreObservation 
         Err(_) => {
             return CredentialStoreObservation {
                 metadata_present: true,
-                read_error: Some("credential-store provenance metadata could not be inspected".into()),
+                read_error: Some(
+                    "credential-store provenance metadata could not be inspected".into(),
+                ),
                 ..CredentialStoreObservation::default()
             };
         }

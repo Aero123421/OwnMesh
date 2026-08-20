@@ -213,7 +213,9 @@ impl ReplayLedger {
                     let file: LedgerFile = serde_json::from_slice(&bytes)
                         .map_err(|e| ReplayLedgerError::Corrupt(e.to_string()))?;
                     if file.entries.len() > max_entries {
-                        return Err(ReplayLedgerError::Corrupt("entry count exceeds limit".into()));
+                        return Err(ReplayLedgerError::Corrupt(
+                            "entry count exceeds limit".into(),
+                        ));
                     }
                     (file.entries, false)
                 }
@@ -325,7 +327,10 @@ impl ReplayLedger {
         process_identity: Option<(u32, u64)>,
     ) -> Result<(), ReplayLedgerError> {
         self.ensure_available()?;
-        let entry = self.entries.get_mut(nonce).ok_or(ReplayLedgerError::Replay)?;
+        let entry = self
+            .entries
+            .get_mut(nonce)
+            .ok_or(ReplayLedgerError::Replay)?;
         if entry.digest != digest {
             return Err(ReplayLedgerError::DigestConflict);
         }
@@ -351,7 +356,12 @@ impl ReplayLedger {
         let completed_entries = self
             .entries
             .values()
-            .filter(|entry| matches!(entry.state, ReplayState::Completed | ReplayState::AbortedBeforeSpawn))
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    ReplayState::Completed | ReplayState::AbortedBeforeSpawn
+                )
+            })
             .count();
         let uncertain_entries = self
             .entries
@@ -366,7 +376,12 @@ impl ReplayLedger {
         let oldest_uncertain_unix = self
             .entries
             .values()
-            .filter(|entry| matches!(entry.state, ReplayState::ReservedPreSpawn | ReplayState::SpawnedUncertain))
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    ReplayState::ReservedPreSpawn | ReplayState::SpawnedUncertain
+                )
+            })
             .map(|entry| entry.reserved_at_unix)
             .min();
         let warning_threshold = self.max_entries.saturating_mul(3) / 5;
@@ -396,15 +411,24 @@ impl ReplayLedger {
     ) -> Result<(), ReplayLedgerError> {
         self.ensure_available()?;
         if actor.is_empty() || actor.len() > 128 || actor.contains(['\n', '\r', '\0']) {
-            return Err(ReplayLedgerError::Invalid("reconciliation actor is invalid".into()));
+            return Err(ReplayLedgerError::Invalid(
+                "reconciliation actor is invalid".into(),
+            ));
         }
-        let entry = self.entries.get_mut(nonce).ok_or(ReplayLedgerError::Replay)?;
+        let entry = self
+            .entries
+            .get_mut(nonce)
+            .ok_or(ReplayLedgerError::Replay)?;
         let prior = entry.state;
         let next = match decision {
-            ReconcileDecision::MarkAbortedBeforeSpawn
-                if prior == ReplayState::ReservedPreSpawn => ReplayState::AbortedBeforeSpawn,
+            ReconcileDecision::MarkAbortedBeforeSpawn if prior == ReplayState::ReservedPreSpawn => {
+                ReplayState::AbortedBeforeSpawn
+            }
             ReconcileDecision::MarkCompleted
-                if prior == ReplayState::SpawnedUncertain && acknowledge_uncertain => ReplayState::Completed,
+                if prior == ReplayState::SpawnedUncertain && acknowledge_uncertain =>
+            {
+                ReplayState::Completed
+            }
             ReconcileDecision::MarkCompleted if prior == ReplayState::SpawnedUncertain => {
                 return Err(ReplayLedgerError::Invalid(
                     "spawned-uncertain reconciliation requires explicit acknowledgement".into(),
@@ -470,8 +494,10 @@ impl ReplayLedger {
     fn prune_completed(&mut self, now_unix: i64) -> Result<(), ReplayLedgerError> {
         let prior = self.entries.len();
         self.entries.retain(|_, entry| {
-            matches!(entry.state, ReplayState::ReservedPreSpawn | ReplayState::SpawnedUncertain)
-                || entry.expires_at_unix >= now_unix
+            matches!(
+                entry.state,
+                ReplayState::ReservedPreSpawn | ReplayState::SpawnedUncertain
+            ) || entry.expires_at_unix >= now_unix
         });
         if self.entries.len() != prior {
             if let Err(error) = self.persist() {
@@ -552,14 +578,20 @@ fn validate_reservation(
 fn validate_entry(nonce: &str, entry: &LedgerEntry) -> Result<(), ReplayLedgerError> {
     validate_reservation(nonce, &entry.digest, entry.expires_at_unix, i64::MIN)?;
     if entry.transition_seq == 0 {
-        return Err(ReplayLedgerError::Corrupt("zero transition sequence".into()));
+        return Err(ReplayLedgerError::Corrupt(
+            "zero transition sequence".into(),
+        ));
     }
     if entry.process_pid.is_some() != entry.process_birth_id.is_some() {
         return Err(ReplayLedgerError::Corrupt(
             "partial process identity in replay ledger".into(),
         ));
     }
-    if entry.result_digest.as_deref().is_some_and(|digest| !is_digest(digest)) {
+    if entry
+        .result_digest
+        .as_deref()
+        .is_some_and(|digest| !is_digest(digest))
+    {
         return Err(ReplayLedgerError::Corrupt("invalid result digest".into()));
     }
     if let Some(record) = &entry.reconciliation {
@@ -585,16 +617,15 @@ fn is_digest(value: &str) -> bool {
 
 fn acquire_ledger_lock(path: &Path) -> Result<File, ReplayLedgerError> {
     use fs2::FileExt;
-    let parent = path.parent().ok_or_else(|| {
-        ReplayLedgerError::Custody("ledger requires a parent directory".into())
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| ReplayLedgerError::Custody("ledger requires a parent directory".into()))?;
     let lock_path = parent.join("replay-ledger.lock");
     #[cfg(unix)]
     if lock_path.exists() {
         use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::symlink_metadata(&lock_path).map_err(|e| {
-            ReplayLedgerError::Custody(format!("inspect replay ledger lock: {e}"))
-        })?;
+        let metadata = std::fs::symlink_metadata(&lock_path)
+            .map_err(|e| ReplayLedgerError::Custody(format!("inspect replay ledger lock: {e}")))?;
         if !metadata.file_type().is_file()
             || metadata.file_type().is_symlink()
             || metadata.uid() != 0
@@ -754,9 +785,7 @@ mod tests {
             Err(ReplayLedgerError::Full),
             "reserved/uncertain entries must never be evicted for capacity"
         );
-        ledger
-            .mark_spawned("nonce-a", &digest('a'), None)
-            .unwrap();
+        ledger.mark_spawned("nonce-a", &digest('a'), None).unwrap();
         ledger.mark_completed("nonce-a", &digest('a')).unwrap();
         ledger.reserve("nonce-b", &digest('b'), 200, 101).unwrap();
     }

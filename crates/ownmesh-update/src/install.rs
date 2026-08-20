@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const APPLY_JOURNAL_SCHEMA: u32 = 2;
@@ -109,10 +109,7 @@ pub fn apply_binaries(
     })?;
 
     validate_version_label(version_label)?;
-    let transaction_suffix = format!(
-        "{version_label}-{}",
-        uuid::Uuid::new_v4().simple()
-    );
+    let transaction_suffix = format!("{version_label}-{}", uuid::Uuid::new_v4().simple());
     let staging = install_dir.join(format!(".ownmesh-staging-{transaction_suffix}"));
     let backup = install_dir.join(format!(".ownmesh-backup-{transaction_suffix}"));
     let _ = fs::remove_dir_all(&staging);
@@ -562,7 +559,9 @@ fn sync_installed_tree(install_dir: &Path, names: &[String]) -> UpdateResult<()>
         if path.exists() {
             fs::File::open(&path)
                 .and_then(|file| file.sync_all())
-                .map_err(|err| UpdateError::Install(format!("sync installed {}: {err}", path.display())))?;
+                .map_err(|err| {
+                    UpdateError::Install(format!("sync installed {}: {err}", path.display()))
+                })?;
         }
     }
     #[cfg(not(unix))]
@@ -684,7 +683,9 @@ fn rollback_from_backup(install_dir: &Path, backup: &Path, names: &[String]) -> 
             file.set_permissions(source_permissions)?;
             Ok(())
         })
-        .map_err(|err| UpdateError::Install(format!("rollback {} failed: {err}", dest.display())))?;
+        .map_err(|err| {
+            UpdateError::Install(format!("rollback {} failed: {err}", dest.display()))
+        })?;
     }
     Ok(())
 }

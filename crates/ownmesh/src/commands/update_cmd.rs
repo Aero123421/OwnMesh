@@ -4,11 +4,11 @@ use crate::cli::{Cli, UpdateArgs, UpdateCmd, UpdateWorkerArgs};
 use ownmesh_config::{load_config, save_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
 use ownmesh_update::{
-    current_install_dir, finalize_apply, finalize_interrupted_commit, is_homebrew_install,
-    interrupted_apply_pending, looks_secret, recover_interrupted_apply, redact_json, redact_url,
-    rollback_apply, verify_applied_binaries, ApplyReport, CheckReport,
-    FetchKind, FetchRequest, FetchResponse, HttpTransport, UpdateChannel, UpdateEngine,
-    UpdateError, UpdateMode, UpdateSettings, ALLOWED_HOSTS,
+    current_install_dir, finalize_apply, finalize_interrupted_commit, interrupted_apply_pending,
+    is_homebrew_install, looks_secret, recover_interrupted_apply, redact_json, redact_url,
+    rollback_apply, verify_applied_binaries, ApplyReport, CheckReport, FetchKind, FetchRequest,
+    FetchResponse, HttpTransport, UpdateChannel, UpdateEngine, UpdateError, UpdateMode,
+    UpdateSettings, ALLOWED_HOSTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -387,7 +387,8 @@ fn begin_transaction(
                 })?;
                 if matching
                     && (!transaction.terminal()
-                        || (pending && matches!(transaction.phase.as_str(), "failed" | "rolled_back")))
+                        || (pending
+                            && matches!(transaction.phase.as_str(), "failed" | "rolled_back")))
                 {
                     recover_recorded_transaction(transaction, install_dir)?;
                 } else if matching
@@ -572,7 +573,12 @@ fn restore_committed_service(
         .ok_or_else(|| "committed update is missing target version".to_owned())?;
     let cli = install_dir.join(format!("ownmesh{}", std::env::consts::EXE_SUFFIX));
     if daemon_status(&cli)
-        .and_then(|status| status.pointer("/daemon/version").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .and_then(|status| {
+            status
+                .pointer("/daemon/version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
         .as_deref()
         == Some(expected)
     {
@@ -864,7 +870,10 @@ pub(crate) fn run_worker(cli: &Cli, args: &UpdateWorkerArgs) -> Result<(), ExitC
         }
         Err(message) => {
             transaction.error = Some(message);
-            if matches!(transaction.phase.as_str(), "commit_decided" | "recovery_required") {
+            if matches!(
+                transaction.phase.as_str(),
+                "commit_decided" | "recovery_required"
+            ) {
                 // Keep the lock and committed phase durable. The worker is
                 // about to exit, so the next invocation will finish journal/
                 // backup cleanup without ever restoring the old binaries.
@@ -981,9 +990,8 @@ fn perform_worker_update(
                         return Err(format!("{message}; previous binaries restored"));
                     }
                     Err(recovery_error) => {
-                        transaction.error = Some(format!(
-                            "{message}; recovery required: {recovery_error}"
-                        ));
+                        transaction.error =
+                            Some(format!("{message}; recovery required: {recovery_error}"));
                         set_phase(paths, transaction, "recovery_required")?;
                         return Err(format!(
                             "{message}; rollback failed and durable recovery evidence was retained: {recovery_error}"
@@ -1030,8 +1038,8 @@ fn perform_worker_update(
     // Durable outer commit decision precedes removal of rollback evidence.
     // Recovery at/after this phase completes the new set and never restores old binaries.
     set_phase(paths, transaction, "commit_decided")?;
-    report.backup_cleanup_pending = !finalize_apply(&report)
-        .map_err(|error| format!("finalize committed update: {error}"))?;
+    report.backup_cleanup_pending =
+        !finalize_apply(&report).map_err(|error| format!("finalize committed update: {error}"))?;
     Ok(Some(report))
 }
 
@@ -1106,9 +1114,7 @@ fn rollback_uncommitted_update(
             UPDATE_DAEMON_READY_TIMEOUT,
         )
         .map_err(|rollback_health| {
-            format!(
-                "{reason}; binaries restored but old daemon health failed: {rollback_health}"
-            )
+            format!("{reason}; binaries restored but old daemon health failed: {rollback_health}")
         })?;
     }
     transaction.error = Some(reason.to_owned());
@@ -1215,7 +1221,8 @@ fn wait_for_daemon_offline(program: &Path, timeout: Duration) -> Result<(), Stri
         }
         if Instant::now() >= deadline {
             return Err(
-                "OwnMesh daemon could not be proven stopped (IPC/service observations disagree)".into(),
+                "OwnMesh daemon could not be proven stopped (IPC/service observations disagree)"
+                    .into(),
             );
         }
         thread::sleep(Duration::from_millis(200));
@@ -1257,7 +1264,9 @@ fn emit_applied(
             println!("  binary hashes and CLI version checks passed; daemon check skipped (service was not running)");
         }
         if report.backup_cleanup_pending {
-            println!("  backup cleanup is pending and will be retried on the next update invocation");
+            println!(
+                "  backup cleanup is pending and will be retried on the next update invocation"
+            );
         }
     }
 }

@@ -232,7 +232,7 @@ export async function readBody(req: Request): Promise<Record<string, string>> {
   const bytes = await readRequestBytesLimited(req);
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
   } catch {
     throw new SyntaxError("invalid UTF-8 form body");
   }

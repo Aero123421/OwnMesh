@@ -1332,7 +1332,13 @@ impl PreparedSupportBundle {
 
     #[must_use]
     pub fn included_sections(&self) -> [&'static str; 5] {
-        ["doctor", "platform", "service", "journal_health", "recent_events"]
+        [
+            "doctor",
+            "platform",
+            "service",
+            "journal_health",
+            "recent_events",
+        ]
     }
 }
 
@@ -1358,7 +1364,8 @@ pub fn prepare_support_bundle(
     scan_serializable_section("journal_health", &bundle.journal_health)?;
     scan_serializable_section("recent_events", &bundle.recent_events)?;
 
-    let bytes = serde_json::to_vec_pretty(&bundle).map_err(|_| SupportBundleError::Serialization)?;
+    let bytes =
+        serde_json::to_vec_pretty(&bundle).map_err(|_| SupportBundleError::Serialization)?;
     if bytes.len() > SUPPORT_MAX_SERIALIZED_BYTES {
         return Err(SupportBundleError::CollectionTooLarge(
             "serialized_bundle".into(),
@@ -1380,10 +1387,14 @@ pub fn write_prepared_support_bundle(
 
 fn validate_support_input(input: &SupportBundleInput) -> Result<(), SupportBundleError> {
     if input.doctor.checks.len() > SUPPORT_MAX_DOCTOR_CHECKS {
-        return Err(SupportBundleError::CollectionTooLarge("doctor.checks".into()));
+        return Err(SupportBundleError::CollectionTooLarge(
+            "doctor.checks".into(),
+        ));
     }
     if input.recent_events.len() > SUPPORT_MAX_EVENTS {
-        return Err(SupportBundleError::CollectionTooLarge("recent_events".into()));
+        return Err(SupportBundleError::CollectionTooLarge(
+            "recent_events".into(),
+        ));
     }
     check_support_text("doctor.version", &input.doctor.version)?;
     for check in &input.doctor.checks {
@@ -1526,8 +1537,9 @@ fn normalize_support_scan_text(text: &str) -> String {
     for character in text.chars() {
         let folded = match character {
             '\u{3000}' => ' ',
-            '\u{ff01}'..='\u{ff5e}' => char::from_u32(u32::from(character) - 0xfee0)
-                .unwrap_or(character),
+            '\u{ff01}'..='\u{ff5e}' => {
+                char::from_u32(u32::from(character) - 0xfee0).unwrap_or(character)
+            }
             _ => character,
         };
         for lowercase in folded.to_lowercase() {
@@ -1586,8 +1598,7 @@ fn has_labeled_secret(text: &str, label: &str, require_bearer: bool) -> bool {
         if require_bearer {
             if let Some(after_bearer) = value.strip_prefix("bearer") {
                 let bearer_value = after_bearer.trim_start_matches(|character: char| {
-                    character.is_whitespace()
-                        || matches!(character, '\\' | '"' | '\'' | ':' | '=')
+                    character.is_whitespace() || matches!(character, '\\' | '"' | '\'' | ':' | '=')
                 });
                 if has_nonempty_secret_value(bearer_value) {
                     return true;
@@ -1609,9 +1620,8 @@ fn has_nonempty_secret_value(value: &str) -> bool {
 }
 
 fn looks_like_high_entropy_secret(token: &str) -> bool {
-    let token = token.trim_matches(|character: char| {
-        matches!(character, '[' | ']' | '{' | '}' | ':' | '=')
-    });
+    let token = token
+        .trim_matches(|character: char| matches!(character, '[' | ']' | '{' | '}' | ':' | '='));
     if token.len() < SUPPORT_HIGH_ENTROPY_MIN_BYTES || token.len() > SUPPORT_MAX_TEXT_BYTES {
         return false;
     }

@@ -3109,9 +3109,9 @@ fn credential_store_health(
     let Ok(bytes) = std::fs::read(path) else {
         return ("warn", None, 0);
     };
-    let Ok(snapshot) = serde_json::from_slice::<
-        ownmesh_identity::CredentialStoreDiagnosticSnapshot,
-    >(&bytes) else {
+    let Ok(snapshot) =
+        serde_json::from_slice::<ownmesh_identity::CredentialStoreDiagnosticSnapshot>(&bytes)
+    else {
         return ("warn", None, 0);
     };
     if snapshot.schema_version != 1 {

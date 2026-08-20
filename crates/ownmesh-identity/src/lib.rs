@@ -29,8 +29,8 @@ pub use secret::{SecretBytes, SecretPurpose, SecretString};
 pub use store::{
     CredentialStoreDiagnosticSnapshot, EncryptedFileKeystore, LegacyMirrorCleanupReport,
     MemorySecretStore, OsKeychainStore, PreferredSecretStore, PreferredSecretStoreReport,
-    PreferredStoreFallbackPolicy, CREDENTIAL_STORE_DIAGNOSTIC_FILE,
-    ResidualFallbackKind, ResidualFallbackSecret, SecretStore,
+    PreferredStoreFallbackPolicy, ResidualFallbackKind, ResidualFallbackSecret, SecretStore,
+    CREDENTIAL_STORE_DIAGNOSTIC_FILE,
 };
 
 /// Stable crate name used by diagnostics and tests.

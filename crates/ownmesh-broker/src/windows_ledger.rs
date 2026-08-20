@@ -64,15 +64,25 @@ struct File {
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum LegacyState { Reserved, Completed }
+enum LegacyState {
+    Reserved,
+    Completed,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LegacyEntry { digest: String, expires_at_unix: i64, state: LegacyState }
+struct LegacyEntry {
+    digest: String,
+    expires_at_unix: i64,
+    state: LegacyState,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LegacyFile { version: u32, entries: BTreeMap<String, LegacyEntry> }
+struct LegacyFile {
+    version: u32,
+    entries: BTreeMap<String, LegacyEntry>,
+}
 
 /// The replay ledger is owner-only at rest and has no best-effort recovery.
 pub struct WindowsDurableReplayLedger {
@@ -105,23 +115,30 @@ impl WindowsDurableReplayLedger {
                     if legacy.version != 1 || legacy.entries.len() > max_entries {
                         return Err("Windows replay ledger legacy entry count is invalid".into());
                     }
-                    let entries = legacy.entries.into_iter().map(|(nonce, entry)| {
-                        let state = match entry.state {
-                            LegacyState::Reserved => State::SpawnedUncertain,
-                            LegacyState::Completed => State::Completed,
-                        };
-                        (nonce, Entry {
-                            digest: entry.digest,
-                            reserved_at_unix: 0,
-                            expires_at_unix: entry.expires_at_unix,
-                            transition_seq: 1,
-                            state,
-                            process_pid: None,
-                            process_birth_id: None,
-                            result_digest: None,
-                            reconciliation: None,
+                    let entries = legacy
+                        .entries
+                        .into_iter()
+                        .map(|(nonce, entry)| {
+                            let state = match entry.state {
+                                LegacyState::Reserved => State::SpawnedUncertain,
+                                LegacyState::Completed => State::Completed,
+                            };
+                            (
+                                nonce,
+                                Entry {
+                                    digest: entry.digest,
+                                    reserved_at_unix: 0,
+                                    expires_at_unix: entry.expires_at_unix,
+                                    transition_seq: 1,
+                                    state,
+                                    process_pid: None,
+                                    process_birth_id: None,
+                                    result_digest: None,
+                                    reconciliation: None,
+                                },
+                            )
                         })
-                    }).collect();
+                        .collect();
                     (entries, true)
                 }
                 value if value == u64::from(VERSION) => {
@@ -191,26 +208,42 @@ impl WindowsDurableReplayLedger {
 
     fn prune_completed(&mut self, now_unix: i64) {
         self.entries.retain(|_, entry| {
-            matches!(entry.state, State::ReservedPreSpawn | State::SpawnedUncertain)
-                || entry.expires_at_unix >= now_unix
+            matches!(
+                entry.state,
+                State::ReservedPreSpawn | State::SpawnedUncertain
+            ) || entry.expires_at_unix >= now_unix
         });
     }
 
     #[must_use]
     pub fn status(&self) -> ReplayLedgerStatus {
         let total_entries = self.entries.len();
-        let completed_entries = self.entries.values().filter(|entry| {
-            matches!(entry.state, State::Completed | State::AbortedBeforeSpawn)
-        }).count();
-        let uncertain_entries = self.entries.values().filter(|entry| {
-            entry.state == State::SpawnedUncertain
-        }).count();
-        let recoverable_pre_spawn_entries = self.entries.values().filter(|entry| {
-            entry.state == State::ReservedPreSpawn
-        }).count();
-        let oldest_uncertain_unix = self.entries.values().filter(|entry| {
-            matches!(entry.state, State::ReservedPreSpawn | State::SpawnedUncertain)
-        }).map(|entry| entry.reserved_at_unix).min();
+        let completed_entries = self
+            .entries
+            .values()
+            .filter(|entry| matches!(entry.state, State::Completed | State::AbortedBeforeSpawn))
+            .count();
+        let uncertain_entries = self
+            .entries
+            .values()
+            .filter(|entry| entry.state == State::SpawnedUncertain)
+            .count();
+        let recoverable_pre_spawn_entries = self
+            .entries
+            .values()
+            .filter(|entry| entry.state == State::ReservedPreSpawn)
+            .count();
+        let oldest_uncertain_unix = self
+            .entries
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    State::ReservedPreSpawn | State::SpawnedUncertain
+                )
+            })
+            .map(|entry| entry.reserved_at_unix)
+            .min();
         let warning_threshold = self.max_entries.saturating_mul(3) / 5;
         let critical_threshold = self.max_entries.saturating_mul(4) / 5;
         ReplayLedgerStatus {
@@ -220,7 +253,9 @@ impl WindowsDurableReplayLedger {
             completed_entries,
             uncertain_entries,
             recoverable_pre_spawn_entries,
-            durable_bytes: std::fs::metadata(&self.path).map(|metadata| metadata.len()).unwrap_or(0),
+            durable_bytes: std::fs::metadata(&self.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
             oldest_uncertain_unix,
             warning: total_entries >= warning_threshold,
             critical: total_entries >= critical_threshold,
@@ -246,10 +281,14 @@ impl WindowsDurableReplayLedger {
         };
         let prior = entry.state;
         let next = match decision {
-            ReconcileDecision::MarkAbortedBeforeSpawn
-                if prior == State::ReservedPreSpawn => State::AbortedBeforeSpawn,
+            ReconcileDecision::MarkAbortedBeforeSpawn if prior == State::ReservedPreSpawn => {
+                State::AbortedBeforeSpawn
+            }
             ReconcileDecision::MarkCompleted
-                if prior == State::SpawnedUncertain && acknowledge_uncertain => State::Completed,
+                if prior == State::SpawnedUncertain && acknowledge_uncertain =>
+            {
+                State::Completed
+            }
             ReconcileDecision::MarkCompleted if prior == State::SpawnedUncertain => {
                 return Err(
                     "Windows replay uncertain reconciliation requires acknowledgement".into(),

@@ -3677,8 +3677,12 @@ async fn dispatch_remote_operation(
                             ownmesh_ipc::app_error::EXECUTABLE_IDENTITY_DRIFT => {
                                 "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"
                             }
-                            ownmesh_ipc::app_error::EXECUTABLE_FORMAT => "OWNMESH_E_EXECUTABLE_FORMAT",
-                            ownmesh_ipc::app_error::JOURNAL_CAPACITY => "OWNMESH_E_JOURNAL_CAPACITY",
+                            ownmesh_ipc::app_error::EXECUTABLE_FORMAT => {
+                                "OWNMESH_E_EXECUTABLE_FORMAT"
+                            }
+                            ownmesh_ipc::app_error::JOURNAL_CAPACITY => {
+                                "OWNMESH_E_JOURNAL_CAPACITY"
+                            }
                             ownmesh_ipc::app_error::TRANSITION_RECOVERY_REQUIRED => {
                                 "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED"
                             }

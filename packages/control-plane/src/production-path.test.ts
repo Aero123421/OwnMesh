@@ -1044,7 +1044,7 @@ test("production-path negatives: expired authorize and device-verification trans
     // Expired device verification transaction
     await store.putDeviceCode({
       device_code: "dcode_expired_vtx",
-      user_code: "EXPD-CODE",
+      user_code: "XPDF-CDFG",
       client_id: CLIENT,
       scope: "ownmesh.read",
       verification_uri: `${ISSUER}/oauth/device`,
@@ -1057,7 +1057,7 @@ test("production-path negatives: expired authorize and device-verification trans
     await store.putDeviceVerificationTransaction({
       id: vtxId,
       csrf_hash: await sha256Hex(csrfDev),
-      user_code: "EXPD-CODE",
+      user_code: "XPDF-CDFG",
       principal_id: PRINCIPAL_ID,
       client_id: CLIENT,
       scope: "ownmesh.read",
@@ -1116,7 +1116,7 @@ test("production-path: AUTH_PROVIDER unknown tenant fails closed (401/403) on au
     assert.equal(authorizeBody.error, "unknown_tenant");
 
     const deviceRes = await worker.fetch(
-      new Request(`${ISSUER}/oauth/device?user_code=ABCD-EFGH`),
+      new Request(`${ISSUER}/oauth/device?user_code=BCDF-JKLM`),
       e,
       ctx,
     );
