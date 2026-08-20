@@ -1,7 +1,7 @@
 diff --git a/crates/ownmesh-update/src/archive.rs b/crates/ownmesh-update/src/archive.rs
 --- a/crates/ownmesh-update/src/archive.rs
 +++ b/crates/ownmesh-update/src/archive.rs
-@@ -298,10 +298,12 @@ fn read_tar_entry_bounded<R: Read>(
+@@ -298,9 +298,11 @@ fn read_tar_entry_bounded<R: Read>(
          if n == 0 {
              break;
          }
