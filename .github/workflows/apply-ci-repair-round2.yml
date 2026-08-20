@@ -38,3 +38,5 @@ jobs:
           git config user.email '184829077+Aero123421@users.noreply.github.com'
           git commit -m 'fix(update): satisfy archive accounting clippy gates'
           git push origin HEAD:fix/resolve-open-issues-v1.2.17
+
+# The file update below intentionally triggers this already-installed workflow.
