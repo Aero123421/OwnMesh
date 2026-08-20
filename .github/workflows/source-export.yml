@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/resolve-open-issues-v1.2.17
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
