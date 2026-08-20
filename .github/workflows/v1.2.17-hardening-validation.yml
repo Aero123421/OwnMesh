@@ -1,0 +1,139 @@
+name: v1.2.17 hardening validation
+
+on:
+  push:
+    branches:
+      - fix/resolve-open-issues-v1.2.17
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: v1.2.17-hardening-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust 1.92 (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            workspace_test_args: ""
+          - name: macOS
+            os: macos-latest
+            workspace_test_args: ""
+          - name: Linux
+            os: ubuntu-latest
+            workspace_test_args: "--exclude ownmesh-session-host --exclude ownmeshd"
+    env:
+      RUSTFLAGS: -D warnings
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Verify Cargo.lock
+        shell: bash
+        run: cargo metadata --locked --format-version 1 --no-deps > /dev/null
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Workspace tests
+        run: cargo test --workspace --all-targets --locked ${{ matrix.workspace_test_args }}
+      - name: Updater persistence regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p ownmesh-persist
+          if test -f crates/ownmesh-update/tests/production_update.rs; then
+            cargo test --locked -p ownmesh-update --test production_update -- --test-threads=1
+          else
+            echo 'missing crates/ownmesh-update/tests/production_update.rs' >&2
+            exit 1
+          fi
+          cargo test --locked -p ownmesh update_cmd::tests -- --test-threads=1
+
+  typescript:
+    name: Control-plane quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Enable pnpm 9.15.0
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r test
+      - run: pnpm -r typecheck
+      - run: pnpm -r lint
+      - name: Wrangler dry-run
+        working-directory: packages/control-plane
+        run: pnpm exec wrangler deploy --dry-run
+
+  release-quality:
+    name: Release and security claims
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify release surfaces
+        run: python scripts/check_release_quality.py
+      - name: Release-quality mutation tests
+        run: python scripts/tests/run_release_quality_tests.py
+      - name: Reject transport artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e .github/patch
+          test ! -e .github/patch8
+          test ! -e .github/workflows/source-export.yml
+          test ! -e .github/workflows/apply-recovered-implementation.yml
+
+  report:
+    name: Validation report
+    needs: [rust, typescript, release-quality]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUST_RESULT: ${{ needs.rust.result }}
+          TS_RESULT: ${{ needs.typescript.result }}
+          RELEASE_RESULT: ${{ needs.release-quality.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/result.md <<EOF
+          ### v1.2.17 hardening validation
+
+          - Rust Windows/macOS/Linux: **${RUST_RESULT}**
+          - Control-plane tests/typecheck/lint: **${TS_RESULT}**
+          - Release-quality and transport-artifact checks: **${RELEASE_RESULT}**
+          - Commit: \`${GITHUB_SHA}\`
+
+          The pull request intentionally remains Draft until the standard CI and Security workflows are also green and every linked issue acceptance criterion has been reviewed.
+          EOF
+          gh pr comment 129 --repo "$GITHUB_REPOSITORY" --body-file /tmp/result.md
+          test "$RUST_RESULT" = success
+          test "$TS_RESULT" = success
+          test "$RELEASE_RESULT" = success
