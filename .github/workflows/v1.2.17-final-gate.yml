@@ -1,0 +1,98 @@
+name: v1.2.17 final gate
+
+on:
+  push:
+    branches:
+      - fix/resolve-open-issues-v1.2.17
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: v1.2.17-final-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wait-for-required-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Wait for CI, Security, and hardening validation on this SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=('CI' 'Security' 'v1.2.17 hardening validation')
+          deadline=$((SECONDS + 3000))
+          while (( SECONDS < deadline )); do
+            runs=$(gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${GITHUB_SHA}&per_page=100")
+            pending=0
+            failed=0
+            summary=''
+            for name in "${required[@]}"; do
+              row=$(jq -r --arg name "$name" '
+                [.workflow_runs[] | select(.name == $name)]
+                | sort_by(.run_number) | last
+                | if . == null then "missing|missing" else "\(.status)|\(.conclusion // \"pending\")" end
+              ' <<<"$runs")
+              status=${row%%|*}
+              conclusion=${row#*|}
+              summary+="- ${name}: ${status}/${conclusion}"$'\n'
+              if [[ "$status" != completed ]]; then
+                pending=1
+              elif [[ "$conclusion" != success ]]; then
+                failed=1
+              fi
+            done
+            printf '%s\n' "$summary"
+            if (( failed )); then
+              printf '%s' "$summary" > /tmp/workflow-summary.txt
+              exit 1
+            fi
+            if (( ! pending )); then
+              printf '%s' "$summary" > /tmp/workflow-summary.txt
+              exit 0
+            fi
+            sleep 30
+          done
+          echo 'Timed out waiting for required workflows on this exact commit.' >&2
+          exit 1
+
+      - name: Comment final-gate success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### v1.2.17 final workflow gate: passed'
+            echo
+            echo 'All required workflows completed successfully on the same commit:'
+            echo
+            cat /tmp/workflow-summary.txt
+            echo
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo
+            echo 'The PR remains Draft pending acceptance-criterion review and cleanup of temporary validation files.'
+          } > /tmp/comment.md
+          gh pr comment 129 --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md
+
+      - name: Comment final-gate failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          {
+            echo '### v1.2.17 final workflow gate: not passed'
+            echo
+            echo "At least one required workflow failed, was missing, or timed out on commit \`${GITHUB_SHA}\`."
+            echo 'The PR remains Draft; no release action is permitted.'
+          } > /tmp/comment.md
+          gh pr comment 129 --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md
