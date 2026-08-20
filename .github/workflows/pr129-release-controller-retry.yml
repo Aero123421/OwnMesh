@@ -1,0 +1,259 @@
+name: PR 129 resumable release controller
+
+on:
+  push:
+    branches:
+      - fix/resolve-open-issues-v1.2.17
+    paths:
+      - .github/workflows/pr129-release-controller-retry.yml
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  checks: read
+  contents: write
+  pull-requests: write
+  security-events: read
+
+concurrency:
+  group: pr129-release-controller
+  cancel-in-progress: false
+
+env:
+  REPO: Aero123421/OwnMesh
+  BRANCH: fix/resolve-open-issues-v1.2.17
+  PR_NUMBER: "129"
+  RELEASE_TAG: v1.2.17
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Inspect PR and release state
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          merged="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.merged')"
+          merge_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.merge_commit_sha // ""')"
+          if gh api "repos/$REPO/releases/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            published=true
+          else
+            published=false
+          fi
+          echo "merged=$merged" >> "$GITHUB_OUTPUT"
+          echo "merge_sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.state.outputs.merged != 'true'
+        with:
+          ref: fix/resolve-open-issues-v1.2.17
+          fetch-depth: 0
+
+      - name: Materialize patch and remove all controller artifacts
+        if: steps.state.outputs.merged != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d .github/patch8 ]; then
+            mapfile -t parts < <(find .github/patch8 -maxdepth 1 -type f -name 'part-*' -print | sort)
+            test "${#parts[@]}" -ge 2
+            cat "${parts[@]}" | tr -d '\r\n' > "$RUNNER_TEMP/changes.gz.b64"
+            base64 --decode "$RUNNER_TEMP/changes.gz.b64" > "$RUNNER_TEMP/changes.gz"
+            gzip -dc "$RUNNER_TEMP/changes.gz" > "$RUNNER_TEMP/changes.patch"
+            grep -q '^diff --git ' "$RUNNER_TEMP/changes.patch"
+            git apply --check --whitespace=nowarn "$RUNNER_TEMP/changes.patch"
+            git apply --index --whitespace=nowarn "$RUNNER_TEMP/changes.patch"
+          fi
+          rm -rf .github/patch .github/patch8
+          rm -f .github/workflows/source-export.yml
+          rm -f .github/workflows/materialize-pr-129.yml
+          rm -f .github/workflows/pr129-release-controller.yml
+          rm -f .github/workflows/pr129-release-controller-retry.yml
+          git add -A
+          git diff --cached --check
+          if ! git diff --cached --quiet; then
+            git config user.name "PHAITOTI"
+            git config user.email "184829077+Aero123421@users.noreply.github.com"
+            git commit -m "fix: finalize hardening merge candidate"
+            for attempt in 1 2 3; do
+              if git push origin "HEAD:$BRANCH"; then break; fi
+              test "$attempt" -lt 3
+              sleep 15
+              git fetch origin "$BRANCH"
+              git rebase "origin/$BRANCH"
+            done
+          fi
+
+      - name: Validate candidate and dispatch official gates
+        if: steps.state.outputs.merged != 'true'
+        id: candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$BRANCH" main --quiet
+          git checkout --detach "origin/$BRANCH"
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          test ! -e .github/patch
+          test ! -e .github/patch8
+          test ! -e .github/workflows/source-export.yml
+          test ! -e .github/workflows/materialize-pr-129.yml
+          test ! -e .github/workflows/pr129-release-controller.yml
+          test ! -e .github/workflows/pr129-release-controller-retry.yml
+          test "$(git diff --name-only origin/main...HEAD | sed '/^$/d' | wc -l)" -ge 5
+          grep -Eq '^version = "1\.2\.17"$' Cargo.toml
+          grep -q 'SERVICE_VERSION = "1.2.17"' packages/control-plane/src/util.ts
+          grep -q 'workflow_dispatch:' .github/workflows/release.yml
+          python scripts/check_release_quality.py
+          gh workflow run ci.yml --repo "$REPO" --ref "$BRANCH"
+          gh workflow run security.yml --repo "$REPO" --ref "$BRANCH"
+
+      - name: Wait for exact-sha CI and Security
+        if: steps.state.outputs.merged != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          wait_for() {
+            local file="$1" label="$2" wid rid status conclusion
+            wid="$(gh api "repos/$REPO/actions/workflows/$file" --jq '.id')"
+            rid=""
+            for _ in $(seq 1 90); do
+              rid="$(gh api --method GET "repos/$REPO/actions/workflows/$wid/runs" -f branch="$BRANCH" -f event=workflow_dispatch -f per_page=30 --jq ".workflow_runs | map(select(.head_sha == \"$SHA\")) | sort_by(.created_at) | last | .id // empty")"
+              [ -n "$rid" ] && break
+              sleep 10
+            done
+            test -n "$rid"
+            echo "$label: https://github.com/$REPO/actions/runs/$rid" >> "$GITHUB_STEP_SUMMARY"
+            for _ in $(seq 1 210); do
+              status="$(gh api "repos/$REPO/actions/runs/$rid" --jq '.status')"
+              conclusion="$(gh api "repos/$REPO/actions/runs/$rid" --jq '.conclusion // ""')"
+              if [ "$status" = completed ]; then
+                if [ "$conclusion" = success ]; then return 0; fi
+                gh run view "$rid" --repo "$REPO" --log-failed || true
+                return 1
+              fi
+              sleep 20
+            done
+            return 1
+          }
+          wait_for ci.yml CI
+          wait_for security.yml Security
+
+      - name: Ready and merge exact candidate
+        if: steps.state.outputs.merged != 'true'
+        id: merged_now
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.candidate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')" = "$SHA"
+          if [ "$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.draft')" = true ]; then
+            gh pr ready "$PR_NUMBER" --repo "$REPO"
+          fi
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --delete-branch=false --match-head-commit "$SHA"
+          test "$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.merged')" = true
+          merge_sha="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.merge_commit_sha')"
+          echo "sha=$merge_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve merge SHA
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.state.outputs.merged }}" = true ]; then
+            sha="${{ steps.state.outputs.merge_sha }}"
+          else
+            sha="${{ steps.merged_now.outputs.sha }}"
+          fi
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.state.outputs.published != 'true'
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify merged source and publish tag
+        if: steps.state.outputs.published != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main --tags --quiet
+          test "$(git rev-parse origin/main)" = "$MERGE_SHA"
+          git checkout --detach "$MERGE_SHA"
+          grep -Eq '^version = "1\.2\.17"$' Cargo.toml
+          grep -q 'SERVICE_VERSION = "1.2.17"' packages/control-plane/src/util.ts
+          grep -q 'v1.2.17' CHANGELOG.md
+          python scripts/check_release_quality.py
+          if gh api "repos/$REPO/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(gh api "repos/$REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')" = "$MERGE_SHA"
+          else
+            gh api --method POST "repos/$REPO/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$MERGE_SHA" >/dev/null
+          fi
+
+      - name: Dispatch and verify signed release
+        if: steps.state.outputs.published != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
+        run: |
+          set -euo pipefail
+          wid="$(gh api "repos/$REPO/actions/workflows/release.yml" --jq '.id')"
+          gh api --method POST "repos/$REPO/actions/workflows/$wid/dispatches" -f ref="$RELEASE_TAG"
+          rid=""
+          for _ in $(seq 1 90); do
+            rid="$(gh api --method GET "repos/$REPO/actions/workflows/$wid/runs" -f event=workflow_dispatch -f per_page=30 --jq ".workflow_runs | map(select(.head_sha == \"$MERGE_SHA\")) | sort_by(.created_at) | last | .id // empty")"
+            [ -n "$rid" ] && break
+            sleep 10
+          done
+          test -n "$rid"
+          echo "Release: https://github.com/$REPO/actions/runs/$rid" >> "$GITHUB_STEP_SUMMARY"
+          for _ in $(seq 1 300); do
+            status="$(gh api "repos/$REPO/actions/runs/$rid" --jq '.status')"
+            conclusion="$(gh api "repos/$REPO/actions/runs/$rid" --jq '.conclusion // ""')"
+            if [ "$status" = completed ]; then
+              if [ "$conclusion" = success ]; then break; fi
+              gh run view "$rid" --repo "$REPO" --log-failed || true
+              exit 1
+            fi
+            sleep 20
+          done
+          test "$(gh api "repos/$REPO/actions/runs/$rid" --jq '.conclusion')" = success
+          release="$(gh api "repos/$REPO/releases/tags/$RELEASE_TAG")"
+          test "$(jq -r '.draft' <<<"$release")" = false
+          test "$(jq -r '.prerelease' <<<"$release")" = false
+          test "$(jq '.assets | length' <<<"$release")" -gt 0
+          echo "Published: $(jq -r '.html_url' <<<"$release")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Completion comment
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Resumable release gate completed: exact-sha CI and Security passed, PR #$PR_NUMBER is merged, and $RELEASE_TAG is published with release assets."
+
+      - name: Failure comment
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Release gate stopped fail-closed. No later merge/tag/release step was allowed after the failing stage. Controller run: https://github.com/$REPO/actions/runs/$GITHUB_RUN_ID"
