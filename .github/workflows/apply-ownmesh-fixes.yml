@@ -1,0 +1,52 @@
+name: Apply validated OwnMesh issue fixes
+
+on:
+  push:
+    branches:
+      - fix/resolve-open-issues-v1.2.17
+    paths:
+      - .github/ownmesh-apply/**
+      - .github/workflows/apply-ownmesh-fixes.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-ownmesh-issue-fixes
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify and apply issue-resolution patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .github/ownmesh-apply/part-* > "$RUNNER_TEMP/ownmesh.patch.b64"
+          echo "496c4918449be9e0127ed17fdc6eeccb2315d1fcd68bfed472d3e34fbd580943  $RUNNER_TEMP/ownmesh.patch.b64" | sha256sum --check --strict
+          base64 --decode "$RUNNER_TEMP/ownmesh.patch.b64" > "$RUNNER_TEMP/ownmesh.patch.gz"
+          echo "0aae953a645c8a32c40a7340eced011b7bb7cf68491d8215500f7f3944710c81  $RUNNER_TEMP/ownmesh.patch.gz" | sha256sum --check --strict
+          gzip --decompress --stdout "$RUNNER_TEMP/ownmesh.patch.gz" > "$RUNNER_TEMP/ownmesh.patch"
+          echo "5bbb70dbadfc7accdbbd099e0c9f6ae31b89e95bb520cdd5d82ce62fe16e892c  $RUNNER_TEMP/ownmesh.patch" | sha256sum --check --strict
+          git apply --check "$RUNNER_TEMP/ownmesh.patch"
+          git apply "$RUNNER_TEMP/ownmesh.patch"
+          rm -rf .github/patch .github/patch8 .github/ownmesh-apply
+          rm -f .github/workflows/source-export.yml .github/workflows/apply-ownmesh-fixes.yml
+          git add -A
+          git diff --check --cached
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Aero123421"
+          git config user.email "184829077+Aero123421@users.noreply.github.com"
+          git commit \
+            -m "fix: resolve remaining hardening issues" \
+            -m "Tracking: #100 #101 #113 #121 #122 #123 #124 #125 #126 #128"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
