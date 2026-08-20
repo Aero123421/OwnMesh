@@ -115,10 +115,16 @@ pub enum ErrorCode {
     ControllerConflict,
     #[serde(rename = "OWNMESH_E_SESSION_NOT_CONTROLLER")]
     SessionNotController,
+    #[serde(rename = "OWNMESH_E_JOURNAL_CAPACITY")]
+    JournalCapacity,
+    #[serde(rename = "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED")]
+    TransitionRecoveryRequired,
 
     // exit 8
     #[serde(rename = "OWNMESH_E_PROFILE_UNAVAILABLE")]
     ProfileUnavailable,
+    #[serde(rename = "OWNMESH_E_EXECUTABLE_FORMAT")]
+    ExecutableFormat,
 
     // exit 9
     #[serde(rename = "OWNMESH_E_INTERNAL")]
@@ -148,7 +154,10 @@ impl ErrorCode {
             Self::StaleSnapshot => "OWNMESH_E_STALE_SNAPSHOT",
             Self::ControllerConflict => "OWNMESH_E_CONTROLLER_CONFLICT",
             Self::SessionNotController => "OWNMESH_E_SESSION_NOT_CONTROLLER",
+            Self::JournalCapacity => "OWNMESH_E_JOURNAL_CAPACITY",
+            Self::TransitionRecoveryRequired => "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED",
             Self::ProfileUnavailable => "OWNMESH_E_PROFILE_UNAVAILABLE",
+            Self::ExecutableFormat => "OWNMESH_E_EXECUTABLE_FORMAT",
             Self::Internal => "OWNMESH_E_INTERNAL",
         }
     }
@@ -178,7 +187,10 @@ impl ErrorCode {
             "OWNMESH_E_STALE_SNAPSHOT" => Ok(Self::StaleSnapshot),
             "OWNMESH_E_CONTROLLER_CONFLICT" => Ok(Self::ControllerConflict),
             "OWNMESH_E_SESSION_NOT_CONTROLLER" => Ok(Self::SessionNotController),
+            "OWNMESH_E_JOURNAL_CAPACITY" => Ok(Self::JournalCapacity),
+            "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED" => Ok(Self::TransitionRecoveryRequired),
             "OWNMESH_E_PROFILE_UNAVAILABLE" => Ok(Self::ProfileUnavailable),
+            "OWNMESH_E_EXECUTABLE_FORMAT" => Ok(Self::ExecutableFormat),
             "OWNMESH_E_INTERNAL" => Ok(Self::Internal),
             _ => Err(DomainError::new(
                 Self::InvalidArgument,
@@ -206,8 +218,10 @@ impl ErrorCode {
             Self::Conflict
             | Self::StaleSnapshot
             | Self::ControllerConflict
-            | Self::SessionNotController => ExitCode::Conflict,
-            Self::ProfileUnavailable => ExitCode::ProfileUnavailable,
+            | Self::SessionNotController
+            | Self::JournalCapacity
+            | Self::TransitionRecoveryRequired => ExitCode::Conflict,
+            Self::ProfileUnavailable | Self::ExecutableFormat => ExitCode::ProfileUnavailable,
             Self::Internal => ExitCode::Internal,
         }
     }
@@ -217,7 +231,12 @@ impl ErrorCode {
     pub const fn retryable(self) -> bool {
         matches!(
             self,
-            Self::DeviceOffline | Self::Timeout | Self::Conflict | Self::Internal
+            Self::DeviceOffline
+                | Self::Timeout
+                | Self::Conflict
+                | Self::JournalCapacity
+                | Self::TransitionRecoveryRequired
+                | Self::Internal
         )
     }
 }

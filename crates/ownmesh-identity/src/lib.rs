@@ -27,8 +27,9 @@ pub use device_key::{
 pub use error::{IdentityError, IdentityResult};
 pub use secret::{SecretBytes, SecretPurpose, SecretString};
 pub use store::{
-    EncryptedFileKeystore, LegacyMirrorCleanupReport, MemorySecretStore, OsKeychainStore,
-    PreferredSecretStore, PreferredSecretStoreReport, PreferredStoreFallbackPolicy,
+    CredentialStoreDiagnosticSnapshot, EncryptedFileKeystore, LegacyMirrorCleanupReport,
+    MemorySecretStore, OsKeychainStore, PreferredSecretStore, PreferredSecretStoreReport,
+    PreferredStoreFallbackPolicy, CREDENTIAL_STORE_DIAGNOSTIC_FILE,
     ResidualFallbackKind, ResidualFallbackSecret, SecretStore,
 };
 

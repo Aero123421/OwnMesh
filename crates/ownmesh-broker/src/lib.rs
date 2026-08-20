@@ -51,7 +51,9 @@ pub use install::{
     broker_status, endpoint_kind_peer_enforceable, install_broker, install_broker_with_config,
     uninstall_broker, BrokerInstallConfig, InstallRecord, InstallStatus, INSTALL_FILE,
 };
-pub use ledger::{ReplayLedger, ReplayLedgerError, ReplayReservation};
+pub use ledger::{
+    ReconcileDecision, ReplayLedger, ReplayLedgerError, ReplayLedgerStatus, ReplayReservation,
+};
 #[cfg(target_os = "macos")]
 pub use macos_lifecycle::load_macos_run_config;
 pub use peer::{

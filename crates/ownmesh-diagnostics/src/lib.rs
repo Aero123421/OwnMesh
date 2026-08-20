@@ -19,7 +19,6 @@
 )]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use thiserror::Error;
 
 /// Stable crate name used by diagnostics and tests.
@@ -251,6 +250,17 @@ pub struct CredentialObservation {
     pub enrolled_device_id_present: bool,
 }
 
+/// Non-secret credential-store provenance persisted by the runtime for doctor.
+#[derive(Debug, Clone, Default)]
+pub struct CredentialStoreObservation {
+    pub metadata_present: bool,
+    pub backend_name: Option<String>,
+    pub fallback_policy: Option<String>,
+    pub degraded: bool,
+    pub residual_fallback_entries: usize,
+    pub read_error: Option<String>,
+}
+
 /// Daemon IPC observation.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonObservation {
@@ -406,6 +416,7 @@ pub struct DoctorInput {
     pub binary: BinaryObservation,
     pub config: ConfigObservation,
     pub credentials: CredentialObservation,
+    pub credential_store: CredentialStoreObservation,
     pub daemon: DaemonObservation,
     pub control_plane: ControlPlaneObservation,
     pub privacy_policy: PrivacyPolicyObservation,
@@ -564,6 +575,54 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         "device connect credential",
         Some("run `ownmesh device enroll`"),
     ));
+
+    // Store provenance is non-secret metadata only. Missing/unreadable metadata
+    // is a warning rather than a fabricated claim about OS-keychain health.
+    let store_check = if let Some(error) = &input.credential_store.read_error {
+        DoctorCheck::warn(
+            "credential.store",
+            "credential-store provenance metadata is unreadable",
+        )
+        .with_detail(error.clone())
+    } else if !input.credential_store.metadata_present {
+        DoctorCheck::warn(
+            "credential.store",
+            "credential-store provenance has not been observed yet",
+        )
+    } else if input.credential_store.degraded
+        || input.credential_store.residual_fallback_entries > 0
+        || input
+            .credential_store
+            .backend_name
+            .as_deref()
+            .is_some_and(|backend| backend.contains("encrypted-file"))
+    {
+        DoctorCheck::warn(
+            "credential.store",
+            format!(
+                "credential store is using/dependent on fallback storage (backend={}, residual_fallback_entries={})",
+                input
+                    .credential_store
+                    .backend_name
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                input.credential_store.residual_fallback_entries,
+            ),
+        )
+    } else {
+        DoctorCheck::pass(
+            "credential.store",
+            format!(
+                "credential store backend {}",
+                input
+                    .credential_store
+                    .backend_name
+                    .as_deref()
+                    .unwrap_or("unknown"),
+            ),
+        )
+    };
+    checks.push(store_check);
     if input.credentials.enrolled_device_id_present {
         checks.push(DoctorCheck::pass(
             "enrollment",
@@ -1159,32 +1218,451 @@ pub fn appears_redacted(text: &str) -> bool {
     true
 }
 
-/// Support bundle (local only until user exports).
+/// Versioned, allowlisted support-bundle schema. No raw file/text section map
+/// exists in the production API: every exported field is explicitly reviewed.
+pub const SUPPORT_BUNDLE_SCHEMA_VERSION: u32 = 2;
+const SUPPORT_MAX_TEXT_BYTES: usize = 2 * 1024;
+const SUPPORT_MAX_DOCTOR_CHECKS: usize = 128;
+const SUPPORT_MAX_EVENTS: usize = 64;
+const SUPPORT_MAX_SERIALIZED_BYTES: usize = 512 * 1024;
+const SUPPORT_HIGH_ENTROPY_MIN_BYTES: usize = 48;
+const SUPPORT_HIGH_ENTROPY_MIN_DISTINCT: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupportBundle {
-    pub created_unix: i64,
-    pub doctor: DoctorReport,
-    pub sections: BTreeMap<String, String>,
-    pub redacted: bool,
+#[serde(deny_unknown_fields)]
+pub struct PublicPlatformFacts {
+    pub os: String,
+    pub arch: String,
+    pub ownmesh_version: String,
 }
 
-/// Build a redacted support bundle preview.
-#[must_use]
-pub fn build_support_bundle(
-    doctor: DoctorReport,
-    raw_sections: BTreeMap<String, String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicServiceFacts {
+    pub platform: String,
+    pub supported: bool,
+    pub installed: bool,
+    pub running: Option<bool>,
+    pub hardening_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PublicJournalHealth {
+    pub transition_pending: usize,
+    pub transition_expired: usize,
+    pub op_journal_entries: usize,
+    pub op_journal_in_progress: usize,
+    pub op_journal_uncertain: usize,
+    pub op_journal_durable_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicDiagnosticEvent {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportBundleV2 {
+    pub schema_version: u32,
+    pub created_unix: i64,
+    pub doctor: DoctorReport,
+    pub platform: PublicPlatformFacts,
+    pub service: PublicServiceFacts,
+    pub journal_health: PublicJournalHealth,
+    pub recent_events: Vec<PublicDiagnosticEvent>,
+}
+
+/// Explicit input for support export. Secret-bearing internal structs cannot be
+/// inserted here; callers must select reviewed public fields individually.
+#[derive(Debug, Clone)]
+pub struct SupportBundleInput {
+    pub doctor: DoctorReport,
+    pub platform: PublicPlatformFacts,
+    pub service: PublicServiceFacts,
+    pub journal_health: PublicJournalHealth,
+    pub recent_events: Vec<PublicDiagnosticEvent>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SupportBundleError {
+    #[error("support bundle field exceeds limit: {0}")]
+    FieldTooLarge(String),
+    #[error("support bundle collection exceeds limit: {0}")]
+    CollectionTooLarge(String),
+    #[error("support bundle secret scanner rejected section: {0}")]
+    SuspiciousContent(String),
+    #[error("support bundle serialization failed")]
+    Serialization,
+    #[error("support bundle owner-only write failed")]
+    Write,
+}
+
+/// Immutable preview/export payload. Preview metadata and file export both use
+/// these exact serialized bytes; no source is re-gathered after preview.
+#[derive(Debug, Clone)]
+pub struct PreparedSupportBundle {
+    bytes: Vec<u8>,
+    sha256_hex: String,
+}
+
+impl PreparedSupportBundle {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn sha256_hex(&self) -> &str {
+        &self.sha256_hex
+    }
+
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        SUPPORT_BUNDLE_SCHEMA_VERSION
+    }
+
+    #[must_use]
+    pub fn included_sections(&self) -> [&'static str; 5] {
+        ["doctor", "platform", "service", "journal_health", "recent_events"]
+    }
+}
+
+/// Build and freeze the exact bytes shown in preview and later exported.
+pub fn prepare_support_bundle(
+    input: SupportBundleInput,
     created_unix: i64,
-) -> SupportBundle {
-    let mut sections = BTreeMap::new();
-    for (k, v) in raw_sections {
-        sections.insert(k, redact_text(&v));
-    }
-    SupportBundle {
+) -> Result<PreparedSupportBundle, SupportBundleError> {
+    validate_support_input(&input)?;
+    let bundle = SupportBundleV2 {
+        schema_version: SUPPORT_BUNDLE_SCHEMA_VERSION,
         created_unix,
-        doctor,
-        sections,
-        redacted: true,
+        doctor: input.doctor,
+        platform: input.platform,
+        service: input.service,
+        journal_health: input.journal_health,
+        recent_events: input.recent_events,
+    };
+
+    scan_serializable_section("doctor", &bundle.doctor)?;
+    scan_serializable_section("platform", &bundle.platform)?;
+    scan_serializable_section("service", &bundle.service)?;
+    scan_serializable_section("journal_health", &bundle.journal_health)?;
+    scan_serializable_section("recent_events", &bundle.recent_events)?;
+
+    let bytes = serde_json::to_vec_pretty(&bundle).map_err(|_| SupportBundleError::Serialization)?;
+    if bytes.len() > SUPPORT_MAX_SERIALIZED_BYTES {
+        return Err(SupportBundleError::CollectionTooLarge(
+            "serialized_bundle".into(),
+        ));
     }
+    let sha256_hex = support_sha256_hex(&bytes);
+    Ok(PreparedSupportBundle { bytes, sha256_hex })
+}
+
+/// Atomically export the already-previewed bytes with owner-only file custody.
+/// This performs no network activity and does not re-read any diagnostic source.
+pub fn write_prepared_support_bundle(
+    path: &std::path::Path,
+    prepared: &PreparedSupportBundle,
+) -> Result<(), SupportBundleError> {
+    ownmesh_ipc::atomic_write_owner_only(path, prepared.bytes())
+        .map_err(|_| SupportBundleError::Write)
+}
+
+fn validate_support_input(input: &SupportBundleInput) -> Result<(), SupportBundleError> {
+    if input.doctor.checks.len() > SUPPORT_MAX_DOCTOR_CHECKS {
+        return Err(SupportBundleError::CollectionTooLarge("doctor.checks".into()));
+    }
+    if input.recent_events.len() > SUPPORT_MAX_EVENTS {
+        return Err(SupportBundleError::CollectionTooLarge("recent_events".into()));
+    }
+    check_support_text("doctor.version", &input.doctor.version)?;
+    for check in &input.doctor.checks {
+        check_support_text("doctor.check.id", &check.id)?;
+        check_support_text("doctor.check.message", &check.message)?;
+        if let Some(detail) = &check.detail {
+            check_support_text("doctor.check.detail", detail)?;
+        }
+    }
+    check_support_text("platform.os", &input.platform.os)?;
+    check_support_text("platform.arch", &input.platform.arch)?;
+    check_support_text("platform.ownmesh_version", &input.platform.ownmesh_version)?;
+    check_support_text("service.platform", &input.service.platform)?;
+    if let Some(summary) = &input.service.hardening_summary {
+        check_support_text("service.hardening_summary", summary)?;
+    }
+    for event in &input.recent_events {
+        check_support_text("recent_events.kind", &event.kind)?;
+        check_support_text("recent_events.message", &event.message)?;
+    }
+    Ok(())
+}
+
+fn check_support_text(field: &str, text: &str) -> Result<(), SupportBundleError> {
+    if text.len() > SUPPORT_MAX_TEXT_BYTES {
+        return Err(SupportBundleError::FieldTooLarge(field.into()));
+    }
+    Ok(())
+}
+
+fn scan_serializable_section<T: Serialize>(
+    section: &str,
+    value: &T,
+) -> Result<(), SupportBundleError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| SupportBundleError::Serialization)?;
+    let text = String::from_utf8_lossy(&bytes);
+    if contains_suspicious_support_content(&text) {
+        return Err(SupportBundleError::SuspiciousContent(section.into()));
+    }
+    Ok(())
+}
+
+fn contains_suspicious_support_content(text: &str) -> bool {
+    let normalized = normalize_support_scan_text(text);
+    let whitespace_normalized = normalized
+        .replace("\\n", " ")
+        .replace("\\r", " ")
+        .replace("\\t", " ");
+    if contains_suspicious_support_content_normalized(&whitespace_normalized) {
+        return true;
+    }
+    let percent_decoded = percent_decode_ascii(&whitespace_normalized);
+    if percent_decoded != whitespace_normalized
+        && contains_suspicious_support_content_normalized(&percent_decoded)
+    {
+        return true;
+    }
+
+    // JSON serialization represents embedded line breaks as `\\n`. A secret
+    // split only to evade line-oriented scanners must still be treated as one
+    // candidate. Keep punctuation intact so ordinary prose is not joined into
+    // a synthetic high-entropy token.
+    let compact_escapes = normalized
+        .replace("\\n", "")
+        .replace("\\r", "")
+        .replace("\\t", "");
+    if compact_escapes != normalized
+        && contains_suspicious_support_content_normalized(&compact_escapes)
+    {
+        return true;
+    }
+    let compact_percent_decoded = percent_decode_ascii(&compact_escapes);
+    compact_percent_decoded != compact_escapes
+        && contains_suspicious_support_content_normalized(&compact_percent_decoded)
+}
+
+fn contains_suspicious_support_content_normalized(text: &str) -> bool {
+    if [
+        "-----begin private key",
+        "-----begin rsa private key",
+        "-----begin ec private key",
+        "-----begin openssh private key",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return true;
+    }
+
+    if has_labeled_secret(text, "authorization", true)
+        || has_labeled_secret(text, "cookie", false)
+        || has_labeled_secret(text, "set-cookie", false)
+        || [
+            "access_token",
+            "refresh_token",
+            "device_code",
+            "client_assertion",
+            "client_secret",
+            "api_key",
+            "password",
+            "private_key",
+            "code_verifier",
+        ]
+        .iter()
+        .any(|label| has_labeled_secret(text, label, false))
+    {
+        return true;
+    }
+
+    // Reject JWT-like three-segment bearer material without copying it into an
+    // error. Ordinary dotted versions/hostnames do not meet these bounds.
+    for token in text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    }) {
+        let token = token.trim_matches(|character: char| matches!(character, ':' | '='));
+        let segments: Vec<&str> = token.split('.').collect();
+        if segments.len() == 3
+            && segments.iter().all(|segment| {
+                segment.len() >= 8
+                    && segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+        {
+            return true;
+        }
+        if looks_like_high_entropy_secret(token) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_support_scan_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for character in text.chars() {
+        let folded = match character {
+            '\u{3000}' => ' ',
+            '\u{ff01}'..='\u{ff5e}' => char::from_u32(u32::from(character) - 0xfee0)
+                .unwrap_or(character),
+            _ => character,
+        };
+        for lowercase in folded.to_lowercase() {
+            normalized.push(lowercase);
+        }
+    }
+    normalized
+}
+
+fn percent_decode_ascii(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = hex_nibble(bytes[index + 1]);
+            let low = hex_nibble(bytes[index + 2]);
+            if let (Some(high), Some(low)) = (high, low) {
+                output.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn has_labeled_secret(text: &str, label: &str, require_bearer: bool) -> bool {
+    let mut remainder = text;
+    while let Some(offset) = remainder.find(label) {
+        let after_label = &remainder[offset + label.len()..];
+        let structural = after_label.trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '\\' | '"' | '\'')
+        });
+        let Some(value) = structural
+            .strip_prefix(':')
+            .or_else(|| structural.strip_prefix('='))
+        else {
+            remainder = after_label;
+            continue;
+        };
+        let value = value.trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '\\' | '"' | '\'' | ':' | '=')
+        });
+        if require_bearer {
+            if let Some(after_bearer) = value.strip_prefix("bearer") {
+                let bearer_value = after_bearer.trim_start_matches(|character: char| {
+                    character.is_whitespace()
+                        || matches!(character, '\\' | '"' | '\'' | ':' | '=')
+                });
+                if has_nonempty_secret_value(bearer_value) {
+                    return true;
+                }
+            }
+        } else if has_nonempty_secret_value(value) {
+            return true;
+        }
+        remainder = after_label;
+    }
+    false
+}
+
+fn has_nonempty_secret_value(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|character| !matches!(character, ',' | '}' | ']' | ')' | ';'))
+}
+
+fn looks_like_high_entropy_secret(token: &str) -> bool {
+    let token = token.trim_matches(|character: char| {
+        matches!(character, '[' | ']' | '{' | '}' | ':' | '=')
+    });
+    if token.len() < SUPPORT_HIGH_ENTROPY_MIN_BYTES || token.len() > SUPPORT_MAX_TEXT_BYTES {
+        return false;
+    }
+    if token.starts_with("http://")
+        || token.starts_with("https://")
+        || token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.contains("\\\\")
+    {
+        return false;
+    }
+    if !token.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'/' | b'=')
+    }) {
+        return false;
+    }
+
+    let mut distinct = [false; 128];
+    let mut distinct_count = 0;
+    let mut has_lower = false;
+    let mut has_upper = false;
+    let mut has_digit = false;
+    let mut has_symbol = false;
+    for byte in token.bytes() {
+        if byte.is_ascii_lowercase() {
+            has_lower = true;
+        } else if byte.is_ascii_uppercase() {
+            has_upper = true;
+        } else if byte.is_ascii_digit() {
+            has_digit = true;
+        } else {
+            has_symbol = true;
+        }
+        let index = usize::from(byte);
+        if !distinct[index] {
+            distinct[index] = true;
+            distinct_count += 1;
+        }
+    }
+    let categories = usize::from(has_lower)
+        + usize::from(has_upper)
+        + usize::from(has_digit)
+        + usize::from(has_symbol);
+    distinct_count >= SUPPORT_HIGH_ENTROPY_MIN_DISTINCT && categories >= 3
+}
+
+fn support_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]

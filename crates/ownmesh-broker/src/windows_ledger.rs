@@ -6,29 +6,53 @@
 //! cannot pre-create or replace it.  A record left `reserved` by a crash is
 //! never retried automatically.
 
+use crate::ledger::{ReconcileDecision, ReplayLedgerStatus};
 use crate::windows::WindowsReplayLedger;
 use ownmesh_broker_client::{operation_facts_digest, BrokerRequestV2};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NONCE: usize = 256;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum State {
-    Reserved,
+    ReservedPreSpawn,
+    SpawnedUncertain,
     Completed,
+    AbortedBeforeSpawn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReconciliationRecord {
+    actor: String,
+    at_unix: i64,
+    prior_state: State,
+    new_state: State,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Entry {
     digest: String,
+    #[serde(default)]
+    reserved_at_unix: i64,
     expires_at_unix: i64,
+    #[serde(default)]
+    transition_seq: u64,
     state: State,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_birth_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconciliation: Option<ReconciliationRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +61,18 @@ struct File {
     version: u32,
     entries: BTreeMap<String, Entry>,
 }
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyState { Reserved, Completed }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEntry { digest: String, expires_at_unix: i64, state: LegacyState }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyFile { version: u32, entries: BTreeMap<String, LegacyEntry> }
 
 /// The replay ledger is owner-only at rest and has no best-effort recovery.
 pub struct WindowsDurableReplayLedger {
@@ -58,15 +94,60 @@ impl WindowsDurableReplayLedger {
         let entries = if path.exists() {
             let bytes = ownmesh_ipc::read_owner_only_file_bounded(&path, MAX_BYTES)
                 .map_err(|error| format!("Windows replay ledger custody/read: {error}"))?;
-            let file: File = serde_json::from_slice(&bytes)
-                .map_err(|error| format!("Windows replay ledger parse: {error}"))?;
-            if file.version != VERSION || file.entries.len() > max_entries {
-                return Err("Windows replay ledger version or entry count is invalid".into());
-            }
-            for (nonce, entry) in &file.entries {
+            let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+                .ok_or("Windows replay ledger version is missing")?;
+            let (entries, migrated) = match version {
+                1 => {
+                    let legacy: LegacyFile = serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("Windows replay ledger legacy parse: {error}"))?;
+                    if legacy.version != 1 || legacy.entries.len() > max_entries {
+                        return Err("Windows replay ledger legacy entry count is invalid".into());
+                    }
+                    let entries = legacy.entries.into_iter().map(|(nonce, entry)| {
+                        let state = match entry.state {
+                            LegacyState::Reserved => State::SpawnedUncertain,
+                            LegacyState::Completed => State::Completed,
+                        };
+                        (nonce, Entry {
+                            digest: entry.digest,
+                            reserved_at_unix: 0,
+                            expires_at_unix: entry.expires_at_unix,
+                            transition_seq: 1,
+                            state,
+                            process_pid: None,
+                            process_birth_id: None,
+                            result_digest: None,
+                            reconciliation: None,
+                        })
+                    }).collect();
+                    (entries, true)
+                }
+                value if value == u64::from(VERSION) => {
+                    let file: File = serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("Windows replay ledger parse: {error}"))?;
+                    if file.entries.len() > max_entries {
+                        return Err("Windows replay ledger entry count is invalid".into());
+                    }
+                    (file.entries, false)
+                }
+                _ => return Err("Windows replay ledger forward version is unsupported".into()),
+            };
+            for (nonce, entry) in &entries {
                 validate_entry(nonce, entry)?;
             }
-            file.entries
+            if migrated {
+                let mut ledger = Self {
+                    path: path.clone(),
+                    max_entries,
+                    entries,
+                    failed_closed: false,
+                };
+                ledger.persist()?;
+                return Ok(ledger);
+            }
+            entries
         } else {
             BTreeMap::new()
         };
@@ -109,8 +190,82 @@ impl WindowsDurableReplayLedger {
     }
 
     fn prune_completed(&mut self, now_unix: i64) {
-        self.entries
-            .retain(|_, entry| entry.state == State::Reserved || entry.expires_at_unix >= now_unix);
+        self.entries.retain(|_, entry| {
+            matches!(entry.state, State::ReservedPreSpawn | State::SpawnedUncertain)
+                || entry.expires_at_unix >= now_unix
+        });
+    }
+
+    #[must_use]
+    pub fn status(&self) -> ReplayLedgerStatus {
+        let total_entries = self.entries.len();
+        let completed_entries = self.entries.values().filter(|entry| {
+            matches!(entry.state, State::Completed | State::AbortedBeforeSpawn)
+        }).count();
+        let uncertain_entries = self.entries.values().filter(|entry| {
+            entry.state == State::SpawnedUncertain
+        }).count();
+        let recoverable_pre_spawn_entries = self.entries.values().filter(|entry| {
+            entry.state == State::ReservedPreSpawn
+        }).count();
+        let oldest_uncertain_unix = self.entries.values().filter(|entry| {
+            matches!(entry.state, State::ReservedPreSpawn | State::SpawnedUncertain)
+        }).map(|entry| entry.reserved_at_unix).min();
+        let warning_threshold = self.max_entries.saturating_mul(3) / 5;
+        let critical_threshold = self.max_entries.saturating_mul(4) / 5;
+        ReplayLedgerStatus {
+            schema_version: VERSION,
+            max_entries: self.max_entries,
+            total_entries,
+            completed_entries,
+            uncertain_entries,
+            recoverable_pre_spawn_entries,
+            durable_bytes: std::fs::metadata(&self.path).map(|metadata| metadata.len()).unwrap_or(0),
+            oldest_uncertain_unix,
+            warning: total_entries >= warning_threshold,
+            critical: total_entries >= critical_threshold,
+        }
+    }
+
+    pub fn reconcile(
+        &mut self,
+        nonce: &str,
+        decision: ReconcileDecision,
+        actor: &str,
+        now_unix: i64,
+        acknowledge_uncertain: bool,
+    ) -> Result<(), String> {
+        if self.failed_closed {
+            return Err("Windows replay ledger is failed closed".into());
+        }
+        if actor.is_empty() || actor.len() > 128 || actor.contains(['\n', '\r', '\0']) {
+            return Err("Windows replay reconciliation actor is invalid".into());
+        }
+        let Some(entry) = self.entries.get_mut(nonce) else {
+            return Err("Windows replay reconciliation nonce is unknown".into());
+        };
+        let prior = entry.state;
+        let next = match decision {
+            ReconcileDecision::MarkAbortedBeforeSpawn
+                if prior == State::ReservedPreSpawn => State::AbortedBeforeSpawn,
+            ReconcileDecision::MarkCompleted
+                if prior == State::SpawnedUncertain && acknowledge_uncertain => State::Completed,
+            ReconcileDecision::MarkCompleted if prior == State::SpawnedUncertain => {
+                return Err(
+                    "Windows replay uncertain reconciliation requires acknowledgement".into(),
+                );
+            }
+            _ => return Err("Windows replay reconciliation conflicts with durable state".into()),
+        };
+        entry.state = next;
+        entry.transition_seq = entry.transition_seq.saturating_add(1);
+        entry.reconciliation = Some(ReconciliationRecord {
+            actor: actor.to_owned(),
+            at_unix: now_unix,
+            prior_state: prior,
+            new_state: next,
+        });
+        self.persist()
     }
 }
 
@@ -131,10 +286,28 @@ impl WindowsReplayLedger for WindowsDurableReplayLedger {
             request.nonce.clone(),
             Entry {
                 digest: operation_facts_digest(&request.facts),
+                reserved_at_unix: now_unix,
                 expires_at_unix: request.expires_at_unix,
-                state: State::Reserved,
+                transition_seq: 1,
+                state: State::ReservedPreSpawn,
+                process_pid: None,
+                process_birth_id: None,
+                result_digest: None,
+                reconciliation: None,
             },
         );
+        self.persist()
+    }
+
+    fn mark_spawned(&mut self, nonce: &str, digest: &str) -> Result<(), String> {
+        let Some(entry) = self.entries.get_mut(nonce) else {
+            return Err("Windows replay spawn boundary lacks a reservation".into());
+        };
+        if entry.digest != digest || entry.state != State::ReservedPreSpawn {
+            return Err("Windows replay spawn boundary conflicts with reservation".into());
+        }
+        entry.state = State::SpawnedUncertain;
+        entry.transition_seq = entry.transition_seq.saturating_add(1);
         self.persist()
     }
 
@@ -145,7 +318,11 @@ impl WindowsReplayLedger for WindowsDurableReplayLedger {
         if entry.digest != digest {
             return Err("Windows replay completion digest differs from reservation".into());
         }
+        if entry.state != State::SpawnedUncertain {
+            return Err("Windows replay completion did not follow a durable spawn boundary".into());
+        }
         entry.state = State::Completed;
+        entry.transition_seq = entry.transition_seq.saturating_add(1);
         self.persist()
     }
 }
@@ -177,6 +354,20 @@ fn validate_entry(nonce: &str, entry: &Entry) -> Result<(), String> {
             .digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        || entry.transition_seq == 0
+        || entry.process_pid.is_some() != entry.process_birth_id.is_some()
+        || entry.result_digest.as_ref().is_some_and(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        })
+        || entry.reconciliation.as_ref().is_some_and(|record| {
+            record.actor.is_empty()
+                || record.actor.len() > 128
+                || record.actor.contains(['\n', '\r', '\0'])
+                || record.prior_state == record.new_state
+        })
     {
         return Err("Windows replay ledger contains an invalid entry".into());
     }

@@ -420,4 +420,10 @@ pub mod app_error {
     /// An approval-bound executable invocation/backing identity changed before
     /// the OS image-open step. The caller must request a fresh authorization.
     pub const EXECUTABLE_IDENTITY_DRIFT: i64 = -32_015;
+    /// The durable operation journal has no safe evictable capacity for a new side effect.
+    pub const JOURNAL_CAPACITY: i64 = -32_016;
+    /// A retained transition record requires explicit recovery/reconciliation.
+    pub const TRANSITION_RECOVERY_REQUIRED: i64 = -32_017;
+    /// The resolved executable cannot be launched by the target OS (for example Win32 error 193).
+    pub const EXECUTABLE_FORMAT: i64 = -32_018;
 }

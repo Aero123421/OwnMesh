@@ -27,6 +27,13 @@ pub const MAX_ENTRY_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum total uncompressed bytes across all accepted members.
 pub const MAX_TOTAL_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Maximum payload size of one PAX/GNU TAR metadata record.
+///
+/// Portable OwnMesh archives need only short path metadata. Bounding these
+/// records independently prevents signed-but-malformed archives from spending
+/// unbounded decompression work outside the normal member budget.
+pub const MAX_TAR_METADATA_ENTRY_BYTES: u64 = 64 * 1024;
+
 /// Documentation / license files permitted beside the five required binaries.
 pub const ALLOWED_DOC_FILES: &[&str] = &[
     "LICENSE",

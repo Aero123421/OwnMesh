@@ -2,6 +2,7 @@
 
 use crate::error::{IdentityError, IdentityResult};
 use crate::secret::{SecretBytes, SecretPurpose};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -290,6 +291,10 @@ pub struct PreferredSecretStore<P = OsKeychainStore, F = EncryptedFileKeystore> 
     prefer_primary: Mutex<bool>,
     /// Outcome of the last legacy-mirror cleanup attempt (if any).
     cleanup_report: Mutex<LegacyMirrorCleanupReport>,
+    /// Production-only location for non-secret doctor provenance metadata.
+    diagnostic_path: Option<PathBuf>,
+    /// Production fallback directory; used only for file-name presence counts.
+    fallback_dir: Option<PathBuf>,
 }
 
 /// Explicit policy for how [`PreferredSecretStore`] uses the encrypted-file fallback.
@@ -361,6 +366,21 @@ pub struct LegacyMirrorCleanupReport {
     pub error: Option<String>,
 }
 
+/// Non-secret credential-store provenance persisted for read-only doctor runs.
+/// No credential bytes, keychain account values, or backend error bodies are stored.
+pub const CREDENTIAL_STORE_DIAGNOSTIC_FILE: &str = "credential-store-report.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialStoreDiagnosticSnapshot {
+    pub schema_version: u32,
+    pub backend_name: String,
+    pub fallback_policy: String,
+    pub degraded: bool,
+    pub residual_fallback_entries: usize,
+    pub cleanup_degraded: bool,
+}
+
 /// Snapshot of preferred-store health, policy, and residual fallback presence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreferredSecretStoreReport {
@@ -404,10 +424,12 @@ impl PreferredSecretStore<OsKeychainStore, EncryptedFileKeystore> {
         let fallback_dir = fallback_dir.as_ref();
         std::fs::create_dir_all(fallback_dir)?;
         let passphrase = resolve_fallback_passphrase(fallback_dir)?;
-        let store = Self::from_backends(
+        let mut store = Self::from_backends(
             OsKeychainStore::new(service),
             EncryptedFileKeystore::new(fallback_dir, passphrase),
         );
+        store.diagnostic_path = Some(fallback_dir.join(CREDENTIAL_STORE_DIAGNOSTIC_FILE));
+        store.fallback_dir = Some(fallback_dir.to_path_buf());
         let policy = store.fallback_policy();
         if let Err(err) = store.cleanup_legacy_fallback_mirrors() {
             // Safety-preserving cleanup failed (primary unverified / delete failed, etc.).
@@ -420,6 +442,7 @@ impl PreferredSecretStore<OsKeychainStore, EncryptedFileKeystore> {
                 "legacy fallback mirror cleanup failed; continuing with degraded preferred secret store; residual fallback secrets may remain"
             );
         }
+        store.persist_diagnostic_snapshot_best_effort();
         Ok(store)
     }
 }
@@ -437,6 +460,8 @@ impl<P, F> PreferredSecretStore<P, F> {
             fallback,
             prefer_primary: Mutex::new(true),
             cleanup_report: Mutex::new(LegacyMirrorCleanupReport::default()),
+            diagnostic_path: None,
+            fallback_dir: None,
         }
     }
 
@@ -518,6 +543,51 @@ impl<P: SecretStore, F: SecretStore> PreferredSecretStore<P, F> {
             });
         }
         out
+    }
+
+    /// Non-secret snapshot consumed by `ownmesh doctor` without keychain reads.
+    #[must_use]
+    pub fn diagnostic_snapshot(&self) -> CredentialStoreDiagnosticSnapshot {
+        let cleanup = self.cleanup_report();
+        let residual_fallback_entries = self
+            .fallback_dir
+            .as_ref()
+            .map(|dir| {
+                [
+                    SecretPurpose::DevicePrivateKey,
+                    SecretPurpose::HumanRefreshToken,
+                    SecretPurpose::DeviceEnrollmentProof,
+                    SecretPurpose::DeviceCredential,
+                ]
+                .into_iter()
+                .filter(|purpose| dir.join(format!("{}.oms", purpose.account())).is_file())
+                .count()
+            })
+            .unwrap_or(0);
+        CredentialStoreDiagnosticSnapshot {
+            schema_version: 1,
+            backend_name: self.backend_name().to_string(),
+            fallback_policy: self.fallback_policy().as_str().to_string(),
+            degraded: cleanup.degraded,
+            residual_fallback_entries,
+            cleanup_degraded: cleanup.degraded,
+        }
+    }
+
+    fn persist_diagnostic_snapshot_best_effort(&self) {
+        let Some(path) = &self.diagnostic_path else {
+            return;
+        };
+        let snapshot = self.diagnostic_snapshot();
+        let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) else {
+            return;
+        };
+        if let Err(error) = ownmesh_persist::write_atomically(path, &bytes) {
+            tracing::warn!(
+                error = %error,
+                "failed to persist non-secret credential-store diagnostic metadata"
+            );
+        }
     }
 
     /// Observability snapshot: policy, degraded flag, cleanup outcome, residual fallback secrets.
@@ -673,7 +743,7 @@ fn combine_delete_results(
 
 impl<P: SecretStore, F: SecretStore> SecretStore for PreferredSecretStore<P, F> {
     fn store(&self, purpose: SecretPurpose, secret: &SecretBytes) -> IdentityResult<()> {
-        match self.primary.store(purpose, secret) {
+        let result = match self.primary.store(purpose, secret) {
             Ok(()) => {
                 if let Ok(mut g) = self.prefer_primary.lock() {
                     *g = true;
@@ -691,20 +761,45 @@ impl<P: SecretStore, F: SecretStore> SecretStore for PreferredSecretStore<P, F> 
                     ))
                 })
             }
-        }
+        };
+        self.persist_diagnostic_snapshot_best_effort();
+        result
     }
 
     fn load(&self, purpose: SecretPurpose) -> IdentityResult<Option<SecretBytes>> {
-        match self.primary.load(purpose) {
-            Ok(Some(v)) => Ok(Some(v)),
-            Ok(None) | Err(_) => self.fallback.load(purpose),
-        }
+        let result = match self.primary.load(purpose) {
+            Ok(Some(v)) => {
+                if let Ok(mut g) = self.prefer_primary.lock() {
+                    *g = true;
+                }
+                Ok(Some(v))
+            }
+            Ok(None) => {
+                let fallback = self.fallback.load(purpose);
+                if matches!(fallback, Ok(Some(_))) {
+                    if let Ok(mut g) = self.prefer_primary.lock() {
+                        *g = false;
+                    }
+                }
+                fallback
+            }
+            Err(_) => {
+                if let Ok(mut g) = self.prefer_primary.lock() {
+                    *g = false;
+                }
+                self.fallback.load(purpose)
+            }
+        };
+        self.persist_diagnostic_snapshot_best_effort();
+        result
     }
 
     fn delete(&self, purpose: SecretPurpose) -> IdentityResult<()> {
         let primary = self.primary.delete(purpose);
         let fallback = self.fallback.delete(purpose);
-        combine_delete_results(primary, fallback)
+        let result = combine_delete_results(primary, fallback);
+        self.persist_diagnostic_snapshot_best_effort();
+        result
     }
 
     fn backend_name(&self) -> &'static str {

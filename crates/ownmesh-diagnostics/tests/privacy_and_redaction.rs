@@ -19,12 +19,13 @@
 )]
 
 use ownmesh_diagnostics::{
-    build_support_bundle, redact_text, run_doctor, BinaryObservation, CheckStatus,
-    ConfigObservation, ControlPlaneObservation, CredentialObservation, CredentialState,
-    DaemonObservation, DoctorInput, JournalsObservation, PrivacyPolicyObservation,
-    ServiceObservation,
+    prepare_support_bundle, redact_text, run_doctor, write_prepared_support_bundle,
+    BinaryObservation, CheckStatus, ConfigObservation, ControlPlaneObservation,
+    CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
+    DoctorInput, JournalsObservation,
+    PrivacyPolicyObservation, PublicDiagnosticEvent, PublicJournalHealth, PublicPlatformFacts,
+    PublicServiceFacts, ServiceObservation, SupportBundleError, SupportBundleInput,
 };
-use std::collections::BTreeMap;
 
 fn base_input() -> DoctorInput {
     DoctorInput {
@@ -53,6 +54,14 @@ fn base_input() -> DoctorInput {
             device_credential_state: CredentialState::default(),
             auth_session_present: true,
             enrolled_device_id_present: true,
+        },
+        credential_store: CredentialStoreObservation {
+            metadata_present: true,
+            backend_name: Some("preferred(os-keychain)".into()),
+            fallback_policy: Some("primary_preferred_encrypted_file_fallback".into()),
+            degraded: false,
+            residual_fallback_entries: 0,
+            read_error: None,
         },
         daemon: DaemonObservation {
             endpoint: Some("local".into()),
@@ -113,6 +122,23 @@ fn doctor_passes_when_telemetry_and_relay_off() {
 }
 
 #[test]
+fn doctor_surfaces_credential_fallback_provenance() {
+    let mut input = base_input();
+    input.credential_store.backend_name = Some("preferred(encrypted-file)".into());
+    input.credential_store.degraded = true;
+    input.credential_store.residual_fallback_entries = 2;
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "credential.store")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(check.message.contains("encrypted-file"));
+    assert!(check.message.contains("residual_fallback_entries=2"));
+}
+
+#[test]
 fn doctor_warns_when_telemetry_or_relay_opted_in() {
     let mut input = base_input();
     input.control_plane.configured = false;
@@ -157,23 +183,136 @@ fn credential_states_are_explicit_without_values() {
     assert!(!json.contains("refresh_token"));
 }
 
+fn support_input() -> SupportBundleInput {
+    SupportBundleInput {
+        doctor: run_doctor(&base_input()),
+        platform: PublicPlatformFacts {
+            os: "linux".into(), arch: "x86_64".into(), ownmesh_version: "1.2.17".into(),
+        },
+        service: PublicServiceFacts {
+            platform: "systemd-user".into(), supported: true, installed: true,
+            running: Some(true), hardening_summary: Some("baseline active".into()),
+        },
+        journal_health: PublicJournalHealth::default(),
+        recent_events: vec![PublicDiagnosticEvent {
+            kind: "service".into(), message: "daemon ready".into(),
+        }],
+    }
+}
+
 #[test]
-fn support_bundle_always_redacted_and_strips_secrets() {
-    let doctor = run_doctor(&DoctorInput::default());
-    let mut sections = BTreeMap::new();
-    sections.insert(
-        "env".into(),
-        "access_token=super-secret-value\npassword=hunter2\n innocuous".into(),
+fn support_bundle_is_typed_scanned_and_preview_bytes_are_exact_export() {
+    let prepared = prepare_support_bundle(support_input(), 1_700_000_000).unwrap();
+    assert_eq!(prepared.schema_version(), 2);
+    assert_eq!(prepared.sha256_hex().len(), 64);
+    assert_eq!(prepared.size(), prepared.bytes().len());
+    let serialized = std::str::from_utf8(prepared.bytes()).unwrap();
+    assert!(serialized.contains("journal_health"));
+    assert!(!serialized.contains("sections"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("support.json");
+    write_prepared_support_bundle(&path, &prepared).unwrap();
+    let exported = std::fs::read(&path).unwrap();
+    assert_eq!(exported, prepared.bytes());
+    use sha2::{Digest, Sha256};
+    let exported_digest: String = Sha256::digest(&exported)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(exported_digest, prepared.sha256_hex());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn support_bundle_secret_scanner_fails_closed_without_echoing_secret() {
+    let mut input = support_input();
+    input.recent_events[0].message = "Authorization: Bearer super.secret.material".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(error, SupportBundleError::SuspiciousContent("recent_events".into()));
+    let text = error.to_string();
+    assert!(!text.contains("super.secret.material"));
+}
+
+#[test]
+fn support_bundle_rejects_secret_query_parameters() {
+    let mut input = support_input();
+    input.recent_events[0].message =
+        "request failed at https://example.test/callback?access_token=canary".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
     );
-    sections.insert("note".into(), "authorization: Bearer abc.def.ghi".into());
-    let bundle = build_support_bundle(doctor, sections, 1_700_000_000);
-    assert!(bundle.redacted);
-    let env = bundle.sections.get("env").unwrap();
-    assert!(env.contains("REDACTED"));
-    assert!(!env.contains("super-secret-value"));
-    assert!(!env.contains("hunter2"));
-    let note = bundle.sections.get("note").unwrap();
-    assert!(!note.contains("abc.def.ghi"));
+    assert!(!error.to_string().contains("canary"));
+}
+
+#[test]
+fn support_bundle_rejects_unlabeled_high_entropy_values() {
+    let mut input = support_input();
+    input.recent_events[0].message =
+        "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7Go2Qw9Rx4Kp6".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
+    );
+}
+
+
+#[test]
+fn support_bundle_rejects_encoded_split_and_unicode_secret_forms() {
+    for message in [
+        r#"{"access_token":"json-canary"}"#,
+        "Authorization:
+Bearer split-line-canary",
+        "Ａｕｔｈｏｒｉｚａｔｉｏｎ： Ｂｅａｒｅｒ full-width-canary",
+        "request failed at https://example.test/callback?%61ccess_token=percent-canary",
+        "-----BEGIN
+PRIVATE KEY-----
+canary",
+    ] {
+        let mut input = support_input();
+        input.recent_events[0].message = message.into();
+        let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+        assert_eq!(
+            error,
+            SupportBundleError::SuspiciousContent("recent_events".into()),
+            "scanner accepted {message:?}",
+        );
+        assert!(!error.to_string().contains("canary"));
+    }
+}
+
+#[test]
+fn support_bundle_rejects_base64_secret_containing_slash() {
+    let mut input = support_input();
+    input.recent_events[0].message =
+        "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7/Go2Qw9Rx4Kp6".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
+    );
+}
+
+#[test]
+fn support_bundle_allows_bounded_paths_and_non_secret_status_text() {
+    let mut input = support_input();
+    input.recent_events[0].message =
+        "/home/alice/.local/state/ownmesh/service-restart-pending".into();
+    prepare_support_bundle(input, 1_700_000_000).unwrap();
+}
+
+#[test]
+fn support_bundle_allows_long_but_low_entropy_diagnostic_text() {
+    let mut input = support_input();
+    input.recent_events[0].message = "service-restart-".repeat(8);
+    prepare_support_bundle(input, 1_700_000_000).unwrap();
 }
 
 #[test]

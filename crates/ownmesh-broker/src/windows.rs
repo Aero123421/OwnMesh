@@ -92,6 +92,7 @@ impl WindowsPeerAuthorizer for WindowsTrustedDaemon {
 /// made before the runner is invoked; a crash leaves it consumed.
 pub trait WindowsReplayLedger: Send {
     fn reserve(&mut self, request: &BrokerRequestV2, now_unix: i64) -> Result<(), String>;
+    fn mark_spawned(&mut self, nonce: &str, digest: &str) -> Result<(), String>;
     fn complete(&mut self, nonce: &str, digest: &str) -> Result<(), String>;
 }
 
@@ -100,6 +101,9 @@ impl WindowsReplayLedger for crate::ReplayLedger {
         self.reserve_verified_request(request, now_unix)
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+    fn mark_spawned(&mut self, nonce: &str, digest: &str) -> Result<(), String> {
+        ReplayLedger::mark_spawned(self, nonce, digest, None).map_err(|error| error.to_string())
     }
     fn complete(&mut self, nonce: &str, digest: &str) -> Result<(), String> {
         self.mark_completed(nonce, digest)
@@ -307,10 +311,14 @@ where
                     self.ledger
                         .lock()
                         .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
-                        .complete(&request.nonce, &digest)?;
+                        .mark_spawned(&request.nonce, &digest)?;
                     let cancelled = self
                         .runner
                         .cancel(&cancel.target_request_id, &cancel.target_nonce);
+                    self.ledger
+                        .lock()
+                        .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
+                        .complete(&request.nonce, &digest)?;
                     Ok(BrokerResponseV2 {
                         request_id: cancel.request_id,
                         ok: true,
@@ -373,6 +381,10 @@ where
                         .lock()
                         .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
                         .reserve(&internal, now)?;
+                    self.ledger
+                        .lock()
+                        .map_err(|_| "Windows replay ledger lock poisoned".to_string())?
+                        .mark_spawned(&internal.nonce, &digest)?;
                     // A pipe connection is part of the authority boundary: the
                     // daemon must keep the exact, SCM-attested connection alive
                     // for the whole side effect.  Do not let a lost client leave
@@ -899,6 +911,10 @@ mod tests {
 
     impl WindowsReplayLedger for TestLedger {
         fn reserve(&mut self, _request: &BrokerRequestV2, _now_unix: i64) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn mark_spawned(&mut self, _nonce: &str, _digest: &str) -> Result<(), String> {
             Ok(())
         }
 

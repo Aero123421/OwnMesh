@@ -3,7 +3,7 @@
 use crate::error::{UpdateError, UpdateResult};
 use crate::limits::{
     ALLOWED_DOC_FILES, MAX_ARCHIVE_ENTRIES, MAX_ENTRY_UNCOMPRESSED_BYTES,
-    MAX_TOTAL_UNCOMPRESSED_BYTES,
+    MAX_TAR_METADATA_ENTRY_BYTES, MAX_TOTAL_UNCOMPRESSED_BYTES,
 };
 use crate::platform::{binary_file_name_for, ArchiveKind, REQUIRED_BINARIES};
 use flate2::read::GzDecoder;
@@ -68,9 +68,13 @@ fn read_tar_gz(bytes: &[u8], os: &str) -> UpdateResult<BTreeMap<String, Vec<u8>>
     let mut archive = TarArchive::new(decoder);
     // Do not follow links; we reject link entry types explicitly below.
     archive.set_overwrite(false);
-    let entries = archive
+    let mut entries = archive
         .entries()
         .map_err(|err| UpdateError::UnsafeArchive(format!("tar open: {err}")))?;
+    // tar::Entries normally consumes GNU/PAX extension records internally and
+    // exposes only the following logical member. Raw iteration is required so
+    // every metadata byte reaches our bounded accounting path first.
+    entries.raw(true);
 
     let allowed = allowed_member_names(os);
     let mut out = BTreeMap::new();
@@ -90,8 +94,17 @@ fn read_tar_gz(bytes: &[u8], os: &str) -> UpdateResult<BTreeMap<String, Vec<u8>>
         let header = entry.header().clone();
         let entry_type = header.entry_type();
 
-        // Skip directories and tar metadata headers (no payload we keep).
+        // TAR metadata and ignored directory payloads are still decompressed
+        // bytes. Charge them to the same archive-wide budget and apply a small
+        // independent per-record ceiling before discarding them.
         if entry_type.is_dir() {
+            drain_tar_entry_bounded(
+                &mut entry,
+                "tar directory metadata",
+                header.size().unwrap_or(0),
+                MAX_TAR_METADATA_ENTRY_BYTES,
+                &mut total_uncompressed,
+            )?;
             continue;
         }
         match entry_type {
@@ -99,11 +112,13 @@ fn read_tar_gz(bytes: &[u8], os: &str) -> UpdateResult<BTreeMap<String, Vec<u8>>
             | EntryType::XGlobalHeader
             | EntryType::GNULongName
             | EntryType::GNULongLink => {
-                // Consume metadata payload without retaining it.
-                let mut sink = std::io::sink();
-                std::io::copy(&mut entry, &mut sink).map_err(|err| {
-                    UpdateError::UnsafeArchive(format!("tar metadata read: {err}"))
-                })?;
+                drain_tar_entry_bounded(
+                    &mut entry,
+                    "tar metadata",
+                    header.size().unwrap_or(0),
+                    MAX_TAR_METADATA_ENTRY_BYTES,
+                    &mut total_uncompressed,
+                )?;
                 continue;
             }
             EntryType::Regular | EntryType::Continuous => {}
@@ -147,18 +162,19 @@ fn read_tar_gz(bytes: &[u8], os: &str) -> UpdateResult<BTreeMap<String, Vec<u8>>
             )));
         }
         if total_uncompressed.saturating_add(declared) > MAX_TOTAL_UNCOMPRESSED_BYTES {
-            return Err(UpdateError::UnsafeArchive(format!(
-                "archive total uncompressed size exceeds limit {MAX_TOTAL_UNCOMPRESSED_BYTES}"
+            return Err(UpdateError::LimitExceeded(format!(
+                "archive total uncompressed size exceeds {MAX_TOTAL_UNCOMPRESSED_BYTES} bytes"
             )));
         }
 
-        let data = read_bounded(&mut entry, name.as_str(), declared)?;
-        total_uncompressed = total_uncompressed.saturating_add(data.len() as u64);
-        if total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
-            return Err(UpdateError::UnsafeArchive(format!(
-                "archive total uncompressed size exceeds limit {MAX_TOTAL_UNCOMPRESSED_BYTES}"
-            )));
-        }
+        let data = read_tar_entry_bounded(
+            &mut entry,
+            name.as_str(),
+            declared,
+            MAX_ENTRY_UNCOMPRESSED_BYTES,
+            &mut total_uncompressed,
+            true,
+        )?;
         out.insert(name, data);
     }
 
@@ -252,6 +268,85 @@ fn read_zip(bytes: &[u8], os: &str) -> UpdateResult<BTreeMap<String, Vec<u8>>> {
     Ok(out)
 }
 
+/// Read a TAR entry with independent per-entry and shared aggregate budgets.
+fn read_tar_entry_bounded<R: Read>(
+    reader: &mut R,
+    label: &str,
+    declared: u64,
+    per_entry_limit: u64,
+    total_uncompressed: &mut u64,
+    retain: bool,
+) -> UpdateResult<Vec<u8>> {
+    if declared > per_entry_limit {
+        return Err(UpdateError::LimitExceeded(format!(
+            "{label} exceeds per-entry limit {per_entry_limit} bytes"
+        )));
+    }
+    if total_uncompressed.saturating_add(declared) > MAX_TOTAL_UNCOMPRESSED_BYTES {
+        return Err(UpdateError::LimitExceeded(format!(
+            "archive total uncompressed size exceeds {MAX_TOTAL_UNCOMPRESSED_BYTES} bytes"
+        )));
+    }
+
+    let mut data = if retain { Vec::new() } else { Vec::with_capacity(0) };
+    let mut buf = [0u8; 8 * 1024];
+    let mut entry_read = 0u64;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|err| UpdateError::UnsafeArchive(format!("read {label}: {err}")))?;
+        if n == 0 {
+            break;
+        }
+        let n = n as u64;
+        entry_read = entry_read.checked_add(n).ok_or_else(|| {
+            UpdateError::LimitExceeded("tar entry byte counter overflow".into())
+        })?;
+        if entry_read > per_entry_limit {
+            return Err(UpdateError::LimitExceeded(format!(
+                "{label} exceeds per-entry limit {per_entry_limit} bytes"
+            )));
+        }
+        if declared > 0 && entry_read > declared {
+            return Err(UpdateError::UnsafeArchive(format!(
+                "{label} expanded past declared size {declared}"
+            )));
+        }
+        *total_uncompressed = total_uncompressed.checked_add(n).ok_or_else(|| {
+            UpdateError::LimitExceeded("archive byte counter overflow".into())
+        })?;
+        if *total_uncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES {
+            return Err(UpdateError::LimitExceeded(format!(
+                "archive total uncompressed size exceeds {MAX_TOTAL_UNCOMPRESSED_BYTES} bytes"
+            )));
+        }
+        if retain {
+            data.extend_from_slice(&buf[..n as usize]);
+        }
+    }
+    Ok(data)
+}
+
+fn drain_tar_entry_bounded<R: Read>(
+    reader: &mut R,
+    label: &str,
+    declared: u64,
+    per_entry_limit: u64,
+    total_uncompressed: &mut u64,
+) -> UpdateResult<()> {
+    // Reuse the exact accounting path. Metadata is capped at 64 KiB, so the
+    // temporary bounded buffer cannot become attacker-controlled large memory.
+    let _ = read_tar_entry_bounded(
+        reader,
+        label,
+        declared,
+        per_entry_limit,
+        total_uncompressed,
+        false,
+    )?;
+    Ok(())
+}
+
 /// Read member bytes with a hard cap; reject expansion past declared/per-entry limits.
 fn read_bounded<R: Read>(reader: &mut R, name: &str, declared: u64) -> UpdateResult<Vec<u8>> {
     let mut data = Vec::new();
@@ -326,4 +421,78 @@ fn safe_member_name(path: &Path) -> UpdateResult<String> {
     }
     let _ = PathBuf::from(&name);
     Ok(name)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use tar::{Builder, Header};
+
+    fn metadata_archive(entry_type: EntryType, payload_len: usize) -> Vec<u8> {
+        let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        let mut builder = Builder::new(encoder);
+        let payload = vec![b'x'; payload_len];
+        let mut header = Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_mode(0o600);
+        header.set_size(payload.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "metadata", payload.as_slice())
+            .expect("append metadata entry");
+        let encoder = builder.into_inner().expect("finish tar");
+        encoder.finish().expect("finish gzip")
+    }
+
+    #[test]
+    fn oversized_tar_extension_records_are_bounded_before_discard() {
+        for entry_type in [
+            EntryType::XHeader,
+            EntryType::XGlobalHeader,
+            EntryType::GNULongName,
+            EntryType::GNULongLink,
+        ] {
+            let archive = metadata_archive(
+                entry_type,
+                (MAX_TAR_METADATA_ENTRY_BYTES + 1) as usize,
+            );
+            let error = read_tar_gz(&archive, "linux").expect_err("metadata must be rejected");
+            assert!(matches!(error, UpdateError::LimitExceeded(_)));
+            let message = error.to_string();
+            assert!(message.contains("tar metadata"));
+            assert!(!message.contains(&"x".repeat(128)));
+        }
+    }
+
+    #[test]
+    fn metadata_bytes_share_the_archive_wide_budget() {
+        let mut total = MAX_TOTAL_UNCOMPRESSED_BYTES - 8;
+        let mut cursor = Cursor::new([0u8; 9]);
+        let error = drain_tar_entry_bounded(
+            &mut cursor,
+            "tar metadata",
+            9,
+            MAX_TAR_METADATA_ENTRY_BYTES,
+            &mut total,
+        )
+        .expect_err("aggregate metadata budget must be enforced");
+        assert!(matches!(error, UpdateError::LimitExceeded(_)));
+    }
+
+    #[test]
+    fn valid_small_metadata_is_charged_exactly_once() {
+        let mut total = 3;
+        let mut cursor = Cursor::new([1u8, 2, 3, 4]);
+        drain_tar_entry_bounded(
+            &mut cursor,
+            "tar metadata",
+            4,
+            MAX_TAR_METADATA_ENTRY_BYTES,
+            &mut total,
+        )
+        .expect("small metadata should fit");
+        assert_eq!(total, 7);
+    }
 }

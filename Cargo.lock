@@ -2018,6 +2018,7 @@ name = "ownmesh-broker"
 version = "1.2.16"
 dependencies = [
  "clap",
+ "fs2",
  "hex",
  "libc",
  "ownmesh-broker-client",
@@ -2075,8 +2076,11 @@ dependencies = [
 name = "ownmesh-diagnostics"
 version = "1.2.16"
 dependencies = [
+ "ownmesh-ipc",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.19",
 ]
 
@@ -2324,6 +2328,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "url",
+ "uuid",
  "zip",
 ]
 

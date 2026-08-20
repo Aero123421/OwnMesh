@@ -663,6 +663,7 @@ fn doctor_input_from_local(
             auth_session_present,
             enrolled_device_id_present: false,
         },
+        credential_store: ownmesh_diagnostics::CredentialStoreObservation::default(),
         daemon: DaemonObservation {
             endpoint: None,
             reachable: daemon.is_some(),

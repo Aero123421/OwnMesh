@@ -48,11 +48,67 @@ function store(): SqlStore {
   return openStore().store;
 }
 
-test("SQL auth code CAS permits exactly one concurrent consumer", async () => {
+test("SQL auth code CAS permits exactly one concurrent valid redemption", async () => {
+  const { store: s, db } = openStore(); await s.ensureBootstrap();
+  await s.putAuthCode({ code: "code", client_id: "client_ownmesh_cli", principal_id: "prin_dev", redirect_uri: "http://localhost/cb", scope: "ownmesh.read", code_challenge: "challenge", code_challenge_method: "S256", expires_at: Date.now() + 60_000, used: false });
+  const input = { code: "code", clientId: "client_ownmesh_cli", redirectUri: "http://localhost/cb", codeChallenge: "challenge" };
+  const results = await Promise.all([s.redeemAuthCode(input), s.redeemAuthCode(input)]);
+  assert.equal(results.filter((result) => result.status === "redeemed").length, 1);
+  assert.equal(results.filter((result) => result.status === "invalid_grant").length, 1);
+  const tokenCount = db.prepare(
+    `SELECT COUNT(*) AS n FROM oauth_tokens WHERE auth_code_hash IS NOT NULL`,
+  ).get() as { n: number };
+  assert.equal(Number(tokenCount.n), 1);
+});
+
+
+
+test("SQL token persistence failure rolls back authorization-code consumption", async () => {
+  const { store: s, db } = openStore();
+  await s.ensureBootstrap();
+  await s.putAuthCode({
+    code: "code_storage_retry",
+    client_id: "client_ownmesh_cli",
+    principal_id: "prin_dev",
+    redirect_uri: "http://localhost/cb",
+    scope: "ownmesh.read",
+    code_challenge: "challenge",
+    code_challenge_method: "S256",
+    expires_at: Date.now() + 60_000,
+    used: false,
+  });
+  db.exec(`CREATE TRIGGER fail_auth_code_token_insert
+    BEFORE INSERT ON oauth_tokens
+    WHEN NEW.auth_code_hash IS NOT NULL
+    BEGIN SELECT RAISE(ABORT, 'injected token persistence failure'); END;`);
+  const input = {
+    code: "code_storage_retry",
+    clientId: "client_ownmesh_cli",
+    redirectUri: "http://localhost/cb",
+    codeChallenge: "challenge",
+  };
+  await assert.rejects(() => s.redeemAuthCode(input), /token persistence failure/);
+  const hash = await sha256Hex(input.code);
+  const afterFailure = db.prepare(
+    `SELECT used FROM oauth_auth_codes WHERE code_hash = ?`,
+  ).get(hash) as { used: number };
+  assert.equal(Number(afterFailure.used), 0);
+  assert.equal(Number((db.prepare(
+    `SELECT COUNT(*) AS n FROM oauth_tokens WHERE auth_code_hash = ?`,
+  ).get(hash) as { n: number }).n), 0);
+
+  db.exec("DROP TRIGGER fail_auth_code_token_insert");
+  const retry = await s.redeemAuthCode(input);
+  assert.equal(retry.status, "redeemed");
+});
+
+test("SQL auth code binding mismatch does not consume the code", async () => {
   const s = store(); await s.ensureBootstrap();
-  await s.putAuthCode({ code: "code", client_id: "client_ownmesh_cli", principal_id: "prin_dev", redirect_uri: "http://localhost/cb", scope: "ownmesh.read", code_challenge: "x", code_challenge_method: "S256", expires_at: Date.now() + 60_000, used: false });
-  const results = await Promise.all([s.takeAuthCode("code"), s.takeAuthCode("code")]);
-  assert.equal(results.filter(Boolean).length, 1);
+  await s.putAuthCode({ code: "code_retry", client_id: "client_ownmesh_cli", principal_id: "prin_dev", redirect_uri: "http://localhost/cb", scope: "ownmesh.read", code_challenge: "challenge", code_challenge_method: "S256", expires_at: Date.now() + 60_000, used: false });
+  const wrong = await s.redeemAuthCode({ code: "code_retry", clientId: "wrong", redirectUri: "http://localhost/cb", codeChallenge: "challenge" });
+  assert.equal(wrong.status, "invalid_grant");
+  const correct = await s.redeemAuthCode({ code: "code_retry", clientId: "client_ownmesh_cli", redirectUri: "http://localhost/cb", codeChallenge: "challenge" });
+  assert.equal(correct.status, "redeemed");
 });
 
 test("SQL refresh CAS permits one rotation and treats the race as reuse", async () => {

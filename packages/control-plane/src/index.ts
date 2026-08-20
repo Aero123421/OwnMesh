@@ -63,14 +63,18 @@ import {
   verifyTransferTicket,
 } from "./transfer-room.ts";
 import {
+  BodyTooLargeError,
+  DuplicateFormFieldError,
   internalContextHeaderName,
   internalDoHeaders,
   json,
+  readBody,
   requireScope,
   SERVICE_NAME,
   SERVICE_VERSION,
   sha256Hex,
   signInternalContext,
+  UnsupportedMediaTypeError,
 } from "./util.ts";
 
 export interface Env {
@@ -713,9 +717,23 @@ export default {
       }
       let authRequest = request;
       if (request.method === "POST") {
-        const form = await request.clone().formData();
+        let form: Record<string, string>;
+        try {
+          form = await readBody(request.clone());
+        } catch (error) {
+          if (error instanceof BodyTooLargeError) {
+            return json({ error: "invalid_request" }, { status: 413, noStore: true });
+          }
+          if (error instanceof UnsupportedMediaTypeError) {
+            return json({ error: "unsupported_media_type" }, { status: 415, noStore: true });
+          }
+          if (error instanceof DuplicateFormFieldError || error instanceof SyntaxError) {
+            return json({ error: "invalid_request" }, { status: 400, noStore: true });
+          }
+          throw error;
+        }
         const postUrl = new URL(request.url);
-        for (const [key, value] of form.entries()) postUrl.searchParams.set(key, String(value));
+        for (const [key, value] of Object.entries(form)) postUrl.searchParams.set(key, value);
         authRequest = new Request(postUrl, { method: "POST", headers: request.headers });
       }
       const principal = await browserPrincipal(authRequest, env);
