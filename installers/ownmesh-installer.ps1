@@ -15,6 +15,15 @@
     $ErrorActionPreference = "Stop"
     $ProgressPreference = "SilentlyContinue"
 
+    # Windows PowerShell 5.1 started from pwsh inherits Core's PSModulePath.
+    # Desktop cmdlets (Unblock-File, ConvertFrom-Json) then fail to auto-load
+    # because Core's Microsoft.PowerShell.Utility is tried first. Keep the 5.1
+    # system module directory first; do not load user-writable module paths.
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $desktopModules = [IO.Path]::GetFullPath((Join-Path $PSHOME "Modules"))
+        $env:PSModulePath = $desktopModules
+    }
+
     $Repository = "Aero123421/OwnMesh"
     $RequestedVersion = if ($env:OWNMESH_VERSION) { $env:OWNMESH_VERSION } else { "latest" }
     $InstallDir = if ($env:OWNMESH_INSTALL_DIR) {
@@ -132,6 +141,32 @@
                 }
                 Start-Sleep -Milliseconds 200
             }
+        }
+    }
+
+    function Get-OwnMeshFileSha256 {
+        param([Parameter(Mandatory)][string]$LiteralPath)
+        if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) {
+            throw "SHA-256 target is not a file: $LiteralPath"
+        }
+        # Do not use the Utility-module file-hash cmdlet: it is missing when
+        # Windows PowerShell 5.1 inherits a Core PSModulePath.
+        $stream = [IO.File]::Open(
+            $LiteralPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        try {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $bytes = $sha.ComputeHash($stream)
+                return ([BitConverter]::ToString($bytes)).Replace("-", "").ToLowerInvariant()
+            } finally {
+                $sha.Dispose()
+            }
+        } finally {
+            $stream.Dispose()
         }
     }
 
@@ -270,8 +305,8 @@
             } else {
                 Move-Item -LiteralPath $restore -Destination $target -ErrorAction Stop
             }
-            $actual = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
-            $expected = (Get-FileHash -LiteralPath $backup -Algorithm SHA256).Hash
+            $actual = Get-OwnMeshFileSha256 -LiteralPath $target
+            $expected = Get-OwnMeshFileSha256 -LiteralPath $backup
             if ($actual -ne $expected) {
                 throw "Rollback verification failed for $name"
             }
@@ -313,7 +348,7 @@
         Assert-SafeUrl $PinnedMinisignUrl
         $archive = Join-Path $BootstrapDir "minisign-0.11-win64.zip"
         Invoke-WebRequest -Uri $PinnedMinisignUrl -OutFile $archive -UseBasicParsing
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+        $actual = Get-OwnMeshFileSha256 -LiteralPath $archive
         if ($actual -ne $PinnedMinisignSha256) {
             throw "pinned minisign bootstrap SHA-256 mismatch"
         }
@@ -615,7 +650,7 @@
         Assert-MinisignSums -SumsPath $sums -SigPath $sig -PubKeyPath $pubKey -MinisignPath $minisignPath
 
         $expected = Get-ChecksumFromSums -SumsPath $sums -AssetName $asset
-        $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-OwnMeshFileSha256 -LiteralPath $archive
         if ($actual -ne $expected) {
             throw "SHA-256 mismatch for $asset (expected $expected, got $actual)"
         }
@@ -701,8 +736,8 @@
                         } else {
                             Move-Item -LiteralPath $restoreStaged -Destination $restorePath -ErrorAction Stop
                         }
-                        $restoredHash = (Get-FileHash -LiteralPath $restorePath -Algorithm SHA256).Hash
-                        $backupHash = (Get-FileHash -LiteralPath $bak -Algorithm SHA256).Hash
+                        $restoredHash = Get-OwnMeshFileSha256 -LiteralPath $restorePath
+                        $backupHash = Get-OwnMeshFileSha256 -LiteralPath $bak
                         if ($restoredHash -ne $backupHash) {
                             throw "Rollback verification failed for $bin"
                         }

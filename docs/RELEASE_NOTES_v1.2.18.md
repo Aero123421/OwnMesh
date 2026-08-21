@@ -17,6 +17,10 @@ machine-checked contract remains
   those calls through `cmd.exe` and treats only the process exit code as
   authoritative, so an upgrade can still stop matching install-dir
   processes.
+- **The same bootstrap no longer requires `Get-FileHash` auto-load.** When
+  `powershell.exe` is launched from pwsh it inherits Core's `PSModulePath`
+  and Desktop cmdlets fail to load. Archive and rollback hashing now uses
+  .NET SHA-256, and Windows PowerShell 5.1 restores `$PSHOME\Modules` first.
 
 ## Compatibility and migration
 

@@ -691,11 +691,17 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("Move-InstalledBinary", text)
         self.assertIn("Stop-InstalledOwnMeshProcesses", text)
         self.assertIn("Invoke-OwnMeshSchTasks", text)
+        self.assertIn("Get-OwnMeshFileSha256", text)
         self.assertIn("Restore-OwnMeshBackup", text)
         self.assertIn("Updated OwnMesh daemon version did not match the CLI", text)
         # Windows PowerShell 5.1 NativeCommandError must not reach schtasks.exe.
         self.assertNotRegex(text, r"(?m)^\s*& schtasks\.exe\b")
         self.assertIn('cmd.exe /c "schtasks.exe /$Action /TN `"$TaskName`" 1>nul 2>nul"', text)
+        # Hashing and Desktop cmdlets must not depend on Get-FileHash auto-load
+        # when powershell.exe inherits a pwsh Core PSModulePath.
+        self.assertNotRegex(text, r"(?im)\bGet-FileHash\b")
+        self.assertIn('[Security.Cryptography.SHA256]::Create()', text)
+        self.assertIn('Join-Path $PSHOME "Modules"', text)
 
     def test_windows_ps1_schtasks_helper_missing_task_on_powershell_51(self) -> None:
         if not _is_windows():
@@ -741,6 +747,52 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("query-fake=", combined)
         self.assertNotIn("NativeCommandError", combined)
         self.assertNotIn("指定されたファイルが見つかりません", combined)
+
+    def test_windows_ps1_sha256_helper_with_core_psmodulepath(self) -> None:
+        if not _is_windows():
+            self.skipTest("Windows PowerShell 5.1 only")
+        powershell = shutil.which("powershell")
+        if not powershell:
+            self.skipTest("powershell.exe not available")
+        text = PS_INSTALLER.read_text(encoding="utf-8")
+        start = text.find("function Get-OwnMeshFileSha256")
+        self.assertNotEqual(start, -1, "Get-OwnMeshFileSha256 helper is missing")
+        end = text.find("function Invoke-OwnMeshSchTasks", start)
+        self.assertGreater(end, start, "could not bound Get-OwnMeshFileSha256")
+        with tempfile.TemporaryDirectory(prefix="ownmesh-sha256-") as tmp:
+            sample = Path(tmp) / "payload.bin"
+            sample.write_bytes(b"ownmesh-sha256-probe\n")
+            expected = _sha256(sample)
+            snippet = (
+                text[start:end]
+                + "$ErrorActionPreference = 'Stop'\n"
+                + "Set-StrictMode -Version Latest\n"
+                + f"$actual = Get-OwnMeshFileSha256 -LiteralPath '{sample}'\n"
+                + "Write-Output \"sha256=$actual\"\n"
+            )
+            env = os.environ.copy()
+            # Same leak a pwsh parent gives powershell.exe on GitHub Actions.
+            env["PSModulePath"] = str(Path(tmp) / "core-modules-only")
+            completed = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    snippet,
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            combined = completed.stdout + completed.stderr
+            self.assertEqual(completed.returncode, 0, combined)
+            self.assertIn(f"sha256={expected}", combined.lower())
+            self.assertNotIn("CommandNotFoundException", combined)
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
@@ -839,8 +891,10 @@ class InstallerAdversarialTests(unittest.TestCase):
                 self.assertIn(binary, smoke.stdout.lower())
                 self.assertIn(expected_version, smoke.stdout)
 
-            # The published one-liner uses Windows PowerShell 5.1. A missing
-            # scheduled task must not abort the upgrade stop path.
+            # The published one-liner uses Windows PowerShell 5.1, often from a
+            # pwsh parent that leaks Core's PSModulePath. Keep the inherited
+            # env so a missing scheduled task and missing Get-FileHash both
+            # stay non-fatal on the upgrade stop path.
             powershell51 = shutil.which("powershell")
             if powershell51:
                 completed51 = subprocess.run(
