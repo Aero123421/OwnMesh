@@ -18,7 +18,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 # `env` backs `--lang`'s OWNMESH_LANG binding. Declared here rather than
 # inherited: workspace feature unification supplies it during a full-workspace
 # build, but `cargo run -p ownmesh-tui` compiles this crate alone.
