@@ -1806,7 +1806,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn control_plane_version_match_is_pass() {
         let mut input = DoctorInput::default();
         input.binary.cli_version = "1.2.18".into();
@@ -1870,6 +1869,7 @@ mod tests {
         assert!(version.message.contains("omitted version"), "{version:?}");
     }
 
+    #[test]
     fn doctor_fail_sets_error_outcome() {
         let mut input = DoctorInput::default();
         input.binary.cli_version = "1.0.0".into();
