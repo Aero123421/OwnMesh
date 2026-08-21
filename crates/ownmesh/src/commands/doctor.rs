@@ -57,15 +57,18 @@ pub fn collect_doctor_report(
                 if args.check_network && !args.offline {
                     input.control_plane.probed = true;
                     match probe_control_plane_health(&url) {
-                        Ok(status) if (200..300).contains(&status) => {
+                        Ok(probe) if (200..300).contains(&probe.status) => {
                             input.control_plane.reachable = Some(true);
-                            input.control_plane.http_status = Some(status);
+                            input.control_plane.http_status = Some(probe.status);
+                            input.control_plane.reported_version = probe.version;
                         }
-                        Ok(status) => {
+                        Ok(probe) => {
                             input.control_plane.reachable = Some(false);
-                            input.control_plane.http_status = Some(status);
-                            input.control_plane.message =
-                                Some(format!("control plane /health returned HTTP {status}"));
+                            input.control_plane.http_status = Some(probe.status);
+                            input.control_plane.message = Some(format!(
+                                "control plane /health returned HTTP {}",
+                                probe.status
+                            ));
                         }
                         Err(msg) => {
                             input.control_plane.reachable = Some(false);
@@ -807,8 +810,16 @@ fn merge_daemon_service_status(daemon: &DaemonObservation, service: &mut Service
     }
 }
 
+/// Bounded `/health` probe result. `version` is parsed from JSON and sanitized.
+pub struct ControlPlaneHealthProbe {
+    pub status: u16,
+    pub version: Option<String>,
+}
+
+const HEALTH_BODY_MAX_BYTES: usize = 16_384;
+
 /// Probe `{base}/health` without sending credentials.
-pub fn probe_control_plane_health(base_url: &str) -> Result<u16, String> {
+pub fn probe_control_plane_health(base_url: &str) -> Result<ControlPlaneHealthProbe, String> {
     let base = base_url.trim().trim_end_matches('/');
     let url = format!("{base}/health");
     let client = reqwest::blocking::Client::builder()
@@ -821,7 +832,34 @@ pub fn probe_control_plane_health(base_url: &str) -> Result<u16, String> {
         .header("accept", "application/json")
         .send()
         .map_err(|e| format!("control plane unreachable: {e}"))?;
-    Ok(resp.status().as_u16())
+    let status = resp.status().as_u16();
+    let version = if (200..300).contains(&status) {
+        match resp.bytes() {
+            Ok(bytes) if bytes.len() <= HEALTH_BODY_MAX_BYTES => {
+                parse_control_plane_health_version(std::str::from_utf8(&bytes).unwrap_or(""))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    Ok(ControlPlaneHealthProbe { status, version })
+}
+
+fn parse_control_plane_health_version(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let version = value.get("version")?.as_str()?.trim();
+    if version.is_empty() || version.len() > 32 {
+        return None;
+    }
+    let stripped = version.strip_prefix('v').unwrap_or(version);
+    if !stripped
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
+        return None;
+    }
+    Some(stripped.to_string())
 }
 
 fn emit_report(cli: &Cli, report: &DoctorReport) {
@@ -1020,6 +1058,24 @@ mod tests {
         let report = ownmesh_diagnostics::run_doctor(&input);
         assert_eq!(report.outcome, DoctorOutcome::Error, "{report:?}");
         assert_eq!(exit_for_report(&report), ExitCode::UsageConfig);
+    }
+
+    #[test]
+    fn health_version_parser_accepts_semver_and_rejects_junk() {
+        assert_eq!(
+            parse_control_plane_health_version(r#"{"version":"1.2.18"}"#).as_deref(),
+            Some("1.2.18")
+        );
+        assert_eq!(
+            parse_control_plane_health_version(r#"{"version":"v1.2.18"}"#).as_deref(),
+            Some("1.2.18")
+        );
+        assert_eq!(
+            parse_control_plane_health_version(r#"{"version":" https://evil.example "}"#),
+            None
+        );
+        assert_eq!(parse_control_plane_health_version("not-json"), None);
+        assert_eq!(parse_control_plane_health_version("{}"), None);
     }
 
     #[test]

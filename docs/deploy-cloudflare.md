@@ -159,7 +159,8 @@ was reached.
 | Endpoint | Purpose |
 |---|---|
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata (includes `device_authorization_endpoint`) |
-| `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata (origin resource) |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata for the `/mcp` resource identifier |
 | `POST /oauth/register` | Dynamic Client Registration; exact ChatGPT public callbacks are stateless, all other clients require tenant authentication; `redirect_uri` **exact match** policy |
 | `GET\|POST /oauth/authorize` | Authenticated principal + explicit consent + auth code + PKCE S256 |
 | `POST /oauth/token` | `authorization_code`, `refresh_token` (rotation + reuse detection), `urn:ietf:params:oauth:grant-type:device_code` |

@@ -677,6 +677,7 @@ fn doctor_input_from_local(
             probed: false,
             reachable: None,
             http_status: None,
+            reported_version: None,
             message: None,
         },
         privacy_policy: PrivacyPolicyObservation {

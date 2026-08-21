@@ -118,6 +118,91 @@ async function callTool(
 // Catalog / annotations
 // ---------------------------------------------------------------------------
 
+test("MCP tools/call without bearer is HTTP 401 with WWW-Authenticate", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const res = await handleMcp(
+    rpc("tools/call", { name: "ownmesh_list_devices", arguments: {} }),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test" },
+  );
+  assert.equal(res.status, 401);
+  const www = res.headers.get("www-authenticate") || "";
+  assert.match(www, /Bearer realm="ownmesh"/);
+  assert.match(
+    www,
+    /resource_metadata="https:\/\/cp\.test\/\.well-known\/oauth-protected-resource\/mcp"/,
+  );
+  assert.equal(www.includes("error="), false);
+  const body = (await res.json()) as { error?: { code: number; message: string } };
+  assert.equal(body.error?.code, -32001);
+  assert.equal(body.error?.message, "unauthorized");
+});
+
+test("MCP invalid bearer is HTTP 401 invalid_token on initialize and tools/call", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const dead = "atk_deadbeefdeadbeefdeadbeefdeadbeef";
+  const init = await handleMcp(
+    rpc("initialize", {
+      protocolVersion: MCP_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "test", version: "0" },
+    }, dead),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test" },
+  );
+  assert.equal(init.status, 401);
+  const www = init.headers.get("www-authenticate") || "";
+  assert.match(www, /error="invalid_token"/);
+  assert.match(
+    www,
+    /resource_metadata="https:\/\/cp\.test\/\.well-known\/oauth-protected-resource\/mcp"/,
+  );
+  const initBody = (await init.json()) as { error?: { message: string } };
+  assert.equal(initBody.error?.message, "invalid_token");
+
+  const call = await handleMcp(
+    rpc("tools/call", { name: "ownmesh_list_devices", arguments: {} }, dead),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test" },
+  );
+  assert.equal(call.status, 401);
+  const callBody = (await call.json()) as { error?: { message: string } };
+  assert.equal(callBody.error?.message, "invalid_token");
+});
+
+test("MCP initialize and tools/list remain reachable without a bearer", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const init = await handleMcp(
+    rpc("initialize", {
+      protocolVersion: MCP_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "test", version: "0" },
+    }),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test" },
+  );
+  assert.equal(init.status, 200);
+  const listed = await handleMcp(
+    rpc("tools/list", {}),
+    store,
+    new URL("https://cp.test/mcp"),
+    undefined,
+    { issuer: "https://cp.test" },
+  );
+  assert.equal(listed.status, 200);
+});
+
 test("MCP catalog has annotations and separates shell from structured run", () => {
   const names = MCP_TOOLS.map((t) => t.name);
   assert.ok(names.includes("ownmesh_command_run"));

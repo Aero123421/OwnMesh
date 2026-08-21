@@ -87,6 +87,7 @@ fn base_input() -> DoctorInput {
             probed: false,
             reachable: None,
             http_status: None,
+            reported_version: None,
             message: None,
         },
         privacy_policy: PrivacyPolicyObservation {

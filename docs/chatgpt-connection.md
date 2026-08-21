@@ -227,8 +227,10 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 
 | Symptom | Check |
 |---|---|
-| OAuth fails | `/.well-known/oauth-authorization-server`, redirect URI exact match, PKCE S256 |
-| Connector dies after hours | Include `offline_access`; confirm refresh tokens issued |
+| OAuth fails | `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, redirect URI exact match, PKCE S256 |
+| Connector dies after hours | Include `offline_access`; confirm refresh tokens issued. Expired access tokens must get HTTP 401 + `WWW-Authenticate` from `/mcp` so ChatGPT can refresh |
+| ChatGPT reports 502 after idle | New chat, then re-consent if 401 refresh still fails. `GET /mcp` with `Accept: text/event-stream` is 405 by design (no long-lived SSE on Workers) |
+| CLI vs Worker version skew | `ownmesh doctor --check-network` warns when `/health` version does not match the CLI |
 | `insufficient_scope` | Re-consent with required scopes |
 | `device_offline` | `ownmeshd run`, enrollment, `/agent/connect` WebSocket |
 | Stuck `approval_required` | TUI/CLI/browser approve; then `ownmesh_get_operation` |

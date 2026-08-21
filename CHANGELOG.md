@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v1.2.19 — ChatGPT MCP token refresh and control-plane version visibility
+
+- `/mcp` returns HTTP 401 with `WWW-Authenticate` (and JSON-RPC `-32001`) when
+  a Bearer token is missing on `tools/call` or is invalid on any JSON-RPC
+  method, so ChatGPT can refresh instead of treating a 200 JSON-RPC error as
+  transport success. Unauthenticated `initialize` / `tools/list` stay available
+  for discovery.
+- `GET /.well-known/oauth-protected-resource/mcp` serves RFC 9728 metadata for
+  the `/mcp` resource identifier; `authorization_servers` remains the issuer
+  origin.
+- `ownmesh doctor --check-network` warns when the control-plane `/health`
+  version does not match the CLI. See `release/SUPPORTED_SURFACES.json`.
+
 ## v1.2.18 — Windows installer upgrade stop on PowerShell 5.1
 
 - The portable Windows installer no longer treats a missing `OwnMesh-ownmeshd`
