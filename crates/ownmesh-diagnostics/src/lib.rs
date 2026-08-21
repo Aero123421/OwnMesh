@@ -280,7 +280,47 @@ pub struct ControlPlaneObservation {
     pub probed: bool,
     pub reachable: Option<bool>,
     pub http_status: Option<u16>,
+    /// `/health` `version` field when a probe parsed it. Never a URL or secret.
+    pub reported_version: Option<String>,
     pub message: Option<String>,
+}
+
+enum ControlPlaneVersionStatus {
+    Match(String),
+    Mismatch { cli: String, control_plane: String },
+    Omitted,
+}
+
+fn normalize_release_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let stripped = trimmed.strip_prefix('v').unwrap_or(trimmed);
+    if stripped.is_empty() || stripped.len() > 32 {
+        return None;
+    }
+    if !stripped
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+    {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+fn control_plane_version_status(cli: &str, reported: Option<&str>) -> ControlPlaneVersionStatus {
+    let Some(control_plane) = reported.and_then(normalize_release_version) else {
+        return ControlPlaneVersionStatus::Omitted;
+    };
+    let Some(cli_version) = normalize_release_version(cli) else {
+        return ControlPlaneVersionStatus::Omitted;
+    };
+    if cli_version == control_plane {
+        ControlPlaneVersionStatus::Match(control_plane)
+    } else {
+        ControlPlaneVersionStatus::Mismatch {
+            cli: cli_version,
+            control_plane,
+        }
+    }
 }
 
 /// Policy / privacy / update defaults observation.
@@ -668,20 +708,53 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         );
         if input.control_plane.probed {
             match input.control_plane.reachable {
-                Some(true) => checks.push(
-                    DoctorCheck::pass(
-                        "control_plane.health",
-                        format!(
-                            "control plane /health ok{}",
-                            input
-                                .control_plane
-                                .http_status
-                                .map(|s| format!(" (HTTP {s})"))
-                                .unwrap_or_default()
-                        ),
-                    )
-                    .with_detail(input.control_plane.url.clone().unwrap_or_default()),
-                ),
+                Some(true) => {
+                    let version_note = input
+                        .control_plane
+                        .reported_version
+                        .as_deref()
+                        .map(|version| format!(", version {version}"))
+                        .unwrap_or_default();
+                    checks.push(
+                        DoctorCheck::pass(
+                            "control_plane.health",
+                            format!(
+                                "control plane /health ok{}{version_note}",
+                                input
+                                    .control_plane
+                                    .http_status
+                                    .map(|s| format!(" (HTTP {s})"))
+                                    .unwrap_or_default()
+                            ),
+                        )
+                        .with_detail(input.control_plane.url.clone().unwrap_or_default()),
+                    );
+                    match control_plane_version_status(
+                        input.binary.cli_version.as_str(),
+                        input.control_plane.reported_version.as_deref(),
+                    ) {
+                        ControlPlaneVersionStatus::Match(version) => {
+                            checks.push(DoctorCheck::pass(
+                                "control_plane.version",
+                                format!("control plane version matches CLI ({version})"),
+                            ));
+                        }
+                        ControlPlaneVersionStatus::Mismatch { cli, control_plane } => {
+                            checks.push(DoctorCheck::warn(
+                                "control_plane.version",
+                                format!(
+                                    "control plane version {control_plane} does not match CLI {cli}; redeploy the Worker"
+                                ),
+                            ));
+                        }
+                        ControlPlaneVersionStatus::Omitted => {
+                            checks.push(DoctorCheck::warn(
+                                "control_plane.version",
+                                "control plane /health omitted version; cannot compare with CLI",
+                            ));
+                        }
+                    }
+                }
                 // A failed opt-in probe must be observable through the process
                 // exit status. The default doctor run does not probe at all.
                 Some(false) => checks.push(DoctorCheck::fail(
@@ -1730,6 +1803,70 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.id == "privacy.telemetry" && c.status == CheckStatus::Pass));
+    }
+
+    #[test]
+    fn control_plane_version_match_is_pass() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.18".into();
+        input.control_plane.configured = true;
+        input.control_plane.probed = true;
+        input.control_plane.reachable = Some(true);
+        input.control_plane.http_status = Some(200);
+        input.control_plane.reported_version = Some("v1.2.18".into());
+        let report = run_doctor(&input);
+        let version = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.version")
+            .expect("version check");
+        assert_eq!(version.status, CheckStatus::Pass, "{version:?}");
+        assert!(version.message.contains("1.2.18"), "{version:?}");
+    }
+
+    #[test]
+    fn control_plane_version_mismatch_is_warn() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.18".into();
+        input.control_plane.configured = true;
+        input.control_plane.probed = true;
+        input.control_plane.reachable = Some(true);
+        input.control_plane.http_status = Some(200);
+        input.control_plane.reported_version = Some("1.2.11".into());
+        let report = run_doctor(&input);
+        let health = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.health")
+            .expect("health check");
+        let version = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.version")
+            .expect("version check");
+        assert_eq!(health.status, CheckStatus::Pass, "{health:?}");
+        assert_eq!(version.status, CheckStatus::Warn, "{version:?}");
+        assert!(version.message.contains("1.2.11"), "{version:?}");
+        assert!(version.message.contains("1.2.18"), "{version:?}");
+        assert_eq!(report.outcome, DoctorOutcome::Warn);
+    }
+
+    #[test]
+    fn control_plane_version_omitted_is_warn() {
+        let mut input = DoctorInput::default();
+        input.binary.cli_version = "1.2.18".into();
+        input.control_plane.configured = true;
+        input.control_plane.probed = true;
+        input.control_plane.reachable = Some(true);
+        input.control_plane.http_status = Some(200);
+        let report = run_doctor(&input);
+        let version = report
+            .checks
+            .iter()
+            .find(|c| c.id == "control_plane.version")
+            .expect("version check");
+        assert_eq!(version.status, CheckStatus::Warn, "{version:?}");
+        assert!(version.message.contains("omitted version"), "{version:?}");
     }
 
     #[test]

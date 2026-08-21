@@ -2860,6 +2860,74 @@ function mcpError(
   return json({ jsonrpc: "2.0", id: id ?? null, error: { code, message, data } });
 }
 
+function mcpProtectedResourceMetadataUrl(issuer: string): string | null {
+  try {
+    const origin = new URL(issuer).origin;
+    if (!origin.startsWith("https://")) return null;
+    return `${origin}/.well-known/oauth-protected-resource/mcp`;
+  } catch {
+    return null;
+  }
+}
+
+function mcpBearerChallenge(issuer: string, error?: "invalid_token"): string {
+  const parts = ['Bearer realm="ownmesh"'];
+  if (error) parts.push(`error="${error}"`);
+  const metadata = mcpProtectedResourceMetadataUrl(issuer);
+  if (metadata) parts.push(`resource_metadata="${metadata}"`);
+  return parts.join(", ");
+}
+
+function mcpUnauthorized(
+  id: string | number | null | undefined,
+  issuer: string,
+  message: "unauthorized" | "invalid_token",
+): Response {
+  return json(
+    { jsonrpc: "2.0", id: id ?? null, error: { code: -32001, message } },
+    {
+      status: 401,
+      noStore: true,
+      headers: {
+        "www-authenticate": mcpBearerChallenge(
+          issuer,
+          message === "invalid_token" ? "invalid_token" : undefined,
+        ),
+      },
+    },
+  );
+}
+
+type McpAccess = {
+  rec: NonNullable<Awaited<ReturnType<ControlPlaneStore["getAccess"]>>>;
+  principal: NonNullable<Awaited<ReturnType<ControlPlaneStore["getPrincipal"]>>>;
+};
+
+async function resolveMcpAccess(
+  store: ControlPlaneStore,
+  token: string | undefined,
+  id: string | number | null | undefined,
+  issuer: string,
+  required: boolean,
+): Promise<McpAccess | Response | null> {
+  if (!token) {
+    return required ? mcpUnauthorized(id, issuer, "unauthorized") : null;
+  }
+  const rec = await store.getAccess(token);
+  if (!rec) return mcpUnauthorized(id, issuer, "invalid_token");
+  const principal = await store.getPrincipal(rec.principal);
+  const principalCredentialGeneration = Number(principal?.credential_generation);
+  if (
+    !principal ||
+    principal.tenant_id !== rec.tenant_id ||
+    !Number.isSafeInteger(principalCredentialGeneration) ||
+    principalCredentialGeneration < 1
+  ) {
+    return mcpUnauthorized(id, issuer, "invalid_token");
+  }
+  return { rec, principal };
+}
+
 function workspaceUnavailableMcpError(
   id: string | number | null | undefined,
   deviceId: string,
@@ -4872,7 +4940,7 @@ export async function handleMcp(
     return json({ error: "method_not_allowed" }, { status: 405 });
   }
 
-  const token = bearer(req);
+  const token = bearer(req) ?? undefined;
   let body: JsonRpc;
   try {
     body = await readRequestJsonLimited<JsonRpc>(req, MAX_REQUEST_BODY_BYTES);
@@ -4886,6 +4954,13 @@ export async function handleMcp(
   }
   const method = body.method || "";
   const id = body.id ?? null;
+
+  // A present but invalid/expired Bearer must 401 on every JSON-RPC method so
+  // ChatGPT (and other MCP OAuth clients) refresh instead of treating HTTP 200
+  // JSON-RPC -32001 as a successful transport round-trip. Missing Bearer stays
+  // allowed for initialize/tools/list discovery.
+  const presentedAccess = await resolveMcpAccess(store, token, id, issuer, false);
+  if (presentedAccess instanceof Response) return presentedAccess;
 
   // Notifications (no response body required by streamable HTTP → 202)
   if (id === null || id === undefined) {
@@ -4940,19 +5015,11 @@ export async function handleMcp(
   }
 
   if (method === "tools/call") {
-    if (!token) return mcpError(id, -32001, "unauthorized");
-    const rec = await store.getAccess(token);
-    if (!rec) return mcpError(id, -32001, "invalid_token");
-    const principal = await store.getPrincipal(rec.principal);
-    const principalCredentialGeneration = Number(principal?.credential_generation);
-    if (
-      !principal ||
-      principal.tenant_id !== rec.tenant_id ||
-      !Number.isSafeInteger(principalCredentialGeneration) ||
-      principalCredentialGeneration < 1
-    ) {
-      return mcpError(id, -32001, "invalid_token");
-    }
+    const access = presentedAccess ?? await resolveMcpAccess(store, token, id, issuer, true);
+    if (access instanceof Response) return access;
+    if (!access) return mcpUnauthorized(id, issuer, "unauthorized");
+    const { rec, principal } = access;
+    const principalCredentialGeneration = Number(principal.credential_generation);
 
     const params = body.params || {};
     const name = String(params.name || "");

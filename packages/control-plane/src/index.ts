@@ -654,7 +654,10 @@ export default {
       }));
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") {
-      return json(protectedResourceMetadata(issuer));
+      return json(protectedResourceMetadata(issuer, issuer));
+    }
+    if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+      return json(protectedResourceMetadata(`${issuer}/mcp`, issuer));
     }
 
     let store: ControlPlaneStore;
