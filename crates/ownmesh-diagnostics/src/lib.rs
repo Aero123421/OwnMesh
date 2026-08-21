@@ -737,7 +737,7 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                             checks.push(DoctorCheck::pass(
                                 "control_plane.version",
                                 format!("control plane version matches CLI ({version})"),
-                            ))
+                            ));
                         }
                         ControlPlaneVersionStatus::Mismatch { cli, control_plane } => {
                             checks.push(DoctorCheck::warn(
@@ -747,10 +747,12 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
                                 ),
                             ));
                         }
-                        ControlPlaneVersionStatus::Omitted => checks.push(DoctorCheck::warn(
-                            "control_plane.version",
-                            "control plane /health omitted version; cannot compare with CLI",
-                        )),
+                        ControlPlaneVersionStatus::Omitted => {
+                            checks.push(DoctorCheck::warn(
+                                "control_plane.version",
+                                "control plane /health omitted version; cannot compare with CLI",
+                            ));
+                        }
                     }
                 }
                 // A failed opt-in probe must be observable through the process
