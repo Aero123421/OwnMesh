@@ -103,7 +103,8 @@ impl WindowsReplayLedger for crate::ReplayLedger {
             .map_err(|error| error.to_string())
     }
     fn mark_spawned(&mut self, nonce: &str, digest: &str) -> Result<(), String> {
-        ReplayLedger::mark_spawned(self, nonce, digest, None).map_err(|error| error.to_string())
+        crate::ReplayLedger::mark_spawned(self, nonce, digest, None)
+            .map_err(|error| error.to_string())
     }
     fn complete(&mut self, nonce: &str, digest: &str) -> Result<(), String> {
         self.mark_completed(nonce, digest)
