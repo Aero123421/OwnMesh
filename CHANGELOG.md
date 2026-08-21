@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v1.2.18 — Windows installer upgrade stop on PowerShell 5.1
+
+- The portable Windows installer no longer treats a missing `OwnMesh-ownmeshd`
+  scheduled task as a terminating error under Windows PowerShell 5.1
+  (`$ErrorActionPreference = Stop` + `schtasks` NativeCommandError).
+  Upgrades that only need to stop matching install-dir processes continue.
+- The same `powershell -File` path also hashes with .NET SHA-256 and restores
+  the Desktop `$PSHOME\Modules` path so a pwsh-inherited Core `PSModulePath`
+  cannot hide `Get-FileHash` / `Unblock-File`. See
+  `installers/ownmesh-installer.ps1`. The machine-checked contract remains
+  `release/SUPPORTED_SURFACES.json`.
+
 ## v1.2.17 — Hardening gates and fail-closed OAuth redemption
 
 - Authorization-code grants verify then CAS-bind the redeemed code hash to
