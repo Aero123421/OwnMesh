@@ -4940,7 +4940,7 @@ export async function handleMcp(
     return json({ error: "method_not_allowed" }, { status: 405 });
   }
 
-  const token = bearer(req);
+  const token = bearer(req) ?? undefined;
   let body: JsonRpc;
   try {
     body = await readRequestJsonLimited<JsonRpc>(req, MAX_REQUEST_BODY_BYTES);
