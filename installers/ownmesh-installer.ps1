@@ -135,6 +135,38 @@
         }
     }
 
+    function Invoke-OwnMeshSchTasks {
+        param(
+            [Parameter(Mandatory)][ValidateSet("Query", "End", "Run")][string]$Action,
+            [Parameter(Mandatory)][string]$TaskName
+        )
+
+        if ($TaskName -cnotin @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
+            throw "Refusing unlisted scheduled task name"
+        }
+
+        # Windows PowerShell 5.1 wraps native stderr as NativeCommandError. With
+        # $ErrorActionPreference Stop that becomes terminating even under *>$null,
+        # so a missing OwnMesh scheduled task aborted upgrades. Route through cmd
+        # and temporarily ignore native errors; only the exit code is authoritative.
+        $previousEap = $ErrorActionPreference
+        $previousNative = $null
+        if (Test-Path -LiteralPath variable:PSNativeCommandUseErrorActionPreference) {
+            $previousNative = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        try {
+            $ErrorActionPreference = "Continue"
+            cmd.exe /c "schtasks.exe /$Action /TN `"$TaskName`" 1>nul 2>nul" | Out-Null
+            return $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousEap
+            if ($null -ne $previousNative) {
+                $PSNativeCommandUseErrorActionPreference = $previousNative
+            }
+        }
+    }
+
     function Stop-InstalledOwnMeshProcesses {
         param(
             [Parameter(Mandatory)][string]$TargetDir,
@@ -172,14 +204,15 @@
 
         $serviceTaskPresent = $false
         foreach ($taskName in @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
-            & schtasks.exe /Query /TN $taskName *> $null
-            if ($LASTEXITCODE -eq 0) { $serviceTaskPresent = $true }
+            if ((Invoke-OwnMeshSchTasks -Action Query -TaskName $taskName) -eq 0) {
+                $serviceTaskPresent = $true
+            }
         }
         if ($serviceWasRunning -and -not $serviceTaskPresent) {
             throw "A manually started ownmeshd.exe is running outside the installed user service; stop it and retry"
         }
         foreach ($taskName in @("OwnMesh-ownmeshd", "OwnMesh\ownmeshd")) {
-            & schtasks.exe /End /TN $taskName *> $null
+            $null = Invoke-OwnMeshSchTasks -Action End -TaskName $taskName
         }
         foreach ($process in $matching) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
@@ -752,9 +785,8 @@
                     -BackupDir $backupDir `
                     -BinaryNames $RequiredBinaries
                 if ($serviceWasRunning) {
-                    & schtasks.exe /Run /TN "OwnMesh-ownmeshd" *> $null
-                    if ($LASTEXITCODE -ne 0) {
-                        & schtasks.exe /Run /TN "OwnMesh\ownmeshd" *> $null
+                    if ((Invoke-OwnMeshSchTasks -Action Run -TaskName "OwnMesh-ownmeshd") -ne 0) {
+                        $null = Invoke-OwnMeshSchTasks -Action Run -TaskName "OwnMesh\ownmeshd"
                     }
                 }
             } catch {

@@ -690,8 +690,57 @@ class InstallerAdversarialTests(unittest.TestCase):
         self.assertIn("[IO.File]::Replace", text)
         self.assertIn("Move-InstalledBinary", text)
         self.assertIn("Stop-InstalledOwnMeshProcesses", text)
+        self.assertIn("Invoke-OwnMeshSchTasks", text)
         self.assertIn("Restore-OwnMeshBackup", text)
         self.assertIn("Updated OwnMesh daemon version did not match the CLI", text)
+        # Windows PowerShell 5.1 NativeCommandError must not reach schtasks.exe.
+        self.assertNotRegex(text, r"(?m)^\s*& schtasks\.exe\b")
+        self.assertIn('cmd.exe /c "schtasks.exe /$Action /TN `"$TaskName`" 1>nul 2>nul"', text)
+
+    def test_windows_ps1_schtasks_helper_missing_task_on_powershell_51(self) -> None:
+        if not _is_windows():
+            self.skipTest("Windows PowerShell 5.1 only")
+        powershell = shutil.which("powershell")
+        if not powershell:
+            self.skipTest("powershell.exe not available")
+        text = PS_INSTALLER.read_text(encoding="utf-8")
+        start = text.find("function Invoke-OwnMeshSchTasks")
+        self.assertNotEqual(start, -1, "Invoke-OwnMeshSchTasks helper is missing")
+        end = text.find("function Stop-InstalledOwnMeshProcesses", start)
+        self.assertGreater(end, start, "could not bound Invoke-OwnMeshSchTasks")
+        snippet = (
+            text[start:end]
+            + "$ErrorActionPreference = 'Stop'\n"
+            + "Set-StrictMode -Version Latest\n"
+            + "$primary = Invoke-OwnMeshSchTasks -Action Query -TaskName 'OwnMesh-ownmeshd'\n"
+            + "$alt = Invoke-OwnMeshSchTasks -Action Query -TaskName 'OwnMesh\\ownmeshd'\n"
+            + "Write-Output \"query-primary=$primary\"\n"
+            + "Write-Output \"query-alt=$alt\"\n"
+            + "cmd.exe /c \"schtasks.exe /Query /TN `\"OwnMesh-DoesNotExist-XYZ`\" 1>nul 2>nul\" | Out-Null\n"
+            + "Write-Output \"query-fake=$LASTEXITCODE\"\n"
+            + "if ($LASTEXITCODE -eq 0) { throw 'synthetic missing task must not look present' }\n"
+        )
+        completed = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                snippet,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        combined = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, combined)
+        self.assertIn("query-primary=", combined)
+        self.assertIn("query-fake=", combined)
+        self.assertNotIn("NativeCommandError", combined)
+        self.assertNotIn("指定されたファイルが見つかりません", combined)
 
     def test_sh_installer_requires_minisig_and_forbids_curl_pipe(self) -> None:
         text = SH_INSTALLER.read_text(encoding="utf-8")
@@ -789,6 +838,32 @@ class InstallerAdversarialTests(unittest.TestCase):
                 self.assertEqual(smoke.returncode, 0, smoke.stdout + smoke.stderr)
                 self.assertIn(binary, smoke.stdout.lower())
                 self.assertIn(expected_version, smoke.stdout)
+
+            # The published one-liner uses Windows PowerShell 5.1. A missing
+            # scheduled task must not abort the upgrade stop path.
+            powershell51 = shutil.which("powershell")
+            if powershell51:
+                completed51 = subprocess.run(
+                    [
+                        powershell51,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(PS_INSTALLER),
+                    ],
+                    cwd=str(ROOT),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                combined51 = completed51.stdout + completed51.stderr
+                self.assertEqual(completed51.returncode, 0, combined51)
+                self.assertIn("Stopping running OwnMesh components for upgrade", combined51)
+                self.assertNotIn("NativeCommandError", combined51)
 
             # A file reparse point must be rejected before replacing any target.
             reparse_install = tmp_path / "reparse-install"
