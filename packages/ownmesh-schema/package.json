@@ -16,7 +16,7 @@
     "test": "tsc --noEmit && node --experimental-strip-types --test src/fixtures-roundtrip.test.ts src/errors.test.ts src/schema-files.test.ts"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
+    "@types/node": "^26.2.0",
     "typescript": "^5.7.2"
   }
 }
