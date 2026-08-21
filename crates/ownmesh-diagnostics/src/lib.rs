@@ -1381,8 +1381,23 @@ pub fn write_prepared_support_bundle(
     path: &std::path::Path,
     prepared: &PreparedSupportBundle,
 ) -> Result<(), SupportBundleError> {
-    ownmesh_ipc::atomic_write_owner_only(path, prepared.bytes())
+    ownmesh_persist::write_atomically_with(path, prepared.bytes(), restrict_support_bundle_file)
         .map_err(|_| SupportBundleError::Write)
+}
+
+/// Apply owner-only permissions before support-bundle bytes are committed.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
+fn restrict_support_bundle_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
 }
 
 fn validate_support_input(input: &SupportBundleInput) -> Result<(), SupportBundleError> {
@@ -1438,6 +1453,12 @@ fn scan_serializable_section<T: Serialize>(
 }
 
 fn contains_suspicious_support_content(text: &str) -> bool {
+    // High-entropy detection must run on original-case text. Folding to
+    // lowercase for labeled-secret matching would collapse mixed-case
+    // alphanumeric tokens into two character categories and miss them.
+    if unlabeled_high_entropy_present(text) {
+        return true;
+    }
     let normalized = normalize_support_scan_text(text);
     let whitespace_normalized = normalized
         .replace("\\n", " ")
@@ -1506,14 +1527,7 @@ fn contains_suspicious_support_content_normalized(text: &str) -> bool {
 
     // Reject JWT-like three-segment bearer material without copying it into an
     // error. Ordinary dotted versions/hostnames do not meet these bounds.
-    for token in text.split(|c: char| {
-        c.is_whitespace()
-            || matches!(
-                c,
-                '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-            )
-    }) {
-        let token = token.trim_matches(|character: char| matches!(character, ':' | '='));
+    for token in support_scan_tokens(text) {
         let segments: Vec<&str> = token.split('.').collect();
         if segments.len() == 3
             && segments.iter().all(|segment| {
@@ -1530,6 +1544,21 @@ fn contains_suspicious_support_content_normalized(text: &str) -> bool {
         }
     }
     false
+}
+
+fn support_scan_tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    })
+    .map(|token| token.trim_matches(|character: char| matches!(character, ':' | '=')))
+}
+
+fn unlabeled_high_entropy_present(text: &str) -> bool {
+    support_scan_tokens(text).any(looks_like_high_entropy_secret)
 }
 
 fn normalize_support_scan_text(text: &str) -> String {
@@ -1671,8 +1700,14 @@ fn looks_like_high_entropy_secret(token: &str) -> bool {
 
 fn support_sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push(char::from(HEX[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    hex
 }
 
 #[cfg(test)]

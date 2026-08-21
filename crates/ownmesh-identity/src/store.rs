@@ -476,11 +476,7 @@ impl<P: SecretStore, F: SecretStore> PreferredSecretStore<P, F> {
     /// True when cleanup failed or a residual mirror cannot be safely verified/removed.
     #[must_use]
     pub fn is_degraded(&self) -> bool {
-        let cleanup_degraded = self
-            .cleanup_report
-            .lock()
-            .map(|g| g.degraded)
-            .unwrap_or(true);
+        let cleanup_degraded = self.cleanup_report.lock().map_or(true, |g| g.degraded);
         if cleanup_degraded {
             return true;
         }
@@ -549,21 +545,17 @@ impl<P: SecretStore, F: SecretStore> PreferredSecretStore<P, F> {
     #[must_use]
     pub fn diagnostic_snapshot(&self) -> CredentialStoreDiagnosticSnapshot {
         let cleanup = self.cleanup_report();
-        let residual_fallback_entries = self
-            .fallback_dir
-            .as_ref()
-            .map(|dir| {
-                [
-                    SecretPurpose::DevicePrivateKey,
-                    SecretPurpose::HumanRefreshToken,
-                    SecretPurpose::DeviceEnrollmentProof,
-                    SecretPurpose::DeviceCredential,
-                ]
-                .into_iter()
-                .filter(|purpose| dir.join(format!("{}.oms", purpose.account())).is_file())
-                .count()
-            })
-            .unwrap_or(0);
+        let residual_fallback_entries = self.fallback_dir.as_ref().map_or(0, |dir| {
+            [
+                SecretPurpose::DevicePrivateKey,
+                SecretPurpose::HumanRefreshToken,
+                SecretPurpose::DeviceEnrollmentProof,
+                SecretPurpose::DeviceCredential,
+            ]
+            .into_iter()
+            .filter(|purpose| dir.join(format!("{}.oms", purpose.account())).is_file())
+            .count()
+        });
         CredentialStoreDiagnosticSnapshot {
             schema_version: 1,
             backend_name: self.backend_name().to_string(),
@@ -803,7 +795,7 @@ impl<P: SecretStore, F: SecretStore> SecretStore for PreferredSecretStore<P, F> 
     }
 
     fn backend_name(&self) -> &'static str {
-        if self.prefer_primary.lock().map(|g| *g).unwrap_or(false) {
+        if self.prefer_primary.lock().is_ok_and(|g| *g) {
             "preferred(os-keychain)"
         } else {
             "preferred(encrypted-file)"

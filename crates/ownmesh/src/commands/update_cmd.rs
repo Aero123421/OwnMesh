@@ -379,42 +379,39 @@ fn begin_transaction(
                 eprintln!("ownmesh update: {error}");
                 ExitCode::Internal
             })?;
-        if !owner_alive {
-            if let Some(transaction) = &existing {
-                let pending = interrupted_apply_pending(install_dir).map_err(|error| {
-                    eprintln!("ownmesh update: inspect interrupted update: {error}");
-                    ExitCode::Internal
-                })?;
-                if matching
-                    && (!transaction.terminal()
-                        || (pending
-                            && matches!(transaction.phase.as_str(), "failed" | "rolled_back")))
-                {
-                    recover_recorded_transaction(transaction, install_dir)?;
-                } else if matching
-                    && pending
-                    && matches!(transaction.phase.as_str(), "completed" | "current")
-                {
-                    eprintln!(
-                        "ownmesh update: committed transaction has unexpected rollback evidence; recovery refused"
-                    );
-                    return Err(ExitCode::Authorization);
-                }
-            }
-            fs::remove_file(&lock_path).map_err(|error| {
-                eprintln!("ownmesh update: clear inactive transaction lock: {error}");
-                ExitCode::Internal
-            })?;
-        } else {
+        if owner_alive {
             let phase = existing
                 .as_ref()
-                .map(|transaction| transaction.phase.as_str())
-                .unwrap_or("unknown");
+                .map_or("unknown", |transaction| transaction.phase.as_str());
             eprintln!(
                 "ownmesh update: another update transaction is active (phase={phase}); run `ownmesh update status`"
             );
             return Err(ExitCode::UsageConfig);
         }
+        if let Some(transaction) = &existing {
+            let pending = interrupted_apply_pending(install_dir).map_err(|error| {
+                eprintln!("ownmesh update: inspect interrupted update: {error}");
+                ExitCode::Internal
+            })?;
+            if matching
+                && (!transaction.terminal()
+                    || (pending && matches!(transaction.phase.as_str(), "failed" | "rolled_back")))
+            {
+                recover_recorded_transaction(transaction, install_dir)?;
+            } else if matching
+                && pending
+                && matches!(transaction.phase.as_str(), "completed" | "current")
+            {
+                eprintln!(
+                    "ownmesh update: committed transaction has unexpected rollback evidence; recovery refused"
+                );
+                return Err(ExitCode::Authorization);
+            }
+        }
+        fs::remove_file(&lock_path).map_err(|error| {
+            eprintln!("ownmesh update: clear inactive transaction lock: {error}");
+            ExitCode::Internal
+        })?;
     } else {
         let pending = interrupted_apply_pending(install_dir).map_err(|error| {
             eprintln!("ownmesh update: inspect retained update journal: {error}");

@@ -150,6 +150,8 @@ pub fn apply_binaries(
             ownmesh_persist::copy_atomically_with(&current, &dest, |file| {
                 #[cfg(unix)]
                 file.set_permissions(source_permissions)?;
+                #[cfg(not(unix))]
+                let _ = file;
                 Ok(())
             })
             .map_err(|err| {
@@ -608,6 +610,8 @@ fn write_binary_atomic_temp(path: &Path, bytes: &[u8]) -> UpdateResult<()> {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o755))?;
         }
+        #[cfg(not(unix))]
+        let _ = file;
         Ok(())
     })
     .map_err(|err| UpdateError::Install(format!("durably stage {}: {err}", path.display())))
@@ -641,6 +645,8 @@ fn replace_file_once(staged: &Path, final_path: &Path) -> std::io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o755))?;
         }
+        #[cfg(not(unix))]
+        let _ = file;
         Ok(())
     })?;
     fs::remove_file(staged)?;
@@ -681,6 +687,8 @@ fn rollback_from_backup(install_dir: &Path, backup: &Path, names: &[String]) -> 
         ownmesh_persist::copy_atomically_with(&src, &dest, |file| {
             #[cfg(unix)]
             file.set_permissions(source_permissions)?;
+            #[cfg(not(unix))]
+            let _ = file;
             Ok(())
         })
         .map_err(|err| {

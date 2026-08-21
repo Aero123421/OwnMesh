@@ -26,6 +26,18 @@ use ownmesh_diagnostics::{
     PublicJournalHealth, PublicPlatformFacts, PublicServiceFacts, ServiceObservation,
     SupportBundleError, SupportBundleInput,
 };
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            hex.push(char::from(HEX[usize::from(byte >> 4)]));
+            hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            hex
+        })
+}
 
 fn base_input() -> DoctorInput {
     DoctorInput {
@@ -221,12 +233,7 @@ fn support_bundle_is_typed_scanned_and_preview_bytes_are_exact_export() {
     write_prepared_support_bundle(&path, &prepared).unwrap();
     let exported = std::fs::read(&path).unwrap();
     assert_eq!(exported, prepared.bytes());
-    use sha2::{Digest, Sha256};
-    let exported_digest: String = Sha256::digest(&exported)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    assert_eq!(exported_digest, prepared.sha256_hex());
+    assert_eq!(sha256_hex(&exported), prepared.sha256_hex());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
