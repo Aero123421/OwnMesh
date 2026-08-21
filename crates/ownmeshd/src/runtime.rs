@@ -1963,7 +1963,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
         self.maybe_make_op_journal_room(key, operation_id)?;
         if self.op_journal.len() >= MAX_OP_JOURNAL_ENTRIES {
             return Err(IpcError::Remote {
-                code: app_error::INTERNAL,
+                code: app_error::JOURNAL_CAPACITY,
                 message: format!(
                     "op journal at capacity ({MAX_OP_JOURNAL_ENTRIES}) with no evictable completed \
 receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)"
@@ -2340,6 +2340,7 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         .map_err(|e| {
             let code = match &e {
                 ownmesh_exec::ExecError::Cancelled => app_error::CONFLICT,
+                ownmesh_exec::ExecError::ExecutableFormat(_) => app_error::EXECUTABLE_FORMAT,
                 _ => app_error::INTERNAL,
             };
             IpcError::Remote {

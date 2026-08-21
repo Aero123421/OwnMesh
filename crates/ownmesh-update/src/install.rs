@@ -7,10 +7,10 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const APPLY_JOURNAL_SCHEMA: u32 = 1;
+const APPLY_JOURNAL_SCHEMA: u32 = 2;
 const APPLY_JOURNAL_NAME: &str = ".ownmesh-update-journal.json";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,6 +19,8 @@ struct ApplyJournal {
     staging_name: String,
     backup_name: String,
     backup_sha256: BTreeMap<String, String>,
+    #[serde(default)]
+    target_sha256: BTreeMap<String, String>,
 }
 
 /// Result of a successful apply.
@@ -31,6 +33,11 @@ pub struct ApplyReport {
     pub backup_dir: Option<PathBuf>,
     /// Names of binaries written.
     pub written: Vec<String>,
+    /// Expected SHA-256 of every installed required binary.
+    pub target_sha256: BTreeMap<String, String>,
+    /// `true` when the update crossed its durable commit point but stale
+    /// backup/staging cleanup could not be completed yet.
+    pub backup_cleanup_pending: bool,
     /// Retained for wire compatibility. Self-update callers now run from a
     /// private worker copy, so no pending Windows replacement is scheduled.
     pub pending_windows_replace: bool,
@@ -102,7 +109,7 @@ pub fn apply_binaries(
     })?;
 
     validate_version_label(version_label)?;
-    let transaction_suffix = format!("{version_label}-{}", std::process::id());
+    let transaction_suffix = format!("{version_label}-{}", uuid::Uuid::new_v4().simple());
     let staging = install_dir.join(format!(".ownmesh-staging-{transaction_suffix}"));
     let backup = install_dir.join(format!(".ownmesh-backup-{transaction_suffix}"));
     let _ = fs::remove_dir_all(&staging);
@@ -116,29 +123,40 @@ pub fn apply_binaries(
         let bytes = binaries.get(name).expect("checked");
         let staged = staging.join(name);
         write_binary_atomic_temp(&staged, bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&staged, perms).map_err(|err| {
-                UpdateError::Install(format!("chmod {}: {err}", staged.display()))
-            })?;
-        }
     }
 
     fs::create_dir_all(&backup).map_err(|err| {
         UpdateError::Install(format!("create backup {}: {err}", backup.display()))
     })?;
 
-    // Backup existing binaries and bind every copy to a digest before swap.
+    // Backup existing binaries and bind every durable copy to a digest before swap.
     let mut backup_sha256 = BTreeMap::new();
+    let mut target_sha256 = BTreeMap::new();
     for name in &required_names {
+        let staged = staging.join(name);
+        target_sha256.insert(name.clone(), sha256_file(&staged)?);
         let current = install_dir.join(name);
         if current.exists() {
             let dest = backup.join(name);
-            fs::copy(&current, &dest).map_err(|err| {
+            #[cfg(unix)]
+            let source_permissions = fs::metadata(&current)
+                .map_err(|err| {
+                    UpdateError::Install(format!(
+                        "read source permissions {}: {err}",
+                        current.display()
+                    ))
+                })?
+                .permissions();
+            ownmesh_persist::copy_atomically_with(&current, &dest, |file| {
+                #[cfg(unix)]
+                file.set_permissions(source_permissions)?;
+                #[cfg(not(unix))]
+                let _ = file;
+                Ok(())
+            })
+            .map_err(|err| {
                 UpdateError::Install(format!(
-                    "backup {} -> {}: {err}",
+                    "durable backup {} -> {}: {err}",
                     current.display(),
                     dest.display()
                 ))
@@ -146,6 +164,9 @@ pub fn apply_binaries(
             backup_sha256.insert(name.clone(), sha256_file(&dest)?);
         }
     }
+    ownmesh_persist::sync_parent_directory(&backup).map_err(|err| {
+        UpdateError::Install(format!("sync backup directory {}: {err}", backup.display()))
+    })?;
 
     let pending_windows_replace = false;
     let mut replaced = Vec::new();
@@ -165,11 +186,14 @@ pub fn apply_binaries(
                 .ok_or_else(|| UpdateError::Install("invalid backup directory name".into()))?
                 .to_owned(),
             backup_sha256: backup_sha256.clone(),
+            target_sha256: target_sha256.clone(),
         },
     )?;
 
-    // Swap staged → final. On failure, rollback from backup.
-    let swap_result = (|| -> UpdateResult<()> {
+    // Swap staged → final. Every pre-commit verification/durability failure
+    // follows the same rollback path while the durable journal still names the
+    // complete backup set.
+    let apply_result = (|| -> UpdateResult<()> {
         for name in &required_names {
             let staged = staging.join(name);
             let final_path = install_dir.join(name);
@@ -183,11 +207,11 @@ pub fn apply_binaries(
                 }
             }
         }
-        Ok(())
+        verify_installed_hashes(install_dir, &target_sha256)?;
+        sync_installed_tree(install_dir, &required_names)
     })();
 
-    if let Err(err) = swap_result {
-        let _ = fs::remove_dir_all(&staging);
+    if let Err(err) = apply_result {
         return match rollback_with_verification(
             install_dir,
             &backup,
@@ -195,8 +219,13 @@ pub fn apply_binaries(
             &backup_sha256,
         ) {
             Ok(()) => {
+                // Rollback commit point: make the restored tree durable before
+                // removing the journal that authorizes use of the backup.
+                sync_installed_tree(install_dir, &required_names)?;
+                remove_apply_journal(install_dir)?;
+                let _ = fs::remove_dir_all(&staging);
                 let _ = fs::remove_dir_all(&backup);
-                let _ = fs::remove_file(apply_journal_path(install_dir));
+                let _ = ownmesh_persist::sync_parent_directory(install_dir);
                 Err(err)
             }
             Err(rollback_error) => Err(UpdateError::Install(format!(
@@ -211,6 +240,8 @@ pub fn apply_binaries(
         install_dir: install_dir.to_path_buf(),
         backup_dir: Some(backup),
         written: replaced,
+        target_sha256,
+        backup_cleanup_pending: false,
         pending_windows_replace,
     })
 }
@@ -240,34 +271,57 @@ pub fn rollback_apply(report: &ApplyReport) -> UpdateResult<()> {
         &report.written,
         &journal.backup_sha256,
     )?;
+    sync_installed_tree(&report.install_dir, &report.written)?;
+    remove_apply_journal(&report.install_dir)?;
     fs::remove_dir_all(backup).map_err(|err| {
         UpdateError::Install(format!(
-            "remove rollback backup {}: {err}",
+            "remove rollback backup {} after rollback commit: {err}",
             backup.display()
         ))
     })?;
-    remove_apply_journal(&report.install_dir)
+    let _ = ownmesh_persist::sync_parent_directory(&report.install_dir);
+    Ok(())
 }
 
-/// Delete the retained backup after version and daemon health verification.
+/// Re-verify and sync the complete installed binary set before the caller
+/// records the durable outer `commit_decided` state.
 ///
 /// # Errors
 ///
-/// Returns an install error when the backup cannot be removed.
-pub fn finalize_apply(report: &ApplyReport) -> UpdateResult<()> {
+/// Returns an install error when any final binary differs from the verified
+/// release bytes or the installed tree cannot be made durable.
+pub fn verify_applied_binaries(report: &ApplyReport) -> UpdateResult<()> {
+    verify_installed_hashes(&report.install_dir, &report.target_sha256)?;
+    sync_installed_tree(&report.install_dir, &report.written)
+}
+
+/// Delete the retained journal and best-effort cleanup after version and
+/// daemon health verification.
+///
+/// # Errors
+///
+/// Returns an install error only when the durable journal commit point cannot
+/// be crossed. The boolean result is `true` when all post-commit artifacts were
+/// removed, or `false` when safe cleanup remains pending.
+pub fn finalize_apply(report: &ApplyReport) -> UpdateResult<bool> {
     // Removing the journal is the durable commit point. Once post-install
     // health has passed, a later cleanup failure must never make a subsequent
     // invocation roll a healthy release back.
     remove_apply_journal(&report.install_dir)?;
+    let mut cleanup_complete = true;
     if let Some(backup) = &report.backup_dir {
-        fs::remove_dir_all(backup).map_err(|err| {
-            UpdateError::Install(format!(
-                "remove verified backup {}: {err}",
-                backup.display()
-            ))
-        })?;
+        // Cleanup is post-commit. Failure must not be reported as an apply
+        // failure that could trigger rollback of an already-committed release.
+        if let Err(error) = fs::remove_dir_all(backup) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                cleanup_complete = false;
+            }
+        }
     }
-    Ok(())
+    if ownmesh_persist::sync_parent_directory(&report.install_dir).is_err() {
+        cleanup_complete = false;
+    }
+    Ok(cleanup_complete)
 }
 
 /// Restore an interrupted multi-binary swap from its durable journal.
@@ -290,14 +344,58 @@ pub fn recover_interrupted_apply(install_dir: &Path) -> UpdateResult<bool> {
         .map(|base| binary_file_name(base))
         .collect::<Vec<_>>();
     rollback_with_verification(install_dir, &backup, &names, &journal.backup_sha256)?;
+    sync_installed_tree(install_dir, &names)?;
+    remove_apply_journal(install_dir)?;
     let _ = fs::remove_dir_all(&staging);
     fs::remove_dir_all(&backup).map_err(|err| {
         UpdateError::Install(format!(
-            "remove recovered backup {}: {err}",
+            "remove recovered backup {} after rollback commit: {err}",
             backup.display()
         ))
     })?;
+    let _ = ownmesh_persist::sync_parent_directory(install_dir);
+    Ok(true)
+}
+
+/// Report whether a validated durable apply journal is present.
+///
+/// # Errors
+///
+/// Returns an install error when the journal is malformed or unsafe. Callers
+/// must not start a new update while such evidence exists.
+pub fn interrupted_apply_pending(install_dir: &Path) -> UpdateResult<bool> {
+    let Some(journal) = read_apply_journal_optional(install_dir)? else {
+        return Ok(false);
+    };
+    validate_apply_journal(&journal)?;
+    Ok(true)
+}
+
+/// Finish a transaction whose outer state durably crossed `commit_decided`.
+/// New binaries are verified from the v2 journal and are never rolled back.
+/// A legacy v1 journal cannot prove a committed target set and fails closed.
+pub fn finalize_interrupted_commit(install_dir: &Path) -> UpdateResult<bool> {
+    let Some(journal) = read_apply_journal_optional(install_dir)? else {
+        return Ok(false);
+    };
+    validate_apply_journal(&journal)?;
+    if journal.schema_version != APPLY_JOURNAL_SCHEMA || journal.target_sha256.is_empty() {
+        return Err(UpdateError::Install(
+            "commit-decided recovery lacks target digest evidence".into(),
+        ));
+    }
+    verify_installed_hashes(install_dir, &journal.target_sha256)?;
+    let names = REQUIRED_BINARIES
+        .iter()
+        .map(|base| binary_file_name(base))
+        .collect::<Vec<_>>();
+    sync_installed_tree(install_dir, &names)?;
     remove_apply_journal(install_dir)?;
+    let staging = install_dir.join(&journal.staging_name);
+    let backup = install_dir.join(&journal.backup_name);
+    let _ = fs::remove_dir_all(staging);
+    let _ = fs::remove_dir_all(backup);
+    let _ = ownmesh_persist::sync_parent_directory(install_dir);
     Ok(true)
 }
 
@@ -336,8 +434,10 @@ fn write_apply_journal(install_dir: &Path, journal: &ApplyJournal) -> UpdateResu
 }
 
 fn remove_apply_journal(install_dir: &Path) -> UpdateResult<()> {
-    match fs::remove_file(apply_journal_path(install_dir)) {
-        Ok(()) => Ok(()),
+    let path = apply_journal_path(install_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => ownmesh_persist::sync_parent_directory(&path)
+            .map_err(|err| UpdateError::Install(format!("sync removed update journal: {err}"))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(UpdateError::Install(format!(
             "remove update journal: {err}"
@@ -355,11 +455,21 @@ fn validate_apply_journal(journal: &ApplyJournal) -> UpdateResult<()> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
     };
-    if journal.schema_version != APPLY_JOURNAL_SCHEMA
+    if !matches!(journal.schema_version, 1 | APPLY_JOURNAL_SCHEMA)
         || !safe_leaf(&journal.staging_name, ".ownmesh-staging-")
         || !safe_leaf(&journal.backup_name, ".ownmesh-backup-")
         || journal.backup_sha256.len() > REQUIRED_BINARIES.len()
+        || (journal.schema_version == APPLY_JOURNAL_SCHEMA
+            && journal.target_sha256.len() != REQUIRED_BINARIES.len())
+        || (journal.schema_version == 1 && !journal.target_sha256.is_empty())
         || journal.backup_sha256.iter().any(|(name, digest)| {
+            !REQUIRED_BINARIES
+                .iter()
+                .any(|base| binary_file_name(base) == *name)
+                || digest.len() != 64
+                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        || journal.target_sha256.iter().any(|(name, digest)| {
             !REQUIRED_BINARIES
                 .iter()
                 .any(|base| binary_file_name(base) == *name)
@@ -429,6 +539,39 @@ fn rollback_with_verification(
     Ok(())
 }
 
+fn verify_installed_hashes(
+    install_dir: &Path,
+    expected: &BTreeMap<String, String>,
+) -> UpdateResult<()> {
+    for (name, digest) in expected {
+        let actual = sha256_file(&install_dir.join(name))?;
+        if !actual.eq_ignore_ascii_case(digest) {
+            return Err(UpdateError::Install(format!(
+                "installed binary checksum mismatch for {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn sync_installed_tree(install_dir: &Path, names: &[String]) -> UpdateResult<()> {
+    #[cfg(unix)]
+    for name in names {
+        let path = install_dir.join(name);
+        if path.exists() {
+            fs::File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|err| {
+                    UpdateError::Install(format!("sync installed {}: {err}", path.display()))
+                })?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = names;
+    ownmesh_persist::sync_parent_directory(install_dir)
+        .map_err(|err| UpdateError::Install(format!("sync install directory: {err}")))
+}
+
 fn sha256_file(path: &Path) -> UpdateResult<String> {
     let mut file = fs::File::open(path)
         .map_err(|err| UpdateError::Install(format!("open backup {}: {err}", path.display())))?;
@@ -461,18 +604,17 @@ fn validate_version_label(version_label: &str) -> UpdateResult<()> {
 }
 
 fn write_binary_atomic_temp(path: &Path, bytes: &[u8]) -> UpdateResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| UpdateError::Install(format!("path has no parent: {}", path.display())))?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|err| UpdateError::Install(format!("temp file in {}: {err}", parent.display())))?;
-    temp.write_all(bytes)
-        .map_err(|err| UpdateError::Install(format!("write temp: {err}")))?;
-    temp.flush()
-        .map_err(|err| UpdateError::Install(format!("flush temp: {err}")))?;
-    temp.persist(path)
-        .map_err(|err| UpdateError::Install(format!("persist {}: {err}", path.display())))?;
-    Ok(())
+    ownmesh_persist::write_atomically_with(path, bytes, |file| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o755))?;
+        }
+        #[cfg(not(unix))]
+        let _ = file;
+        Ok(())
+    })
+    .map_err(|err| UpdateError::Install(format!("durably stage {}: {err}", path.display())))
 }
 
 fn replace_file(staged: &Path, final_path: &Path) -> std::io::Result<()> {
@@ -497,16 +639,18 @@ fn replace_file(staged: &Path, final_path: &Path) -> std::io::Result<()> {
 }
 
 fn replace_file_once(staged: &Path, final_path: &Path) -> std::io::Result<()> {
-    if final_path.exists() {
-        if let Err(err) = fs::remove_file(final_path) {
-            // On Windows, deleting a running image may fail; try rename aside.
-            let aside = final_path.with_extension("old");
-            let _ = fs::remove_file(&aside);
-            fs::rename(final_path, &aside)?;
-            let _ = err;
+    ownmesh_persist::copy_atomically_with(staged, final_path, |file| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o755))?;
         }
-    }
-    fs::rename(staged, final_path)
+        #[cfg(not(unix))]
+        let _ = file;
+        Ok(())
+    })?;
+    fs::remove_file(staged)?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -531,12 +675,23 @@ fn rollback_from_backup(install_dir: &Path, backup: &Path, names: &[String]) -> 
                 }
             }
         }
-        let restore = install_dir.join(format!(".{name}.rollback-{}", std::process::id()));
-        fs::copy(&src, &restore).map_err(|err| {
-            UpdateError::Install(format!("stage rollback {} failed: {err}", dest.display()))
-        })?;
-        replace_file(&restore, &dest).map_err(|err| {
-            let _ = fs::remove_file(&restore);
+        #[cfg(unix)]
+        let source_permissions = fs::metadata(&src)
+            .map_err(|err| {
+                UpdateError::Install(format!(
+                    "read rollback permissions {}: {err}",
+                    src.display()
+                ))
+            })?
+            .permissions();
+        ownmesh_persist::copy_atomically_with(&src, &dest, |file| {
+            #[cfg(unix)]
+            file.set_permissions(source_permissions)?;
+            #[cfg(not(unix))]
+            let _ = file;
+            Ok(())
+        })
+        .map_err(|err| {
             UpdateError::Install(format!("rollback {} failed: {err}", dest.display()))
         })?;
     }

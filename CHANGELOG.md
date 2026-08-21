@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## v1.2.17 — Hardening gates and fail-closed OAuth redemption
+
+- Authorization-code grants verify then CAS-bind the redeemed code hash to
+  one token family. D1 migration `0017` adds `oauth_tokens.auth_code_hash`.
+- Request bodies are limited by actual bytes; Content-Length is advisory.
+  Device `user_code` values are generated with Web Crypto rejection sampling.
+- TAR header/extension records are charged to updater decompression budgets.
+- Support-bundle export is a typed allowlisted v2 preview; mixed-case
+  high-entropy tokens fail closed and export bytes match preview bytes.
+- Doctor surfaces non-secret credential-store provenance (backend, residual
+  fallback entries, degraded cleanup).
+- Privileged-broker replay ledgers reconcile crash-left reservations and
+  enforce capacity. Updater apply/rollback stays crash-consistent for the
+  five required binaries. See #100 #101 #113 #121 #122 #123 #124 #125 #126
+  #128. The machine-checked contract remains `release/SUPPORTED_SURFACES.json`.
+
 ## v1.2.16 — Prepared executable custody
 
 - Approval-bound command execution now retains the exact invocation entry,

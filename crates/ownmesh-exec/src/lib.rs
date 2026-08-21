@@ -62,9 +62,10 @@ pub enum ExecError {
     ResourceLimit(String),
     #[error("cancelled")]
     Cancelled,
-    /// Process spawn failed. The message carries an actionable Windows hint
-    /// when the failure is Win32 error 193 (invalid executable format), which
-    /// npm-style extensionless shims trigger before the resolver fix.
+    /// Process spawn failed because the OS rejected the executable image format.
+    #[error("{0}")]
+    ExecutableFormat(String),
+    /// Process spawn failed for another reason.
     #[error("{0}")]
     Spawn(String),
 }
@@ -1026,7 +1027,16 @@ fn windows_batch_argv(script: &Path, args: &[String]) -> Result<Vec<String>, Spa
 /// extensionless npm-style POSIX shims; everything else keeps the raw OS
 /// message so the underlying cause is never swallowed.
 #[must_use]
-pub fn describe_spawn_error(program: &str, source: &std::io::Error) -> String {
+pub fn map_spawn_error(program: &str, source: &std::io::Error) -> ExecError {
+    let message = describe_spawn_error(program, source);
+    if source.raw_os_error() == Some(193) {
+        ExecError::ExecutableFormat(message)
+    } else {
+        ExecError::Spawn(message)
+    }
+}
+
+fn describe_spawn_error(program: &str, source: &std::io::Error) -> String {
     if source.raw_os_error() == Some(193) {
         format!(
             "failed to start `{program}`: not a valid Win32 application (error 193). \
@@ -2112,7 +2122,7 @@ async fn run_command_cancellable_inner(
     };
     let mut child = command
         .spawn()
-        .map_err(|source| ExecError::Spawn(describe_spawn_error(&req.program, &source)))?;
+        .map_err(|source| map_spawn_error(&req.program, &source))?;
     // Retain custody until the child exits. On macOS a shebang launch may
     // return from posix_spawn before the interpreter has reopened the staged
     // script path; deleting it immediately would turn an approved launch into

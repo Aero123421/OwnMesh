@@ -6,11 +6,13 @@ use crate::commands::service::{self, ServiceStatusSnapshot};
 use ownmesh_config::{redact_control_plane_url, OwnMeshPaths};
 use ownmesh_diagnostics::{
     appears_redacted, run_doctor, BinaryObservation, ConfigObservation, ControlPlaneObservation,
-    CredentialObservation, CredentialState, DaemonObservation, DoctorOutcome, DoctorReport,
-    PrivacyPolicyObservation, ServiceObservation,
+    CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
+    DoctorOutcome, DoctorReport, PrivacyPolicyObservation, ServiceObservation,
 };
 use ownmesh_domain::ExitCode;
-use ownmesh_identity::SecretPurpose;
+use ownmesh_identity::{
+    CredentialStoreDiagnosticSnapshot, SecretPurpose, CREDENTIAL_STORE_DIAGNOSTIC_FILE,
+};
 use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use std::env;
 use std::fs;
@@ -30,6 +32,7 @@ pub fn collect_doctor_report(
         binary: observe_binaries(cli_version),
         config: observe_config(paths),
         credentials: observe_credentials(paths),
+        credential_store: observe_credential_store(paths),
         daemon,
         control_plane: ControlPlaneObservation::default(),
         privacy_policy: observe_privacy_policy(paths),
@@ -294,6 +297,51 @@ fn observe_secret_presence_metadata_only(paths: &OwnMeshPaths, obs: &mut Credent
     if device_cred_blob.is_file() {
         obs.device_credential_present = true;
         obs.device_credential_state = CredentialState::Present;
+    }
+}
+
+fn observe_credential_store(paths: &OwnMeshPaths) -> CredentialStoreObservation {
+    let path = paths.keystore_dir().join(CREDENTIAL_STORE_DIAGNOSTIC_FILE);
+    if !path.is_file() {
+        return CredentialStoreObservation::default();
+    }
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() <= 16 * 1024 => metadata,
+        Ok(_) => {
+            return CredentialStoreObservation {
+                metadata_present: true,
+                read_error: Some("credential-store provenance metadata exceeds size limit".into()),
+                ..CredentialStoreObservation::default()
+            };
+        }
+        Err(_) => {
+            return CredentialStoreObservation {
+                metadata_present: true,
+                read_error: Some(
+                    "credential-store provenance metadata could not be inspected".into(),
+                ),
+                ..CredentialStoreObservation::default()
+            };
+        }
+    };
+    let _ = metadata;
+    match fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CredentialStoreDiagnosticSnapshot>(&bytes).ok())
+    {
+        Some(snapshot) if snapshot.schema_version == 1 => CredentialStoreObservation {
+            metadata_present: true,
+            backend_name: Some(snapshot.backend_name),
+            fallback_policy: Some(snapshot.fallback_policy),
+            degraded: snapshot.degraded || snapshot.cleanup_degraded,
+            residual_fallback_entries: snapshot.residual_fallback_entries,
+            read_error: None,
+        },
+        _ => CredentialStoreObservation {
+            metadata_present: true,
+            read_error: Some("credential-store provenance metadata is invalid".into()),
+            ..CredentialStoreObservation::default()
+        },
     }
 }
 

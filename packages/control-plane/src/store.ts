@@ -120,6 +120,12 @@ export type AuthCodeRecord = {
   used: boolean;
 };
 
+
+export type AuthCodeRedemption =
+  | { status: "redeemed"; record: AuthCodeRecord; token: TokenRecord }
+  | { status: "invalid_grant" };
+
+export type PutDeviceCodeResult = "created" | "user_code_collision";
 export type DeviceCodeRecord = {
   device_code: string;
   user_code: string;
@@ -688,7 +694,12 @@ export interface ControlPlaneStore {
   advancePrincipalCredentialGeneration(id: string): Promise<number | null>;
 
   putAuthCode(code: AuthCodeRecord): Promise<void>;
-  takeAuthCode(code: string): Promise<AuthCodeRecord | null>;
+  redeemAuthCode(input: {
+    code: string;
+    clientId: string;
+    redirectUri: string;
+    codeChallenge: string;
+  }): Promise<AuthCodeRedemption>;
 
   issueTokens(
     clientId: string,
@@ -711,7 +722,7 @@ export interface ControlPlaneStore {
    */
   lookupRevocableToken(token: string): Promise<RevocableTokenMeta | null>;
 
-  putDeviceCode(rec: DeviceCodeRecord): Promise<void>;
+  putDeviceCode(rec: DeviceCodeRecord): Promise<PutDeviceCodeResult>;
   getDeviceCode(deviceCode: string): Promise<DeviceCodeRecord | null>;
   getDeviceCodeByUserCode(userCode: string): Promise<DeviceCodeRecord | null>;
   approveDeviceCode(userCode: string, principalId: string): Promise<boolean>;
@@ -1010,7 +1021,7 @@ export interface ControlPlaneStore {
   schemaReadiness(): Promise<SchemaReadiness>;
 }
 
-/** Cheap structural readiness of required tables/columns/indexes (0002–0016). */
+/** Cheap structural readiness of required tables/columns/indexes (0002–0017). */
 export type SchemaReadiness = {
   schema_ready: boolean;
   checks: {
@@ -1038,6 +1049,8 @@ export type SchemaReadiness = {
     owner_auth_challenges: boolean;
     /** 0014 independent rolling refresh-token inactivity deadline */
     oauth_tokens_refresh_lifetime: boolean;
+    /** 0017 authorization-code redemption receipt binding */
+    oauth_tokens_auth_code_redemption: boolean;
     /** 0016 device-scoped workspace custody (workspace ids are device-local) */
     device_workspaces: boolean;
     device_workspace_members: boolean;
@@ -1072,6 +1085,11 @@ const SCHEMA_READINESS_OBJECTS: Record<
   oauth_tokens_refresh_lifetime: {
     table: "oauth_tokens",
     columns: ["refresh_expires_at"],
+  },
+  oauth_tokens_auth_code_redemption: {
+    table: "oauth_tokens",
+    columns: ["auth_code_hash"],
+    indexes: ["idx_oauth_tokens_auth_code_hash"],
   },
   oauth_auth_codes: {
     table: "oauth_auth_codes",
@@ -1352,6 +1370,18 @@ export class MemoryStore implements ControlPlaneStore {
         created_at: nowIso(),
       });
     }
+    if (!this.clients.has("client_ownmesh_cli")) {
+      this.clients.set("client_ownmesh_cli", {
+        client_id: "client_ownmesh_cli",
+        tenant_id: DEFAULT_TENANT,
+        client_name: "OwnMesh CLI",
+        redirect_uris: [
+          "http://127.0.0.1:8750/callback",
+          "http://localhost:8750/callback",
+        ],
+        created_at: nowIso(),
+      });
+    }
   }
 
   /**
@@ -1476,13 +1506,49 @@ export class MemoryStore implements ControlPlaneStore {
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
     this.authCodes.set(code.code, { ...code });
   }
-  async takeAuthCode(code: string): Promise<AuthCodeRecord | null> {
-    const rec = this.authCodes.get(code);
-    if (!rec || rec.used) return null;
-    if (Date.now() > rec.expires_at) return null;
+  async redeemAuthCode(input: {
+    code: string; clientId: string; redirectUri: string; codeChallenge: string;
+  }): Promise<AuthCodeRedemption> {
+    // This method intentionally contains no await before its commit point. In
+    // the in-memory conformance store, validation, single-use consumption, and
+    // token publication therefore happen in one JavaScript turn.
+    const rec = this.authCodes.get(input.code);
+    if (!rec || rec.used || Date.now() > rec.expires_at) return { status: "invalid_grant" };
+    if (
+      rec.client_id !== input.clientId ||
+      rec.redirect_uri !== input.redirectUri ||
+      rec.code_challenge !== input.codeChallenge ||
+      rec.code_challenge_method !== "S256"
+    ) {
+      return { status: "invalid_grant" };
+    }
+    const principalRecord = this.principals.get(rec.principal_id);
+    const client = this.clients.get(rec.client_id);
+    if (!principalRecord || !client || client.tenant_id !== principalRecord.tenant_id) {
+      throw new Error("authorization code client/principal binding is unavailable");
+    }
+
+    const access = randomToken("atk_");
+    const refresh = randomToken("rtk_");
+    const token: TokenRecord = {
+      access_token: access,
+      refresh_token: refresh,
+      client_id: rec.client_id,
+      scope: rec.scope,
+      principal: rec.principal_id,
+      expires_at: Date.now() + ACCESS_TOKEN_TTL_MS,
+      refresh_expires_at: Date.now() + REFRESH_TOKEN_IDLE_TTL_MS,
+      revoked: false,
+      refresh_family: randomToken("fam_"),
+      refresh_used: false,
+      tenant_id: principalRecord.tenant_id,
+    };
+
     rec.used = true;
-    this.authCodes.set(code, rec);
-    return { ...rec };
+    this.authCodes.set(input.code, rec);
+    this.tokensByAccess.set(access, token);
+    this.accessByRefresh.set(refresh, access);
+    return { status: "redeemed", record: { ...rec }, token: { ...token } };
   }
 
   async issueTokens(
@@ -1643,9 +1709,13 @@ export class MemoryStore implements ControlPlaneStore {
     };
   }
 
-  async putDeviceCode(rec: DeviceCodeRecord): Promise<void> {
-    this.deviceCodes.set(rec.device_code, { ...rec });
-    this.deviceByUserCode.set(rec.user_code.toUpperCase(), rec.device_code);
+  async putDeviceCode(rec: DeviceCodeRecord): Promise<PutDeviceCodeResult> {
+    const normalized = rec.user_code.toUpperCase();
+    if (this.deviceByUserCode.has(normalized)) return "user_code_collision";
+    if (this.deviceCodes.has(rec.device_code)) throw new Error("device_code collision");
+    this.deviceCodes.set(rec.device_code, { ...rec, user_code: normalized });
+    this.deviceByUserCode.set(normalized, rec.device_code);
+    return "created";
   }
   async getDeviceCode(deviceCode: string): Promise<DeviceCodeRecord | null> {
     const rec = this.deviceCodes.get(deviceCode);
@@ -2621,7 +2691,7 @@ export class MemoryStore implements ControlPlaneStore {
   }
 
   async schemaReadiness(): Promise<SchemaReadiness> {
-    // In-memory store always carries the full logical 0002–0008 schema.
+    // In-memory store always carries the full logical 0002–0017 schema.
     const checks = Object.fromEntries(
       Object.keys(SCHEMA_READINESS_OBJECTS).map((k) => [k, true]),
     ) as SchemaReadiness["checks"];
@@ -3008,23 +3078,117 @@ export class SqlStore implements ControlPlaneStore {
       .run();
   }
 
-  async takeAuthCode(code: string): Promise<AuthCodeRecord | null> {
-    const hash = await sha256Hex(code);
+  async redeemAuthCode(input: {
+    code: string; clientId: string; redirectUri: string; codeChallenge: string;
+  }): Promise<AuthCodeRedemption> {
+    if (!this.db.batch) {
+      throw new Error("SqlStore.redeemAuthCode requires db.batch");
+    }
+    const codeHash = await sha256Hex(input.code);
+    const checkedAt = nowIso();
     const row = await this.db.prepare(
-      `UPDATE oauth_auth_codes SET used = 1
-       WHERE code_hash = ? AND used = 0 AND expires_at > ?
-       RETURNING client_id, principal_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at`,
-    ).bind(hash, nowIso()).first<{
+      `SELECT ac.client_id, ac.principal_id, ac.redirect_uri, ac.scope,
+              ac.code_challenge, ac.code_challenge_method, ac.expires_at,
+              p.tenant_id
+       FROM oauth_auth_codes ac
+       JOIN principals p ON p.id = ac.principal_id
+       JOIN oauth_clients c ON c.client_id = ac.client_id AND c.tenant_id = p.tenant_id
+       WHERE ac.code_hash = ? AND ac.used = 0 AND ac.expires_at > ?
+         AND ac.client_id = ? AND ac.redirect_uri = ?
+         AND ac.code_challenge = ? AND ac.code_challenge_method = 'S256'`,
+    ).bind(codeHash, checkedAt, input.clientId, input.redirectUri, input.codeChallenge).first<{
       client_id: string; principal_id: string; redirect_uri: string; scope: string;
       code_challenge: string; code_challenge_method: string; expires_at: string;
+      tenant_id: string;
     }>();
-    if (!row) return null;
-    return {
-      code, client_id: row.client_id, principal_id: row.principal_id,
-      redirect_uri: row.redirect_uri, scope: row.scope,
-      code_challenge: row.code_challenge, code_challenge_method: row.code_challenge_method,
-      expires_at: Date.parse(row.expires_at), used: true,
+    if (!row) return { status: "invalid_grant" };
+
+    const access = randomToken("atk_");
+    const refresh = randomToken("rtk_");
+    const family = randomToken("fam_");
+    const expiresAt = Date.now() + ACCESS_TOKEN_TTL_MS;
+    const refreshExpiresAt = Date.now() + REFRESH_TOKEN_IDLE_TTL_MS;
+    const accessHash = await sha256Hex(access);
+    const refreshHash = await sha256Hex(refresh);
+    const createdAt = nowIso();
+    type BatchResult = { meta?: { changes?: number }; success?: boolean };
+
+    // The unique auth_code_hash binds exactly one token family to the code.
+    // D1 batch is transactional: if token persistence fails, the subsequent
+    // code-consumption update and the token insert both roll back.
+    let results: BatchResult[];
+    try {
+      results = await this.db.batch<BatchResult>([
+        this.db.prepare(
+          `INSERT INTO oauth_tokens
+           (access_token_hash, refresh_token_hash, client_id, principal_id, scope,
+            refresh_family, refresh_used, revoked, expires_at, refresh_expires_at,
+            created_at, auth_code_hash)
+           SELECT ?, ?, ac.client_id, ac.principal_id, ac.scope, ?, 0, 0, ?, ?, ?, ac.code_hash
+           FROM oauth_auth_codes ac
+           JOIN principals p ON p.id = ac.principal_id
+           JOIN oauth_clients c ON c.client_id = ac.client_id AND c.tenant_id = p.tenant_id
+           WHERE ac.code_hash = ? AND ac.used = 0 AND ac.expires_at > ?
+             AND ac.client_id = ? AND ac.redirect_uri = ?
+             AND ac.code_challenge = ? AND ac.code_challenge_method = 'S256'`,
+        ).bind(
+          accessHash, refreshHash, family, nowIso(expiresAt), nowIso(refreshExpiresAt), createdAt,
+          codeHash, checkedAt, input.clientId, input.redirectUri, input.codeChallenge,
+        ),
+        this.db.prepare(
+          `UPDATE oauth_auth_codes SET used = 1
+           WHERE code_hash = ? AND used = 0 AND expires_at > ?
+             AND client_id = ? AND redirect_uri = ?
+             AND code_challenge = ? AND code_challenge_method = 'S256'
+             AND EXISTS (
+               SELECT 1 FROM oauth_tokens
+               WHERE auth_code_hash = ? AND access_token_hash = ?
+             )`,
+        ).bind(
+          codeHash, checkedAt, input.clientId, input.redirectUri, input.codeChallenge,
+          codeHash, accessHash,
+        ),
+      ]);
+    } catch (error) {
+      // A concurrent winner may surface as a unique-index conflict on some D1
+      // adapters. Distinguish that from an actual storage failure without ever
+      // exposing the authorization code or verifier.
+      const winner = await this.db.prepare(
+        `SELECT 1 AS redeemed FROM oauth_tokens WHERE auth_code_hash = ?`,
+      ).bind(codeHash).first("redeemed");
+      if (winner) return { status: "invalid_grant" };
+      throw error;
+    }
+
+    const tokenInserted = Number(results[0]?.meta?.changes ?? 0) === 1;
+    const codeConsumed = Number(results[1]?.meta?.changes ?? 0) === 1;
+    if (!tokenInserted || !codeConsumed) return { status: "invalid_grant" };
+
+    const record: AuthCodeRecord = {
+      code: input.code,
+      client_id: row.client_id,
+      principal_id: row.principal_id,
+      redirect_uri: row.redirect_uri,
+      scope: row.scope,
+      code_challenge: row.code_challenge,
+      code_challenge_method: row.code_challenge_method,
+      expires_at: Date.parse(row.expires_at),
+      used: true,
     };
+    const token: TokenRecord = {
+      access_token: access,
+      refresh_token: refresh,
+      client_id: row.client_id,
+      scope: row.scope,
+      principal: row.principal_id,
+      expires_at: expiresAt,
+      refresh_expires_at: refreshExpiresAt,
+      revoked: false,
+      refresh_family: family,
+      refresh_used: false,
+      tenant_id: row.tenant_id,
+    };
+    return { status: "redeemed", record, token };
   }
 
   async issueTokens(
@@ -3386,13 +3550,14 @@ export class SqlStore implements ControlPlaneStore {
     };
   }
 
-  async putDeviceCode(rec: DeviceCodeRecord): Promise<void> {
+  async putDeviceCode(rec: DeviceCodeRecord): Promise<PutDeviceCodeResult> {
     const hash = await sha256Hex(rec.device_code);
-    await this.db
+    const result = await this.db
       .prepare(
         `INSERT INTO device_codes
          (device_code_hash, user_code, client_id, scope, verification_uri, interval_sec, expires_at, status, principal_id, last_polled_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_code) DO NOTHING`,
       )
       .bind(
         hash,
@@ -3408,6 +3573,12 @@ export class SqlStore implements ControlPlaneStore {
         nowIso(),
       )
       .run();
+    const changes = Number(
+      (result as { meta?: { changes?: number }; changes?: number }).meta?.changes
+        ?? (result as { changes?: number }).changes
+        ?? 0,
+    );
+    return changes >= 1 ? "created" : "user_code_collision";
   }
 
   async getDeviceCode(deviceCode: string): Promise<DeviceCodeRecord | null> {
@@ -5295,7 +5466,7 @@ export class SqlStore implements ControlPlaneStore {
   }
 
   /**
-   * Probe 0002–0008 tables, required columns (SELECT projections), and indexes
+   * Probe 0002–0017 tables, required columns (SELECT projections), and indexes
    * (sqlite_master). Compatible with D1 (no PRAGMA dependency).
    */
   async schemaReadiness(): Promise<SchemaReadiness> {

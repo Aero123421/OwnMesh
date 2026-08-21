@@ -262,6 +262,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
         // P1-D/P1-F: profile discovery canary — user-local bin dirs that exist
         // but are not searched mean installed CLIs appear not-installed.
         let profile_discovery = profile_discovery_health();
+        let credential_store = credential_store_health(&self.paths);
         let mut payload = system_diagnosis_payload(
             &observed_at,
             SystemDiagnosisFacts {
@@ -284,6 +285,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 op_journal_uncertain,
                 op_journal_degraded: self.op_journal_degraded.is_some(),
                 profile_discovery,
+                credential_store,
             },
         );
         if let Some(object) = payload.as_object_mut() {
@@ -3089,6 +3091,41 @@ struct SystemDiagnosisFacts {
     op_journal_uncertain: usize,
     op_journal_degraded: bool,
     profile_discovery: (&'static str, Vec<String>),
+    credential_store: (&'static str, Option<String>, usize),
+}
+
+fn credential_store_health(
+    paths: &ownmesh_config::OwnMeshPaths,
+) -> (&'static str, Option<String>, usize) {
+    let path = paths
+        .keystore_dir()
+        .join(ownmesh_identity::CREDENTIAL_STORE_DIAGNOSTIC_FILE);
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return ("unknown", None, 0);
+    };
+    if metadata.len() > 16 * 1024 {
+        return ("warn", None, 0);
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return ("warn", None, 0);
+    };
+    let Ok(snapshot) =
+        serde_json::from_slice::<ownmesh_identity::CredentialStoreDiagnosticSnapshot>(&bytes)
+    else {
+        return ("warn", None, 0);
+    };
+    if snapshot.schema_version != 1 {
+        return ("warn", None, 0);
+    }
+    let fallback = snapshot.backend_name.contains("encrypted-file")
+        || snapshot.degraded
+        || snapshot.cleanup_degraded
+        || snapshot.residual_fallback_entries > 0;
+    (
+        if fallback { "warn" } else { "ok" },
+        Some(snapshot.backend_name),
+        snapshot.residual_fallback_entries,
+    )
 }
 
 /// Profile-discovery health canary (P1-D/P1-F): runs official profile
@@ -3224,6 +3261,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "ok"
     };
     let (profile_status, profile_notes) = &facts.profile_discovery;
+    let (credential_store_status, credential_store_backend, residual_fallback_entries) =
+        &facts.credential_store;
     let overall = if facts.lockdown {
         "lockdown"
     } else if supervisor_state == "unavailable" {
@@ -3238,6 +3277,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "op_journal_uncertain"
     } else if facts.op_journal_in_progress > 0 {
         "op_journal_in_progress"
+    } else if *credential_store_status != "ok" {
+        "credential_store_issues"
     } else if *profile_status == "warn" {
         "profile_discovery_issues"
     } else if facts.stale_sessions > 0 {
@@ -3255,6 +3296,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         | "op_journal_pressure"
         | "op_journal_uncertain"
         | "op_journal_in_progress"
+        | "credential_store_issues"
         | "profile_discovery_issues" => "run_local_doctor",
         "stale_sessions" => "reconcile_stale_sessions",
         "workspace_selection_required" => "select_workspace",
@@ -3320,6 +3362,11 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "uncertain": facts.op_journal_uncertain,
                 "degraded": facts.op_journal_degraded,
             },
+        },
+        "credential_store": {
+            "status": credential_store_status,
+            "backend": credential_store_backend,
+            "residual_fallback_entries": residual_fallback_entries,
         },
         "profile_discovery": {
             "status": profile_status,
@@ -3422,6 +3469,7 @@ mod system_diagnosis_tests {
             op_journal_uncertain: 0,
             op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
+            credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
         };
         let cases = [
             (healthy_facts(), "healthy", "none"),
@@ -3463,7 +3511,8 @@ mod system_diagnosis_tests {
             assert_eq!(value["checks"].as_array().map(Vec::len), Some(5));
             let serialized = value.to_string();
             for forbidden in [
-                "credential",
+                "token",
+                "secret",
                 "command",
                 "argv",
                 "environment",
@@ -3501,6 +3550,7 @@ mod system_diagnosis_tests {
             op_journal_uncertain: 0,
             op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
+            credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
         };
 
         // Retained-expired transition records → fail, actionable.
@@ -3682,12 +3732,14 @@ mod system_diagnosis_tests {
             op_journal_uncertain: 0,
             op_journal_degraded: false,
             profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
+            credential_store: ("warn", Some("preferred(encrypted-file)".into()), 1),
         };
         let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
         let serialized = value.to_string();
         assert!(serialized.len() < 16 * 1024, "payload must stay bounded");
         for forbidden in [
-            "credential",
+            "token",
+            "secret",
             "command",
             "argv",
             "environment",
