@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v1.2.20 — TUI terminal-contract reliability
+
+- Ctrl+C is a universal emergency exit from every screen, overlay, wizard
+  step, and palette state; raw mode no longer swallows the interrupt gesture.
+  `q` remains the normal quit. Documented in the command bar and help text
+  across all four UI languages.
+- Terminal input failures (EOF, detached or broken TTY) end the interactive
+  loop as a controlled exit instead of an endless redraw-only idle loop, and
+  terminal restoration reports (and retries) partial cleanup failures instead
+  of a false success. Non-TTY invocations fail closed with usage guidance.
+- Mouse capture is disabled by default: captured clicks were discarded and
+  scroll events mutated unrelated list cursors while hijacking native
+  terminal selection (worst on macOS trackpads). Capture returns only with
+  functional mouse navigation.
+- List navigation is clamped to existing rows on every path (keyboard,
+  refresh shrink, screen transitions) and lists scroll to keep the selected
+  row visible via Ratatui stateful widgets; empty lists pin the cursor.
+
+See `docs/RELEASE_NOTES_v1.2.20.md` for details.
+
 ## v1.2.19 — ChatGPT MCP token refresh and control-plane version visibility
 
 - `/mcp` returns HTTP 401 with `WWW-Authenticate` (and JSON-RPC `-32001`) when
