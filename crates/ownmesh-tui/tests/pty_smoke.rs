@@ -37,6 +37,11 @@ const RESTORE_SCREEN_MARKER: &[u8] = b"\x1b[?1049l";
 
 struct TuiProcess {
     child: Box<dyn Child + Send + Sync>,
+    /// Held so the Windows-only `ConPTY` teardown test can close the master.
+    /// On POSIX this harness can neither observe nor usefully trigger a
+    /// master hangup (SIGHUP masks application handling), so the field is
+    /// intentionally unread there.
+    #[allow(dead_code)]
     master: Option<Box<dyn MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
     output: Arc<Mutex<Vec<u8>>>,
