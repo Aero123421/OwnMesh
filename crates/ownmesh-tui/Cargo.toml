@@ -51,3 +51,12 @@ unicode-width = "0.2.0"
 
 [dev-dependencies]
 tempfile = "3.15.0"
+
+# PTY smoke tests spawn the real binary behind a pseudo-terminal. The same
+# platform pins as ownmesh-session-host apply: see the comment there for why
+# Darwin needs 0.9 and Windows stays on 0.8.1.
+[target.'cfg(not(windows))'.dev-dependencies]
+portable-pty = "=0.9.0"
+
+[target.'cfg(windows)'.dev-dependencies]
+portable-pty = "=0.8.1"
