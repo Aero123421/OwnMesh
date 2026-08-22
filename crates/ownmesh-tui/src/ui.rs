@@ -13,7 +13,7 @@ use ownmesh_policy::AccessPreset;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use std::sync::LazyLock;
 
@@ -268,10 +268,10 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let text = if app.status_line.is_empty() {
         localized(
             app.lang,
-            "↑/↓ select · Enter open · Ctrl+K commands · ? help",
-            "↑/↓ 選択 · Enter 開く · Ctrl+K コマンド · ? ヘルプ",
-            "↑/↓ 选择 · Enter 打开 · Ctrl+K 命令 · ? 帮助",
-            "↑/↓ выбор · Enter открыть · Ctrl+K команды · ? помощь",
+            "↑/↓ select · Enter open · Ctrl+K commands · ? help · Ctrl+C exit",
+            "↑/↓ 選択 · Enter 開く · Ctrl+K コマンド · ? ヘルプ · Ctrl+C 終了",
+            "↑/↓ 选择 · Enter 打开 · Ctrl+K 命令 · ? 帮助 · Ctrl+C 退出",
+            "↑/↓ выбор · Enter открыть · Ctrl+K команды · ? помощь · Ctrl+C выход",
         )
         .to_owned()
     } else {
@@ -765,16 +765,38 @@ fn draw_workspaces(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
+/// Render `items` with the shared cursor kept in range and scrolled into
+/// view. A stateful widget recomputes the viewport offset each frame so the
+/// selected row is always visible (issue #135).
+fn render_list_with_cursor(
+    frame: &mut Frame<'_>,
+    items: Vec<ListItem<'_>>,
+    selected: usize,
+    area: Rect,
+) {
+    let mut state = ListState::default();
+    if let Some(last) = items.len().checked_sub(1) {
+        state.select(Some(selected.min(last)));
+    }
+    frame.render_stateful_widget(List::new(items), area, &mut state);
+}
+
 fn draw_list_screen(frame: &mut Frame<'_>, app: &App, area: Rect, items: Vec<String>, hint: &str) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(area);
+    // Highlight and viewport follow one pre-clamped selection so they can
+    // never disagree (#135).
+    let selected = items
+        .len()
+        .checked_sub(1)
+        .map_or(0, |last| app.list_cursor.min(last));
     let list_items: Vec<ListItem> = items
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let style = if i == app.list_cursor {
+            let style = if i == selected {
                 app.theme.selection
             } else {
                 app.theme.body
@@ -783,7 +805,7 @@ fn draw_list_screen(frame: &mut Frame<'_>, app: &App, area: Rect, items: Vec<Str
             ListItem::new(text).style(style)
         })
         .collect();
-    frame.render_widget(List::new(list_items), chunks[0]);
+    render_list_with_cursor(frame, list_items, selected, chunks[0]);
     frame.render_widget(
         Paragraph::new(hint)
             .style(app.theme.muted)
@@ -807,17 +829,20 @@ fn draw_approvals(frame: &mut Frame<'_>, app: &App, area: Rect) {
             chunks[0],
         );
     } else {
+        let selected = app
+            .approval_cursor
+            .min(app.approvals.len().saturating_sub(1));
         let items: Vec<ListItem> = app
             .approvals
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let mark = if i == app.approval_cursor { ">" } else { " " };
+                let mark = if i == selected { ">" } else { " " };
                 let line = format!(
                     "{mark} [{}] {} · {} — {}",
                     a.state, a.id, a.capability, a.reason
                 );
-                let style = if i == app.approval_cursor {
+                let style = if i == selected {
                     app.theme.selection
                 } else if a.state == "pending" {
                     app.theme.warn
@@ -831,7 +856,7 @@ fn draw_approvals(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .style(style)
             })
             .collect();
-        frame.render_widget(List::new(items), chunks[0]);
+        render_list_with_cursor(frame, items, selected, chunks[0]);
     }
     frame.render_widget(
         Paragraph::new(t(app.lang, Msg::ApprovalsHint)).style(app.theme.muted),
@@ -1269,11 +1294,15 @@ fn draw_palette(frame: &mut Frame<'_>, app: &App) {
         chunks[0],
     );
 
+    let selected = items
+        .len()
+        .checked_sub(1)
+        .map_or(0, |last| app.palette.cursor.min(last));
     let list_items: Vec<ListItem> = items
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let style = if i == app.palette.cursor {
+            let style = if i == selected {
                 app.theme.selection
             } else {
                 app.theme.body
@@ -1285,7 +1314,7 @@ fn draw_palette(frame: &mut Frame<'_>, app: &App) {
             .style(style)
         })
         .collect();
-    frame.render_widget(List::new(list_items), chunks[1]);
+    render_list_with_cursor(frame, list_items, selected, chunks[1]);
     frame.render_widget(
         Paragraph::new(t(app.lang, Msg::PaletteHint)).style(app.theme.muted),
         chunks[2],
@@ -1449,6 +1478,67 @@ mod tests {
             snap.to_ascii_lowercase().contains("setup")
                 || snap.contains("Wizard")
                 || snap.contains("Configure")
+        );
+    }
+
+    #[test]
+    fn long_sessions_list_scrolls_selection_into_view() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Sessions;
+        app.set_sessions_from_json(&serde_json::json!({
+            "sessions": (0..40)
+                .map(|i| serde_json::json!({ "id": format!("s{i:02}"), "state": "active" }))
+                .collect::<Vec<_>>()
+        }));
+        for _ in 0..39 {
+            app.move_list_cursor(1);
+        }
+        assert_eq!(app.list_cursor, 39);
+        let snap = render_snapshot(&app, MIN_COLS, MIN_ROWS);
+        assert!(
+            snap.contains("s39"),
+            "selected row must scroll into view:\n{snap}"
+        );
+        assert!(
+            !snap.contains("s00"),
+            "rows above the viewport must be scrolled away:\n{snap}"
+        );
+
+        // Moving back up brings the top rows into view again.
+        for _ in 0..39 {
+            app.move_list_cursor(-1);
+        }
+        assert_eq!(app.list_cursor, 0);
+        let snap = render_snapshot(&app, MIN_COLS, MIN_ROWS);
+        assert!(snap.contains("s00"), "first row visible again:\n{snap}");
+        assert!(!snap.contains("s39"), "bottom row scrolled away:\n{snap}");
+    }
+
+    #[test]
+    fn long_approval_queue_scrolls_selection_into_view() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Approvals;
+        app.set_approvals_from_json(&serde_json::json!({
+            "approvals": (0..30)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("ap-{i:02}"),
+                        "capability": "fs.read",
+                        "state": "pending",
+                        "reason": "check"
+                    })
+                })
+                .collect::<Vec<_>>()
+        }));
+        app.approval_cursor = 29;
+        let snap = render_snapshot(&app, MIN_COLS, MIN_ROWS);
+        assert!(
+            snap.contains("ap-29"),
+            "selected approval must scroll into view:\n{snap}"
+        );
+        assert!(
+            !snap.contains("ap-00"),
+            "approvals above the viewport must be scrolled away:\n{snap}"
         );
     }
 
