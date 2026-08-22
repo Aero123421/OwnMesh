@@ -1,13 +1,19 @@
-//! PTY smoke tests for the interactive TUI lifecycle.
+//! Terminal-lifecycle smoke tests for the interactive TUI.
 //!
-//! These spawn the real `ownmesh-tui` binary behind a pseudo-terminal and
-//! verify terminal-state contracts that unit tests cannot reach:
+//! These spawn the real `ownmesh-tui` binary and verify terminal-state
+//! contracts that unit tests cannot reach:
 //!
-//! - Ctrl+C exits promptly from the dashboard with a successful status
-//!   (issue #136: raw mode swallows the usual SIGINT gesture).
-//! - Closing the controlling PTY terminates the loop instead of leaving a
-//!   redraw-only zombie (issue #137: poll/read errors must be a controlled
-//!   exit).
+//! - Ctrl+C exits promptly from the dashboard with a successful status and a
+//!   restored terminal (issue #136: raw mode swallows the usual SIGINT
+//!   gesture).
+//! - Non-interactive invocations without stdin/stdout TTYs fail closed with
+//!   usage guidance instead of starting the UI (issue #137).
+//! - On Windows/ConPTY, closing the controlling pseudoconsole terminates the
+//!   loop promptly (issue #137 read-error branch). This is POSIX-skipped:
+//!   there the kernel raises SIGHUP on master close, which terminates the
+//!   child regardless of application handling, so the assertion cannot
+//!   distinguish the controlled-exit path; the duplicated reader fd also
+//!   keeps the pty alive in this harness.
 //!
 //! The platform pins mirror `ownmesh-session-host`: Darwin teardown needs
 //! portable-pty 0.9, Windows stays on 0.8.1 (`ConPTY` cursor handshake).
@@ -16,6 +22,7 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -169,20 +176,39 @@ fn ctrl_c_exits_promptly_from_the_dashboard() {
 }
 
 #[test]
-fn closing_the_controlling_pty_terminates_the_loop() {
+fn non_tty_invocation_fails_closed_with_usage_guidance() {
+    // stdin/stdout are pipes here, not terminals: the TUI must refuse to
+    // start instead of entering raw mode against a dead surface (#137).
+    let output = Command::new(env!("CARGO_BIN_EXE_ownmesh-tui"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn ownmesh-tui with piped stdio");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected UsageConfig refusal; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires an interactive terminal"),
+        "refusal must explain the TTY requirement: {stderr}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn closing_the_controlling_conpty_terminates_the_loop() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut tui = spawn_tui(dir.path());
     wait_until_drawn(&tui);
 
-    // Drop the input side and then the master: poll/read must fail and the
-    // interactive loop must end instead of spinning forever (#137).
-    //
-    // Caveat: on POSIX, closing the master raises SIGHUP to the child's
-    // foreground process group, so termination there may come from the signal
-    // rather than the poll/read error path. Windows/ConPTY genuinely
-    // exercises the controlled-exit branch. This test pins the user-visible
-    // contract (no redraw-only zombie) on every platform; exit status is
-    // intentionally not asserted.
+    // Drop the input side and then the master: the console session ends and
+    // poll/read fail, so the interactive loop must end instead of spinning
+    // forever (#137). Exit status is intentionally not asserted: teardown may
+    // surface as either a clean error exit or console-host termination.
     tui.writer.take();
     drop(tui.master.take());
 
