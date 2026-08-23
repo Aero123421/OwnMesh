@@ -1,55 +1,30 @@
 # OwnMesh
 
-> **Any AI. Any CLI. Any machine. Your cloud.**
+OwnMesh lets AI clients such as ChatGPT use your Windows, macOS, and Linux
+machines. It is self-hosted end to end: an open-source agent runs on each
+device, and the control plane is a Cloudflare Worker you deploy into your own
+Cloudflare account. There is no vendor-hosted service, no telemetry, no
+phone-home.
 
-OwnMesh is a self-hosted, open-source capability runtime. ChatGPT and other MCP
-clients can use your Windows, macOS, and Linux machines through a control plane
-deployed in your own Cloudflare account.
+OwnMesh is not an AI orchestrator or a remote desktop. The local agent runs as
+your normal user; privileged work is opt-in and handled by a separate broker
+process with no network access.
 
-OwnMesh is not an AI orchestrator and does not require a vendor-hosted OwnMesh
-account. The local agent stays under your user account; an optional, separate,
-networkless broker handles explicitly approved privileged work.
+## What you get
 
-## Status
-
-**v1.2.16 stable** — Apache-2.0 monorepo (Rust workspace + Cloudflare Worker).
-
-The shipped CLI surface has no intentionally unimplemented entries. Its
-machine-checked contract is
-[`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json).
-“Complete” refers to that admitted product surface, not every aspirational item
-in the full specification or every optional native package/signing format.
-
-### What is included
-
-- One-command setup for desktop and headless/SSH machines, read-only `doctor`,
-  user-level service management, and the bundled dark terminal UI.
-- ChatGPT-compatible MCP OAuth with dynamic client registration, rotating
-  refresh tokens, built-in single-owner passkey login, and exact callback
-  validation.
-- Device enroll/list/show/rename/labels/key rotation/revoke.
-- Local and authenticated remote execution plus session creation. Remote
-  requests require explicit idempotency and never fall back to local execution.
-- Approved commands bind the exact invocation entry, backing executable,
-  classification, and `argv[0]`; executable drift fails closed before spawn.
-- Nine structured AI CLI profiles, persistent profile sessions, and profile
-  scan/list/show/login/test/start/resume commands.
-- Approval list/show/watch and typed approve/deny operations.
-- Policy inspection, presets, and structured rule mutation; lockdown/unlock and
-  token revocation.
-- Fresh-passkey authorization for sensitive admin mutations. Decisions are
-  bound to the exact operation and are consumed exactly once.
-- Authenticated, resumable, bounded device-to-device transfer with explicit
-  plan/send/list/status/cancel commands. Destination replace requires
-  `overwrite_expected_sha256`; there is no blind overwrite/force fallback.
-- `ownmesh mcp serve --stdio`, a bounded JSONL bridge that uses the configured
-  issuer and OS credential store without printing secrets or diagnostics to
-  stdout.
+- **ChatGPT as a client, out of the box.** OwnMesh exposes an MCP endpoint
+  with OAuth, dynamic client registration, and passkey login for the owner.
+- **Multi-device operation.** Enroll devices from the CLI or the built-in
+  terminal UI, then run commands, read and write approved paths, query logs,
+  open interactive sessions, and transfer files between machines.
+- **A policy you control.** Every request passes your allow/ask/deny rules.
+  Sensitive actions (approvals, policy changes, unlock) additionally require a
+  fresh passkey decision bound to exactly that operation.
+- **Honest state everywhere.** What the UI reports is what was verified; the
+  shipped CLI surface is machine-checked in
+  [`release/SUPPORTED_SURFACES.json`](./release/SUPPORTED_SURFACES.json).
 
 ## Install
-
-The normal installer verifies the release signature and checksums before
-installing binaries.
 
 Linux or macOS:
 
@@ -63,76 +38,58 @@ Windows PowerShell:
 $p="$env:TEMP\ownmesh-installer.ps1"; Invoke-WebRequest https://github.com/Aero123421/OwnMesh/releases/latest/download/ownmesh-installer.ps1 -OutFile $p; powershell -NoProfile -ExecutionPolicy Bypass -File $p
 ```
 
-On macOS the one-line install needs [Homebrew](https://brew.sh) so it can obtain
-`minisign` for signature verification. Install `minisign` yourself (or point
-`OWNMESH_MINISIGN` at an existing binary) to skip that dependency. On Linux the
-installer bootstraps a pinned, hash-checked `minisign` when none is present.
+Both installers verify the release signature and checksums before they touch
+your system. On macOS the one-liner uses Homebrew to fetch `minisign` for the
+signature check (install `minisign` yourself, or point `OWNMESH_MINISIGN` at
+an existing binary, to skip that). On Linux a pinned, hash-checked `minisign`
+is bootstrapped when none is present.
 
-For offline-verifiable bootstrap, download `ownmesh-installer.sh` or
-`ownmesh-installer.ps1` together with `SHA256SUMS` and `SHA256SUMS.minisig`,
-then verify the signature and installer checksum before execution.
+Prefer to verify by hand? Download the installer together with `SHA256SUMS`
+and `SHA256SUMS.minisig`, check the signature and checksum, then run it.
 
-Take the public key **out of band**, not from the release you are verifying —
-a release asset cannot vouch for itself. Use
-[`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub) from a
-repository clone, and confirm it is key ID `C596813EFB0946A4`. The same key is
-compiled into the installers and into `ownmesh update`, so all three agree on
-one trust root. `minisign.pub` is published alongside each release only as a
-convenience for readers who already know the key ID.
+Take the public key from a repository clone — not from the release you are
+verifying, since a release cannot vouch for itself:
+[`docs/release-keys/minisign.pub`](./docs/release-keys/minisign.pub), key ID
+`C596813EFB0946A4`. The same key is compiled into the installers and into
+`ownmesh update`, so all three agree on one trust root.
 
-The installers also enforce archive entry/size limits, an exact file allowlist,
-and reject traversal, links, devices, and duplicate members. When upgrading an
-existing portable install, they quiesce the exact installed OwnMesh processes,
-restart a previously running service, verify its version, and restore the old
-binaries if post-install health fails.
-
-After the first installation, update Windows, macOS, or Linux with one command:
+After the first install, updates are one command on every platform:
 
 ```bash
 ownmesh update
 ```
 
-It verifies the same signed release chain, drains sessions, stops and restores
-the user service, atomically replaces all five binaries, verifies the new CLI
-and daemon versions, and rolls back on failure. On Windows the update continues
-in a private detached worker, so the installed executable does not lock itself.
-Use `ownmesh update status` to inspect an in-progress or completed transaction.
-Homebrew-managed installations continue to use `brew upgrade ownmesh`.
+It re-verifies the signed release chain, drains sessions, replaces all five
+binaries atomically, restarts your service, verifies the new versions, and
+rolls back if anything fails. `ownmesh update status` shows progress.
+Homebrew-managed installs keep using `brew upgrade ownmesh`.
 
-## First run
+## Setup
 
 ### 1. Deploy your control plane
 
-Every later step needs its URL, so this comes first. From a clone:
+Everything else needs its URL, so start here:
 
 ```bash
 cd packages/control-plane && corepack enable && pnpm install --frozen-lockfile && pnpm run deploy:guided
 ```
 
-The guided deploy creates or reuses D1, applies migrations, deploys the Worker,
-provisions required secrets, and prints the owner-login URL, the ChatGPT MCP
-URL, and the exact `ownmesh setup` command for step 2. See
-[`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md) and
+The guided deploy creates or reuses D1, applies migrations, deploys the
+Worker, provisions secrets, and prints the owner-login URL, the ChatGPT MCP
+URL, and the exact `ownmesh setup` command for the next step.
+Details: [`docs/deploy-cloudflare.md`](./docs/deploy-cloudflare.md),
 [`docs/chatgpt-connection.md`](./docs/chatgpt-connection.md).
 
 ### 2. Connect a machine
 
-Desktop: launch the TUI and choose **Finish setup**. It asks for the Worker URL
-and policy, then performs sign-in, device enrollment, and Agent startup without
-making you assemble a long command:
+Desktop: launch the TUI and choose **Finish setup**.
 
 ```bash
 ownmesh
 ```
 
-The direct CLI equivalent is:
-
-```bash
-ownmesh setup --control-plane-url https://your-worker.example --quickstart
-```
-
-SSH or Ubuntu Server (prints a URL and short code for approval on another
-device). The same URL + code flow is also used by the TUI over SSH:
+SSH or headless servers print a URL and short code that you approve on
+another device:
 
 ```bash
 ownmesh setup --control-plane-url https://your-worker.example --quickstart --device-login --non-interactive --force
@@ -140,7 +97,7 @@ ownmesh setup --control-plane-url https://your-worker.example --quickstart --dev
 
 ### 3. Verify
 
-Read-only; changes nothing. Add `--check-network` to also probe the control
+Read-only; change nothing. Add `--check-network` to also probe the control
 plane's `/health`:
 
 ```bash
@@ -149,46 +106,48 @@ ownmesh doctor --json
 
 ## Security model
 
-- The control plane belongs to the user; there is no mandatory central SaaS.
-- Telemetry, cloud relay, and automatic update network checks are off by default.
-- Files, command output, and logs remain local unless a requested operation
-  explicitly transfers data.
-- OAuth/device credentials live in the operating-system credential store, not
-  `config.toml`.
-- Sensitive admin actions are typed; there is no generic method/parameter
-  passthrough. A same-user local socket is not treated as human presence.
-- The normal `ownmeshd` service is always user-level. The optional privileged
-  broker has no network access.
-- Full Access has no hidden hard deny, while every selected policy still applies
-  its documented allow/ask/deny behavior.
-
-Optional privileged execution is enabled separately:
+- You own the control plane. There is no mandatory central service.
+- Telemetry, cloud file relay, and automatic update checks are off by
+  default. Files, command output, and logs stay local unless an operation
+  explicitly moves them.
+- Credentials live in the OS credential store, not in `config.toml`.
+- Admin actions are typed operations, never generic method/parameter
+  passthrough. A same-user local socket does not count as human presence.
+- `ownmeshd` always runs as your user. The optional privileged broker has no
+  network access and is installed separately:
 
 ```bash
 sudo ownmesh privileged install && ownmesh service install
 ```
 
-On Windows, run `ownmesh privileged install` in an Administrator PowerShell,
-then run `ownmesh service install` as the normal user.
+(On Windows, run the first command in an Administrator PowerShell, then the
+second as the normal user.)
 
-## Platform and integration evidence
+- Full Access has no hidden hard deny. Whichever policy you choose still
+  applies its documented allow/ask/deny behavior.
 
-Portable archives are produced for Windows x64, macOS arm64/x64, and Linux musl
-arm64/x64 with LICENSE/NOTICE/release notes, CycloneDX SBOMs, SHA-256 checksums,
-mandatory minisign signature, and GitHub build provenance.
+## Release assurance, and what is still open
 
-The networkless privileged-broker lifecycle is implemented on Linux, macOS, and
-Windows. Linux has a native root lifecycle receipt. macOS/Windows native release
-receipts and the full public MCP → installed agent → broker E8 receipt remain
-open evidence; this is not presented as live proof for those routes.
-Authenticode, Apple notarization, MSI/NSIS, and native macOS packages are not
-part of v1.2.16.
+Releases ship as portable archives for Windows x64, macOS arm64/x64, and
+Linux musl arm64/x64, each with SHA-256 checksums, a mandatory minisign
+signature, CycloneDX SBOMs, and GitHub build provenance.
 
-ChatGPT dynamic registration, OAuth, passkey return, refresh, and MCP linking
-have a manual live compatibility receipt. The local workerd suites are
-reproducible; a fully automated external ChatGPT E10 receipt remains open.
+Things we have verified vs. things still pending:
 
-## Development gates
+- The networkless privileged-broker lifecycle is implemented on all three
+  operating systems. Linux has a native root receipt; macOS/Windows native
+  receipts and the full MCP → agent → broker receipt are still open evidence,
+  and we do not claim them as proven.
+- ChatGPT dynamic registration, OAuth, passkey return, refresh, and MCP
+  linking have a manual live compatibility receipt; fully automated external
+  verification is still pending.
+- Authenticode, Apple notarization, MSI/NSIS, and native macOS packages are
+  not part of this release train.
+
+## Development
+
+Rust 1.92, Node 22, and pnpm 9.15.0 are pinned by the repository. The quality
+gates:
 
 ```bash
 cargo fmt --all --check
@@ -201,7 +160,7 @@ pnpm -r typecheck
 pnpm -r lint
 ```
 
-Rust 1.92.0, Node 22, and pnpm 9.15.0 are pinned by the repository.
+See [CONTRIBUTING](./CONTRIBUTING.md) for setup and PR expectations.
 
 ## Documentation
 
@@ -212,7 +171,7 @@ Rust 1.92.0, Node 22, and pnpm 9.15.0 are pinned by the repository.
 - [ChatGPT connection](./docs/chatgpt-connection.md)
 - [Threat model](./docs/THREAT_MODEL.md)
 - [Roadmap](./docs/ROADMAP.md) — what is planned next, and what is not
-- [v1.2.16 release notes](./docs/RELEASE_NOTES_v1.2.16.md)
+- [v1.2.20 release notes](./docs/RELEASE_NOTES_v1.2.20.md)
 - [Target specification](./OWNMESH_SPECIFICATION.ja.md) — roadmap authority,
   not a claim that every optional target is shipped
 
