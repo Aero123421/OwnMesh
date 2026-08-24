@@ -969,7 +969,9 @@ fn draw_help_modal(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_connector_modal(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_fixed(frame.area(), 76, 16);
+    // Linux gains a linger-disclosure line (#143); keep the modal tall enough.
+    let height = if cfg!(target_os = "linux") { 18 } else { 16 };
+    let area = centered_fixed(frame.area(), 76, height);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -993,7 +995,25 @@ fn draw_connector_modal(frame: &mut Frame<'_>, app: &App) {
         "请先完成设置",
         "Сначала завершите настройку",
     ));
-    let lines = vec![
+    let linger_note: Option<Line<'_>> = if cfg!(target_os = "linux") {
+        Some(Line::from(Span::styled(
+            localized(
+                app.lang,
+                "Linux: the agent stops at logout unless you enable lingering \
+                 (loginctl enable-linger $USER).",
+                "Linux: ログアウトでエージェントが停止します。常時オンにするには自分で \
+                 lingeringを有効化してください (loginctl enable-linger $USER)。",
+                "Linux：注销后代理会停止；如需保持在线，请自行启用 lingering \
+                 (loginctl enable-linger $USER)。",
+                "Linux: агент останавливается при выходе из системы; для постоянной работы \
+                 включите lingering (loginctl enable-linger $USER).",
+            ),
+            app.theme.muted,
+        )))
+    } else {
+        None
+    };
+    let mut lines = vec![
         Line::from(localized(
             app.lang,
             "Add OwnMesh in ChatGPT. This is separate from enrolling this PC.",
@@ -1020,17 +1040,21 @@ fn draw_connector_modal(frame: &mut Frame<'_>, app: &App) {
             "2. Вставьте MCP URL, выберите OAuth и войдите.",
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            localized(
-                app.lang,
-                "Esc / Enter  close",
-                "Esc / Enter  閉じる",
-                "Esc / Enter  关闭",
-                "Esc / Enter  закрыть",
-            ),
-            app.theme.muted,
-        )),
     ];
+    if let Some(note) = linger_note {
+        lines.push(note);
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        localized(
+            app.lang,
+            "Esc / Enter  close",
+            "Esc / Enter  閉じる",
+            "Esc / Enter  关闭",
+            "Esc / Enter  закрыть",
+        ),
+        app.theme.muted,
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 

@@ -381,7 +381,9 @@ fn run_uninstall(
             unit_path: None,
             message: Some(e),
             hardening: None,
+            linger: None,
         });
+
         let value = json!({
             "schema_version": 1,
             "ok": true,

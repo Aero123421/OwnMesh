@@ -232,7 +232,7 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 | ChatGPT reports 502 after idle | New chat, then re-consent if 401 refresh still fails. `GET /mcp` with `Accept: text/event-stream` is 405 by design (no long-lived SSE on Workers) |
 | CLI vs Worker version skew | `ownmesh doctor --check-network` warns when `/health` version does not match the CLI |
 | `insufficient_scope` | Re-consent with required scopes |
-| `device_offline` | `ownmeshd run`, enrollment, `/agent/connect` WebSocket |
+| `device_offline` | `ownmeshd run`, enrollment, `/agent/connect` WebSocket. On Linux, also check lingering: without it (`loginctl show-user $USER -p Linger` → `Linger=no`) the agent stops at GUI logout and the device goes offline until you log in again (`ownmesh doctor` warns). A hung reconnect on a dual-stack host with a blackholed IPv6 route is another known cause; the bounded connect timeout (v1.2.21+) retries with an IPv4 fallback instead of hanging forever |
 | Stuck `approval_required` | TUI/CLI/browser approve; then `ownmesh_get_operation` |
 | Write works in ChatGPT UI but file missing | ChatGPT confirm ≠ OwnMesh approve |
 | Unexpected allow | Verify preset is not `full_access` by mistake |

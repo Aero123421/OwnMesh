@@ -733,11 +733,19 @@ fn observe_profile_discovery() -> ownmesh_diagnostics::ProfileDiscoveryObservati
                 full_dirs.push(dir.clone());
             }
         }
-        // Existing user-local bin dirs that are absent from PATH.
+        // Existing user-local bin dirs that are absent from PATH. Home is
+        // collapsed to `~` so the disclosure matches the resolver's own
+        // labels (#145).
+        let home_path = std::path::PathBuf::from(&home);
         for dir in &user_dirs {
             if dir.is_dir() && !system_dirs.contains(dir) {
-                obs.existing_dirs_not_searched
-                    .push(dir.display().to_string());
+                let label = match dir.strip_prefix(&home_path) {
+                    Ok(stripped) if !stripped.as_os_str().is_empty() => {
+                        format!("~/{}", stripped.display())
+                    }
+                    _ => dir.display().to_string(),
+                };
+                obs.existing_dirs_not_searched.push(label);
             }
         }
         // Official profiles that resolve only through the full search.
@@ -778,6 +786,7 @@ fn observe_service() -> ServiceObservation {
             unit_path: None,
             message: Some(err),
             hardening: None,
+            linger: None,
         },
     }
 }
@@ -790,6 +799,7 @@ fn service_obs_from_snapshot(snap: &ServiceStatusSnapshot) -> ServiceObservation
         running: snap.running,
         unit_path: snap.unit_path.clone(),
         message: snap.message.clone(),
+        linger: snap.linger,
         hardening: snap.hardening.as_ref().map(|h| {
             ownmesh_diagnostics::ServiceHardeningObservation {
                 no_new_privileges: h.no_new_privileges,
@@ -1172,6 +1182,7 @@ mod tests {
             unit_path: None,
             message: None,
             hardening: None,
+            linger: None,
         };
         merge_daemon_service_status(&daemon, &mut unknown);
         assert_eq!(unknown.running, Some(true));

@@ -111,6 +111,9 @@ fn base_input() -> DoctorInput {
             unit_path: None,
             message: None,
             hardening: None,
+            // Non-Linux/undetectable in the base fixture; linger-specific
+            // rows are covered by dedicated tests below.
+            linger: None,
         },
         journals: JournalsObservation::default(),
         profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
@@ -173,6 +176,62 @@ fn online_agent_route_passes_and_absent_route_is_omitted() {
             .any(|check| check.id == "daemon.agent_route"),
         "unknown route must not fabricate a check"
     );
+}
+
+/// #143: Linger=no on an otherwise ready device is a warn that names the
+/// operator command; OwnMesh never enables lingering itself.
+#[test]
+fn linux_linger_off_warns_without_enabling_anything() {
+    let mut input = base_input();
+    input.service.linger = Some(false);
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.linger")
+        .expect("linger=no must be disclosed");
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(check.message.contains("loginctl enable-linger"));
+    // The warn lifts the outcome to Warn (still exit-ok, never healthy).
+    assert!(report.outcome == DoctorOutcome::Warn);
+
+    let mut lingering = base_input();
+    lingering.service.linger = Some(true);
+    let report = run_doctor(&lingering);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.linger")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass);
+}
+
+/// #144: a fully-baselined hardening unit still discloses that
+/// RestrictNamespaces=yes blocks containers/sandbox tools.
+#[test]
+fn baseline_hardening_pass_discloses_namespace_restriction() {
+    let mut input = base_input();
+    let hardening = ownmesh_diagnostics::ServiceHardeningObservation {
+        no_new_privileges: true,
+        umask_set: true,
+        restrict_suidsgid: true,
+        restrict_realtime: true,
+        lock_personality: true,
+        system_call_architectures: true,
+        restrict_namespaces: true,
+        protect_proc: true,
+        ..Default::default()
+    };
+    input.service.hardening = Some(hardening);
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.hardening")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass);
+    assert!(check.message.contains("RestrictNamespaces=yes"));
+    assert!(check.message.contains("RestrictNamespaces=no"));
 }
 
 #[test]

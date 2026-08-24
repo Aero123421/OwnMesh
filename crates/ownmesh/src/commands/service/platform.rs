@@ -287,6 +287,9 @@ pub struct ServiceStatusSnapshot {
     /// Effective service hardening disclosure (Linux systemd --user units):
     /// `None` on platforms without a unit-file model.
     pub hardening: Option<ServiceHardening>,
+    /// Linux only: `loginctl show-user` linger state (#143). `None` on other
+    /// platforms or when `loginctl` is unavailable — never a keychain read.
+    pub linger: Option<bool>,
 }
 
 /// Effective hardening of an installed systemd --user unit, read read-only
@@ -646,6 +649,7 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
                 unit_path: Some(unit.display().to_string()),
                 message: None,
                 hardening: observe_unit_hardening_isolated(&unit),
+                linger: None,
             });
         }
         #[cfg(windows)]
@@ -670,6 +674,7 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
                 unit_path: None,
                 message: Some("user-level service unsupported on this OS".into()),
                 hardening: None,
+                linger: None,
             })
         }
     }
@@ -1148,6 +1153,7 @@ fn probe_windows<R: ProcessRunner + ?Sized>(runner: &R) -> Result<ServiceStatusS
         unit_path: Some(format!("task:{SERVICE_TASK_NAME}")),
         message: Some("scheduled task not found".into()),
         hardening: None,
+        linger: None,
     })
 }
 
@@ -1187,6 +1193,7 @@ fn probe_windows_named<R: ProcessRunner + ?Sized>(
         unit_path: Some(format!("task:{task}")),
         message: None,
         hardening: None,
+        linger: None,
     })
 }
 
@@ -1354,6 +1361,7 @@ fn probe_macos(runner: &impl ProcessRunner) -> Result<ServiceStatusSnapshot, Str
         unit_path: Some(plist_path.display().to_string()),
         message: None,
         hardening: None,
+        linger: None,
     })
 }
 
@@ -1412,6 +1420,38 @@ fn uninstall_linux(runner: &impl ProcessRunner) -> Result<(), String> {
     Ok(())
 }
 
+/// Read-only linger observation for the current user (#143). `loginctl
+/// show-user <uid> -p Linger` answers `Linger=yes|no`; any failure
+/// (missing `loginctl`, container, non-systemd) yields `None` so doctor can
+/// omit the check instead of guessing. Metadata only: never reads the
+/// keychain and never enables lingering.
+#[cfg(target_os = "linux")]
+fn observe_linger(runner: &impl ProcessRunner) -> Option<bool> {
+    let uid = std::env::var("UID")
+        .ok()
+        .filter(|value| value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty())
+        .or_else(|| {
+            // Fallback when UID is unset (rare outside shells): derive from
+            // the numeric user id via `id -u`.
+            runner
+                .run("id", &["-u"])
+                .map(|out| out.stdout.trim().to_owned())
+                .ok()
+                .filter(|value| value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty())
+        })?;
+    let output = runner
+        .run("loginctl", &["show-user", &uid, "--property=Linger"])
+        .ok()?;
+    if !output.success() {
+        return None;
+    }
+    match output.stdout.trim() {
+        "Linger=yes" => Some(true),
+        "Linger=no" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn probe_linux(runner: &impl ProcessRunner) -> Result<ServiceStatusSnapshot, String> {
     let unit_path = systemd_user_unit_path()?;
@@ -1446,6 +1486,7 @@ fn probe_linux(runner: &impl ProcessRunner) -> Result<ServiceStatusSnapshot, Str
         // loaded unit (base + drop-ins + defaults), falling back to the
         // section-validated static file analysis when systemd is unavailable.
         hardening: observe_unit_hardening_effective(runner, &unit_path),
+        linger: observe_linger(runner),
     })
 }
 

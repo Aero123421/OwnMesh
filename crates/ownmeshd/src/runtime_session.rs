@@ -597,9 +597,10 @@ arguments so the exact argv can be launched",
                         return Err(IpcError::Remote {
                             code: app_error::INVALID_PARAMS,
                             message: format!(
-                                "program `{}` could not be resolved to a launchable executable \
-(check PATH and user-local CLI dirs); install it or use an explicit path",
-                                argv[0]
+                                "program `{}` could not be resolved to a launchable executable; \
+install it or use an explicit path. {}",
+                                argv[0],
+                                ownmesh_exec::searched_dirs_note()
                             ),
                         });
                     }

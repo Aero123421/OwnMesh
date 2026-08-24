@@ -1032,6 +1032,28 @@ pub fn spawn_pty(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String> 
     }
 }
 
+/// PTY spawn failures must stay honest about likely systemd hardening causes
+/// (#144): on Linux the shipped `--user` unit sets `RestrictNamespaces=yes`,
+/// so programs that create namespaces at startup fail with an opaque EPERM.
+/// Name the directive and the documented operator drop-in; the default stays
+/// fail-closed.
+fn annotate_pty_spawn_error(stage: &str, error: &dyn std::fmt::Display) -> String {
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if cfg!(target_os = "linux") && (lower.contains("permission denied") || lower.contains("eperm"))
+    {
+        format!(
+            "{stage}: {detail}. This can happen when the program creates Linux namespaces \
+(containers, sandbox tools, unshare) while the ownmeshd service unit sets \
+`RestrictNamespaces=yes`. The default stays fail-closed; a local drop-in setting \
+`RestrictNamespaces=no` (`systemctl --user edit ownmesh-ownmeshd.service`) allows namespaces \
+for this device — `ownmesh doctor` discloses the effective unit"
+        )
+    } else {
+        format!("{stage}: {detail}")
+    }
+}
+
 fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String> {
     let system = native_pty_system();
     let pair = system
@@ -1066,7 +1088,7 @@ fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String>
     let child = pair
         .slave
         .spawn_command(builder)
-        .map_err(|e| format!("spawn: {e}"))?;
+        .map_err(|e| annotate_pty_spawn_error("spawn", &e))?;
     drop(pair.slave);
 
     let pid = child.process_id();
@@ -1145,7 +1167,7 @@ fn spawn_live_portable(cmd: &PtyCommand, size: PtySize) -> Result<LiveHost, Stri
     let child = pair
         .slave
         .spawn_command(builder)
-        .map_err(|e| format!("spawn: {e}"))?;
+        .map_err(|e| annotate_pty_spawn_error("spawn", &e))?;
     drop(pair.slave);
 
     let pid = child.process_id();
