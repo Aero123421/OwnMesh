@@ -695,6 +695,9 @@ pub fn user_cli_search_dirs(home: Option<&Path>) -> Vec<PathBuf> {
 #[must_use]
 pub fn spawn_search_dir_labels() -> Vec<String> {
     let mut labels: Vec<String> = Vec::new();
+    // `dirs` is extended with the user-local extras on Unix only; Windows
+    // keeps the inherited user PATH, so the mut is unused there.
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut dirs: Vec<PathBuf> =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
     #[cfg(not(windows))]
