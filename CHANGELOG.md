@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## v1.2.21 — Transport availability, journal honesty, and Linux disclosure
+
+- Agent and transfer WebSocket connects are bounded (15 s) with RFC 8305-style
+  family interleaving and IPv4 fallback; a blackholed AAAA can no longer park a
+  reconnect forever (#140). `connect_timeout` is a typed reconnect category.
+- Terminal operation failures reconcile their reserved op-journal marker into
+  a compact failed receipt, so retries replay the stored failure instead of
+  being refused forever as in_progress keys; crash residue keeps exact-once
+  semantics per ADR 0010 (#142).
+- Doctor and system.diagnose expose live Agent-route presence via the new
+  credentialed `daemon.route_status` IPC method (`daemon.agent_route` check,
+  additive `agent_route` diagnosis id and `agent_route_offline` overall);
+  doctor no longer passes while ChatGPT sees the device offline (#141).
+- Incremental workspace registry refresh: ready agents publish the full
+  registry on device-local changes over one new authenticated message
+  (`workspace.registry` / ack, ADR 0014), so workspace activation no longer
+  waits for a reconnect (#146). Shared JSON schema added and validated in both
+  languages.
+- Linux disclosures without loosening defaults: spawn-resolution failures list
+  the searched directories (service PATH plus user-local extras, home
+  collapsed); EPERM spawn errors and the hardening pass row name
+  RestrictNamespaces=yes and its operator drop-in (#144/#145); doctor warns
+  when Linger=no so logout-killed agents are diagnosable, and TUI/docs state
+  the session-lifetime caveat (#143).
+
+See `docs/RELEASE_NOTES_v1.2.21.md` for details.
+
 ## v1.2.20 — TUI terminal-contract reliability
 
 - Ctrl+C is a universal emergency exit from every screen, overlay, wizard
