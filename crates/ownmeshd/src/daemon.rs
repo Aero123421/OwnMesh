@@ -86,6 +86,12 @@ async fn run_async() -> Result<(), ExitCode> {
         guard.reconcile_expired_transitions().await;
     }
 
+    // #141: live Agent-route presence, observed by the transport and exposed
+    // to doctor/system.diagnose via the runtime. Starts as Disabled and flips
+    // Offline/Online with each connect attempt / authenticated ready session.
+    let (presence_tx, presence_rx) = watch::channel(ownmesh_ipc::AgentRoutePresence::Disabled);
+    runtime.lock().await.install_route_presence(presence_rx);
+
     // P1-E review (ADR 0011): surface the effective-sandbox condition that
     // makes OwnMesh custody validation unsound BEFORE the first state access.
     // A systemd `--user` unit that forces a user namespace (PrivateUsers=yes
@@ -134,12 +140,15 @@ async fn run_async() -> Result<(), ExitCode> {
             config,
             Some(runtime),
             transport_shutdown_rx,
+            Some(presence_tx),
         ))),
         Ok(None) => {
+            drop(presence_tx);
             tracing::info!("no active enrolled device credential; remote Agent transport disabled");
             None
         }
         Err(err) => {
+            drop(presence_tx);
             // Fail closed for remote connectivity while keeping the local IPC
             // boundary available for repair/re-enrollment.
             tracing::error!(error = %err, "remote Agent transport configuration rejected");

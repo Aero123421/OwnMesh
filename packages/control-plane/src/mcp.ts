@@ -1973,6 +1973,16 @@ const SYSTEM_DIAGNOSIS_CHECK_IDS = new Set([
   "session_supervisor",
   "sessions",
 ]);
+// #141 additive: device-observed live Agent-route presence. Older Agents omit
+// this check entirely; their diagnoses stay valid because every required id
+// above must be present and unknown ids are dropped either way. The Control
+// Plane additionally synthesizes its own authoritative `route` check from
+// DeviceRoom presence.
+const SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS = new Set(["agent_route"]);
+const SYSTEM_DIAGNOSIS_ALL_CHECK_IDS = new Set([
+  ...SYSTEM_DIAGNOSIS_CHECK_IDS,
+  ...SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS,
+]);
 const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
   string,
   Record<string, { status: "pass" | "warn" | "fail"; provenance: "authoritative" | "observed" }>
@@ -1999,6 +2009,12 @@ const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
   sessions: {
     healthy: { status: "pass", provenance: "authoritative" },
     stale: { status: "warn", provenance: "authoritative" },
+  },
+  agent_route: {
+    online: { status: "pass", provenance: "observed" },
+    disabled: { status: "pass", provenance: "observed" },
+    unknown: { status: "pass", provenance: "observed" },
+    offline: { status: "fail", provenance: "observed" },
   },
 };
 
@@ -2205,7 +2221,7 @@ export function normalizeSystemDiagnosis(
   const rawChecks = Array.isArray(source?.checks) ? source.checks : [];
   const checks: Record<string, unknown>[] = [];
   const seen = new Set<string>();
-  for (const candidate of rawChecks.slice(0, SYSTEM_DIAGNOSIS_CHECK_IDS.size)) {
+  for (const candidate of rawChecks.slice(0, SYSTEM_DIAGNOSIS_ALL_CHECK_IDS.size)) {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
     const check = candidate as Record<string, unknown>;
     const id = diagnosisText(check.id);
@@ -2213,7 +2229,7 @@ export function normalizeSystemDiagnosis(
     const at = diagnosisTimestamp(check.observed_at);
     const contract = id && state ? SYSTEM_DIAGNOSIS_CHECK_CONTRACT[id]?.[state] : undefined;
     if (
-      !id || !SYSTEM_DIAGNOSIS_CHECK_IDS.has(id) || seen.has(id) ||
+      !id || !SYSTEM_DIAGNOSIS_ALL_CHECK_IDS.has(id) || seen.has(id) ||
       !state || !at || !contract ||
       check.status !== contract.status || check.provenance !== contract.provenance
     ) continue;
@@ -2238,7 +2254,7 @@ export function normalizeSystemDiagnosis(
   if (
     source?.schema !== SYSTEM_DIAGNOSIS_SCHEMA || !sourceObservedAt ||
     !agentVersion || !protocolVersion ||
-    seen.size !== SYSTEM_DIAGNOSIS_CHECK_IDS.size
+    ![...SYSTEM_DIAGNOSIS_CHECK_IDS].every((id) => seen.has(id))
   ) {
     return {
       schema: SYSTEM_DIAGNOSIS_SCHEMA,
@@ -2319,14 +2335,16 @@ export function normalizeSystemDiagnosis(
                 ? "stale_sessions"
                 : stateFor("workspace") === "unbound_enforced"
                   ? "workspace_selection_required"
-                  : "healthy";
+                  : stateFor("agent_route") === "offline"
+                    ? "agent_route_offline"
+                    : "healthy";
   const recommendation = overall === "lockdown"
     ? "unlock_locally"
     : overall === "supervisor_unavailable"
       ? "restart_session_supervisor"
       : overall === "journal_degraded"
         ? "repair_op_journal_locally"
-        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues"
+        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues" || overall === "agent_route_offline"
         ? "run_local_doctor"
         : overall === "stale_sessions"
           ? "reconcile_stale_sessions"

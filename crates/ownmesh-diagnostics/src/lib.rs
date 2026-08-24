@@ -269,6 +269,10 @@ pub struct DaemonObservation {
     /// Observed only from a successful local IPC `daemon.status` response.
     pub pid: Option<u32>,
     pub message: Option<String>,
+    /// Live Agent-route presence from `daemon.route_status` (#141):
+    /// `online` / `offline` / `disabled` / `unknown`. `None` when the daemon
+    /// is unreachable or the method is unsupported (older daemon).
+    pub agent_route: Option<String>,
 }
 
 /// Control-plane observation (URL may be shown; no tokens).
@@ -693,6 +697,32 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
             )
             .with_detail(input.daemon.endpoint.clone().unwrap_or_default()),
         );
+    }
+
+    // Live Agent route (#141): what the daemon's transport observes right now.
+    // A green /health or local IPC must not hide an offline ChatGPT route.
+    // `None` (daemon unreachable, or an older daemon without the method) omits
+    // the row instead of guessing; `unknown` is an honest pass with a note.
+    match input.daemon.agent_route.as_deref() {
+        Some("online") => checks.push(DoctorCheck::pass(
+            "daemon.agent_route",
+            "Agent WebSocket route to the control plane is connected",
+        )),
+        Some("offline") => checks.push(DoctorCheck::fail(
+            "daemon.agent_route",
+            "the daemon is running but its Agent WebSocket route to the control plane is \
+             not connected; MCP clients such as ChatGPT will report this device offline. \
+             Check connectivity (including IPv6 blackhole/hung reconnect), then inspect \
+             `ownmeshd` logs for reconnect activity",
+        )),
+        Some("disabled") => checks.push(DoctorCheck::pass(
+            "daemon.agent_route",
+            "remote Agent routing is disabled (no enrolled device credential); this \
+             device intentionally has no ChatGPT route",
+        )),
+        // `unknown` or an older daemon without the method: omit rather than
+        // guess.
+        _ => {}
     }
 
     // Control plane

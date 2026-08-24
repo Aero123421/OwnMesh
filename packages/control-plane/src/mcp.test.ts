@@ -961,7 +961,7 @@ test("system diagnosis folds device-local journal and discovery health into over
     created_at: "2026-08-13T00:00:00Z",
   };
   const observedAt = "2026-08-13T00:00:00Z";
-  const check = (id: string, state: string, status: "pass" | "warn" = "pass") => ({
+  const check = (id: string, state: string, status: "pass" | "warn" | "fail" = "pass") => ({
     id, status, state,
     provenance: ["policy", "workspace", "sessions"].includes(id)
       ? "authoritative"
@@ -973,6 +973,62 @@ test("system diagnosis folds device-local journal and discovery health into over
     check("daemon", "running"), check("session_supervisor", "not_required"),
     { ...check("sessions", "healthy"), count: 0, nonterminal_count: 0, stale_count: 0 },
   ];
+
+  // #141: an old Agent (5 checks, no agent_route) stays healthy.
+  const legacyAgent = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.20", protocol_version: "ownmesh.device/1.0" },
+      checks: baseChecks,
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(legacyAgent.overall, "healthy");
+
+  // #141: a device-observed offline Agent route lifts overall away from
+  // healthy even though the Control Plane's own route probe is online.
+  const routeOffline = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.21", protocol_version: "ownmesh.device/1.0" },
+      checks: [...baseChecks, check("agent_route", "offline", "fail")],
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(routeOffline.overall, "agent_route_offline");
+  assert.equal(routeOffline.recommendation, "run_local_doctor");
+  const routeCheck = (routeOffline.checks as Record<string, unknown>[]).find(
+    (c) => c.id === "agent_route",
+  );
+  assert.equal(routeCheck?.status, "fail");
+
+  // An unknown extra check id never enters the allowlisted result.
+  const poisonedExtra = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.21", protocol_version: "ownmesh.device/1.0" },
+      checks: [
+        ...baseChecks,
+        check("agent_route", "online"),
+        { ...check("sneaky_exfil", "running"), path: "/home/user/secret" },
+      ],
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(poisonedExtra.overall, "healthy");
+  assert.equal(
+    (poisonedExtra.checks as Record<string, unknown>[]).some((c) => c.id === "sneaky_exfil"),
+    false,
+  );
 
   // A poisoned transition journal lifts overall away from healthy.
   const poisoned = normalizeSystemDiagnosis(
@@ -1093,7 +1149,7 @@ test("system diagnosis folds device-local journal and discovery health into over
 
   // Old Agents (no fields) stay healthy and additive fields default to ok —
   // no schema version bump, no exfiltration surface.
-  const legacy = normalizeSystemDiagnosis(
+  const oldAgentNoRoute = normalizeSystemDiagnosis(
     {
       schema: "ownmesh.system_diagnosis/1.0",
       observed_at: observedAt,
@@ -1106,16 +1162,16 @@ test("system diagnosis folds device-local journal and discovery health into over
     "online",
     observedAt,
   );
-  assert.equal(legacy.overall, "healthy", "absent additive fields must not fail the diagnosis");
+  assert.equal(oldAgentNoRoute.overall, "healthy", "absent additive fields must not fail the diagnosis");
   assert.equal(
-    ((legacy.journals as Record<string, unknown>).transition as Record<string, unknown>).status,
+    ((oldAgentNoRoute.journals as Record<string, unknown>).transition as Record<string, unknown>).status,
     "ok",
   );
   assert.equal(
-    ((legacy.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
+    ((oldAgentNoRoute.journals as Record<string, unknown>).op_journal as Record<string, unknown>).status,
     "ok",
   );
-  const json = JSON.stringify(legacy);
+  const json = JSON.stringify(oldAgentNoRoute);
   assert.doesNotMatch(json, /must-not-persist|C:\\secret/);
 
   // P1-F: a present-but-malformed status (wrong type or unrecognized string)

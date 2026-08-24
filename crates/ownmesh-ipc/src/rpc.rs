@@ -14,6 +14,10 @@ pub mod methods {
     pub const HELLO: &str = "ipc.hello";
     /// Daemon status snapshot.
     pub const STATUS: &str = "daemon.status";
+    /// Live Agent-route presence as observed by the daemon transport
+    /// (`online` / `offline` / `disabled` / `unknown`). Requires the client
+    /// credential — it is not part of the uncredentialed probe surface.
+    pub const ROUTE_STATUS: &str = "daemon.route_status";
     /// Graceful ping used by reconnect probes.
     pub const PING: &str = "ipc.ping";
 
@@ -394,6 +398,34 @@ pub struct DaemonStatus {
     pub endpoint: String,
     /// Monotonic uptime seconds since start.
     pub uptime_secs: u64,
+}
+
+/// Live Agent-route presence as observed by the daemon transport (#141).
+/// `Online` means an authenticated ready Agent WebSocket session is live
+/// right now — the same condition the control plane reports to MCP clients
+/// as `connection_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRoutePresence {
+    /// No enrolled device credential or rejected configuration: remote
+    /// routing is intentionally off.
+    Disabled,
+    /// Transport configured but no live authenticated ready session. Covers
+    /// reconnect backoff, a hung connect, and post-ready peer closes.
+    Offline,
+    /// An authenticated ready Agent WebSocket session is live.
+    Online,
+}
+
+impl AgentRoutePresence {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Offline => "offline",
+            Self::Online => "online",
+        }
+    }
 }
 
 /// JSON-RPC application error codes (local IPC).

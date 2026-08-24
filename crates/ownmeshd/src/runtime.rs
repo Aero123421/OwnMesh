@@ -690,6 +690,10 @@ pub struct DaemonRuntime {
     review_manifests: ReviewManifestStore,
     review_results: ReviewResultStore,
     transition_recovery_running: bool,
+    /// Live Agent-route presence shared by the transport (#141). `None` in
+    /// unit-test runtimes where no transport is wired; doctor and
+    /// system.diagnose report `unknown` instead of guessing.
+    route_presence: Option<watch::Receiver<ownmesh_ipc::AgentRoutePresence>>,
     /// Optional cancel signal for the currently executing remote command.
     /// Lives only for the duration of `dispatch_cancellable`.
     active_cancel: Option<watch::Receiver<bool>>,
@@ -903,6 +907,7 @@ impl DaemonRuntime {
             review_manifests,
             review_results,
             transition_recovery_running: false,
+            route_presence: None,
             active_cancel: None,
             active_remote_operation_id: None,
             active_remote_expires_at_unix: None,
@@ -1401,6 +1406,37 @@ retry — refusing the persist rather than claiming compaction succeeded while t
     }
 
     /// Resolve a registered workspace root by id (default → `ws_default`).
+    #[allow(clippy::needless_pass_by_value)]
+    fn handle_route_status(&self) -> Value {
+        // #141: live Agent-route presence as observed by the transport —
+        // the same condition the control plane reports to MCP clients as
+        // `connection_status`. No secrets, no keychain reads.
+        let route = self
+            .route_presence
+            .as_ref()
+            .map(|rx| rx.borrow().as_str())
+            .unwrap_or("unknown");
+        json!({
+            "schema_version": 1,
+            "route": route,
+        })
+    }
+
+    /// Wire the live Agent-route presence channel installed by the daemon
+    /// (#141). Absent in unit tests; consumers then see `unknown`.
+    pub fn install_route_presence(
+        &mut self,
+        receiver: watch::Receiver<ownmesh_ipc::AgentRoutePresence>,
+    ) {
+        self.route_presence = Some(receiver);
+    }
+
+    /// Live Agent-route presence string for system.diagnose facts (#141).
+    pub(crate) fn agent_route_presence(&self) -> Option<&'static str> {
+        self.route_presence.as_ref().map(|rx| rx.borrow().as_str())
+    }
+
+    /// Resolve a registered workspace root by id (default → `ws_default`).
     ///
     /// Restricted modes pin and authorize against the selected root only.
     /// Unknown ids fail closed (never fall back to another tenant/device root).
@@ -1613,6 +1649,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::POLICY_SHOW,
             methods::POLICY_VALIDATE,
             methods::STATUS,
+            methods::ROUTE_STATUS,
             methods::PING,
             methods::GRANTS_LIST,
             methods::GRANTS_SHOW,
@@ -1650,6 +1687,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::GRANTS_LIST,
             methods::GRANTS_SHOW,
             methods::GRANTS_REVOKE,
+            methods::ROUTE_STATUS,
             ops_methods::SYSTEM_DIAGNOSE,
             ops_methods::GIT_STATUS,
             ops_methods::GIT_DIFF,
@@ -5590,6 +5628,7 @@ path or install the tool so detection and execution agree",
         self.check_lockdown(method)?;
         self.check_journal_degraded(method)?;
         match method {
+            methods::ROUTE_STATUS => Ok(self.handle_route_status()),
             methods::OPS_EXEC => self.handle_exec(params, client).await,
             methods::OPS_FS_LIST => self.handle_fs_list(params, client).await,
             methods::OPS_FS_STAT => self.handle_fs_stat(params, client).await,

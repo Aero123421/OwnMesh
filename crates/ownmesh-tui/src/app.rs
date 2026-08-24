@@ -713,6 +713,9 @@ fn doctor_input_from_local(
             reachable: daemon.is_some(),
             pid: daemon.map(|status| status.pid),
             message: None,
+            // The TUI readiness view does not query the live route; doctor
+            // owns that observation (#141).
+            agent_route: None,
         },
         // Network is opt-in; TUI never probes the control plane.
         control_plane: ControlPlaneObservation {

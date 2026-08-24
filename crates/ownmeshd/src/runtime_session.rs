@@ -286,6 +286,7 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 op_journal_degraded: self.op_journal_degraded.is_some(),
                 profile_discovery,
                 credential_store,
+                agent_route: self.agent_route_presence(),
             },
         );
         if let Some(object) = payload.as_object_mut() {
@@ -3092,6 +3093,10 @@ struct SystemDiagnosisFacts {
     op_journal_degraded: bool,
     profile_discovery: (&'static str, Vec<String>),
     credential_store: (&'static str, Option<String>, usize),
+    /// Live Agent-route presence observed by the transport (#141): the same
+    /// condition the control plane reports to MCP clients as
+    /// `connection_status`. `None` means not wired (unknown), e.g. unit tests.
+    agent_route: Option<&'static str>,
 }
 
 fn credential_store_health(
@@ -3263,6 +3268,15 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
     let (profile_status, profile_notes) = &facts.profile_discovery;
     let (credential_store_status, credential_store_backend, residual_fallback_entries) =
         &facts.credential_store;
+    // #141: a daemon that is up but whose Agent route is not ready must not
+    // look healthy. `offline` is the only failing observation; `disabled`
+    // (no enrolled credential) and `unknown` (not wired, e.g. tests) are
+    // honest passes.
+    let agent_route_status = if facts.agent_route == Some("offline") {
+        "fail"
+    } else {
+        "pass"
+    };
     let overall = if facts.lockdown {
         "lockdown"
     } else if supervisor_state == "unavailable" {
@@ -3277,6 +3291,8 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         "op_journal_uncertain"
     } else if facts.op_journal_in_progress > 0 {
         "op_journal_in_progress"
+    } else if agent_route_status == "fail" {
+        "agent_route_offline"
     } else if *credential_store_status != "ok" {
         "credential_store_issues"
     } else if *profile_status == "warn" {
@@ -3296,6 +3312,7 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
         | "op_journal_pressure"
         | "op_journal_uncertain"
         | "op_journal_in_progress"
+        | "agent_route_offline"
         | "credential_store_issues"
         | "profile_discovery_issues" => "run_local_doctor",
         "stale_sessions" => "reconcile_stale_sessions",
@@ -3328,6 +3345,13 @@ fn system_diagnosis_payload(observed_at: &str, facts: SystemDiagnosisFacts) -> V
                 "status": if facts.lockdown { "warn" } else { "pass" },
                 "state": if facts.lockdown { "lockdown" } else { "running" },
                 "provenance": "observed", "observed_at": observed_at,
+            },
+            {
+                "id": "agent_route",
+                "status": agent_route_status,
+                "state": facts.agent_route.unwrap_or("unknown"),
+                "provenance": "observed",
+                "observed_at": observed_at,
             },
             {
                 "id": "session_supervisor",
@@ -3470,6 +3494,7 @@ mod system_diagnosis_tests {
             op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
+            agent_route: None,
         };
         let cases = [
             (healthy_facts(), "healthy", "none"),
@@ -3503,12 +3528,22 @@ mod system_diagnosis_tests {
                 "workspace_selection_required",
                 "select_workspace",
             ),
+            (
+                // #141: a daemon whose Agent route is offline must not look
+                // healthy even when everything else is green.
+                SystemDiagnosisFacts {
+                    agent_route: Some("offline"),
+                    ..healthy_facts()
+                },
+                "agent_route_offline",
+                "run_local_doctor",
+            ),
         ];
         for (facts, overall, recommendation) in cases {
             let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
             assert_eq!(value["overall"], overall);
             assert_eq!(value["recommendation"], recommendation);
-            assert_eq!(value["checks"].as_array().map(Vec::len), Some(5));
+            assert_eq!(value["checks"].as_array().map(Vec::len), Some(6));
             let serialized = value.to_string();
             for forbidden in [
                 "token",
@@ -3529,7 +3564,7 @@ mod system_diagnosis_tests {
 
     /// P0-A/P0-B/P1-F: a poisoned transition journal, dangerous op-journal
     /// pressure and profile-discovery failures must each move `overall` away
-    /// from `healthy` with an actionable recommendation, while the 5 check ids
+    /// from `healthy` with an actionable recommendation, while the 6 check ids
     /// stay stable (additive top-level fields only).
     #[test]
     fn journal_and_discovery_issues_are_not_reported_healthy() {
@@ -3551,6 +3586,7 @@ mod system_diagnosis_tests {
             op_journal_degraded: false,
             profile_discovery: ("ok", vec![]),
             credential_store: ("ok", Some("preferred(os-keychain)".into()), 0),
+            agent_route: None,
         };
 
         // Retained-expired transition records → fail, actionable.
@@ -3708,7 +3744,7 @@ mod system_diagnosis_tests {
         assert_eq!(value["journals"]["transition"]["status"], "ok");
         assert_eq!(value["journals"]["op_journal"]["status"], "ok");
         assert_eq!(value["profile_discovery"]["status"], "ok");
-        assert_eq!(value["checks"].as_array().map(Vec::len), Some(5));
+        assert_eq!(value["checks"].as_array().map(Vec::len), Some(6));
     }
 
     /// The health payload must stay a fixed allowlisted surface: no
@@ -3733,6 +3769,7 @@ mod system_diagnosis_tests {
             op_journal_degraded: false,
             profile_discovery: ("warn", vec!["user-local bin dir not searched".into()]),
             credential_store: ("warn", Some("preferred(encrypted-file)".into()), 1),
+            agent_route: None,
         };
         let value = system_diagnosis_payload("2026-08-13T00:00:00Z", facts);
         let serialized = value.to_string();

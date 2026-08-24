@@ -14,7 +14,7 @@ use ownmesh_identity::{
     load_device_credential, load_or_create_device_key, DeviceKeyPair, PreferredSecretStore,
     SecretString, DEFAULT_KEYCHAIN_SERVICE,
 };
-use ownmesh_ipc::{methods, ClientIdentity};
+use ownmesh_ipc::{methods, AgentRoutePresence, ClientIdentity};
 use ownmesh_protocol::{
     Envelope, OperationEnvelope, OperationPayload, OperationRequestPayload, OPERATION_CONTRACT_V1,
     PROTOCOL_DEVICE_V1,
@@ -1531,6 +1531,7 @@ pub async fn run(
     config: AgentTransportConfig,
     runtime: Option<Arc<Mutex<DaemonRuntime>>>,
     mut shutdown: watch::Receiver<bool>,
+    presence: Option<watch::Sender<AgentRoutePresence>>,
 ) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut state = match AgentTransportState::load(
@@ -1547,15 +1548,24 @@ pub async fn run(
     let mut backoff = ReconnectBackoff::default();
     loop {
         if *shutdown.borrow() {
+            if let Some(presence) = &presence {
+                let _ = presence.send_replace(AgentRoutePresence::Offline);
+            }
             return;
         }
         let mut reached_ready = false;
+        // A new attempt starts without a live route; a hung or failing
+        // connect must be visible as offline immediately (#141).
+        if let Some(presence) = &presence {
+            let _ = presence.send_replace(AgentRoutePresence::Offline);
+        }
         match connect_and_run(
             &config,
             runtime.as_ref(),
             &mut state,
             &mut shutdown,
             &mut reached_ready,
+            presence.as_ref(),
         )
         .await
         {
@@ -1599,6 +1609,7 @@ async fn connect_and_run(
     state: &mut AgentTransportState,
     shutdown: &mut watch::Receiver<bool>,
     reached_ready: &mut bool,
+    presence: Option<&watch::Sender<AgentRoutePresence>>,
 ) -> Result<(), String> {
     let mut request = config
         .ws_url
@@ -1643,6 +1654,11 @@ async fn connect_and_run(
     };
     perform_handshake(&mut socket, config, state, workspace_registry.as_ref()).await?;
     *reached_ready = true;
+    // The authenticated ready session is live: this is the same condition the
+    // control plane reports to MCP clients as `connection_status` (#141).
+    if let Some(presence) = presence {
+        let _ = presence.send_replace(AgentRoutePresence::Online);
+    }
     tracing::info!(
         issuer = %ownmesh_config::redact_control_plane_url(&config.issuer),
         device_id = %config.device_id,
@@ -5358,6 +5374,7 @@ mod tests {
         });
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (presence_tx, presence_rx) = watch::channel(ownmesh_ipc::AgentRoutePresence::Offline);
         let mut first_shutdown = shutdown_rx.clone();
         let mut first_reached_ready = false;
         assert!(connect_and_run(
@@ -5366,10 +5383,17 @@ mod tests {
             &mut state,
             &mut first_shutdown,
             &mut first_reached_ready,
+            Some(&presence_tx),
         )
         .await
         .is_err());
         assert!(first_reached_ready);
+        // #141: an authenticated ready session must be observable as online
+        // while it lives — even after the peer closes the socket.
+        assert_eq!(
+            *presence_rx.borrow(),
+            ownmesh_ipc::AgentRoutePresence::Online
+        );
         let mut second_shutdown = shutdown_rx;
         let mut second_reached_ready = false;
         assert!(connect_and_run(
@@ -5378,6 +5402,7 @@ mod tests {
             &mut state,
             &mut second_shutdown,
             &mut second_reached_ready,
+            Some(&presence_tx),
         )
         .await
         .is_err());

@@ -13,7 +13,7 @@ use ownmesh_domain::ExitCode;
 use ownmesh_identity::{
     CredentialStoreDiagnosticSnapshot, SecretPurpose, CREDENTIAL_STORE_DIAGNOSTIC_FILE,
 };
-use ownmesh_ipc::{ClientIdentity, ClientOptions, Endpoint, IpcClient};
+use ownmesh_ipc::{methods, ClientIdentity, ClientOptions, Endpoint, IpcClient};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -475,16 +475,34 @@ fn observe_daemon(paths: &OwnMeshPaths) -> DaemonObservation {
                 return Err(format!("client credential error: {err}"));
             }
         };
-        match client.status().await {
-            Ok(status) => Ok(status),
-            Err(err) => Err(err.to_string()),
-        }
+        let status = match client.status().await {
+            Ok(status) => status,
+            Err(err) => return Err(err.to_string()),
+        };
+        // #141: observe the live Agent route through the daemon. A missing or
+        // unsupported method (older daemon) stays `None` so the check is
+        // omitted instead of guessed.
+        let agent_route = match client.call(methods::ROUTE_STATUS, None).await {
+            Ok(value) => value
+                .get("route")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .filter(|route| {
+                    matches!(
+                        route.as_str(),
+                        "online" | "offline" | "disabled" | "unknown"
+                    )
+                }),
+            Err(_) => None,
+        };
+        Ok((status, agent_route))
     });
 
     match reachable {
-        Ok(status) => {
+        Ok((status, agent_route)) => {
             obs.reachable = true;
             obs.pid = (status.pid != 0).then_some(status.pid);
+            obs.agent_route = agent_route;
         }
         Err(msg) => {
             obs.reachable = false;
@@ -1144,6 +1162,7 @@ mod tests {
             reachable: true,
             pid: Some(42),
             message: None,
+            agent_route: None,
         };
         let mut unknown = ServiceObservation {
             platform: "test".into(),

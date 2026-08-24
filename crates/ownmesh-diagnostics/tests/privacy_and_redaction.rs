@@ -22,9 +22,9 @@ use ownmesh_diagnostics::{
     prepare_support_bundle, redact_text, run_doctor, write_prepared_support_bundle,
     BinaryObservation, CheckStatus, ConfigObservation, ControlPlaneObservation,
     CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
-    DoctorInput, JournalsObservation, PrivacyPolicyObservation, PublicDiagnosticEvent,
-    PublicJournalHealth, PublicPlatformFacts, PublicServiceFacts, ServiceObservation,
-    SupportBundleError, SupportBundleInput,
+    DoctorInput, DoctorOutcome, JournalsObservation, PrivacyPolicyObservation,
+    PublicDiagnosticEvent, PublicJournalHealth, PublicPlatformFacts, PublicServiceFacts,
+    ServiceObservation, SupportBundleError, SupportBundleInput,
 };
 use sha2::{Digest, Sha256};
 
@@ -80,6 +80,7 @@ fn base_input() -> DoctorInput {
             reachable: true,
             pid: Some(1),
             message: None,
+            agent_route: Some("online".into()),
         },
         control_plane: ControlPlaneObservation {
             configured: true,
@@ -132,6 +133,46 @@ fn doctor_passes_when_telemetry_and_relay_off() {
         .find(|c| c.id == "privacy.relay")
         .unwrap();
     assert_eq!(rel.status, CheckStatus::Pass);
+}
+
+/// #141: an offline Agent route while the daemon is reachable must fail the
+/// report — a green /health or local IPC must not hide an offline ChatGPT
+/// device.
+#[test]
+fn offline_agent_route_fails_the_report_while_daemon_is_up() {
+    let mut input = base_input();
+    input.daemon.agent_route = Some("offline".into());
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "daemon.agent_route")
+        .expect("offline route must be disclosed");
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert!(!report.ok && report.outcome == DoctorOutcome::Error);
+}
+
+#[test]
+fn online_agent_route_passes_and_absent_route_is_omitted() {
+    let online = run_doctor(&base_input());
+    let check = online
+        .checks
+        .iter()
+        .find(|check| check.id == "daemon.agent_route")
+        .expect("online route row present");
+    assert_eq!(check.status, CheckStatus::Pass);
+
+    // Older daemon (method unsupported): the row is omitted, not guessed.
+    let mut absent = base_input();
+    absent.daemon.agent_route = None;
+    let report = run_doctor(&absent);
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|check| check.id == "daemon.agent_route"),
+        "unknown route must not fabricate a check"
+    );
 }
 
 #[test]

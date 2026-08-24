@@ -65,9 +65,9 @@ pub use registry::{
     MANAGEMENT_CREDENTIAL_FILE_NAME,
 };
 pub use rpc::{
-    app_error, methods, CredentialClientParams, CredentialProvisionParams, CredentialSecretResult,
-    DaemonStatus, HelloParams, HelloResult, RequestId, RpcErrorObject, RpcRequest, RpcResponse,
-    JSONRPC_VERSION,
+    app_error, methods, AgentRoutePresence, CredentialClientParams, CredentialProvisionParams,
+    CredentialSecretResult, DaemonStatus, HelloParams, HelloResult, RequestId, RpcErrorObject,
+    RpcRequest, RpcResponse, JSONRPC_VERSION,
 };
 pub use server::{reject_unknown_handler, IpcServer, MethodHandler, RevokedClients, ServerConfig};
 pub use transport::{connect, process_birth_id, ClientConnection, LocalListener, ServerConnection};
