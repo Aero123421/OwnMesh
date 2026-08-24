@@ -2990,11 +2990,16 @@ mod tests {
             "{msg}"
         );
         // The deterministic user-local extras appear (home-collapsed).
-        let labels = spawn_search_dir_labels();
-        assert!(
-            labels.iter().any(|label| label.starts_with("~/.local/bin")),
-            "user-local dirs must be part of the searched set: {labels:?}"
-        );
+        // Windows has no separate user-local discovery step (user bins ride
+        // the user PATH), so this expectation is Unix-only.
+        #[cfg(not(windows))]
+        {
+            let labels = spawn_search_dir_labels();
+            assert!(
+                labels.iter().any(|label| label.starts_with("~/.local/bin")),
+                "user-local dirs must be part of the searched set: {labels:?}"
+            );
+        }
         // Bounded listing: at most 12 directories plus an omission note.
         assert!(msg.len() < 2 * 1024, "message must stay bounded: {msg}");
         // Non-NotFound errors keep their own Display text only.
