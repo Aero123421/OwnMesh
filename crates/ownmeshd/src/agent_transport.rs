@@ -3911,6 +3911,14 @@ async fn dispatch_remote_operation(
             .map(|ts| ts.date_time().unix_timestamp())
     });
     let remote_payload_hash = request.payload_hash.clone();
+    // Captured before the params move into the runtime dispatch: the caller's
+    // contract idempotency key drives terminal-failure journal reconciliation
+    // below (#142).
+    let caller_idempotency_key = mapped
+        .1
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let outcome = {
         let mut guard = runtime.lock().await;
         guard
@@ -4158,6 +4166,37 @@ async fn dispatch_remote_operation(
                 }
                 other => ("failed", "OWNMESH_E_INTERNAL".to_owned(), other.to_string()),
             };
+            // #142: a terminal device result must never strand the caller's
+            // idempotency key as an eternal in_progress op-journal marker.
+            // Reconcile our own reserved marker into a compact failed receipt
+            // so retries replay this same failure and doctor stops reporting
+            // an uncertain in-flight mutation. Covers every runtime admission
+            // path (gate_and_run, review, approval, remote session
+            // mutations), each of which reserves under the same principal-
+            // namespaced key. Best-effort: a reconciliation persist failure is
+            // logged and leaves the exact-once marker untouched.
+            if let Some(caller_key) = caller_idempotency_key.as_deref() {
+                let ipc_code = match &error {
+                    ownmesh_ipc::IpcError::Remote { code, .. } => *code,
+                    _ => ownmesh_ipc::app_error::INTERNAL,
+                };
+                let reconciled = {
+                    let mut guard = runtime.lock().await;
+                    guard.reconcile_failed_idempotent(
+                        caller_key,
+                        client.principal_key(),
+                        &operation_id,
+                        ipc_code,
+                        &message,
+                    )
+                };
+                if reconciled {
+                    tracing::info!(
+                        operation_id = %operation_id,
+                        "op-journal in-progress marker reconciled to a terminal failed receipt"
+                    );
+                }
+            }
             json!({
                 "operation_contract": OPERATION_CONTRACT_V1,
                 "operation_id": operation_id,
@@ -4423,7 +4462,7 @@ mod tests {
                 assert_eq!(reconnect_failure_category(&error), "connect_timeout");
             }
             Ok(Ok((_, addr))) => panic!("unexpected connect success to {addr}"),
-            Err(_) => panic!("watchdog elapsed before the bounded dial deadline"),
+            Err(error) => panic!("watchdog elapsed before the bounded dial deadline: {error}"),
         }
     }
 

@@ -2018,6 +2018,73 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         Ok(())
     }
 
+    /// Reconcile a durable in-progress marker with a terminal, definitive
+    /// failure outcome (#142). The dispatch finished with a non-retryable
+    /// error, so leaving the marker in place would strand the caller's
+    /// idempotency key forever and keep doctor reporting an uncertain
+    /// in-flight mutation. The marker becomes a compact *failed* receipt:
+    /// replaying the same key still cannot re-run a side effect — it replays
+    /// the stored failure.
+    ///
+    /// Safety envelope (ADR 0010 unchanged): only this operation's own
+    /// in-progress marker is reconciled (the `operation_id` must match);
+    /// completed receipts and unknown/forward-version states stay untouched;
+    /// a crash between reserve and terminal result still leaves the
+    /// exact-once in-progress marker for operator reconciliation. Returns
+    /// `Ok(true)` only when a marker was actually reconciled.
+    fn fail_idempotent(
+        &mut self,
+        key: Option<&String>,
+        operation_id: &str,
+        error_code: i64,
+        error_message: &str,
+    ) -> IpcResult<bool> {
+        let Some(key) = key else {
+            return Ok(false);
+        };
+        let Some(entry) = self.op_journal.get(key) else {
+            return Ok(false);
+        };
+        if op_journal_entry_state(entry) != OpJournalEntryState::InProgress {
+            return Ok(false);
+        }
+        if entry.get("operation_id").and_then(Value::as_str) != Some(operation_id) {
+            return Ok(false);
+        }
+        let receipt = json!({
+            "durable_receipt": true,
+            "status": "failed",
+            "operation_id": operation_id,
+            "error": {
+                "code": error_code,
+                "message": bounded_journal_error_message(error_message),
+                "retryable": false,
+            },
+        });
+        self.store_idempotent(Some(key), &receipt)?;
+        Ok(true)
+    }
+
+    /// Transport entry point for [`Self::fail_idempotent`]: reconcile the
+    /// caller's reserved journal key after a remote dispatch produced a
+    /// terminal failed/cancelled device result (#142). Recomputes the same
+    /// principal-namespaced journal key the admission path reserved.
+    pub fn reconcile_failed_idempotent(
+        &mut self,
+        idempotency_key: &str,
+        principal_key: &str,
+        operation_id: &str,
+        error_code: i64,
+        error_message: &str,
+    ) -> bool {
+        let requester_principal = canonicalize_principal_key(principal_key);
+        let journal_key = principal_journal_key(&requester_principal, idempotency_key);
+        matches!(
+            self.fail_idempotent(Some(&journal_key), operation_id, error_code, error_message,),
+            Ok(true)
+        )
+    }
+
     async fn gate_and_run(
         &mut self,
         facts: OperationFacts,
@@ -2032,6 +2099,24 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             .as_ref()
             .map(|k| principal_journal_key(&requester_principal, k));
         if let Some(prev) = self.lookup_idempotent(journal_key.as_ref())? {
+            // A reconciled terminal failure (#142) replays as the same
+            // definitive error — never as a new attempt and never disguised
+            // as a completed result. The stored JSON-RPC code/message are the
+            // exact pair the first attempt produced.
+            if prev.get("status").and_then(Value::as_str) == Some("failed") {
+                let error = prev.get("error").cloned().unwrap_or_else(|| json!({}));
+                return Err(IpcError::Remote {
+                    code: error
+                        .get("code")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(app_error::INTERNAL),
+                    message: error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| "operation previously failed".into()),
+                });
+            }
             let mut replayed = prev;
             if let Some(obj) = replayed.as_object_mut() {
                 obj.insert("replayed".into(), json!(true));
@@ -2158,10 +2243,41 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                     return Err(journal_degraded_error(reason));
                 }
                 self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
-                // Once the durable marker exists, every execution/finalization error
-                // deliberately leaves it in place. Retrying an uncertain external
-                // side effect is less safe than requiring operator reconciliation.
-                let result = self.execute_request(&request).await?;
+                // A crash between this reserve and a terminal outcome must
+                // keep the exact-once marker (ADR 0010). But a definitive
+                // execution error is itself terminal: reconcile the marker
+                // into a compact failed receipt so the key replays the same
+                // failure instead of being stranded as an eternal in_progress
+                // marker (#142).
+                let executed = self.execute_request(&request).await;
+                let result = match executed {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let (code, message) = match &error {
+                            IpcError::Remote { code, message } => (*code, message.clone()),
+                            _ => (app_error::INTERNAL, error.to_string()),
+                        };
+                        if let Err(reconcile_error) = self.fail_idempotent(
+                            journal_key.as_ref(),
+                            &operation_id,
+                            code,
+                            &message,
+                        ) {
+                            eprintln!(
+                                "warning: failed to persist terminal failure receipt \
+                                 {operation_id}: {reconcile_error:?}"
+                            );
+                        }
+                        self.append_audit(
+                            "operation.failed",
+                            Some(&facts.capability),
+                            Some(&operation_id),
+                            Some("allow"),
+                            "execution returned a terminal error; journal marker reconciled",
+                        );
+                        return Err(error);
+                    }
+                };
                 let body = json!({
                     "approval_required": false,
                     "operation_id": operation_id,
@@ -9795,6 +9911,11 @@ fn op_journal_durable_view(journal: &HashMap<String, Value>) -> HashMap<String, 
                         .map(|v| (flag, v))
                 })
                 .collect();
+        // A reconciled terminal failure (#142) carries a small bounded
+        // `error` object (code/message/retryable). Preserving it keeps a
+        // replayed key returning the original definitive error instead of a
+        // generic one; the message is already capped at write time.
+        let error = value.get("error").filter(|v| v.is_object()).cloned();
         let mut compact = json!({
             "durable_receipt": true,
             "truncated": true,
@@ -9841,10 +9962,27 @@ fn op_journal_durable_view(journal: &HashMap<String, Value>) -> HashMap<String, 
             if let Some(session) = session {
                 object.insert("session".into(), session);
             }
+            if let Some(error) = error {
+                object.insert("error".into(), error);
+            }
         }
         out.insert(key.clone(), compact);
     }
     out
+}
+
+/// Cap a stored failure message so reconciled failed receipts stay small
+/// journal entries regardless of the underlying error text.
+fn bounded_journal_error_message(message: &str) -> String {
+    const MAX_MESSAGE_BYTES: usize = 512;
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return message.to_owned();
+    }
+    let mut cut = MAX_MESSAGE_BYTES;
+    while cut > 0 && !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &message[..cut])
 }
 
 fn read_bounded_state_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
@@ -10309,7 +10447,7 @@ mod broker_intent_tests {
     }
 
     #[tokio::test]
-    async fn local_elevation_stays_in_the_same_runtime_and_uncertain_marker_blocks_replay() {
+    async fn local_elevation_stays_in_the_same_runtime_and_terminal_failure_never_reruns() {
         let temp = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(temp.path());
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
@@ -10329,12 +10467,16 @@ mod broker_intent_tests {
             .await
             .expect_err("local elevation must not fall back to local spawning");
         assert!(first.to_string().contains("broker") || first.to_string().contains("binding"));
+        // #142: the definitive failure reconciles the reserved marker into a
+        // terminal failed receipt, so a retry replays that same stored error.
+        // It must never rerun the operation and never masquerade as success.
         let second = runtime
             .dispatch(methods::OPS_EXEC, Some(params), &client)
             .await
-            .expect_err("uncertain elevated operation must not rerun");
+            .expect_err("terminal failure must not rerun");
         assert!(
-            second.to_string().contains("in-progress") || second.to_string().contains("uncertain")
+            second.to_string().contains("broker") || second.to_string().contains("binding"),
+            "replay must return the stored terminal failure: {second}"
         );
     }
 
@@ -11848,6 +11990,154 @@ mod journal_lifecycle_tests {
         // Replay of an in-progress key stays refused.
         let err = runtime.lookup_idempotent(key.as_ref()).unwrap_err();
         assert!(err.to_string().contains("in-progress"), "{err}");
+    }
+
+    /// #142: a terminal execution failure must reconcile its reserved marker
+    /// into a compact failed receipt instead of stranding an eternal
+    /// in_progress key. A crash between reserve and terminal result keeps the
+    /// marker (exact-once commit point), which is what this test's starting
+    /// point models.
+    #[test]
+    fn terminal_failure_reconciles_in_progress_marker_into_failed_receipt() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let journal_key = Some("prin\u{1f}op_failed".to_string());
+        runtime
+            .begin_idempotent(journal_key.as_ref(), "op_failed_1")
+            .expect("begin marker");
+        assert!(runtime.op_journal_key_is_in_progress_for_test("op_failed"));
+
+        let reconciled = runtime.reconcile_failed_idempotent(
+            "op_failed",
+            "prin",
+            "op_failed_1",
+            app_error::INVALID_PARAMS,
+            "no such file",
+        );
+        assert!(reconciled, "own in-progress marker must reconcile");
+        assert!(
+            !runtime.op_journal_key_is_in_progress_for_test("op_failed"),
+            "marker no longer in progress after reconciliation"
+        );
+
+        // The durable file holds the compact failed receipt, not the marker.
+        let raw = std::fs::read_to_string(paths.state_dir.join("op-journal.json")).unwrap();
+        let durable: HashMap<String, Value> = serde_json::from_str(&raw).unwrap();
+        let receipt = durable.get(journal_key.as_deref().unwrap()).unwrap();
+        assert!(
+            receipt.get(OP_JOURNAL_STATE_FIELD).is_none(),
+            "compacted receipts classify via positive proof, not the marker field"
+        );
+        assert_eq!(
+            receipt.get("status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(receipt.get("durable_receipt"), Some(&Value::Bool(true)));
+        let error = receipt
+            .get("error")
+            .expect("bounded error object survives compaction");
+        assert_eq!(
+            error.get("code").and_then(Value::as_i64),
+            Some(app_error::INVALID_PARAMS)
+        );
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("no such file")
+        );
+        assert_eq!(error.get("retryable"), Some(&Value::Bool(false)));
+
+        // Reconciling again (or after any other terminal outcome) is a no-op.
+        let again = runtime.reconcile_failed_idempotent(
+            "op_failed",
+            "prin",
+            "op_failed_1",
+            app_error::INTERNAL,
+            "second attempt",
+        );
+        assert!(!again, "completed receipts are never rewritten");
+    }
+
+    /// #142 safety envelope: reconciliation only touches this operation's own
+    /// in_progress marker — foreign operation ids, unknown keys, and
+    /// completed/uncertain entries stay untouched.
+    #[test]
+    fn failure_reconciliation_is_scoped_to_the_own_in_progress_marker() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+
+        // Unknown key: nothing to reconcile.
+        assert!(!runtime.reconcile_failed_idempotent(
+            "missing",
+            "prin",
+            "op_x",
+            app_error::INTERNAL,
+            "boom"
+        ));
+
+        // Marker reserved under a different operation id: never clobbered.
+        let key = Some("prin\u{1f}op_other".to_string());
+        runtime
+            .begin_idempotent(key.as_ref(), "op_reserved_by_a")
+            .expect("begin");
+        assert!(!runtime.reconcile_failed_idempotent(
+            "op_other",
+            "prin",
+            "op_reserved_by_b",
+            app_error::INTERNAL,
+            "boom"
+        ));
+        assert!(
+            runtime.op_journal_key_is_in_progress_for_test("op_other"),
+            "foreign operation id must not reconcile"
+        );
+
+        // Uncertain (unknown state) entries stay verbatim fail-closed.
+        runtime.op_journal.insert(
+            "prin\u{1f}op_uncertain".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: "phase_two",
+                "operation_id": "op_uncertain_1",
+            }),
+        );
+        assert!(!runtime.reconcile_failed_idempotent(
+            "op_uncertain",
+            "prin",
+            "op_uncertain_1",
+            app_error::INTERNAL,
+            "boom"
+        ));
+        assert!(runtime.has_op_journal_key_for_test("prin\u{1f}op_uncertain"));
+        let entry = runtime
+            .op_journal
+            .get("prin\u{1f}op_uncertain")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            entry.get(OP_JOURNAL_STATE_FIELD).and_then(Value::as_str),
+            Some("phase_two")
+        );
+
+        // Completed receipts stay untouched (a replayed success is intact).
+        let completed = json!({
+            "durable_receipt": true,
+            "truncated": true,
+            "status": "completed",
+            "operation_id": "op_done",
+            OP_JOURNAL_COMPLETED_UNIX_FIELD: DaemonRuntime::now(),
+        });
+        runtime
+            .op_journal
+            .insert("prin\u{1f}op_done".into(), completed);
+        assert!(!runtime.reconcile_failed_idempotent(
+            "op_done",
+            "prin",
+            "op_done",
+            app_error::INTERNAL,
+            "boom"
+        ));
+        assert!(runtime.has_op_journal_key_for_test("prin\u{1f}op_done"));
     }
 
     /// P0-B: near capacity, only old completed receipts are evicted; a fresh
