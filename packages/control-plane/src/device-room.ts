@@ -433,6 +433,15 @@ export type HandleMessageResult = {
     workspaces?: Array<{ id: string; generation: string }>;
     enforce_workspace?: boolean;
   };
+  /**
+   * #146: incremental workspace-registry refresh from a live ready agent.
+   * DeviceRoom must persist the full registry snapshot via
+   * store.syncDeviceWorkspaces before the agent may rely on it.
+   */
+  workspace_registry_sync?: {
+    enforce_workspace: boolean;
+    workspaces: Array<{ id: string; generation: string }>;
+  };
 };
 
 const MAX_AGENT_VERSION_LENGTH = 128;
@@ -1466,6 +1475,45 @@ export class DeviceRoomRouter {
           },
         });
         return { ok: true };
+      }
+      case "workspace.registry": {
+        // #146: incremental registry refresh from a live ready agent. The
+        // payload is the same shape as ready.workspace_registry and is
+        // validated by the same allowlist; activation stays fail-closed in
+        // workspace-activation until these generations are observed.
+        if (att.role !== "agent" || att.phase !== "ready") return { ok: false, error: "invalid_state" };
+        const refreshRegistry = readyWorkspaceRegistry(msg.payload);
+        // Unlike `ready`, a legacy ids-only advertisement cannot prove which
+        // local root a generation denotes, so a refresh without concrete
+        // generations is rejected.
+        if (
+          refreshRegistry == null ||
+          !Array.isArray(refreshRegistry.workspaces) ||
+          refreshRegistry.workspaces.length < 1
+        ) {
+          this.sendError(
+            sessionId,
+            "OWNMESH_E_BAD_ENVELOPE",
+            "invalid workspace registry",
+            msg.correlation_id,
+          );
+          return { ok: false, error: "invalid_workspace_registry" };
+        }
+        const ack = this.nextEnvelope("workspace.registry.ack", { ok: true }, msg.correlation_id);
+        this.sendToSession(sessionId, JSON.stringify(ack));
+        void this.audit.append({
+          kind: "device.ready",
+          summary: "agent workspace registry refresh",
+          device_id: this.deviceId,
+          meta: { workspace_count: refreshRegistry.workspaces.length },
+        });
+        return {
+          ok: true,
+          workspace_registry_sync: {
+            enforce_workspace: refreshRegistry.enforce_workspace,
+            workspaces: refreshRegistry.workspaces,
+          },
+        };
       }
       case "ping": {
         const pong = this.nextEnvelope("pong", { t: Date.now() }, msg.correlation_id);
@@ -3163,6 +3211,8 @@ export class DeviceRoom {
         preview?.type === "operation.event" ||
         preview?.type === "operation.progress" ||
         preview?.type === "proof" ||
+        // #146: a registry refresh mutates durable device state.
+        preview?.type === "workspace.registry" ||
         preview?.type === "ready";
     } catch {
       /* handleMessage will reject malformed JSON */
@@ -3220,6 +3270,27 @@ export class DeviceRoom {
       } catch {
         // A concurrent revoke or D1 failure means this connection no longer
         // has an authoritative identity. Do not leave a ready socket live.
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+    }
+
+    // #146: persist the incremental registry refresh. Fail-closed on storage
+    // errors so the agent cannot assume a generation the store never saw.
+    if (result.ok && result.workspace_registry_sync) {
+      if (!this.env.DB) {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+      try {
+        const store = createStore(this.env);
+        await store.syncDeviceWorkspaces(
+          this.deviceId,
+          result.workspace_registry_sync.workspaces,
+        );
+      } catch {
         this.storageBroken = true;
         this.failClosedAll("storage unavailable", 1013);
         return;

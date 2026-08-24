@@ -671,6 +671,10 @@ pub struct DaemonRuntime {
     workspaces: Vec<WorkspaceEntry>,
     #[allow(dead_code)]
     workspaces_path: PathBuf,
+    /// #146: notified whenever the device-local registry changes so the live
+    /// Agent transport can publish an incremental `workspace.registry`
+    /// snapshot. `None` in unit tests without a transport.
+    workspace_registry_notify: Option<Arc<tokio::sync::Notify>>,
     enforce_workspace: bool,
     log_path: PathBuf,
     sessions: SessionManager,
@@ -896,6 +900,7 @@ impl DaemonRuntime {
             workspace_root,
             workspaces,
             workspaces_path,
+            workspace_registry_notify: None,
             enforce_workspace,
             log_path,
             sessions,
@@ -1434,6 +1439,21 @@ retry — refusing the persist rather than claiming compaction succeeded while t
     /// Live Agent-route presence string for system.diagnose facts (#141).
     pub(crate) fn agent_route_presence(&self) -> Option<&'static str> {
         self.route_presence.as_ref().map(|rx| rx.borrow().as_str())
+    }
+
+    /// Wire the workspace-registry change channel installed by the daemon
+    /// (#146): registry mutations notify the live transport.
+    pub fn install_workspace_registry_notify(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.workspace_registry_notify = Some(notify);
+    }
+
+    /// Signal the transport that the device-local registry changed (#146).
+    /// Fire-and-forget: the next live-loop turn publishes a full snapshot,
+    /// and a disconnected transport simply picks it up in the next handshake.
+    pub(crate) fn notify_workspace_registry_changed(&self) {
+        if let Some(notify) = &self.workspace_registry_notify {
+            notify.notify_one();
+        }
     }
 
     /// Resolve a registered workspace root by id (default → `ws_default`).
@@ -7790,6 +7810,40 @@ mod device_binding_tests {
             .as_str()
             .unwrap()
             .contains("Independent of access_preset"));
+    }
+
+    /// #146: registry mutations store a Notify permit so the live transport's
+    /// `workspace_registry_notify` wakes on the next select turn.
+    #[tokio::test]
+    async fn workspace_mutations_notify_the_registry_listener() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        runtime.install_workspace_registry_notify(notify.clone());
+
+        // With no waiter parked, notify_one stores exactly one permit.
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        runtime
+            .handle_workspace_add(
+                Some(json!({
+                    "path": root.to_string_lossy(),
+                    "id": "ws_proj",
+                })),
+                &ClientIdentity::new("client:local:test", "test"),
+            )
+            .unwrap();
+        // The stored permit must be observable immediately.
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("workspace_add must signal the registry listener");
+
+        // A remove signals again for the next drain turn.
+        runtime.notify_workspace_registry_changed();
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("a subsequent change must be signalled too");
     }
 
     #[test]

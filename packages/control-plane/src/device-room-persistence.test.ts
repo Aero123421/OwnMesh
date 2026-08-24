@@ -623,6 +623,110 @@ test("authenticated ready refreshes bounded metadata without heartbeat writes", 
   assert.equal(stale?.protocol_version, PROTOCOL);
 });
 
+test("workspace.registry refresh persists generations without reconnect (#146)", async () => {
+  const deviceId = "dev_ws_registry_sync01";
+  const { adapter, store } = openSqliteAdapter();
+  const { token } = await seedActiveDevice(store, deviceId);
+  const authHash = await sha256Hex(token);
+  const sessionId = "ags_ws_registry_sync";
+  const socket = mockSocket({
+    role: "agent",
+    device_id: deviceId,
+    session_id: sessionId,
+    connected_at: Date.now(),
+    // Only reachable after proof in production; harness seeds it directly.
+    phase: "proven",
+    auth_hash: authHash,
+    lastSeq: 0,
+  });
+  const room = new DeviceRoom(mockDOState({ sockets: [socket] }), {
+    DB: adapter as unknown as D1Database,
+  });
+  await room.ready;
+
+  // Complete the ready handshake first (no registry advertised yet).
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "ready", deviceId, {
+      agent_version: "1.2.21",
+      protocol_version: "payload-is-not-authoritative",
+      remote_routing_enabled: true,
+    })),
+  );
+  assert.equal(room.router.sessions.get(sessionId)?.phase, "ready");
+
+  // Device-local workspace_add while the session stays live.
+  const generationA = `wsg_${"a".repeat(32)}`;
+  const generationB = `wsg_${"b".repeat(32)}`;
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "workspace.registry", deviceId, {
+      enforce_workspace: true,
+      workspaces: [
+        { id: "ws_default", generation: generationA },
+        { id: "ws_repo", generation: generationB },
+      ],
+    }, undefined, { seq: 2 })),
+  );
+
+  const acks = socket.sent
+    .map((s) => JSON.parse(s) as DeviceEnvelope)
+    .filter((e) => e.type === "workspace.registry.ack");
+  assert.equal(acks.length, 1, "an accepted refresh is acknowledged");
+
+  // The observed generations are durable — the workspace is operable.
+  const repo = await store.getWorkspace(deviceId, "ws_repo");
+  assert.ok(repo);
+  assert.equal(repo.local_generation, generationB);
+});
+
+test("workspace.registry rejects non-ready sessions and invalid payloads (#146)", async () => {
+  const deviceId = "dev_ws_registry_guard";
+  const room = new DeviceRoomHarness(deviceId, () => true);
+
+  // Not ready (still proven): rejected.
+  const agent = room.connect("agent");
+  room.router.sessions.get(agent)!.phase = "proven";
+  const early = await room.send(
+    agent,
+    envFor(agent, "workspace.registry", deviceId, {
+      enforce_workspace: false,
+      workspaces: [{ id: "ws_default", generation: `wsg_${"c".repeat(32)}` }],
+    }),
+  );
+  assert.equal(early.error, "invalid_state");
+
+  // Client role can never publish a registry.
+  const client = room.connect("client");
+  room.router.sessions.get(client)!.phase = "ready";
+  const fromClient = await room.send(
+    client,
+    envFor(client, "workspace.registry", deviceId, {
+      enforce_workspace: false,
+      workspaces: [{ id: "ws_default", generation: `wsg_${"c".repeat(32)}` }],
+    }),
+  );
+  assert.equal(fromClient.error, "invalid_state");
+
+  // Ready agent, legacy ids-only payload: no generations, rejected.
+  room.router.sessions.get(agent)!.phase = "ready";
+  const idsOnly = await room.send(
+    agent,
+    envFor(agent, "workspace.registry", deviceId, { enforce_workspace: true, ids: ["ws_default"] }),
+  );
+  assert.equal(idsOnly.error, "invalid_workspace_registry");
+
+  // Unknown workspace id shape: rejected.
+  const badId = await room.send(
+    agent,
+    envFor(agent, "workspace.registry", deviceId, {
+      enforce_workspace: true,
+      workspaces: [{ id: "../etc", generation: `wsg_${"c".repeat(32)}` }],
+    }),
+  );
+  assert.equal(badId.error, "invalid_workspace_registry");
+});
+
 test("hibernated expired pending operation converges in D1 on DeviceRoom restart", async () => {
   const originalNow = Date.now;
   let now = 1_800_000_000_000;

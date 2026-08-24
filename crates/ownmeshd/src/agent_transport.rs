@@ -279,6 +279,10 @@ pub struct AgentTransportConfig {
     /// command can still publish its terminal result.
     orphan_completions: Arc<std::sync::Mutex<Vec<CompletedReply>>>,
     orphan_notify: Arc<tokio::sync::Notify>,
+    /// #146: notified when the device-local workspace registry changes so the
+    /// live session can publish an incremental `workspace.registry` snapshot
+    /// without waiting for the next ready handshake. `None` in tests.
+    workspace_registry_notify: Option<Arc<tokio::sync::Notify>>,
     /// In-process operation.request tasks. Survives Agent reconnect so a live
     /// detached spawn is not re-entered as a journal CONFLICT.
     in_process_dispatches: Arc<Mutex<HashSet<String>>>,
@@ -972,6 +976,7 @@ async fn run_destination_transfer_pump(
 pub fn configured_transport(
     paths: &OwnMeshPaths,
     cfg: &OwnMeshConfig,
+    workspace_registry_notify: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<Option<AgentTransportConfig>, String> {
     let Some(active_id) = cfg.active_instance.as_deref() else {
         return Ok(None);
@@ -1016,6 +1021,7 @@ pub fn configured_transport(
         preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
         orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
         orphan_notify: Arc::new(tokio::sync::Notify::new()),
+        workspace_registry_notify,
         in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
         state_path: paths.state_dir.join(TRANSPORT_STATE_FILE),
     }))
@@ -1931,6 +1937,8 @@ async fn live_loop(
     let (finish_tx, mut finish_rx) = mpsc::channel::<FinishedRemoteOp>(MAX_COMPLETION_QUEUE);
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REMOTE_OPS));
     let active_dispatches = Arc::clone(&config.in_process_dispatches);
+    // #146: set when the device-local registry changed mid-session.
+    let mut registry_dirty = false;
 
     // Do not replay the Agent-local crash outbox on reconnect. DeviceRoom owns
     // the authoritative pending/cancel state and redelivers only after applying
@@ -1943,6 +1951,27 @@ async fn live_loop(
         // Drain before select! so a Notify wakeup dropped by a competing
         // branch cannot strand a detached completion until the next handshake.
         publish_orphan_completions(socket, config, state).await?;
+        // #146: an incremental workspace-registry snapshot is published after
+        // the select turn, mirroring the orphan-completion drain pattern.
+        if registry_dirty {
+            registry_dirty = false;
+            if let Some(runtime) = runtime {
+                let (enforce_workspace, workspaces) =
+                    runtime.lock().await.remote_workspace_registry();
+                send_envelope(
+                    socket,
+                    config,
+                    state,
+                    "workspace.registry",
+                    json!({
+                        "enforce_workspace": enforce_workspace,
+                        "workspaces": workspaces,
+                    }),
+                    None,
+                )
+                .await?;
+            }
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1972,6 +2001,16 @@ async fn live_loop(
             }
             () = config.orphan_notify.notified() => {
                 // Wake only; the next loop turn drains and publishes every row.
+            }
+            () = async {
+                match &config.workspace_registry_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Wake only; the top of the next loop turn publishes the
+                // current full registry snapshot (#146).
+                registry_dirty = true;
             }
             message = socket.next() => {
                 let message = message
@@ -4514,6 +4553,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
@@ -4558,6 +4598,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
@@ -4592,6 +4633,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
@@ -4631,6 +4673,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
@@ -4710,6 +4753,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
@@ -4824,6 +4868,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
@@ -4890,6 +4935,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
@@ -4989,6 +5035,101 @@ mod tests {
         assert!(persisted.completed("op_cancel_bind").is_some());
     }
 
+    /// #146: a mid-session registry change publishes an incremental
+    /// `workspace.registry` snapshot on the live socket — no reconnect needed.
+    #[tokio::test]
+    async fn live_loop_publishes_workspace_registry_refresh_on_change() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_loopback").unwrap();
+        let key = DeviceKeyPair::generate();
+        let issuer = format!("http://{address}");
+        let credential = "dcred_registry_secret";
+        let registry_notify = Arc::new(tokio::sync::Notify::new());
+        let config = AgentTransportConfig {
+            issuer: issuer.clone(),
+            ws_url: agent_connect_url(&issuer, device.as_str()).unwrap(),
+            origin: issuer.clone(),
+            device_id: device.clone(),
+            credential: SecretString::new(credential),
+            key: Arc::new(key),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: Some(Arc::clone(&registry_notify)),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        let runtime_dir = tempdir().unwrap();
+        let runtime_paths = OwnMeshPaths::for_base(runtime_dir.path());
+        let daemon = DaemonRuntime::open(&runtime_paths).unwrap();
+        let runtime = Arc::new(Mutex::new(daemon));
+        let mut state = AgentTransportState::fresh(&config.issuer, &config.device_id);
+
+        let server_device = device.clone();
+        let notify_for_server = Arc::clone(&registry_notify);
+        let _ = server_device;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // The test client connects with plain connect_async and drives
+            // live_loop directly (no hello/challenge exchange to mirror).
+            let mut socket =
+                accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+                    .await
+                    .unwrap();
+
+            // No unsolicited frame (heartbeat is 30 s away) before a change.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err()
+            );
+
+            // The device-local registry changes (workspace_add/remove).
+            notify_for_server.notify_one();
+
+            let refresh = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let envelope = receive_test_envelope(&mut socket).await;
+                    if envelope.message_type == "workspace.registry" {
+                        break envelope;
+                    }
+                }
+            })
+            .await
+            .expect("refresh must arrive after the change");
+            assert_eq!(refresh.payload["enforce_workspace"], Value::Bool(true));
+            let workspaces = refresh.payload["workspaces"].as_array().unwrap();
+            assert!(
+                workspaces.iter().any(|w| w["id"] == "ws_default"
+                    && w["generation"]
+                        .as_str()
+                        .is_some_and(|g: &str| g.starts_with("wsg_"))),
+                "full snapshot must include the default workspace generation: {workspaces:?}"
+            );
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut socket, _) = tokio_tungstenite::connect_async(config.ws_url.as_str())
+            .await
+            .unwrap();
+        let _ = live_loop(
+            &mut socket,
+            &config,
+            Some(&runtime),
+            &mut state,
+            &mut shutdown_rx,
+        )
+        .await;
+        drop(shutdown_tx);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server task must finish")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn real_websocket_control_plane_redelivery_recovers_started_and_cached_results() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5009,6 +5150,7 @@ mod tests {
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
             orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
             orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
             in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
