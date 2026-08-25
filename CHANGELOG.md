@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Service lifecycle honesty
+
+- `service start` and `service stop` now cross the observable daemon IPC
+  boundary instead of treating an accepted service-manager request as a
+  completed transition; a request that never reaches (or leaves) the endpoint
+  returns `OWNMESH_E_SERVICE` with the manager's own installed/running facts
+  rather than `ok:true` with `running:null` (#154).
+- macOS `service stop` boots the LaunchAgent out of the user domain, so
+  `KeepAlive=true` can no longer relaunch the daemon behind a reported stop;
+  `start` re-enables and bootstraps the job idempotently, and `uninstall`
+  refuses to delete the plist until launchd confirms the job is unloaded
+  (#147).
+- Linux `service uninstall` reports every `systemctl --user` failure and keeps
+  the unit and install record in place until the manager confirms the unit is
+  inactive, so a failed stop can no longer be hidden by deleting the unit file.
+  An unreachable user bus is no longer mistaken for an absent unit (#149).
+- `service install` compares the descriptor actually registered with the OS —
+  systemd unit body, macOS plist plus loaded launchd job, Windows task action
+  and bound context — against a versioned descriptor digest persisted in
+  `user-service.json`. A hand-edited, older-version, or unreadable descriptor
+  is repaired instead of reported as idempotent success (#153).
+- The Windows Scheduled Task binds the daemon to the config/state/runtime
+  directories validated at install time, via typed `ownmeshd run
+  --config-dir/--state-dir/--runtime-dir` arguments shared by the XML import
+  and the `/TR` fallback — no `cmd /c set … &&` wrapper. Typed arguments
+  outrank `OWNMESH_*` environment variables, so an autostarted daemon can no
+  longer split one installation into two state trees (#148).
+
+### Endpoints and sessions
+
+- Unix endpoints are validated against the platform `sockaddr_un` capacity
+  before bind: a long but valid runtime directory now resolves to a
+  deterministic short owner-only pathname (0700, custody-attested) that every
+  producer and consumer derives identically, and an explicitly configured
+  socket path that cannot be bound is rejected with the required reduction
+  instead of failing later inside `bind` (#155).
+- Windows named pipes are scoped by a SHA-256 digest of the normalized runtime
+  path rather than a truncated alphanumeric filter, so distinct profiles can no
+  longer collide onto one pipe; a failed connect names the upgrade/restart
+  remedy for a daemon still on the legacy pipe name (#151).
+- Structured-pipe sessions publish EOF and a real exit code: each reader marks
+  its stream terminal on every exit path, the child is reaped once, and
+  completion requires child exit plus both stream EOFs so a late stream cannot
+  be truncated. Supervisor status and daemon diagnosis now observe a completed
+  structured child instead of reporting it live until TTL (#152).
+
+### Installer
+
+- The Unix installer recognizes a running `ownmeshd` whose executable was
+  replaced, which Linux reports as `/proc/<pid>/exe` → `<path> (deleted)`. The
+  suffix is stripped only after the remaining pathname matches the normalized
+  install-dir daemon, so upgrades restart and version-check the stale daemon
+  instead of silently leaving it running; matching is never by process name
+  (#150).
+
 ## v1.2.21 — Transport availability, journal honesty, and Linux disclosure
 
 - Agent and transfer WebSocket connects are bounded (15 s) with RFC 8305-style

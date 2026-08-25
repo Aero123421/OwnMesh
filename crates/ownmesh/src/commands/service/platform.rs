@@ -535,8 +535,32 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
         #[cfg(target_os = "macos")]
         {
+            // `stop` boots the job out so KeepAlive cannot relaunch it, so
+            // `start` must re-bootstrap rather than assume a loaded job.
+            // The sequence is idempotent: enable, bootstrap if unloaded, then
+            // kickstart to guarantee a live instance either way.
             let uid = user_id_string()?;
-            let target = format!("gui/{uid}/{SERVICE_LABEL}");
+            let domain = format!("gui/{uid}");
+            let target = format!("{domain}/{SERVICE_LABEL}");
+            let plist = launch_agent_path()?;
+            let plist_str = plist.display().to_string();
+
+            let enable = self.runner.run("launchctl", &["enable", &target])?;
+            if !enable.success() && !launchctl_absent(&enable) {
+                return Err(format!(
+                    "launchctl enable failed: {}{}",
+                    enable.stdout, enable.stderr
+                ));
+            }
+            let bootstrap = self
+                .runner
+                .run("launchctl", &["bootstrap", &domain, &plist_str])?;
+            if !bootstrap.success() && !launchctl_already_loaded(&bootstrap) {
+                return Err(format!(
+                    "launchctl bootstrap failed: {}{}",
+                    bootstrap.stdout, bootstrap.stderr
+                ));
+            }
             let out = self
                 .runner
                 .run("launchctl", &["kickstart", "-k", &target])?;
@@ -593,20 +617,31 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         }
         #[cfg(target_os = "macos")]
         {
+            // The shipped LaunchAgent sets KeepAlive=true, so signalling the
+            // process is not a stop: launchd relaunches it immediately. The
+            // job must be booted out of the user domain, which both stops the
+            // process and prevents the relaunch (#147). The descriptor stays on
+            // disk, so `start` can bootstrap it again.
             let uid = user_id_string()?;
-            let target = format!("gui/{uid}/{SERVICE_LABEL}");
-            let out = self
+            let domain = format!("gui/{uid}");
+            let target = format!("{domain}/{SERVICE_LABEL}");
+            let plist = launch_agent_path()?;
+            let plist_str = plist.display().to_string();
+
+            let out = self.runner.run("launchctl", &["bootout", &target])?;
+            if out.success() || launchctl_absent(&out) {
+                return Ok(());
+            }
+            // Older launchd builds require the domain + plist form.
+            let fallback = self
                 .runner
-                .run("launchctl", &["kill", "SIGTERM", &target])?;
-            if out.success()
-                || out.stderr.contains("No such process")
-                || out.stdout.contains("No such process")
-            {
+                .run("launchctl", &["bootout", &domain, &plist_str])?;
+            if fallback.success() || launchctl_absent(&fallback) {
                 return Ok(());
             }
             return Err(format!(
-                "launchctl kill failed: {}{}",
-                out.stdout, out.stderr
+                "launchctl bootout failed: {}{}{}{}",
+                out.stdout, out.stderr, fallback.stdout, fallback.stderr
             ));
         }
         #[cfg(target_os = "linux")]
@@ -626,6 +661,87 @@ impl<'a, R: ProcessRunner> ServiceManager<'a, R> {
         #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             Err("unsupported".into())
+        }
+    }
+
+    /// Compare the descriptor actually registered with the OS against `plan`.
+    ///
+    /// Idempotent install means the OS registration is current, so every
+    /// platform inspects the *effective* descriptor rather than accepting a
+    /// matching file path or task name. An unreadable or malformed descriptor
+    /// is drift requiring repair, never success (#153).
+    pub fn descriptor_state(&self, plan: &InstallPlan) -> DescriptorState {
+        if self.runner.fs_root().is_some() {
+            let unit_path = PathBuf::from(&plan.unit_path);
+            return if systemd_unit_body_matches(&unit_path, &plan.descriptor_body) {
+                DescriptorState::Current
+            } else {
+                DescriptorState::Drift("unit body differs from the generated descriptor".into())
+            };
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let unit_path = PathBuf::from(&plan.unit_path);
+            if !unit_path.is_file() {
+                return DescriptorState::Drift("unit file is missing".into());
+            }
+            return if systemd_unit_body_matches(&unit_path, &plan.descriptor_body) {
+                DescriptorState::Current
+            } else {
+                DescriptorState::Drift("unit body differs from the generated descriptor".into())
+            };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let plist_path = PathBuf::from(&plan.unit_path);
+            return launch_agent_descriptor_state(
+                fs::read_to_string(&plist_path).ok().as_deref(),
+                &plan.descriptor_body,
+            );
+        }
+        #[cfg(windows)]
+        {
+            let task = match windows_installed_task_name(self.runner) {
+                Ok(Some(task)) => task,
+                Ok(None) => return DescriptorState::Drift("no OwnMesh task is registered".into()),
+                Err(error) => return DescriptorState::Drift(format!("task query failed: {error}")),
+            };
+            if task != SERVICE_TASK_NAME {
+                return DescriptorState::Drift(format!(
+                    "task {task} predates the current descriptor name"
+                ));
+            }
+            let exported = match self
+                .runner
+                .run("schtasks", &["/Query", "/TN", task, "/XML"])
+            {
+                Ok(out) if out.success() => out.stdout,
+                Ok(out) => {
+                    return DescriptorState::Drift(format!(
+                        "schtasks /Query /XML failed (status {})",
+                        out.status
+                    ))
+                }
+                Err(error) => {
+                    return DescriptorState::Drift(format!("schtasks /Query /XML failed: {error}"))
+                }
+            };
+            let registered = windows_task_identity(&exported);
+            if registered == WindowsTaskIdentity::default() {
+                return DescriptorState::Drift("registered task XML is unreadable".into());
+            }
+            let expected = windows_task_identity(&plan.descriptor_body);
+            return if registered == expected {
+                DescriptorState::Current
+            } else {
+                DescriptorState::Drift(
+                    "registered task action/context differs from the generated descriptor".into(),
+                )
+            };
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            DescriptorState::Drift("descriptor comparison unsupported on this OS".into())
         }
     }
 
@@ -987,6 +1103,270 @@ pub(super) fn systemd_unit_body_matches(unit_path: &Path, expected: &str) -> boo
     on_disk.replace("\r\n", "\n") == expected.replace("\r\n", "\n")
 }
 
+/// Descriptor identity of the macOS LaunchAgent, from the plist alone.
+///
+/// Deliberately takes no runner: whether launchd currently has the job loaded
+/// is lifecycle state, not descriptor drift. `service stop` boots the agent out
+/// on purpose and leaves the plist installed, so treating "not loaded" as drift
+/// would make the next `service install` bootstrap a `RunAtLoad`/`KeepAlive`
+/// job and silently restart a service the operator deliberately stopped. The
+/// signature is the guarantee: loaded state cannot reach this decision.
+#[cfg(any(test, target_os = "macos"))]
+pub(super) fn launch_agent_descriptor_state(
+    on_disk: Option<&str>,
+    expected: &str,
+) -> DescriptorState {
+    let Some(on_disk) = on_disk else {
+        return DescriptorState::Drift("LaunchAgent plist is missing or unreadable".into());
+    };
+    if on_disk.replace("\r\n", "\n") == expected.replace("\r\n", "\n") {
+        DescriptorState::Current
+    } else {
+        DescriptorState::Drift("LaunchAgent plist differs from the generated descriptor".into())
+    }
+}
+
+/// What a `launchctl print` probe proved about a job after `bootout`.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnloadProof {
+    /// The job answered, so it is still loaded.
+    StillLoaded,
+    /// launchd explicitly reported the job as absent.
+    Unloaded,
+    /// The probe itself failed. Never proof of anything.
+    Unknown,
+}
+
+/// Classify the post-bootout `launchctl print` probe.
+///
+/// A permission, domain, or spawn failure says nothing about liveness, so it
+/// must not be read as absence: doing that deletes the descriptor (and later
+/// the install record) while the job may still be running — the partial-cleanup
+/// shape #147 exists to prevent.
+#[cfg(any(test, target_os = "macos"))]
+pub(super) fn classify_unload_probe(result: &Result<CommandOutput, String>) -> UnloadProof {
+    match result {
+        Ok(out) if out.success() => UnloadProof::StillLoaded,
+        Ok(out) if launchctl_absent(out) => UnloadProof::Unloaded,
+        Ok(_) | Err(_) => UnloadProof::Unknown,
+    }
+}
+
+/// Whether the descriptor actually registered with the OS still matches the
+/// descriptor OwnMesh would generate now (#153).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptorState {
+    /// The registered descriptor matches the current plan.
+    Current,
+    /// The registered descriptor differs, is missing, or cannot be read.
+    /// Install must rewrite it; this is never idempotent success.
+    Drift(String),
+}
+
+impl DescriptorState {
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+
+    /// Human-readable reason a descriptor needs repair.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Current => None,
+            Self::Drift(reason) => Some(reason.as_str()),
+        }
+    }
+}
+
+/// Semantic identity of a Windows Scheduled Task action.
+///
+/// Task Scheduler reformats imported XML, so a byte comparison would report
+/// permanent drift. These are the behaviorally relevant fields; comparing them
+/// detects a manual edit, an older descriptor version, or a task whose bound
+/// runtime context no longer matches the CLI's.
+#[cfg(any(test, windows))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowsTaskIdentity {
+    /// Number of `<Exec>` actions. Anything but exactly one is drift: a task
+    /// that keeps the expected first action and appends a second one runs
+    /// something OwnMesh never registered.
+    pub exec_action_count: usize,
+    /// Number of `<Trigger…>` children, so an added trigger is drift.
+    pub trigger_count: usize,
+    pub logon_trigger_count: usize,
+    pub logon_trigger_enabled: String,
+    pub command: String,
+    pub arguments: String,
+    pub working_directory: String,
+    pub logon_type: String,
+    pub run_level: String,
+    pub multiple_instances_policy: String,
+    pub disallow_start_if_on_batteries: String,
+    pub stop_if_going_on_batteries: String,
+    pub allow_hard_terminate: String,
+    pub start_when_available: String,
+    pub run_only_if_network_available: String,
+    pub allow_start_on_demand: String,
+    pub enabled: String,
+    pub hidden: String,
+    pub execution_time_limit: String,
+    pub priority: String,
+    pub restart_interval: String,
+    pub restart_count: String,
+}
+
+/// Extract the first `<tag>…</tag>` body, trimmed. Namespaced/attributed tags
+/// are matched on the opening name only, which is what Task Scheduler emits.
+#[cfg(any(test, windows))]
+fn xml_tag_value(xml: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(start) = xml.find(&open) else {
+        return String::new();
+    };
+    let rest = &xml[start + open.len()..];
+    let Some(end) = rest.find(&close) else {
+        return String::new();
+    };
+    // Task Scheduler re-encodes entities; decode the ones OwnMesh emits so a
+    // round-tripped descriptor compares equal to the rendered one.
+    decode_xml_entities(rest[..end].trim())
+}
+
+#[cfg(any(test, windows))]
+fn decode_xml_entities(raw: &str) -> String {
+    raw.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Count `<tag>` / `<tag …>` / `<tag/>` occurrences, ignoring closing tags.
+#[cfg(any(test, windows))]
+fn xml_element_count(xml: &str, tag: &str) -> usize {
+    let needle = format!("<{tag}");
+    let mut count = 0;
+    let mut rest = xml;
+    while let Some(at) = rest.find(&needle) {
+        let after = &rest[at + needle.len()..];
+        // `<Exec>` and `<Exec …>` count; `<ExecAction>` must not.
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+        {
+            count += 1;
+        }
+        rest = after;
+    }
+    count
+}
+
+/// Number of *direct* child elements of a section, whatever their type.
+///
+/// Depth is tracked so a trigger's own children are not counted as triggers;
+/// only the section's top level is cardinality.
+#[cfg(any(test, windows))]
+fn xml_child_element_count(section: &str) -> usize {
+    let mut count = 0;
+    let mut depth = 0_usize;
+    let mut rest = section;
+    while let Some(at) = rest.find('<') {
+        let after = &rest[at + 1..];
+        let Some(gt) = after.find('>') else { break };
+        let tag = &after[..gt];
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+        } else if tag.starts_with('?') || tag.starts_with('!') {
+            // XML declaration or comment: not an element.
+        } else if tag.ends_with('/') {
+            if depth == 0 {
+                count += 1;
+            }
+        } else {
+            if depth == 0 {
+                count += 1;
+            }
+            depth += 1;
+        }
+        rest = &after[gt + 1..];
+    }
+    count
+}
+
+/// Structural semantic identity of a registered Windows Scheduled Task.
+///
+/// Task Scheduler reformats imported XML, so a byte comparison would report
+/// permanent drift. Every behaviorally relevant rendered field is compared
+/// instead, together with the *cardinality* of actions and triggers: comparing
+/// only the first `<Command>`/`<Arguments>` would let a task keep the expected
+/// action, append a second one, and still be reported current.
+#[cfg(any(test, windows))]
+#[must_use]
+pub fn windows_task_identity(xml: &str) -> WindowsTaskIdentity {
+    let actions = xml_section(xml, "Actions").unwrap_or_default();
+    let exec = xml_section(&actions, "Exec").unwrap_or_default();
+    let triggers = xml_section(xml, "Triggers").unwrap_or_default();
+    let logon = xml_section(&triggers, "LogonTrigger").unwrap_or_default();
+    let principals = xml_section(xml, "Principals").unwrap_or_default();
+    let settings = xml_section(xml, "Settings").unwrap_or_default();
+    let restart = xml_section(&settings, "RestartOnFailure").unwrap_or_default();
+
+    WindowsTaskIdentity {
+        exec_action_count: xml_element_count(&actions, "Exec"),
+        trigger_count: xml_child_element_count(&triggers),
+        logon_trigger_count: xml_element_count(&triggers, "LogonTrigger"),
+        logon_trigger_enabled: xml_tag_value(&logon, "Enabled"),
+        // Scoped to the single `<Exec>`: a second action cannot masquerade as
+        // the expected one, and the counts above reject it outright.
+        command: xml_tag_value(&exec, "Command"),
+        arguments: xml_tag_value(&exec, "Arguments"),
+        working_directory: xml_tag_value(&exec, "WorkingDirectory"),
+        logon_type: xml_tag_value(&principals, "LogonType"),
+        run_level: xml_tag_value(&principals, "RunLevel"),
+        multiple_instances_policy: xml_tag_value(&settings, "MultipleInstancesPolicy"),
+        disallow_start_if_on_batteries: xml_tag_value(&settings, "DisallowStartIfOnBatteries"),
+        stop_if_going_on_batteries: xml_tag_value(&settings, "StopIfGoingOnBatteries"),
+        allow_hard_terminate: xml_tag_value(&settings, "AllowHardTerminate"),
+        start_when_available: xml_tag_value(&settings, "StartWhenAvailable"),
+        run_only_if_network_available: xml_tag_value(&settings, "RunOnlyIfNetworkAvailable"),
+        allow_start_on_demand: xml_tag_value(&settings, "AllowStartOnDemand"),
+        enabled: xml_tag_value(&settings, "Enabled"),
+        hidden: xml_tag_value(&settings, "Hidden"),
+        execution_time_limit: xml_tag_value(&settings, "ExecutionTimeLimit"),
+        priority: xml_tag_value(&settings, "Priority"),
+        restart_interval: xml_tag_value(&restart, "Interval"),
+        restart_count: xml_tag_value(&restart, "Count"),
+    }
+}
+
+/// Body of the first `<tag …>…</tag>` element, attributes allowed on the open tag.
+#[cfg(any(test, windows))]
+fn xml_section(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut from = 0;
+    // Skip prefix matches such as `<ExecutionTimeLimit>` when looking for `<Exec>`.
+    let start = loop {
+        let at = xml[from..].find(&open)? + from;
+        let after = &xml[at + open.len()..];
+        if after
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+        {
+            break at;
+        }
+        from = at + open.len();
+    };
+    let body_start = start + xml[start..].find('>')? + 1;
+    let end = xml[body_start..].find(&close)? + body_start;
+    Some(xml[body_start..end].to_string())
+}
+
 /// Locate `ownmeshd` next to the CLI or on PATH.
 pub fn resolve_ownmeshd_path(explicit: Option<&str>) -> Result<PathBuf, String> {
     if let Some(raw) = explicit {
@@ -1073,7 +1453,8 @@ fn install_windows<R: ProcessRunner + ?Sized>(
     match out {
         Ok(o) if o.success() => Ok(()),
         Ok(o) => {
-            // Fallback: /TR form with quoted command.
+            // Fallback: /TR form with the identical quoted command line,
+            // including the install-time path binding (#148).
             let tr = windows_task_run_command(paths);
             let out2 = runner.run(
                 "schtasks",
@@ -1318,13 +1699,75 @@ fn install_macos(runner: &impl ProcessRunner, paths: &ServicePaths) -> Result<()
     ))
 }
 
+/// launchd reports an absent job/service in several wordings; all mean the
+/// requested state is already reached, which is idempotent success.
+#[cfg(any(test, target_os = "macos"))]
+fn launchctl_absent(out: &CommandOutput) -> bool {
+    let text = format!("{}{}", out.stdout, out.stderr).to_ascii_lowercase();
+    text.contains("no such process")
+        || text.contains("could not find specified service")
+        || text.contains("not find service")
+        || text.contains("no such file or directory")
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_already_loaded(out: &CommandOutput) -> bool {
+    let text = format!("{}{}", out.stdout, out.stderr).to_ascii_lowercase();
+    text.contains("already bootstrapped") || text.contains("service already loaded")
+}
+
 #[cfg(target_os = "macos")]
 fn uninstall_macos(runner: &impl ProcessRunner) -> Result<(), String> {
     let plist_path = launch_agent_path()?;
     let uid = user_id_string()?;
     let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{SERVICE_LABEL}");
     let plist_str = plist_path.display().to_string();
-    let _ = runner.run("launchctl", &["bootout", &domain, &plist_str]);
+
+    // The descriptor is removed only after launchd confirms the job is gone.
+    // Deleting the plist first would hide a failed bootout behind an
+    // "installed: false" probe while the process kept running (#147).
+    let out = runner.run("launchctl", &["bootout", &target])?;
+    if !out.success() && !launchctl_absent(&out) {
+        let fallback = runner.run("launchctl", &["bootout", &domain, &plist_str])?;
+        if !fallback.success() && !launchctl_absent(&fallback) {
+            return Err(format!(
+                "launchctl bootout failed; LaunchAgent left installed so uninstall can be retried: {}{}{}{}",
+                out.stdout, out.stderr, fallback.stdout, fallback.stderr
+            ));
+        }
+    }
+    // Only an explicitly reported absence proves the job is unloaded. A
+    // permission, domain, or spawn failure from `launchctl print` says nothing
+    // about liveness, and treating it as absence would delete the descriptor
+    // (and later the record) with the job possibly still running — the exact
+    // partial-cleanup shape #147 is about.
+    let probe = runner.run("launchctl", &["print", &target]);
+    match classify_unload_probe(&probe) {
+        UnloadProof::Unloaded => {}
+        UnloadProof::StillLoaded => {
+            return Err(
+                "LaunchAgent job is still loaded after bootout; LaunchAgent left installed so uninstall can be retried"
+                    .into(),
+            );
+        }
+        UnloadProof::Unknown => {
+            let detail = match &probe {
+                Ok(out) => format!(
+                    "status {}: {}{}",
+                    out.status,
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                ),
+                Err(error) => error.clone(),
+            };
+            return Err(format!(
+                "launchctl print could not confirm the job is unloaded ({detail}); \
+                 liveness is unknown, so the LaunchAgent is left installed and uninstall can be retried"
+            ));
+        }
+    }
+
     match fs::remove_file(&plist_path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1405,10 +1848,125 @@ fn install_linux(runner: &impl ProcessRunner, paths: &ServicePaths) -> Result<()
     Ok(())
 }
 
+/// systemd wordings that mean the requested end state already holds. These are
+/// idempotent success; every other failure is reported (#149).
+#[cfg(any(test, target_os = "linux"))]
+fn systemctl_already_absent(out: &CommandOutput) -> bool {
+    let text = format!("{}{}", out.stdout, out.stderr).to_ascii_lowercase();
+    // An unreachable user bus is not proof that the unit is gone — it is the
+    // second uninstall failure shape in #149 (stop, disable, daemon-reload and
+    // the probe all fail while the manager keeps running ownmeshd). Its message
+    // ends in "No such file or directory", so absence must be matched on unit
+    // wording only, never on a bare errno string.
+    if text.contains("failed to connect to bus") || text.contains("failed to connect to system") {
+        return false;
+    }
+    text.contains("not loaded")
+        || text.contains("could not be found")
+        || text.contains("does not exist")
+        || text.contains("no such unit")
+}
+
+/// Stop and disable the unit, then prove the manager considers it inactive.
+///
+/// Split out from [`uninstall_linux`] so the failure paths are testable without
+/// touching the filesystem, and so no descriptor is deleted until this returns
+/// `Ok` (#149).
+#[cfg(any(test, target_os = "linux"))]
+pub(super) fn stop_and_disable_user_unit<R: ProcessRunner + ?Sized>(
+    runner: &R,
+) -> Result<(), String> {
+    // Every systemctl result is checked. Discarding them and deleting the unit
+    // file would make a failed stop look like a completed uninstall while
+    // ownmeshd kept running and serving remote execution.
+    for verb in ["stop", "disable"] {
+        let out = runner.run("systemctl", &["--user", verb, SERVICE_UNIT_NAME])?;
+        if !out.success() && !systemctl_already_absent(&out) {
+            return Err(format!(
+                "systemctl --user {verb} failed ({}); unit left installed so uninstall can be retried: {}{}",
+                out.status,
+                out.stdout.trim(),
+                out.stderr.trim()
+            ));
+        }
+    }
+
+    // An unknown manager state is not proof of an inactive unit, so only an
+    // explicitly reported down state may pass. `is-active` exits non-zero for
+    // every state except `active`, so the exit status cannot be the signal:
+    // keying on it would let `Failed to connect to bus` (empty stdout) fall
+    // through as "not active" and delete the unit of a still-running manager.
+    let mut last_seen = String::new();
+    for attempt in 0..IS_ACTIVE_POLL_ATTEMPTS {
+        let probe = runner.run("systemctl", &["--user", "is-active", SERVICE_UNIT_NAME])?;
+        match classify_is_active(&probe) {
+            UnitLiveness::Down => return Ok(()),
+            // A unit can still be tearing down immediately after `stop`.
+            UnitLiveness::Up | UnitLiveness::Deactivating => {
+                last_seen = probe.stdout.trim().to_owned();
+                if attempt + 1 < IS_ACTIVE_POLL_ATTEMPTS {
+                    std::thread::sleep(IS_ACTIVE_POLL_INTERVAL);
+                }
+            }
+            UnitLiveness::Unknown => {
+                return Err(format!(
+                    "systemctl --user is-active could not be classified ({}): {}{}; \
+                     liveness is unknown, so the unit is left installed and uninstall can be retried",
+                    probe.status,
+                    probe.stdout.trim(),
+                    probe.stderr.trim()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "systemctl --user still reports ownmesh-ownmeshd.service as '{last_seen}' after stop; \
+         unit left installed so uninstall can be retried"
+    ))
+}
+
+/// Bounded wait for a unit to finish tearing down after `stop`.
+#[cfg(any(test, target_os = "linux"))]
+const IS_ACTIVE_POLL_ATTEMPTS: usize = 10;
+#[cfg(any(test, target_os = "linux"))]
+const IS_ACTIVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What `systemctl is-active` proved about the unit.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnitLiveness {
+    /// Explicitly reported as not running.
+    Down,
+    /// Explicitly reported as running or coming up.
+    Up,
+    /// Explicitly reported as still tearing down.
+    Deactivating,
+    /// The manager did not answer with a state OwnMesh recognizes. Never
+    /// treated as proof of anything.
+    Unknown,
+}
+
+/// Classify `systemctl is-active` output.
+///
+/// The exit status is deliberately ignored: `is-active` exits non-zero for
+/// every state other than `active`, so only the reported state word is
+/// evidence. Anything else — an empty answer from an unreachable bus, a
+/// localized message, an unrecognized state — is [`UnitLiveness::Unknown`].
+#[cfg(any(test, target_os = "linux"))]
+pub(super) fn classify_is_active(out: &CommandOutput) -> UnitLiveness {
+    match out.stdout.trim() {
+        // `unknown` is what systemd answers for a unit it has never loaded.
+        "inactive" | "failed" | "unknown" => UnitLiveness::Down,
+        "active" | "activating" | "reloading" | "refreshing" => UnitLiveness::Up,
+        "deactivating" => UnitLiveness::Deactivating,
+        _ => UnitLiveness::Unknown,
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn uninstall_linux(runner: &impl ProcessRunner) -> Result<(), String> {
-    let _ = runner.run("systemctl", &["--user", "stop", SERVICE_UNIT_NAME]);
-    let _ = runner.run("systemctl", &["--user", "disable", SERVICE_UNIT_NAME]);
+    stop_and_disable_user_unit(runner)?;
+
     let unit_path = systemd_user_unit_path()?;
     remove_ownmesh_generated_dropins(&unit_path)?;
     match fs::remove_file(&unit_path) {
@@ -1416,7 +1974,15 @@ fn uninstall_linux(runner: &impl ProcessRunner) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("remove unit: {e}")),
     }
-    let _ = runner.run("systemctl", &["--user", "daemon-reload"]);
+    let reload = runner.run("systemctl", &["--user", "daemon-reload"])?;
+    if !reload.success() {
+        return Err(format!(
+            "systemctl --user daemon-reload failed ({}) after removing the unit; run it manually to reconcile the manager: {}{}",
+            reload.status,
+            reload.stdout.trim(),
+            reload.stderr.trim()
+        ));
+    }
     Ok(())
 }
 
@@ -3448,5 +4014,345 @@ RestrictNamespaces=yes\nProtectProc=invisible\nExecStart=/bin/true\n",
             *runner.tasks.lock().expect("lock"),
             WindowsTaskSet::default()
         );
+    }
+}
+
+/// Review #2 and #4: the macOS descriptor and unload decisions, exercised on
+/// every platform because they are pure functions of their inputs.
+#[cfg(test)]
+mod macos_decision_tests {
+    use super::{
+        classify_unload_probe, launch_agent_descriptor_state, CommandOutput, DescriptorState,
+        UnloadProof,
+    };
+
+    const PLIST: &str =
+        "<plist><dict><key>Label</key><string>dev.ownmesh.ownmeshd</string></dict></plist>\n";
+
+    /// The signature takes no runner, so loaded state cannot influence the
+    /// decision. That is the fix: `service stop` boots the agent out and leaves
+    /// the plist installed, and the next `service install` must not read that
+    /// as drift and bootstrap a KeepAlive job back to running.
+    #[test]
+    fn descriptor_identity_is_the_plist_alone() {
+        assert_eq!(
+            launch_agent_descriptor_state(Some(PLIST), PLIST),
+            DescriptorState::Current
+        );
+        // Line-ending normalization only; nothing else may differ.
+        let crlf = PLIST.replace('\n', "\r\n");
+        assert_eq!(
+            launch_agent_descriptor_state(Some(&crlf), PLIST),
+            DescriptorState::Current
+        );
+    }
+
+    #[test]
+    fn an_edited_or_missing_plist_is_drift() {
+        let edited = PLIST.replace("dev.ownmesh.ownmeshd", "dev.evil.agent");
+        assert!(matches!(
+            launch_agent_descriptor_state(Some(&edited), PLIST),
+            DescriptorState::Drift(_)
+        ));
+        assert!(matches!(
+            launch_agent_descriptor_state(None, PLIST),
+            DescriptorState::Drift(_)
+        ));
+    }
+
+    fn out(status: i32, stdout: &str, stderr: &str) -> Result<CommandOutput, String> {
+        Ok(CommandOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    #[test]
+    fn only_an_explicit_absence_proves_the_job_is_unloaded() {
+        assert_eq!(
+            classify_unload_probe(&out(0, "state = running\n", "")),
+            UnloadProof::StillLoaded
+        );
+        assert_eq!(
+            classify_unload_probe(&out(113, "", "Could not find specified service\n")),
+            UnloadProof::Unloaded
+        );
+        assert_eq!(
+            classify_unload_probe(&out(3, "", "No such process\n")),
+            UnloadProof::Unloaded
+        );
+    }
+
+    /// A probe that failed for its own reasons says nothing about liveness, so
+    /// it must never let the descriptor be deleted (#147 partial cleanup).
+    #[test]
+    fn a_failed_probe_is_never_read_as_absence() {
+        for probe in [
+            out(1, "", "Operation not permitted\n"),
+            out(125, "", "Bootstrap failed: 5: Input/output error\n"),
+            out(1, "", ""),
+            Err("spawn launchctl: No such file or directory".into()),
+        ] {
+            assert_eq!(
+                classify_unload_probe(&probe),
+                UnloadProof::Unknown,
+                "{probe:?} must not be read as proof of absence"
+            );
+        }
+    }
+}
+
+/// #149: `systemctl --user` failures during uninstall must be reported, and no
+/// descriptor may be deleted while the manager still reports the unit active.
+#[cfg(test)]
+mod uninstall_honesty_tests {
+    use super::{
+        classify_is_active, stop_and_disable_user_unit, CommandOutput, ProcessRunner, UnitLiveness,
+    };
+    use std::sync::Mutex;
+
+    /// Runner that fails one chosen systemctl verb and can keep reporting the
+    /// unit active, reproducing both shapes described in #149.
+    struct FailingSystemctl {
+        failing_verb: Option<&'static str>,
+        active_after_stop: bool,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl FailingSystemctl {
+        fn new(failing_verb: Option<&'static str>, active_after_stop: bool) -> Self {
+            Self {
+                failing_verb,
+                active_after_stop,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().expect("lock").clone()
+        }
+    }
+
+    impl ProcessRunner for FailingSystemctl {
+        fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push(format!("{program} {}", args.join(" ")));
+            let verb = args.get(1).copied().unwrap_or_default();
+            if Some(verb) == self.failing_verb {
+                return Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Failed to connect to bus: No such file or directory\n".into(),
+                });
+            }
+            if verb == "is-active" {
+                return Ok(CommandOutput {
+                    status: i32::from(!self.active_after_stop),
+                    stdout: if self.active_after_stop {
+                        "active\n".into()
+                    } else {
+                        "inactive\n".into()
+                    },
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandOutput {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn stop_failure_is_reported_and_stops_the_sequence() {
+        let runner = FailingSystemctl::new(Some("stop"), false);
+        let error = stop_and_disable_user_unit(&runner).unwrap_err();
+        assert!(error.contains("stop failed"), "{error}");
+        assert!(error.contains("retried"), "{error}");
+        // Nothing after the failed stop ran, so no descriptor can be deleted.
+        assert_eq!(runner.calls().len(), 1, "{:?}", runner.calls());
+    }
+
+    #[test]
+    fn disable_failure_is_reported() {
+        let runner = FailingSystemctl::new(Some("disable"), false);
+        let error = stop_and_disable_user_unit(&runner).unwrap_err();
+        assert!(error.contains("disable failed"), "{error}");
+    }
+
+    #[test]
+    fn a_still_active_unit_fails_even_when_every_command_succeeded() {
+        let runner = FailingSystemctl::new(None, true);
+        let error = stop_and_disable_user_unit(&runner).unwrap_err();
+        assert!(error.contains("still reports"), "{error}");
+        assert!(error.contains("'active'"), "{error}");
+        assert!(error.contains("retried"), "{error}");
+    }
+
+    #[test]
+    fn an_absent_unit_is_idempotent_success() {
+        // `systemctl --user stop` on a never-loaded unit is the documented
+        // idempotent case and must not be reported as a failure.
+        struct AbsentUnit;
+        impl ProcessRunner for AbsentUnit {
+            fn run(&self, _program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+                let verb = args.get(1).copied().unwrap_or_default();
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: if verb == "is-active" {
+                        "inactive\n".into()
+                    } else {
+                        String::new()
+                    },
+                    stderr: if verb == "is-active" {
+                        String::new()
+                    } else {
+                        "Unit ownmesh-ownmeshd.service not loaded.\n".into()
+                    },
+                })
+            }
+        }
+        stop_and_disable_user_unit(&AbsentUnit).unwrap();
+    }
+
+    #[test]
+    fn an_unavailable_user_bus_is_never_mistaken_for_an_absent_unit() {
+        // Every systemctl call fails with "Failed to connect to bus: No such
+        // file or directory". That errno string must not be read as unit
+        // absence, or a still-running manager would look uninstalled (#149).
+        struct NoBus;
+        impl ProcessRunner for NoBus {
+            fn run(&self, _program: &str, _args: &[&str]) -> Result<CommandOutput, String> {
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "Failed to connect to bus: No such file or directory\n".into(),
+                })
+            }
+        }
+        let error = stop_and_disable_user_unit(&NoBus).unwrap_err();
+        assert!(error.contains("stop failed"), "{error}");
+    }
+
+    /// Review #5: the bus can fail specifically at `is-active`, after stop and
+    /// disable both succeeded. An unclassifiable answer is not proof of an
+    /// inactive unit, so the unit must be retained rather than removed.
+    #[test]
+    fn a_bus_failure_at_is_active_retains_the_unit() {
+        struct BusDiesAtIsActive;
+        impl ProcessRunner for BusDiesAtIsActive {
+            fn run(&self, _program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+                if args.get(1).copied() == Some("is-active") {
+                    return Ok(CommandOutput {
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: "Failed to connect to bus: No such file or directory\n".into(),
+                    });
+                }
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let error = stop_and_disable_user_unit(&BusDiesAtIsActive).unwrap_err();
+        assert!(error.contains("could not be classified"), "{error}");
+        assert!(error.contains("retried"), "{error}");
+    }
+
+    /// `is-active` exits non-zero for every state except `active`, so the exit
+    /// status can never be the signal. Only the reported state word is.
+    #[test]
+    fn is_active_is_classified_by_state_not_exit_status() {
+        let probe = |status: i32, stdout: &str, stderr: &str| CommandOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        for down in ["inactive", "failed", "unknown"] {
+            assert_eq!(
+                classify_is_active(&probe(3, down, "")),
+                UnitLiveness::Down,
+                "{down} must be down despite the non-zero status"
+            );
+        }
+        assert_eq!(
+            classify_is_active(&probe(0, "active", "")),
+            UnitLiveness::Up
+        );
+        assert_eq!(
+            classify_is_active(&probe(3, "activating", "")),
+            UnitLiveness::Up
+        );
+        assert_eq!(
+            classify_is_active(&probe(3, "deactivating", "")),
+            UnitLiveness::Deactivating
+        );
+        // An unreachable bus answers with nothing at all.
+        assert_eq!(
+            classify_is_active(&probe(
+                1,
+                "",
+                "Failed to connect to bus: No such file or directory"
+            )),
+            UnitLiveness::Unknown
+        );
+        // A localized or unexpected answer is never read as proof.
+        assert_eq!(
+            classify_is_active(&probe(3, "inaktiv", "")),
+            UnitLiveness::Unknown
+        );
+    }
+
+    /// A unit still tearing down is polled rather than failed immediately, and
+    /// passes once it reports inactive.
+    #[test]
+    fn a_deactivating_unit_is_polled_until_it_is_down() {
+        struct Deactivating {
+            calls: Mutex<usize>,
+        }
+        impl ProcessRunner for Deactivating {
+            fn run(&self, _program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+                if args.get(1).copied() != Some("is-active") {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    });
+                }
+                let mut calls = self.calls.lock().expect("lock");
+                *calls += 1;
+                let stdout = if *calls < 3 {
+                    "deactivating"
+                } else {
+                    "inactive"
+                };
+                Ok(CommandOutput {
+                    status: 3,
+                    stdout: format!("{stdout}\n"),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let runner = Deactivating {
+            calls: Mutex::new(0),
+        };
+        stop_and_disable_user_unit(&runner).unwrap();
+        assert!(*runner.calls.lock().expect("lock") >= 3);
+    }
+
+    #[test]
+    fn a_clean_sequence_succeeds() {
+        let runner = FailingSystemctl::new(None, false);
+        stop_and_disable_user_unit(&runner).unwrap();
+        let calls = runner.calls();
+        assert!(calls.iter().any(|c| c.contains("stop")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("disable")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("is-active")), "{calls:?}");
     }
 }

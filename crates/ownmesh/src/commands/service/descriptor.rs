@@ -35,6 +35,26 @@ impl ServicePaths {
     fn runtime_str(&self) -> String {
         self.runtime_dir.canonical.display().to_string()
     }
+
+    /// `ownmeshd` arguments that bind the daemon to the validated install-time
+    /// layout, as typed values rather than shell text.
+    ///
+    /// Windows Scheduled Task actions carry no environment block, so the same
+    /// binding the systemd unit and LaunchAgent express through
+    /// `OWNMESH_*_DIR` travels here as arguments. An injection-prone
+    /// `cmd /c set … &&` wrapper is deliberately avoided (#148).
+    #[must_use]
+    pub fn daemon_run_args(&self) -> Vec<String> {
+        vec![
+            "run".to_string(),
+            "--config-dir".to_string(),
+            self.config_str(),
+            "--state-dir".to_string(),
+            self.state_str(),
+            "--runtime-dir".to_string(),
+            self.runtime_str(),
+        ]
+    }
 }
 
 /// Render a systemd --user unit.
@@ -228,15 +248,12 @@ pub fn render_launch_agent_plist(paths: &ServicePaths) -> String {
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub fn render_scheduled_task_xml(paths: &ServicePaths) -> String {
     let exe = xml_escape(&paths.exe_str());
-    // Command line: quoted exe + run
-    let args = xml_escape("run");
-    let config = xml_escape(&paths.config_str());
-    let state = xml_escape(&paths.state_str());
-    let runtime = xml_escape(&paths.runtime_str());
-    // Environment via cmd wrapper is avoided; Task Scheduler supports little env
-    // injection safely. We pass env through a tiny wrapper command line using
-    // `cmd /c set ...&&` is injection-prone — instead document that ownmeshd
-    // discovers default user paths. Still embed WorkingDirectory.
+    // A Task Scheduler action carries no environment block, and a
+    // `cmd /c set … &&` wrapper would be injection-prone. The install-time
+    // layout therefore travels as typed `ownmeshd run` arguments, exactly as
+    // the `/TR` fallback builds them, so both registration paths bind the same
+    // daemon context (#148).
+    let args = xml_escape(&windows_task_arguments(paths));
     let workdir = {
         let p = paths
             .executable
@@ -246,7 +263,6 @@ pub fn render_scheduled_task_xml(paths: &ServicePaths) -> String {
             .unwrap_or_default();
         xml_escape(&p)
     };
-    let _ = (config, state, runtime); // reserved for future Task env support
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -298,11 +314,30 @@ pub fn render_scheduled_task_xml(paths: &ServicePaths) -> String {
     )
 }
 
+/// Windows task argument string (everything after the executable).
+///
+/// Shared by the XML `<Arguments>` element and the `/TR` fallback so the two
+/// registration paths are behaviorally identical.
+#[must_use]
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub fn windows_task_arguments(paths: &ServicePaths) -> String {
+    paths
+        .daemon_run_args()
+        .iter()
+        .map(|arg| quote_windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Build the Windows `schtasks /TR` action string with safe quoting.
 #[must_use]
 #[cfg_attr(not(any(test, windows)), allow(dead_code))]
 pub fn windows_task_run_command(paths: &ServicePaths) -> String {
-    format!("{} run", quote_windows_arg(&paths.exe_str()))
+    format!(
+        "{} {}",
+        quote_windows_arg(&paths.exe_str()),
+        windows_task_arguments(paths)
+    )
 }
 
 #[cfg(test)]
@@ -526,7 +561,48 @@ mod tests {
         // Must not *run as* LocalSystem (description may mention it negatively).
         assert!(!xml.contains("<UserId>LocalSystem</UserId>"));
         assert!(!xml.contains("HighestAvailable"));
+    }
+
+    /// #148: the Windows task must bind the daemon to the same validated
+    /// config/state/runtime directories the installing CLI used, and the XML
+    /// import and `/TR` fallback must register the identical action.
+    #[test]
+    fn scheduled_task_binds_install_time_paths_in_both_registration_paths() {
+        let (_dir, sp) = sample_paths();
+        let xml = render_scheduled_task_xml(&sp);
         let tr = windows_task_run_command(&sp);
-        assert!(tr.ends_with(" run"));
+        let arguments = windows_task_arguments(&sp);
+
+        for flag in ["--config-dir", "--state-dir", "--runtime-dir"] {
+            assert!(xml.contains(flag), "task XML must carry {flag}:\n{xml}");
+            assert!(tr.contains(flag), "/TR fallback must carry {flag}: {tr}");
+        }
+        for dir in [
+            sp.config_dir.canonical.display().to_string(),
+            sp.state_dir.canonical.display().to_string(),
+            sp.runtime_dir.canonical.display().to_string(),
+        ] {
+            assert!(
+                xml.contains(&xml_escape(&dir)),
+                "task XML must bind {dir}:\n{xml}"
+            );
+            assert!(tr.contains(&dir), "/TR fallback must bind {dir}: {tr}");
+        }
+        // Both registration paths derive from one argument builder, so they
+        // cannot drift apart.
+        assert!(
+            tr.ends_with(&arguments),
+            "/TR fallback must end with the shared arguments: {tr}"
+        );
+        assert!(
+            xml.contains(&format!(
+                "<Arguments>{}</Arguments>",
+                xml_escape(&arguments)
+            )),
+            "task XML arguments must equal the shared arguments:\n{xml}"
+        );
+        // No shell wrapper: a `cmd /c set … &&` form would be injection-prone.
+        assert!(!tr.to_ascii_lowercase().contains("cmd /c"), "{tr}");
+        assert!(!xml.to_ascii_lowercase().contains("cmd /c"), "{xml}");
     }
 }

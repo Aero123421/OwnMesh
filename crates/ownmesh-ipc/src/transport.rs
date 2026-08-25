@@ -687,7 +687,9 @@ pub async fn connect(endpoint: &Endpoint) -> IpcResult<ClientConnection> {
                 }
             }
             Err(IpcError::Disconnected(format!(
-                "failed to open named pipe {name}: {}",
+                "failed to open named pipe {name}: {}; a daemon started by a release that \
+                 predates the digest-scoped pipe name listens on a different pipe — run \
+                 `ownmesh service restart` after upgrading",
                 last_err
                     .map(|e| e.to_string())
                     .unwrap_or_else(|| "unknown".into())
@@ -1895,10 +1897,59 @@ unsafe fn process_image_path(pid: u32) -> Option<String> {
 #[cfg(unix)]
 fn prepare_unix_path(path: &Path) -> IpcResult<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if Endpoint::is_short_socket_root(parent) {
+            // The shortened-endpoint root lives in a shared world-writable
+            // directory, so it is created and re-validated as owner-only on
+            // every bind rather than trusted because it already exists.
+            ensure_owner_only_short_root(parent)?;
+        } else {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     if path.exists() {
         std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Create (0700) or attest custody of the shortened-endpoint root.
+///
+/// Fail-closed: a pre-existing entry must be a real directory — not a symlink —
+/// owned by this uid with no group/other bits. Anything else is refused instead
+/// of being repaired, because a hostile pre-creation is indistinguishable from
+/// a damaged one and binding into it would expose the socket.
+#[cfg(unix)]
+fn ensure_owner_only_short_root(root: &Path) -> IpcResult<()> {
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    match DirBuilder::new().mode(0o700).create(root) {
+        Ok(()) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(IpcError::Io(err)),
+    }
+
+    let meta = std::fs::symlink_metadata(root)?;
+    if !meta.file_type().is_dir() {
+        return Err(IpcError::Protocol(format!(
+            "shortened socket root {} is not a directory (fail-closed)",
+            root.display()
+        )));
+    }
+    let uid = rustix::process::getuid().as_raw();
+    if meta.uid() != uid {
+        return Err(IpcError::Protocol(format!(
+            "shortened socket root {} is owned by uid {} rather than {uid} (fail-closed)",
+            root.display(),
+            meta.uid()
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(IpcError::Protocol(format!(
+            "shortened socket root {} has mode {mode:04o}; owner-only 0700 is required (fail-closed)",
+            root.display()
+        )));
     }
     Ok(())
 }
