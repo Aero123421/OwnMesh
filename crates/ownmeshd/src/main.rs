@@ -47,10 +47,47 @@ struct Cli {
     command: Option<Commands>,
 }
 
+/// Explicit layout binding for `ownmeshd run`.
+///
+/// A service descriptor must pin the daemon to the directories validated at
+/// install time. Windows Scheduled Task actions cannot carry environment
+/// variables safely, so the binding travels as typed arguments instead of an
+/// injection-prone `cmd /c set ... &&` wrapper (#148). These take precedence
+/// over `OWNMESH_*` environment variables.
+#[derive(Debug, Default, clap::Args)]
+// The `_dir` suffixes are the CLI contract: clap derives `--config-dir`,
+// `--state-dir`, and `--runtime-dir` from these names, and they mirror
+// `ownmesh_config::PathOverrides`.
+#[allow(clippy::struct_field_names)]
+struct PathArgs {
+    /// Absolute configuration directory to bind this daemon to.
+    #[arg(long, value_name = "DIR")]
+    config_dir: Option<std::path::PathBuf>,
+    /// Absolute durable-state directory to bind this daemon to.
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<std::path::PathBuf>,
+    /// Absolute runtime directory (IPC endpoint) to bind this daemon to.
+    #[arg(long, value_name = "DIR")]
+    runtime_dir: Option<std::path::PathBuf>,
+}
+
+impl PathArgs {
+    fn into_overrides(self) -> ownmesh_config::PathOverrides {
+        ownmesh_config::PathOverrides {
+            config_dir: self.config_dir,
+            state_dir: self.state_dir,
+            runtime_dir: self.runtime_dir,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Run the daemon in the foreground (default).
-    Run,
+    Run {
+        #[command(flatten)]
+        paths: PathArgs,
+    },
     /// Print version and exit.
     Version,
     /// Show whether a local daemon appears reachable.
@@ -86,8 +123,21 @@ enum CredentialCommands {
 fn main() -> StdExitCode {
     init_tracing();
     let cli = Cli::parse();
-    let code = match cli.command.unwrap_or(Commands::Run) {
-        Commands::Run => run_daemon(),
+    let code = match cli.command.unwrap_or_else(|| Commands::Run {
+        paths: PathArgs::default(),
+    }) {
+        Commands::Run { paths } => {
+            // Bind the layout before anything resolves it, so every later
+            // `OwnMeshPaths::discover()` in this process agrees with the
+            // descriptor that launched it.
+            match ownmesh_config::install_path_overrides(&paths.into_overrides()) {
+                Ok(()) => run_daemon(),
+                Err(error) => {
+                    tracing::error!(error = %error, "invalid path arguments");
+                    ExitCode::UsageConfig
+                }
+            }
+        }
         Commands::Version => {
             println!(
                 "{name} {version}",
