@@ -1406,6 +1406,229 @@ pub fn process_birth_id(_pid: u32) -> Result<Option<u64>, String> {
     Err("process birth identity is unavailable on this platform".into())
 }
 
+/// Return the birth witness of a PID that is **still running**.
+///
+/// This differs from [`process_birth_id`] in exactly one way: a process that
+/// has already exited but has not yet been reaped by its parent reports
+/// `Ok(None)` (exited) instead of `Ok(Some(birth))` (live).
+///
+/// A Unix zombie still owns its PID slot and its kernel-recorded start time,
+/// so a pure birth-witness probe reports it as present. Session lifecycle
+/// treats "the attested child is present" as "the child is alive", which is
+/// how a short-lived session whose child had already exited stayed pinned as
+/// `running` and refused reconciliation with "authenticated child is still
+/// alive, refusing PID-only termination" (#31).
+///
+/// The PID-reuse protection is unchanged: the caller still compares the
+/// returned witness against the one it persisted, and a reused PID reports a
+/// different birth. This only stops an exited-but-unreaped process from being
+/// mistaken for a live one — it never converts an indeterminate probe into a
+/// "dead" answer, which stays an `Err` so callers keep failing closed.
+#[cfg(target_os = "linux")]
+pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {path}: {error}")),
+    };
+    // `comm` (field 2) is parenthesized and may itself contain spaces and
+    // parentheses, so every field after it is located from the last `)`.
+    let end = stat
+        .rfind(')')
+        .ok_or_else(|| format!("parse {path}: missing comm terminator"))?;
+    let rest = stat
+        .get(end + 2..)
+        .ok_or_else(|| format!("parse {path}: missing fields"))?;
+    let mut fields = rest.split_whitespace();
+    // Field 3: process state character.  `Z` is a reaped-pending zombie and
+    // `X`/`x` is a fully dead task still visible for an instant.
+    let state = fields
+        .next()
+        .ok_or_else(|| format!("parse {path}: missing process state"))?;
+    if matches!(state, "Z" | "X" | "x") {
+        return Ok(None);
+    }
+    // Field 22 (`starttime`) is 19 fields further along from field 3.
+    fields
+        .nth(18)
+        .ok_or_else(|| format!("parse {path}: missing start time"))?
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| format!("parse {path} start time: {error}"))
+}
+
+/// Windows equivalent of the Unix zombie case: a process object stays
+/// queryable while any handle to it is open, so `GetProcessTimes` keeps
+/// answering for an exited process. `WaitForSingleObject` with a zero timeout
+/// is the unambiguous liveness answer — unlike `GetExitCodeProcess`, it cannot
+/// be confused by a live process that happens to be destined to exit with
+/// `STILL_ACTIVE` (259).
+#[cfg(windows)]
+pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+    };
+
+    // SAFETY: `OpenProcess` receives a scalar PID and the returned kernel
+    // handle is immediately wrapped in `OwnedHandle` for RAII cleanup.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        // ERROR_INVALID_PARAMETER is Windows' documented no-such-PID result.
+        return if error.raw_os_error() == Some(87) {
+            Ok(None)
+        } else {
+            Err(format!("OpenProcess({pid}) failed: {error}"))
+        };
+    }
+    // SAFETY: ownership of the non-null handle returned above is transferred
+    // exactly once to `OwnedHandle`.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: the owned process handle remains live for this call.
+    let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), 0) };
+    if wait == WAIT_OBJECT_0 {
+        // The process object is signaled: the process has exited.
+        return Ok(None);
+    }
+    if wait == WAIT_FAILED {
+        return Err(format!(
+            "WaitForSingleObject({pid}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the owned process handle remains live for this call.
+    unsafe { process_creation_filetime(process.as_raw_handle()).map(Some) }
+}
+
+/// Darwin reports a reaped-pending child as `SZOMB` in `pbi_status`.
+#[cfg(target_os = "macos")]
+pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+    use std::mem::{size_of, MaybeUninit};
+
+    /// `SZOMB` from `<sys/proc.h>`; `libc` does not re-export the `p_stat`
+    /// constants that `proc_bsdinfo::pbi_status` uses.
+    const DARWIN_SZOMB: u32 = 5;
+
+    let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(size_of::<libc::proc_bsdinfo>())
+        .map_err(|_| "proc_bsdinfo size exceeds c_int")?;
+    // SAFETY: `info` has exactly `size` writable bytes and `proc_pidinfo`
+    // initializes them on a successful full-size reply.
+    let copied = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(pid).map_err(|_| format!("PID {pid} exceeds c_int"))?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if copied == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) | Some(libc::ENOENT) => Ok(None),
+            _ => Err(format!("proc_pidinfo({pid}) failed: {error}")),
+        };
+    }
+    if copied != size {
+        return Err(format!(
+            "proc_pidinfo({pid}) returned incomplete proc_bsdinfo ({copied} of {size} bytes)"
+        ));
+    }
+    // SAFETY: exact-size successful `proc_pidinfo` reply initialized info.
+    let info = unsafe { info.assume_init() };
+    if u32::from(info.pbi_status) == DARWIN_SZOMB {
+        return Ok(None);
+    }
+    const MICROS_PER_SECOND: u64 = 1_000_000;
+    if info.pbi_start_tvusec >= MICROS_PER_SECOND {
+        return Err(format!(
+            "proc_pidinfo({pid}) returned invalid start microseconds {}",
+            info.pbi_start_tvusec
+        ));
+    }
+    let birth = info
+        .pbi_start_tvsec
+        .checked_mul(MICROS_PER_SECOND)
+        .and_then(|seconds| seconds.checked_add(info.pbi_start_tvusec))
+        .filter(|birth| *birth != 0)
+        .ok_or_else(|| format!("proc_pidinfo({pid}) returned invalid process start time"))?;
+    Ok(Some(birth))
+}
+
+/// Other platforms keep the same fail-closed contract as
+/// [`process_birth_id`]: no witness, no reconciliation.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn running_process_birth_id(_pid: u32) -> Result<Option<u64>, String> {
+    Err("process liveness is unavailable on this platform".into())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_liveness_tests {
+    use super::{process_birth_id, running_process_birth_id};
+
+    /// #31: a child that exited but has not been reaped keeps its PID slot and
+    /// its kernel start time, so a birth-witness probe still finds it. Session
+    /// lifecycle must see it as exited or a dead session stays `running`
+    /// forever and refuses reconciliation.
+    #[test]
+    fn a_zombie_child_is_exited_even_though_its_birth_witness_survives() {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = child.id();
+        // Deliberately do NOT reap: wait for the kernel to publish state `Z`.
+        let mut state = String::new();
+        for _ in 0..200 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            if let Some(end) = stat.rfind(')') {
+                state = stat
+                    .get(end + 2..)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+            if state == "Z" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(state, "Z", "child did not become a zombie");
+
+        // The plain birth witness still reports the PID as present ...
+        assert!(
+            process_birth_id(pid).expect("probe succeeds").is_some(),
+            "a zombie keeps its PID slot and start time"
+        );
+        // ... while the liveness probe correctly reports it as exited.
+        assert_eq!(
+            running_process_birth_id(pid).expect("probe succeeds"),
+            None,
+            "a zombie must be treated as exited for session lifecycle"
+        );
+
+        child.wait().expect("reap the child");
+    }
+
+    /// PID-reuse protection is unchanged: a running process still returns the
+    /// same stable witness the caller persisted.
+    #[test]
+    fn a_running_process_keeps_its_stable_birth_witness() {
+        let pid = std::process::id();
+        let live = running_process_birth_id(pid)
+            .expect("probe succeeds")
+            .expect("the current process is running");
+        assert_eq!(Some(live), process_birth_id(pid).expect("probe succeeds"));
+        assert_eq!(
+            running_process_birth_id(pid).expect("probe succeeds"),
+            Some(live),
+        );
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::process_birth_id;

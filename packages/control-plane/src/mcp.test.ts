@@ -23,6 +23,10 @@ import {
   makeEnvelope,
   sanitizeMcpArgs,
   normalizeSystemDiagnosis,
+  mcpCatalogFingerprint,
+  mcpCatalogRevision,
+  mcpSessionCatalogRevision,
+  PUBLISHED_MCP_TOOLS,
   __setGetOperationWaiterCapForTest,
 } from "./mcp.ts";
 import {
@@ -201,6 +205,136 @@ test("MCP initialize and tools/list remain reachable without a bearer", async ()
     { issuer: "https://cp.test" },
   );
   assert.equal(listed.status, 200);
+});
+
+// #158: ChatGPT held a 51-tool snapshot while the deployment published 54.
+test("MCP publishes one comparable catalog generation across every surface", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const url = new URL("https://cp.test/mcp");
+  const opts = { issuer: "https://cp.test" };
+  const revision = await mcpCatalogRevision();
+  assert.match(revision, /^[0-9a-f]{16}$/);
+  // Deterministic: the same catalog always hashes to the same revision.
+  assert.equal(revision, await mcpCatalogRevision());
+
+  const discovery = await handleMcp(
+    new Request(url, { method: "GET", headers: { accept: "application/json" } }),
+    store,
+    url,
+    undefined,
+    opts,
+  );
+  const discoveryBody = await discovery.json() as Record<string, unknown>;
+  assert.equal(discoveryBody.catalog_revision, revision);
+
+  const init = await handleMcp(
+    rpc("initialize", { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {} }),
+    store,
+    url,
+    undefined,
+    opts,
+  );
+  const initBody = await init.json() as { result: Record<string, unknown> };
+  const meta = initBody.result._meta as Record<string, unknown>;
+  assert.equal(meta["ownmesh/catalog_revision"], revision);
+  const sessionId = init.headers.get("mcp-session-id");
+  assert.equal(mcpSessionCatalogRevision(sessionId), revision);
+
+  const listed = await handleMcp(rpc("tools/list", {}), store, url, undefined, opts);
+  const listedBody = await listed.json() as {
+    result: { tools: { name: string }[]; _meta: Record<string, unknown> };
+  };
+  assert.equal(listedBody.result._meta["ownmesh/catalog_revision"], revision);
+
+  // The number advertised anonymously, the number actually listed, and the
+  // published registry must be one generation - a client that trusts any of
+  // the three sees the same catalog.
+  assert.equal(discoveryBody.tools, PUBLISHED_MCP_TOOLS.length);
+  assert.equal(listedBody.result.tools.length, PUBLISHED_MCP_TOOLS.length);
+  assert.equal(meta["ownmesh/tool_count"], PUBLISHED_MCP_TOOLS.length);
+
+  // The published set is exactly the non-alias, non-hidden registry, and a
+  // withheld compatibility alias stays callable but undiscoverable.
+  const listedNames = listedBody.result.tools.map((t) => t.name).sort();
+  const expectedNames = MCP_TOOLS.filter((t) => !t.aliasOf && !t.hidden)
+    .map((t) => t.name)
+    .sort();
+  assert.deepEqual(listedNames, expectedNames);
+  const hidden = MCP_TOOLS.filter((t) => t.aliasOf || t.hidden).map((t) => t.name);
+  for (const name of hidden) {
+    assert.equal(listedNames.includes(name), false, `${name} must stay out of tools/list`);
+  }
+
+  // The revision covers what tools/list actually returns: a description or
+  // schema edit changes it, so a client cannot silently keep an old snapshot.
+  const fingerprint = mcpCatalogFingerprint();
+  for (const tool of PUBLISHED_MCP_TOOLS) {
+    assert.ok(fingerprint.includes(JSON.stringify(tool.name)));
+  }
+});
+
+test("a stale MCP session is expired so the client must re-initialize", async () => {
+  const store = new MemoryStore();
+  await store.ensureBootstrap();
+  const url = new URL("https://cp.test/mcp");
+  const opts = { issuer: "https://cp.test" };
+  const revision = await mcpCatalogRevision();
+
+  const withSession = (method: string, sessionId: string) => {
+    const req = rpc(method, {});
+    const headers = new Headers(req.headers);
+    headers.set("mcp-session-id", sessionId);
+    return new Request(req, { headers });
+  };
+
+  // A session minted under the current catalog keeps working.
+  const current = await handleMcp(
+    withSession("tools/list", `mcp_${revision}_s_live`),
+    store,
+    url,
+    undefined,
+    opts,
+  );
+  assert.equal(current.status, 200);
+
+  // A session minted under a different catalog generation gets HTTP 404, which
+  // MCP defines as "session expired, start a new one with initialize".
+  const stale = "0".repeat(16);
+  assert.notEqual(stale, revision);
+  const expired = await handleMcp(
+    withSession("tools/list", `mcp_${stale}_s_old`),
+    store,
+    url,
+    undefined,
+    opts,
+  );
+  assert.equal(expired.status, 404);
+  const expiredBody = await expired.json() as Record<string, unknown>;
+  assert.equal(expiredBody.reason, "tool_catalog_changed");
+  assert.equal(expiredBody.catalog_revision, revision);
+
+  // `initialize` is how a client recovers, so it is never refused.
+  const reinit = await handleMcp(
+    withSession("initialize", `mcp_${stale}_s_old`),
+    store,
+    url,
+    undefined,
+    opts,
+  );
+  assert.equal(reinit.status, 200);
+  assert.equal(mcpSessionCatalogRevision(reinit.headers.get("mcp-session-id")), revision);
+
+  // A session id this Worker never minted is not treated as a stale catalog.
+  const foreign = await handleMcp(
+    withSession("tools/list", "client-invented-session"),
+    store,
+    url,
+    undefined,
+    opts,
+  );
+  assert.equal(foreign.status, 200);
+  assert.equal(mcpSessionCatalogRevision("client-invented-session"), null);
 });
 
 test("MCP catalog has annotations and separates shell from structured run", () => {
@@ -484,7 +618,7 @@ test("elevated structured command is normalized and exact-action-bound", async (
 
   const make = (args: Record<string, unknown>) => buildDeviceOperation({
     toolName: "ownmesh_command_run", args, operationId: "op_elevated", deviceId: "dev_elevated",
-    principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 7,
+    principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 7, principalRevocationEpoch: 1,
     expiresAt: "2099-01-01T00:00:00.000Z", oauthClientId: "client_mcp",
   });
   const [plain, privileged] = await Promise.all([make(ordinary), make(elevated)]);
@@ -508,7 +642,7 @@ test("detached structured command is normalized and exact-action-bound", async (
 
   const make = (args: Record<string, unknown>) => buildDeviceOperation({
     toolName: "ownmesh_command_run", args, operationId: "op_detach", deviceId: "dev_detach",
-    principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 7,
+    principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 7, principalRevocationEpoch: 1,
     expiresAt: "2099-01-01T00:00:00.000Z", oauthClientId: "client_mcp",
   });
   const [plain, detachedOp] = await Promise.all([make(ordinary), make(detached)]);
@@ -1483,6 +1617,194 @@ test("system diagnosis folds device-local journal and discovery health into over
   assert.match(winNotesJson, /\[REDACTED\]/);
   assert.match(winNotesJson, /ok note/);
   assert.doesNotMatch(JSON.stringify(winNotes), /Alice|Bob/);
+});
+
+// #161: Control Plane N must interpret Agent N-1, N and N+1 diagnoses.
+test("system diagnosis is forward-compatible across the Agent contract matrix", () => {
+  const device = {
+    agent_version: "1.2.22",
+    protocol_version: "ownmesh.device/1.0",
+    created_at: "2026-08-25T00:00:00Z",
+  };
+  const observedAt = "2026-08-25T00:00:00Z";
+  const check = (id: string, state: string, status: "pass" | "warn" | "fail" = "pass") => ({
+    id,
+    status,
+    state,
+    provenance: ["policy", "workspace", "sessions"].includes(id) ? "authoritative" : "observed",
+    observed_at: observedAt,
+  });
+  const requiredChecks = [
+    check("policy", "allow"),
+    check("workspace", "bound_enforced"),
+    check("daemon", "running"),
+    check("session_supervisor", "not_required"),
+    { ...check("sessions", "healthy"), count: 0, nonterminal_count: 0, stale_count: 0 },
+  ];
+  const findCheck = (result: Record<string, unknown>, id: string) =>
+    (result.checks as Record<string, unknown>[]).find((c) => c.id === id);
+
+  // Agent N-1: the pre-`agent_route` five-check payload still parses.
+  const older = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.19", protocol_version: "ownmesh.device/1.0" },
+      checks: requiredChecks,
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(older.overall, "healthy");
+
+  // Agent N+1 (the exact #161 production shape): an additive check emitted
+  // *before* a required one must not truncate that required check away. This
+  // is what collapsed a valid 1.2.21 diagnosis into `invalid_response` on a
+  // 1.2.19 Worker, because the scan window was the size of the known-id set.
+  const additiveBeforeRequired = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.23", protocol_version: "ownmesh.device/1.0" },
+      checks: [
+        check("policy", "allow"),
+        check("workspace", "bound_enforced"),
+        check("daemon", "running"),
+        check("agent_route", "online"),
+        check("future_probe_a", "whatever"),
+        check("future_probe_b", "whatever"),
+        check("session_supervisor", "not_required"),
+        { ...check("sessions", "healthy"), count: 0, nonterminal_count: 0, stale_count: 0 },
+      ],
+      future_section: { anything: "additive" },
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(additiveBeforeRequired.overall, "healthy");
+  assert.equal(additiveBeforeRequired.diagnosis_rejection, undefined);
+  assert.equal(findCheck(additiveBeforeRequired, "sessions")?.state, "healthy");
+  assert.equal(findCheck(additiveBeforeRequired, "future_probe_a"), undefined);
+  assert.equal(findCheck(additiveBeforeRequired, "device_diagnosis"), undefined);
+
+  // A known check carrying an unknown state stays bounded and visible rather
+  // than discarding the whole diagnosis — and never reports healthy.
+  const unknownState = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.7",
+      observed_at: observedAt,
+      agent: { version: "1.3.0", protocol_version: "ownmesh.device/1.0" },
+      checks: [
+        ...requiredChecks.filter((c) => c.id !== "daemon"),
+        check("daemon", "quiesced_for_update", "warn"),
+      ],
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(unknownState.overall, "agent_contract_drift");
+  assert.equal(unknownState.recommendation, "upgrade_control_plane");
+  assert.equal(findCheck(unknownState, "daemon")?.state, "unsupported_value");
+  assert.equal(findCheck(unknownState, "daemon")?.status, "warn");
+  assert.doesNotMatch(JSON.stringify(unknownState), /quiesced_for_update/);
+
+  // A different contract major is an explicit deployment answer, not a
+  // malformed device response.
+  const futureMajor = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/2.0",
+      observed_at: observedAt,
+      agent: { version: "2.0.0", protocol_version: "ownmesh.device/1.0" },
+      checks: requiredChecks,
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(futureMajor.overall, "unsupported_diagnosis_version");
+  assert.equal(futureMajor.diagnosis_rejection, "unsupported_contract_version");
+  assert.equal(futureMajor.recommendation, "upgrade_control_plane");
+  const versionCheck = findCheck(futureMajor, "device_diagnosis");
+  assert.equal(versionCheck?.state, "unsupported_contract_version");
+  assert.equal(versionCheck?.received_contract_major, 2);
+  assert.equal(versionCheck?.supported_contract, "ownmesh.system_diagnosis/1.1");
+
+  // Every remaining rejection keeps its own bounded reason code instead of one
+  // opaque `invalid_response` bucket.
+  const rejectionFor = (raw: unknown) =>
+    normalizeSystemDiagnosis(raw, device, "online", observedAt).diagnosis_rejection;
+  assert.equal(rejectionFor("not-an-object"), "malformed_payload");
+  assert.equal(
+    rejectionFor({
+      schema: "something.else/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.22", protocol_version: "ownmesh.device/1.0" },
+      checks: requiredChecks,
+    }),
+    "malformed_payload",
+  );
+  assert.equal(
+    rejectionFor({
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "not-a-version", protocol_version: "ownmesh.device/1.0" },
+      checks: requiredChecks,
+    }),
+    "missing_agent_metadata",
+  );
+  assert.equal(
+    rejectionFor({
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.22", protocol_version: "ownmesh.device/1.0" },
+      checks: requiredChecks.filter((c) => c.id !== "sessions"),
+    }),
+    "missing_required_check",
+  );
+  assert.equal(
+    rejectionFor({
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.22", protocol_version: "ownmesh.device/1.0" },
+      checks: [
+        ...requiredChecks.filter((c) => c.id !== "sessions"),
+        // A known (id, state) pair whose status contradicts the contract.
+        { ...check("sessions", "healthy"), status: "fail" },
+      ],
+    }),
+    "bad_status",
+  );
+  assert.equal(
+    rejectionFor({
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.22", protocol_version: "ownmesh.device/1.0" },
+      checks: [
+        ...requiredChecks.filter((c) => c.id !== "sessions"),
+        { ...check("sessions", "healthy"), observed_at: "not-a-timestamp" },
+      ],
+    }),
+    "bad_check_shape",
+  );
+
+  // Fail-closed is preserved: a missing security-relevant required check can
+  // never be normalized into a usable diagnosis.
+  const missingPolicy = normalizeSystemDiagnosis(
+    {
+      schema: "ownmesh.system_diagnosis/1.0",
+      observed_at: observedAt,
+      agent: { version: "1.2.22", protocol_version: "ownmesh.device/1.0" },
+      checks: requiredChecks.filter((c) => c.id !== "policy"),
+    },
+    device,
+    "online",
+    observedAt,
+  );
+  assert.equal(missingPolicy.overall, "diagnosis_unavailable");
+  assert.equal(findCheck(missingPolicy, "policy"), undefined);
 });
 
 

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const pnpmScript = process.env.npm_execpath;
@@ -86,6 +87,13 @@ const ownerInit = spawnSync(process.execPath, [
 if (ownerInit.error) throw ownerInit.error;
 if (ownerInit.status !== 0) process.exit(ownerInit.status || 1);
 
+// #158: a deploy that reports success while the edge still serves an older
+// Worker leaves clients on a catalog generation this release no longer
+// publishes. Verify the deployed build before telling the operator it is live.
+process.stdout.write("Verifying the deployed build...\n");
+const expected = await verifyDeployedBuild(issuer);
+if (!expected) process.exit(1);
+
 process.stdout.write(`\nLiveness check:    ${issuer}/health\n`);
 process.stdout.write(`Readiness check:   ${issuer}/health/ready\n`);
 process.stdout.write(`ChatGPT MCP URL:   ${issuer}/mcp\n`);
@@ -94,3 +102,55 @@ process.stdout.write(`ChatGPT MCP URL:   ${issuer}/mcp\n`);
 process.stdout.write("\nNext, connect a machine to this control plane:\n\n");
 process.stdout.write(`  ownmesh setup --control-plane-url ${issuer} --quickstart\n`);
 process.stdout.write("\nOn a headless or SSH machine, add --device-login --non-interactive --force.\n");
+
+/**
+ * Confirm the origin now serving traffic is the build this deploy published.
+ *
+ * A Worker rollout is not instantaneous, and a partially applied deploy will
+ * happily answer requests from the previous version. Comparing the deployed
+ * `SERVICE_VERSION` and MCP catalog revision against this checkout is what
+ * turns "wrangler exited 0" into "the release is live" (#158).
+ */
+async function verifyDeployedBuild(origin) {
+  const localVersion = readLocalServiceVersion();
+  if (!localVersion) {
+    process.stderr.write("Could not read SERVICE_VERSION from src/util.ts.\n");
+    return false;
+  }
+  let health;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      const response = await fetch(`${origin}/health`, { headers: { accept: "application/json" } });
+      if (response.ok) {
+        health = await response.json();
+        if (health?.version === localVersion) break;
+      }
+    } catch {
+      // Propagation and DNS warm-up both look like a transport error here.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  if (!health) {
+    process.stderr.write(`Could not read ${origin}/health after deployment.\n`);
+    return false;
+  }
+  if (health.version !== localVersion) {
+    process.stderr.write(
+      `Deployed Worker advertises version ${health.version}, but this release is ${localVersion}.\n` +
+        "Refusing to report success: clients would keep an older tool catalog.\n",
+    );
+    return false;
+  }
+  process.stdout.write(
+    `Deployed ${health.version} (MCP catalog ${health?.mcp_catalog?.revision ?? "unknown"}, ` +
+      `${health?.mcp_catalog?.tools ?? "?"} tools).\n` +
+      "Compare that revision against the client's loaded catalog when tools look stale.\n",
+  );
+  return true;
+}
+
+/** Read SERVICE_VERSION straight from the source of truth. */
+function readLocalServiceVersion() {
+  const source = readFileSync(fileURLToPath(new URL("../src/util.ts", import.meta.url)), "utf8");
+  return source.match(/export const SERVICE_VERSION\s*=\s*"([^"]+)"/)?.[1];
+}

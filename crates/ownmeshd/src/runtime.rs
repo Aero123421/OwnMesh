@@ -2446,6 +2446,11 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             });
         }
 
+        // #160: the authoritative pre-spawn gate. `handle_exec` rejects the
+        // same request at admission, but an approved request executes here
+        // later and must never reach spawn either.
+        reject_self_reentrant_ownmesh_exec(&p.program, &p.args)?;
+
         let _detached_guard = if p.detach {
             Some(acquire_detached_slot()?)
         } else {
@@ -3190,6 +3195,10 @@ path or install the tool so detection and execution agree",
                 },
             )?);
         }
+        // #160: refuse a self-reentrant OwnMesh invocation before it consumes
+        // an idempotency key or an approval, so the caller gets one bounded
+        // typed error instead of a device-wide stall.
+        reject_self_reentrant_ownmesh_exec(&p.program, &p.args)?;
         // Facts carry only server-computed pin identity — never client digests.
         let facts = OperationFacts {
             capability: "command.run".into(),
@@ -5882,6 +5891,10 @@ path or install the tool so detection and execution agree",
         }
         let mut recovered_pids = Vec::new();
         let mut interrupted_opens = Vec::new();
+        // #31: sessions whose child the supervisor proves is gone. Terminal
+        // reconciliation is what stops one dead short-lived session from being
+        // re-examined — and re-rejected — on every later reattach.
+        let mut exited_sessions = Vec::new();
         {
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -5892,60 +5905,79 @@ path or install the tool so detection and execution agree",
                 if state == ownmesh_session::SessionState::Starting {
                     let transition_id =
                         format!("open-recovery:{session_id}:{}", binding.controller_epoch);
-                    proxy
-                        .terminate(&exact, transition_id)
-                        .await
-                        .map_err(|error| IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!(
-                                "interrupted persistent session {session_id} cleanup is pending: {error}"
-                            ),
-                        })?;
+                    if let Err(error) = proxy.terminate(&exact, transition_id).await {
+                        // Fail closed for *this* session only: a cleanup that
+                        // could not be acknowledged keeps its record for
+                        // explicit recovery.
+                        eprintln!(
+                            "warning: interrupted persistent session {session_id} \
+                             cleanup is pending: {error}"
+                        );
+                        continue;
+                    }
                     interrupted_opens.push(session_id);
                     continue;
                 }
                 if binding.binding_expires_unix <= now {
                     continue;
                 }
-                let status = proxy
-                    .status(&exact)
-                    .await
-                    .map_err(|error| IpcError::Remote {
-                        code: app_error::CONFLICT,
-                        message: format!(
-                            "persistent session {session_id} cannot reattach without respawn: {error}"
-                        ),
-                    })?;
+                let status = match proxy.status(&exact).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        // The supervisor could not answer for this session.
+                        // That is indeterminate, not proof of death, so the
+                        // record is retained — but it must not stop an
+                        // unrelated session from reattaching or opening.
+                        eprintln!(
+                            "warning: persistent session {session_id} \
+                             cannot reattach without respawn: {error}"
+                        );
+                        continue;
+                    }
+                };
                 let (pid, birth) = match (status.pid, status.process_birth_id) {
                     (Some(pid), Some(birth)) if !status.exited => (pid, birth),
+                    // The supervisor is authoritative and says this host has
+                    // no live child. A short-lived process that exited before
+                    // (or right after) publication lands here; previously the
+                    // whole reattach aborted, which made every later
+                    // `session_open`, `replay` and `close` fail while naming
+                    // that unrelated stale session (#31).
                     _ => {
-                        return Err(IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!(
-                                "persistent session {session_id} did not attest child process identity"
-                            ),
-                        });
+                        exited_sessions.push(session_id);
+                        continue;
                     }
                 };
                 if let (Some(expected_pid), Some(expected_birth)) =
                     (binding.child_pid, binding.child_process_birth)
                 {
                     if pid != expected_pid || birth != expected_birth {
-                        return Err(IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!(
-                                "persistent session {session_id} child process identity changed during reattach"
-                            ),
-                        });
+                        // A different process under the same host binding is a
+                        // real conflict, but still a per-session one: retain
+                        // the record fail-closed and keep going.
+                        eprintln!(
+                            "warning: persistent session {session_id} child process \
+                             identity changed during reattach"
+                        );
+                        continue;
                     }
                 }
                 recovered_pids.push((session_id, pid, birth));
             }
         }
-        if recovered_pids.is_empty() && interrupted_opens.is_empty() {
+        if recovered_pids.is_empty() && interrupted_opens.is_empty() && exited_sessions.is_empty() {
             return Ok(());
         }
         let snapshot = self.sessions.clone();
+        for session_id in exited_sessions {
+            self.sessions.close(&session_id).map_err(session_err)?;
+            self.sessions
+                .set_sidecar_host_binding(&session_id, None)
+                .map_err(session_err)?;
+            self.sessions
+                .set_host_pid(&session_id, None)
+                .map_err(session_err)?;
+        }
         for session_id in interrupted_opens {
             self.sessions.close(&session_id).map_err(session_err)?;
             self.sessions
@@ -6367,9 +6399,10 @@ recorded lease id; retained fail-closed — run `ownmesh doctor` or inspect {} "
     ///
     /// 1. **OS process proof.** For each binding that carries the attested
     ///    child identity (`child_pid` + `child_process_birth`), ask the OS
-    ///    whether that exact process still exists. `process_birth_id`
-    ///    returns `Ok(None)` only when the OS confirmed the PID no longer
-    ///    exists; a reused PID reports a different birth, which equally
+    ///    whether that exact process is still running.
+    ///    `running_process_birth_id` returns `Ok(None)` only when the OS
+    ///    confirmed the PID is gone or the process exited without being
+    ///    reaped (#31); a reused PID reports a different birth, which equally
     ///    proves the original child is gone. A matching birth means that
     ///    sidecar is still live → retain (never contradicted by the
     ///    supervisor). An inspection error is indeterminate and falls
@@ -6401,9 +6434,12 @@ recorded lease id; retained fail-closed — run `ownmesh doctor` or inspect {} "
         for binding in bindings {
             if let Some((pid, expected_birth)) = binding.child_pid.zip(binding.child_process_birth)
             {
-                match ownmesh_ipc::process_birth_id(pid) {
-                    // OS-confirmed gone, or the PID was reused by a different
-                    // process: the original child is provably dead.
+                // #31: an exited-but-unreaped child must count as dead here
+                // too, or its expired record is retained forever.
+                match ownmesh_ipc::running_process_birth_id(pid) {
+                    // OS-confirmed gone (including exited-not-yet-reaped), or
+                    // the PID was reused by a different process: the original
+                    // child is provably dead.
                     Ok(None) => {}
                     Ok(Some(birth)) if birth != expected_birth => {}
                     // The attested child is still live: that is authoritative
@@ -7705,9 +7741,132 @@ fn persistent_sidecar_has_terminal_receipt(
         && receipt.controller_epoch == binding.controller_epoch
 }
 
+/// Basenames of the OwnMesh binaries whose normal entry points open this
+/// daemon's IPC. Never used on its own — a basename is trivially spoofed by
+/// copying or renaming an unrelated program — only to *find* candidate paths
+/// whose file identity is then compared.
+#[cfg(windows)]
+const OWNMESH_IPC_BINARY_NAMES: &[&str] = &["ownmesh.exe", "ownmeshd.exe"];
+#[cfg(not(windows))]
+const OWNMESH_IPC_BINARY_NAMES: &[&str] = &["ownmesh", "ownmeshd"];
+
+/// Candidate absolute paths of OwnMesh binaries that re-enter daemon IPC.
+///
+/// Covers the running daemon image, its installed siblings, and whatever the
+/// spawn search would resolve, so a request naming any of them — directly, by
+/// symlink, by hard link, or through PATH — lands on the same file identity.
+fn ownmesh_ipc_binary_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+    if let Ok(current) = std::env::current_exe() {
+        // A Linux image replaced by an upgrade reads back with a `(deleted)`
+        // suffix and cannot be opened; identity lookup skips it and the
+        // installed siblings below still match (#150).
+        if let Some(dir) = current.parent().map(Path::to_path_buf) {
+            for name in OWNMESH_IPC_BINARY_NAMES {
+                push(dir.join(name));
+            }
+        }
+        push(current);
+    }
+    for name in OWNMESH_IPC_BINARY_NAMES {
+        if let Some(resolved) = resolve_executable_path(name, None) {
+            push(resolved);
+        }
+    }
+    paths
+}
+
+/// OwnMesh CLI argv forms proven to exit before any daemon IPC is opened.
+///
+/// Clap answers `--version`/`--help` and terminates during argument parsing,
+/// before a subcommand runs, so these can never re-enter the runtime. The rule
+/// is deliberately narrow: exactly one argument, matched exactly. Anything
+/// with a subcommand, an `--` separator, or extra arguments is refused with
+/// the rest of the family, because whether clap still short-circuits then
+/// depends on how that subcommand declares trailing arguments.
+fn ownmesh_argv_never_opens_ipc(args: &[String]) -> bool {
+    matches!(args, [only] if matches!(only.as_str(), "--version" | "-V" | "--help" | "-h"))
+}
+
+/// True when `identity` names the same file as one of `candidates`.
+///
+/// A platform that cannot report file identity (`None`) falls back to a
+/// canonical-path comparison rather than silently matching nothing.
+fn same_file_as_any(
+    path: &Path,
+    identity: (Option<u64>, Option<u64>),
+    candidates: &[PathBuf],
+) -> bool {
+    let canonical = std::fs::canonicalize(path).ok();
+    candidates.iter().any(|candidate| {
+        if let (Some(device), Some(inode)) = identity {
+            if let Ok((Some(candidate_device), Some(candidate_inode))) =
+                ownmesh_exec::file_identity(candidate)
+            {
+                return device == candidate_device && inode == candidate_inode;
+            }
+        }
+        canonical
+            .as_ref()
+            .zip(std::fs::canonicalize(candidate).ok().as_ref())
+            .is_some_and(|(a, b)| a == b)
+    })
+}
+
+/// Refuse an execution request that would run an OwnMesh binary which
+/// re-enters this daemon's IPC (#160).
+///
+/// The daemon holds one global runtime mutex across a `command.run` child's
+/// full lifetime. A child that synchronously calls back into daemon IPC waits
+/// for that same mutex, so neither side can progress and every later request
+/// for the device queues behind the deadlock — one permitted command makes the
+/// whole device look broken.
+///
+/// This is a bounded pre-spawn guard, not the concurrency fix: it cannot see
+/// an OwnMesh CLI call inside a shell string or a script, which is why the
+/// runtime lock still must not be held across arbitrary child work.
+fn reject_self_reentrant_ownmesh_exec(program: &str, args: &[String]) -> IpcResult<()> {
+    let path = Path::new(program);
+    if !path.is_absolute() {
+        // Structured requests are resolved to an absolute path before this
+        // runs; a relative program is a shell payload and is not identifiable.
+        return Ok(());
+    }
+    let Ok(identity) = ownmesh_exec::file_identity(path) else {
+        return Ok(());
+    };
+    let candidates = ownmesh_ipc_binary_paths();
+    if !same_file_as_any(path, identity, &candidates) {
+        return Ok(());
+    }
+    if ownmesh_argv_never_opens_ipc(args) {
+        return Ok(());
+    }
+    Err(IpcError::Remote {
+        code: app_error::CONFLICT,
+        message: "OWNMESH_E_SELF_REENTRANT_EXEC: running the OwnMesh CLI on the device it \
+manages would re-enter the daemon and block every later request for this device; use the \
+dedicated tools (system.diagnose, policy/grants/workspace) instead. Only `--version` and \
+`--help` are executable this way."
+            .into(),
+    })
+}
+
 /// A process is live only when both the stored PID and OS-issued birth witness
-/// still match. A missing/changing witness proves the original child ended,
-/// but does not assign ownership to a reused PID.
+/// still match **and** the OS reports it as still running. A missing/changing
+/// witness proves the original child ended, but does not assign ownership to a
+/// reused PID.
+///
+/// #31: `running_process_birth_id` — not the plain birth witness — is the
+/// liveness authority here. A child that exited without being reaped keeps its
+/// PID and start time, so the plain witness reported a zombie as live and
+/// close/terminate answered "authenticated child is still alive, refusing
+/// PID-only termination" for a session whose process was already gone.
 fn persistent_child_is_live(binding: &SidecarHostBinding) -> Result<bool, String> {
     let pid = binding
         .child_pid
@@ -7715,7 +7874,7 @@ fn persistent_child_is_live(binding: &SidecarHostBinding) -> Result<bool, String
     let expected = binding
         .child_process_birth
         .ok_or("persistent sidecar binding lacks a durable child birth witness")?;
-    match ownmesh_ipc::process_birth_id(pid)? {
+    match ownmesh_ipc::running_process_birth_id(pid)? {
         Some(observed) => Ok(observed == expected),
         None => Ok(false),
     }
@@ -8046,6 +8205,166 @@ mod device_binding_tests {
         assert!(recovered.host_pid.is_none());
     }
 
+    /// #31: one stale session must never poison unrelated session work.
+    ///
+    /// A short-lived child that exits leaves a `running` record whose host the
+    /// supervisor reports as exited. Reattach used to abort the whole pass
+    /// with `did not attest child process identity`, and because reattach runs
+    /// on the way to *every* supervisor-backed call, later `session_open`,
+    /// `replay` and `close` all failed while naming that unrelated session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exited_session_is_reconciled_and_never_blocks_a_live_one() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let sidecar_root = paths.state_dir.join("session-supervisor");
+        let (supervisor_server, _) =
+            ownmesh_session_host::SupervisorIpcServer::new(&sidecar_root, &paths.runtime_dir)
+                .unwrap();
+        let endpoint = supervisor_server.endpoint().clone();
+        let server = Arc::clone(supervisor_server.server());
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move { server.serve().await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let management =
+            read_management_credential(supervisor_server.credential_state_dir()).unwrap();
+        let supervisor =
+            SupervisorClient::bootstrap(endpoint, paths.runtime_dir.clone(), management)
+                .await
+                .unwrap();
+
+        let mut spawn_session = |title: &str, program: &str, args: Vec<String>| {
+            let session = runtime
+                .sessions
+                .open(
+                    SessionKind::Pty,
+                    title,
+                    "client:remote:tenant:owner",
+                    DaemonRuntime::now(),
+                    None,
+                )
+                .unwrap();
+            let lease = session.controller.clone().unwrap();
+            (
+                session.id.clone(),
+                SupervisorSpawnRequest {
+                    session_id: session.id,
+                    device_id: "dev_a".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "client:remote:tenant:owner".into(),
+                    controller_epoch: lease.epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    host_expires_unix: DaemonRuntime::now() + 7_200,
+                    command: SupervisorCommand {
+                        program: program.to_owned(),
+                        args,
+                        cwd: None,
+                        env: Vec::new(),
+                    },
+                    cols: 80,
+                    rows: 24,
+                    io_mode: HostIoMode::StructuredPipes,
+                    profile_id: Some("test-profile".into()),
+                    adapter_dialect: Some("test-jsonl".into()),
+                },
+                lease.expires_unix,
+            )
+        };
+
+        // A short-lived child that exits almost immediately.
+        let (short_id, short_request, short_expiry) =
+            spawn_session("short-lived", "/bin/sh", vec!["-c".into(), "exit 0".into()]);
+        // An unrelated long-lived child that must keep working.
+        let (long_id, long_request, long_expiry) = spawn_session(
+            "long-lived",
+            "/bin/sh",
+            vec!["-c".into(), "sleep 30".into()],
+        );
+
+        let short_exact = supervisor.spawn(short_request).await.unwrap();
+        let long_exact = supervisor.spawn(long_request).await.unwrap();
+        let binding_for = |exact: &SupervisorBinding, expires: i64| SidecarHostBinding {
+            device_id: exact.device_id.clone(),
+            workspace_id: exact.workspace_id.clone(),
+            owner_principal: exact.owner_principal.clone(),
+            host_nonce: exact.host_nonce.clone(),
+            controller_epoch: exact.controller_epoch,
+            binding_expires_unix: expires,
+            host_expires_unix: DaemonRuntime::now() + 7_200,
+            child_pid: None,
+            child_process_birth: None,
+        };
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&short_id, Some(binding_for(&short_exact, short_expiry)))
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&long_id, Some(binding_for(&long_exact, long_expiry)))
+            .unwrap();
+        runtime.persist_sessions().unwrap();
+        runtime.supervisor = Some(supervisor);
+
+        // Wait until the supervisor observes the short-lived child's exit.
+        for _ in 0..200 {
+            let status = runtime
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .status(&short_exact)
+                .await;
+            if status.map(|s| s.exited).unwrap_or(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        runtime
+            .reattach_persistent_sidecars()
+            .await
+            .expect("an exited session must not fail the whole reattach pass");
+
+        assert_eq!(
+            runtime.sessions.get(&short_id).unwrap().state,
+            ownmesh_session::SessionState::Closed,
+            "an exited child reconciles to terminal instead of staying `running`"
+        );
+        assert!(runtime
+            .sessions
+            .get(&short_id)
+            .unwrap()
+            .sidecar_host
+            .is_none());
+        assert_eq!(
+            runtime.sessions.get(&long_id).unwrap().state,
+            ownmesh_session::SessionState::Running,
+            "an unrelated live session must survive the same pass"
+        );
+        assert!(
+            runtime.sessions.get(&long_id).unwrap().host_pid.is_some(),
+            "the live session must still reattach to its child"
+        );
+
+        // The stale record is gone, so a second pass is clean and an unrelated
+        // new session can be opened.
+        runtime
+            .reattach_persistent_sidecars()
+            .await
+            .expect("reattach stays clean once the stale record is reconciled");
+
+        let _ = runtime
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .terminate(&long_exact, format!("test-cleanup:{long_id}"))
+            .await;
+        server.request_shutdown();
+        server_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn close_retry_after_restart_terminates_an_interrupted_starting_sidecar() {
         let dir = tempdir().unwrap();
@@ -8227,6 +8546,165 @@ mod device_binding_tests {
             runtime.sessions.get(&session.id).unwrap().state,
             ownmesh_session::SessionState::Running
         );
+    }
+
+    /// #31 (Linux regression): a short-lived session child that exited
+    /// without being reaped keeps its PID and start time, so the birth-witness
+    /// probe reported it as live. `close` then refused to reconcile
+    /// ("authenticated child is still alive, refusing PID-only termination")
+    /// and the dead session stayed pinned as `running` forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_child_reconciles_to_terminal_instead_of_blocking_close() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let session = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "zombie-child",
+                "client:remote:tenant:owner",
+                DaemonRuntime::now(),
+                None,
+            )
+            .unwrap();
+
+        // A real short-lived child, deliberately left unreaped.
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let child_pid = child.id();
+        let child_process_birth = ownmesh_ipc::process_birth_id(child_pid)
+            .expect("probe succeeds")
+            .expect("a freshly spawned child has a birth witness");
+        for _ in 0..200 {
+            if ownmesh_ipc::running_process_birth_id(child_pid) == Ok(None) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            ownmesh_ipc::running_process_birth_id(child_pid),
+            Ok(None),
+            "child did not become a zombie"
+        );
+        // The PID slot and start time survive, which is exactly what used to
+        // be mistaken for liveness.
+        assert_eq!(
+            ownmesh_ipc::process_birth_id(child_pid),
+            Ok(Some(child_process_birth))
+        );
+
+        runtime
+            .sessions
+            .set_host_pid(&session.id, Some(child_pid))
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(
+                &session.id,
+                Some(SidecarHostBinding {
+                    device_id: "dev_a".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "client:remote:tenant:owner".into(),
+                    host_nonce: "host_nonce".into(),
+                    controller_epoch: 1,
+                    binding_expires_unix: DaemonRuntime::now() + 60,
+                    host_expires_unix: DaemonRuntime::now() + 600,
+                    child_pid: Some(child_pid),
+                    child_process_birth: Some(child_process_birth),
+                }),
+            )
+            .unwrap();
+
+        // Close with the supervisor unavailable now converges to terminal.
+        let reconciled = runtime
+            .reconcile_terminal_after_supervisor_failure(&session.id, TransitionKind::Close)
+            .expect("a zombie child must not block reconciliation");
+        assert!(reconciled);
+        let recovered = runtime.sessions.get(&session.id).unwrap();
+        assert_eq!(recovered.state, ownmesh_session::SessionState::Closed);
+        assert!(recovered.sidecar_host.is_none());
+
+        child.wait().expect("reap the child");
+    }
+
+    /// #31: the same zombie is reconciled during an ordinary read, so
+    /// `session_show` / `session_list` stop reporting a dead session as
+    /// `running`. A genuinely live child is still never terminalized.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_time_reconciliation_clears_a_zombie_but_keeps_a_live_child() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        let bind = |pid: u32, birth: u64| SidecarHostBinding {
+            device_id: "dev_a".into(),
+            workspace_id: "ws_default".into(),
+            owner_principal: "owner".into(),
+            host_nonce: "host_nonce".into(),
+            controller_epoch: 1,
+            binding_expires_unix: now + 60,
+            host_expires_unix: now + 600,
+            child_pid: Some(pid),
+            child_process_birth: Some(birth),
+        };
+
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let dead_pid = child.id();
+        let dead_birth = ownmesh_ipc::process_birth_id(dead_pid)
+            .expect("probe succeeds")
+            .expect("birth witness");
+        for _ in 0..200 {
+            if ownmesh_ipc::running_process_birth_id(dead_pid) == Ok(None) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(ownmesh_ipc::running_process_birth_id(dead_pid), Ok(None));
+
+        let dead = runtime
+            .sessions
+            .open(SessionKind::Pty, "dead", "owner", now, None)
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&dead.id, Some(bind(dead_pid, dead_birth)))
+            .unwrap();
+
+        let live_pid = std::process::id();
+        let live_birth = ownmesh_ipc::process_birth_id(live_pid)
+            .expect("probe succeeds")
+            .expect("this test process is live");
+        let live = runtime
+            .sessions
+            .open(SessionKind::Pty, "live", "owner", now, None)
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&live.id, Some(bind(live_pid, live_birth)))
+            .unwrap();
+
+        assert_eq!(
+            runtime.reconcile_dead_persistent_sessions().unwrap(),
+            1,
+            "only the provably dead session is reconciled"
+        );
+        assert_eq!(
+            runtime.sessions.get(&dead.id).unwrap().state,
+            ownmesh_session::SessionState::Closed
+        );
+        assert_eq!(
+            runtime.sessions.get(&live.id).unwrap().state,
+            ownmesh_session::SessionState::Running,
+            "a live attested child is never falsely terminalized"
+        );
+
+        child.wait().expect("reap the child");
     }
 
     #[tokio::test]
@@ -10609,6 +11087,120 @@ mod broker_intent_tests {
             runtime.op_journal.is_empty(),
             "no side-effect receipt may exist"
         );
+    }
+
+    /// #160: an OwnMesh CLI child that re-enters daemon IPC deadlocks the
+    /// runtime mutex the daemon holds across the child's lifetime, and every
+    /// later request for the device queues behind it. Detection must survive
+    /// renaming, hard links, and symlinks — a basename check would miss all
+    /// three.
+    #[cfg(unix)]
+    #[test]
+    fn a_renamed_or_linked_ownmesh_binary_is_refused_before_spawn() {
+        let dir = tempdir().unwrap();
+        // `current_exe()` is in the candidate set, so this test binary stands
+        // in for an installed OwnMesh binary.
+        let current = std::env::current_exe().unwrap();
+
+        let hard_link = dir.path().join("totally-unrelated-name");
+        let linked = std::fs::hard_link(&current, &hard_link).is_ok();
+        let symlink = dir.path().join("also-unrelated");
+        std::os::unix::fs::symlink(&current, &symlink).unwrap();
+
+        let refused = |path: &Path, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            reject_self_reentrant_ownmesh_exec(&path.display().to_string(), &args)
+        };
+
+        let error = refused(&current, &["doctor"]).unwrap_err();
+        assert!(
+            error.to_string().contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
+            "expected the bounded typed refusal: {error}"
+        );
+        assert!(
+            refused(&symlink, &["doctor", "--json", "--offline"]).is_err(),
+            "a symlink to an OwnMesh binary is the same file"
+        );
+        if linked {
+            assert!(
+                refused(&hard_link, &["status"]).is_err(),
+                "a hard link under an unrelated name is the same file"
+            );
+        }
+
+        // Proven no-IPC informational entry points stay usable, including
+        // through the same links.
+        for informational in [vec!["--version"], vec!["-V"], vec!["--help"], vec!["-h"]] {
+            assert!(
+                refused(&current, &informational).is_ok(),
+                "{informational:?} exits during argument parsing"
+            );
+            assert!(refused(&symlink, &informational).is_ok());
+        }
+        // Anything beyond that single argument is refused with the family:
+        // whether clap still short-circuits depends on the subcommand.
+        assert!(refused(&current, &["doctor", "--help"]).is_err());
+        assert!(refused(&current, &["--version", "extra"]).is_err());
+        assert!(refused(&current, &[]).is_err());
+
+        // An unrelated program is untouched.
+        assert!(reject_self_reentrant_ownmesh_exec("/bin/true", &["--version".into()]).is_ok());
+        // A non-absolute program is a shell payload, not an identifiable file.
+        assert!(reject_self_reentrant_ownmesh_exec("ownmesh", &["doctor".into()]).is_ok());
+    }
+
+    /// #160: the refusal is reachable through the real dispatch path and is a
+    /// terminal typed error, not a stalled operation. Nothing is authorized
+    /// and no side-effect receipt is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn self_reentrant_exec_fails_fast_without_authorizing_anything() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let client = ClientIdentity::new("exec-reentrancy-test", "test");
+        let current = std::env::current_exe().unwrap();
+
+        let error = runtime
+            .dispatch(
+                methods::OPS_EXEC,
+                Some(json!({
+                    "program": current.display().to_string(),
+                    "args": ["doctor", "--json", "--offline"],
+                    "kind": "structured",
+                    "workspace_id": "ws_default",
+                    "idempotency_key": "reentrant_doctor_1",
+                })),
+                &client,
+            )
+            .await
+            .expect_err("a self-reentrant OwnMesh invocation must fail before spawn");
+        assert!(
+            error.to_string().contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
+            "expected the bounded typed refusal: {error}"
+        );
+        assert!(
+            runtime.op_journal.is_empty(),
+            "a pre-admission refusal must not consume an idempotency key"
+        );
+
+        // An unrelated command on the same runtime still works, which is the
+        // property the deadlock destroyed.
+        let ok = runtime
+            .dispatch(
+                methods::OPS_EXEC,
+                Some(json!({
+                    "program": "/bin/true",
+                    "args": [],
+                    "kind": "structured",
+                    "workspace_id": "ws_default",
+                })),
+                &client,
+            )
+            .await
+            .expect("an unrelated command must remain executable");
+        assert_eq!(ok.get("approval_required"), Some(&json!(false)));
     }
 
     #[test]

@@ -142,6 +142,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   const b = await buildCanonicalAction({
@@ -151,6 +152,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   assert.equal(await hashCanonicalAction(a), await hashCanonicalAction(b));
@@ -165,6 +167,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   assert.notEqual(await hashCanonicalAction(a), await hashCanonicalAction(c));
@@ -178,6 +181,7 @@ test("bindCanonicalAction includes operation_id, expires_at, claim_version", asy
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_a",
   });
   const expiresAt = "2030-01-01T00:00:00.000Z";
@@ -212,11 +216,11 @@ test("principal credential generation is durable, rotates on credential changes,
 
     const before = await buildCanonicalAction({
       toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
-      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 2,
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 2, principalRevocationEpoch: 1,
     });
     const after = await buildCanonicalAction({
       toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
-      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3,
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3, principalRevocationEpoch: 1,
     });
     assert.notEqual(await hashCanonicalAction(before), await hashCanonicalAction(after));
     assert.equal(
@@ -414,6 +418,7 @@ test("buildDeviceOperation always sets server payload_hash and wire binding fiel
     principalId: "prin_1",
     tenantId: "ten_1",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt,
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -503,6 +508,7 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   const firstHash = await hashCanonicalAction(firstAction);
@@ -772,6 +778,7 @@ test("command env is normalized into canonical action facts", async () => {
     principalId: "prin_env",
     tenantId: "ten_env",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
   });
   assert.deepEqual((canonical.facts as { env?: Record<string, string> }).env, {
     A: "1",
@@ -791,6 +798,7 @@ test("command env is normalized into canonical action facts", async () => {
     principalId: "prin_env",
     tenantId: "ten_env",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
   const facts = (op.bound_action.facts as { env?: Record<string, string> }).env;
@@ -937,6 +945,7 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -1664,6 +1673,7 @@ test("dispatch outbox survives large write claim (~300 KiB) and redelivers after
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",

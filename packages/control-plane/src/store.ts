@@ -205,13 +205,36 @@ export type AuditEvent = {
   meta?: Record<string, unknown>;
 };
 
+/**
+ * Bounded, non-secret causes that remove authority from a principal (#162).
+ * A routine refresh rotation is deliberately absent: reissuing a token is not
+ * a withdrawal of authority.
+ */
+export type PrincipalRevocationReason =
+  | "explicit_revocation"
+  | "refresh_reuse";
+
 export type PrincipalRecord = {
   id: string;
   tenant_id: string;
   kind: string;
   display_name: string;
-  /** Server-owned, positive, monotonic OAuth credential epoch. */
+  /**
+   * Server-owned, positive, monotonic OAuth credential *issuance* epoch. It
+   * advances on every credential rotation, including healthy refreshes, and
+   * is observability only — never an authorization boundary (#162).
+   */
   credential_generation: number;
+  /**
+   * Server-owned, positive, monotonic *revocation* epoch. It advances only
+   * when authority is intentionally removed (explicit revoke, refresh-family
+   * reuse detection, account/session invalidation). Device operations bind to
+   * this, so a routine refresh cannot invalidate already-authorized work while
+   * a real revocation still invalidates all of it.
+   */
+  revocation_epoch: number;
+  /** Bounded cause of the most recent revocation-epoch advance, if any. */
+  revocation_reason?: PrincipalRevocationReason | null;
   created_at: string;
 };
 
@@ -692,6 +715,10 @@ export interface ControlPlaneStore {
   getPrincipal(id: string): Promise<PrincipalRecord | null>;
   /** Advance the server-owned OAuth credential epoch. Never caller supplied. */
   advancePrincipalCredentialGeneration(id: string): Promise<number | null>;
+  advancePrincipalRevocationEpoch(
+    id: string,
+    reason: PrincipalRevocationReason,
+  ): Promise<number | null>;
 
   putAuthCode(code: AuthCodeRecord): Promise<void>;
   redeemAuthCode(input: {
@@ -1044,6 +1071,8 @@ export type SchemaReadiness = {
     mcp_approval_outbox: boolean;
     /** 0012 server-owned principal OAuth credential generation */
     principals_credential_generation: boolean;
+    /** 0018 revocation epoch separated from routine refresh issuance (#162) */
+    principals_revocation_epoch: boolean;
     /** 0013 built-in owner passkeys + one-time WebAuthn challenges */
     owner_passkeys: boolean;
     owner_auth_challenges: boolean;
@@ -1278,6 +1307,10 @@ const SCHEMA_READINESS_OBJECTS: Record<
     table: "principals",
     columns: ["id", "credential_generation"],
   },
+  principals_revocation_epoch: {
+    table: "principals",
+    columns: ["id", "revocation_epoch", "revocation_reason"],
+  },
   owner_passkeys: {
     table: "owner_passkeys",
     columns: [
@@ -1367,6 +1400,8 @@ export class MemoryStore implements ControlPlaneStore {
         kind: "human",
         display_name: "Dev User",
         credential_generation: 1,
+        revocation_epoch: 1,
+        revocation_reason: null,
         created_at: nowIso(),
       });
     }
@@ -1485,6 +1520,8 @@ export class MemoryStore implements ControlPlaneStore {
       kind,
       display_name: displayName,
       credential_generation: 1,
+      revocation_epoch: 1,
+      revocation_reason: null,
       created_at: nowIso(),
     };
     this.principals.set(id, p);
@@ -1499,6 +1536,26 @@ export class MemoryStore implements ControlPlaneStore {
     const next = principal.credential_generation + 1;
     if (!Number.isSafeInteger(next) || next < 1) throw new Error("principal credential generation overflow");
     principal.credential_generation = next;
+    this.principals.set(id, principal);
+    return next;
+  }
+
+  /**
+   * Remove authority from a principal (#162): advance the revocation epoch and
+   * record which bounded cause did it. Always advances the issuance generation
+   * too, so a revocation is never *less* invalidating than a refresh.
+   */
+  async advancePrincipalRevocationEpoch(
+    id: string,
+    reason: PrincipalRevocationReason,
+  ): Promise<number | null> {
+    const principal = this.principals.get(id);
+    if (!principal) return null;
+    const next = (principal.revocation_epoch ?? 1) + 1;
+    if (!Number.isSafeInteger(next) || next < 1) throw new Error("principal revocation epoch overflow");
+    principal.revocation_epoch = next;
+    principal.revocation_reason = reason;
+    principal.credential_generation += 1;
     this.principals.set(id, principal);
     return next;
   }
@@ -1618,7 +1675,8 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
-      await this.advancePrincipalCredentialGeneration(prior.principal);
+      // Reuse is compromise, not continuation: remove authority (#162).
+      await this.advancePrincipalRevocationEpoch(prior.principal, "refresh_reuse");
       return {
         ok: false,
         error: "reuse",
@@ -1639,7 +1697,7 @@ export class MemoryStore implements ControlPlaneStore {
           this.tokensByAccess.set(k, v);
         }
       }
-      await this.advancePrincipalCredentialGeneration(old.principal);
+      await this.advancePrincipalRevocationEpoch(old.principal, "refresh_reuse");
       return {
         ok: false,
         error: "reuse",
@@ -1651,6 +1709,10 @@ export class MemoryStore implements ControlPlaneStore {
     this.tokensByAccess.set(access, old);
     this.accessByRefresh.delete(refreshToken);
     this.usedRefresh.set(refreshToken, old.refresh_family);
+    // #162: a healthy rotation advances the issuance generation for
+    // observability only. It deliberately does NOT advance the revocation
+    // epoch, so operations already authorized by this same healthy refresh
+    // family stay deliverable across the 15-minute access-token boundary.
     await this.advancePrincipalCredentialGeneration(old.principal);
     const next = await this.issueTokens(
       old.client_id,
@@ -1669,7 +1731,7 @@ export class MemoryStore implements ControlPlaneStore {
         if (rec && !rec.revoked) {
           rec.revoked = true;
           this.tokensByAccess.set(access, rec);
-          await this.advancePrincipalCredentialGeneration(rec.principal);
+          await this.advancePrincipalRevocationEpoch(rec.principal, "explicit_revocation");
         }
         this.accessByRefresh.delete(token);
       }
@@ -1680,7 +1742,7 @@ export class MemoryStore implements ControlPlaneStore {
       rec.revoked = true;
       this.tokensByAccess.set(token, rec);
       this.accessByRefresh.delete(rec.refresh_token);
-      await this.advancePrincipalCredentialGeneration(rec.principal);
+      await this.advancePrincipalRevocationEpoch(rec.principal, "explicit_revocation");
     }
   }
 
@@ -2843,7 +2905,7 @@ export class SqlStore implements ControlPlaneStore {
   ): Promise<PrincipalRecord> {
     const existing = await this.db
       .prepare(
-        `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
+        `SELECT id, tenant_id, kind, display_name, credential_generation, revocation_epoch, revocation_reason, created_at FROM principals WHERE id = ?`,
       )
       .bind(id)
       .first<PrincipalRecord>();
@@ -2864,13 +2926,15 @@ export class SqlStore implements ControlPlaneStore {
       kind,
       display_name: displayName,
       credential_generation: 1,
+      revocation_epoch: 1,
+      revocation_reason: null,
       created_at: created,
     };
   }
 
   async getPrincipal(id: string): Promise<PrincipalRecord | null> {
     return this.db.prepare(
-      `SELECT id, tenant_id, kind, display_name, credential_generation, created_at FROM principals WHERE id = ?`,
+      `SELECT id, tenant_id, kind, display_name, credential_generation, revocation_epoch, revocation_reason, created_at FROM principals WHERE id = ?`,
     ).bind(id).first<PrincipalRecord>();
   }
 
@@ -3054,6 +3118,30 @@ export class SqlStore implements ControlPlaneStore {
       .first<{ credential_generation: number }>();
     const generation = Number(updated?.credential_generation);
     return Number.isSafeInteger(generation) && generation >= 1 ? generation : null;
+  }
+
+  /**
+   * Remove authority from a principal (#162): advance the revocation epoch and
+   * record the bounded cause. The issuance generation advances too, so a
+   * revocation is never less invalidating than a routine refresh.
+   */
+  async advancePrincipalRevocationEpoch(
+    id: string,
+    reason: PrincipalRevocationReason,
+  ): Promise<number | null> {
+    const updated = await this.db
+      .prepare(
+        `UPDATE principals
+         SET revocation_epoch = revocation_epoch + 1,
+             revocation_reason = ?,
+             credential_generation = credential_generation + 1
+         WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1
+         RETURNING revocation_epoch`,
+      )
+      .bind(reason, id)
+      .first<{ revocation_epoch: number }>();
+    const epoch = Number(updated?.revocation_epoch);
+    return Number.isSafeInteger(epoch) && epoch >= 1 ? epoch : null;
   }
 
   async putAuthCode(code: AuthCodeRecord): Promise<void> {
@@ -3343,9 +3431,14 @@ export class SqlStore implements ControlPlaneStore {
         this.db.prepare(
           `UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`,
         ).bind(fam),
+        // #162: reuse is compromise. Advance the revocation epoch so every
+        // operation authorized by this credential family is invalidated.
         this.db.prepare(
-          `UPDATE principals SET credential_generation = credential_generation + 1
-           WHERE id = ? AND credential_generation >= 1`,
+          `UPDATE principals
+           SET revocation_epoch = revocation_epoch + 1,
+               revocation_reason = 'refresh_reuse',
+               credential_generation = credential_generation + 1
+           WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
         ).bind(row.principal_id),
       ]);
       if (!used) {
@@ -3419,6 +3512,9 @@ export class SqlStore implements ControlPlaneStore {
                AND cur.revoked = 0
            )`,
       ).bind(accessHash, newRefreshHash, expiresAtIso, refreshExpiresAtIso, ts, refreshHash),
+      // #162: a healthy rotation advances the *issuance* generation only.
+      // The revocation epoch is untouched, so an operation queued under the
+      // previous access token stays authorized across the refresh boundary.
       this.db.prepare(
         `UPDATE principals SET credential_generation = credential_generation + 1
          WHERE id = ? AND credential_generation >= 1
@@ -3442,8 +3538,11 @@ export class SqlStore implements ControlPlaneStore {
           this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
             .bind(raced.refresh_family),
           this.db.prepare(
-            `UPDATE principals SET credential_generation = credential_generation + 1
-             WHERE id = ? AND credential_generation >= 1`,
+            `UPDATE principals
+             SET revocation_epoch = revocation_epoch + 1,
+                 revocation_reason = 'refresh_reuse',
+                 credential_generation = credential_generation + 1
+             WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
           ).bind(row.principal_id),
         ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
@@ -3459,8 +3558,11 @@ export class SqlStore implements ControlPlaneStore {
           this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
             .bind(ledger.refresh_family),
           this.db.prepare(
-            `UPDATE principals SET credential_generation = credential_generation + 1
-             WHERE id = ? AND credential_generation >= 1`,
+            `UPDATE principals
+             SET revocation_epoch = revocation_epoch + 1,
+                 revocation_reason = 'refresh_reuse',
+                 credential_generation = credential_generation + 1
+             WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
           ).bind(row.principal_id),
         ]);
         return { ok: false, error: "reuse", description: "refresh token reuse detected" };
@@ -3482,9 +3584,14 @@ export class SqlStore implements ControlPlaneStore {
         ).bind(fam, nowIso()),
         this.db.prepare(`UPDATE oauth_tokens SET revoked = 1 WHERE refresh_family = ?`)
           .bind(fam),
+        // #162: reuse is compromise. Advance the revocation epoch so every
+        // operation authorized by this credential family is invalidated.
         this.db.prepare(
-          `UPDATE principals SET credential_generation = credential_generation + 1
-           WHERE id = ? AND credential_generation >= 1`,
+          `UPDATE principals
+           SET revocation_epoch = revocation_epoch + 1,
+               revocation_reason = 'refresh_reuse',
+               credential_generation = credential_generation + 1
+           WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1`,
         ).bind(row.principal_id),
       ]);
       return { ok: false, error: "reuse", description: "refresh token reuse detected" };
@@ -3518,9 +3625,14 @@ export class SqlStore implements ControlPlaneStore {
     if (!row || row.revoked) return;
     if (!this.db.batch) throw new Error("SqlStore.revokeToken requires db.batch");
     await this.db.batch([
+      // #162: an explicit revoke removes authority, so it advances the
+      // revocation epoch and terminally invalidates bound operations.
       this.db.prepare(
-        `UPDATE principals SET credential_generation = credential_generation + 1
-         WHERE id = ? AND credential_generation >= 1
+        `UPDATE principals
+         SET revocation_epoch = revocation_epoch + 1,
+             revocation_reason = 'explicit_revocation',
+             credential_generation = credential_generation + 1
+         WHERE id = ? AND revocation_epoch >= 1 AND credential_generation >= 1
            AND EXISTS (SELECT 1 FROM oauth_tokens WHERE ${column} = ? AND revoked = 0)`,
       ).bind(row.principal_id, hash),
       this.db.prepare(
