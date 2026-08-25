@@ -1466,10 +1466,12 @@ pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
 /// `STILL_ACTIVE` (259).
 #[cfg(windows)]
 pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+    // `SYNCHRONIZE` is a standard access right shared by every waitable
+    // object; windows-sys declares it once, under the file-system module.
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, SYNCHRONIZE,
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     // SAFETY: `OpenProcess` receives a scalar PID and the returned kernel
@@ -1509,7 +1511,8 @@ pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
     use std::mem::{size_of, MaybeUninit};
 
     /// `SZOMB` from `<sys/proc.h>`; `libc` does not re-export the `p_stat`
-    /// constants that `proc_bsdinfo::pbi_status` uses.
+    /// constants that `proc_bsdinfo::pbi_status` uses. Typed to match
+    /// `pbi_status` exactly so no conversion is needed at the comparison.
     const DARWIN_SZOMB: u32 = 5;
 
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::uninit();
@@ -1540,7 +1543,7 @@ pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
     }
     // SAFETY: exact-size successful `proc_pidinfo` reply initialized info.
     let info = unsafe { info.assume_init() };
-    if u32::from(info.pbi_status) == DARWIN_SZOMB {
+    if info.pbi_status == DARWIN_SZOMB {
         return Ok(None);
     }
     const MICROS_PER_SECOND: u64 = 1_000_000;

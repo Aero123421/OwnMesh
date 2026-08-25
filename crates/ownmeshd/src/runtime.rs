@@ -11143,8 +11143,14 @@ mod broker_intent_tests {
         assert!(refused(&current, &["--version", "extra"]).is_err());
         assert!(refused(&current, &[]).is_err());
 
-        // An unrelated program is untouched.
-        assert!(reject_self_reentrant_ownmesh_exec("/bin/true", &["--version".into()]).is_ok());
+        // An unrelated program is untouched. `/bin/sh` rather than `/bin/true`:
+        // only `/bin/sh` is guaranteed on every Unix (macOS ships `true` under
+        // `/usr/bin`), and a path that does not exist would pass this
+        // assertion without proving anything.
+        assert!(Path::new("/bin/sh").exists());
+        assert!(
+            reject_self_reentrant_ownmesh_exec("/bin/sh", &["-c".into(), "true".into()]).is_ok()
+        );
         // A non-absolute program is a shell payload, not an identifiable file.
         assert!(reject_self_reentrant_ownmesh_exec("ownmesh", &["doctor".into()]).is_ok());
     }
@@ -11186,21 +11192,26 @@ mod broker_intent_tests {
         );
 
         // An unrelated command on the same runtime still works, which is the
-        // property the deadlock destroyed.
-        let ok = runtime
-            .dispatch(
-                methods::OPS_EXEC,
-                Some(json!({
-                    "program": "/bin/true",
-                    "args": [],
-                    "kind": "structured",
-                    "workspace_id": "ws_default",
-                })),
-                &client,
-            )
-            .await
-            .expect("an unrelated command must remain executable");
-        assert_eq!(ok.get("approval_required"), Some(&json!(false)));
+        // property the deadlock destroyed. Linux only: `fixture_executable`
+        // falls back to this test binary elsewhere, and this test binary is
+        // exactly what the guard is supposed to refuse.
+        #[cfg(target_os = "linux")]
+        {
+            let ok = runtime
+                .dispatch(
+                    methods::OPS_EXEC,
+                    Some(json!({
+                        "program": fixture_executable().display().to_string(),
+                        "args": [],
+                        "kind": "structured",
+                        "workspace_id": "ws_default",
+                    })),
+                    &client,
+                )
+                .await
+                .expect("an unrelated command must remain executable");
+            assert_eq!(ok.get("approval_required"), Some(&json!(false)));
+        }
     }
 
     #[test]
