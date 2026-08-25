@@ -1270,6 +1270,34 @@ mod lifecycle_honesty_tests {
         assert!(manager.descriptor_state(&plan).is_current());
     }
 
+    /// Review #2: a deliberate `service stop` must survive a later
+    /// `service install`. Install may only re-register a *drifted* descriptor;
+    /// treating a stopped (unloaded) service as drift would re-register it and
+    /// silently bring a RunAtLoad/KeepAlive job back up.
+    #[test]
+    fn install_after_stop_does_not_restart_the_service() {
+        let runner = ScriptedProcessRunner::default();
+        let fixture = install_fixture(&runner);
+        let manager = ServiceManager::new(&runner);
+
+        manager.start().unwrap();
+        assert_eq!(manager.probe().unwrap().running, Some(true));
+        manager.stop().unwrap();
+        assert_eq!(manager.probe().unwrap().running, Some(false));
+
+        run_install(&cli(), &fixture.paths, &manager, &install_args(&fixture)).unwrap();
+
+        assert_eq!(
+            manager.probe().unwrap().running,
+            Some(false),
+            "install must not restart a service the operator deliberately stopped"
+        );
+        assert!(
+            manager.probe().unwrap().installed,
+            "the descriptor must remain installed"
+        );
+    }
+
     #[test]
     fn manually_altered_descriptor_is_repaired_not_reported_idempotent() {
         let runner = ScriptedProcessRunner::default();
@@ -1472,8 +1500,12 @@ mod lifecycle_honesty_tests {
         for flag in ["--config-dir", "--state-dir", "--runtime-dir"] {
             assert!(expected.arguments.contains(flag), "{expected:?}");
         }
-        assert!(expected.has_logon_trigger);
+        assert_eq!(expected.logon_trigger_count, 1);
+        assert_eq!(expected.trigger_count, 1);
+        assert_eq!(expected.exec_action_count, 1);
         assert_eq!(expected.run_level, "LeastPrivilege");
+        assert_eq!(expected.restart_count, "3");
+        assert_eq!(expected.restart_interval, "PT1M");
 
         // A task whose action lost the path binding is drift, not a match.
         let stale = rendered.replace(
@@ -1481,5 +1513,92 @@ mod lifecycle_honesty_tests {
             "<Arguments>run</Arguments>",
         );
         assert_ne!(windows_task_identity(&stale), expected);
+    }
+
+    /// A registered task that keeps the expected first action but adds a
+    /// second one runs something OwnMesh never registered, so cardinality is
+    /// part of the identity rather than only the first `<Exec>`'s fields.
+    #[test]
+    fn an_added_task_action_is_drift() {
+        let dir = tempdir().unwrap();
+        let exe = touch_exe(dir.path(), "ownmeshd.exe");
+        let paths = OwnMeshPaths::for_base(dir.path().join("om"));
+        paths.ensure_layout().unwrap();
+        let service_paths = build_service_paths(Some(exe.to_str().unwrap()), &paths).unwrap();
+        let rendered = render_scheduled_task_xml(&service_paths);
+        let expected = windows_task_identity(&rendered);
+
+        let with_second_action = rendered.replace(
+            "</Exec>\n  </Actions>",
+            "</Exec>\n    <Exec>\n      <Command>C:\\Windows\\System32\\calc.exe</Command>\n    </Exec>\n  </Actions>",
+        );
+        let smuggled = windows_task_identity(&with_second_action);
+        assert_eq!(
+            smuggled.command, expected.command,
+            "fixture must keep the expected first action"
+        );
+        assert_eq!(smuggled.exec_action_count, 2);
+        assert_ne!(
+            smuggled, expected,
+            "a task with an extra action must not compare equal"
+        );
+    }
+
+    /// The restart policy is behavior, so a changed one is drift even though
+    /// the action and trigger are untouched.
+    #[test]
+    fn an_altered_restart_policy_is_drift() {
+        let dir = tempdir().unwrap();
+        let exe = touch_exe(dir.path(), "ownmeshd.exe");
+        let paths = OwnMeshPaths::for_base(dir.path().join("om"));
+        paths.ensure_layout().unwrap();
+        let service_paths = build_service_paths(Some(exe.to_str().unwrap()), &paths).unwrap();
+        let rendered = render_scheduled_task_xml(&service_paths);
+        let expected = windows_task_identity(&rendered);
+
+        for (from, to) in [
+            ("<Count>3</Count>", "<Count>99</Count>"),
+            ("<Interval>PT1M</Interval>", "<Interval>PT5M</Interval>"),
+            (
+                "<StartWhenAvailable>true</StartWhenAvailable>",
+                "<StartWhenAvailable>false</StartWhenAvailable>",
+            ),
+            (
+                "<AllowStartOnDemand>true</AllowStartOnDemand>",
+                "<AllowStartOnDemand>false</AllowStartOnDemand>",
+            ),
+            (
+                "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+                "<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>",
+            ),
+            ("<Priority>7</Priority>", "<Priority>4</Priority>"),
+            ("<Hidden>false</Hidden>", "<Hidden>true</Hidden>"),
+        ] {
+            let altered = rendered.replace(from, to);
+            assert_ne!(altered, rendered, "fixture for {from} did not apply");
+            assert_ne!(
+                windows_task_identity(&altered),
+                expected,
+                "changing {from} must be drift"
+            );
+        }
+    }
+
+    /// An added trigger changes when the daemon starts, so it is drift too.
+    #[test]
+    fn an_added_trigger_is_drift() {
+        let dir = tempdir().unwrap();
+        let exe = touch_exe(dir.path(), "ownmeshd.exe");
+        let paths = OwnMeshPaths::for_base(dir.path().join("om"));
+        paths.ensure_layout().unwrap();
+        let service_paths = build_service_paths(Some(exe.to_str().unwrap()), &paths).unwrap();
+        let rendered = render_scheduled_task_xml(&service_paths);
+        let expected = windows_task_identity(&rendered);
+
+        let with_boot_trigger = rendered.replace(
+            "</LogonTrigger>",
+            "</LogonTrigger>\n    <BootTrigger>\n      <Enabled>true</Enabled>\n    </BootTrigger>",
+        );
+        assert_ne!(windows_task_identity(&with_boot_trigger), expected);
     }
 }
