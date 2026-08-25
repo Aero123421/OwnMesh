@@ -10752,15 +10752,61 @@ mod broker_intent_tests {
         Ok(dir)
     }
 
+    /// A launchable, structured system executable that is **not** an OwnMesh
+    /// binary.
+    ///
+    /// This deliberately no longer falls back to `current_exe()`: the daemon
+    /// image is part of the OwnMesh binary set, so `command.run` now refuses it
+    /// before spawn (#160). Using the test binary here would exercise that
+    /// refusal instead of whatever the caller meant to test.
+    ///
+    /// `cmd.exe` is likewise unusable — it reclassifies as `raw_shell` and
+    /// changes the policy path under test.
     fn fixture_executable() -> PathBuf {
         #[cfg(target_os = "linux")]
         {
             PathBuf::from("/bin/true")
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // macOS ships coreutils-style helpers under /usr/bin, not /bin.
+            PathBuf::from("/usr/bin/true")
+        }
+        #[cfg(windows)]
+        {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+            // Any one of these is a stock System32 component; take the first
+            // that is actually present rather than betting on a single name.
+            ["whoami.exe", "hostname.exe", "where.exe"]
+                .iter()
+                .map(|name| PathBuf::from(format!("{root}\\System32\\{name}")))
+                .find(|candidate| candidate.is_file())
+                .expect("a stock System32 executable must exist")
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             std::env::current_exe().unwrap()
         }
+    }
+
+    /// The shared exec fixture must stay usable by every test that only needs
+    /// "some launchable program". If it ever names an OwnMesh binary again,
+    /// the self-reentrancy guard refuses it and unrelated tests start failing
+    /// on whichever platform the fixture falls back on — which is exactly how
+    /// this was found, on a macOS runner rather than locally.
+    #[test]
+    fn the_exec_fixture_is_never_refused_as_a_self_reentrant_ownmesh_binary() {
+        let fixture = fixture_executable();
+        assert!(
+            fixture.exists(),
+            "exec fixture must exist on this platform: {}",
+            fixture.display()
+        );
+        assert!(
+            reject_self_reentrant_ownmesh_exec(&fixture.display().to_string(), &[]).is_ok(),
+            "the shared exec fixture must not be an OwnMesh binary: {}",
+            fixture.display()
+        );
     }
 
     fn bound_runtime() -> (tempfile::TempDir, DaemonRuntime, ExecParams) {
