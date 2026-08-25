@@ -304,7 +304,9 @@ impl StructuredProcessHost {
         // the pipes can keep them open indefinitely, so completion is published
         // here rather than left to a thread that may never wake.
         for ring in [&self.stdout, &self.stderr] {
-            let mut ring = ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut ring = ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             ring.exited = true;
         }
         for reader in self.readers.drain(..) {
@@ -335,7 +337,10 @@ impl Drop for StreamEofGuard {
     fn drop(&mut self) {
         // A panicking reader must still publish EOF; the ring's byte state is
         // append-only, so recovering a poisoned lock cannot expose a torn value.
-        let mut ring = self.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ring = self
+            .ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         ring.exited = true;
     }
 }

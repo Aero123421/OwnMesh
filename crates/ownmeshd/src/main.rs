@@ -230,6 +230,52 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// #148: a service descriptor binds the daemon's layout through typed
+    /// arguments, so `ownmeshd run` must accept them and carry them into the
+    /// process-wide overrides verbatim.
+    #[test]
+    fn run_accepts_a_typed_layout_binding() {
+        let cli = Cli::try_parse_from([
+            "ownmeshd",
+            "run",
+            "--config-dir",
+            "/opt/profile/config",
+            "--state-dir",
+            "/opt/profile/state",
+            "--runtime-dir",
+            "/opt/profile/run",
+        ])
+        .expect("run must accept the descriptor's layout arguments");
+        let Some(Commands::Run { paths }) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        let overrides = paths.into_overrides();
+        assert_eq!(
+            overrides.config_dir.as_deref(),
+            Some(std::path::Path::new("/opt/profile/config"))
+        );
+        assert_eq!(
+            overrides.state_dir.as_deref(),
+            Some(std::path::Path::new("/opt/profile/state"))
+        );
+        assert_eq!(
+            overrides.runtime_dir.as_deref(),
+            Some(std::path::Path::new("/opt/profile/run"))
+        );
+    }
+
+    /// The arguments stay optional: a bare `run`, and the implicit default
+    /// subcommand, must keep discovering the platform layout.
+    #[test]
+    fn run_without_a_layout_binding_stays_unbound() {
+        let cli = Cli::try_parse_from(["ownmeshd", "run"]).unwrap();
+        let Some(Commands::Run { paths }) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert!(paths.into_overrides().is_empty());
+        assert!(Cli::try_parse_from(["ownmeshd"]).unwrap().command.is_none());
+    }
+
     #[test]
     fn cli_help_has_run() {
         let help = Cli::command().render_help().to_string();
