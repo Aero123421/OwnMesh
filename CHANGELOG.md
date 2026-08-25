@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v1.2.22 — Service lifecycle, endpoint, and session honesty
+
+Closes the nine open issues from the 2026-08-24 audit (#147–#155). Every one
+is displayed state that was not the authoritative state; each is closed by
+making the check authoritative rather than by relaxing the claim.
+
 ### Service lifecycle honesty
 
 - `service start` and `service stop` now cross the observable daemon IPC
@@ -19,10 +25,18 @@
   inactive, so a failed stop can no longer be hidden by deleting the unit file.
   An unreachable user bus is no longer mistaken for an absent unit (#149).
 - `service install` compares the descriptor actually registered with the OS —
-  systemd unit body, macOS plist plus loaded launchd job, Windows task action
-  and bound context — against a versioned descriptor digest persisted in
-  `user-service.json`. A hand-edited, older-version, or unreadable descriptor
-  is repaired instead of reported as idempotent success (#153).
+  systemd unit body, macOS plist, and the Windows task's structural identity
+  (action and trigger cardinality plus every rendered setting, since Task
+  Scheduler reformats imported XML) — against a versioned descriptor digest
+  persisted in `user-service.json`. A hand-edited, older-version, or unreadable
+  descriptor is repaired instead of reported as idempotent success. Descriptor
+  identity is independent of whether the service is currently loaded, so a
+  deliberate `service stop` survives a later install (#153).
+- Probe results that prove nothing are classified as unknown rather than as
+  absence: `systemctl is-active` is read by reported state rather than exit
+  status (it exits non-zero for every state but `active`), and only an
+  explicitly reported absence from `launchctl print` allows the descriptor to
+  be removed (#147/#149).
 - The Windows Scheduled Task binds the daemon to the config/state/runtime
   directories validated at install time, via typed `ownmeshd run
   --config-dir/--state-dir/--runtime-dir` arguments shared by the XML import
@@ -46,7 +60,12 @@
   its stream terminal on every exit path, the child is reaped once, and
   completion requires child exit plus both stream EOFs so a late stream cannot
   be truncated. Supervisor status and daemon diagnosis now observe a completed
-  structured child instead of reporting it live until TTL (#152).
+  structured child instead of reporting it live until TTL. A forced termination
+  waits a bounded grace for the readers to publish EOF themselves and only
+  seals the streams when a descendant still holds the pipes — refusing further
+  appends so no output can follow the reported completion, and disclosing the
+  cutoff rather than implying a clean EOF. A termination that failed publishes
+  nothing (#152).
 
 ### Installer
 
@@ -56,6 +75,8 @@
   install-dir daemon, so upgrades restart and version-check the stale daemon
   instead of silently leaving it running; matching is never by process name
   (#150).
+
+See `docs/RELEASE_NOTES_v1.2.22.md` for details.
 
 ## v1.2.21 — Transport availability, journal honesty, and Linux disclosure
 
