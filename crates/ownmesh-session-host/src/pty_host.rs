@@ -2388,11 +2388,14 @@ mod tests {
         );
     }
 
-    /// When a descendant holds the pipes open the readers cannot publish EOF
-    /// themselves, so the forced cutoff must seal the streams rather than mark
-    /// them terminal while they can still be appended to.
+    /// Terminate always leaves the session terminal, whichever path it took.
+    ///
+    /// Which path that is depends on the platform: a shell that execs its
+    /// command leaves no descendant holding the pipes, so the readers publish
+    /// EOF themselves and no seal is needed. That difference is not part of the
+    /// contract — being terminal afterwards is.
     #[test]
-    fn forced_cutoff_seals_streams_when_readers_cannot_finish() {
+    fn terminate_always_publishes_a_terminal_state() {
         let cmd = if cfg!(windows) {
             PtyCommand {
                 program: "cmd.exe".into(),
@@ -2413,6 +2416,48 @@ mod tests {
         host.terminate().unwrap();
 
         for ring in [&host.stdout, &host.stderr] {
+            assert!(
+                ring.lock().unwrap().exited,
+                "terminate must publish completion on every platform"
+            );
+        }
+        assert!(host.is_exited());
+    }
+
+    /// The forced-cutoff publication itself: while the child is alive the
+    /// readers are necessarily parked, so sealing must publish completion,
+    /// refuse further appends, and disclose the bytes it cut off. Deterministic
+    /// on every platform because it does not depend on how the kill propagates.
+    #[test]
+    fn sealing_publishes_completion_and_discloses_the_cutoff() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // The child is live, so neither reader can have reached EOF.
+        for ring in [&host.stdout, &host.stderr] {
+            assert!(
+                !ring.lock().unwrap().exited,
+                "a live child's readers must not have published EOF yet"
+            );
+        }
+
+        host.seal_streams();
+
+        for ring in [&host.stdout, &host.stderr] {
             let ring = ring.lock().unwrap();
             assert!(ring.exited, "a forced cutoff must publish completion");
             assert!(
@@ -2424,6 +2469,7 @@ mod tests {
                 "a forced cutoff loses untransferred bytes and must disclose it"
             );
         }
+        let _ = host.terminate();
     }
 
     /// A termination that failed proves nothing about the child or its
