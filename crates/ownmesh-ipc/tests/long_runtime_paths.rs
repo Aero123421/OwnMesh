@@ -36,10 +36,15 @@ async fn over_long_runtime_dir_still_binds_and_accepts() {
     let client_endpoint = Endpoint::default_for(&runtime, IpcBus::Daemon);
     assert_eq!(client_endpoint, endpoint);
     let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
-    connect(&client_endpoint)
+    // Hold the client connection open across the accept. macOS resolves peer
+    // credentials through `LOCAL_PEERCRED`, which fails closed with ENOTCONN
+    // once the peer has gone; letting this bind drop early would race the
+    // server's fail-closed credential check rather than test the endpoint.
+    let client = connect(&client_endpoint)
         .await
         .expect("client connect must reach the bound listener");
     accept.await.expect("accept task").expect("accept");
+    drop(client);
 
     let _ = std::fs::remove_dir_all(&runtime);
 }
