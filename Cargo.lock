@@ -2020,7 +2020,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "ownmesh"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-broker"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "clap",
  "fs2",
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-broker-client"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-config"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "ownmesh-domain",
  "ownmesh-persist",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-diagnostics"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "ownmesh-persist",
  "serde",
@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-domain"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "jsonschema",
  "serde",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-exec"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "hex",
  "nix 0.28.0",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-fs"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "hex",
  "libc",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-identity"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2196,7 +2196,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-ipc"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "bytes",
  "libc",
@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-logs"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "serde",
  "serde_json",
@@ -2225,14 +2225,14 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-persist"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "ownmesh-policy"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "ownmesh-domain",
  "serde",
@@ -2243,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-profiles"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "ownmesh-exec",
  "serde",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-protocol"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "jsonschema",
  "ownmesh-domain",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-session"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "ownmesh-domain",
  "ownmesh-persist",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-session-host"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "clap",
  "crossterm 0.28.1",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-transfer"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "fs2",
  "hex",
@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-transition-journal"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "ownmesh-ipc",
  "ownmesh-session",
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-tui"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2359,7 +2359,7 @@ dependencies = [
 
 [[package]]
 name = "ownmesh-update"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "flate2",
  "hex",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "ownmeshd"
-version = "1.2.22"
+version = "1.2.23"
 dependencies = [
  "clap",
  "futures-util",
