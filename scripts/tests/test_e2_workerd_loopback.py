@@ -719,7 +719,7 @@ def main() -> int:
                     "--persist-to",
                     str(persist),
                     "--command",
-                    "INSERT OR IGNORE INTO workspace_members (workspace_id,principal_id,created_at) VALUES ('ws_default','prin_other','2026-08-08T00:00:00.000Z');",
+                    f"INSERT OR IGNORE INTO device_workspace_members (device_id,workspace_id,principal_id,created_at) VALUES ({device_id!r},'ws_default','prin_other','2026-08-08T00:00:00.000Z');",
                 ),
                 cwd=CONTROL_PLANE,
                 env=base_env,
