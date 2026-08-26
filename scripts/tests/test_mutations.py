@@ -140,7 +140,7 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_action_tag_pin_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
                 "actions/checkout@v4",
                 1,
             )
@@ -174,7 +174,7 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_action_missing_pin_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
                 "actions/checkout",
                 1,
             )
