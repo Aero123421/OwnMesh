@@ -952,7 +952,10 @@ mod tests {
                 grant_id: "grant".into(),
                 operation_id: "operation".into(),
                 payload_sha256: "a".repeat(64),
-                expires_at_unix: now + 2,
+                // The journal below is the expiry boundary under test. Keep
+                // the enclosing grant live long enough that a loaded Windows
+                // CI runner cannot expire it while this fixture is prepared.
+                expires_at_unix: now + 300,
             },
             bytes.len() as u64,
             hex::encode(Sha256::digest(bytes)),
