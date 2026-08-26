@@ -78,29 +78,49 @@ def classify(status: int | None, headers: dict[str, str], body: bytes) -> tuple[
     The distinction that matters is *who answered*: Cloudflare's edge or the
     Worker. A Worker 401 is a correct, recoverable protocol answer; an edge 403
     is an outage for every client with the wrong fingerprint.
+
+    Classification is by *shape*, not by status code. Cloudflare's block,
+    challenge, and origin-error pages span 403, 429, 503 and 520-527, and this
+    endpoint only ever answers JSON — so an HTML body carrying a ``cf-ray`` is
+    a far more reliable edge signal than any status allowlist. Keying on
+    status alone is how a managed challenge or an IP block gets filed as
+    ``unknown`` and never reaches the operator as a WAF-rule problem.
     """
     if status is None:
         return "transport", "no response"
     text = body[:4096].decode("utf-8", "replace")
-    if status == 403 and ("Error 1010" in text or "error code: 1010" in text):
+    lowered = text.lower()
+    content_type = headers.get("content-type", "")
+    is_json = "application/json" in content_type
+    # `<!doctype html` rather than `<!DOCTYPE html>`: the declaration is
+    # case-insensitive and the closing bracket may be preceded by attributes.
+    looks_like_html = "<!doctype html" in lowered or "<html" in lowered
+
+    if "1010" in lowered and ("error 1010" in lowered or "error code: 1010" in lowered):
         return "edge", "Cloudflare Error 1010 (browser signature)"
-    if status in (403, 503) and "<!DOCTYPE html>" in text.upper():
-        return "edge", f"HTML challenge/blocked page (HTTP {status})"
-    if status == 429 and "cf-ray" in headers and "application/json" not in headers.get(
-        "content-type", ""
-    ):
+    if not is_json and (looks_like_html or "cf-mitigated" in headers):
+        # Cloudflare's own origin errors are 520-527 and are edge-generated,
+        # so this must be decided before any 5xx is attributed to the Worker.
+        if 520 <= status <= 527:
+            return "edge", f"Cloudflare origin error {status} (Worker not reached)"
+        if "cf-ray" in headers or "cf-mitigated" in headers:
+            return "edge", f"Cloudflare challenge/block page (HTTP {status})"
+        return "unknown", f"HTTP {status} returned HTML from an unidentified layer"
+    if 520 <= status <= 527:
+        return "edge", f"Cloudflare origin error {status} (Worker not reached)"
+    if status == 429 and "cf-ray" in headers and not is_json:
         return "edge", "edge rate limit"
     if status == 401 and "www-authenticate" in headers:
         return "worker", "HTTP 401 with Bearer challenge (correct refresh contract)"
     if 500 <= status < 600:
         return "worker", f"Worker {status}"
-    if "application/json" in headers.get("content-type", ""):
+    if is_json:
         try:
             json.loads(text)
         except json.JSONDecodeError:
             return "worker", f"HTTP {status} with malformed JSON body"
         return "worker", f"HTTP {status}"
-    return "unknown", f"HTTP {status} ({headers.get('content-type', 'no content-type')})"
+    return "unknown", f"HTTP {status} ({content_type or 'no content-type'})"
 
 
 def request_urllib(

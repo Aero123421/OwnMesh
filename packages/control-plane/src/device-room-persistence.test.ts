@@ -1521,9 +1521,9 @@ test("a routine refresh keeps a queued operation deliverable; revocation still k
     assert.equal(failed?.status, "failed");
     const error = (failed?.data as { error?: Record<string, unknown> })?.error;
     assert.equal(error?.code, "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH");
-    assert.equal(error?.reason, "explicit_revocation");
+    assert.equal((error?.details as { reason?: string } | undefined)?.reason, "explicit_revocation");
     assert.equal(error?.retryable, false);
-    assert.equal(error?.next_action, undefined);
+    assert.equal((error?.details as { next_action?: string } | undefined)?.next_action, undefined);
     // No token, refresh family, or credential material crosses the boundary.
     assert.doesNotMatch(JSON.stringify(failed?.data), /atk_|rtk_|refresh_family/);
   }
@@ -1556,7 +1556,7 @@ test("a routine refresh keeps a queued operation deliverable; revocation still k
     const failed = await store.getMcpOperation(operationId);
     assert.equal(failed?.status, "failed");
     const error = (failed?.data as { error?: Record<string, unknown> })?.error;
-    assert.equal(error?.reason, "refresh_reuse");
+    assert.equal((error?.details as { reason?: string } | undefined)?.reason, "refresh_reuse");
     assert.equal(error?.retryable, false);
   }
 
@@ -1583,9 +1583,10 @@ test("a routine refresh keeps a queued operation deliverable; revocation still k
     assert.equal(failed?.status, "failed");
     const error = (failed?.data as { error?: Record<string, unknown> })?.error;
     assert.equal(error?.code, "OWNMESH_E_AUTHORIZATION_REFRESHED");
-    assert.equal(error?.reason, "routine_refresh");
+    const details = error?.details as { reason?: string; next_action?: string } | undefined;
+    assert.equal(details?.reason, "routine_refresh");
     assert.equal(error?.retryable, true);
-    assert.equal(error?.next_action, "resubmit");
+    assert.equal(details?.next_action, "resubmit");
     // The old operation stays terminal: it is never rebound or redelivered.
     assert.equal(armed.room.router.pending.has(operationId), false);
   }

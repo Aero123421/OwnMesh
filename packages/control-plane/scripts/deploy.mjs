@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const pnpmScript = process.env.npm_execpath;
 const command = pnpmScript ? process.execPath : process.platform === "win32" ? "pnpm.cmd" : "pnpm";
@@ -117,13 +117,32 @@ async function verifyDeployedBuild(origin) {
     process.stderr.write("Could not read SERVICE_VERSION from src/util.ts.\n");
     return false;
   }
+  // #158: version equality alone cannot catch a deploy that changes the tool
+  // catalog without moving the release train — which is the common case, since
+  // a description or inputSchema edit does not bump SERVICE_VERSION. The
+  // catalog revision is the value that actually distinguishes those builds, so
+  // it has to be compared, not just printed.
+  const localRevision = await readLocalCatalogRevision();
+  if (!localRevision) {
+    process.stderr.write(
+      "Could not compute the local MCP catalog revision; refusing to verify a deploy\n" +
+        "against version equality alone (a catalog-only change would pass silently).\n",
+    );
+    return false;
+  }
+
   let health;
   for (let attempt = 0; attempt < 10; attempt += 1) {
+    // Reset per attempt: a later failure must not leave a stale body behind,
+    // or the mismatch message below reports a version nobody just observed.
+    health = undefined;
     try {
       const response = await fetch(`${origin}/health`, { headers: { accept: "application/json" } });
       if (response.ok) {
         health = await response.json();
-        if (health?.version === localVersion) break;
+        if (health?.version === localVersion && health?.mcp_catalog?.revision === localRevision) {
+          break;
+        }
       }
     } catch {
       // Propagation and DNS warm-up both look like a transport error here.
@@ -141,12 +160,49 @@ async function verifyDeployedBuild(origin) {
     );
     return false;
   }
+  const deployedRevision = health?.mcp_catalog?.revision;
+  if (deployedRevision !== localRevision) {
+    process.stderr.write(
+      `Deployed MCP catalog revision ${deployedRevision ?? "(absent)"} does not match this ` +
+        `release (${localRevision}).\n` +
+        "The edge is still serving an older build; clients would keep a stale tool catalog.\n",
+    );
+    return false;
+  }
   process.stdout.write(
-    `Deployed ${health.version} (MCP catalog ${health?.mcp_catalog?.revision ?? "unknown"}, ` +
+    `Deployed ${health.version} (MCP catalog ${deployedRevision}, ` +
       `${health?.mcp_catalog?.tools ?? "?"} tools).\n` +
       "Compare that revision against the client's loaded catalog when tools look stale.\n",
   );
   return true;
+}
+
+/**
+ * Expected catalog revision for this checkout.
+ *
+ * Computed in a child Node with type stripping enabled rather than from a
+ * generated file, so there is no second copy to fall out of sync with
+ * `PUBLISHED_MCP_TOOLS`.
+ */
+async function readLocalCatalogRevision() {
+  const entry = fileURLToPath(new URL("../src/mcp.ts", import.meta.url));
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--experimental-strip-types",
+      "--no-warnings",
+      "-e",
+      `const m = await import(${JSON.stringify(pathToFileURL(entry).href)});` +
+        "process.stdout.write(await m.mcpCatalogRevision());",
+    ],
+    { encoding: "utf8", windowsHide: true },
+  );
+  if (child.status !== 0) {
+    if (child.stderr) process.stderr.write(child.stderr);
+    return undefined;
+  }
+  const revision = (child.stdout || "").trim();
+  return /^[0-9a-f]{16}$/.test(revision) ? revision : undefined;
 }
 
 /** Read SERVICE_VERSION straight from the source of truth. */

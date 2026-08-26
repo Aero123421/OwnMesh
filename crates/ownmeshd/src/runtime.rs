@@ -691,6 +691,10 @@ pub struct DaemonRuntime {
     /// retained fail-closed and surfaced here instead of poisoning unrelated
     /// future sessions.
     transition_recovery_health: TransitionRecoveryHealth,
+    /// Sessions the last reattach pass could not resolve either way and
+    /// retained fail-closed. Reported through `system.diagnose` so the
+    /// indeterminate case is queryable, not only visible in daemon logs.
+    pub(super) reattach_retained_sessions: usize,
     review_manifests: ReviewManifestStore,
     review_results: ReviewResultStore,
     transition_recovery_running: bool,
@@ -909,6 +913,7 @@ impl DaemonRuntime {
             supervisor: None,
             transition_journal,
             transition_recovery_health: TransitionRecoveryHealth::default(),
+            reattach_retained_sessions: 0,
             review_manifests,
             review_results,
             transition_recovery_running: false,
@@ -5891,6 +5896,11 @@ path or install the tool so detection and execution agree",
         }
         let mut recovered_pids = Vec::new();
         let mut interrupted_opens = Vec::new();
+        // Sessions this pass could not resolve either way. Counted rather than
+        // only logged so the indeterminate case has a queryable representation
+        // (surfaced through `system.diagnose`) instead of living in a stderr
+        // stream a service manager may discard.
+        let mut retained = 0_usize;
         // #31: sessions whose child the supervisor proves is gone. Terminal
         // reconciliation is what stops one dead short-lived session from being
         // re-examined — and re-rejected — on every later reattach.
@@ -5908,11 +5918,16 @@ path or install the tool so detection and execution agree",
                     if let Err(error) = proxy.terminate(&exact, transition_id).await {
                         // Fail closed for *this* session only: a cleanup that
                         // could not be acknowledged keeps its record for
-                        // explicit recovery.
-                        eprintln!(
-                            "warning: interrupted persistent session {session_id} \
-                             cleanup is pending: {error}"
+                        // explicit recovery. This is now the only signal that
+                        // the record was retained — the RPC itself succeeds —
+                        // so it is a structured, filterable event carrying the
+                        // session id rather than a bare stderr line.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %error,
+                            "interrupted persistent session cleanup is pending; record retained"
                         );
+                        retained += 1;
                         continue;
                     }
                     interrupted_opens.push(session_id);
@@ -5928,10 +5943,12 @@ path or install the tool so detection and execution agree",
                         // That is indeterminate, not proof of death, so the
                         // record is retained — but it must not stop an
                         // unrelated session from reattaching or opening.
-                        eprintln!(
-                            "warning: persistent session {session_id} \
-                             cannot reattach without respawn: {error}"
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %error,
+                            "persistent session cannot reattach without respawn; record retained"
                         );
+                        retained += 1;
                         continue;
                     }
                 };
@@ -5955,16 +5972,21 @@ path or install the tool so detection and execution agree",
                         // A different process under the same host binding is a
                         // real conflict, but still a per-session one: retain
                         // the record fail-closed and keep going.
-                        eprintln!(
-                            "warning: persistent session {session_id} child process \
-                             identity changed during reattach"
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "persistent session child process identity changed during reattach; \
+                             record retained"
                         );
+                        retained += 1;
                         continue;
                     }
                 }
                 recovered_pids.push((session_id, pid, birth));
             }
         }
+        // Publish the retained count even when there is nothing to commit, so a
+        // pass that resolved nothing still reports what it could not resolve.
+        self.reattach_retained_sessions = retained;
         if recovered_pids.is_empty() && interrupted_opens.is_empty() && exited_sessions.is_empty() {
             return Ok(());
         }
@@ -7848,7 +7870,7 @@ fn reject_self_reentrant_ownmesh_exec(program: &str, args: &[String]) -> IpcResu
         return Ok(());
     }
     Err(IpcError::Remote {
-        code: app_error::CONFLICT,
+        code: app_error::SELF_REENTRANT_EXEC,
         message: "OWNMESH_E_SELF_REENTRANT_EXEC: running the OwnMesh CLI on the device it \
 manages would re-enter the daemon and block every later request for this device; use the \
 dedicated tools (system.diagnose, policy/grants/workspace) instead. Only `--version` and \
@@ -11158,10 +11180,24 @@ mod broker_intent_tests {
             reject_self_reentrant_ownmesh_exec(&path.display().to_string(), &args)
         };
 
+        // A typed code, not just a message prefix: a client must be able to
+        // tell this apart from every other conflict without substring-matching
+        // prose that anyone could reword.
         let error = refused(&current, &["doctor"]).unwrap_err();
-        assert!(
-            error.to_string().contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
-            "expected the bounded typed refusal: {error}"
+        match &error {
+            IpcError::Remote { code, message } => {
+                assert_eq!(*code, app_error::SELF_REENTRANT_EXEC);
+                assert!(
+                    message.contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a typed self-reentrancy refusal, got {other}"),
+        }
+        assert_eq!(
+            ownmesh_domain::ErrorCode::parse("OWNMESH_E_SELF_REENTRANT_EXEC").unwrap(),
+            ownmesh_domain::ErrorCode::SelfReentrantExec,
+            "the wire code must round-trip through the shared taxonomy"
         );
         assert!(
             refused(&symlink, &["doctor", "--json", "--offline"]).is_err(),
@@ -11228,10 +11264,16 @@ mod broker_intent_tests {
             )
             .await
             .expect_err("a self-reentrant OwnMesh invocation must fail before spawn");
-        assert!(
-            error.to_string().contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
-            "expected the bounded typed refusal: {error}"
-        );
+        match &error {
+            IpcError::Remote { code, message } => {
+                assert_eq!(*code, app_error::SELF_REENTRANT_EXEC);
+                assert!(
+                    message.contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a typed self-reentrancy refusal, got {other}"),
+        }
         assert!(
             runtime.op_journal.is_empty(),
             "a pre-admission refusal must not consume an idempotency key"

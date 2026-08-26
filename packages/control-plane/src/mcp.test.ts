@@ -1730,7 +1730,9 @@ test("system diagnosis is forward-compatible across the Agent contract matrix", 
   const versionCheck = findCheck(futureMajor, "device_diagnosis");
   assert.equal(versionCheck?.state, "unsupported_contract_version");
   assert.equal(versionCheck?.received_contract_major, 2);
-  assert.equal(versionCheck?.supported_contract, "ownmesh.system_diagnosis/1.1");
+  // Held at the minor the Agent actually emits: advertising a `1.1` that no
+  // Agent will ever send is a false lead for an operator reading a skew error.
+  assert.equal(versionCheck?.supported_contract, "ownmesh.system_diagnosis/1.0");
 
   // Every remaining rejection keeps its own bounded reason code instead of one
   // opaque `invalid_response` bucket.

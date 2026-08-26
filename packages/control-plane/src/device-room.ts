@@ -29,7 +29,14 @@ import {
   verifyInternalContext,
 } from "./util.ts";
 import { createStore, type ControlPlaneStore, type McpOperationRecord, type WorkspaceRecord } from "./store.ts";
-import { normalizeSystemDiagnosis, principalRevocationEpochOf } from "./mcp.ts";
+import {
+  authorityInvalidationError,
+  authorityInvalidationSummary,
+  boundAuthorityInvalidationReason,
+  boundPrincipalAuthority,
+  boundPrincipalAuthorityCurrent,
+  normalizeSystemDiagnosis,
+} from "./mcp.ts";
 import {
   annotatePolicyObservation,
   annotateWorkspaceList,
@@ -527,19 +534,7 @@ function readyWorkspaceRegistry(
   return { workspaces, enforce_workspace: raw.enforce_workspace };
 }
 
-type PrincipalCredentialBinding = {
-  principal_id: string;
-  tenant_id: string;
-  /** OAuth issuance generation at authorization time (observability). */
-  generation: number;
-  /**
-   * Revocation epoch at authorization time (#162). Absent on actions bound by
-   * a Control Plane older than the split; those fall back to the strict
-   * generation comparison so an older binding is never treated as *more*
-   * durable than the code that produced it.
-   */
-  revocation_epoch: number | null;
-};
+
 
 type WorkspaceAuthorityResult =
   | "ok"
@@ -569,32 +564,7 @@ function workspaceAuthorityBinding(
 }
 
 /** Extract only a complete, server-bound credential epoch from an operation. */
-function principalCredentialBinding(payload: Record<string, unknown>): PrincipalCredentialBinding | null {
-  const authorization = payload.authorization;
-  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
-  const bound = (authorization as Record<string, unknown>).bound_action;
-  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
-  const action = bound as Record<string, unknown>;
-  const principalId = action.principal_id;
-  const tenantId = action.tenant_id;
-  const generation = action.principal_credential_generation;
-  const epoch = action.principal_revocation_epoch;
-  if (
-    typeof principalId !== "string" || principalId.trim() === "" ||
-    typeof tenantId !== "string" || tenantId.trim() === "" ||
-    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
-  ) return null;
-  // A present-but-malformed epoch is a corrupt binding, not a legacy one.
-  if (epoch !== undefined && (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1)) {
-    return null;
-  }
-  return {
-    principal_id: principalId,
-    tenant_id: tenantId,
-    generation,
-    revocation_epoch: epoch === undefined ? null : epoch,
-  };
-}
+
 
 type SessionIngressGuard = {
   lastSeq: number;
@@ -2376,58 +2346,22 @@ export class DeviceRoom {
     expected?: { principal_id: string; tenant_id: string },
   ): Promise<"ok" | "binding_mismatch" | "credential_generation_mismatch" | "storage_unavailable"> {
     if (!this.env.DB) return "storage_unavailable";
-    const binding = principalCredentialBinding(payload);
+    const binding = boundPrincipalAuthority(payload);
     if (!binding) return "binding_mismatch";
     if (
       expected &&
       (binding.principal_id !== expected.principal_id || binding.tenant_id !== expected.tenant_id)
     ) return "binding_mismatch";
     try {
+      // #162: one shared decision with the Worker-side gates in mcp.ts.
+      // Authority is removed by revocation and refresh-family reuse, not by
+      // reissuing a token.
       const current = await createStore(this.env).getPrincipal(binding.principal_id);
-      if (!current || current.tenant_id !== binding.tenant_id) return "credential_generation_mismatch";
-      // #162: authority is removed by revocation and refresh-family reuse, not
-      // by reissuing a token. Comparing the issuance generation made a normal
-      // 15-minute refresh terminally invalidate work that was only waiting for
-      // a device to reconnect. The revocation epoch is the authority boundary;
-      // an advance still invalidates every operation from that family.
-      if (binding.revocation_epoch !== null) {
-        return principalRevocationEpochOf(current) === binding.revocation_epoch
-          ? "ok"
-          : "credential_generation_mismatch";
-      }
-      // Legacy binding with no epoch: keep the original strict comparison.
-      return current.credential_generation === binding.generation
+      return boundPrincipalAuthorityCurrent(binding, current)
         ? "ok"
         : "credential_generation_mismatch";
     } catch {
       return "storage_unavailable";
-    }
-  }
-
-  /**
-   * Bounded, non-secret cause of a delivery-time authorization invalidation
-   * (#162). Never exposes tokens, refresh families, or credential material —
-   * only which class of event removed the authority.
-   *
-   * `routine_refresh` can only be reported for a legacy binding that carries
-   * no revocation epoch; current bindings are not invalidated by a rotation at
-   * all, which is the point of the split.
-   */
-  private async credentialInvalidationReason(
-    payload: Record<string, unknown>,
-  ): Promise<"explicit_revocation" | "refresh_reuse" | "routine_refresh" | "unknown_generation_change"> {
-    const binding = principalCredentialBinding(payload);
-    if (!binding || !this.env.DB) return "unknown_generation_change";
-    try {
-      const current = await createStore(this.env).getPrincipal(binding.principal_id);
-      if (!current) return "unknown_generation_change";
-      const reason = current.revocation_reason;
-      if (reason === "explicit_revocation" || reason === "refresh_reuse") return reason;
-      // No revocation has ever been recorded for this principal, so whatever
-      // moved the issuance generation was a normal credential rotation.
-      return binding.revocation_epoch === null ? "routine_refresh" : "unknown_generation_change";
-    } catch {
-      return "unknown_generation_change";
     }
   }
 
@@ -2522,35 +2456,16 @@ export class DeviceRoom {
       const check = await this.credentialGenerationCurrent(pending.payload);
       if (check === "ok") continue;
       if (check === "storage_unavailable") throw new Error("storage_unavailable");
-      const reason = await this.credentialInvalidationReason(pending.payload);
-      // #162: a routine credential continuation is recoverable, a withdrawal
-      // of authority is not. The old operation is terminal either way — it is
-      // never rebound, retried, or dispatched under new credentials — but a
-      // caller told `retryable:false` for a healthy refresh has no way back,
-      // even though a freshly authorized request would succeed immediately.
-      const recoverable = reason === "routine_refresh";
+      // #162: same bounded reason and retry contract as the Worker-side gates.
+      const reason = await boundAuthorityInvalidationReason(store, pending.payload);
       this.router.pending.delete(pending.correlation_id);
       removed = true;
       await store.updateMcpOperation(
         operationId,
         {
           status: "failed",
-          summary: recoverable
-            ? "operation authorization was refreshed before device delivery"
-            : "operation authorization invalidated before device delivery",
-          data: {
-            error: {
-              code: recoverable
-                ? "OWNMESH_E_AUTHORIZATION_REFRESHED"
-                : "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-              message: recoverable
-                ? "principal credentials were refreshed before device delivery; this operation was never delivered and can be resubmitted"
-                : "principal credential authority was revoked before device delivery",
-              reason,
-              retryable: recoverable,
-              ...(recoverable ? { next_action: "resubmit" } : {}),
-            },
-          },
+          summary: authorityInvalidationSummary(reason, "delivery"),
+          data: { error: authorityInvalidationError(reason, "delivery") },
           approval_required: false,
         },
         ["pending", "running", "approval_required", "cancel_requested"],

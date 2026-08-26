@@ -1318,30 +1318,54 @@ pub fn process_birth_id(pid: u32) -> Result<Option<u64>, String> {
     unsafe { process_creation_filetime(process.as_raw_handle()).map(Some) }
 }
 
-/// Linux `/proc/<pid>/stat` start time is kernel-supplied and changes on PID
-/// reuse.  Permission or parse failures fail closed rather than claiming a
-/// process is absent.
+/// Read the process state character and start time from `/proc/<pid>/stat`.
+///
+/// One parser for both [`process_birth_id`] and [`running_process_birth_id`]:
+/// the field offsets must agree exactly between them or the zombie regression
+/// in #31 silently returns, and the surest way to keep two copies in agreement
+/// is not to have two copies.
+///
+/// `Ok(None)` means the OS confirmed the PID no longer exists. Permission or
+/// parse failures are `Err` — indeterminate, never a false "dead".
 #[cfg(target_os = "linux")]
-pub fn process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+fn read_proc_stat_fields(pid: u32) -> Result<Option<(char, u64)>, String> {
     let path = format!("/proc/{pid}/stat");
     let stat = match std::fs::read_to_string(&path) {
         Ok(stat) => stat,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("read {path}: {error}")),
     };
+    // Field 2 (`comm`) is parenthesized and may itself contain spaces and
+    // parentheses, so every later field is located from the last `)`.
     let end = stat
         .rfind(')')
         .ok_or_else(|| format!("parse {path}: missing comm terminator"))?;
-    let start = stat
+    let rest = stat
         .get(end + 2..)
         .ok_or_else(|| format!("parse {path}: missing fields"))?;
-    start
-        .split_whitespace()
-        .nth(19)
+    let mut fields = rest.split_whitespace();
+    // Field 3: process state character.
+    let state = fields
+        .next()
+        .and_then(|field| field.chars().next())
+        .ok_or_else(|| format!("parse {path}: missing process state"))?;
+    // Field 22 (`starttime`) is 19 fields further along from field 3.
+    let birth = fields
+        .nth(18)
         .ok_or_else(|| format!("parse {path}: missing start time"))?
         .parse::<u64>()
-        .map(Some)
-        .map_err(|error| format!("parse {path} start time: {error}"))
+        .map_err(|error| format!("parse {path} start time: {error}"))?;
+    Ok(Some((state, birth)))
+}
+
+/// Linux `/proc/<pid>/stat` start time is kernel-supplied and changes on PID
+/// reuse.  Permission or parse failures fail closed rather than claiming a
+/// process is absent.
+#[cfg(target_os = "linux")]
+pub fn process_birth_id(pid: u32) -> Result<Option<u64>, String> {
+    // The process state is deliberately ignored here: this is a birth witness,
+    // and an exited-but-unreaped process still owns the identity it names.
+    Ok(read_proc_stat_fields(pid)?.map(|(_state, birth)| birth))
 }
 
 /// macOS exposes the kernel-recorded process start timestamp through
@@ -1426,36 +1450,15 @@ pub fn process_birth_id(_pid: u32) -> Result<Option<u64>, String> {
 /// "dead" answer, which stays an `Err` so callers keep failing closed.
 #[cfg(target_os = "linux")]
 pub fn running_process_birth_id(pid: u32) -> Result<Option<u64>, String> {
-    let path = format!("/proc/{pid}/stat");
-    let stat = match std::fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("read {path}: {error}")),
+    let Some((state, birth)) = read_proc_stat_fields(pid)? else {
+        return Ok(None);
     };
-    // `comm` (field 2) is parenthesized and may itself contain spaces and
-    // parentheses, so every field after it is located from the last `)`.
-    let end = stat
-        .rfind(')')
-        .ok_or_else(|| format!("parse {path}: missing comm terminator"))?;
-    let rest = stat
-        .get(end + 2..)
-        .ok_or_else(|| format!("parse {path}: missing fields"))?;
-    let mut fields = rest.split_whitespace();
-    // Field 3: process state character.  `Z` is a reaped-pending zombie and
-    // `X`/`x` is a fully dead task still visible for an instant.
-    let state = fields
-        .next()
-        .ok_or_else(|| format!("parse {path}: missing process state"))?;
-    if matches!(state, "Z" | "X" | "x") {
+    // `Z` is a reaped-pending zombie and `X`/`x` is a fully dead task still
+    // visible for an instant. Both have exited.
+    if matches!(state, 'Z' | 'X' | 'x') {
         return Ok(None);
     }
-    // Field 22 (`starttime`) is 19 fields further along from field 3.
-    fields
-        .nth(18)
-        .ok_or_else(|| format!("parse {path}: missing start time"))?
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|error| format!("parse {path} start time: {error}"))
+    Ok(Some(birth))
 }
 
 /// Windows equivalent of the Unix zombie case: a process object stays

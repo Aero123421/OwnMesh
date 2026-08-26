@@ -229,7 +229,13 @@ operations are fenced until it is resolved — run `ownmesh doctor` or inspect {
                 }
             }
         };
-        let stale_sessions = registry_stale_sessions + supervisor_host_stale;
+        // A session the reattach pass could not prove either dead or live is
+        // stale by exactly the definition already in use here: state the
+        // daemon is displaying that it cannot vouch for. Counting it lifts
+        // `overall` to `stale_sessions` with the `reconcile_stale_sessions`
+        // recommendation, which is the action an operator should take.
+        let stale_sessions =
+            registry_stale_sessions + supervisor_host_stale + self.reattach_retained_sessions;
         // P0-A: transition-journal health. Pending records are an early signal;
         // retained-expired records are fail-closed state that must not be
         // reported as healthy.

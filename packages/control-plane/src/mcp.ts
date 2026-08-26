@@ -1970,6 +1970,10 @@ export type PublicOwnMeshError = {
   details?: {
     error?: string;
     status?: string;
+    /** Bounded authorization-invalidation cause (#162). */
+    reason?: string;
+    /** Bounded recovery hint that accompanies a recoverable `reason`. */
+    next_action?: string;
     http_status?: number;
     timeout_ms?: number;
     retry_after_ms?: number;
@@ -2038,8 +2042,17 @@ const SYSTEM_DIAGNOSIS_SCHEMA = "ownmesh.system_diagnosis/1.0" as const;
  */
 const SYSTEM_DIAGNOSIS_CONTRACT_NAME = "ownmesh.system_diagnosis" as const;
 const SYSTEM_DIAGNOSIS_SUPPORTED_MAJOR = 1;
-/** Highest minor this parser understands; a higher minor is still accepted. */
-const SYSTEM_DIAGNOSIS_SUPPORTED_MINOR = 1;
+/**
+ * Highest minor this parser understands; a higher minor is still accepted.
+ *
+ * Held at the minor the Agent actually emits. The Agent is pinned to `1.0`
+ * (raising it would be rejected outright by any Worker <= 1.2.22, which
+ * compares the schema string for exact equality), and this number is only ever
+ * shown to an operator who is already staring at a version-skew failure —
+ * advertising support for a `1.1` that does not exist would be a false lead at
+ * exactly the wrong moment.
+ */
+const SYSTEM_DIAGNOSIS_SUPPORTED_MINOR = 0;
 /**
  * Bounded scan window for device-reported checks.
  *
@@ -3228,30 +3241,168 @@ export function readDispatchOutbox(data: Record<string, unknown> | null | undefi
 }
 
 /**
+ * Principal authority carried by an immutable bound action.
+ *
+ * `revocation_epoch` is absent on actions bound before the #162 split; those
+ * keep the original strict `credential_generation` comparison, so an older
+ * binding is never treated as more durable than the code that produced it.
+ */
+export type BoundPrincipalAuthority = {
+  principal_id: string;
+  tenant_id: string;
+  generation: number;
+  revocation_epoch: number | null;
+};
+
+/**
+ * Read the principal authority out of `payload.authorization.bound_action`.
+ *
+ * Returns `null` for anything missing or malformed — including a
+ * present-but-invalid revocation epoch, which is a corrupt binding rather
+ * than a legacy one.
+ */
+export function boundPrincipalAuthority(
+  payload: Record<string, unknown>,
+): BoundPrincipalAuthority | null {
+  const authorization = payload.authorization;
+  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
+  const bound = (authorization as Record<string, unknown>).bound_action;
+  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
+  const action = bound as Record<string, unknown>;
+  const principalId = action.principal_id;
+  const tenantId = action.tenant_id;
+  const generation = action.principal_credential_generation;
+  const epoch = action.principal_revocation_epoch;
+  if (
+    typeof principalId !== "string" || principalId.trim() === "" ||
+    typeof tenantId !== "string" || tenantId.trim() === "" ||
+    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
+  ) return null;
+  if (epoch !== undefined && (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1)) {
+    return null;
+  }
+  return {
+    principal_id: principalId,
+    tenant_id: tenantId,
+    generation,
+    revocation_epoch: epoch === undefined ? null : epoch,
+  };
+}
+
+/**
+ * The single decision for "is this bound action's authority still
+ * authoritative?" (#162).
+ *
+ * Deliberately one exported function rather than a copy per gate. This
+ * boundary is evaluated at three separate points — Worker-side redelivery,
+ * the pre-route check, and DeviceRoom's final dispatch check — and two of
+ * them previously disagreed: DeviceRoom compared the revocation epoch while
+ * the Worker-side gates still compared every credential issuance, so a
+ * routine refresh still terminated a queued operation through the retry path.
+ *
+ * Authority is removed by revocation and refresh-family reuse, never by
+ * reissuing a token.
+ */
+export function boundPrincipalAuthorityCurrent(
+  binding: BoundPrincipalAuthority,
+  principal: { tenant_id: string; credential_generation: number; revocation_epoch?: number | null } | null,
+): boolean {
+  if (!principal || principal.tenant_id !== binding.tenant_id) return false;
+  if (binding.revocation_epoch !== null) {
+    return principalRevocationEpochOf(principal) === binding.revocation_epoch;
+  }
+  return principal.credential_generation === binding.generation;
+}
+
+/** Bounded, non-secret cause of a delivery-time authorization invalidation. */
+export type PrincipalAuthorityInvalidationReason =
+  | "explicit_revocation"
+  | "refresh_reuse"
+  | "routine_refresh"
+  | "unknown_generation_change";
+
+/**
+ * Why a bound action's authority is no longer current (#162).
+ *
+ * Never exposes tokens, refresh families, or credential material — only which
+ * class of event removed the authority. `routine_refresh` can only be reported
+ * for a legacy binding that carries no revocation epoch; current bindings are
+ * not invalidated by a rotation at all, which is the point of the split.
+ */
+export async function boundAuthorityInvalidationReason(
+  store: ControlPlaneStore,
+  payload: Record<string, unknown>,
+): Promise<PrincipalAuthorityInvalidationReason> {
+  const binding = boundPrincipalAuthority(payload);
+  if (!binding) return "unknown_generation_change";
+  try {
+    const current = await store.getPrincipal(binding.principal_id);
+    if (!current) return "unknown_generation_change";
+    const reason = current.revocation_reason;
+    if (reason === "explicit_revocation" || reason === "refresh_reuse") return reason;
+    // No revocation has ever been recorded for this principal, so whatever
+    // moved the issuance generation was a normal credential rotation.
+    return binding.revocation_epoch === null ? "routine_refresh" : "unknown_generation_change";
+  } catch {
+    return "unknown_generation_change";
+  }
+}
+
+/**
+ * The public error body for an invalidated authority, shared by every gate.
+ *
+ * A routine credential continuation is recoverable, a withdrawal of authority
+ * is not. The old operation is terminal either way — it is never rebound,
+ * retried, or dispatched under new credentials — but a caller told
+ * `retryable:false` for a healthy refresh has no way back, even though a
+ * freshly authorized request would succeed immediately.
+ */
+export function authorityInvalidationError(
+  reason: PrincipalAuthorityInvalidationReason,
+  boundary: "delivery" | "redelivery",
+): Record<string, unknown> {
+  const recoverable = reason === "routine_refresh";
+  return {
+    code: recoverable
+      ? "OWNMESH_E_AUTHORIZATION_REFRESHED"
+      : "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+    message: recoverable
+      ? `principal credentials were refreshed before device ${boundary}; this operation was never delivered and can be resubmitted`
+      : `principal credential authority was revoked before device ${boundary}`,
+    retryable: recoverable,
+    // Under `details` so the bounded reason survives `compactPublicError`'s
+    // allowlist and is actually visible to the caller, not durable-record-only.
+    details: {
+      reason,
+      ...(recoverable ? { next_action: "resubmit" } : {}),
+    },
+  };
+}
+
+/** Summary line matching {@link authorityInvalidationError}. */
+export function authorityInvalidationSummary(
+  reason: PrincipalAuthorityInvalidationReason,
+  boundary: "delivery" | "redelivery",
+): string {
+  return reason === "routine_refresh"
+    ? `operation authorization was refreshed before device ${boundary}`
+    : `operation authorization invalidated before device ${boundary}`;
+}
+
+/**
  * Outbox payloads are immutable but can wait across a credential rotation.
- * Re-read the server-owned principal epoch immediately before a Worker-side
- * delivery attempt; DeviceRoom repeats this check immediately before socket
- * delivery. Missing or malformed authority is never considered current.
+ * Re-read the server-owned principal authority immediately before a
+ * Worker-side delivery attempt; DeviceRoom repeats this check immediately
+ * before socket delivery. Missing or malformed authority is never considered
+ * current.
  */
 async function boundCredentialGenerationCurrent(
   store: ControlPlaneStore,
   operation: { payload: Record<string, unknown> },
 ): Promise<boolean> {
-  const authorization = operation.payload.authorization;
-  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return false;
-  const bound = (authorization as Record<string, unknown>).bound_action;
-  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return false;
-  const action = bound as Record<string, unknown>;
-  const principalId = action.principal_id;
-  const tenantId = action.tenant_id;
-  const generation = action.principal_credential_generation;
-  if (
-    typeof principalId !== "string" || principalId.trim() === "" ||
-    typeof tenantId !== "string" || tenantId.trim() === "" ||
-    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
-  ) return false;
-  const principal = await store.getPrincipal(principalId);
-  return principal?.tenant_id === tenantId && principal.credential_generation === generation;
+  const binding = boundPrincipalAuthority(operation.payload);
+  if (!binding) return false;
+  return boundPrincipalAuthorityCurrent(binding, await store.getPrincipal(binding.principal_id));
 }
 
 /** True when a non-terminal claim still needs (re)dispatch of the bound body. */
@@ -3437,6 +3588,16 @@ function compactPublicError(value: unknown, fallbackMessage: string): PublicOwnM
   }
   if (typeof rawDetails.status === "string") {
     details.status = boundedPublicText(rawDetails.status, "unknown", 64);
+  }
+  // #162: the bounded authorization-invalidation reason and its recovery hint.
+  // Both are closed enums produced by `authorityInvalidationError`, never
+  // device- or client-supplied text, and they are useless to an operator if
+  // they only survive in the durable row.
+  if (typeof rawDetails.reason === "string") {
+    details.reason = boundedPublicText(rawDetails.reason, "unknown", 64);
+  }
+  if (typeof rawDetails.next_action === "string") {
+    details.next_action = boundedPublicText(rawDetails.next_action, "unknown", 64);
   }
   for (const key of ["http_status", "timeout_ms", "retry_after_ms"] as const) {
     const number = rawDetails[key];
@@ -6829,20 +6990,17 @@ export async function handleMcp(
         const box = readDispatchOutbox(replayed.data || {});
         if (box) {
           if (!(await boundCredentialGenerationCurrent(store, box.body))) {
+            const reason = await boundAuthorityInvalidationReason(store, box.body.payload);
             const rejected = await patchOp(
               store,
               tracker,
               replayed.operation_id,
               {
                 status: "failed",
-                summary: "operation authorization invalidated before device redelivery",
+                summary: authorityInvalidationSummary(reason, "redelivery"),
                 data: {
                   ...(replayed.data || {}),
-                  error: {
-                    code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-                    message: "principal credential rotated or was revoked before device redelivery",
-                    retryable: false,
-                  },
+                  error: authorityInvalidationError(reason, "redelivery"),
                 },
                 approval_required: false,
               },
@@ -6964,18 +7122,14 @@ export async function handleMcp(
     }
 
     if (!(await boundCredentialGenerationCurrent(store, deviceOp))) {
+      const reason = await boundAuthorityInvalidationReason(store, deviceOp.payload);
       const env = makeEnvelope({
         operation_id: operationId,
         status: "failed",
         device_id: deviceId,
-        summary: "operation authorization invalidated before device delivery",
+        summary: authorityInvalidationSummary(reason, "delivery"),
         data: {
-          error: {
-            code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-            message: "principal credential rotated or was revoked before device delivery",
-            retryable: false,
-            operation_id: operationId,
-          },
+          error: { ...authorityInvalidationError(reason, "delivery"), operation_id: operationId },
         },
         correlation_id: correlation,
         warnings: injectWarnings,
