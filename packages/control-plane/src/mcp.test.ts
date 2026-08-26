@@ -26,6 +26,7 @@ import {
   mcpCatalogFingerprint,
   mcpCatalogRevision,
   mcpSessionCatalogRevision,
+  principalRevocationEpochOf,
   PUBLISHED_MCP_TOOLS,
   __setGetOperationWaiterCapForTest,
 } from "./mcp.ts";
@@ -180,6 +181,41 @@ test("MCP invalid bearer is HTTP 401 invalid_token on initialize and tools/call"
   assert.equal(call.status, 401);
   const callBody = (await call.json()) as { error?: { message: string } };
   assert.equal(callBody.error?.message, "invalid_token");
+});
+
+test("MCP fails closed when a stored principal revocation epoch is corrupt", async () => {
+  assert.equal(principalRevocationEpochOf({}), 1, "legacy records default to epoch 1");
+  for (const invalid of [null, 0, -1, 1.5, Number.NaN, "1", true]) {
+    assert.equal(
+      principalRevocationEpochOf({ revocation_epoch: invalid }),
+      null,
+      `invalid epoch ${String(invalid)} must not regain epoch 1 authority`,
+    );
+  }
+
+  const { store, token } = await authed();
+  const principal = store.principals.get("prin_dev")!;
+  principal.revocation_epoch = 0;
+
+  for (const request of [
+    rpc("initialize", {
+      protocolVersion: MCP_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "test", version: "0" },
+    }, token),
+    rpc("tools/call", { name: "ownmesh_list_devices", arguments: {} }, token),
+  ]) {
+    const response = await handleMcp(
+      request,
+      store,
+      new URL("https://cp.test/mcp"),
+      undefined,
+      { issuer: "https://cp.test" },
+    );
+    assert.equal(response.status, 401);
+    const body = (await response.json()) as { error?: { message?: string } };
+    assert.equal(body.error?.message, "invalid_token");
+  }
 });
 
 test("MCP initialize and tools/list remain reachable without a bearer", async () => {

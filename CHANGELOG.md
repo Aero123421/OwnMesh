@@ -2,9 +2,12 @@
 
 ## Unreleased
 
-Closes the availability findings from the 2026-08-25 production session
-(#158–#162) plus the reopened Linux session regression (#31). Each is a case
-where OwnMesh reported a healthy component while a client could not use it.
+Mitigates the concrete failure modes reproduced from the 2026-08-25 production
+session (#158–#162) and the reopened Linux session regression (#31). These
+changes do not claim every issue acceptance criterion is complete: live
+ChatGPT/production canaries, the Cloudflare WAF configuration, transactional
+multi-session reattach, and the runtime-wide execution-lock redesign remain
+tracked in their original issues.
 
 ### Device availability
 
@@ -14,9 +17,12 @@ where OwnMesh reported a healthy component while a client could not use it.
   synchronously re-enters daemon IPC waited on the lock its own parent held —
   and every later filesystem, Git, session, and diagnosis request for that
   device queued behind it until the first operation was cancelled by hand.
-  Detection uses OS file identity, so a renamed copy, a hard link, or a symlink
-  is recognized as the same binary; `--version` and `--help` stay executable
-  because they exit during argument parsing, before any IPC is opened (#160).
+  Detection uses OS file identity, so the same installed file reached after a
+  rename, through a hard link, or through a symlink is recognized; `--version`
+  and `--help` stay executable because they exit during argument parsing,
+  before any IPC is opened. A byte-for-byte copied executable and invocation
+  through a shell or script remain outside this guard, so #160 stays open for
+  the runtime-wide lock redesign.
 - Linux session lifecycle treats an exited-but-unreaped child as exited. A
   zombie keeps its PID slot and kernel start time, so the birth-witness probe
   reported it as live: `close` answered "authenticated child is still alive,

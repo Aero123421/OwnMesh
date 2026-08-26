@@ -3122,11 +3122,13 @@ async function resolveMcpAccess(
   if (!rec) return mcpUnauthorized(id, issuer, "invalid_token");
   const principal = await store.getPrincipal(rec.principal);
   const principalCredentialGeneration = Number(principal?.credential_generation);
+  const principalRevocationEpoch = principalRevocationEpochOf(principal ?? {});
   if (
     !principal ||
     principal.tenant_id !== rec.tenant_id ||
     !Number.isSafeInteger(principalCredentialGeneration) ||
-    principalCredentialGeneration < 1
+    principalCredentialGeneration < 1 ||
+    principalRevocationEpoch === null
   ) {
     return mcpUnauthorized(id, issuer, "invalid_token");
   }
@@ -3134,7 +3136,8 @@ async function resolveMcpAccess(
 }
 
 /**
- * Revocation epoch of a principal record, defaulting to `1` (#162).
+ * Revocation epoch of a principal record, defaulting to `1` only when the
+ * field is absent on a pre-migration record (#162).
  *
  * A record written before migration 0018 has no stored epoch. `1` is the
  * schema default and the value every principal starts at, so a pre-migration
@@ -3143,10 +3146,13 @@ async function resolveMcpAccess(
  * stored value past it.
  */
 export function principalRevocationEpochOf(principal: {
-  revocation_epoch?: number | null;
-}): number {
-  const epoch = Number(principal.revocation_epoch ?? 1);
-  return Number.isSafeInteger(epoch) && epoch >= 1 ? epoch : 1;
+  revocation_epoch?: unknown;
+}): number | null {
+  const epoch = principal.revocation_epoch;
+  if (epoch === undefined) return 1;
+  return typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 1
+    ? epoch
+    : null;
 }
 
 function workspaceUnavailableMcpError(
@@ -5455,6 +5461,9 @@ export async function handleMcp(
     const { rec, principal } = access;
     const principalCredentialGeneration = Number(principal.credential_generation);
     const principalRevocationEpoch = principalRevocationEpochOf(principal);
+    if (principalRevocationEpoch === null) {
+      return mcpUnauthorized(id, issuer, "invalid_token");
+    }
 
     const params = body.params || {};
     const name = String(params.name || "");
@@ -7861,8 +7870,12 @@ async function completeApprovalPost(
   const approver = await store.getPrincipal(principal.id);
   const approverCredentialGeneration = Number(approver?.credential_generation);
   const approverRevocationEpoch = principalRevocationEpochOf(approver ?? {});
-  if (!Number.isSafeInteger(approverCredentialGeneration) || approverCredentialGeneration < 1) {
-    return json({ error: "forbidden", error_description: "approver credential generation unavailable" }, { status: 403 });
+  if (
+    !Number.isSafeInteger(approverCredentialGeneration) ||
+    approverCredentialGeneration < 1 ||
+    approverRevocationEpoch === null
+  ) {
+    return json({ error: "forbidden", error_description: "approver authority unavailable" }, { status: 403 });
   }
   if (input.expectedOperationId && input.expectedOperationId !== op.operation_id) {
     return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
