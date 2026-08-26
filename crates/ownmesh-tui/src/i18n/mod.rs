@@ -493,7 +493,7 @@ fn en_us() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "Navigate with Tab/arrows. Ctrl+K opens commands. Setup wizard: Ctrl+K → Wizard. Approvals: a approve, d deny.",
+        "Navigate with Tab/arrows. Ctrl+K opens commands. Setup wizard: Ctrl+K → Wizard. Approvals: a approve, d deny. q quits normally; Ctrl+C exits from any screen or overlay.",
     );
     insert(&mut m, Msg::DaemonOnline, "Daemon online");
     insert(&mut m, Msg::DaemonOffline, "Daemon offline");
@@ -759,7 +759,7 @@ fn ja_jp() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "Tab/矢印で移動。Ctrl+K でコマンド。セットアップ: Ctrl+K → ウィザード。承認: a 許可、d 拒否。",
+        "Tab/矢印で移動。Ctrl+K でコマンド。セットアップ: Ctrl+K → ウィザード。承認: a 許可、d 拒否。通常終了は q。Ctrl+C はどの画面・オーバーレイからでも緊急終了します。",
     );
     insert(&mut m, Msg::DaemonOnline, "デーモン接続中");
     insert(&mut m, Msg::DaemonOffline, "デーモン未接続");
@@ -1033,7 +1033,7 @@ fn zh_hans() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "用 Tab/方向键导航。Ctrl+K 打开命令。向导: Ctrl+K → 向导。审批: a 批准，d 拒绝。",
+        "用 Tab/方向键导航。Ctrl+K 打开命令。向导: Ctrl+K → 向导。审批: a 批准，d 拒绝。正常退出按 q；Ctrl+C 可从任何界面或浮层紧急退出。",
     );
     insert(&mut m, Msg::DaemonOnline, "守护进程在线");
     insert(&mut m, Msg::DaemonOffline, "守护进程离线");
@@ -1275,7 +1275,7 @@ fn ru_ru() -> BTreeMap<Msg, &'static str> {
     insert(
         &mut m,
         Msg::HelpBody,
-        "Навигация Tab/стрелки. Ctrl+K — команды. Мастер: Ctrl+K → Wizard. Одобрения: a принять, d отклонить.",
+        "Навигация Tab/стрелки. Ctrl+K — команды. Мастер: Ctrl+K → Wizard. Одобрения: a принять, d отклонить. Обычный выход — q; Ctrl+C завершает работу с любого экрана или панели.",
     );
     insert(&mut m, Msg::DaemonOnline, "Демон в сети");
     insert(&mut m, Msg::DaemonOffline, "Демон не в сети");

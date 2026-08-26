@@ -159,7 +159,8 @@ was reached.
 | Endpoint | Purpose |
 |---|---|
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata (includes `device_authorization_endpoint`) |
-| `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata |
+| `GET /.well-known/oauth-protected-resource` | RFC 9728 protected resource metadata (origin resource) |
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728 metadata for the `/mcp` resource identifier |
 | `POST /oauth/register` | Dynamic Client Registration; exact ChatGPT public callbacks are stateless, all other clients require tenant authentication; `redirect_uri` **exact match** policy |
 | `GET\|POST /oauth/authorize` | Authenticated principal + explicit consent + auth code + PKCE S256 |
 | `POST /oauth/token` | `authorization_code`, `refresh_token` (rotation + reuse detection), `urn:ietf:params:oauth:grant-type:device_code` |
@@ -204,6 +205,91 @@ Proof body: `{ "device_id", "challenge_id", "signature": "<64-byte ed25519 hex>"
 5. Enroll a device with `ownmesh device enroll` / `ownmesh login` against your issuer URL (CLI ticket **cli-auth-09**)
 
 **Policy note:** ChatGPT tool calls are **not** the authorization boundary. The local `ownmeshd` policy engine is final.
+
+## Machine endpoints must not require a browser signature
+
+OwnMesh's protocol endpoints are called by programs — ChatGPT's connector, the
+CLI, SDKs, and health probes. None of them is a browser. A zone-level rule that
+classifies clients by browser signature (Bot Fight Mode, Browser Integrity
+Check, a managed WAF rule, or a custom rule matching on User-Agent) can reject a
+valid JSON-RPC request with Cloudflare's own **HTTP 403 / Error 1010** before it
+reaches the Worker.
+
+That failure is worse than it looks:
+
+- it never appears in Worker logs, because the Worker is never invoked;
+- it carries no `WWW-Authenticate` challenge, so the OAuth refresh path cannot
+  recover from it;
+- a single blocked `initialize` / `tools/list` removes the **entire** tool
+  catalog from the client, rather than failing one device operation;
+- it looks intermittent, because a client may use different HTTP stacks or
+  egress paths for install, refresh, and invocation.
+
+### Diagnose
+
+```bash
+python scripts/probe_machine_endpoints.py https://<worker>.workers.dev
+```
+
+The probe sends the same anonymous `tools/list` from two HTTP stacks (Python
+`urllib` and curl) under several User-Agents, plus one deliberately invalid
+bearer, and reports **which layer answered**. It sends no credentials.
+
+- `worker` — the request reached OwnMesh. `HTTP 401` with a Bearer challenge on
+  the invalid-bearer probe is the correct, recoverable answer.
+- `edge` — Cloudflare answered instead. This is the misconfiguration below.
+
+A ready-made manual check for the same thing:
+
+```bash
+# Blocked by a browser-signature rule: HTML body containing "Error 1010".
+python3 -c 'import urllib.request,json;
+req=urllib.request.Request("https://<worker>.workers.dev/mcp",
+  data=json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).encode(),
+  headers={"content-type":"application/json","accept":"application/json, text/event-stream"});
+print(urllib.request.urlopen(req).status)'
+```
+
+### Fix (Cloudflare dashboard)
+
+Create a **WAF custom rule** with action **Skip**, scoped to the machine
+endpoints only, and skip only the browser-classification products:
+
+| Setting | Value |
+|---|---|
+| Rule name | `ownmesh machine endpoints` |
+| Expression | `(http.request.uri.path eq "/mcp") or (http.request.uri.path eq "/oauth/token") or (http.request.uri.path eq "/oauth/register") or (http.request.uri.path eq "/oauth/revoke") or (http.request.uri.path eq "/oauth/device_authorization") or (starts_with(http.request.uri.path, "/.well-known/oauth-")) or (starts_with(http.request.uri.path, "/v1/devices")) or (http.request.uri.path eq "/agent/connect")` |
+| Action | Skip → **Browser Integrity Check**, **Bot Fight Mode / Super Bot Fight Mode**, and any managed WAF rule the probe shows is firing |
+
+Keep everything else on. In particular do **not** skip rate limiting, do not
+raise the request-size limits, and do not disable the WAF for the zone:
+
+- OwnMesh's own path-scoped rate limiting and `MAX_REQUEST_BODY_BYTES` bound
+  stay in force in the Worker.
+- Authentication is unchanged — `tools/call` still fails closed without a valid
+  bearer, and discovery is anonymous by design.
+- Device policy on the machine remains the final authority either way.
+
+If your zone uses **Cloudflare Access**, exclude the same paths from the Access
+application. Access issues an interactive login redirect, which a
+machine-to-machine client cannot complete.
+
+### Keep watching it
+
+A zone rule can be re-enabled by a later dashboard change, so treat this as
+monitored state rather than a one-time fix. Run the probe from at least two
+egress locations on a schedule and alert separately on:
+
+| Signal | Meaning | Action |
+|---|---|---|
+| edge `403` / Error 1010 | zone rule is classifying clients | restore the skip rule above |
+| Worker `401` on discovery | OAuth/bearer problem | check token issuance |
+| Worker `5xx` | Worker or binding failure | check deploy and D1 bindings |
+| `HTTP 200` with malformed JSON-RPC | protocol regression | check the release |
+
+The probe prints Cloudflare's `cf-ray` for every non-Worker answer. Include it
+in a Cloudflare support request; it identifies the exact edge decision without
+exposing tokens, request bodies, or user content.
 
 ## Health check
 

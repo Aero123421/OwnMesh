@@ -35,7 +35,15 @@ import {
   protectedResourceMetadata,
   type AuthenticatedPrincipal,
 } from "./oauth.ts";
-import { handleApprove, handleMcp, MCP_SYNC_WAIT_MS, MCP_TOOLS, parseMcpMaxTimeoutMs } from "./mcp.ts";
+import {
+  handleApprove,
+  handleMcp,
+  MCP_SYNC_WAIT_MS,
+  MCP_TOOLS,
+  mcpCatalogRevision,
+  parseMcpMaxTimeoutMs,
+  PUBLISHED_MCP_TOOLS,
+} from "./mcp.ts";
 import { DeviceRoom } from "./device-room.ts";
 import {
   handleChatGptConnector,
@@ -63,14 +71,18 @@ import {
   verifyTransferTicket,
 } from "./transfer-room.ts";
 import {
+  BodyTooLargeError,
+  DuplicateFormFieldError,
   internalContextHeaderName,
   internalDoHeaders,
   json,
+  readBody,
   requireScope,
   SERVICE_NAME,
   SERVICE_VERSION,
   sha256Hex,
   signInternalContext,
+  UnsupportedMediaTypeError,
 } from "./util.ts";
 
 export interface Env {
@@ -596,6 +608,13 @@ export default {
         status: "ok",
         liveness: true,
         storage: env.DB ? "d1" : "unavailable",
+        // #158: the deployed catalog generation, so a deploy can verify that
+        // the Worker now serving traffic is the release it just published and
+        // an operator can compare a client snapshot without a bearer token.
+        mcp_catalog: {
+          revision: await mcpCatalogRevision(),
+          tools: PUBLISHED_MCP_TOOLS.length,
+        },
       });
     }
 
@@ -650,7 +669,10 @@ export default {
       }));
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") {
-      return json(protectedResourceMetadata(issuer));
+      return json(protectedResourceMetadata(issuer, issuer));
+    }
+    if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+      return json(protectedResourceMetadata(`${issuer}/mcp`, issuer));
     }
 
     let store: ControlPlaneStore;
@@ -713,9 +735,23 @@ export default {
       }
       let authRequest = request;
       if (request.method === "POST") {
-        const form = await request.clone().formData();
+        let form: Record<string, string>;
+        try {
+          form = await readBody(request.clone());
+        } catch (error) {
+          if (error instanceof BodyTooLargeError) {
+            return json({ error: "invalid_request" }, { status: 413, noStore: true });
+          }
+          if (error instanceof UnsupportedMediaTypeError) {
+            return json({ error: "unsupported_media_type" }, { status: 415, noStore: true });
+          }
+          if (error instanceof DuplicateFormFieldError || error instanceof SyntaxError) {
+            return json({ error: "invalid_request" }, { status: 400, noStore: true });
+          }
+          throw error;
+        }
         const postUrl = new URL(request.url);
-        for (const [key, value] of form.entries()) postUrl.searchParams.set(key, String(value));
+        for (const [key, value] of Object.entries(form)) postUrl.searchParams.set(key, value);
         authRequest = new Request(postUrl, { method: "POST", headers: request.headers });
       }
       const principal = await browserPrincipal(authRequest, env);
