@@ -467,6 +467,7 @@ function mockSocket(att: SessionAttachment | null = null): MockSocket {
 function mockDOState(opts?: {
   sockets?: MockSocket[];
   storage?: Map<string, unknown>;
+  onStoragePut?: (key: string, value: unknown) => void;
 }): DurableObjectState {
   const map = opts?.storage || new Map<string, unknown>();
   const sockets = opts?.sockets || [];
@@ -476,6 +477,7 @@ function mockDOState(opts?: {
       get: async (key: string) => map.get(key),
       put: async (key: string, value: unknown) => {
         map.set(key, structuredClone(value));
+        opts?.onStoragePut?.(key, value);
       },
       delete: async (key: string) => map.delete(key),
       list: async () => new Map(map),
@@ -627,6 +629,15 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
   const deviceId = "dev_ws_registry_sync01";
   const { adapter, store } = openSqliteAdapter();
   const { token } = await seedActiveDevice(store, deviceId);
+  const events: string[] = [];
+  const trackedAdapter: SqlDatabase = {
+    prepare: (query) => adapter.prepare(query),
+    async batch<T>(statements: SqlStatement[]): Promise<T[]> {
+      const result = await adapter.batch!<T>(statements);
+      events.push("d1");
+      return result;
+    },
+  };
   const authHash = await sha256Hex(token);
   const sessionId = "ags_ws_registry_sync";
   const socket = mockSocket({
@@ -639,8 +650,13 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
     auth_hash: authHash,
     lastSeq: 0,
   });
-  const room = new DeviceRoom(mockDOState({ sockets: [socket] }), {
-    DB: adapter as unknown as D1Database,
+  const room = new DeviceRoom(mockDOState({
+    sockets: [socket],
+    onStoragePut: (key) => {
+      if (key === ROOM_STATE_STORAGE_KEY) events.push("room");
+    },
+  }), {
+    DB: trackedAdapter as unknown as D1Database,
   });
   await room.ready;
 
@@ -654,6 +670,13 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
     })),
   );
   assert.equal(room.router.sessions.get(sessionId)?.phase, "ready");
+  events.length = 0;
+  const originalSend = socket.send.bind(socket);
+  socket.send = (data: string) => {
+    const envelope = JSON.parse(data) as DeviceEnvelope;
+    if (envelope.type === "workspace.registry.ack") events.push("ack");
+    originalSend(data);
+  };
 
   // Device-local workspace_add while the session stays live.
   const generationA = `wsg_${"a".repeat(32)}`;
@@ -673,11 +696,70 @@ test("workspace.registry refresh persists generations without reconnect (#146)",
     .map((s) => JSON.parse(s) as DeviceEnvelope)
     .filter((e) => e.type === "workspace.registry.ack");
   assert.equal(acks.length, 1, "an accepted refresh is acknowledged");
+  const ackIndex = events.indexOf("ack");
+  assert.ok(events.indexOf("d1") >= 0, `D1 snapshot must be written: ${events.join(",")}`);
+  assert.ok(events.indexOf("d1") < ackIndex, `D1 must precede ACK: ${events.join(",")}`);
+  assert.ok(
+    events.lastIndexOf("room", ackIndex) < ackIndex && events.lastIndexOf("room", ackIndex) >= 0,
+    `room sequence state must precede ACK: ${events.join(",")}`,
+  );
 
   // The observed generations are durable — the workspace is operable.
   const repo = await store.getWorkspace(deviceId, "ws_repo");
   assert.ok(repo);
   assert.equal(repo.local_generation, generationB);
+});
+
+test("workspace.registry storage failure closes without ACK (#146)", async () => {
+  const deviceId = "dev_ws_registry_fail01";
+  const base = openSqliteAdapter();
+  const { token } = await seedActiveDevice(base.store, deviceId);
+  const failingAdapter: SqlDatabase = {
+    prepare: (query) => base.adapter.prepare(query),
+    async batch<T>(_statements: SqlStatement[]): Promise<T[]> {
+      throw new Error("injected workspace registry D1 failure");
+    },
+  };
+  const sessionId = "ags_ws_registry_fail";
+  const socket = mockSocket({
+    role: "agent",
+    device_id: deviceId,
+    session_id: sessionId,
+    connected_at: Date.now(),
+    phase: "proven",
+    auth_hash: await sha256Hex(token),
+    lastSeq: 0,
+  });
+  const room = new DeviceRoom(mockDOState({ sockets: [socket] }), {
+    DB: failingAdapter as unknown as D1Database,
+  });
+  await room.ready;
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "ready", deviceId, {
+      agent_version: "1.2.21",
+      protocol_version: PROTOCOL,
+      remote_routing_enabled: true,
+    })),
+  );
+  socket.sent.length = 0;
+
+  await room.webSocketMessage(
+    socket as unknown as WebSocket,
+    JSON.stringify(envFor(sessionId, "workspace.registry", deviceId, {
+      enforce_workspace: true,
+      workspaces: [
+        { id: "ws_default", generation: `wsg_${"c".repeat(32)}` },
+      ],
+    }, undefined, { seq: 2 })),
+  );
+
+  const acks = socket.sent
+    .map((raw) => JSON.parse(raw) as DeviceEnvelope)
+    .filter((envelope) => envelope.type === "workspace.registry.ack");
+  assert.equal(acks.length, 0, "a failed D1 snapshot must never be acknowledged");
+  assert.equal(socket.closed?.code, 1013);
+  assert.equal(room.isStorageBroken, true);
 });
 
 test("workspace.registry rejects non-ready sessions and invalid payloads (#146)", async () => {

@@ -1893,6 +1893,16 @@ fn authoritative_terminal_correlations(payload: &Value) -> Result<Vec<String>, S
     Ok(validated)
 }
 
+fn validate_workspace_registry_ack(payload: &Value) -> Result<(), String> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "workspace.registry.ack payload must be an object".to_owned())?;
+    if object.len() != 1 || object.get("ok") != Some(&Value::Bool(true)) {
+        return Err("workspace.registry.ack requires exactly {\"ok\":true}".into());
+    }
+    Ok(())
+}
+
 fn dispatch_outcome_unknown_reply(operation_id: &ownmesh_domain::OperationId) -> Value {
     json!({
         "operation_contract": OPERATION_CONTRACT_V1,
@@ -2194,6 +2204,7 @@ async fn handle_live_frame(
     };
     match envelope.message_type.as_str() {
         "pong" => Ok(()),
+        "workspace.registry.ack" => validate_workspace_registry_ack(&envelope.payload),
         "ping" => {
             send_envelope(
                 socket,
@@ -5069,7 +5080,6 @@ mod tests {
 
         let server_device = device.clone();
         let notify_for_server = Arc::clone(&registry_notify);
-        let _ = server_device;
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             // The test client connects with plain connect_async and drives
@@ -5108,6 +5118,36 @@ mod tests {
                         .is_some_and(|g: &str| g.starts_with("wsg_"))),
                 "full snapshot must include the default workspace generation: {workspaces:?}"
             );
+            // A durable registry acknowledgement is a live-session control
+            // message, not a reconnect boundary. The Agent must accept it and
+            // continue serving subsequent frames on the same socket.
+            send_test_envelope(
+                &mut socket,
+                &server_device,
+                1,
+                "workspace.registry.ack",
+                json!({ "ok": true }),
+                None,
+            )
+            .await;
+            send_test_envelope(
+                &mut socket,
+                &server_device,
+                2,
+                "ping",
+                json!({ "probe": "after_registry_ack" }),
+                Some("corr_registry_ack_probe"),
+            )
+            .await;
+            let pong =
+                tokio::time::timeout(Duration::from_secs(5), receive_test_envelope(&mut socket))
+                    .await
+                    .expect("Agent must remain connected after workspace.registry.ack");
+            assert_eq!(pong.message_type, "pong");
+            assert_eq!(
+                pong.correlation_id.as_deref(),
+                Some("corr_registry_ack_probe")
+            );
             socket.send(Message::Close(None)).await.unwrap();
         });
 
@@ -5128,6 +5168,19 @@ mod tests {
             .await
             .expect("server task must finish")
             .unwrap();
+    }
+
+    #[test]
+    fn workspace_registry_ack_requires_exact_success_payload() {
+        assert!(validate_workspace_registry_ack(&json!({ "ok": true })).is_ok());
+        for invalid in [
+            json!({ "ok": false }),
+            json!({ "ok": true, "extra": true }),
+            json!({}),
+            json!(true),
+        ] {
+            assert!(validate_workspace_registry_ack(&invalid).is_err());
+        }
     }
 
     #[tokio::test]
