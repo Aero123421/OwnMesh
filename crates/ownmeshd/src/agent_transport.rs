@@ -6388,6 +6388,40 @@ mod tests {
     }
 
     #[test]
+    fn approval_decision_binding_requires_and_accepts_workspace_version() {
+        let device = DeviceId::parse("dev_apr_workspace").unwrap();
+        let (mut request, expires) = sample_bound_approval_decision(
+            device.as_str(),
+            "op_target_write",
+            "approve",
+            &"ef".repeat(32),
+        );
+        request.workspace_id = Some(ownmesh_domain::WorkspaceId::parse("ws_default").unwrap());
+        let bound = request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap();
+        bound.insert("workspace_id".into(), json!("ws_default"));
+        refresh_bound_hash(&mut request);
+        let err = verify_exact_action_binding(&device, &request, Some(&expires)).unwrap_err();
+        assert!(err.contains("workspace_version"), "{err}");
+
+        request
+            .authorization
+            .as_mut()
+            .unwrap()
+            .bound_action
+            .as_object_mut()
+            .unwrap()
+            .insert("workspace_version".into(), json!(7));
+        refresh_bound_hash(&mut request);
+        assert!(verify_exact_action_binding(&device, &request, Some(&expires)).is_ok());
+    }
+
+    #[test]
     fn approval_decision_rejects_unsigned() {
         let device = DeviceId::parse("dev_apr_unsigned").unwrap();
         let request = OperationRequestPayload {

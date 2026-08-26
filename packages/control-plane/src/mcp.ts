@@ -8054,6 +8054,36 @@ async function completeApprovalPost(
           { status: 409 },
         );
       }
+      const targetWorkspaceId = op.workspace_id ?? null;
+      const actionWorkspaceVersion = op.action?.workspace_version;
+      const targetWorkspaceVersion =
+        targetWorkspaceId === null
+          ? null
+          : typeof actionWorkspaceVersion === "number" &&
+              Number.isSafeInteger(actionWorkspaceVersion) &&
+              actionWorkspaceVersion > 0
+            ? actionWorkspaceVersion
+            : null;
+      if (targetWorkspaceId !== null && targetWorkspaceVersion === null) {
+        await store.releaseMcpApprovalOutboxClaim(
+          claimed.id,
+          claimToken,
+          claimVersion,
+          "approval_target_workspace_version_missing",
+        );
+        claimSettled = true;
+        return json(
+          {
+            error: "conflict",
+            error_description:
+              "workspace-bound approval target is missing its authoritative workspace version",
+            operation_id: op.operation_id,
+            delivery_status: "pending",
+            retryable: false,
+          },
+          { status: 409 },
+        );
+      }
       const prepared = await patchOp(
         store,
         defaultOpTracker,
@@ -8186,7 +8216,8 @@ async function completeApprovalPost(
         principal_credential_generation: approverCredentialGeneration,
         principal_revocation_epoch: approverRevocationEpoch,
         oauth_client_id: null,
-        workspace_id: op.workspace_id ?? null,
+        workspace_id: targetWorkspaceId,
+        workspace_version: targetWorkspaceVersion,
         facts: decisionFacts,
         operation_id: decisionOpId,
         expires_at: decisionExpiresAt,

@@ -682,6 +682,7 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
     approval_url: `https://cp.test/approve?operation_id=${opId}`,
     warnings: [],
     correlation_id: corr,
+    workspace_id: "ws_default",
     policy_authority: "ownmesh_device",
     payload_hash: targetHash,
     expires_at: targetExpires,
@@ -690,6 +691,8 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
       capability: "filesystem.write",
       action: "fs.write",
       tool: "ownmesh_fs_write",
+      workspace_id: "ws_default",
+      workspace_version: 7,
       path: "secret.txt",
     },
     created_at: new Date().toISOString(),
@@ -835,6 +838,9 @@ test("/approve auth+CSRF+one-time delivers decision to DeviceRoom; double approv
   assert.ok(auth?.bound_action && typeof auth.bound_action === "object");
   assert.equal(auth!.bound_action!.action, "approval.decision");
   assert.equal(auth!.bound_action!.principal_id, "prin_dev");
+  assert.equal(deliveries[0]!.payload.workspace_id, "ws_default");
+  assert.equal(auth!.bound_action!.workspace_id, "ws_default");
+  assert.equal(auth!.bound_action!.workspace_version, 7);
   assert.equal(
     (auth!.bound_action!.facts as { decision?: string } | undefined)?.decision,
     "approve",
@@ -1902,4 +1908,3 @@ test("approval_required without issuer does not persist a relative approval_url"
   assert.equal(applied.ok && applied.record?.approval_required, true);
   assert.equal(applied.ok && applied.record?.approval_url, undefined);
 });
-

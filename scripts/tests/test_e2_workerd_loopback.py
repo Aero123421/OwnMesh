@@ -150,14 +150,18 @@ def wait_for_health(issuer: str, process: subprocess.Popen[bytes]) -> None:
 
 
 def loopback_failure_logs(log_path: Path) -> str:
-    daemon = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    daemon_logs: list[str] = []
+    for candidate in sorted(log_path.parent.glob("ownmeshd*.log")):
+        daemon = candidate.read_text(encoding="utf-8", errors="replace")
+        daemon_logs.append(f"{candidate.name}:\n{daemon[-4000:]}")
     wrangler_path = log_path.parent / "wrangler.log"
     wrangler = (
         wrangler_path.read_text(encoding="utf-8", errors="replace")
         if wrangler_path.exists()
         else ""
     )
-    return f"ownmeshd:\n{daemon[-4000:]}\nworkerd:\n{wrangler[-4000:]}"
+    daemon_output = "\n\n".join(daemon_logs)
+    return f"{daemon_output}\nworkerd:\n{wrangler[-4000:]}"
 
 
 def wait_for_ready(process: subprocess.Popen[bytes], log_path: Path) -> dict[str, object]:
