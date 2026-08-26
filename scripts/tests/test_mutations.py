@@ -151,7 +151,7 @@ class CheckerMutationTests(unittest.TestCase):
     def test_mutation_action_branch_pin_fails(self) -> None:
         def mutate(text: str) -> str:
             return text.replace(
-                "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+                "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
                 "actions/setup-node@main",
                 1,
             )
