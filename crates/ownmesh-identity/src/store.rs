@@ -200,9 +200,9 @@ impl SecretStore for EncryptedFileKeystore {
         let key = self.derive_key(&salt)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key)
             .map_err(|err| IdentityError::Crypto(format!("chacha key: {err}")))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, secret.expose())
+            .encrypt(&nonce, secret.expose())
             .map_err(|err| IdentityError::Crypto(format!("encrypt: {err}")))?;
 
         let mut file_bytes = Vec::with_capacity(4 + 16 + 12 + ciphertext.len());
@@ -250,9 +250,9 @@ impl SecretStore for EncryptedFileKeystore {
         let key = self.derive_key(&salt)?;
         let cipher = ChaCha20Poly1305::new_from_slice(&key)
             .map_err(|err| IdentityError::Crypto(format!("chacha key: {err}")))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let plain = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| IdentityError::Keystore("decrypt failed (bad passphrase?)".into()))?;
         Ok(Some(SecretBytes::new(plain)))
     }

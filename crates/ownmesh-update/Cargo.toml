@@ -31,7 +31,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 flate2 = "1.0.35"
-minisign = "0.7"
+minisign = "0.9"
 serde_json = "1"
 tar = "0.4.43"
 tempfile = "3.15.0"
