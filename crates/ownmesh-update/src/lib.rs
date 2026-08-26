@@ -43,7 +43,11 @@ pub use checksum::{parse_sha256sums, sha256_hex, verify_checksum};
 pub use engine::{CheckReport, UpdateEngine};
 pub use error::{UpdateError, UpdateResult};
 pub use github::{ReleaseMeta, SelectedRelease, DEFAULT_REPOSITORY};
-pub use install::{apply_binaries, current_install_dir, is_homebrew_install, ApplyReport};
+pub use install::{
+    apply_binaries, current_install_dir, finalize_apply, finalize_interrupted_commit,
+    interrupted_apply_pending, is_homebrew_install, recover_interrupted_apply, rollback_apply,
+    verify_applied_binaries, ApplyReport,
+};
 pub use limits::{
     ALLOWED_DOC_FILES, DOWNLOAD_TIMEOUT_SECS, MAX_ARCHIVE_BYTES, MAX_ARCHIVE_ENTRIES,
     MAX_CHECKSUMS_BYTES, MAX_ENTRY_UNCOMPRESSED_BYTES, MAX_METADATA_BYTES, MAX_SIGNATURE_BYTES,

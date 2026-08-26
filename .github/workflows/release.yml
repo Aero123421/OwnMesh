@@ -208,6 +208,7 @@ jobs:
     name: Publish gated release
     needs: [ci-gate, security-gate, build, distribution-metadata]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       attestations: write
@@ -340,8 +341,22 @@ jobs:
           echo "available=true" >> "${GITHUB_OUTPUT}"
       - name: Install minisign
         run: |
-          sudo apt-get update
-          sudo apt-get install -y minisign
+          set -euo pipefail
+          # apt-get minisign can stall indefinitely on ubuntu-latest (v1.2.15).
+          # Same pinned jedisct1/minisign 0.11 linux x64 archive as the installer.
+          url="https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz"
+          expect="f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0"
+          archive="$(mktemp)"
+          trap 'rm -f "${archive}"' EXIT
+          curl -fsSL --retry 3 --retry-delay 2 -o "${archive}" "${url}"
+          echo "${expect}  ${archive}" | sha256sum -c -
+          workdir="$(mktemp -d)"
+          trap 'rm -f "${archive}"; rm -rf "${workdir}"' EXIT
+          tar -xzf "${archive}" -C "${workdir}"
+          test -x "${workdir}/minisign-linux/x86_64/minisign"
+          sudo install -m 0755 "${workdir}/minisign-linux/x86_64/minisign" /usr/local/bin/minisign
+          command -v minisign
+          minisign -v
       - name: Sign checksums and immediately verify
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}

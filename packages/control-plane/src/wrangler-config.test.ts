@@ -75,4 +75,8 @@ test("wrangler.jsonc has D1 + DeviceRoom and no R2/TURN bindings", () => {
   assert.equal(rateLimits.find((entry) => entry.name === "MCP_RATE_LIMITER")?.simple.limit, 120);
   assert.equal(rateLimits.find((entry) => entry.name === "AUTH_IP_RATE_LIMITER")?.simple.limit, 600);
   assert.equal(rateLimits.find((entry) => entry.name === "MCP_IP_RATE_LIMITER")?.simple.limit, 1200);
+
+  const vars = cfg.vars as Record<string, string>;
+  assert.equal(vars.MCP_OPS_MAX_PER_TENANT, "20000");
+  assert.equal(vars.MCP_MAX_TIMEOUT_MS, "300000");
 });

@@ -1,0 +1,7 @@
+{
+  "enforce_workspace": true,
+  "workspaces": [
+    { "id": "ws_default", "generation": "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    { "id": "ws_repo", "generation": "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }
+  ]
+}

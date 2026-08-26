@@ -140,6 +140,29 @@ impl SupervisorClient {
                 .await?,
         )?)
     }
+    /// Read-only liveness probe used by daemon transition recovery (P0-A):
+    /// whether a host for `session_id` is still tracked by the live supervisor.
+    /// A host is removed from the supervisor map only after its termination
+    /// succeeds (`sweep_expired`), so "not tracked" is the authoritative proof
+    /// that no sidecar for that session can still be live under this
+    /// supervisor instance. No binding validity is required — expired
+    /// bindings are exactly what recovery asks about.
+    pub async fn host_live(&self, session_id: &str) -> IpcResult<bool> {
+        let value = self
+            .client
+            .call(
+                SupervisorRpcMethods::HOST_LIVE,
+                Some(json!({ "session_id": session_id })),
+            )
+            .await?;
+        value
+            .get("live")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| IpcError::Remote {
+                code: app_error::INTERNAL,
+                message: "supervisor host_live reply missing live flag".into(),
+            })
+    }
     pub async fn write(&self, binding: &SupervisorBinding, bytes: Vec<u8>) -> IpcResult<()> {
         self.client
             .call(
@@ -271,6 +294,9 @@ pub struct SupervisorRpcMethods;
 impl SupervisorRpcMethods {
     pub const SPAWN: &'static str = "session_supervisor.spawn";
     pub const STATUS: &'static str = "session_supervisor.status";
+    /// Read-only: whether a host for a session is still tracked (P0-A
+    /// authoritative sidecar-liveness proof for expired transition records).
+    pub const HOST_LIVE: &'static str = "session_supervisor.host_live";
     pub const WRITE: &'static str = "session_supervisor.write";
     pub const RESIZE: &'static str = "session_supervisor.resize";
     pub const DRAIN: &'static str = "session_supervisor.drain";
@@ -410,6 +436,15 @@ async fn dispatch(
         SupervisorRpcMethods::STATUS | SupervisorRpcMethods::REATTACH => {
             let binding: SupervisorBinding = parse(params)?;
             Ok(json!(state.reattach(&binding).await.map_err(invalid)?))
+        }
+        SupervisorRpcMethods::HOST_LIVE => {
+            #[derive(Deserialize)]
+            struct P {
+                session_id: String,
+            }
+            let p: P = parse(params)?;
+            require_component(&p.session_id, "session_id")?;
+            Ok(json!({ "live": state.host_live(&p.session_id).await }))
         }
         SupervisorRpcMethods::WRITE => {
             let params: WriteParams = parse(params)?;
@@ -706,7 +741,18 @@ mod tests {
         IpcClient,
     };
     use std::time::Duration;
-    use tempfile::tempdir;
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     fn client(endpoint: Endpoint, runtime: &Path, credential: Option<String>) -> IpcClient {
         let client = IpcClient::new(
@@ -829,6 +875,47 @@ mod tests {
             .terminate(&binding, "terminate-bootstrap".into())
             .await
             .unwrap();
+        supervisor.server().request_shutdown();
+        task.await.unwrap();
+    }
+
+    /// P0-A review: `session_supervisor.host_live` is the authoritative
+    /// sidecar-liveness probe for daemon transition recovery. It is a
+    /// read-only, binding-independent check: a spawned host reports live, an
+    /// unknown session reports dead, and a terminated host reports dead.
+    #[tokio::test]
+    async fn host_live_rpc_tracks_spawn_and_termination() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let (supervisor, _) = SupervisorIpcServer::new(&state_dir, &runtime).unwrap();
+        let endpoint = supervisor.endpoint().clone();
+        let server = Arc::clone(supervisor.server());
+        let task = tokio::spawn(async move { server.serve().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let management = read_management_credential(supervisor.credential_state_dir()).unwrap();
+        let daemon = SupervisorClient::bootstrap(endpoint.clone(), runtime.clone(), management)
+            .await
+            .unwrap();
+        assert!(
+            !daemon.host_live("ses_never").await.unwrap(),
+            "an unknown session must report not-live"
+        );
+        let request: SupervisorSpawnRequest = serde_json::from_value(spawn_params()).unwrap();
+        let binding = daemon.spawn(request).await.unwrap();
+        assert!(
+            daemon.host_live("ses_ipc").await.unwrap(),
+            "a spawned host must report live"
+        );
+        daemon
+            .terminate(&binding, "terminate-probe".into())
+            .await
+            .unwrap();
+        assert!(
+            !daemon.host_live("ses_ipc").await.unwrap(),
+            "a terminated host must report not-live"
+        );
         supervisor.server().request_shutdown();
         task.await.unwrap();
     }

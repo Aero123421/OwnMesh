@@ -11,9 +11,13 @@ import {
   handleOwnerLogin,
   handleOwnerPasskeyOptions,
   handleOwnerPasskeyRegistrationOptions,
+  issueOwnerPresenceForCommitment,
   issueOwnerPresenceForOperation,
+  ownerPresenceForCommitment,
   ownerPresenceForOperation,
   ownerPrincipalFromRequest,
+  parseApprovalSelection,
+  approvalSetCommitment,
   sameOriginBrowserPost,
 } from "./owner-auth.ts";
 import { MemoryStore, SqlStore, type SqlDatabase, type SqlStatement } from "./store.ts";
@@ -273,6 +277,75 @@ test("approval presence is short-lived, signed, and bound to one exact operation
       "op_alpha_123",
     ),
     false,
+  );
+});
+
+test("batch approval presence is bound to a server-side set commitment, not v1 operation_id", async () => {
+  const authEnv = await env();
+  const principal = { id: "prin_owner", tenant_id: "ten_default", display_name: "Owner" };
+  const hashA = "a".repeat(64);
+  const hashB = "b".repeat(64);
+  const commitment = await approvalSetCommitment([
+    { operation_id: "op_beta", payload_hash: hashB },
+    { operation_id: "op_alpha", payload_hash: hashA },
+  ]);
+  assert.ok(commitment);
+  const sortedSame = await approvalSetCommitment([
+    { operation_id: "op_alpha", payload_hash: hashA },
+    { operation_id: "op_beta", payload_hash: hashB },
+  ]);
+  assert.equal(commitment, sortedSame);
+
+  const setCookie = await issueOwnerPresenceForCommitment(authEnv, ISSUER, principal, commitment!);
+  assert.ok(setCookie);
+  const cookie = setCookie!.split(";", 1)[0]!;
+  const request = new Request(`${ISSUER}/approve?ids=op_alpha&ids=op_beta`, { headers: { cookie } });
+  assert.equal(
+    await ownerPresenceForCommitment(request, authEnv, ISSUER, principal, commitment!),
+    true,
+  );
+  const other = await approvalSetCommitment([
+    { operation_id: "op_alpha", payload_hash: hashA },
+    { operation_id: "op_gamma", payload_hash: hashB },
+  ]);
+  assert.equal(
+    await ownerPresenceForCommitment(request, authEnv, ISSUER, principal, other!),
+    false,
+  );
+  assert.equal(
+    await ownerPresenceForOperation(request, authEnv, ISSUER, principal, "op_alpha"),
+    false,
+  );
+
+  const v1 = await issueOwnerPresenceForOperation(authEnv, ISSUER, principal, "op_alpha");
+  const v1Cookie = v1!.split(";", 1)[0]!;
+  assert.equal(
+    await ownerPresenceForCommitment(
+      new Request(`${ISSUER}/approve?ids=op_alpha`, { headers: { cookie: v1Cookie } }),
+      authEnv,
+      ISSUER,
+      principal,
+      commitment!,
+    ),
+    false,
+  );
+});
+
+test("approval URL selection rejects mixed operation_id and ids and canonicalizes batch membership", () => {
+  assert.equal(parseApprovalSelection(new URL(`${ISSUER}/approve`)).kind, "list");
+  assert.deepEqual(parseApprovalSelection(new URL(`${ISSUER}/approve?operation_id=op_alpha`)), {
+    kind: "single",
+    operationId: "op_alpha",
+  });
+  const batch = parseApprovalSelection(new URL(`${ISSUER}/approve?ids=op_b&ids=op_a&ids=op_b`));
+  assert.deepEqual(batch, { kind: "batch", operationIds: ["op_a", "op_b"] });
+  assert.equal(
+    parseApprovalSelection(new URL(`${ISSUER}/approve?operation_id=op_a&ids=op_b`)).kind,
+    "invalid",
+  );
+  assert.equal(
+    (parseApprovalSelection(new URL(`${ISSUER}/approve?ids=${"x".repeat(200)}`)) as { error?: string }).error,
+    "invalid ids",
   );
 });
 

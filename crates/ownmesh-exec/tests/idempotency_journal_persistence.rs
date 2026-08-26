@@ -34,6 +34,7 @@ fn result(stdout: &str) -> RunResult {
         timed_out: false,
         duration_ms: 1,
         truncated: false,
+        pid: None,
         replayed: false,
     }
 }

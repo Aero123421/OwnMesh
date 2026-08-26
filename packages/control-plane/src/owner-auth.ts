@@ -79,7 +79,31 @@ type PresenceClaims = {
   nonce: string;
 };
 
+type PresenceClaimsV2 = {
+  v: 2;
+  purpose: "approve";
+  sub: string;
+  tenant: string;
+  aud: string;
+  commitment: string;
+  exp: number;
+  nonce: string;
+};
+
 const PRESENCE_SIGNING_CONTEXT = "ownmesh.owner.presence.v1:";
+const PRESENCE_SIGNING_CONTEXT_V2 = "ownmesh.owner.presence.v2:";
+const APPROVE_LIST_CSRF_COOKIE = "__Host-ownmesh_approve_list";
+const APPROVE_LIST_CSRF_TTL_SECONDS = 10 * 60;
+const PAYLOAD_HASH_RE = /^[0-9a-f]{64}$/i;
+
+/** Hard cap on one passkey-bound approval set. */
+export const MAX_BATCH_APPROVAL_IDS = 32;
+
+export type ApprovalSelection =
+  | { kind: "list" }
+  | { kind: "single"; operationId: string }
+  | { kind: "batch"; operationIds: string[] }
+  | { kind: "invalid"; error: string };
 
 function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -153,15 +177,115 @@ function validOperationId(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value);
 }
 
-function approvalOperationId(target: string, issuer: string): string | null {
+/** Canonical lowercase SHA-256 hex, or null when the value is not a payload hash. */
+export function payloadHashForCommitment(value: unknown): string | null {
+  if (typeof value !== "string" || !PAYLOAD_HASH_RE.test(value)) return null;
+  return value.toLowerCase();
+}
+
+/**
+ * Parse `/approve` query selection.
+ * `operation_id` (exactly one) and `ids` are mutually exclusive. Duplicate `ids`
+ * are collapsed; order is sorted for the v2 commitment.
+ */
+export function parseApprovalSelection(url: URL): ApprovalSelection {
+  const singles = url.searchParams.getAll("operation_id").filter((value) => value.length > 0);
+  const rawIds = url.searchParams.getAll("ids").filter((value) => value.length > 0);
+  if (singles.length > 0 && rawIds.length > 0) {
+    return { kind: "invalid", error: "operation_id and ids are mutually exclusive" };
+  }
+  if (singles.length > 1) {
+    return { kind: "invalid", error: "exactly one operation_id allowed" };
+  }
+  if (singles.length === 1) {
+    return validOperationId(singles[0]!)
+      ? { kind: "single", operationId: singles[0]! }
+      : { kind: "invalid", error: "invalid operation_id" };
+  }
+  if (rawIds.length === 0) return { kind: "list" };
+  const seen = new Set<string>();
+  const operationIds: string[] = [];
+  for (const id of rawIds) {
+    if (!validOperationId(id)) return { kind: "invalid", error: "invalid ids" };
+    if (seen.has(id)) continue;
+    seen.add(id);
+    operationIds.push(id);
+  }
+  if (operationIds.length > MAX_BATCH_APPROVAL_IDS) {
+    return { kind: "invalid", error: `ids exceeds ${MAX_BATCH_APPROVAL_IDS}` };
+  }
+  operationIds.sort();
+  return { kind: "batch", operationIds };
+}
+
+function parseApprovalTarget(target: string, issuer: string): ApprovalSelection | null {
   try {
     const url = new URL(target, issuer);
     if (url.origin !== new URL(issuer).origin || url.pathname !== "/approve") return null;
-    const values = url.searchParams.getAll("operation_id");
-    return values.length === 1 && validOperationId(values[0]!) ? values[0]! : null;
+    const selection = parseApprovalSelection(url);
+    return selection.kind === "invalid" ? null : selection;
   } catch {
     return null;
   }
+}
+
+export function approvalSelectionReturnTo(selection: Extract<ApprovalSelection, { kind: "single" | "batch" | "list" }>): string {
+  if (selection.kind === "single") {
+    return `/approve?operation_id=${encodeURIComponent(selection.operationId)}`;
+  }
+  if (selection.kind === "batch") {
+    return `/approve?${selection.operationIds.map((id) => `ids=${encodeURIComponent(id)}`).join("&")}`;
+  }
+  return "/approve";
+}
+
+/**
+ * SHA-256 of sorted `operation_id:payload_hash` lines. Hashes must be server-looked-up
+ * 64-char hex; the client must not supply them.
+ */
+export async function approvalSetCommitment(
+  entries: Array<{ operation_id: string; payload_hash: string }>,
+): Promise<string | null> {
+  if (entries.length < 1 || entries.length > MAX_BATCH_APPROVAL_IDS) return null;
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (!validOperationId(entry.operation_id) || seen.has(entry.operation_id)) return null;
+    const hash = payloadHashForCommitment(entry.payload_hash);
+    if (!hash) return null;
+    seen.add(entry.operation_id);
+    lines.push(`${entry.operation_id}:${hash}`);
+  }
+  lines.sort();
+  return sha256Hex(lines.join("\n"));
+}
+
+export async function approvalCommitmentForIds(
+  store: ControlPlaneStore,
+  operationIds: string[],
+): Promise<string | null> {
+  if (operationIds.length < 1 || operationIds.length > MAX_BATCH_APPROVAL_IDS) return null;
+  const entries: Array<{ operation_id: string; payload_hash: string }> = [];
+  for (const operationId of operationIds) {
+    const op = await store.getMcpOperation(operationId);
+    const hash = payloadHashForCommitment(op?.payload_hash);
+    if (!op || op.status !== "approval_required" || !hash) return null;
+    entries.push({ operation_id: operationId, payload_hash: hash });
+  }
+  return approvalSetCommitment(entries);
+}
+
+export function issueApproveListCsrf(): { token: string; header: string } {
+  const token = randomToken("csrf_");
+  return {
+    token,
+    header: cookie(APPROVE_LIST_CSRF_COOKIE, token, APPROVE_LIST_CSRF_TTL_SECONDS, "Strict"),
+  };
+}
+
+export function verifyApproveListCsrf(request: Request, token: string): boolean {
+  const cookieToken = cookieValue(request, APPROVE_LIST_CSRF_COOKIE) || "";
+  return Boolean(token && cookieToken && constantTimeEqual(token, cookieToken));
 }
 
 export function sameOriginBrowserPost(request: Request, issuer: string): boolean {
@@ -368,6 +492,44 @@ export async function issueOwnerPresenceForOperation(
   return cookie(PRESENCE_COOKIE, `${body}.${bytesToBase64Url(signature)}`, PRESENCE_TTL_SECONDS, "Strict");
 }
 
+/**
+ * Mint a short-lived v2 presence cookie bound to a set commitment
+ * (`SHA-256` of sorted `operation_id:payload_hash` lines). Distinct HMAC
+ * context from v1 so a v1 verifier cannot accept this cookie.
+ */
+export async function issueOwnerPresenceForCommitment(
+  env: OwnerAuthEnv,
+  issuer: string,
+  principal: OwnerPrincipal,
+  commitment: string,
+): Promise<string | null> {
+  const bound = payloadHashForCommitment(commitment);
+  if (
+    !ownerAuthConfigured(env) ||
+    principal.id !== OWNER_ID ||
+    principal.tenant_id !== OWNER_TENANT ||
+    !bound
+  ) {
+    return null;
+  }
+  const claims: PresenceClaimsV2 = {
+    v: 2,
+    purpose: "approve",
+    sub: principal.id,
+    tenant: principal.tenant_id,
+    aud: new URL(issuer).origin,
+    commitment: bound,
+    exp: Date.now() + PRESENCE_TTL_SECONDS * 1000,
+    nonce: randomToken("p_").slice(0, 40),
+  };
+  const body = bytesToBase64Url(new TextEncoder().encode(JSON.stringify(claims)));
+  const signed = `${PRESENCE_SIGNING_CONTEXT_V2}${body}`;
+  const signature = new Uint8Array(
+    await crypto.subtle.sign("HMAC", await hmacKey(env.SESSION_SECRET!), new TextEncoder().encode(signed)),
+  );
+  return cookie(PRESENCE_COOKIE, `${body}.${bytesToBase64Url(signature)}`, PRESENCE_TTL_SECONDS, "Strict");
+}
+
 export async function ownerPresenceForOperation(
   request: Request,
   env: OwnerAuthEnv,
@@ -407,6 +569,57 @@ export async function ownerPresenceForOperation(
       claims.tenant === principal.tenant_id &&
       claims.aud === new URL(issuer).origin &&
       claims.operation_id === operationId &&
+      typeof claims.exp === "number" &&
+      claims.exp > now &&
+      claims.exp <= now + PRESENCE_TTL_SECONDS * 1000 + 60_000 &&
+      typeof claims.nonce === "string" &&
+      claims.nonce.length >= 16
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function ownerPresenceForCommitment(
+  request: Request,
+  env: OwnerAuthEnv,
+  issuer: string,
+  principal: OwnerPrincipal,
+  commitment: string,
+): Promise<boolean> {
+  const bound = payloadHashForCommitment(commitment);
+  if (
+    !ownerAuthConfigured(env) ||
+    principal.id !== OWNER_ID ||
+    principal.tenant_id !== OWNER_TENANT ||
+    !bound
+  ) {
+    return false;
+  }
+  const token = cookieValue(request, PRESENCE_COOKIE);
+  if (!token || token.length > 2048) return false;
+  const [body, signature, extra] = token.split(".");
+  if (!body || !signature || extra !== undefined) return false;
+  const bodyBytes = base64UrlToBytes(body);
+  const signatureBytes = base64UrlToBytes(signature);
+  if (!bodyBytes || !signatureBytes) return false;
+  const valid = await crypto.subtle.verify(
+    "HMAC",
+    await hmacKey(env.SESSION_SECRET!),
+    signatureBytes,
+    new TextEncoder().encode(`${PRESENCE_SIGNING_CONTEXT_V2}${body}`),
+  );
+  if (!valid) return false;
+  try {
+    const claims = JSON.parse(new TextDecoder().decode(bodyBytes)) as Partial<PresenceClaimsV2>;
+    const now = Date.now();
+    return (
+      claims.v === 2 &&
+      claims.purpose === "approve" &&
+      claims.sub === principal.id &&
+      claims.tenant === principal.tenant_id &&
+      claims.aud === new URL(issuer).origin &&
+      claims.commitment === bound &&
       typeof claims.exp === "number" &&
       claims.exp > now &&
       claims.exp <= now + PRESENCE_TTL_SECONDS * 1000 + 60_000 &&
@@ -468,13 +681,13 @@ export function ownerLoginRedirect(request: Request, issuer: string): Response {
 
 export function ownerPresenceRedirect(request: Request, issuer: string): Response {
   const current = new URL(request.url);
-  const operationId = approvalOperationId(`${current.pathname}${current.search}`, issuer);
-  if (!operationId) {
-    return json({ error: "invalid_request", error_description: "operation_id required" }, { status: 400, noStore: true });
+  const selection = parseApprovalSelection(current);
+  if (selection.kind !== "single" && selection.kind !== "batch") {
+    return json({ error: "invalid_request", error_description: "operation_id or ids required" }, { status: 400, noStore: true });
   }
   const login = new URL("/login", issuer);
   login.searchParams.set("fresh", "1");
-  login.searchParams.set("return_to", `/approve?operation_id=${encodeURIComponent(operationId)}`);
+  login.searchParams.set("return_to", approvalSelectionReturnTo(selection));
   return new Response(null, { status: 302, headers: { location: login.toString() } });
 }
 
@@ -590,8 +803,10 @@ export async function handleOwnerLogin(
   }
   const url = new URL(request.url);
   const returnTo = safeReturnTo(url.searchParams.get("return_to"), issuer);
+  const returnSelection = parseApprovalTarget(returnTo, issuer);
   const forceFreshApproval =
-    url.searchParams.get("fresh") === "1" && approvalOperationId(returnTo, issuer) !== null;
+    url.searchParams.get("fresh") === "1" &&
+    (returnSelection?.kind === "single" || returnSelection?.kind === "batch");
   if (request.method === "GET") {
     if (!forceFreshApproval && await ownerPrincipalFromRequest(request, env, issuer)) {
       return new Response(null, { status: 302, headers: { location: returnTo } });
@@ -635,15 +850,19 @@ async function appendPresenceCookieForReturnTo(
   env: OwnerAuthEnv,
   issuer: string,
   returnTo: string,
+  store: ControlPlaneStore,
 ): Promise<void> {
-  const operationId = approvalOperationId(returnTo, issuer);
-  if (!operationId) return;
-  const presence = await issueOwnerPresenceForOperation(
-    env,
-    issuer,
-    { id: OWNER_ID, tenant_id: OWNER_TENANT, display_name: "Owner" },
-    operationId,
-  );
+  const selection = parseApprovalTarget(returnTo, issuer);
+  const owner = { id: OWNER_ID, tenant_id: OWNER_TENANT, display_name: "Owner" };
+  if (selection?.kind === "single") {
+    const presence = await issueOwnerPresenceForOperation(env, issuer, owner, selection.operationId);
+    if (presence) headers.append("set-cookie", presence);
+    return;
+  }
+  if (selection?.kind !== "batch") return;
+  const commitment = await approvalCommitmentForIds(store, selection.operationIds);
+  if (!commitment) return;
+  const presence = await issueOwnerPresenceForCommitment(env, issuer, owner, commitment);
   if (presence) headers.append("set-cookie", presence);
 }
 
@@ -747,7 +966,7 @@ export async function handleOwnerPasskeyRegistrationVerify(
     const headers = new Headers();
     headers.append("set-cookie", cookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, "Lax"));
     headers.append("set-cookie", passkeyChallengeCookie("", 0));
-    await appendPresenceCookieForReturnTo(headers, env, issuer, challenge.return_to);
+    await appendPresenceCookieForReturnTo(headers, env, issuer, challenge.return_to, store);
     return json({ ok: true, redirect: challenge.return_to }, { status: 200, noStore: true, headers });
   } catch {
     return passkeyError("verification_failed", 401);
@@ -846,7 +1065,7 @@ export async function handleOwnerPasskeyVerify(
     const headers = new Headers();
     headers.append("set-cookie", cookie(SESSION_COOKIE, session, SESSION_TTL_SECONDS, "Lax"));
     headers.append("set-cookie", passkeyChallengeCookie("", 0));
-    await appendPresenceCookieForReturnTo(headers, env, issuer, challenge.return_to);
+    await appendPresenceCookieForReturnTo(headers, env, issuer, challenge.return_to, store);
     return json({ ok: true, redirect: challenge.return_to }, { status: 200, noStore: true, headers });
   } catch {
     return passkeyError("verification_failed", 401);
@@ -863,6 +1082,7 @@ export async function handleOwnerLogout(request: Request, issuer: string): Promi
       ["location", "/login"],
       ["set-cookie", cookie(SESSION_COOKIE, "", 0, "Lax")],
       ["set-cookie", cookie(PRESENCE_COOKIE, "", 0, "Strict")],
+      ["set-cookie", cookie(APPROVE_LIST_CSRF_COOKIE, "", 0, "Strict")],
       ["cache-control", "no-store, no-cache"],
     ],
   });

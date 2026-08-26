@@ -19,6 +19,7 @@ import {
   signInternalContext,
   verifyInternalContext,
   sha256Hex,
+  INTERNAL_CONTEXT_DEFAULT_TTL_MS,
   INTERNAL_CONTEXT_TTL_MS,
   InternalContextReplayGuard,
   defaultInternalContextReplayGuard,
@@ -495,6 +496,25 @@ test("internal context: replay of same nonce rejected; method/path/body_sha256 b
       }),
     (err: unknown) => err instanceof Error && err.message === "exp_exceeds_max_ttl",
   );
+
+  // A normally minted token remains valid when the verifier clock is modestly
+  // behind the signer. The hard 30s verification cap is intentionally retained.
+  assert.ok(INTERNAL_CONTEXT_DEFAULT_TTL_MS < INTERNAL_CONTEXT_TTL_MS);
+  const defaultMintStartedAt = Date.now();
+  const skewSafeToken = await signInternalContext(TEST_SECRET, {
+    op: "operation",
+    device_id: "dev_ctx_replay_01",
+    principal_id: "prin_a",
+    tenant_id: "ten_a",
+    nonce: "n_ttl_skew_headroom_01",
+  });
+  const skewSafeVerify = await verifyInternalContext(TEST_SECRET, skewSafeToken, {
+    op: "operation",
+    device_id: "dev_ctx_replay_01",
+    nowMs: defaultMintStartedAt - 2_000,
+    replayGuard: guard,
+  });
+  assert.equal(skewSafeVerify.ok, true);
 
   // Verify-time: token whose exp is further than max TTL from "now" is rejected.
   // Build a valid short-lived token, then verify with a clock far before exp window end

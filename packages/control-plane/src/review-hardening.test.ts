@@ -12,7 +12,15 @@ test("published tool catalog contains no duplicate aliases", () => {
   assert.equal(new Set(published).size, published.length, "published names must be unique");
   for (const tool of PUBLISHED_MCP_TOOLS) {
     assert.equal(tool.aliasOf, undefined, `${tool.name} is an alias and must not be published`);
+    assert.notEqual(tool.hidden, true, `${tool.name} is hidden and must not be published`);
   }
+});
+
+test("deprecated session release stays callable but is not model-facing", () => {
+  const legacy = MCP_TOOLS.find((tool) => tool.name === "ownmesh_session_release");
+  assert.ok(legacy, "legacy release must remain callable through tools/call");
+  assert.equal(legacy!.hidden, true);
+  assert.ok(!PUBLISHED_MCP_TOOLS.some((tool) => tool.name === legacy!.name));
 });
 
 test("every alias points at a published canonical tool and keeps its contract", () => {
@@ -98,6 +106,7 @@ test("small agent ergonomics matrix selects canonical tools without shell fallba
     { task: "inspect a review receipt", tool: "ownmesh_review_show", calls: 1, polls: 0, shellFallbacks: 0 },
     { task: "plan a device transfer", tool: "ownmesh_transfer_plan", calls: 1, polls: 0, shellFallbacks: 0 },
     { task: "poll accepted async work", tool: "ownmesh_get_operation", calls: 1, polls: 1, shellFallbacks: 0 },
+    { task: "inspect effective policy", tool: "ownmesh_policy_show", calls: 1, polls: 0, shellFallbacks: 0 },
   ] as const;
   const published = new Map(PUBLISHED_MCP_TOOLS.map((tool) => [tool.name, tool]));
   for (const row of tasks) {
@@ -112,7 +121,7 @@ test("small agent ergonomics matrix selects canonical tools without shell fallba
       }),
       { calls: 0, polls: 0, shellFallbacks: 0 },
     ),
-    { calls: 9, polls: 1, shellFallbacks: 0 },
+    { calls: 10, polls: 1, shellFallbacks: 0 },
   );
 
   assert.match(published.get("ownmesh_command_run")!.description, /bounded non-interactive/);

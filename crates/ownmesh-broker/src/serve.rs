@@ -998,6 +998,12 @@ async fn handle_linux_production_connection(
             {
                 return Err("cancel fence or OS peer identity mismatch (fail-closed)".into());
             }
+            state
+                .ledger
+                .lock()
+                .map_err(|_| "replay ledger lock poisoned".to_string())?
+                .mark_spawned(&cancel.nonce, &cancel_digest, None)
+                .map_err(|error| replay_error(&error))?;
             target
                 .cancel
                 .send(true)
@@ -1074,6 +1080,14 @@ async fn handle_linux_production_connection(
                 cancel: cancel_tx,
             },
         );
+        // Persist the side-effect boundary before the runner may spawn. A crash
+        // after this point remains blocked as spawned_uncertain on restart.
+        state
+            .ledger
+            .lock()
+            .map_err(|_| "replay ledger lock poisoned".to_string())?
+            .mark_spawned(&internal.nonce, &digest, None)
+            .map_err(|error| replay_error(&error))?;
         // The Execute connection remains part of the authorization boundary
         // until its response has been produced.  A separate connection may
         // carry an exact CancelIntent, but EOF/reset (or any unexpected second
