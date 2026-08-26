@@ -531,6 +531,7 @@ def main() -> int:
             }
         )
         base_env["PATH"] = str(fixture_bin_dir) + os.pathsep + base_env.get("PATH", "")
+        log_path = temp / "ownmeshd-0.log"
 
         try:
             run_checked(
@@ -665,7 +666,6 @@ def main() -> int:
             wait_for_health(issuer, wrangler_process)
 
             binary = ROOT / "target" / "debug" / ("ownmeshd.exe" if os.name == "nt" else "ownmeshd")
-            log_path = temp / "ownmeshd-0.log"
             daemon_process = start_daemon(binary, base_env, log_path)
             state0 = wait_for_ready(daemon_process, log_path)
 
@@ -3081,6 +3081,10 @@ def main() -> int:
                 f"list_op={list_op}, patch_op={patch_op}, shell_op={shell_op}, ses_op={ses_op}, chunks={chunk_i})"
             )
             return 0
+        except Exception as error:
+            raise RuntimeError(
+                f"{error}\n{loopback_failure_logs(log_path)}"
+            ) from error
         finally:
             stop_process(daemon_process)
             stop_session_sidecars(state_dir)
