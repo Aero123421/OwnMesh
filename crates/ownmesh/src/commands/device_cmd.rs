@@ -1,14 +1,15 @@
 //! `ownmesh device` enrollment and lifecycle commands.
 
 use crate::auth::{
-    enroll_device, list_devices, load_access_token, open_secret_store, resolve_issuer,
-    revoke_device, rotate_local_device_key, update_device_metadata, AuthSession, DeviceInfo,
-    SessionPaths,
+    device_name_candidate, enroll_device, is_generic_device_name, list_devices, load_access_token,
+    open_secret_store, resolve_issuer, revoke_device, rotate_local_device_key,
+    update_device_metadata, AuthSession, DeviceInfo, SessionPaths,
 };
 use crate::cli::{Cli, DeviceCmd};
 use ownmesh_domain::ExitCode;
 use ownmesh_identity::PreferredSecretStore;
 use serde_json::json;
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 /// Dispatch device subcommands that are implemented for §5-CLI.
@@ -38,13 +39,15 @@ pub fn run_enroll(cli: &Cli) -> Result<(), ExitCode> {
             ctx.session.issuer.clone()
         };
 
+        let candidate = device_name_candidate();
+        let name = prompt_device_name(cli, &candidate);
         let result = enroll_device(
             &ctx.http,
             &issuer,
             &ctx.access,
             &ctx.store,
             &ctx.session_paths,
-            None,
+            name.as_deref(),
         )
         .await
         .map_err(|err| {
@@ -74,6 +77,28 @@ pub fn run_enroll(cli: &Cli) -> Result<(), ExitCode> {
         }
         Ok(())
     })
+}
+
+fn prompt_device_name(cli: &Cli, candidate: &str) -> Option<String> {
+    if cli.json || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return None;
+    }
+    if !is_generic_device_name(candidate) {
+        return None;
+    }
+    println!("OS hostname is unavailable or generic ({candidate}).");
+    print!("Device name [{candidate}]: ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return Some(candidate.to_owned());
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        Some(candidate.to_owned())
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 fn run_list(cli: &Cli) -> Result<(), ExitCode> {

@@ -13,7 +13,7 @@ use ownmesh_policy::AccessPreset;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use std::sync::LazyLock;
 
@@ -268,10 +268,10 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let text = if app.status_line.is_empty() {
         localized(
             app.lang,
-            "↑/↓ select · Enter open · Ctrl+K commands · ? help",
-            "↑/↓ 選択 · Enter 開く · Ctrl+K コマンド · ? ヘルプ",
-            "↑/↓ 选择 · Enter 打开 · Ctrl+K 命令 · ? 帮助",
-            "↑/↓ выбор · Enter открыть · Ctrl+K команды · ? помощь",
+            "↑/↓ select · Enter open · Ctrl+K commands · ? help · Ctrl+C exit",
+            "↑/↓ 選択 · Enter 開く · Ctrl+K コマンド · ? ヘルプ · Ctrl+C 終了",
+            "↑/↓ 选择 · Enter 打开 · Ctrl+K 命令 · ? 帮助 · Ctrl+C 退出",
+            "↑/↓ выбор · Enter открыть · Ctrl+K команды · ? помощь · Ctrl+C выход",
         )
         .to_owned()
     } else {
@@ -676,15 +676,75 @@ fn overview_action_copy(lang: Lang, action: OverviewAction) -> (&'static str, &'
 }
 
 fn draw_devices(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(t(app.lang, Msg::DevicesLocal), app.theme.body)),
         Line::from(match &app.daemon {
             Some(s) => format!("  endpoint={} state={}", s.endpoint, s.state),
             None => format!("  {}", t(app.lang, Msg::DaemonOffline)),
         }),
         Line::from(""),
-        Line::from(Span::styled(t(app.lang, Msg::DevicesHint), app.theme.muted)),
+        Line::from(Span::styled(
+            t(app.lang, Msg::DevicesInventory),
+            app.theme.body,
+        )),
     ];
+    let snapshot = app.device_inventory.loaded_snapshot().cloned();
+    match &app.device_inventory {
+        crate::control_plane::DeviceInventory::NotConfigured => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesNotConfigured)));
+        }
+        crate::control_plane::DeviceInventory::AuthRequired => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesAuthRequired)));
+        }
+        crate::control_plane::DeviceInventory::Empty => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesEmpty)));
+        }
+        crate::control_plane::DeviceInventory::Loaded { devices, truncated } => {
+            for device in devices {
+                lines.push(Line::from(crate::control_plane::format_device_row(
+                    device,
+                    app.readiness.device_id.as_deref(),
+                )));
+            }
+            if *truncated {
+                lines.push(Line::from(Span::styled(
+                    t(app.lang, Msg::DevicesTruncated),
+                    app.theme.muted,
+                )));
+            }
+        }
+        crate::control_plane::DeviceInventory::Unreachable { message, .. } => {
+            lines.push(Line::from(format!(
+                "{} {}",
+                t(app.lang, Msg::DevicesUnreachable),
+                message
+            )));
+            if let Some(crate::control_plane::DeviceInventory::Loaded { devices, truncated }) =
+                snapshot.as_ref()
+            {
+                for device in devices {
+                    lines.push(Line::from(crate::control_plane::format_device_row(
+                        device,
+                        app.readiness.device_id.as_deref(),
+                    )));
+                }
+                if *truncated {
+                    lines.push(Line::from(Span::styled(
+                        t(app.lang, Msg::DevicesTruncated),
+                        app.theme.muted,
+                    )));
+                }
+            }
+        }
+        crate::control_plane::DeviceInventory::Idle => {
+            lines.push(Line::from(t(app.lang, Msg::DevicesHint)));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        t(app.lang, Msg::DevicesHintRefresh),
+        app.theme.muted,
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
@@ -705,16 +765,38 @@ fn draw_workspaces(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
+/// Render `items` with the shared cursor kept in range and scrolled into
+/// view. A stateful widget recomputes the viewport offset each frame so the
+/// selected row is always visible (issue #135).
+fn render_list_with_cursor(
+    frame: &mut Frame<'_>,
+    items: Vec<ListItem<'_>>,
+    selected: usize,
+    area: Rect,
+) {
+    let mut state = ListState::default();
+    if let Some(last) = items.len().checked_sub(1) {
+        state.select(Some(selected.min(last)));
+    }
+    frame.render_stateful_widget(List::new(items), area, &mut state);
+}
+
 fn draw_list_screen(frame: &mut Frame<'_>, app: &App, area: Rect, items: Vec<String>, hint: &str) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(area);
+    // Highlight and viewport follow one pre-clamped selection so they can
+    // never disagree (#135).
+    let selected = items
+        .len()
+        .checked_sub(1)
+        .map_or(0, |last| app.list_cursor.min(last));
     let list_items: Vec<ListItem> = items
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let style = if i == app.list_cursor {
+            let style = if i == selected {
                 app.theme.selection
             } else {
                 app.theme.body
@@ -723,7 +805,7 @@ fn draw_list_screen(frame: &mut Frame<'_>, app: &App, area: Rect, items: Vec<Str
             ListItem::new(text).style(style)
         })
         .collect();
-    frame.render_widget(List::new(list_items), chunks[0]);
+    render_list_with_cursor(frame, list_items, selected, chunks[0]);
     frame.render_widget(
         Paragraph::new(hint)
             .style(app.theme.muted)
@@ -747,17 +829,20 @@ fn draw_approvals(frame: &mut Frame<'_>, app: &App, area: Rect) {
             chunks[0],
         );
     } else {
+        let selected = app
+            .approval_cursor
+            .min(app.approvals.len().saturating_sub(1));
         let items: Vec<ListItem> = app
             .approvals
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                let mark = if i == app.approval_cursor { ">" } else { " " };
+                let mark = if i == selected { ">" } else { " " };
                 let line = format!(
                     "{mark} [{}] {} · {} — {}",
                     a.state, a.id, a.capability, a.reason
                 );
-                let style = if i == app.approval_cursor {
+                let style = if i == selected {
                     app.theme.selection
                 } else if a.state == "pending" {
                     app.theme.warn
@@ -771,7 +856,7 @@ fn draw_approvals(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .style(style)
             })
             .collect();
-        frame.render_widget(List::new(items), chunks[0]);
+        render_list_with_cursor(frame, items, selected, chunks[0]);
     }
     frame.render_widget(
         Paragraph::new(t(app.lang, Msg::ApprovalsHint)).style(app.theme.muted),
@@ -884,7 +969,9 @@ fn draw_help_modal(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_connector_modal(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_fixed(frame.area(), 76, 16);
+    // Linux gains a linger-disclosure line (#143); keep the modal tall enough.
+    let height = if cfg!(target_os = "linux") { 18 } else { 16 };
+    let area = centered_fixed(frame.area(), 76, height);
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -908,7 +995,25 @@ fn draw_connector_modal(frame: &mut Frame<'_>, app: &App) {
         "请先完成设置",
         "Сначала завершите настройку",
     ));
-    let lines = vec![
+    let linger_note: Option<Line<'_>> = if cfg!(target_os = "linux") {
+        Some(Line::from(Span::styled(
+            localized(
+                app.lang,
+                "Linux: the agent stops at logout unless you enable lingering \
+                 (loginctl enable-linger $USER).",
+                "Linux: ログアウトでエージェントが停止します。常時オンにするには自分で \
+                 lingeringを有効化してください (loginctl enable-linger $USER)。",
+                "Linux：注销后代理会停止；如需保持在线，请自行启用 lingering \
+                 (loginctl enable-linger $USER)。",
+                "Linux: агент останавливается при выходе из системы; для постоянной работы \
+                 включите lingering (loginctl enable-linger $USER).",
+            ),
+            app.theme.muted,
+        )))
+    } else {
+        None
+    };
+    let mut lines = vec![
         Line::from(localized(
             app.lang,
             "Add OwnMesh in ChatGPT. This is separate from enrolling this PC.",
@@ -935,17 +1040,21 @@ fn draw_connector_modal(frame: &mut Frame<'_>, app: &App) {
             "2. Вставьте MCP URL, выберите OAuth и войдите.",
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            localized(
-                app.lang,
-                "Esc / Enter  close",
-                "Esc / Enter  閉じる",
-                "Esc / Enter  关闭",
-                "Esc / Enter  закрыть",
-            ),
-            app.theme.muted,
-        )),
     ];
+    if let Some(note) = linger_note {
+        lines.push(note);
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        localized(
+            app.lang,
+            "Esc / Enter  close",
+            "Esc / Enter  閉じる",
+            "Esc / Enter  关闭",
+            "Esc / Enter  закрыть",
+        ),
+        app.theme.muted,
+    )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
@@ -1209,11 +1318,15 @@ fn draw_palette(frame: &mut Frame<'_>, app: &App) {
         chunks[0],
     );
 
+    let selected = items
+        .len()
+        .checked_sub(1)
+        .map_or(0, |last| app.palette.cursor.min(last));
     let list_items: Vec<ListItem> = items
         .iter()
         .enumerate()
         .map(|(i, c)| {
-            let style = if i == app.palette.cursor {
+            let style = if i == selected {
                 app.theme.selection
             } else {
                 app.theme.body
@@ -1225,7 +1338,7 @@ fn draw_palette(frame: &mut Frame<'_>, app: &App) {
             .style(style)
         })
         .collect();
-    frame.render_widget(List::new(list_items), chunks[1]);
+    render_list_with_cursor(frame, list_items, selected, chunks[1]);
     frame.render_widget(
         Paragraph::new(t(app.lang, Msg::PaletteHint)).style(app.theme.muted),
         chunks[2],
@@ -1393,6 +1506,67 @@ mod tests {
     }
 
     #[test]
+    fn long_sessions_list_scrolls_selection_into_view() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Sessions;
+        app.set_sessions_from_json(&serde_json::json!({
+            "sessions": (0..40)
+                .map(|i| serde_json::json!({ "id": format!("s{i:02}"), "state": "active" }))
+                .collect::<Vec<_>>()
+        }));
+        for _ in 0..39 {
+            app.move_list_cursor(1);
+        }
+        assert_eq!(app.list_cursor, 39);
+        let snap = render_snapshot(&app, MIN_COLS, MIN_ROWS);
+        assert!(
+            snap.contains("s39"),
+            "selected row must scroll into view:\n{snap}"
+        );
+        assert!(
+            !snap.contains("s00"),
+            "rows above the viewport must be scrolled away:\n{snap}"
+        );
+
+        // Moving back up brings the top rows into view again.
+        for _ in 0..39 {
+            app.move_list_cursor(-1);
+        }
+        assert_eq!(app.list_cursor, 0);
+        let snap = render_snapshot(&app, MIN_COLS, MIN_ROWS);
+        assert!(snap.contains("s00"), "first row visible again:\n{snap}");
+        assert!(!snap.contains("s39"), "bottom row scrolled away:\n{snap}");
+    }
+
+    #[test]
+    fn long_approval_queue_scrolls_selection_into_view() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Approvals;
+        app.set_approvals_from_json(&serde_json::json!({
+            "approvals": (0..30)
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("ap-{i:02}"),
+                        "capability": "fs.read",
+                        "state": "pending",
+                        "reason": "check"
+                    })
+                })
+                .collect::<Vec<_>>()
+        }));
+        app.approval_cursor = 29;
+        let snap = render_snapshot(&app, MIN_COLS, MIN_ROWS);
+        assert!(
+            snap.contains("ap-29"),
+            "selected approval must scroll into view:\n{snap}"
+        );
+        assert!(
+            !snap.contains("ap-00"),
+            "approvals above the viewport must be scrolled away:\n{snap}"
+        );
+    }
+
+    #[test]
     fn overview_renders_selected_linux_console_structure() {
         let app = test_app(Lang::EnUs);
         let snapshot = render_snapshot(&app, 120, 32).to_ascii_lowercase();
@@ -1423,5 +1597,77 @@ mod tests {
         let snapshot = render_snapshot(&app, 120, 32).to_ascii_lowercase();
         assert!(snapshot.contains("https://mesh.example/mcp"));
         assert!(snapshot.contains("separate from enrolling this pc"));
+    }
+
+    #[test]
+    fn devices_inventory_renders_multi_device_and_keeps_error_snapshot() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Devices;
+        app.readiness.device_id = Some("dev_local".into());
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::Loaded {
+            devices: vec![
+                crate::control_plane::InventoryDevice {
+                    id: "dev_local".into(),
+                    name: Some("This PC".into()),
+                    enrollment_status: Some("active".into()),
+                    connection_status: Some("connected".into()),
+                    agent_version: Some("1.2.11".into()),
+                    last_seen_at: Some("2026-08-14T00:00:00Z".into()),
+                },
+                crate::control_plane::InventoryDevice {
+                    id: "dev_other".into(),
+                    name: Some("Studio".into()),
+                    enrollment_status: Some("active".into()),
+                    connection_status: Some("offline".into()),
+                    agent_version: Some("1.2.10".into()),
+                    last_seen_at: Some("2026-08-13T00:00:00Z".into()),
+                },
+            ],
+            truncated: false,
+        });
+        let snap = render_snapshot(&app, 120, 32);
+        assert!(snap.contains("dev_local"));
+        assert!(snap.contains("This PC"));
+        assert!(snap.contains("dev_other"));
+        assert!(snap.contains("Studio"));
+        assert!(snap.contains("enroll=active"));
+        assert!(snap.contains("route=offline"));
+        assert!(snap.to_ascii_lowercase().contains("refresh"));
+        assert!(!snap.contains("atk_"));
+        assert!(!snap.to_ascii_lowercase().contains("bearer "));
+
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::Unreachable {
+            message: "[REDACTED line containing bearer]".into(),
+            previous: Some(Box::new(crate::control_plane::DeviceInventory::Loaded {
+                devices: vec![crate::control_plane::InventoryDevice {
+                    id: "dev_local".into(),
+                    name: Some("This PC".into()),
+                    enrollment_status: Some("active".into()),
+                    connection_status: Some("connected".into()),
+                    agent_version: Some("1.2.11".into()),
+                    last_seen_at: None,
+                }],
+                truncated: false,
+            })),
+        });
+        let failed = render_snapshot(&app, 120, 32);
+        assert!(failed.contains("This PC"));
+        assert!(failed.contains("unreachable"));
+        assert!(!failed.contains("atk_secret"));
+    }
+
+    #[test]
+    fn devices_empty_and_auth_states_are_honest() {
+        let mut app = test_app(Lang::EnUs);
+        app.screen = Screen::Devices;
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::Empty);
+        let empty = render_snapshot(&app, MIN_COLS, MIN_ROWS).to_ascii_lowercase();
+        assert!(empty.contains("no enrolled devices"));
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::AuthRequired);
+        let auth = render_snapshot(&app, MIN_COLS, MIN_ROWS).to_ascii_lowercase();
+        assert!(auth.contains("authentication required"));
+        app.replace_device_inventory(crate::control_plane::DeviceInventory::NotConfigured);
+        let missing = render_snapshot(&app, MIN_COLS, MIN_ROWS).to_ascii_lowercase();
+        assert!(missing.contains("not configured"));
     }
 }

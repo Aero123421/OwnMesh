@@ -77,6 +77,40 @@ async fn run_async() -> Result<(), ExitCode> {
         ExitCode::Internal
     })?;
 
+    // P0-A: reconcile provably-moot expired transition records at startup so a
+    // stale row can never poison the first sessions of a fresh daemon. The
+    // pass is non-blocking and fail-closed: ambiguous records stay retained
+    // and are surfaced by system.diagnose / doctor instead of aborting start.
+    {
+        let mut guard = runtime.lock().await;
+        guard.reconcile_expired_transitions().await;
+    }
+
+    // #141: live Agent-route presence, observed by the transport and exposed
+    // to doctor/system.diagnose via the runtime. Starts as Disabled and flips
+    // Offline/Online with each connect attempt / authenticated ready session.
+    let (presence_tx, presence_rx) = watch::channel(ownmesh_ipc::AgentRoutePresence::Disabled);
+    runtime.lock().await.install_route_presence(presence_rx);
+
+    // #146: device-local workspace registry changes wake the live transport
+    // to publish an incremental workspace.registry snapshot.
+    let workspace_registry_notify = Arc::new(tokio::sync::Notify::new());
+    runtime
+        .lock()
+        .await
+        .install_workspace_registry_notify(Arc::clone(&workspace_registry_notify));
+
+    // P1-E review (ADR 0011): surface the effective-sandbox condition that
+    // makes OwnMesh custody validation unsound BEFORE the first state access.
+    // A systemd `--user` unit that forces a user namespace (PrivateUsers=yes
+    // or any filesystem namespacing directive) hides real host uids behind
+    // the overflow uid 65534, so custody cannot verify host-root-owned
+    // ancestors and fails closed. Logging the cause + remediation here turns
+    // the cryptic `ancestor is owned by untrusted uid 65534` startup failure
+    // into an actionable one; the daemon still fails closed via custody.
+    #[cfg(target_os = "linux")]
+    reconcile_user_namespace_sandbox();
+
     let (endpoint, auth) = service_endpoint_and_auth(&paths, &cfg).map_err(|err| {
         tracing::error!(error = %err, "service socket configuration failed (fail-closed)");
         ExitCode::UsageConfig
@@ -109,17 +143,24 @@ async fn run_async() -> Result<(), ExitCode> {
     );
 
     let (transport_shutdown, transport_shutdown_rx) = watch::channel(false);
-    let transport_task = match agent_transport::configured_transport(&paths, &cfg) {
+    let transport_task = match agent_transport::configured_transport(
+        &paths,
+        &cfg,
+        Some(workspace_registry_notify),
+    ) {
         Ok(Some(config)) => Some(tokio::spawn(agent_transport::run(
             config,
             Some(runtime),
             transport_shutdown_rx,
+            Some(presence_tx),
         ))),
         Ok(None) => {
+            drop(presence_tx);
             tracing::info!("no active enrolled device credential; remote Agent transport disabled");
             None
         }
         Err(err) => {
+            drop(presence_tx);
             // Fail closed for remote connectivity while keeping the local IPC
             // boundary available for repair/re-enrollment.
             tracing::error!(error = %err, "remote Agent transport configuration rejected");
@@ -174,6 +215,53 @@ fn remove_legacy_token(path: &std::path::Path) -> std::io::Result<bool> {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
+    }
+}
+
+/// True when `/proc/self/uid_map` content is NOT the full identity mapping
+/// (`0 0 4294967295`) — i.e. the process is inside a user namespace where at
+/// least some host uids are hidden or remapped. Pure so the predicate is
+/// unit-testable on any platform. An empty/unreadable map is treated as the
+/// normal case (no hiding) so the check itself never breaks startup.
+#[cfg(target_os = "linux")]
+fn user_namespace_hides_host_uids(uid_map: &str) -> bool {
+    let trimmed = uid_map.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    !trimmed
+        .lines()
+        .all(|line| line.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"])
+}
+
+/// P1-E / ADR 0011: detect a user namespace that hides real host uids and
+/// log the custody consequence with remediation before the first state
+/// access. A systemd `--user` unit forces `PrivateUsers=yes` when any
+/// filesystem namespacing directive is present (systemd NEWS v254;
+/// systemd.exec(5): "in which case PrivateUsers= is implicitly enabled"),
+/// mapping host root and every other host user to the overflow uid 65534.
+/// Inside that namespace OwnMesh custody validation cannot verify real
+/// ownership, so it fails closed with `ancestor is owned by untrusted uid
+/// 65534`. This warning is diagnostic only — custody still enforces the
+/// boundary — and it makes the failure actionable instead of cryptic.
+#[cfg(target_os = "linux")]
+fn reconcile_user_namespace_sandbox() {
+    let Ok(map) = std::fs::read_to_string("/proc/self/uid_map") else {
+        return;
+    };
+    if user_namespace_hides_host_uids(&map) {
+        tracing::warn!(
+            uid_map = %map.trim(),
+            "ownmeshd is running inside a user namespace that hides real host uids \
+        (PrivateUsers=yes or a filesystem namespacing directive such as ProtectSystem/ProtectHome/\
+        ReadWritePaths/PrivateTmp in a systemd --user unit; see ADR 0011 and systemd.exec(5)). \
+        OwnMesh custody validation cannot distinguish host-root-owned ancestors from attacker-owned \
+        ones (both appear as uid 65534) and will fail closed with `ancestor is owned by untrusted uid \
+        65534` unless every state/config ancestor is owned by this daemon inside the namespace. \
+        Remove the namespacing directives or the drop-in that adds them, then re-run \
+        `ownmesh service install` (it removes OwnMesh-generated leftovers; operator drop-ins \
+        must be deleted by hand); `ownmesh doctor` discloses the effective unit."
+        );
     }
 }
 
@@ -571,7 +659,44 @@ mod tests {
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
-    use tempfile::tempdir;
+
+    /// P1-E review (ADR 0011): the pure predicate that detects a user
+    /// namespace hiding real host uids. The normal process map is the single
+    /// full identity line `0 0 4294967295`; every namespace shape systemd
+    /// produces for a `--user` service (self→self `1000 1000 1`, a
+    /// root-mapped `0 0 1`, multi-line maps) hides some host uids behind the
+    /// overflow uid, which is exactly the condition that makes OwnMesh
+    /// custody validation fail closed. CI host hostnames/uid maps must never
+    /// influence the test — the predicate is fed synthetic maps only.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn user_namespace_hiding_predicate_matches_systemd_user_shapes() {
+        assert!(!user_namespace_hides_host_uids("0 0 4294967295"));
+        assert!(!user_namespace_hides_host_uids("0 0 4294967295\n"));
+        assert!(!user_namespace_hides_host_uids(""));
+        // systemd --user with PrivateUsers=yes: self→self single-line map.
+        assert!(user_namespace_hides_host_uids("1000 1000 1"));
+        // Root-mapped user namespace (unprivileged userns variants).
+        assert!(user_namespace_hides_host_uids("0 0 1"));
+        // systemd --user under root's manager: root + user lines, host root
+        // still hidden from the daemon's point of view.
+        assert!(user_namespace_hides_host_uids("0 0 1\n1000 1000 1"));
+        // A truncated/partial identity map hides the unmapped range.
+        assert!(user_namespace_hides_host_uids("0 0 1\n1 1 4294967294"));
+    }
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn configured_service_endpoint_uses_shared_resolution() {
@@ -1228,8 +1353,81 @@ mod tests {
             .await
             .expect("second");
         assert_eq!(second["replayed"], true);
-        assert_eq!(first["result"]["stdout"], second["result"]["stdout"]);
+        // P0-B: replay returns the compact exact-once receipt (never a
+        // re-execution); the full body exists only in the immediate response.
+        assert_eq!(second["durable_receipt"], true);
+        assert_eq!(second["truncated"], true);
+        assert!(
+            second.get("result").is_none(),
+            "replay must be the compact receipt: {second}"
+        );
         assert_eq!(first["operation_id"], second["operation_id"]);
+
+        server.request_shutdown();
+        let _ = handle.await;
+    }
+
+    /// #142: a remote-style operation whose execution fails after the journal
+    /// reserve must reconcile the marker into a terminal failed receipt. A
+    /// retry with the same key replays that stored failure instead of being
+    /// refused forever as an in-progress/uncertain key, and doctor no longer
+    /// sees an in-flight marker.
+    #[tokio::test]
+    async fn failed_operation_replays_stored_failure_instead_of_stranding_marker() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+        let client = test_client(endpoint, paths.runtime_dir.clone());
+
+        {
+            let mut g = runtime.lock().await;
+            g.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        }
+
+        let key = "idem-failed-stat";
+        let first_error = client
+            .call(
+                methods::OPS_FS_STAT,
+                Some(json!({
+                    "path": "definitely-missing-path.txt",
+                    "idempotency_key": key,
+                })),
+            )
+            .await
+            .expect_err("stat of a missing path fails");
+        let failure_text = first_error.to_string();
+        assert!(
+            !failure_text.contains("in-progress or uncertain"),
+            "the original error must surface, not a journal refusal: {failure_text}"
+        );
+
+        // The journal key is reconciled: no durable in_progress marker remains.
+        {
+            let g = runtime.lock().await;
+            assert!(
+                !g.op_journal_key_is_in_progress_for_test(key),
+                "terminal failure must not strand an in_progress marker"
+            );
+        }
+
+        // A retry with the same key replays the stored failed receipt —
+        // the same definitive error, never a new side effect and never an
+        // eternal CONFLICT refusal.
+        let second_error = client
+            .call(
+                methods::OPS_FS_STAT,
+                Some(json!({
+                    "path": "definitely-missing-path.txt",
+                    "idempotency_key": key,
+                })),
+            )
+            .await
+            .expect_err("replay returns the stored failure");
+        let replay_text = second_error.to_string();
+        assert!(
+            !replay_text.contains("in-progress or uncertain"),
+            "replayed failure must not be a journal refusal: {replay_text}"
+        );
 
         server.request_shutdown();
         let _ = handle.await;
@@ -2462,6 +2660,62 @@ mod tests {
             .join("workspace")
             .join("deny-me.txt")
             .exists());
+    }
+
+    #[tokio::test]
+    async fn grants_mint_recovery_approve_uses_enqueued_device_and_principal() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        paths.ensure_layout().unwrap();
+        let mut rt = crate::runtime::DaemonRuntime::open(&paths).expect("runtime");
+        rt.set_policy_for_test(preset_document(AccessPreset::WorkspaceOnly));
+
+        let remote_op = "op_mcp_grants_mint_1".to_owned();
+        let remote_client = ClientIdentity::new("client:remote:ten_test:prin_chat", "0.1.0");
+        let asked = rt
+            .dispatch_cancellable_bound_with_generation(
+                methods::ADMIN_GRANTS_MINT_REQUEST,
+                Some(json!({
+                    "tools": ["fs_write"],
+                    "ttl_seconds": 60,
+                    "idempotency_key": "mint-recovery-1",
+                    "principal_id": "client:forged",
+                    "device_id": "dev_forged",
+                })),
+                &remote_client,
+                None,
+                Some(remote_op.clone()),
+                Some(chrono_lite_unix_now() + 300),
+                Some("a".repeat(64)),
+                Some("dev_mint_1".into()),
+                Some(7),
+            )
+            .await
+            .expect("mint ask");
+        assert_eq!(asked["approval_required"], true, "{asked}");
+        let approval_id = asked["approval_id"].as_str().unwrap().to_owned();
+
+        let approved = rt
+            .apply_control_plane_approval_decision(Some(json!({
+                "approval_id": approval_id,
+                "target_operation_id": remote_op,
+                "target_payload_hash": "a".repeat(64),
+                "decision": "approve",
+                "approver_principal": "prin_owner",
+            })))
+            .await
+            .expect("mint approve");
+        assert_eq!(approved["approval_decision_applied"], true, "{approved}");
+        assert_eq!(approved["replayed"], false, "{approved}");
+        let grant = &approved["result"]["grant"];
+        assert_eq!(grant["grant_type"], "bounded_tool");
+        assert_eq!(
+            grant["principal_id"].as_str().unwrap(),
+            "client:remote:ten_test:prin_chat"
+        );
+        assert_eq!(grant["device_id"], "dev_mint_1");
+        assert_ne!(grant["principal_id"], "client:forged");
+        assert_ne!(grant["device_id"], "dev_forged");
     }
 
     #[tokio::test]

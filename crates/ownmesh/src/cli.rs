@@ -3,7 +3,7 @@
 //! This module is the **final owner** of the CLI registration table. Later tickets
 //! implement command bodies without reshaping the tree.
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// `OwnMesh` command-line interface.
 #[derive(Debug, Parser)]
@@ -80,6 +80,9 @@ pub enum Commands {
     /// Policy inspection and editing.
     #[command(subcommand)]
     Policy(PolicyCmd),
+    /// Device-local grants (bounded tool grants and temporary overlays).
+    #[command(subcommand)]
+    Grants(GrantsCmd),
     /// Peer-to-peer transfer.
     #[command(subcommand)]
     Transfer(TransferCmd),
@@ -89,9 +92,11 @@ pub enum Commands {
     /// Privileged broker lifecycle.
     #[command(subcommand)]
     Privileged(PrivilegedCmd),
-    /// Update checks and application.
-    #[command(subcommand)]
-    Update(UpdateCmd),
+    /// Update OwnMesh. With no subcommand, securely updates this machine.
+    Update(UpdateArgs),
+    /// Internal detached update worker. Not a public CLI surface.
+    #[command(name = "__update-worker", hide = true)]
+    UpdateWorker(UpdateWorkerArgs),
     /// MCP helpers.
     #[command(subcommand)]
     Mcp(McpCmd),
@@ -150,6 +155,8 @@ pub struct SetupArgs {
 }
 
 /// `ownmesh doctor` arguments.
+// Independent command-line switches, not persistent product state.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Parser)]
 pub struct DoctorArgs {
     /// Probe the configured control plane over the network (off by default).
@@ -159,6 +166,14 @@ pub struct DoctorArgs {
     /// Never touch the network, even with --check-network in a shell alias.
     #[arg(long)]
     pub offline: bool,
+
+    /// Archive an unreadable op-journal and restore from a valid backup, or start empty. Local-only; requires `--i-understand-replay-risk`.
+    #[arg(long)]
+    pub repair_journal: bool,
+
+    /// Confirm that discarding an unreadable op-journal accepts bounded replay risk for in-flight keys.
+    #[arg(long)]
+    pub i_understand_replay_risk: bool,
 }
 
 /// `ownmesh login` arguments.
@@ -545,6 +560,41 @@ pub enum PolicyCmd {
     },
 }
 
+/// `ownmesh grants` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum GrantsCmd {
+    /// List device-local grants.
+    List,
+    /// Show one grant.
+    Show {
+        /// Grant id.
+        id: String,
+    },
+    /// Revoke one grant immediately.
+    Revoke {
+        /// Grant id.
+        id: String,
+    },
+    /// Mint a passkey-approved bounded tool grant (Ask-only lift, TTL ≤ 4h).
+    Mint {
+        /// Canonical tool name (repeatable). No wildcards.
+        #[arg(long = "tool", required = true)]
+        tools: Vec<String>,
+        /// Lifetime in seconds (1..=14400).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..=14_400))]
+        ttl_seconds: i64,
+        /// Optional max uses.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        max_uses: Option<u32>,
+        /// Optional workspace id.
+        #[arg(long)]
+        workspace_id: Option<String>,
+        /// Optional exact-once key for scripted retries (generated when omitted).
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+}
+
 /// `ownmesh transfer` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum TransferCmd {
@@ -552,7 +602,7 @@ pub enum TransferCmd {
     Plan {
         /// Source workspace-relative path (no absolute paths, traversal, or backslashes).
         source: String,
-        /// Destination workspace-relative path (no overwrite/force mode exists).
+        /// Destination workspace-relative path. Existing destinations fail closed unless `--overwrite-expected-sha256` matches.
         dest: String,
         /// Source enrolled device id.
         #[arg(long)]
@@ -572,8 +622,12 @@ pub enum TransferCmd {
         /// Immutable plan lifetime in seconds (60–86400; default 3600).
         #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(60..=86_400))]
         ttl_seconds: u32,
+        /// SHA-256 of the existing destination file (64 lowercase hex). When set, replacement is allowed only if the destination matches this hash at preflight and publish. Blind force/overwrite is not available.
+        #[arg(long)]
+        overwrite_expected_sha256: Option<String>,
     },
-    /// Start or resume a previously planned transfer.
+    /// Start or resume a previously planned transfer. One call advances as far as
+    /// authoritative state allows; the response includes typed next_action semantics.
     Send {
         /// Immutable transfer id returned by `transfer plan`.
         id: String,
@@ -699,14 +753,32 @@ pub enum PrivilegedCmd {
 }
 
 /// `ownmesh update` subcommands.
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Optional update operation. Omit to download, verify, and install the latest release.
+    #[command(subcommand)]
+    pub command: Option<UpdateCmd>,
+}
+
+/// Arguments passed only to the detached self-update worker.
+#[derive(Debug, Clone, Args)]
+pub struct UpdateWorkerArgs {
+    /// Transaction identifier created by the parent CLI.
+    #[arg(long, hide = true)]
+    pub transaction_id: String,
+}
+
+/// `ownmesh update` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum UpdateCmd {
     /// Check for updates.
     Check,
     /// Download an update.
     Download,
-    /// Apply a downloaded update.
+    /// Download, verify, and apply the latest release (same as `ownmesh update`).
     Apply,
+    /// Show the most recent update transaction.
+    Status,
     /// Show or set the update channel.
     Channel {
         /// Optional new channel.

@@ -142,6 +142,8 @@ impl McpHttpClient {
                 match rpc_code {
                     -32602 => ErrorCode::InvalidArgument,
                     -32004 => ErrorCode::Authorization,
+                    -32015 => ErrorCode::ExecutableIdentityDrift,
+                    -32019 => ErrorCode::SelfReentrantExec,
                     -32009 => ErrorCode::Conflict,
                     _ => ErrorCode::Internal,
                 },

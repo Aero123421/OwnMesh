@@ -83,6 +83,17 @@ impl LogProvider for WindowsEventLogProvider {
 }
 
 #[cfg(windows)]
+/// Absolute `%SystemRoot%\System32\cmd.exe` (never a bare `cmd.exe`).
+/// `CreateProcess` resolves a bare `cmd.exe` by searching the parent
+/// executable's directory and the *current directory* before system
+/// directories, so a workspace/cwd file could shadow the interpreter
+/// (Microsoft CreateProcess documentation; P1-C review).
+fn system_cmd_exe() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    format!("{}\\System32\\cmd.exe", root.trim_end_matches(['/', '\\']))
+}
+
+#[cfg(windows)]
 fn fetch_wevtutil(channel: &str, count: usize) -> LogResult<Vec<String>> {
     // Invoke through cmd.exe so quoting matches the documented CLI
     // (`wevtutil qe <Path> /c:<Count> /rd:true /f:text`).
@@ -91,7 +102,7 @@ fn fetch_wevtutil(channel: &str, count: usize) -> LogResult<Vec<String>> {
         sanitize_channel(channel),
         count.max(1)
     );
-    let output = Command::new("cmd.exe")
+    let output = Command::new(system_cmd_exe())
         .args(["/C", &cmdline])
         .output()
         .map_err(|e| LogError::Backend(format!("spawn wevtutil: {e}")))?;

@@ -271,7 +271,7 @@ test("cancel: no device_id → direct cancelled", async () => {
   assert.equal((await store.getMcpOperation(opId))?.status, "cancelled");
 });
 
-test("cancel: route rejected → original state kept + error envelope", async () => {
+test("cancel: route rejected → target remains durably fenced + error envelope", async () => {
   const { store, token } = await seedAuthed();
   const deviceId = "dev_cancel_rej_01abcdef";
   const opId = randomId("op_");
@@ -309,12 +309,11 @@ test("cancel: route rejected → original state kept + error envelope", async ()
   assert.equal(body.result!.isError, true);
   assert.equal(sc.data?.error?.code, "OWNMESH_E_CANCEL_ROUTE_FAILED");
   assert.equal(sc.data?.route_status, "rejected");
-  assert.equal(sc.data?.previous?.status, "running");
-  // Store must remain at original running — never cancelled / cancel_requested.
-  assert.equal((await store.getMcpOperation(opId))?.status, "running");
+  assert.equal(sc.data?.previous?.status, "cancel_requested");
+  assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
 });
 
-test("cancel: route throw → original state kept + error envelope", async () => {
+test("cancel: route throw → target remains durably fenced + error envelope", async () => {
   const { store, token } = await seedAuthed();
   const deviceId = "dev_cancel_thr_01abcdef";
   const opId = randomId("op_");
@@ -350,11 +349,11 @@ test("cancel: route throw → original state kept + error envelope", async () =>
   assert.equal(body.result!.isError, true);
   assert.equal(sc.data?.error?.code, "OWNMESH_E_CANCEL_ROUTE_FAILED");
   assert.match(String(sc.data?.error?.message || ""), /cancel_route_network_down/);
-  assert.equal(sc.data?.previous?.status, "pending");
-  assert.equal((await store.getMcpOperation(opId))?.status, "pending");
+  assert.equal(sc.data?.previous?.status, "cancel_requested");
+  assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
 });
 
-test("cancel: uncertain route (DO throw via routeToDeviceRoom) keeps running", async () => {
+test("cancel: uncertain route (DO throw via routeToDeviceRoom) keeps target fenced", async () => {
   const { store, token } = await seedAuthed();
   const deviceId = "dev_cancel_unavail_01ab";
   const opId = randomId("op_");
@@ -395,12 +394,11 @@ test("cancel: uncertain route (DO throw via routeToDeviceRoom) keeps running", a
     body.result?.structuredContent?.data?.error?.code,
     "OWNMESH_E_CANCEL_ROUTE_FAILED",
   );
-  // Cancel is only cancel_requested after confirmed route; uncertain ≠ confirmed.
   assert.equal(body.result?.structuredContent?.data?.route_status, "dispatch_uncertain");
-  assert.equal((await store.getMcpOperation(opId))?.status, "running");
+  assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
 });
 
-test("cancel: timed-out DO route keeps original state + explicit timeout error", async () => {
+test("cancel: timed-out DO route keeps target fenced + explicit timeout error", async () => {
   const { store, token } = await seedAuthed();
   const deviceId = "dev_cancel_timeout_01ab";
   const opId = randomId("op_");
@@ -444,8 +442,8 @@ test("cancel: timed-out DO route keeps original state + explicit timeout error",
   assert.equal(sc?.data?.error?.details?.error, "device_room_fetch_timeout");
   assert.equal(sc?.data?.error?.details?.timeout_ms, 5);
   assert.equal(sc?.data?.route_status, "dispatch_uncertain");
-  assert.equal(sc?.data?.previous?.status, "approval_required");
-  assert.equal((await store.getMcpOperation(opId))?.status, "approval_required");
+  assert.equal(sc?.data?.previous?.status, "cancel_requested");
+  assert.equal((await store.getMcpOperation(opId))?.status, "cancel_requested");
 });
 
 // ---------------------------------------------------------------------------

@@ -98,6 +98,47 @@ mod tests {
     }
 
     #[test]
+    fn workspace_registry_schema_validates_refresh_fixture() {
+        // ADR 0014: the incremental `workspace.registry` refresh payload is
+        // the same shape as `ready.workspace_registry`; the shared schema is
+        // the contract both implementations validate against.
+        let schema_path = Path::new(SHARED_SCHEMAS_DIR).join("workspace-registry.schema.json");
+        let schema_raw = fs::read_to_string(&schema_path).expect("workspace registry schema");
+        let schema_json: serde_json::Value = serde_json::from_str(&schema_raw).unwrap();
+        let validator = jsonschema::validator_for(&schema_json).expect("compile");
+
+        let fixture_path = Path::new(SHARED_FIXTURES_DIR).join("workspace_registry_refresh.json");
+        let data: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&fixture_path).unwrap()).unwrap();
+        if let Err(err) = validator.validate(&data) {
+            panic!("workspace registry fixture failed schema validation: {err}");
+        }
+
+        // Rejects: unknown fields, missing generation, bad id shape.
+        for mutation in [
+            serde_json::json!({
+                "enforce_workspace": true,
+                "workspaces": [
+                    { "id": "ws_default", "generation": "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "root": "/home/x" }
+                ]
+            }),
+            serde_json::json!({
+                "enforce_workspace": true,
+                "workspaces": [ { "id": "ws_default" } ]
+            }),
+            serde_json::json!({
+                "enforce_workspace": true,
+                "workspaces": [ { "id": "../etc", "generation": "wsg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } ]
+            }),
+        ] {
+            assert!(
+                validator.validate(&mutation).is_err(),
+                "mutation must fail validation: {mutation}"
+            );
+        }
+    }
+
+    #[test]
     fn operation_fixtures_roundtrip_and_validate_schema() {
         let schema_path = Path::new(SHARED_SCHEMAS_DIR).join("operation-envelope.schema.json");
         let schema_raw = fs::read_to_string(&schema_path).expect("operation schema");

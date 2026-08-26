@@ -227,13 +227,58 @@ Every tool result carries a stable envelope (also in `structuredContent`):
 
 | Symptom | Check |
 |---|---|
-| OAuth fails | `/.well-known/oauth-authorization-server`, redirect URI exact match, PKCE S256 |
-| Connector dies after hours | Include `offline_access`; confirm refresh tokens issued |
+| OAuth fails | `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, redirect URI exact match, PKCE S256 |
+| Connector dies after hours | Include `offline_access`; confirm refresh tokens issued. Expired access tokens must get HTTP 401 + `WWW-Authenticate` from `/mcp` so ChatGPT can refresh |
+| ChatGPT reports 502 after idle | New chat, then re-consent if 401 refresh still fails. `GET /mcp` with `Accept: text/event-stream` is 405 by design (no long-lived SSE on Workers) |
+| CLI vs Worker version skew | `ownmesh doctor --check-network` warns when `/health` version does not match the CLI |
 | `insufficient_scope` | Re-consent with required scopes |
-| `device_offline` | `ownmeshd run`, enrollment, `/agent/connect` WebSocket |
+| `device_offline` | `ownmeshd run`, enrollment, `/agent/connect` WebSocket. On Linux, also check lingering: without it (`loginctl show-user $USER -p Linger` → `Linger=no`) the agent stops at GUI logout and the device goes offline until you log in again (`ownmesh doctor` warns). A hung reconnect on a dual-stack host with a blackholed IPv6 route is another known cause; the bounded connect timeout (v1.2.21+) retries with an IPv4 fallback instead of hanging forever |
 | Stuck `approval_required` | TUI/CLI/browser approve; then `ownmesh_get_operation` |
 | Write works in ChatGPT UI but file missing | ChatGPT confirm ≠ OwnMesh approve |
 | Unexpected allow | Verify preset is not `full_access` by mistake |
+| Some tools are missing from ChatGPT | Stale connector catalog. Compare generations, see **Tool catalog looks stale** below |
+| Tools disappear entirely / no catalog at all | Edge rejection, not a stale catalog. Run `python scripts/probe_machine_endpoints.py https://<worker>` and see [deploy-cloudflare.md](./deploy-cloudflare.md#machine-endpoints-must-not-require-a-browser-signature) |
+| `ownmesh_system_diagnose` returns `diagnosis_unavailable` | Read `diagnosis_rejection`; `unsupported_contract_version` means deploy the current Worker, other reasons point at the device |
+| `OWNMESH_E_SELF_REENTRANT_EXEC` | Expected. Running the OwnMesh CLI on the device it manages would deadlock the daemon, so it is refused before spawn. Use `ownmesh_system_diagnose` and the policy/grants/workspace tools instead; only `ownmesh --version` / `--help` are executable this way |
+| `OWNMESH_E_AUTHORIZATION_REFRESHED` | The operation was never delivered and its authorization was refreshed while it waited. Resubmit the same request; it is authorized under the current credentials |
+
+### Tool catalog looks stale
+
+ChatGPT loads the tool catalog when the connector session is established and
+keeps it. If a deployment adds or removes tools while a session is live, the
+client can keep serving the old set — new tools stay invisible and removed ones
+stay callable.
+
+Compare the two generations before changing anything:
+
+```bash
+# What this deployment publishes right now (no bearer needed).
+curl -s https://<worker>/mcp | jq '{tools, catalog_revision, service_version}'
+curl -s https://<worker>/health | jq .mcp_catalog
+```
+
+`catalog_revision` is a SHA-256 over exactly the bytes `tools/list` returns, so
+it changes whenever a tool name, description, annotation, or `inputSchema`
+changes — including changes that do not move the release version. It is also
+returned in `initialize._meta["ownmesh/catalog_revision"]` and on every
+`tools/list` response.
+
+Recovery, in order:
+
+1. **Confirm the deployment is current.** If `service_version` is behind the
+   release you installed, the deploy did not take effect. `pnpm run
+   deploy:guided` now refuses to report success in that case.
+2. **Start a new chat.** The Worker binds the catalog revision into the MCP
+   session id and answers `HTTP 404` to any request carrying a session minted
+   under a different revision, which is MCP's signal to re-`initialize`. A new
+   conversation therefore picks up the current catalog without touching the
+   connector.
+3. Only if a fresh session still shows the old set, disconnect and reconnect the
+   connector.
+
+You never need to guess which individual tools are stale: if
+`catalog_revision` matches between the deployment and a freshly initialized
+session, the catalogs are identical.
 
 ---
 

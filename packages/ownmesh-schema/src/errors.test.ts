@@ -17,6 +17,15 @@ import {
 import { checkExpiryAt } from "./time.ts";
 
 describe("error taxonomy", () => {
+  it("maps executable identity drift to fresh authorization", () => {
+    assert.equal(errorExitCode("OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"), 4);
+    const error = new SchemaError(
+      "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT",
+      "request must be re-authorized",
+    );
+    assert.equal(error.retryable, false);
+  });
+
   it("rejects unknown and invalid ids", () => {
     assert.throws(
       () => parseAnyId("foo_bar"),

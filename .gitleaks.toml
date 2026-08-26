@@ -21,6 +21,13 @@ regexes = ['''^logs-winevt-1$''']
 paths = ['''^crates/ownmeshd/src/daemon\.rs$''']
 
 [[rules.allowlists]]
+description = "Fixed idempotency value in the unbound diagnosis regression test"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^idem_diagnose_unbound_1$''']
+paths = ['''^crates/ownmeshd/src/agent_transport\.rs$''']
+
+[[rules.allowlists]]
 description = "Base64url-encoded WebAuthn owner ID used only by control-plane tests"
 condition = "AND"
 regexTarget = "secret"

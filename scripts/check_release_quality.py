@@ -297,6 +297,13 @@ def main() -> int:
     require_text(publish_job, "docs/release-keys/minisign.pub", "Release signing trust root")
     require_text(publish_job, "minisign -Vm", "Release signature verification")
     require_text(publish_job, "minisign -S", "Release signature creation")
+    require_text(
+        publish_job,
+        "f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0",
+        "Release publish pinned minisign bootstrap",
+    )
+    require("apt-get install -y minisign" not in publish_job,
+            "Release publish must not install minisign via apt (can stall)")
     require_text(publish_job, "prerelease: false", "Formal release is not forced prerelease")
     require("RELEASE_NOTES_v1.0.1.md" not in release, "release body must not be fixed to v1.0.1")
     require_text(release, "RELEASE_NOTES_${GITHUB_REF_NAME}.md", "Release notes lookup")

@@ -2,7 +2,7 @@
 //!
 //! Split out of `runtime.rs`: plan/preflight/start/chunk/finalize/status/list/
 //! cancel/artifact_get form one bounded, resumable protocol whose invariants
-//! (immutable plans, no overwrite fallback, exact-once finalize) are easier to
+//! (immutable plans, hash-bound overwrite only, exact-once finalize) are easier to
 //! audit as a unit.
 //!
 //! Behavior is unchanged; only the file boundary moved. This is a child module
@@ -16,6 +16,52 @@ use super::{
     TransferBinding, TransferChunk, TransferError, TransferGrant, TransferPlan, Value,
     MAX_CHUNK_BYTES,
 };
+use ownmesh_fs::{FsError, WorkspaceRoot};
+
+fn parse_optional_content_hash(value: Option<String>) -> IpcResult<Option<String>> {
+    let Some(hash) = value else {
+        return Ok(None);
+    };
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(Some(hash));
+    }
+    Err(IpcError::Remote {
+        code: app_error::INVALID_PARAMS,
+        message: "overwrite_expected_sha256 must be 64 lowercase hex characters".into(),
+    })
+}
+
+fn check_destination_overwrite(
+    workspace: &WorkspaceRoot,
+    rel: &Path,
+    overwrite_expected_sha256: Option<&str>,
+) -> IpcResult<()> {
+    match (overwrite_expected_sha256, workspace.hash_regular_file(rel)) {
+        (None, Err(FsError::NotFound(_))) => Ok(()),
+        (None, Ok(_)) => Err(IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: "destination already exists; overwrite is forbidden".into(),
+        }),
+        (Some(expected), Ok(actual)) if actual == expected => Ok(()),
+        (Some(expected), Ok(actual)) => Err(IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: format!(
+                "destination hash mismatch: expected {expected}, observed {actual}"
+            ),
+        }),
+        (Some(expected), Err(FsError::NotFound(_))) => Err(IpcError::Remote {
+            code: app_error::CONFLICT,
+            message: format!(
+                "destination is missing; overwrite_expected_sha256 {expected} requires an existing file"
+            ),
+        }),
+        (_, Err(error)) => Err(fs_err(error)),
+    }
+}
 
 impl DaemonRuntime {
     pub(super) async fn handle_transfer_plan(
@@ -303,8 +349,11 @@ impl DaemonRuntime {
             expires_at: u64,
             coordinator_request_id: String,
             workspace_version: u64,
+            #[serde(default)]
+            overwrite_expected_sha256: Option<String>,
         }
         let p: Params = parse_params(params)?;
+        let overwrite_expected_sha256 = parse_optional_content_hash(p.overwrite_expected_sha256)?;
         let authority = self.transfer_authority(client)?;
         let binding = TransferBinding {
             tenant_id: authority.tenant_id.clone(),
@@ -352,12 +401,11 @@ impl DaemonRuntime {
         let destination = workspace
             .resolve(Path::new(&binding.destination_relative_path))
             .map_err(fs_err)?;
-        if destination.exists() {
-            return Err(IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: "destination already exists; overwrite is forbidden".into(),
-            });
-        }
+        check_destination_overwrite(
+            &workspace,
+            Path::new(&binding.destination_relative_path),
+            overwrite_expected_sha256.as_deref(),
+        )?;
         let parent = destination.parent().ok_or_else(|| IpcError::Remote {
             code: app_error::INVALID_PARAMS,
             message: "destination parent is missing".into(),
@@ -425,6 +473,8 @@ impl DaemonRuntime {
             grant_operation_id: String,
             grant_payload_sha256: String,
             grant_expires_at_unix: u64,
+            #[serde(default)]
+            overwrite_expected_sha256: Option<String>,
         }
         let p: Params = parse_params(params)?;
         let authority = self.transfer_authority(client)?;
@@ -488,23 +538,55 @@ impl DaemonRuntime {
             source_relative_path: p.source_path,
             destination_relative_path: p.destination_path,
         };
+        let source_relative_path = binding.source_relative_path.clone();
+        let workspace_id = p.workspace_id.clone();
+        let grant = TransferGrant {
+            grant_id: p.grant_id.clone(),
+            operation_id: p.grant_operation_id.clone(),
+            payload_sha256: p.grant_payload_sha256.clone(),
+            expires_at_unix: p.grant_expires_at_unix,
+        };
         let plan = TransferPlan::from_verified(
             binding,
-            TransferGrant {
-                grant_id: p.grant_id,
-                operation_id: p.grant_operation_id,
-                payload_sha256: p.grant_payload_sha256,
-                expires_at_unix: p.grant_expires_at_unix,
-            },
+            grant.clone(),
             p.size_bytes,
-            p.content_sha256,
+            p.content_sha256.clone(),
         )
+        .map_err(Self::transfer_error)?
+        .with_overwrite_expected_sha256(parse_optional_content_hash(p.overwrite_expected_sha256)?)
         .map_err(Self::transfer_error)?;
         if plan.plan_sha256() != p.plan_sha256 {
             return Err(IpcError::Remote {
                 code: app_error::UNAUTHORIZED,
                 message: "transfer start plan hash mismatch".into(),
             });
+        }
+        if p.role == "source" {
+            let source = self.workspace_for(Some(&workspace_id))?;
+            let source_handle = source
+                .open_verified_read(Path::new(&source_relative_path))
+                .map_err(fs_err)?;
+            let observed = TransferPlan::for_workspace_source(
+                source_handle,
+                plan.binding().clone(),
+                grant,
+                PlanLimits::default(),
+                Self::now() as u64,
+            )
+            .map_err(Self::transfer_error)?;
+            if observed.size_bytes() != plan.size_bytes() || observed.sha256() != plan.sha256() {
+                return Err(IpcError::Remote {
+                    code: app_error::CONFLICT,
+                    message: "source changed after preflight evidence".into(),
+                });
+            }
+        } else {
+            let destination = self.workspace_for(Some(&workspace_id))?;
+            check_destination_overwrite(
+                &destination,
+                Path::new(&plan.binding().destination_relative_path),
+                plan.overwrite_expected_sha256(),
+            )?;
         }
         self.transfer_store
             .save_plan(&plan)
@@ -653,9 +735,6 @@ impl DaemonRuntime {
             });
         }
         let workspace = self.workspace_for(Some(&p.workspace_id))?;
-        let destination = workspace
-            .resolve(Path::new(&plan.binding().destination_relative_path))
-            .map_err(fs_err)?;
         if let Some(journal) = self
             .transfer_store
             .load(&plan)
@@ -677,12 +756,11 @@ impl DaemonRuntime {
                 );
             }
         }
-        if destination.exists() {
-            return Err(IpcError::Remote {
-                code: app_error::CONFLICT,
-                message: "destination already exists; overwrite is forbidden".into(),
-            });
-        }
+        check_destination_overwrite(
+            &workspace,
+            Path::new(&plan.binding().destination_relative_path),
+            plan.overwrite_expected_sha256(),
+        )?;
         self.ensure_destination_cache_capacity(plan.id())
             .map_err(Self::transfer_error)?;
         let now = Self::now() as u64;
@@ -878,10 +956,7 @@ impl DaemonRuntime {
             .transfer_store
             .acquire(&plan, Self::now() as u64, authority.expires_at_unix)
             .map_err(Self::transfer_error)?;
-        match self
-            .transfer_store
-            .publish_completed_no_replace(&plan, &workspace)
-        {
+        match self.transfer_store.publish_completed(&plan, &workspace) {
             Ok(()) | Err(ownmesh_transfer::TransferError::DestinationExists) => {
                 let mut artifact = workspace
                     .open_verified_transfer_artifact_read(Path::new(

@@ -4,7 +4,7 @@ use crate::pty_host::RawDrainOutput;
 use crate::{HostIoMode, HostManifest, LiveHost, OwnerSpool, SpoolPage, StructuredProcessHost};
 use ownmesh_session::{PtyCommand, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use tokio::sync::Mutex;
 
@@ -112,6 +112,13 @@ impl HostedHost {
 /// terminates its process tree as a deliberate crash-cleanup policy.
 pub struct SupervisorState {
     hosts: Mutex<HashMap<String, Hosted>>,
+    /// Hosts removed from `hosts` whose termination is still in flight. A
+    /// liveness probe must keep reporting them live until the sweep confirms
+    /// death: `host_live` is the daemon's authoritative sidecar-liveness
+    /// proof for expired transition records, and a host whose kill has been
+    /// issued but not confirmed dead must never be reported dead (P0-A
+    /// review, sweep window).
+    terminating: Mutex<HashSet<String>>,
     root: std::path::PathBuf,
 }
 
@@ -119,6 +126,7 @@ impl SupervisorState {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             hosts: Mutex::new(HashMap::new()),
+            terminating: Mutex::new(HashSet::new()),
             root: root.as_ref().to_path_buf(),
         }
     }
@@ -181,6 +189,24 @@ impl SupervisorState {
             .ok_or("supervisor host unavailable")?;
         exact_identity(binding, &hosted.manifest)?;
         Ok(hosted.host.status())
+    }
+
+    /// Whether a host for `session_id` is still tracked by this supervisor.
+    ///
+    /// Read-only and binding-independent: daemon transition recovery uses it
+    /// as authoritative sidecar-liveness proof for expired transition records
+    /// (P0-A). A host is reported live while it is either in the live map or
+    /// in the in-flight `terminating` set, and is removed from the live map
+    /// only after its termination is confirmed; failed terminations are
+    /// re-tracked (`sweep_expired`). "Not tracked" therefore means the
+    /// sidecar was never spawned under this supervisor or was confirmed
+    /// terminated — never "we forgot about a live child" and never "we
+    /// issued a kill and are still waiting for it to die".
+    pub async fn host_live(&self, session_id: &str) -> bool {
+        if self.hosts.lock().await.contains_key(session_id) {
+            return true;
+        }
+        self.terminating.lock().await.contains(session_id)
     }
 
     pub async fn write(&self, binding: &SupervisorBinding, bytes: &[u8]) -> Result<(), String> {
@@ -534,11 +560,25 @@ impl SupervisorState {
 
     /// Terminate expired hosts in a bounded sweep. A running sidecar invokes
     /// this periodically; every operation independently enforces expiry too.
+    ///
+    /// A host is moved into the in-flight `terminating` set *before* its
+    /// termination begins and leaves it only after the attempt completes, and
+    /// it is removed from the live map only after its termination is
+    /// confirmed; a host whose termination fails (unkillable child, transient
+    /// OS error, or a child that did not confirm exit within the bounded poll
+    /// window) is re-tracked so the next sweep retries it. Removal from the
+    /// registry is therefore the authoritative "this sidecar is dead" signal
+    /// the daemon relies on when it clears an expired transition record, and
+    /// a concurrent liveness probe can never observe an in-flight kill as
+    /// proof of death (P0-A review). Returns the number of hosts confirmed
+    /// terminated this pass.
     pub async fn sweep_expired(&self) -> usize {
         let now = unix_now();
-        let mut expired = Vec::new();
+        let mut confirmed = 0;
+        let mut to_sweep = Vec::new();
         {
             let mut hosts = self.hosts.lock().await;
+            let mut terminating = self.terminating.lock().await;
             let ids: Vec<_> = hosts
                 .iter()
                 .filter(|(_, hosted)| hosted.manifest.host_expires_unix <= now)
@@ -547,15 +587,40 @@ impl SupervisorState {
                 .collect();
             for id in ids {
                 if let Some(hosted) = hosts.remove(&id) {
-                    expired.push(hosted);
+                    // The kill is issued outside the lock; keep the host
+                    // visible to liveness probes for the whole attempt.
+                    terminating.insert(id.clone());
+                    to_sweep.push((id, hosted));
                 }
             }
         }
-        let count = expired.len();
-        for mut hosted in expired {
-            let _ = hosted.host.terminate();
+        for (id, mut hosted) in to_sweep {
+            let terminated = hosted.host.terminate();
+            match terminated {
+                Ok(()) => {
+                    // Confirmed dead: clear the in-flight marker. "Untracked"
+                    // now really means the sidecar is gone.
+                    self.terminating.lock().await.remove(&id);
+                    confirmed += 1;
+                }
+                Err(error) => {
+                    // Never claim a host is gone while its child may still be
+                    // alive: re-track it BEFORE clearing the in-flight marker
+                    // so a concurrent liveness probe can never observe an
+                    // untracked host between the two steps, and the next
+                    // sweep retries the kill.
+                    eprintln!(
+                        "supervisor sweep: failed to terminate expired host {id} ({error}); \
+retained for retry"
+                    );
+                    let mut hosts = self.hosts.lock().await;
+                    let mut terminating = self.terminating.lock().await;
+                    hosts.insert(id.clone(), hosted);
+                    terminating.remove(&id);
+                }
+            }
         }
-        count
+        confirmed
     }
 
     /// Terminate a host exactly once.  The receipt survives removal from the
@@ -671,7 +736,18 @@ fn status(host: &LiveHost) -> SupervisorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
     #[tokio::test]
     async fn nonce_mismatch_cannot_reattach_or_terminate() {
         let root = tempdir().unwrap();
@@ -755,6 +831,174 @@ mod tests {
             pid_before_expiry
         );
         state.terminate(&reclaimed).await.unwrap();
+    }
+
+    /// P0-A review: `host_live` is the authoritative liveness probe used by
+    /// daemon transition recovery — a tracked host reports live; a host that
+    /// was never spawned reports dead; a terminated host reports dead.
+    #[tokio::test]
+    async fn host_live_reflects_spawn_and_termination() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        assert!(!state.host_live("ses_never").await);
+        let binding = state
+            .spawn(
+                HostManifest::new(
+                    "ses_probe",
+                    "dev",
+                    "ws",
+                    "owner",
+                    1,
+                    unix_now() + 60,
+                    unix_now() + 600,
+                )
+                .unwrap(),
+                shell_command(),
+                PtySize::default(),
+            )
+            .await
+            .unwrap();
+        assert!(state.host_live("ses_probe").await);
+        assert!(!state.host_live("ses_other").await);
+        state.terminate(&binding).await.unwrap();
+        assert!(
+            !state.host_live("ses_probe").await,
+            "a terminated host must no longer be reported live"
+        );
+    }
+
+    /// P0-A review: `sweep_expired` confirms termination before untracking an
+    /// expired host — the count is the number of hosts confirmed dead, and
+    /// `host_live` reflects the authoritative registry afterwards.
+    #[tokio::test]
+    async fn sweep_expired_terminates_and_untracks_expired_host() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let binding = state
+            .spawn(
+                HostManifest::new(
+                    "ses_swept",
+                    "dev",
+                    "ws",
+                    "owner",
+                    1,
+                    unix_now() + 1,
+                    unix_now() + 2,
+                )
+                .unwrap(),
+                shell_command(),
+                PtySize::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(state.host_live("ses_swept").await);
+        assert_eq!(state.sweep_expired().await, 1);
+        assert!(
+            !state.host_live("ses_swept").await,
+            "sweep removal is the authoritative 'sidecar is dead' signal"
+        );
+        assert_eq!(
+            state.sweep_expired().await,
+            0,
+            "a second sweep has nothing left to terminate"
+        );
+        let _ = binding;
+    }
+
+    /// P0-A review (sweep window): a host whose termination is in flight must
+    /// still be reported live by `host_live`. The old code removed the host
+    /// from the registry before issuing the kill, so a concurrent liveness
+    /// probe — the daemon's authoritative sidecar-death proof for expired
+    /// transition records — could observe "not tracked" while the sidecar was
+    /// still alive, and recovery could clear the record over a live host.
+    /// The in-flight `terminating` set closes that window: probes see live
+    /// until the sweep confirms death, and only then is the host untracked.
+    #[tokio::test]
+    async fn host_live_reports_in_flight_termination_as_live_until_confirmed() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let binding = state
+            .spawn(
+                HostManifest::new(
+                    "ses_inflight",
+                    "dev",
+                    "ws",
+                    "owner",
+                    1,
+                    unix_now() + 1,
+                    unix_now() + 2,
+                )
+                .unwrap(),
+                shell_command(),
+                PtySize::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // Simulate the exact in-flight window `sweep_expired` now maintains:
+        // the host is out of the live map (kill issued) but still in
+        // `terminating` until the attempt completes. Liveness probes must
+        // report live in this window.
+        {
+            let mut hosts = state.hosts.lock().await;
+            let hosted = hosts.remove("ses_inflight").expect("expired host present");
+            state.terminating.lock().await.insert("ses_inflight".into());
+            // Dropping `hosted` runs its best-effort Drop cleanup; the
+            // registry state is what the probe observes, and it must not
+            // report dead.
+            drop(hosted);
+        }
+        assert!(
+            state.host_live("ses_inflight").await,
+            "an in-flight termination must still be reported live so recovery retains the record"
+        );
+
+        // Once the attempt completes (confirmed dead), the host is untracked
+        // and probes report dead — the authoritative "sidecar is dead" signal.
+        state.terminating.lock().await.remove("ses_inflight");
+        assert!(
+            !state.host_live("ses_inflight").await,
+            "a confirmed-terminated host must no longer be reported live"
+        );
+        let _ = binding;
+    }
+
+    /// P0-A review (sweep window): `sweep_expired` must keep the host
+    /// visible to liveness probes across the whole termination attempt and
+    /// leave no in-flight residue — a failed terminate re-tracks the host
+    /// (still live), and a confirmed terminate untracks it (dead).
+    #[tokio::test]
+    async fn sweep_expired_keeps_hosts_tracked_until_death_is_confirmed() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let binding = state
+            .spawn(
+                HostManifest::new(
+                    "ses_sweep_window",
+                    "dev",
+                    "ws",
+                    "owner",
+                    1,
+                    unix_now() + 1,
+                    unix_now() + 2,
+                )
+                .unwrap(),
+                shell_command(),
+                PtySize::default(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        assert_eq!(state.sweep_expired().await, 1);
+        assert!(
+            state.terminating.lock().await.is_empty(),
+            "sweep must leave no in-flight termination residue"
+        );
+        assert!(!state.host_live("ses_sweep_window").await);
+        let _ = binding;
     }
 
     #[tokio::test]
@@ -954,6 +1198,65 @@ mod tests {
             .terminate_idempotent(&stale_binding, "tr_terminate", "digest_terminal")
             .await
             .is_err());
+    }
+
+    /// Regression for #152: a completed structured child must be observable as
+    /// exited through supervisor status, not reported live until TTL sweep.
+    #[tokio::test]
+    async fn supervisor_status_observes_a_terminal_structured_child() {
+        let root = tempdir().unwrap();
+        let state = SupervisorState::new(root.path());
+        let mut manifest = HostManifest::new(
+            "ses_structured_exit",
+            "dev",
+            "ws",
+            "owner_a",
+            1,
+            unix_now() + 60,
+            unix_now() + 600,
+        )
+        .unwrap();
+        manifest.io_mode = HostIoMode::StructuredPipes;
+        manifest.profile_id = Some("fixture".into());
+        manifest.adapter_dialect = Some("jsonl".into());
+        let command = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "echo done & echo oops 1>&2".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf done; printf oops >&2; exit 0".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let binding = state
+            .spawn_with_io(
+                manifest,
+                command,
+                PtySize::default(),
+                HostIoMode::StructuredPipes,
+            )
+            .await
+            .unwrap();
+
+        let mut observed = false;
+        for _ in 0..200 {
+            if state.reattach(&binding).await.unwrap().exited {
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            observed,
+            "supervisor status never reported the completed structured child as exited"
+        );
+        let _ = state.terminate(&binding).await;
     }
 
     fn shell_command() -> PtyCommand {
