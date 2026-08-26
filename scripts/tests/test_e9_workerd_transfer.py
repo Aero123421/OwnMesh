@@ -554,10 +554,12 @@ def main() -> int:
             advance_until_state(
                 issuer, access, resume_transfer_id, marker + "-resume", {"destination_preflight"}
             )
-            resume_started = public_call(issuer, access, "ownmesh_transfer_send", {
-                "transfer_id": resume_transfer_id,
-                "idempotency_key": f"e9-send-{marker}-resume",
-            }, 30)
+            # A public send may return after dispatching the source-boundary
+            # revalidation while the transfer still reports destination_preflight.
+            # Wait on the public state machine instead of assuming runner timing.
+            resume_started = advance_until_state(
+                issuer, access, resume_transfer_id, marker + "-resume", {"sending"}
+            )
             started_state, started_meta = transfer_state(resume_started)
             if started_state != "sending" or started_meta.get("epoch") != 1 or started_meta.get("fence") != 1:
                 raise RuntimeError(f"restart transfer did not enter first sending generation: {resume_started}")
