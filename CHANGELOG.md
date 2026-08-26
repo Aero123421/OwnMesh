@@ -101,6 +101,22 @@ tracked in their original issues.
   documents the scoped WAF skip rule that fixes it while keeping rate limiting,
   payload bounds, and authentication in force (#159).
 
+### macOS prepared executable compatibility
+
+- macOS 26 kills copied Apple platform binaries such as `/bin/sh` and
+  `/bin/echo`, even when the private copy is byte-identical and its embedded
+  signature verifies. Prepared execution now keeps the existing private,
+  digest-verified snapshot for ordinary user executables, but launches only an
+  `SF_RESTRICTED`, root-owned system backing path after proving the executable
+  and every canonical ancestor are non-writable by the daemon, retaining all
+  opened custody handles, revalidating the pins, and preserving the approved
+  invocation as `argv[0]`. No executable is re-signed or rewritten.
+- The verify-to-spawn mutation tests use a copied OwnMesh test image instead of
+  assuming a relocated Apple platform binary is executable. macOS coverage now
+  also executes a real restricted platform binary and retargets its mutable
+  proxy after preparation to prove the attacker-controlled invocation is never
+  reopened.
+
 ## v1.2.22 — Service lifecycle, endpoint, and session honesty
 
 Closes the nine open issues from the 2026-08-24 audit (#147–#155). Every one
