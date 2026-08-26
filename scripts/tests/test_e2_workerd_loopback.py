@@ -3029,7 +3029,12 @@ def main() -> int:
             cancel_page = wait_operation(issuer, access_token, str(cancel_page_started.get("operation_id") or ""), want={"completed"})
             cancel_page_data = cancel_page.get("data") if isinstance(cancel_page.get("data"), dict) else {}
             _, cancel_bytes = review_chunk_bytes(cancel_page_data)
-            if find_value(cancelled_done, "phase") != "cancelled" or b"process tree termination requested" not in cancel_bytes:
+            cancelled_receipt = cancelled_done.get("data")
+            if (
+                not isinstance(cancelled_receipt, dict)
+                or cancelled_receipt.get("phase") != "cancelled"
+                or b"process tree termination requested" not in cancel_bytes
+            ):
                 raise RuntimeError(f"review cancellation did not terminate active process tree: {cancelled_done}")
 
             # Restore full_user_access for any later local inspection (cleanup path).
