@@ -3,7 +3,9 @@
 //! The approval-time pins are path-based durable facts. Preparation opens the
 //! invocation and canonical backing, revalidates both against those facts, and
 //! then retains the exact image object used by the launcher. No prepared launch
-//! re-resolves the approved invocation or silently substitutes its backing path.
+//! re-resolves an attacker-writable invocation. macOS platform binaries are the
+//! narrow exception to private-image execution: their verified system backing
+//! path is immutable to the daemon and is launched with the approved argv0.
 
 use super::{
     open_file_identity, verify_open_file_pin, verify_path_entry_pin, CommandKind, ExecError,
@@ -41,8 +43,22 @@ enum PreparedImage {
     Descriptor(File),
     #[cfg(windows)]
     LockedPath(WindowsPathCustody),
+    #[cfg(target_os = "macos")]
+    RestrictedPath(MacOsRestrictedPathCustody),
     #[cfg(not(any(target_os = "linux", windows)))]
     Snapshot(SnapshotCustody),
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsRestrictedPathCustody {
+    launcher_path: PathBuf,
+    // A macOS platform binary cannot be executed from a byte-for-byte private
+    // copy on recent macOS releases. The original image and its immutable
+    // root-owned ancestor chain stay open while posix_spawn opens the verified
+    // backing path. The approved invocation remains argv[0].
+    _invocation: File,
+    _backing: File,
+    _ancestors: Vec<File>,
 }
 
 #[cfg(windows)]
@@ -84,8 +100,9 @@ impl Drop for SnapshotCustody {
 /// an object that can be consumed only by [`run_prepared_command_cancellable`](
 /// crate::run_prepared_command_cancellable).
 ///
-/// `staging_root` is required on targets without descriptor execution. It must
-/// be an already custody-validated owner directory (the daemon runtime dir).
+/// `staging_root` is required on targets that may use snapshot execution. It
+/// must be an already custody-validated owner directory (the daemon runtime
+/// dir).
 pub fn prepare_executable(
     invocation_path: &Path,
     invocation_pin: &ExecutablePin,
@@ -191,7 +208,18 @@ pub fn prepare_executable_with_interpreter(
         backing_entry,
         ancestors,
     )?;
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    let image = finish_macos_custody(
+        invocation_path,
+        invocation_pin,
+        backing_pin,
+        invocation,
+        backing,
+        staging_root.ok_or_else(|| {
+            ExecError::Journal("prepared executable staging root is required on this OS".into())
+        })?,
+    )?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let image = PreparedImage::Snapshot(stage_verified_image(
         &mut invocation,
         invocation_path,
@@ -370,6 +398,150 @@ fn finish_windows_custody(
         _launcher_entry: launcher_entry,
         _ancestors: ancestors,
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn finish_macos_custody(
+    invocation_path: &Path,
+    invocation_pin: &ExecutablePin,
+    backing_pin: &ExecutablePin,
+    mut invocation: File,
+    mut backing: File,
+    staging_root: &Path,
+) -> ExecResult<PreparedImage> {
+    if let Some(ancestors) = macos_restricted_path_custody(
+        invocation_path,
+        invocation_pin,
+        backing_pin,
+        &mut invocation,
+        &mut backing,
+    )? {
+        return Ok(PreparedImage::RestrictedPath(MacOsRestrictedPathCustody {
+            launcher_path: PathBuf::from(&backing_pin.path),
+            _invocation: invocation,
+            _backing: backing,
+            _ancestors: ancestors,
+        }));
+    }
+
+    Ok(PreparedImage::Snapshot(stage_verified_image(
+        &mut invocation,
+        invocation_path,
+        backing_pin,
+        staging_root,
+    )?))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_restricted_path_custody(
+    invocation_path: &Path,
+    invocation_pin: &ExecutablePin,
+    backing_pin: &ExecutablePin,
+    invocation: &mut File,
+    backing: &mut File,
+) -> ExecResult<Option<Vec<File>>> {
+    use std::os::macos::fs::MetadataExt as MacOsMetadataExt;
+    use std::os::unix::fs::MetadataExt as UnixMetadataExt;
+
+    // SF_RESTRICTED is the Darwin system-immutable flag from <sys/stat.h>.
+    // Ordinary user-owned executables stay on the independent snapshot path.
+    const SF_RESTRICTED: u32 = 0x0008_0000;
+    let metadata = backing.metadata()?;
+    if MacOsMetadataExt::st_flags(&metadata) & SF_RESTRICTED == 0 {
+        return Ok(None);
+    }
+    if !metadata.is_file()
+        || UnixMetadataExt::uid(&metadata) != 0
+        || UnixMetadataExt::mode(&metadata) & 0o022 != 0
+    {
+        return Err(ExecError::Journal(
+            "restricted macOS executable lacks root-owned immutable custody".into(),
+        ));
+    }
+
+    let backing_path = Path::new(&backing_pin.path);
+    if std::fs::canonicalize(backing_path)? != backing_path {
+        return Err(ExecError::Journal(
+            "restricted macOS executable backing path is not canonical".into(),
+        ));
+    }
+    require_macos_path_not_writable(backing_path)?;
+
+    let mut ancestor_paths: Vec<&Path> = backing_path.ancestors().skip(1).collect();
+    ancestor_paths.reverse();
+    let mut ancestors = Vec::with_capacity(ancestor_paths.len());
+    for directory in ancestor_paths {
+        let path_metadata = std::fs::symlink_metadata(directory)?;
+        if !path_metadata.is_dir()
+            || path_metadata.file_type().is_symlink()
+            || UnixMetadataExt::uid(&path_metadata) != 0
+            || UnixMetadataExt::mode(&path_metadata) & 0o022 != 0
+        {
+            return Err(ExecError::Journal(format!(
+                "restricted macOS executable ancestor lacks root-owned immutable custody: {}",
+                directory.display()
+            )));
+        }
+        require_macos_path_not_writable(directory)?;
+        let handle = open_macos_directory_custody(directory)?;
+        let opened_metadata = handle.metadata()?;
+        if UnixMetadataExt::dev(&opened_metadata) != UnixMetadataExt::dev(&path_metadata)
+            || UnixMetadataExt::ino(&opened_metadata) != UnixMetadataExt::ino(&path_metadata)
+        {
+            return Err(ExecError::Journal(format!(
+                "restricted macOS executable ancestor changed while opening: {}",
+                directory.display()
+            )));
+        }
+        ancestors.push(handle);
+    }
+
+    // Revalidate after the full ancestor inspection. From this point the
+    // unprivileged daemon cannot replace the SF_RESTRICTED image or any path
+    // component used by posix_spawn.
+    verify_path_entry_pin(invocation_path, invocation_pin)?;
+    verify_open_file_pin(invocation, invocation_path, invocation_pin)?;
+    verify_open_file_pin(invocation, invocation_path, backing_pin)?;
+    verify_path_entry_pin(backing_path, backing_pin)?;
+    verify_open_file_pin(backing, backing_path, backing_pin)?;
+    if open_file_identity(invocation)? != open_file_identity(backing)? {
+        return Err(ExecError::Journal(
+            "restricted macOS invocation changed during custody validation".into(),
+        ));
+    }
+
+    Ok(Some(ancestors))
+}
+
+#[cfg(target_os = "macos")]
+fn require_macos_path_not_writable(path: &Path) -> ExecResult<()> {
+    use rustix::fs::Access;
+    match rustix::fs::access(path, Access::WRITE_OK) {
+        Ok(()) => Err(ExecError::Journal(format!(
+            "restricted macOS executable custody path is writable by the daemon: {}",
+            path.display()
+        ))),
+        Err(error)
+            if error == rustix::io::Errno::ACCESS
+                || error == rustix::io::Errno::PERM
+                || error == rustix::io::Errno::ROFS =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(ExecError::Io(error.into())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_directory_custody(path: &Path) -> ExecResult<File> {
+    use rustix::fs::{open, Mode, OFlags};
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| ExecError::Io(error.into()))?;
+    Ok(File::from(descriptor))
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -556,6 +728,13 @@ pub(super) fn build_prepared_command(
             command.arg0(&prepared.approved_argv0);
             command.args(&args);
             (command, PreparedImage::Snapshot(snapshot))
+        }
+        #[cfg(target_os = "macos")]
+        PreparedImage::RestrictedPath(restricted) => {
+            let mut command = Command::new(&restricted.launcher_path);
+            command.arg0(&prepared.approved_argv0);
+            command.args(&args);
+            (command, PreparedImage::RestrictedPath(restricted))
         }
     };
     if let Some(cwd) = &req.cwd {

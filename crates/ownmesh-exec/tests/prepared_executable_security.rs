@@ -5,8 +5,11 @@ use ownmesh_exec::{
     ExecutablePin, RunRequest,
 };
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+
+const PREPARED_HELPER_MARKER_ENV: &str = "OWNMESH_PREPARED_HELPER_MARKER";
 
 fn proxy_pins(path: &Path, kind: CommandKind) -> (ExecutablePin, ExecutablePin) {
     let invocation = pin_executable(path, kind).expect("pin invocation");
@@ -35,6 +38,45 @@ fn false_program() -> &'static Path {
         bin
     } else {
         Path::new("/usr/bin/false")
+    }
+}
+
+fn copy_prepared_helper(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::copy(
+        std::env::current_exe().expect("current integration-test executable"),
+        path,
+    )
+    .expect("copy integration-test helper");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("make integration-test helper executable");
+}
+
+fn write_failing_replacement(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, b"#!/bin/sh\nexit 91\n").expect("write replacement executable");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .expect("make replacement executable");
+}
+
+fn prepared_helper_request(program: &Path, marker: &str) -> RunRequest {
+    let mut req = request(
+        program,
+        &["--exact", "prepared_executable_test_helper", "--nocapture"],
+    );
+    req.env
+        .insert(PREPARED_HELPER_MARKER_ENV.into(), marker.into());
+    req
+}
+
+#[test]
+fn prepared_executable_test_helper() {
+    if let Ok(marker) = std::env::var(PREPARED_HELPER_MARKER_ENV) {
+        std::io::stdout()
+            .write_all(marker.as_bytes())
+            .expect("write prepared helper marker");
     }
 }
 
@@ -78,8 +120,8 @@ async fn replacement_after_preparation_cannot_change_the_executed_image() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("approved-image");
     let replacement = temp.path().join("replacement-image");
-    std::fs::copy("/bin/echo", &target).unwrap();
-    std::fs::copy(false_program(), &replacement).unwrap();
+    copy_prepared_helper(&target);
+    write_failing_replacement(&replacement);
     let alias = temp.path().join("approved-proxy");
     symlink(&target, &alias).unwrap();
     let (invocation, backing) = proxy_pins(&alias, CommandKind::Structured);
@@ -88,29 +130,29 @@ async fn replacement_after_preparation_cannot_change_the_executed_image() {
     // This is the verify-to-exec window from OM-SEC-02. Linux executes the
     // retained descriptor and macOS executes the already-copied private image.
     std::fs::rename(&replacement, &target).unwrap();
-    let req = request(&alias, &["prepared-image-ran"]);
+    let req = prepared_helper_request(&alias, "prepared-image-ran");
     let result = run_prepared_command_cancellable(&req, prepared, None, None)
         .await
         .unwrap();
 
     assert_eq!(result.exit_code, Some(0));
-    assert_eq!(result.stdout.trim(), "prepared-image-ran");
+    assert!(result.stdout.contains("prepared-image-ran"));
 }
 
 #[tokio::test]
 async fn in_place_write_after_preparation_cannot_change_the_executed_image() {
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("approved-image");
-    std::fs::copy("/bin/echo", &target).unwrap();
+    copy_prepared_helper(&target);
     let (invocation, backing) = proxy_pins(&target, CommandKind::Structured);
     let prepared = prepare_executable(&target, &invocation, &backing, Some(temp.path())).unwrap();
 
     // An open descriptor to the original inode is not enough on Unix: another
     // writer can mutate that inode. The prepared Linux memfd is sealed and the
     // macOS private snapshot is already independent before this write.
-    std::fs::copy(false_program(), &target).unwrap();
+    write_failing_replacement(&target);
     let result = run_prepared_command_cancellable(
-        &request(&target, &["immutable-image-ran"]),
+        &prepared_helper_request(&target, "immutable-image-ran"),
         prepared,
         None,
         None,
@@ -119,7 +161,7 @@ async fn in_place_write_after_preparation_cannot_change_the_executed_image() {
     .unwrap();
 
     assert_eq!(result.exit_code, Some(0));
-    assert_eq!(result.stdout.trim(), "immutable-image-ran");
+    assert!(result.stdout.contains("immutable-image-ran"));
 }
 
 #[tokio::test]
@@ -148,15 +190,15 @@ async fn parent_directory_replacement_after_preparation_is_harmless() {
     let parent = temp.path().join("approved-parent");
     std::fs::create_dir(&parent).unwrap();
     let target = parent.join("approved-image");
-    std::fs::copy("/bin/echo", &target).unwrap();
+    copy_prepared_helper(&target);
     let (invocation, backing) = proxy_pins(&target, CommandKind::Structured);
     let prepared = prepare_executable(&target, &invocation, &backing, Some(temp.path())).unwrap();
 
     std::fs::rename(&parent, temp.path().join("moved-approved-parent")).unwrap();
     std::fs::create_dir(&parent).unwrap();
-    std::fs::copy(false_program(), &target).unwrap();
+    write_failing_replacement(&target);
     let result = run_prepared_command_cancellable(
-        &request(&target, &["parent-custody-ran"]),
+        &prepared_helper_request(&target, "parent-custody-ran"),
         prepared,
         None,
         None,
@@ -165,7 +207,52 @@ async fn parent_directory_replacement_after_preparation_is_harmless() {
     .unwrap();
 
     assert_eq!(result.exit_code, Some(0));
-    assert_eq!(result.stdout.trim(), "parent-custody-ran");
+    assert!(result.stdout.contains("parent-custody-ran"));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn restricted_macos_platform_binary_executes_from_verified_backing() {
+    let temp = tempfile::tempdir().unwrap();
+    let program = Path::new("/bin/echo");
+    let (invocation, backing) = proxy_pins(program, CommandKind::Structured);
+    let prepared = prepare_executable(program, &invocation, &backing, Some(temp.path())).unwrap();
+
+    let result = run_prepared_command_cancellable(
+        &request(program, &["macos-platform-binary-ran"]),
+        prepared,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.stdout.trim(), "macos-platform-binary-ran");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn restricted_macos_proxy_retarget_after_preparation_is_harmless() {
+    let temp = tempfile::tempdir().unwrap();
+    let alias = temp.path().join("restricted-platform-proxy");
+    symlink("/bin/echo", &alias).unwrap();
+    let (invocation, backing) = proxy_pins(&alias, CommandKind::Structured);
+    let prepared = prepare_executable(&alias, &invocation, &backing, Some(temp.path())).unwrap();
+
+    std::fs::remove_file(&alias).unwrap();
+    symlink(false_program(), &alias).unwrap();
+    let result = run_prepared_command_cancellable(
+        &request(&alias, &["retarget-could-not-run"]),
+        prepared,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.stdout.trim(), "retarget-could-not-run");
 }
 
 #[test]
