@@ -6,6 +6,7 @@
 
 use crate::runtime::DaemonRuntime;
 use crate::transfer_crypto::{canonical_ephemeral_proof, AgentTransferTicket, TransferEphemeral};
+use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
 use ownmesh_config::{atomic_write, OwnMeshConfig, OwnMeshPaths};
 use ownmesh_domain::{DeviceId, ErrorCode, MessageId, Timestamp};
@@ -13,7 +14,7 @@ use ownmesh_identity::{
     load_device_credential, load_or_create_device_key, DeviceKeyPair, PreferredSecretStore,
     SecretString, DEFAULT_KEYCHAIN_SERVICE,
 };
-use ownmesh_ipc::{methods, ClientIdentity};
+use ownmesh_ipc::{methods, AgentRoutePresence, ClientIdentity};
 use ownmesh_protocol::{
     Envelope, OperationEnvelope, OperationPayload, OperationRequestPayload, OPERATION_CONTRACT_V1,
     PROTOCOL_DEVICE_V1,
@@ -22,16 +23,20 @@ use ownmesh_transfer::TransferChunk;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request as ClientHttpRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{client_async_tls_with_config, MaybeTlsStream, WebSocketStream};
 use url::Url;
 use uuid::Uuid;
 
@@ -49,6 +54,17 @@ const MAX_PAYLOAD_BYTES: usize = 1_000_000;
 /// Reject transport state files larger than this before deserialize.
 const MAX_TRANSPORT_STATE_FILE_BYTES: usize = 8 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bounded TCP+TLS+WebSocket connect budget. `HANDSHAKE_TIMEOUT` only guards
+/// the post-connect handshake frames; without this bound a blackholed address
+/// (for example an unreachable AAAA on a dual-stack host) parks the reconnect
+/// loop in SYN-SENT forever (#140).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// RFC 8305 style head start before the next candidate address joins the
+/// connect race, so a working A record is tried while a blackholed AAAA is
+/// still pending instead of after it.
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(300);
+/// Cap resolved candidate addresses so a hostile resolver cannot fan out work.
+const MAX_CONNECT_ADDRESSES: usize = 16;
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 /// Bounded completion queue between worker tasks and the live WebSocket loop.
@@ -91,6 +107,8 @@ impl ReconnectBackoff {
 fn reconnect_failure_category(error: &str) -> &'static str {
     if error.contains("control plane rejected") || error.contains("unsupported device protocol") {
         "protocol_rejection"
+    } else if error.contains("connect timed out") {
+        "connect_timeout"
     } else if error.contains("socket closed")
         || error.contains("control plane closed")
         || error.contains("WebSocket stream ended")
@@ -100,6 +118,146 @@ fn reconnect_failure_category(error: &str) -> &'static str {
     } else {
         "transport_error"
     }
+}
+
+/// Interleave resolved addresses by family, RFC 8305 style: the first attempt
+/// uses the family the resolver ranked first (usually IPv6), and candidates
+/// alternate families afterwards while preserving relative order inside each
+/// family. A blackholed AAAA therefore no longer blocks a working A record.
+fn order_connect_addresses(addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut ordered = Vec::with_capacity(addrs.len());
+    let mut prefer_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let mut v6 = addrs.iter().filter(|addr| addr.is_ipv6());
+    let mut v4 = addrs.iter().filter(|addr| addr.is_ipv4());
+    while ordered.len() < addrs.len() {
+        let next = if prefer_v6 {
+            v6.next().or_else(|| v4.next())
+        } else {
+            v4.next().or_else(|| v6.next())
+        };
+        match next {
+            Some(addr) => ordered.push(*addr),
+            None => break,
+        }
+        prefer_v6 = !prefer_v6;
+    }
+    ordered
+}
+
+type DialFuture = Pin<Box<dyn Future<Output = std::io::Result<TcpStream>> + Send>>;
+type Dialer = Arc<dyn Fn(SocketAddr) -> DialFuture + Send + Sync>;
+
+fn tcp_dialer() -> Dialer {
+    Arc::new(|addr| Box::pin(TcpStream::connect(addr)) as DialFuture)
+}
+
+/// Dial every resolved address with a bounded, staggered race (RFC 8305
+/// Happy Eyeballs): attempts start in interleaved family order, each later
+/// candidate waits [`HAPPY_EYEBALLS_DELAY`] for its predecessors, and the
+/// first established connection wins. The whole operation is bounded by
+/// `timeout`, so neither a refused port nor a blackholed address can park a
+/// reconnect forever.
+async fn dial_addresses_bounded(
+    addrs: Vec<SocketAddr>,
+    timeout: Duration,
+    dial: Dialer,
+) -> Result<(TcpStream, SocketAddr), String> {
+    type Attempt = tokio::task::JoinHandle<(SocketAddr, std::io::Result<TcpStream>)>;
+    if addrs.is_empty() {
+        return Err("WebSocket host resolved to no addresses".into());
+    }
+    let timeout_error = format!("WebSocket connect timed out after {}s", timeout.as_secs());
+    let exhausted_error = "WebSocket connect failed on every resolved address";
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut attempts: FuturesUnordered<Attempt> = FuturesUnordered::new();
+    let push_attempt = |attempts: &mut FuturesUnordered<Attempt>, addr: SocketAddr| {
+        let dial = Arc::clone(&dial);
+        attempts.push(tokio::spawn(async move {
+            let result = dial(addr).await;
+            (addr, result)
+        }));
+    };
+    for (index, addr) in addrs.iter().copied().enumerate() {
+        if index > 0 && !attempts.is_empty() {
+            // Give earlier attempts their head start; leave early on success.
+            let head_start = tokio::time::sleep(HAPPY_EYEBALLS_DELAY);
+            tokio::pin!(head_start);
+            let mut winner: Option<(SocketAddr, TcpStream)> = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut deadline => return Err(timeout_error),
+                    () = &mut head_start => break,
+                    settled = attempts.next(), if !attempts.is_empty() => match settled {
+                        Some(Ok((addr, Ok(stream)))) => {
+                            winner = Some((addr, stream));
+                            break;
+                        }
+                        Some(_) => {}
+                        None => break,
+                    },
+                }
+            }
+            if let Some((addr, stream)) = winner {
+                return Ok((stream, addr));
+            }
+        }
+        push_attempt(&mut attempts, addr);
+    }
+    // Phase 2: drain the remaining attempts, still bounded by the deadline.
+    loop {
+        if attempts.is_empty() {
+            return Err(exhausted_error.into());
+        }
+        tokio::select! {
+            biased;
+            () = &mut deadline => return Err(timeout_error),
+            settled = attempts.next() => match settled {
+                Some(Ok((addr, Ok(stream)))) => return Ok((stream, addr)),
+                Some(_) => {}
+                None => return Err(exhausted_error.into()),
+            },
+        }
+    }
+}
+
+/// Resolve the request URL and open the TLS WebSocket over a bounded,
+/// family-interleaved TCP connect. This replaces `connect_async_with_config`,
+/// which dials only the resolver's first answer and can hang forever when
+/// that address blackholes (#140).
+async fn open_bounded_websocket(
+    request: ClientHttpRequest,
+    max_bytes: usize,
+    label: &'static str,
+) -> Result<AgentSocket, String> {
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .ok_or_else(|| format!("{label}: URL has no host"))?
+        .to_owned();
+    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("wss") => 443,
+        _ => 80,
+    });
+    let addrs: Vec<SocketAddr> = lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| format!("{label}: DNS resolution failed: {error}"))?
+        .take(MAX_CONNECT_ADDRESSES)
+        .collect();
+    let ordered = order_connect_addresses(&addrs);
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(max_bytes))
+        .max_frame_size(Some(max_bytes));
+    let (stream, _) = dial_addresses_bounded(ordered, CONNECT_TIMEOUT, tcp_dialer())
+        .await
+        .map_err(|error| format!("{label}: {error}"))?;
+    // Match the nagle behavior of connect_async_with_config(.., disable_nagle=true).
+    let _ = stream.set_nodelay(true);
+    let (socket, _) = client_async_tls_with_config(request, stream, Some(ws_config), None)
+        .await
+        .map_err(|error| format!("{label}: {error}"))?;
+    Ok(socket)
 }
 
 /// Fully bound transport inputs. Secret-bearing fields intentionally have no
@@ -116,6 +274,18 @@ pub struct AgentTransportConfig {
     /// preflight and deliberately never enter AgentTransportState or logs.
     preflight_ephemerals: Arc<Mutex<HashMap<String, PreflightEphemeral>>>,
     state_path: PathBuf,
+    /// Completions whose live-loop `finish_tx` was gone (Agent reconnect).
+    /// The next live loop absorbs these before redelivery so a detached
+    /// command can still publish its terminal result.
+    orphan_completions: Arc<std::sync::Mutex<Vec<CompletedReply>>>,
+    orphan_notify: Arc<tokio::sync::Notify>,
+    /// #146: notified when the device-local workspace registry changes so the
+    /// live session can publish an incremental `workspace.registry` snapshot
+    /// without waiting for the next ready handshake. `None` in tests.
+    workspace_registry_notify: Option<Arc<tokio::sync::Notify>>,
+    /// In-process operation.request tasks. Survives Agent reconnect so a live
+    /// detached spawn is not re-entered as a journal CONFLICT.
+    in_process_dispatches: Arc<Mutex<HashSet<String>>>,
 }
 
 struct PreflightEphemeral {
@@ -806,6 +976,7 @@ async fn run_destination_transfer_pump(
 pub fn configured_transport(
     paths: &OwnMeshPaths,
     cfg: &OwnMeshConfig,
+    workspace_registry_notify: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<Option<AgentTransportConfig>, String> {
     let Some(active_id) = cfg.active_instance.as_deref() else {
         return Ok(None);
@@ -848,6 +1019,10 @@ pub fn configured_transport(
         credential: envelope.credential().clone(),
         key: Arc::new(key),
         preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+        orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+        orphan_notify: Arc::new(tokio::sync::Notify::new()),
+        workspace_registry_notify,
+        in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
         state_path: paths.state_dir.join(TRANSPORT_STATE_FILE),
     }))
 }
@@ -965,12 +1140,12 @@ pub async fn connect_transfer_socket(
             .parse()
             .map_err(|_| "transfer ticket cannot be encoded as an HTTP header")?,
     );
-    let ws_config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_TRANSFER_SOCKET_BYTES))
-        .max_frame_size(Some(MAX_TRANSFER_SOCKET_BYTES));
-    let (socket, _) = connect_async_with_config(request, Some(ws_config), true)
-        .await
-        .map_err(|error| format!("transfer WebSocket connect failed: {error}"))?;
+    let socket = open_bounded_websocket(
+        request,
+        MAX_TRANSFER_SOCKET_BYTES,
+        "transfer WebSocket connect failed",
+    )
+    .await?;
     Ok(socket)
 }
 
@@ -1257,6 +1432,63 @@ fn compact_completed_reply(reply: CompletedReply) -> CompletedReply {
     completion_receipt(&reply)
 }
 
+impl AgentTransportConfig {
+    fn remember_orphan_completion(&self, completed: CompletedReply) {
+        let compact = compact_completed_reply(completed);
+        if let Ok(mut orphans) = self.orphan_completions.lock() {
+            orphans.retain(|row| row.correlation_id != compact.correlation_id);
+            if orphans.len() >= MAX_COMPLETED_REPLIES {
+                orphans.remove(0);
+            }
+            orphans.push(compact);
+        }
+        self.orphan_notify.notify_one();
+    }
+
+    fn take_orphan_completions(&self) -> Vec<CompletedReply> {
+        self.orphan_completions
+            .lock()
+            .map(|mut orphans| orphans.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
+
+fn absorb_orphan_completions(
+    config: &AgentTransportConfig,
+    state: &mut AgentTransportState,
+) -> Result<Vec<CompletedReply>, String> {
+    let drained = config.take_orphan_completions();
+    if drained.is_empty() {
+        return Ok(Vec::new());
+    }
+    for completed in &drained {
+        state.remember_completed(completed.clone());
+    }
+    state.save(&config.state_path)?;
+    Ok(drained)
+}
+
+/// Persist parked reconnect completions and publish every row. Callers must
+/// not drop the returned list: a different inbound correlation must still
+/// send every parked `operation.result`.
+async fn publish_orphan_completions(
+    socket: &mut AgentSocket,
+    config: &AgentTransportConfig,
+    state: &mut AgentTransportState,
+) -> Result<Vec<CompletedReply>, String> {
+    let drained = absorb_orphan_completions(config, state)?;
+    for completed in &drained {
+        send_cached_result(socket, config, state, completed).await?;
+    }
+    Ok(drained)
+}
+
+fn orphan_already_published(correlation: &str, published: &[CompletedReply]) -> bool {
+    published
+        .iter()
+        .any(|row| row.correlation_id == correlation)
+}
+
 fn completion_receipt(reply: &CompletedReply) -> CompletedReply {
     let status = reply
         .payload
@@ -1305,6 +1537,7 @@ pub async fn run(
     config: AgentTransportConfig,
     runtime: Option<Arc<Mutex<DaemonRuntime>>>,
     mut shutdown: watch::Receiver<bool>,
+    presence: Option<watch::Sender<AgentRoutePresence>>,
 ) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut state = match AgentTransportState::load(
@@ -1321,15 +1554,24 @@ pub async fn run(
     let mut backoff = ReconnectBackoff::default();
     loop {
         if *shutdown.borrow() {
+            if let Some(presence) = &presence {
+                let _ = presence.send_replace(AgentRoutePresence::Offline);
+            }
             return;
         }
         let mut reached_ready = false;
+        // A new attempt starts without a live route; a hung or failing
+        // connect must be visible as offline immediately (#141).
+        if let Some(presence) = &presence {
+            let _ = presence.send_replace(AgentRoutePresence::Offline);
+        }
         match connect_and_run(
             &config,
             runtime.as_ref(),
             &mut state,
             &mut shutdown,
             &mut reached_ready,
+            presence.as_ref(),
         )
         .await
         {
@@ -1373,6 +1615,7 @@ async fn connect_and_run(
     state: &mut AgentTransportState,
     shutdown: &mut watch::Receiver<bool>,
     reached_ready: &mut bool,
+    presence: Option<&watch::Sender<AgentRoutePresence>>,
 ) -> Result<(), String> {
     let mut request = config
         .ws_url
@@ -1399,12 +1642,9 @@ async fn connect_and_run(
             .parse()
             .map_err(|_| "Agent version cannot be encoded as an HTTP header".to_owned())?,
     );
-    let ws_config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_PAYLOAD_BYTES))
-        .max_frame_size(Some(MAX_PAYLOAD_BYTES));
-    let connect = connect_async_with_config(request, Some(ws_config), true);
-    let (mut socket, _) = tokio::select! {
-        result = connect => result.map_err(|error| format!("WebSocket connect failed: {error}"))?,
+    let connect = open_bounded_websocket(request, MAX_PAYLOAD_BYTES, "WebSocket connect failed");
+    let mut socket = tokio::select! {
+        result = connect => result?,
         changed = shutdown.changed() => {
             if changed.is_err() || *shutdown.borrow() {
                 return Ok(());
@@ -1420,12 +1660,18 @@ async fn connect_and_run(
     };
     perform_handshake(&mut socket, config, state, workspace_registry.as_ref()).await?;
     *reached_ready = true;
+    // The authenticated ready session is live: this is the same condition the
+    // control plane reports to MCP clients as `connection_status` (#141).
+    if let Some(presence) = presence {
+        let _ = presence.send_replace(AgentRoutePresence::Online);
+    }
     tracing::info!(
         issuer = %ownmesh_config::redact_control_plane_url(&config.issuer),
         device_id = %config.device_id,
         remote_routing_enabled = runtime.is_some(),
         "Agent WebSocket authenticated and ready"
     );
+    publish_orphan_completions(&mut socket, config, state).await?;
     live_loop(&mut socket, config, runtime, state, shutdown).await
 }
 
@@ -1690,7 +1936,9 @@ async fn live_loop(
     // Bounded queue + semaphore: slow WSS consumers must not grow RSS without limit.
     let (finish_tx, mut finish_rx) = mpsc::channel::<FinishedRemoteOp>(MAX_COMPLETION_QUEUE);
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REMOTE_OPS));
-    let active_dispatches = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let active_dispatches = Arc::clone(&config.in_process_dispatches);
+    // #146: set when the device-local registry changed mid-session.
+    let mut registry_dirty = false;
 
     // Do not replay the Agent-local crash outbox on reconnect. DeviceRoom owns
     // the authoritative pending/cancel state and redelivers only after applying
@@ -1700,6 +1948,30 @@ async fn live_loop(
     // stable correlation with a fresh message id/sequence.
 
     loop {
+        // Drain before select! so a Notify wakeup dropped by a competing
+        // branch cannot strand a detached completion until the next handshake.
+        publish_orphan_completions(socket, config, state).await?;
+        // #146: an incremental workspace-registry snapshot is published after
+        // the select turn, mirroring the orphan-completion drain pattern.
+        if registry_dirty {
+            registry_dirty = false;
+            if let Some(runtime) = runtime {
+                let (enforce_workspace, workspaces) =
+                    runtime.lock().await.remote_workspace_registry();
+                send_envelope(
+                    socket,
+                    config,
+                    state,
+                    "workspace.registry",
+                    json!({
+                        "enforce_workspace": enforce_workspace,
+                        "workspaces": workspaces,
+                    }),
+                    None,
+                )
+                .await?;
+            }
+        }
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1726,6 +1998,19 @@ async fn live_loop(
                 state.remember_completed(finished.completed.clone());
                 state.save(&config.state_path)?;
                 send_cached_result(socket, config, state, &finished.completed).await?;
+            }
+            () = config.orphan_notify.notified() => {
+                // Wake only; the next loop turn drains and publishes every row.
+            }
+            () = async {
+                match &config.workspace_registry_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // Wake only; the top of the next loop turn publishes the
+                // current full registry snapshot (#146).
+                registry_dirty = true;
             }
             message = socket.next() => {
                 let message = message
@@ -1936,7 +2221,11 @@ async fn handle_live_frame(
                 .correlation_id
                 .as_deref()
                 .ok_or_else(|| "operation.request requires correlation_id".to_owned())?;
+            let absorbed = publish_orphan_completions(socket, config, state).await?;
             if let Some(completed) = state.completed(correlation).cloned() {
+                if orphan_already_published(correlation, &absorbed) {
+                    return Ok(());
+                }
                 return send_cached_result(socket, config, state, &completed).await;
             }
             // Duplicate / crash-resume: recover the immutable envelope from the outbox.
@@ -2141,6 +2430,8 @@ async fn handle_live_frame(
 
             // In-process exact-once: do not start a second side effect while one runs
             // (Duplicate redelivery or crash-outbox resume during the same session).
+            // Skip is safe only because the original task parks its completion
+            // and live_loop publishes every parked row on each turn.
             {
                 let mut active = active_dispatches.lock().await;
                 if !active.insert(correlation.to_owned()) {
@@ -2196,7 +2487,18 @@ async fn handle_live_frame(
                 };
                 // Backpressure: wait for the live loop to drain rather than drop
                 // or grow an unbounded queue while the WebSocket consumer is slow.
-                let _ = finish_tx.send(FinishedRemoteOp { completed }).await;
+                // If the live loop is gone (Agent reconnect), park the result so
+                // the next session can publish it instead of mapping a still-running
+                // journal marker to OWNMESH_E_CONFLICT.
+                if finish_tx
+                    .send(FinishedRemoteOp {
+                        completed: completed.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    transfer_config.remember_orphan_completion(completed);
+                }
                 let mut active = active_dispatches.lock().await;
                 active.remove(&correlation_owned);
             });
@@ -2752,7 +3054,10 @@ fn map_request_to_method(
             }
             methods::ADMIN_APPROVAL_BRIDGE_REQUEST
         }
+        ("admin.grants.mint", "admin.grants.mint") => methods::ADMIN_GRANTS_MINT_REQUEST,
         ("policy.show", "policy.show" | "ownmesh_policy_show" | "show") => methods::POLICY_SHOW,
+        ("grants.list", "grants.list" | "ownmesh_grants_list") => methods::GRANTS_LIST,
+        ("grants.revoke", "grants.revoke" | "ownmesh_grants_revoke") => methods::GRANTS_REVOKE,
         ("filesystem.read", "fs.list" | "ownmesh_fs_list" | "ownmesh_list_files") => {
             methods::OPS_FS_LIST
         }
@@ -3225,6 +3530,8 @@ fn bound_result_object(value: Value) -> Value {
             "duration_ms",
             "replayed",
             "cancelled",
+            "detached",
+            "pid",
             "signal_delivered",
             "workspace_id",
             "workspace_version",
@@ -3577,6 +3884,23 @@ async fn dispatch_remote_operation(
                             | ownmesh_ipc::app_error::TOKEN_REVOKED
                             | ownmesh_ipc::app_error::LOCKDOWN => "OWNMESH_E_AUTHORIZATION",
                             ownmesh_ipc::app_error::INVALID_PARAMS => "OWNMESH_E_INVALID_ARGUMENT",
+                            ownmesh_ipc::app_error::EXECUTABLE_IDENTITY_DRIFT => {
+                                "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"
+                            }
+                            ownmesh_ipc::app_error::EXECUTABLE_FORMAT => {
+                                "OWNMESH_E_EXECUTABLE_FORMAT"
+                            }
+                            ownmesh_ipc::app_error::JOURNAL_CAPACITY => {
+                                "OWNMESH_E_JOURNAL_CAPACITY"
+                            }
+                            ownmesh_ipc::app_error::TRANSITION_RECOVERY_REQUIRED => {
+                                "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED"
+                            }
+                            ownmesh_ipc::app_error::CONFLICT
+                                if message.starts_with("OWNMESH_E_JOURNAL_DEGRADED") =>
+                            {
+                                "OWNMESH_E_JOURNAL_DEGRADED"
+                            }
                             ownmesh_ipc::app_error::CONFLICT => "OWNMESH_E_CONFLICT",
                             _ => "OWNMESH_E_INTERNAL",
                         };
@@ -3642,6 +3966,14 @@ async fn dispatch_remote_operation(
             .map(|ts| ts.date_time().unix_timestamp())
     });
     let remote_payload_hash = request.payload_hash.clone();
+    // Captured before the params move into the runtime dispatch: the caller's
+    // contract idempotency key drives terminal-failure journal reconciliation
+    // below (#142).
+    let caller_idempotency_key = mapped
+        .1
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let outcome = {
         let mut guard = runtime.lock().await;
         guard
@@ -3874,6 +4206,14 @@ async fn dispatch_remote_operation(
                         ownmesh_ipc::app_error::PLATFORM_UNSUPPORTED => {
                             "OWNMESH_E_PLATFORM_UNSUPPORTED"
                         }
+                        ownmesh_ipc::app_error::EXECUTABLE_IDENTITY_DRIFT => {
+                            "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"
+                        }
+                        ownmesh_ipc::app_error::CONFLICT
+                            if message.starts_with("OWNMESH_E_JOURNAL_DEGRADED") =>
+                        {
+                            "OWNMESH_E_JOURNAL_DEGRADED"
+                        }
                         ownmesh_ipc::app_error::CONFLICT => "OWNMESH_E_CONFLICT",
                         _ => "OWNMESH_E_INTERNAL",
                     };
@@ -3881,6 +4221,37 @@ async fn dispatch_remote_operation(
                 }
                 other => ("failed", "OWNMESH_E_INTERNAL".to_owned(), other.to_string()),
             };
+            // #142: a terminal device result must never strand the caller's
+            // idempotency key as an eternal in_progress op-journal marker.
+            // Reconcile our own reserved marker into a compact failed receipt
+            // so retries replay this same failure and doctor stops reporting
+            // an uncertain in-flight mutation. Covers every runtime admission
+            // path (gate_and_run, review, approval, remote session
+            // mutations), each of which reserves under the same principal-
+            // namespaced key. Best-effort: a reconciliation persist failure is
+            // logged and leaves the exact-once marker untouched.
+            if let Some(caller_key) = caller_idempotency_key.as_deref() {
+                let ipc_code = match &error {
+                    ownmesh_ipc::IpcError::Remote { code, .. } => *code,
+                    _ => ownmesh_ipc::app_error::INTERNAL,
+                };
+                let reconciled = {
+                    let mut guard = runtime.lock().await;
+                    guard.reconcile_failed_idempotent(
+                        caller_key,
+                        client.principal_key(),
+                        &operation_id,
+                        ipc_code,
+                        &message,
+                    )
+                };
+                if reconciled {
+                    tracing::info!(
+                        operation_id = %operation_id,
+                        "op-journal in-progress marker reconciled to a terminal failed receipt"
+                    );
+                }
+            }
             json!({
                 "operation_contract": OPERATION_CONTRACT_V1,
                 "operation_id": operation_id,
@@ -3979,10 +4350,22 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use ownmesh_identity::verify_from_public_key_hex;
-    use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn agent_url_preserves_issuer_path_and_uses_secure_scheme() {
@@ -4040,6 +4423,105 @@ mod tests {
     }
 
     #[test]
+    fn order_connect_addresses_interleaves_families_keeping_resolver_order() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4 = |last: u8| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)), 443);
+        let v6 = |last: u16| {
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, last)),
+                443,
+            )
+        };
+        // Resolver ranked IPv6 first: the dial order alternates families.
+        let ordered = order_connect_addresses(&[v6(1), v6(2), v4(1), v4(2)]);
+        assert_eq!(ordered, vec![v6(1), v4(1), v6(2), v4(2)]);
+        // Resolver ranked IPv4 first keeps that preference.
+        let ordered = order_connect_addresses(&[v4(1), v6(1), v4(2)]);
+        assert_eq!(ordered, vec![v4(1), v6(1), v4(2)]);
+        // Single-family lists are untouched.
+        assert_eq!(order_connect_addresses(&[v4(3), v4(4)]), vec![v4(3), v4(4)]);
+        // Exhausting one family falls back to the other without reordering.
+        let ordered = order_connect_addresses(&[v6(1), v4(1), v4(2)]);
+        assert_eq!(ordered, vec![v6(1), v4(1), v4(2)]);
+    }
+
+    #[test]
+    fn reconnect_failure_category_classifies_connect_timeout() {
+        assert_eq!(
+            reconnect_failure_category(
+                "WebSocket connect failed: WebSocket connect timed out after 15s"
+            ),
+            "connect_timeout"
+        );
+        assert_eq!(
+            reconnect_failure_category(
+                "WebSocket connect failed: DNS resolution failed: failed to lookup"
+            ),
+            "transport_error"
+        );
+        assert_eq!(
+            reconnect_failure_category("WebSocket connect failed on every resolved address"),
+            "transport_error"
+        );
+    }
+
+    /// Dial stub: the blackhole port hangs forever (a SYN with no reply); any
+    /// other port performs a real loopback connect.
+    fn test_dial(blackhole_port: u16) -> Dialer {
+        Arc::new(move |addr| {
+            if addr.port() == blackhole_port {
+                Box::pin(std::future::pending()) as DialFuture
+            } else {
+                Box::pin(TcpStream::connect(addr))
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn dial_abandons_blackholed_first_address_for_working_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let working = listener.local_addr().unwrap();
+        // The first candidate never completes; the second is a live loopback.
+        let addrs = vec![
+            SocketAddr::from(([127, 0, 0, 1], working.port() + 1)),
+            working,
+        ];
+        let attempt = dial_addresses_bounded(addrs, CONNECT_TIMEOUT, test_dial(working.port() + 1));
+        // Real wall-clock time: the fallback must win after the Happy
+        // Eyeballs head start, well inside the connect budget.
+        let (stream, addr) = tokio::time::timeout(Duration::from_secs(10), attempt)
+            .await
+            .expect("fallback connect must resolve after the head start")
+            .unwrap();
+        assert_eq!(addr, working);
+        drop(stream);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_times_out_when_every_candidate_hangs_forever() {
+        let addrs = vec![
+            SocketAddr::from(([127, 0, 0, 1], 1)),
+            SocketAddr::from(([127, 0, 0, 1], 2)),
+        ];
+        // Every candidate hangs; only the bounded deadline can end the dial.
+        let dial: Dialer = Arc::new(|_addr| Box::pin(std::future::pending()) as DialFuture);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            dial_addresses_bounded(addrs, CONNECT_TIMEOUT, dial),
+        )
+        .await;
+        match outcome {
+            // The paused clock auto-advances to the dial deadline.
+            Ok(Err(error)) => {
+                assert!(error.contains("timed out"), "unexpected error: {error}");
+                assert_eq!(reconnect_failure_category(&error), "connect_timeout");
+            }
+            Ok(Ok((_, addr))) => panic!("unexpected connect success to {addr}"),
+            Err(error) => panic!("watchdog elapsed before the bounded dial deadline: {error}"),
+        }
+    }
+
+    #[test]
     fn state_rejects_corruption_and_bounds_replay_windows() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("transport.json");
@@ -4069,6 +4551,10 @@ mod tests {
             credential: SecretString::new("redacted-test-credential"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -4099,6 +4585,81 @@ mod tests {
     }
 
     #[test]
+    fn orphan_completion_is_absorbed_into_transport_state() {
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_orphan").unwrap();
+        let config = AgentTransportConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            ws_url: agent_connect_url("http://127.0.0.1:1", device.as_str()).unwrap(),
+            origin: "http://127.0.0.1:1".into(),
+            device_id: device.clone(),
+            credential: SecretString::new("redacted-test-credential"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        config.remember_orphan_completion(CompletedReply {
+            correlation_id: "op_orphan".into(),
+            operation_id: "op_orphan".into(),
+            payload: json!({ "status": "completed", "result": { "ok": true } }),
+        });
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        let drained = absorb_orphan_completions(&config, &mut state).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(state.completed("op_orphan").is_some());
+        assert_eq!(
+            absorb_orphan_completions(&config, &mut state)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn absorb_orphan_completions_returns_every_parked_row() {
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_orphan_all").unwrap();
+        let config = AgentTransportConfig {
+            issuer: "http://127.0.0.1:1".into(),
+            ws_url: agent_connect_url("http://127.0.0.1:1", device.as_str()).unwrap(),
+            origin: "http://127.0.0.1:1".into(),
+            device_id: device.clone(),
+            credential: SecretString::new("redacted-test-credential"),
+            key: Arc::new(DeviceKeyPair::generate()),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        config.remember_orphan_completion(CompletedReply {
+            correlation_id: "op_a".into(),
+            operation_id: "op_a".into(),
+            payload: json!({ "status": "completed" }),
+        });
+        config.remember_orphan_completion(CompletedReply {
+            correlation_id: "op_b".into(),
+            operation_id: "op_b".into(),
+            payload: json!({ "status": "completed" }),
+        });
+        let mut state = AgentTransportState::fresh(&config.issuer, &device);
+        let drained = absorb_orphan_completions(&config, &mut state).unwrap();
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().any(|row| row.correlation_id == "op_a"));
+        assert!(drained.iter().any(|row| row.correlation_id == "op_b"));
+        assert!(state.completed("op_a").is_some());
+        assert!(state.completed("op_b").is_some());
+        assert!(orphan_already_published("op_a", &drained));
+        assert!(orphan_already_published("op_b", &drained));
+        assert!(!orphan_already_published("op_other", &drained));
+    }
+
+    #[test]
     fn operation_request_persists_pending_outbox_across_crash_reload() {
         let dir = tempdir().unwrap();
         let device = DeviceId::parse("dev_outbox").unwrap();
@@ -4110,6 +4671,10 @@ mod tests {
             credential: SecretString::new("redacted-test-credential"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -4186,6 +4751,10 @@ mod tests {
             credential: SecretString::new("redacted-test-credential"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let mut state = AgentTransportState::fresh(&config.issuer, &device);
@@ -4297,6 +4866,10 @@ mod tests {
             credential: SecretString::new("dcred_failed_send"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let (mut socket, _) = tokio_tungstenite::connect_async(config.ws_url.as_str())
@@ -4360,6 +4933,10 @@ mod tests {
             credential: SecretString::new("dcred_cancel_reconnect"),
             key: Arc::new(DeviceKeyPair::generate()),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let runtime_dir = tempdir().unwrap();
@@ -4458,6 +5035,101 @@ mod tests {
         assert!(persisted.completed("op_cancel_bind").is_some());
     }
 
+    /// #146: a mid-session registry change publishes an incremental
+    /// `workspace.registry` snapshot on the live socket — no reconnect needed.
+    #[tokio::test]
+    async fn live_loop_publishes_workspace_registry_refresh_on_change() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dir = tempdir().unwrap();
+        let device = DeviceId::parse("dev_loopback").unwrap();
+        let key = DeviceKeyPair::generate();
+        let issuer = format!("http://{address}");
+        let credential = "dcred_registry_secret";
+        let registry_notify = Arc::new(tokio::sync::Notify::new());
+        let config = AgentTransportConfig {
+            issuer: issuer.clone(),
+            ws_url: agent_connect_url(&issuer, device.as_str()).unwrap(),
+            origin: issuer.clone(),
+            device_id: device.clone(),
+            credential: SecretString::new(credential),
+            key: Arc::new(key),
+            preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: Some(Arc::clone(&registry_notify)),
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
+            state_path: dir.path().join("transport.json"),
+        };
+        let runtime_dir = tempdir().unwrap();
+        let runtime_paths = OwnMeshPaths::for_base(runtime_dir.path());
+        let daemon = DaemonRuntime::open(&runtime_paths).unwrap();
+        let runtime = Arc::new(Mutex::new(daemon));
+        let mut state = AgentTransportState::fresh(&config.issuer, &config.device_id);
+
+        let server_device = device.clone();
+        let notify_for_server = Arc::clone(&registry_notify);
+        let _ = server_device;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // The test client connects with plain connect_async and drives
+            // live_loop directly (no hello/challenge exchange to mirror).
+            let mut socket =
+                accept_hdr_async(stream, |_: &Request, response: Response| Ok(response))
+                    .await
+                    .unwrap();
+
+            // No unsolicited frame (heartbeat is 30 s away) before a change.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err()
+            );
+
+            // The device-local registry changes (workspace_add/remove).
+            notify_for_server.notify_one();
+
+            let refresh = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let envelope = receive_test_envelope(&mut socket).await;
+                    if envelope.message_type == "workspace.registry" {
+                        break envelope;
+                    }
+                }
+            })
+            .await
+            .expect("refresh must arrive after the change");
+            assert_eq!(refresh.payload["enforce_workspace"], Value::Bool(true));
+            let workspaces = refresh.payload["workspaces"].as_array().unwrap();
+            assert!(
+                workspaces.iter().any(|w| w["id"] == "ws_default"
+                    && w["generation"]
+                        .as_str()
+                        .is_some_and(|g: &str| g.starts_with("wsg_"))),
+                "full snapshot must include the default workspace generation: {workspaces:?}"
+            );
+            socket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (mut socket, _) = tokio_tungstenite::connect_async(config.ws_url.as_str())
+            .await
+            .unwrap();
+        let _ = live_loop(
+            &mut socket,
+            &config,
+            Some(&runtime),
+            &mut state,
+            &mut shutdown_rx,
+        )
+        .await;
+        drop(shutdown_tx);
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server task must finish")
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn real_websocket_control_plane_redelivery_recovers_started_and_cached_results() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4476,6 +5148,10 @@ mod tests {
             credential: SecretString::new(credential),
             key: Arc::new(key),
             preflight_ephemerals: Arc::new(Mutex::new(HashMap::new())),
+            orphan_completions: Arc::new(std::sync::Mutex::new(Vec::new())),
+            orphan_notify: Arc::new(tokio::sync::Notify::new()),
+            workspace_registry_notify: None,
+            in_process_dispatches: Arc::new(Mutex::new(HashSet::new())),
             state_path: dir.path().join("transport.json"),
         };
         let runtime_dir = tempdir().unwrap();
@@ -4594,7 +5270,6 @@ mod tests {
         let server_device = device.clone();
         let server_origin = issuer.clone();
         let server_credential = credential.to_owned();
-        let expected_started_result = seeded_result.clone();
         let replay_target = target.clone();
         let redeliver_expired_raw = expired_raw.clone();
         let redeliver_legacy_raw = legacy_raw.clone();
@@ -4773,7 +5448,21 @@ mod tests {
                     .await;
                     let reconciled = receive_test_envelope(&mut socket).await;
                     assert_eq!(reconciled.correlation_id.as_deref(), Some("op_bind_test"));
-                    assert_eq!(reconciled.payload, expected_started_result);
+                    // P0-B: the authoritative replay answers with the compact
+                    // exact-once receipt (workspace-bound, `replayed: true`),
+                    // never a re-execution and never the stale full body.
+                    assert_eq!(reconciled.payload["status"], "completed");
+                    assert_eq!(reconciled.payload["operation_id"], "op_bind_test");
+                    assert_eq!(reconciled.payload["result"]["durable_receipt"], true);
+                    assert_eq!(reconciled.payload["result"]["truncated"], true);
+                    assert_eq!(reconciled.payload["result"]["replayed"], true);
+                    assert_eq!(reconciled.payload["result"]["workspace_id"], "ws_default");
+                    assert_eq!(reconciled.payload["result"]["operation_id"], "op_bind_test");
+                    assert!(
+                        reconciled.payload["result"].get("bytes_written").is_none()
+                            && reconciled.payload["result"].get("path").is_none(),
+                        "redelivery must not replay the full body: {reconciled:?}"
+                    );
                     assert_eq!(
                         std::fs::read_to_string(&replay_target).unwrap(),
                         "sentinel after first execution"
@@ -4827,6 +5516,7 @@ mod tests {
         });
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (presence_tx, presence_rx) = watch::channel(ownmesh_ipc::AgentRoutePresence::Offline);
         let mut first_shutdown = shutdown_rx.clone();
         let mut first_reached_ready = false;
         assert!(connect_and_run(
@@ -4835,10 +5525,17 @@ mod tests {
             &mut state,
             &mut first_shutdown,
             &mut first_reached_ready,
+            Some(&presence_tx),
         )
         .await
         .is_err());
         assert!(first_reached_ready);
+        // #141: an authenticated ready session must be observable as online
+        // while it lives — even after the peer closes the socket.
+        assert_eq!(
+            *presence_rx.borrow(),
+            ownmesh_ipc::AgentRoutePresence::Online
+        );
         let mut second_shutdown = shutdown_rx;
         let mut second_reached_ready = false;
         assert!(connect_and_run(
@@ -4847,6 +5544,7 @@ mod tests {
             &mut state,
             &mut second_shutdown,
             &mut second_reached_ready,
+            Some(&presence_tx),
         )
         .await
         .is_err());

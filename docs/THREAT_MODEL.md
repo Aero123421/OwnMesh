@@ -1,6 +1,6 @@
-# OwnMesh Threat Model (v1.2.11)
+# OwnMesh Threat Model (v1.2.16)
 
-**Status:** Published for release train v1.2.11
+**Status:** Published for release train v1.2.16
 **Related:** [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md), [`SECURITY.md`](../SECURITY.md), ADR [`0001-release-signing-sbom-provenance.md`](./adr/0001-release-signing-sbom-provenance.md)  
 **Method:** STRIDE-oriented asset / adversary / control mapping. Full Access is an intentional product mode; the trust boundary is integrity of authenticated intent, not “block the AI.”
 
@@ -59,6 +59,9 @@
 | Workspace custody (E4) | v1.2 | Workspace-relative path authority and ACL | `control-plane/migrations/0011_workspace_acl.sql` |
 | Windows daemon (E8) | v1.2 | LocalSystem SCM service + SID-bound named pipe | `ownmesh-broker/src/windows*.rs` |
 | Resumable transfer (E9) | v1.2 | `TransferRoom` DO, ephemeral proofs, chunk resumption | `control-plane/src/transfer-room.ts`, `ownmeshd/src/transfer_crypto.rs` |
+| Bounded tool grants | unreleased | Distinct `grant_type: "bounded_tool"` overlay; Ask-only lift; Deny wins; passkey mint | `ownmesh-policy`, `ownmeshd` grants IPC, ADR 0012 |
+| Batch approval presence | unreleased | v2 set commitment over server-side payload hashes; deny-all without passkey | `control-plane/src/owner-auth.ts`, `mcp.ts`, ADR 0012 |
+| Prepared executable custody | v1.2.16 | Same-user path/proxy mutation between approval, verification, and OS image-open | `ownmesh-exec/src/prepared.rs`, `ownmeshd/src/runtime.rs`, ADR 0013 |
 
 Each is exercised by the adversarial suites listed in
 [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md); this table
@@ -70,12 +73,12 @@ the release notes for the evidence split.
 | Adversary | Goals | Primary controls |
 | --- | --- | --- |
 | A1 Remote unauthenticated | Reach device tools without OAuth | Worker authn, no public device admin API without token |
-| A2 Stolen OAuth access token | Call MCP / device ops until expiry | Short TTL, audience/scope binding, revoke |
+| A2 Stolen OAuth access token | Call MCP / device ops until expiry | Short TTL, audience/scope binding, revoke; stolen token can revoke grants (tightening) but cannot mint them or approve |
 | A3 Stolen refresh token | Mint new access tokens | Rotation + reuse detection, keychain storage |
 | A4 Prompt-injection (model/tool args) | “Always allow”, forge approval | Device policy is final; injection strings inert for authz |
 | A5 Local cross-user | User B drives User A’s daemon | OS-attested peer credentials + pipe/socket ACL; per-client credential for privileged IPC methods |
 | A6 Local malware same-user | Replay elevated broker ops | Broker MAC, nonce, expiry, replay cache; capability tokens |
-| A7 Path / symlink attacker | Escape workspace in restricted presets | Canonicalize-then-authorize; Full Access is explicit non-enforce |
+| A7 Path / symlink attacker | Escape workspace or change an approval-bound executable/proxy | Descriptor-rooted filesystem custody; prepared executable images bind proxy entry, target relation, backing digest, and OS image-open; Full Access is explicit non-enforce |
 | A8 Command injection | Turn structured argv into shell metachar execution | Structured exec never invokes a shell |
 | A9 Supply chain | Troianed dependency or release asset | `cargo audit` / pnpm audit, SBOM, checksums + signing (ADR-0001) |
 | A10 Honest-but-curious operator | Learn secrets from telemetry/support | Telemetry default OFF; bundle redaction; audit local-first |
@@ -99,6 +102,7 @@ the release notes for the evidence split.
 | Replay / idempotency | `crates/ownmesh-exec/tests/security_*.rs`, `ownmesh-broker*`, `ownmeshd` daemon idempotency tests |
 | Path traversal / symlink | `crates/ownmesh-fs/tests/security_path.rs` |
 | Command argument injection | `crates/ownmesh-exec/tests/security_command_injection.rs` |
+| Executable proxy / verify-to-exec drift | `crates/ownmesh-exec/tests/prepared_executable_*.rs`, `ownmeshd/tests/adversarial_security.rs` |
 | Broker boundary / networkless | `crates/ownmesh-broker/tests/security_boundary.rs`, `ownmesh-broker-client` |
 | IPC spoofing | `crates/ownmesh-ipc/tests/security_spoofing.rs` |
 | WS / envelope parser fuzz | `crates/ownmesh-protocol/tests/fuzz_harness_build.rs`, `ws_parser_fuzz.rs` |
@@ -110,7 +114,7 @@ the release notes for the evidence split.
 
 See [`SECURITY_REVIEW_CHECKLIST.md`](./SECURITY_REVIEW_CHECKLIST.md) for per-checkbox deep links.
 
-## 6. Explicit non-goals / waivers (v1.2.11)
+## 6. Explicit non-goals / waivers (v1.2.16)
 
 | ID | Scope | Note |
 | --- | --- | --- |

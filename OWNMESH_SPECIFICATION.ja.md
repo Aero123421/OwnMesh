@@ -336,6 +336,7 @@ Custom Domain を推奨するが必須ではない。
 ```text
 /mcp
 /.well-known/oauth-protected-resource
+/.well-known/oauth-protected-resource/mcp
 /.well-known/oauth-authorization-server
 /authorize
 /token
@@ -773,7 +774,38 @@ Full Access preset では broker request を自動 allow できる。ただし b
 - `elevated: true` または専用 tool を使用する。
 - Privileged Broker を経由する。
 
-## 9.2 Process 管理
+## 9.2 Executable identity と実行 custody
+
+承認対象の command は、次の server-computed facts を同一 operation の contract
+として拘束する。client が申告した digest や command kind を認可根拠にしない。
+
+- exact argv（`argv[0]` を含む）。
+- 解決済み invocation path と、その directory entry / symlink / reparse identity。
+- invocation が指す canonical backing executable の file identity、長さ、SHA-256。
+- invocation と backing の target relation。
+- `structured` / `raw_shell` classification、cwd、承認済み environment overlay。
+
+承認後に invocation の消失・置換・retarget、backing の置換・内容変更、target
+relation または classification の変更を検出した場合は、別 path や canonical
+backing を代替起動してはならない。child を開始せず、次の typed error を返して
+新しい operation と承認を要求する。
+
+```text
+OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT
+```
+
+実行直前の検証と OS の image-open は、同じ kernel object または検証後に不変化した
+owner-only private snapshot に結合する。`PreparedExecutable` 作成後に未検証の path
+lookup へ戻ってはならず、raw-shell でも選択した shell executable 自体に同じ規則を
+適用する。proxy/shim を正常に使う場合は承認された invocation name と `argv[0]` の
+意味を保持する。
+
+`structured` は「OwnMesh が shell を自動挿入しない」ことだけを意味し、sandbox
+ではない。multicall binary、interpreter、launcher、package manager 等は argv から
+別 process を起動できるため、任意コード実行を制限するには executable/argv/env の
+allowlist と OS process confinement を別途組み合わせる。
+
+## 9.3 Process 管理
 
 - Process group / Job Object を作成する。
 - stdout/stderr を別 stream として保持する。
@@ -782,7 +814,7 @@ Full Access preset では broker request を自動 allow できる。ただし b
 - timeout、最大出力量、CPU/Memory limit は設定可能。
 - resource limit が OS で保証できない場合は `best_effort` と明示する。
 
-## 9.3 出力
+## 9.4 出力
 
 - Agent は出力を 64 KiB 以下の chunk に分割する。
 - Control Plane への event は時間またはサイズで batch する。
@@ -790,14 +822,19 @@ Full Access preset では broker request を自動 allow できる。ただし b
 - 超過時は `truncated: true` と `artifact_id`、cursor を返す。
 - 完全出力は標準で Device にのみ保存する。
 
-## 9.4 Operation delivery
+## 9.5 Operation delivery
 
 - Control Plane から Device への delivery は at-least-once とみなす。
 - 全 write operation は `operation_id` と `idempotency_key` を持つ。
 - Device は完了済み operation をローカル journal で重複排除する。
-- 同じ operation を再受信しても再実行せず、保存済み結果を返す。
+- 同じ operation を再受信しても再実行せず、保存済みレシート(要約)を返す。
+- 端末ローカル journal の完了済みレシートの保存期間は 30 日で、
+  容量逼迫時および再実行パス上で 30 日を超えたレシートは削除される
+  (ADR-0010、Control Plane の 30 日 tombstone ウィンドウと一致)。
+  実行中/結果不明のマーカーは決して削除されない。保存期間外に再受信された
+  operation は新規操作として扱われ、古いレシートは返されない。
 
-## 9.5 Offline
+## 9.6 Offline
 
 - 標準では offline Device への command queue を行わない。
 - `DEVICE_OFFLINE` を明確に返す。
@@ -2046,7 +2083,7 @@ agent -> server: ready(capabilities, profiles_summary)
 
 - Windows: `%APPDATA%\OwnMesh\config.toml`、state は `%LOCALAPPDATA%\OwnMesh`。
 - macOS: `~/Library/Application Support/OwnMesh/`。
-- Linux: `$XDG_CONFIG_HOME/ownmesh`、`$XDG_STATE_HOME/ownmesh`、`$XDG_RUNTIME_DIR/ownmesh`。
+- Linux: `$XDG_CONFIG_HOME/ownmesh`、`$XDG_STATE_HOME/ownmesh`、`$XDG_RUNTIME_DIR/ownmesh`（未設定時は owner-only の `/run/user/<uid>/ownmesh` が既にあればそれを使う）。
 
 ## 23.2 分離
 

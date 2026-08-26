@@ -28,8 +28,22 @@ import {
   verifyEd25519Hex,
   verifyInternalContext,
 } from "./util.ts";
-import { createStore, type ControlPlaneStore, type McpOperationRecord } from "./store.ts";
-import { normalizeSystemDiagnosis } from "./mcp.ts";
+import { createStore, type ControlPlaneStore, type McpOperationRecord, type WorkspaceRecord } from "./store.ts";
+import {
+  authorityInvalidationError,
+  authorityInvalidationSummary,
+  boundAuthorityInvalidationReason,
+  boundPrincipalAuthority,
+  boundPrincipalAuthorityCurrent,
+  normalizeSystemDiagnosis,
+} from "./mcp.ts";
+import {
+  annotatePolicyObservation,
+  annotateWorkspaceList,
+  annotateWorkspaceRecord,
+  parseWorkspaceGeneration,
+  parseWorkspaceId,
+} from "./workspace-activation.ts";
 import { parseTransferPreflightResult, type TransferServerBinding } from "./transfer-orchestrator.ts";
 
 export const PROTOCOL = "ownmesh.device/1.0";
@@ -314,6 +328,20 @@ function pendingDeadlineMs(p: PendingOperation): number {
   return p.created_at + (p.live_only ? LIVE_TRANSFER_TOMBSTONE_MAX_TTL_MS : PENDING_TTL_MS);
 }
 
+/**
+ * Detached `command.run` keeps Device Room correlation until `expires_at`.
+ * Do not mark these `live_only`: that flag skips Agent redelivery, which
+ * detached commands still need (spawn is journal-deduped on the device).
+ */
+function isDetachedCommandPending(p: PendingOperation): boolean {
+  const payload = p.payload;
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.capability !== "command.run") return false;
+  const args = payload.arguments;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+  return (args as Record<string, unknown>).detach === true;
+}
+
 type ApprovalDecisionBinding = {
   target_operation_id: string;
   decision: "approve" | "deny";
@@ -412,6 +440,15 @@ export type HandleMessageResult = {
     workspaces?: Array<{ id: string; generation: string }>;
     enforce_workspace?: boolean;
   };
+  /**
+   * #146: incremental workspace-registry refresh from a live ready agent.
+   * DeviceRoom must persist the full registry snapshot via
+   * store.syncDeviceWorkspaces before the agent may rely on it.
+   */
+  workspace_registry_sync?: {
+    enforce_workspace: boolean;
+    workspaces: Array<{ id: string; generation: string }>;
+  };
 };
 
 const MAX_AGENT_VERSION_LENGTH = 128;
@@ -497,12 +534,6 @@ function readyWorkspaceRegistry(
   return { workspaces, enforce_workspace: raw.enforce_workspace };
 }
 
-type PrincipalCredentialBinding = {
-  principal_id: string;
-  tenant_id: string;
-  generation: number;
-};
-
 type WorkspaceAuthorityResult =
   | "ok"
   | "binding_mismatch"
@@ -528,24 +559,6 @@ function workspaceAuthorityBinding(
     action.workspace_version < 1
   ) return null;
   return { workspace_id: action.workspace_id, version: action.workspace_version };
-}
-
-/** Extract only a complete, server-bound credential epoch from an operation. */
-function principalCredentialBinding(payload: Record<string, unknown>): PrincipalCredentialBinding | null {
-  const authorization = payload.authorization;
-  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
-  const bound = (authorization as Record<string, unknown>).bound_action;
-  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
-  const action = bound as Record<string, unknown>;
-  const principalId = action.principal_id;
-  const tenantId = action.tenant_id;
-  const generation = action.principal_credential_generation;
-  if (
-    typeof principalId !== "string" || principalId.trim() === "" ||
-    typeof tenantId !== "string" || tenantId.trim() === "" ||
-    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
-  ) return null;
-  return { principal_id: principalId, tenant_id: tenantId, generation };
 }
 
 type SessionIngressGuard = {
@@ -847,9 +860,13 @@ export class DeviceRoomRouter {
       // A live-only tombstone has no bearer to replay and exists solely to
       // correlate a genuine long-running transfer result. Its bounded transfer
       // expiry, rather than the ordinary 15-minute dispatch TTL, controls it.
-      const staleByTtl = !p.live_only && (
-        !Number.isFinite(p.created_at) || now - p.created_at > PENDING_TTL_MS
-      );
+      // Detached command.run is the other long-lived pending shape: skip the
+      // 15-minute TTL, but still expire at expires_at (24h dispatch cap).
+      const detached = isDetachedCommandPending(p);
+      const staleByTtl =
+        !p.live_only &&
+        (!Number.isFinite(p.created_at) ||
+          (!detached && now - p.created_at > PENDING_TTL_MS));
       const staleByExpiry = Number.isFinite(expMs) && expMs <= now;
       if (staleByTtl || staleByExpiry) {
         this.pending.delete(key);
@@ -1441,6 +1458,45 @@ export class DeviceRoomRouter {
           },
         });
         return { ok: true };
+      }
+      case "workspace.registry": {
+        // #146: incremental registry refresh from a live ready agent. The
+        // payload is the same shape as ready.workspace_registry and is
+        // validated by the same allowlist; activation stays fail-closed in
+        // workspace-activation until these generations are observed.
+        if (att.role !== "agent" || att.phase !== "ready") return { ok: false, error: "invalid_state" };
+        const refreshRegistry = readyWorkspaceRegistry(msg.payload);
+        // Unlike `ready`, a legacy ids-only advertisement cannot prove which
+        // local root a generation denotes, so a refresh without concrete
+        // generations is rejected.
+        if (
+          refreshRegistry == null ||
+          !Array.isArray(refreshRegistry.workspaces) ||
+          refreshRegistry.workspaces.length < 1
+        ) {
+          this.sendError(
+            sessionId,
+            "OWNMESH_E_BAD_ENVELOPE",
+            "invalid workspace registry",
+            msg.correlation_id,
+          );
+          return { ok: false, error: "invalid_workspace_registry" };
+        }
+        const ack = this.nextEnvelope("workspace.registry.ack", { ok: true }, msg.correlation_id);
+        this.sendToSession(sessionId, JSON.stringify(ack));
+        void this.audit.append({
+          kind: "device.ready",
+          summary: "agent workspace registry refresh",
+          device_id: this.deviceId,
+          meta: { workspace_count: refreshRegistry.workspaces.length },
+        });
+        return {
+          ok: true,
+          workspace_registry_sync: {
+            enforce_workspace: refreshRegistry.enforce_workspace,
+            workspaces: refreshRegistry.workspaces,
+          },
+        };
       }
       case "ping": {
         const pong = this.nextEnvelope("pong", { t: Date.now() }, msg.correlation_id);
@@ -2285,16 +2341,18 @@ export class DeviceRoom {
     expected?: { principal_id: string; tenant_id: string },
   ): Promise<"ok" | "binding_mismatch" | "credential_generation_mismatch" | "storage_unavailable"> {
     if (!this.env.DB) return "storage_unavailable";
-    const binding = principalCredentialBinding(payload);
+    const binding = boundPrincipalAuthority(payload);
     if (!binding) return "binding_mismatch";
     if (
       expected &&
       (binding.principal_id !== expected.principal_id || binding.tenant_id !== expected.tenant_id)
     ) return "binding_mismatch";
     try {
+      // #162: one shared decision with the Worker-side gates in mcp.ts.
+      // Authority is removed by revocation and refresh-family reuse, not by
+      // reissuing a token.
       const current = await createStore(this.env).getPrincipal(binding.principal_id);
-      if (!current || current.tenant_id !== binding.tenant_id) return "credential_generation_mismatch";
-      return current.credential_generation === binding.generation
+      return boundPrincipalAuthorityCurrent(binding, current)
         ? "ok"
         : "credential_generation_mismatch";
     } catch {
@@ -2393,20 +2451,16 @@ export class DeviceRoom {
       const check = await this.credentialGenerationCurrent(pending.payload);
       if (check === "ok") continue;
       if (check === "storage_unavailable") throw new Error("storage_unavailable");
+      // #162: same bounded reason and retry contract as the Worker-side gates.
+      const reason = await boundAuthorityInvalidationReason(store, pending.payload);
       this.router.pending.delete(pending.correlation_id);
       removed = true;
       await store.updateMcpOperation(
         operationId,
         {
           status: "failed",
-          summary: "operation authorization invalidated before device delivery",
-          data: {
-            error: {
-              code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-              message: "principal credential rotated or was revoked before device delivery",
-              retryable: false,
-            },
-          },
+          summary: authorityInvalidationSummary(reason, "delivery"),
+          data: { error: authorityInvalidationError(reason, "delivery") },
           approval_required: false,
         },
         ["pending", "running", "approval_required", "cancel_requested"],
@@ -3138,6 +3192,8 @@ export class DeviceRoom {
         preview?.type === "operation.event" ||
         preview?.type === "operation.progress" ||
         preview?.type === "proof" ||
+        // #146: a registry refresh mutates durable device state.
+        preview?.type === "workspace.registry" ||
         preview?.type === "ready";
     } catch {
       /* handleMessage will reject malformed JSON */
@@ -3201,6 +3257,27 @@ export class DeviceRoom {
       }
     }
 
+    // #146: persist the incremental registry refresh. Fail-closed on storage
+    // errors so the agent cannot assume a generation the store never saw.
+    if (result.ok && result.workspace_registry_sync) {
+      if (!this.env.DB) {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+      try {
+        const store = createStore(this.env);
+        await store.syncDeviceWorkspaces(
+          this.deviceId,
+          result.workspace_registry_sync.workspaces,
+        );
+      } catch {
+        this.storageBroken = true;
+        this.failClosedAll("storage unavailable", 1013);
+        return;
+      }
+    }
+
     // Pending TTL/expiry must reach D1 before Agent outbox reconciliation, so
     // an expired correlation is an authoritative terminal tombstone on this
     // same reconnect rather than requiring a second connection.
@@ -3245,6 +3322,7 @@ export class DeviceRoom {
           payload: result.mcp_result.payload,
           deviceId: this.deviceId,
           expectedApprovalDecision,
+          issuer: this.env.OAUTH_ISSUER,
         });
         if (!applied.ok) {
           // Unknown/mismatched/CAS loss — do not forward or drop pending.
@@ -3663,6 +3741,108 @@ function internalTransferFailureSummary(tool: string, status: string): string {
   return needsApproval ? "transfer start requires approval" : "transfer start failed";
 }
 
+function approvalUrlFromIssuer(issuer: string | undefined, operationId: string): string | undefined {
+  const base = (issuer || "").replace(/\/$/, "");
+  if (!base || !/^https?:\/\//i.test(base)) return undefined;
+  return `${base}/approve?operation_id=${encodeURIComponent(operationId)}`;
+}
+
+async function applyWorkspaceActivationSideEffects(
+  store: ControlPlaneStore,
+  op: McpOperationRecord,
+  data: Record<string, unknown>,
+  status: string,
+): Promise<Record<string, unknown>> {
+  if (!op.device_id) return data;
+  const deviceId = op.device_id;
+  const reservedId = parseWorkspaceId(op.workspace_id);
+  const resultId = parseWorkspaceId(data.id);
+  const resultMatchesReservation = !reservedId || !resultId || resultId === reservedId;
+  const workspaceId = reservedId || resultId;
+
+  if (status === "completed") {
+    if (
+      resultMatchesReservation &&
+      (op.tool === "ownmesh_workspace_add" ||
+        op.tool === "ownmesh_workspace_update" ||
+        op.tool === "ownmesh_workspace_show")
+    ) {
+      const generation = parseWorkspaceGeneration(data.generation);
+      if (workspaceId && generation) {
+        await store.observeWorkspaceGeneration(deviceId, workspaceId, generation);
+      }
+    }
+    if (op.tool === "ownmesh_workspace_list" && Array.isArray(data.workspaces)) {
+      for (const entry of data.workspaces) {
+        if (!entry || typeof entry !== "object") continue;
+        const row = entry as Record<string, unknown>;
+        const id = parseWorkspaceId(row.id);
+        const generation = parseWorkspaceGeneration(row.generation);
+        if (id && generation) {
+          await store.observeWorkspaceGeneration(deviceId, id, generation);
+        }
+      }
+    }
+    if (op.tool === "ownmesh_workspace_remove" && workspaceId) {
+      await store.deactivateWorkspace(deviceId, workspaceId);
+    }
+    const enforcement =
+      typeof data.workspace_root_enforcement === "boolean"
+        ? data.workspace_root_enforcement
+        : typeof data.enforce_workspace === "boolean"
+          ? data.enforce_workspace
+          : undefined;
+    if (
+      enforcement !== undefined &&
+      (op.tool === "ownmesh_workspace_list" ||
+        op.tool === "ownmesh_policy_show" ||
+        op.tool === "ownmesh_policy_preset")
+    ) {
+      await store.recordObservedWorkspaceEnforcement(deviceId, enforcement);
+    }
+  }
+
+  if (
+    status === "failed" &&
+    op.tool === "ownmesh_workspace_remove" &&
+    workspaceId
+  ) {
+    const existing = await store.getWorkspace(deviceId, workspaceId);
+    if (existing && !existing.local_generation) {
+      await store.deactivateWorkspace(deviceId, workspaceId);
+    }
+  }
+
+  const device = await store.getDevice(deviceId);
+  if (op.tool === "ownmesh_workspace_list") {
+    const records = new Map<string, WorkspaceRecord>();
+    if (Array.isArray(data.workspaces)) {
+      for (const entry of data.workspaces) {
+        if (!entry || typeof entry !== "object") continue;
+        const id = (entry as { id?: string }).id;
+        if (typeof id === "string") {
+          const record = await store.getWorkspace(deviceId, id);
+          if (record) records.set(id, record);
+        }
+      }
+    }
+    return annotateWorkspaceList(data, records, device?.enforce_workspace);
+  }
+  if (
+    op.tool === "ownmesh_workspace_add" ||
+    op.tool === "ownmesh_workspace_update" ||
+    op.tool === "ownmesh_workspace_show" ||
+    op.tool === "ownmesh_workspace_remove"
+  ) {
+    const record = workspaceId ? await store.getWorkspace(deviceId, workspaceId) : null;
+    return annotateWorkspaceRecord(data, record);
+  }
+  if (op.tool === "ownmesh_policy_show" || op.tool === "ownmesh_policy_preset") {
+    return annotatePolicyObservation(data, device?.enforce_workspace);
+  }
+  return data;
+}
+
 /**
  * Map a device-originated operation.result onto authoritative mcp_operations state.
  * Single runtime helper (DeviceRoom DO); mcp.ts must not duplicate this.
@@ -3679,6 +3859,7 @@ export async function applyMcpOperationResult(
     payload: Record<string, unknown>;
     deviceId?: string;
     expectedApprovalDecision?: ApprovalDecisionBinding | null;
+    issuer?: string;
   },
 ): Promise<ApplyMcpOperationResultOutcome> {
   const payloadOpId = opts.payload.operation_id != null ? String(opts.payload.operation_id) : undefined;
@@ -4022,6 +4203,15 @@ export async function applyMcpOperationResult(
     });
   }
 
+  if (op.device_id && (status === "completed" || status === "failed")) {
+    data = await applyWorkspaceActivationSideEffects(store, op, data, status);
+  }
+
+  const approvalUrlValue =
+    status === "approval_required"
+      ? approvalUrlFromIssuer(opts.issuer, op.operation_id)
+      : op.approval_url;
+
   // Internal transfer tools may not make a durable row into a bearer or
   // diagnostics channel through an approval id or session id either. Preserve
   // only a pre-existing authoritative value; never copy Agent input.
@@ -4065,6 +4255,7 @@ export async function applyMcpOperationResult(
       truncated: truncatedFlag,
       next_cursor: nextCursor,
       approval_required: status === "approval_required",
+      approval_url: approvalUrlValue,
       approval_id: approvalId,
       session_id: internalTransferTool || systemDiagnosisTool
         ? op.session_id

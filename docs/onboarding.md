@@ -1,6 +1,6 @@
 # OwnMesh onboarding
 
-This document covers the supported v1.2.11 first-run, ChatGPT connection, and
+This document covers the supported v1.2.16 first-run, ChatGPT connection, and
 user-level service flow. The machine-checked command contract is
 [`release/SUPPORTED_SURFACES.json`](../release/SUPPORTED_SURFACES.json).
 
@@ -151,7 +151,10 @@ See [`deploy-cloudflare.md`](./deploy-cloudflare.md) for account prerequisites.
 
 The passkey protects owner identity; it is not copied to ChatGPT. A sensitive
 approval or admin mutation requests a fresh passkey assertion bound to that
-exact operation. A long-lived browser session alone is insufficient. See
+exact operation (or, for a selected pending set, to the server-computed
+payload-hash commitment). A long-lived browser session alone is insufficient
+to approve. Deny-all of listed pending operations is tightening and uses the
+owner session plus CSRF rather than a new assertion. See
 [`chatgpt-connection.md`](./chatgpt-connection.md) for connector fields and
 recovery details.
 
@@ -163,8 +166,8 @@ recovery details.
 | Device metadata | `device list/show/rename/labels/rotate-key/revoke` |
 | Remote work | `exec --device … --idempotency-key …`, `session open <device> --idempotency-key …` |
 | AI CLI profiles | `profile scan/list/show/login/test/start/resume` |
-| Approvals | `approval list/show/watch/approve/deny` |
-| Policy/admin | `policy show/validate/explain/preset/rule`, `lockdown`, `unlock`, `tokens revoke` |
+| Approvals | `approval list/show/watch/approve/deny`; browser `/approve` inbox, batch set, deny-all |
+| Policy/admin | `policy show/validate/explain/preset/rule`, `grants list/show/revoke/mint`, `lockdown`, `unlock`, `tokens revoke` |
 | Transfer | `transfer plan/send/list/status/cancel` |
 | Local MCP bridge | `mcp serve --stdio` |
 
@@ -172,9 +175,17 @@ Remote mutation keys are caller-selected and mandatory so a retry cannot create
 a second operation. A remote target that is unavailable fails as remote; it is
 never executed on the machine running the CLI.
 
+`ownmesh_command_run` with `detach: true` dispatches a process without the
+synchronous timeout clamp or the five-minute dispatch expiry. Poll
+`ownmesh_get_operation` (optionally with `wait_ms`) for completion. The
+detached correlation lasts until cancel or 24 hours. Synchronous `timeout_ms`
+is operator-capped by Worker env `MCP_MAX_TIMEOUT_MS` (default 300s, hard
+ceiling 1 hour).
+
 Device labels are replaced by the supplied bounded label set. Rename and label
 updates are owner-scoped and reject revoked devices. Transfer paths are
-workspace-relative; no overwrite/force mode exists.
+workspace-relative. Replacement requires `overwrite_expected_sha256` matching
+the current destination content; there is no blind overwrite/force mode.
 
 `ownmesh mcp serve --stdio` speaks bounded JSONL on stdin/stdout and forwards to
 the configured authenticated MCP issuer. Protocol replies are the only stdout
@@ -186,9 +197,12 @@ Approval decisions, policy changes, unlock, and token revocation are security
 mutations. They use typed requests rather than a generic local RPC escape hatch:
 
 1. OwnMesh validates and records the exact requested action.
-2. The browser approval page requires a fresh passkey assertion for that action.
+2. The browser approval page requires a fresh passkey assertion for that action
+   or selected set. Bounded tool grants (`ownmesh grants mint`) use the same
+   admin passkey path and lift **Ask** only; they never override Deny.
 3. The control plane delivers a decision bound to the operation ID, payload
-   hash, owner/tenant, and expiry.
+   hash, owner/tenant, and expiry. Batch delivery still consumes each
+   operation once.
 4. The device validates the decision and executes the recorded mutation once.
 
 A forged same-user local socket request, stale browser cookie, replayed decision,
@@ -197,8 +211,17 @@ side effect.
 
 ## `ownmesh doctor`
 
-Doctor is fully read-only: it does not create config roots, keystores, unlock
-files, or services and does not load credential values from keychain APIs.
+Doctor does not create config roots, keystores, unlock files, or services and
+does not load credential values from keychain APIs. The only explicit mutation
+is local op-journal repair:
+
+```bash
+ownmesh doctor --repair-journal --i-understand-replay-risk
+```
+
+That repair is refused while the daemon is running, requires the confirmation
+flag, and may discard unreadable receipts (bounded replay risk). All other
+doctor modes stay read-only.
 
 ```bash
 ownmesh doctor
@@ -240,6 +263,23 @@ ownmesh service uninstall
 Paths are canonicalized; unsafe links, writable locations, and descriptor
 injection are rejected. Descriptor writes are atomic and success is reported
 only after an OS probe confirms the state.
+
+### Linux session lifetime (lingering)
+
+The systemd `--user` service runs inside your login session. OwnMesh never
+enables lingering automatically, so on a Linux desktop the agent — and with it
+the ChatGPT route — stops when you log out and starts only after you log in
+again. `ownmesh doctor` warns while `Linger=no`. For an always-on device,
+enable it yourself once:
+
+```bash
+loginctl enable-linger $USER
+```
+
+Note: with lingering enabled, an unattended boot cannot unlock your desktop
+keyring. Device credentials that live in the Secret Service may fail to load
+until you log in; doctor discloses this as metadata only and never reads the
+keychain.
 
 ## Optional privileged broker
 
@@ -295,7 +335,7 @@ mixed-version installation.
 
 ## Distribution scope
 
-v1.2.11 supports signed portable archives and the verified shell/PowerShell
+v1.2.16 supports signed portable archives and the verified shell/PowerShell
 one-line installers. Windows MSI/NSIS, native/universal macOS packages,
 Authenticode, and Apple notarization are outside this release's distribution
 contract.

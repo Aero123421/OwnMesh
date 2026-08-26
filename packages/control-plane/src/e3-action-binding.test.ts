@@ -23,6 +23,9 @@ import {
   MCP_MAX_OUTPUT_BYTES,
   MCP_MAX_READ_BYTES,
   MCP_MAX_TIMEOUT_MS,
+  MCP_MAX_TIMEOUT_MS_DEFAULT,
+  MCP_MAX_TIMEOUT_MS_HARD_CEILING,
+  parseMcpMaxTimeoutMs,
   DISPATCH_OUTBOX_KEY,
   type OperationRouter,
 } from "./mcp.ts";
@@ -32,8 +35,12 @@ import {
   MCP_OPS_MAX_DATA_JSON_BYTES,
   MCP_OPS_MAX_DISPATCH_OUTBOX_BYTES,
   MCP_OPS_MAX_PER_TENANT,
+  MCP_OPS_MAX_PER_TENANT_DEFAULT,
+  MCP_OPS_MAX_PER_TENANT_HARD_CEILING,
+  MCP_OPS_QUOTA_PRESSURE_RATIO,
   MCP_OPS_RESULT_TTL_MS,
   MCP_OPS_TOMBSTONE_TTL_MS,
+  parseMcpOpsMaxPerTenant,
   boundClientVisibleOperationData,
   boundMcpOperationRecord,
   type SqlDatabase,
@@ -84,12 +91,12 @@ function adaptSqlite(db: DatabaseSync): SqlDatabase {
   };
 }
 
-function openSqlStore(): SqlStore {
+function openSqlStore(opts?: { mcpOpsMaxPerTenant?: number }): SqlStore {
   const db = new DatabaseSync(":memory:");
   for (const f of readdirSync(migrationsDir).filter((x) => x.endsWith(".sql")).sort()) {
     db.exec(readFileSync(join(migrationsDir, f), "utf8"));
   }
-  return new SqlStore(adaptSqlite(db), "sqlite");
+  return new SqlStore(adaptSqlite(db), "sqlite", opts);
 }
 
 async function seedAuthed(store: MemoryStore | SqlStore, principal = "prin_dev") {
@@ -135,6 +142,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   const b = await buildCanonicalAction({
@@ -144,6 +152,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   assert.equal(await hashCanonicalAction(a), await hashCanonicalAction(b));
@@ -158,6 +167,7 @@ test("canonical action hash is stable and content-digest based", async () => {
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   assert.notEqual(await hashCanonicalAction(a), await hashCanonicalAction(c));
@@ -171,6 +181,7 @@ test("bindCanonicalAction includes operation_id, expires_at, claim_version", asy
     principalId: "prin_a",
     tenantId: "ten_a",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_a",
   });
   const expiresAt = "2030-01-01T00:00:00.000Z";
@@ -205,11 +216,11 @@ test("principal credential generation is durable, rotates on credential changes,
 
     const before = await buildCanonicalAction({
       toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
-      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 2,
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 2, principalRevocationEpoch: 1,
     });
     const after = await buildCanonicalAction({
       toolName: "ownmesh_fs_list", args: { path: "/" }, deviceId: "dev_credential",
-      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3,
+      principalId: "prin_dev", tenantId: "ten_default", principalCredentialGeneration: 3, principalRevocationEpoch: 1,
     });
     assert.notEqual(await hashCanonicalAction(before), await hashCanonicalAction(after));
     assert.equal(
@@ -252,7 +263,10 @@ test("principal credential generation is durable, rotates on credential changes,
   }
 });
 
-test("idempotency retry converges on the original operation across credential rotation", async () => {
+// #162: the E3 redelivery gate spans real wall-clock time, so it is the gate a
+// routine 15-minute rotation actually crosses. A refresh must not terminate a
+// queued operation; a revocation still must.
+test("idempotency retry survives a routine refresh and still dies on revocation", async () => {
   const store = new MemoryStore();
   const tok = await seedAuthed(store);
   const deviceId = "dev_e3_rotation_retry";
@@ -266,12 +280,12 @@ test("idempotency retry converges on the original operation across credential ro
       return { status: "dispatch_uncertain" };
     },
   };
-  const call = async (idempotencyKey: string, id: number) => {
+  const call = async (idempotencyKey: string, id: number, accessToken: string) => {
     const response = await handleMcp(
       new Request("https://cp.test/mcp", {
         method: "POST",
         headers: {
-          authorization: `Bearer ${tok.access_token}`,
+          authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({
@@ -301,28 +315,59 @@ test("idempotency retry converges on the original operation across credential ro
     return body.result?.structuredContent || {};
   };
 
-  const first = await call("idem_rotation_stable", 1);
+  const first = await call("idem_rotation_stable", 1, tok.access_token);
   const firstId = String(first.operation_id);
   assert.match(firstId, /^op_/);
   assert.equal(routed, 1);
-  assert.equal((await store.getMcpOperation(firstId))?.action?.principal_credential_generation, 1);
+  const bound = await store.getMcpOperation(firstId);
+  assert.equal(bound?.action?.principal_credential_generation, 1);
+  assert.equal(bound?.action?.principal_revocation_epoch, 1);
 
-  assert.equal(await store.advancePrincipalCredentialGeneration("prin_dev"), 2);
-  const retry = await call("idem_rotation_stable", 2);
-  assert.equal(retry.operation_id, firstId);
-  assert.equal(retry.status, "failed");
+  // A real refresh rotation: the issuance generation advances, the revocation
+  // epoch does not.
+  const rotated = await store.rotateRefresh(tok.refresh_token);
+  assert.equal(rotated.ok, true);
+  if (!rotated.ok) return;
+  const after = (await store.getPrincipal("prin_dev"))!;
+  assert.equal(after.credential_generation, 2);
+  assert.equal(after.revocation_epoch, 1);
+
+  // The retry converges on the original operation and stays deliverable. It is
+  // the *same* bound body being redelivered exactly once per retry (the first
+  // route returned dispatch_uncertain), never a second execution.
+  const refreshed = await call("idem_rotation_stable", 2, rotated.token.access_token);
+  assert.equal(refreshed.operation_id, firstId);
+  assert.equal(refreshed.status, "pending", "a routine refresh must not terminate a queued op");
+  assert.equal(routed, 2, "the original bound body is redelivered, not re-executed");
+  const stillBound = await store.getMcpOperation(firstId);
+  assert.equal(stillBound?.action?.principal_credential_generation, 1);
+  assert.equal(stillBound?.action?.principal_revocation_epoch, 1);
+
+  // Revocation is a withdrawal of authority and still terminates it.
+  assert.equal(await store.advancePrincipalRevocationEpoch("prin_dev", "explicit_revocation"), 2);
+  const revokedRetry = await call("idem_rotation_stable", 3, rotated.token.access_token);
+  assert.equal(revokedRetry.operation_id, firstId);
+  assert.equal(revokedRetry.status, "failed");
+  const error = (revokedRetry.data as { error?: Record<string, unknown> } | undefined)?.error;
+  assert.equal(error?.code, "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH");
+  assert.equal(error?.retryable, false);
+  // The bounded reason survives the public compaction, not just the durable row.
+  assert.equal((error?.details as { reason?: string } | undefined)?.reason, "explicit_revocation");
+  assert.equal(routed, 2, "a revoked operation is never dispatched again");
   assert.equal(
-    ((retry.data as { error?: { code?: string } } | undefined)?.error?.code),
-    "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+    (await store.getMcpOperation(firstId))?.action?.principal_revocation_epoch,
+    1,
+    "the old operation is never rebound to the new epoch",
   );
-  assert.equal(routed, 1, "same key must not re-execute under the new credential generation");
-  assert.equal((await store.getMcpOperation(firstId))?.action?.principal_credential_generation, 1);
 
-  const fresh = await call("idem_rotation_fresh", 3);
+  // Recovery is a *fresh* request under the current authority, never a retry of
+  // the old binding: a new key mints a distinct operation bound to the new
+  // epoch, and that one does dispatch.
+  const fresh = await call("idem_rotation_fresh", 4, rotated.token.access_token);
   const freshId = String(fresh.operation_id);
-  assert.notEqual(freshId, firstId);
-  assert.equal(routed, 2, "execution under the new generation requires a new key");
-  assert.equal((await store.getMcpOperation(freshId))?.action?.principal_credential_generation, 2);
+  assert.notEqual(freshId, firstId, "a fresh key must not converge on the terminated operation");
+  assert.equal(routed, 3);
+  assert.equal((await store.getMcpOperation(freshId))?.action?.principal_revocation_epoch, 2);
 });
 
 test("idempotency retry cannot redeliver an outbox after cancel_requested wins", async () => {
@@ -407,6 +452,7 @@ test("buildDeviceOperation always sets server payload_hash and wire binding fiel
     principalId: "prin_1",
     tenantId: "ten_1",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt,
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -496,6 +542,7 @@ test("MCP idempotency mismatch fails closed without routing", async () => {
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     oauthClientId: "client_mcp",
   });
   const firstHash = await hashCanonicalAction(firstAction);
@@ -765,6 +812,7 @@ test("command env is normalized into canonical action facts", async () => {
     principalId: "prin_env",
     tenantId: "ten_env",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
   });
   assert.deepEqual((canonical.facts as { env?: Record<string, string> }).env, {
     A: "1",
@@ -784,6 +832,7 @@ test("command env is normalized into canonical action facts", async () => {
     principalId: "prin_env",
     tenantId: "ten_env",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   });
   const facts = (op.bound_action.facts as { env?: Record<string, string> }).env;
@@ -795,7 +844,8 @@ test("command env is normalized into canonical action facts", async () => {
 });
 
 test("durable MCP operation records bound oversized data and enforce tenant quota", async () => {
-  const store = new MemoryStore();
+  const quotaCap = 8;
+  const store = new MemoryStore({ mcpOpsMaxPerTenant: quotaCap });
   await store.ensureBootstrap();
   const huge = "x".repeat(MCP_OPS_MAX_DATA_JSON_BYTES + 1024);
   const bounded = boundMcpOperationRecord({
@@ -832,7 +882,7 @@ test("durable MCP operation records bound oversized data and enforce tenant quot
   assert.equal((bounded.data as { path?: string }).path, "big.txt");
   assert.equal(bounded.next_cursor, "off_160000");
 
-  for (let i = 0; i < MCP_OPS_MAX_PER_TENANT; i++) {
+  for (let i = 0; i < quotaCap; i++) {
     await store.putMcpOperation({
       operation_id: `op_q_${i}`,
       tenant_id: "ten_quota",
@@ -929,6 +979,7 @@ test("dispatch outbox: crash after claim before route is redelivered on retry", 
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",
@@ -1236,7 +1287,8 @@ test("dispatch_uncertain: pending outbox is redelivered on identical retry", asy
 });
 
 test("idempotency tombstones are retained under quota until 30-day window closes", async () => {
-  const store = new MemoryStore();
+  const quotaCap = 8;
+  const store = new MemoryStore({ mcpOpsMaxPerTenant: quotaCap });
   await store.ensureBootstrap();
   const tenant = "ten_tomb";
   const principal = "prin_tomb";
@@ -1244,7 +1296,7 @@ test("idempotency tombstones are retained under quota until 30-day window closes
   const now = Date.now();
 
   // Fill tenant to capacity with completed ops aged >7d so they compact to tombstones.
-  for (let i = 0; i < MCP_OPS_MAX_PER_TENANT; i++) {
+  for (let i = 0; i < quotaCap; i++) {
     const created = new Date(now - MCP_OPS_RESULT_TTL_MS - 60_000).toISOString();
     await store.putMcpOperation({
       operation_id: `op_tomb_${i}`,
@@ -1334,6 +1386,296 @@ test("idempotency tombstones are retained under quota until 30-day window closes
   assert.ok(MCP_OPS_TOMBSTONE_TTL_MS > MCP_OPS_RESULT_TTL_MS);
 });
 
+/**
+ * P0-B review (lazy tombstone expiry): a tombstone older than the 30-day
+ * idempotency window must be hard-deleted before the existing-row lookup, so a
+ * same-key retry is dispatched as a fresh operation instead of returning the
+ * stale tombstone as `existing` forever. Both store implementations previously
+ * returned the existing row before running quota cleanup, which could block
+ * reuse of an expired key indefinitely.
+ */
+test("expired idempotency tombstones are hard-deleted so the key becomes reusable", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_expired_${store.kind}`;
+    const principal = "prin_expired";
+    const device = "dev_expired";
+    const ancient = new Date(Date.now() - MCP_OPS_RESULT_TTL_MS - 60_000).toISOString();
+
+    // Completed op bound to the key, aged past the result TTL so the next
+    // quota pass compacts it to an idempotency tombstone.
+    await store.putMcpOperation({
+      operation_id: "op_expired_1",
+      tenant_id: tenant,
+      principal_id: principal,
+      device_id: device,
+      tool: "ownmesh_fs_write",
+      status: "completed",
+      summary: "done",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      payload_hash: "ph_expired_1",
+      idempotency_key: "idem_expired_1",
+      action: { tool: "ownmesh_fs_write" },
+      policy_authority: "ownmesh_device",
+      created_at: ancient,
+      updated_at: ancient,
+    });
+    // Trigger quota compaction to a tombstone with a same-tenant fresh op.
+    await store.putMcpOperation({
+      operation_id: "op_expired_trigger",
+      tenant_id: tenant,
+      principal_id: principal,
+      device_id: device,
+      tool: "ownmesh_fs_stat",
+      status: "pending",
+      summary: "trigger",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_expired_trigger",
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    const tombstone = await store.getMcpOperation("op_expired_1");
+    assert.ok(tombstone, `${store.kind}: op must still exist as a tombstone`);
+    assert.equal(tombstone.status, "tombstone");
+    // Age the tombstone past the 30-day hard-delete window.
+    await store.updateMcpOperation("op_expired_1", {
+      updated_at: new Date(Date.now() - MCP_OPS_TOMBSTONE_TTL_MS - 60_000).toISOString(),
+    });
+    // Same-key claim must now mint a FRESH operation, not return the stale
+    // tombstone as `existing` forever.
+    const claim = await store.claimMcpOperationByIdempotency({
+      operation_id: "op_expired_retry",
+      tenant_id: tenant,
+      principal_id: principal,
+      device_id: device,
+      tool: "ownmesh_fs_write",
+      status: "pending",
+      summary: "retry",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_expired_1",
+      action: { tool: "ownmesh_fs_write" },
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    assert.equal(
+      claim.outcome,
+      "created",
+      `${store.kind}: an expired tombstone must not block key reuse forever`,
+    );
+    assert.equal(claim.op.operation_id, "op_expired_retry");
+    // The old tombstone is gone.
+    assert.equal(await store.getMcpOperation("op_expired_1"), null);
+  }
+});
+
+test("MCP_MAX_TIMEOUT_MS env parsing fails closed to the documented default", () => {
+  assert.equal(parseMcpMaxTimeoutMs(undefined), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs(""), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs("nope"), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs(0), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs(-4), MCP_MAX_TIMEOUT_MS_DEFAULT);
+  assert.equal(parseMcpMaxTimeoutMs("8"), 8);
+  assert.equal(parseMcpMaxTimeoutMs(8), 8);
+  assert.equal(parseMcpMaxTimeoutMs(String(MCP_MAX_TIMEOUT_MS_HARD_CEILING + 1)), MCP_MAX_TIMEOUT_MS_HARD_CEILING);
+  assert.equal(MCP_MAX_TIMEOUT_MS, MCP_MAX_TIMEOUT_MS_DEFAULT);
+});
+
+test("sanitizeMcpArgs clamps timeout_ms to the operator-configured ceiling", () => {
+  const defaulted = sanitizeMcpArgs({ timeout_ms: 999_999_999 }, "ownmesh_command_run");
+  assert.equal(defaulted.timeout_ms, MCP_MAX_TIMEOUT_MS_DEFAULT);
+  const raised = sanitizeMcpArgs(
+    { timeout_ms: 999_999_999 },
+    "ownmesh_command_run",
+    { maxTimeoutMs: MCP_MAX_TIMEOUT_MS_HARD_CEILING },
+  );
+  assert.equal(raised.timeout_ms, MCP_MAX_TIMEOUT_MS_HARD_CEILING);
+});
+
+test("MCP_OPS_MAX_PER_TENANT env parsing fails closed to the documented default", () => {
+  assert.equal(parseMcpOpsMaxPerTenant(undefined), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant(""), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant("nope"), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant(0), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant(-4), MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(parseMcpOpsMaxPerTenant("8"), 8);
+  assert.equal(parseMcpOpsMaxPerTenant(8), 8);
+  assert.equal(parseMcpOpsMaxPerTenant(String(MCP_OPS_MAX_PER_TENANT_HARD_CEILING + 1)), MCP_OPS_MAX_PER_TENANT_HARD_CEILING);
+  assert.equal(MCP_OPS_MAX_PER_TENANT, MCP_OPS_MAX_PER_TENANT_DEFAULT);
+  assert.equal(MCP_OPS_QUOTA_PRESSURE_RATIO, 0.6);
+});
+
+test("configured tenant quota is the cap used by both stores", async () => {
+  const quotaCap = 3;
+  for (const store of [
+    new MemoryStore({ mcpOpsMaxPerTenant: quotaCap }),
+    openSqlStore({ mcpOpsMaxPerTenant: quotaCap }),
+  ] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_cfg_${store.kind}`;
+    assert.equal(store.mcpOpsMaxPerTenant(), quotaCap);
+    for (let i = 0; i < quotaCap; i++) {
+      await store.putMcpOperation({
+        operation_id: `op_cfg_${store.kind}_${i}`,
+        tenant_id: tenant,
+        principal_id: "prin_cfg",
+        device_id: "dev_cfg",
+        tool: "ownmesh_fs_stat",
+        status: "completed",
+        summary: "fill",
+        data: { i },
+        truncated: false,
+        next_cursor: null,
+        approval_required: false,
+        warnings: [],
+        idempotency_key: `idem_cfg_${i}`,
+        policy_authority: "ownmesh_device",
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+    }
+    const quota = await store.getMcpOperationQuota(tenant);
+    assert.equal(quota.rows, quotaCap);
+    assert.equal(quota.limit, quotaCap);
+    assert.equal(quota.status, "critical");
+    await assert.rejects(
+      () =>
+        store.putMcpOperation({
+          operation_id: `op_cfg_${store.kind}_overflow`,
+          tenant_id: tenant,
+          principal_id: "prin_cfg",
+          device_id: "dev_cfg",
+          tool: "ownmesh_fs_stat",
+          status: "pending",
+          summary: "overflow",
+          data: {},
+          truncated: false,
+          next_cursor: null,
+          approval_required: false,
+          warnings: [],
+          idempotency_key: "idem_cfg_overflow",
+          policy_authority: "ownmesh_device",
+          created_at: nowIso(),
+          updated_at: nowIso(),
+        }),
+      /mcp_operation_quota_exceeded/,
+    );
+  }
+});
+
+test("keyless terminal rows are hard-deleted at result TTL instead of tombstoned", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_keyless_${store.kind}`;
+    const ancient = new Date(Date.now() - MCP_OPS_RESULT_TTL_MS - 60_000).toISOString();
+    await store.putMcpOperation({
+      operation_id: "op_keyless_old",
+      tenant_id: tenant,
+      principal_id: "prin_keyless",
+      device_id: "dev_keyless",
+      tool: "ownmesh_fs_read",
+      status: "completed",
+      summary: "read page",
+      data: { content: "x" },
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: null,
+      policy_authority: "ownmesh_device",
+      created_at: ancient,
+      updated_at: ancient,
+    });
+    await store.putMcpOperation({
+      operation_id: "op_keyed_old",
+      tenant_id: tenant,
+      principal_id: "prin_keyless",
+      device_id: "dev_keyless",
+      tool: "ownmesh_fs_write",
+      status: "completed",
+      summary: "write",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_keyed_old",
+      payload_hash: "ph_keyed",
+      policy_authority: "ownmesh_device",
+      created_at: ancient,
+      updated_at: ancient,
+    });
+    await store.putMcpOperation({
+      operation_id: "op_keyless_trigger",
+      tenant_id: tenant,
+      principal_id: "prin_keyless",
+      device_id: "dev_keyless",
+      tool: "ownmesh_fs_stat",
+      status: "pending",
+      summary: "trigger compact",
+      data: {},
+      truncated: false,
+      next_cursor: null,
+      approval_required: false,
+      warnings: [],
+      idempotency_key: "idem_keyless_trigger",
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    assert.equal(
+      await store.getMcpOperation("op_keyless_old"),
+      null,
+      `${store.kind}: keyless terminal row must not occupy a tombstone slot`,
+    );
+    const keyed = await store.getMcpOperation("op_keyed_old");
+    assert.ok(keyed, `${store.kind}: keyed receipt must remain`);
+    assert.equal(keyed.status, "tombstone");
+    assert.equal(keyed.idempotency_key, "idem_keyed_old");
+  }
+});
+
+test("legacy keyless tombstones are purged on compact", async () => {
+  for (const store of [new MemoryStore(), openSqlStore()] as const) {
+    await store.ensureBootstrap();
+    const tenant = `ten_legacy_ts_${store.kind}`;
+    await store.putMcpOperation({
+      operation_id: "op_legacy_keyless_ts",
+      tenant_id: tenant,
+      principal_id: "prin_legacy",
+      device_id: "dev_legacy",
+      tool: "ownmesh_fs_read",
+      status: "tombstone",
+      summary: "tombstone: result TTL expired; idempotency retained",
+      data: { tombstone: true },
+      truncated: true,
+      next_cursor: null,
+      approval_required: false,
+      warnings: ["durable_result_tombstoned"],
+      idempotency_key: null,
+      policy_authority: "ownmesh_device",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+    const quota = await store.getMcpOperationQuota(tenant);
+    assert.equal(quota.rows, 0, `${store.kind}: keyless tombstone must be dropped immediately`);
+    assert.equal(await store.getMcpOperation("op_legacy_keyless_ts"), null);
+  }
+});
+
 test("dispatch outbox survives large write claim (~300 KiB) and redelivers after crash", async () => {
   const store = new MemoryStore();
   const token = await seedAuthed(store);
@@ -1365,6 +1707,7 @@ test("dispatch outbox survives large write claim (~300 KiB) and redelivers after
     principalId: "prin_dev",
     tenantId: "ten_default",
     principalCredentialGeneration: 1,
+    principalRevocationEpoch: 1,
     expiresAt: new Date(Date.now() + 300_000).toISOString(),
     claimVersion: 1,
     oauthClientId: "client_mcp",

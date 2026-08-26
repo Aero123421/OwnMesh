@@ -411,7 +411,18 @@ mod tests {
     use crate::server::{reject_unknown_handler, IpcServer, ServerConfig};
     use crate::{current_os_user_id, read_management_credential, BootstrapStatus};
     use std::sync::Arc;
-    use tempfile::tempdir;
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     async fn start_test_server(
         runtime: &Path,

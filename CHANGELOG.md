@@ -2,6 +2,459 @@
 
 ## Unreleased
 
+Mitigates the concrete failure modes reproduced from the 2026-08-25 production
+session (#158–#162) and the reopened Linux session regression (#31). These
+changes do not claim every issue acceptance criterion is complete: live
+ChatGPT/production canaries, the Cloudflare WAF configuration, transactional
+multi-session reattach, and the runtime-wide execution-lock redesign remain
+tracked in their original issues.
+
+### Device availability
+
+- A remote `command_run` of the OwnMesh CLI is refused before spawn with
+  `OWNMESH_E_SELF_REENTRANT_EXEC` instead of deadlocking the daemon. The daemon
+  holds one runtime mutex across a child's whole lifetime, so a child that
+  synchronously re-enters daemon IPC waited on the lock its own parent held —
+  and every later filesystem, Git, session, and diagnosis request for that
+  device queued behind it until the first operation was cancelled by hand.
+  Detection uses OS file identity, so the same installed file reached after a
+  rename, through a hard link, or through a symlink is recognized; `--version`
+  and `--help` stay executable because they exit during argument parsing,
+  before any IPC is opened. A byte-for-byte copied executable and invocation
+  through a shell or script remain outside this guard, so #160 stays open for
+  the runtime-wide lock redesign.
+- Linux session lifecycle treats an exited-but-unreaped child as exited. A
+  zombie keeps its PID slot and kernel start time, so the birth-witness probe
+  reported it as live: `close` answered "authenticated child is still alive,
+  refusing PID-only termination", the dead session stayed pinned as `running`,
+  and one such record made every later `session_open`, `replay`, and `close`
+  fail while naming that unrelated session. PID-reuse protection is unchanged —
+  the birth witness is still compared, it just no longer counts a zombie as
+  running (#31).
+- Reattach now isolates failures per session. A session the supervisor proves
+  has no live child reconciles to terminal; an indeterminate one is retained
+  fail-closed. Neither aborts the pass for unrelated sessions (#31).
+- `session_show` reconciles provably dead records during an ordinary read, so a
+  finished session stops being displayed as `running` (#31).
+
+### Authorization continuity
+
+- A routine OAuth refresh rotation no longer invalidates queued device
+  operations. Revocation and refresh-token reuse now advance a separate
+  `revocation_epoch`, and device operations bind to that epoch rather than to
+  every credential issuance. Access tokens live 15 minutes, so an operation
+  waiting through a reconnect, a Durable Object wake, or a temporary queue
+  blockage previously crossed a refresh boundary and was failed as a
+  non-retryable credential mismatch — indistinguishable from a real revocation
+  (#162).
+- Explicit revocation and refresh-family reuse still terminally invalidate every
+  operation authorized by the affected family, and an invalidated operation is
+  never rebound, redelivered, or retried in place.
+- The public error names a bounded reason (`explicit_revocation`,
+  `refresh_reuse`, `routine_refresh`, `unknown_generation_change`) without
+  exposing tokens, refresh families, or credential material. A credential
+  continuation returns `OWNMESH_E_AUTHORIZATION_REFRESHED` with
+  `retryable: true` and `next_action: resubmit` instead of a bare
+  `retryable: false` a caller cannot act on (#162).
+
+### Diagnosis and catalog compatibility
+
+- The `system.diagnose` payload contract is validated independently of the
+  device protocol version. A newer Agent's additive checks and fields no longer
+  invalidate a diagnosis: the scan window is a fixed bound rather than the size
+  of the Control Plane's own known-id set, which is what silently truncated the
+  required `sessions` check once the Agent began emitting `agent_route` ahead of
+  it, collapsing a valid diagnosis into `invalid_response` (#161).
+- The single `invalid_response` bucket is replaced by bounded reason codes
+  (`unsupported_contract_version`, `missing_agent_metadata`,
+  `missing_required_check`, `bad_check_shape`, `bad_status`,
+  `malformed_payload`), and a different contract major returns
+  `unsupported_diagnosis_version` with the version numbers and an
+  `upgrade_control_plane` recommendation instead of blaming the device. A known
+  check with an unknown state stays visible as `unsupported_value` and lifts
+  `overall` away from `healthy`. Missing security-relevant checks remain
+  fail-closed (#161).
+- MCP exposes a deterministic catalog revision — a SHA-256 over exactly the
+  bytes `tools/list` returns — on `GET /mcp`, `/health`, `initialize._meta`, and
+  every `tools/list` response, so a deployment's catalog and a client's snapshot
+  can be compared directly (#158).
+- The catalog revision is bound into the MCP session id. A request carrying a
+  session minted under a different revision is answered with HTTP 404, which
+  MCP defines as "session expired, re-`initialize`", so a long-lived connector
+  converges on the current catalog after a deployment instead of serving a stale
+  one. `listChanged` stays `false`: this Streamable HTTP deployment has no
+  server-initiated stream and must not claim a notification it cannot deliver
+  (#158).
+- `pnpm run deploy:guided` verifies that the origin now serving traffic
+  advertises the version being released, and refuses to report success
+  otherwise. A deploy that leaves an older Worker live is what left production
+  three release generations behind while clients kept an old catalog (#158).
+
+### Deployment
+
+- `scripts/probe_machine_endpoints.py` checks MCP discovery and the OAuth
+  metadata endpoints from two HTTP stacks under several User-Agents and reports
+  which layer answered, so a Cloudflare browser-signature rejection (HTTP 403 /
+  Error 1010) is never mistaken for a Worker fault. Such a rejection never
+  reaches the Worker, carries no `WWW-Authenticate` challenge, and removes the
+  whole tool catalog rather than failing one operation. `docs/deploy-cloudflare.md`
+  documents the scoped WAF skip rule that fixes it while keeping rate limiting,
+  payload bounds, and authentication in force (#159).
+
+## v1.2.22 — Service lifecycle, endpoint, and session honesty
+
+Closes the nine open issues from the 2026-08-24 audit (#147–#155). Every one
+is displayed state that was not the authoritative state; each is closed by
+making the check authoritative rather than by relaxing the claim.
+
+### Service lifecycle honesty
+
+- `service start` and `service stop` now cross the observable daemon IPC
+  boundary instead of treating an accepted service-manager request as a
+  completed transition; a request that never reaches (or leaves) the endpoint
+  returns `OWNMESH_E_SERVICE` with the manager's own installed/running facts
+  rather than `ok:true` with `running:null` (#154).
+- macOS `service stop` boots the LaunchAgent out of the user domain, so
+  `KeepAlive=true` can no longer relaunch the daemon behind a reported stop;
+  `start` re-enables and bootstraps the job idempotently, and `uninstall`
+  refuses to delete the plist until launchd confirms the job is unloaded
+  (#147).
+- Linux `service uninstall` reports every `systemctl --user` failure and keeps
+  the unit and install record in place until the manager confirms the unit is
+  inactive, so a failed stop can no longer be hidden by deleting the unit file.
+  An unreachable user bus is no longer mistaken for an absent unit (#149).
+- `service install` compares the descriptor actually registered with the OS —
+  systemd unit body, macOS plist, and the Windows task's structural identity
+  (action and trigger cardinality plus every rendered setting, since Task
+  Scheduler reformats imported XML) — against a versioned descriptor digest
+  persisted in `user-service.json`. A hand-edited, older-version, or unreadable
+  descriptor is repaired instead of reported as idempotent success. Descriptor
+  identity is independent of whether the service is currently loaded, so a
+  deliberate `service stop` survives a later install (#153).
+- Probe results that prove nothing are classified as unknown rather than as
+  absence: `systemctl is-active` is read by reported state rather than exit
+  status (it exits non-zero for every state but `active`), and only an
+  explicitly reported absence from `launchctl print` allows the descriptor to
+  be removed (#147/#149).
+- The Windows Scheduled Task binds the daemon to the config/state/runtime
+  directories validated at install time, via typed `ownmeshd run
+  --config-dir/--state-dir/--runtime-dir` arguments shared by the XML import
+  and the `/TR` fallback — no `cmd /c set … &&` wrapper. Typed arguments
+  outrank `OWNMESH_*` environment variables, so an autostarted daemon can no
+  longer split one installation into two state trees (#148).
+
+### Endpoints and sessions
+
+- Unix endpoints are validated against the platform `sockaddr_un` capacity
+  before bind: a long but valid runtime directory now resolves to a
+  deterministic short owner-only pathname (0700, custody-attested) that every
+  producer and consumer derives identically, and an explicitly configured
+  socket path that cannot be bound is rejected with the required reduction
+  instead of failing later inside `bind` (#155).
+- Windows named pipes are scoped by a SHA-256 digest of the normalized runtime
+  path rather than a truncated alphanumeric filter, so distinct profiles can no
+  longer collide onto one pipe; a failed connect names the upgrade/restart
+  remedy for a daemon still on the legacy pipe name (#151).
+- Structured-pipe sessions publish EOF and a real exit code: each reader marks
+  its stream terminal on every exit path, the child is reaped once, and
+  completion requires child exit plus both stream EOFs so a late stream cannot
+  be truncated. Supervisor status and daemon diagnosis now observe a completed
+  structured child instead of reporting it live until TTL. A forced termination
+  waits a bounded grace for the readers to publish EOF themselves and only
+  seals the streams when a descendant still holds the pipes — refusing further
+  appends so no output can follow the reported completion, and disclosing the
+  cutoff rather than implying a clean EOF. A termination that failed publishes
+  nothing (#152).
+
+### Installer
+
+- The Unix installer recognizes a running `ownmeshd` whose executable was
+  replaced, which Linux reports as `/proc/<pid>/exe` → `<path> (deleted)`. The
+  suffix is stripped only after the remaining pathname matches the normalized
+  install-dir daemon, so upgrades restart and version-check the stale daemon
+  instead of silently leaving it running; matching is never by process name
+  (#150).
+
+See `docs/RELEASE_NOTES_v1.2.22.md` for details.
+
+## v1.2.21 — Transport availability, journal honesty, and Linux disclosure
+
+- Agent and transfer WebSocket connects are bounded (15 s) with RFC 8305-style
+  family interleaving and IPv4 fallback; a blackholed AAAA can no longer park a
+  reconnect forever (#140). `connect_timeout` is a typed reconnect category.
+- Terminal operation failures reconcile their reserved op-journal marker into
+  a compact failed receipt, so retries replay the stored failure instead of
+  being refused forever as in_progress keys; crash residue keeps exact-once
+  semantics per ADR 0010 (#142).
+- Doctor and system.diagnose expose live Agent-route presence via the new
+  credentialed `daemon.route_status` IPC method (`daemon.agent_route` check,
+  additive `agent_route` diagnosis id and `agent_route_offline` overall);
+  doctor no longer passes while ChatGPT sees the device offline (#141).
+- Incremental workspace registry refresh: ready agents publish the full
+  registry on device-local changes over one new authenticated message
+  (`workspace.registry` / ack, ADR 0014), so workspace activation no longer
+  waits for a reconnect (#146). Shared JSON schema added and validated in both
+  languages.
+- Linux disclosures without loosening defaults: spawn-resolution failures list
+  the searched directories (service PATH plus user-local extras, home
+  collapsed); EPERM spawn errors and the hardening pass row name
+  RestrictNamespaces=yes and its operator drop-in (#144/#145); doctor warns
+  when Linger=no so logout-killed agents are diagnosable, and TUI/docs state
+  the session-lifetime caveat (#143).
+
+See `docs/RELEASE_NOTES_v1.2.21.md` for details.
+
+## v1.2.20 — TUI terminal-contract reliability
+
+- Ctrl+C is a universal emergency exit from every screen, overlay, wizard
+  step, and palette state; raw mode no longer swallows the interrupt gesture.
+  `q` remains the normal quit. Documented in the command bar and help text
+  across all four UI languages.
+- Terminal input failures (EOF, detached or broken TTY) end the interactive
+  loop as a controlled exit instead of an endless redraw-only idle loop, and
+  terminal restoration reports (and retries) partial cleanup failures instead
+  of a false success. Non-TTY invocations fail closed with usage guidance.
+- Mouse capture is disabled by default: captured clicks were discarded and
+  scroll events mutated unrelated list cursors while hijacking native
+  terminal selection (worst on macOS trackpads). Capture returns only with
+  functional mouse navigation.
+- List navigation is clamped to existing rows on every path (keyboard,
+  refresh shrink, screen transitions) and lists scroll to keep the selected
+  row visible via Ratatui stateful widgets; empty lists pin the cursor.
+
+See `docs/RELEASE_NOTES_v1.2.20.md` for details.
+
+## v1.2.19 — ChatGPT MCP token refresh and control-plane version visibility
+
+- `/mcp` returns HTTP 401 with `WWW-Authenticate` (and JSON-RPC `-32001`) when
+  a Bearer token is missing on `tools/call` or is invalid on any JSON-RPC
+  method, so ChatGPT can refresh instead of treating a 200 JSON-RPC error as
+  transport success. Unauthenticated `initialize` / `tools/list` stay available
+  for discovery.
+- `GET /.well-known/oauth-protected-resource/mcp` serves RFC 9728 metadata for
+  the `/mcp` resource identifier; `authorization_servers` remains the issuer
+  origin.
+- `ownmesh doctor --check-network` warns when the control-plane `/health`
+  version does not match the CLI. See `release/SUPPORTED_SURFACES.json`.
+
+## v1.2.18 — Windows installer upgrade stop on PowerShell 5.1
+
+- The portable Windows installer no longer treats a missing `OwnMesh-ownmeshd`
+  scheduled task as a terminating error under Windows PowerShell 5.1
+  (`$ErrorActionPreference = Stop` + `schtasks` NativeCommandError).
+  Upgrades that only need to stop matching install-dir processes continue.
+- The same `powershell -File` path also hashes with .NET SHA-256 and restores
+  the Desktop `$PSHOME\Modules` path so a pwsh-inherited Core `PSModulePath`
+  cannot hide `Get-FileHash` / `Unblock-File`. See
+  `installers/ownmesh-installer.ps1`. The machine-checked contract remains
+  `release/SUPPORTED_SURFACES.json`.
+
+## v1.2.17 — Hardening gates and fail-closed OAuth redemption
+
+- Authorization-code grants verify then CAS-bind the redeemed code hash to
+  one token family. D1 migration `0017` adds `oauth_tokens.auth_code_hash`.
+- Request bodies are limited by actual bytes; Content-Length is advisory.
+  Device `user_code` values are generated with Web Crypto rejection sampling.
+- TAR header/extension records are charged to updater decompression budgets.
+- Support-bundle export is a typed allowlisted v2 preview; mixed-case
+  high-entropy tokens fail closed and export bytes match preview bytes.
+- Doctor surfaces non-secret credential-store provenance (backend, residual
+  fallback entries, degraded cleanup).
+- Privileged-broker replay ledgers reconcile crash-left reservations and
+  enforce capacity. Updater apply/rollback stays crash-consistent for the
+  five required binaries. See #100 #101 #113 #121 #122 #123 #124 #125 #126
+  #128. The machine-checked contract remains `release/SUPPORTED_SURFACES.json`.
+
+## v1.2.16 — Prepared executable custody
+
+- Approval-bound command execution now retains the exact invocation entry,
+  canonical backing identity, classification, and `argv[0]`. Invocation or
+  backing drift returns `OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT`; the runtime no
+  longer substitutes a canonical backing path for a changed proxy.
+- Generic and review command spawn consume a non-cloneable prepared executable.
+  Linux uses a sealed anonymous image, macOS an owner-only verified snapshot,
+  and Windows target/proxy/ancestor handles held without write/delete sharing
+  until spawn completes. Raw shells prepare the selected interpreter too.
+- Deterministic cross-platform regression fixtures cover proxy deletion,
+  retarget/recreation, backing replacement, atomic and in-place content change,
+  parent-directory replacement, exact `argv[0]`, and zero canary side effects.
+- Executable entry identity is part of policy/approval facts, and the typed
+  drift error is aligned across Rust, IPC/CLI, TypeScript, and JSON schemas.
+  See ADR 0013.
+
+## v1.2.15 — Service install remediator and runtime-dir alignment
+
+- Linux CLI/updater runtime discovery uses owner-only `/run/user/<uid>/ownmesh`
+  when `XDG_RUNTIME_DIR` is unset, matching the systemd user unit instead of
+  falling back to `state_dir/run`. Update worker and nested `ownmesh status`
+  children receive `OWNMESH_CONFIG_DIR` / `OWNMESH_STATE_DIR` /
+  `OWNMESH_RUNTIME_DIR` so a headless shell cannot health-check the wrong
+  socket. See #113.
+- `ownmesh service install` now remediates leftover OwnMesh-generated systemd
+  user drop-ins (`10-ownmesh-workspaces.conf` / `# Generated by OwnMesh`
+  files that set `ReadWritePaths=` and other user-namespace-forcing
+  directives). A matching executable is no longer treated as an idempotent
+  no-op while those leftovers remain. Operator-written drop-ins are left
+  in place; if they still force a user namespace, install fails closed
+  instead of reporting `ok: true`. The shipped user unit also sets
+  `StartLimitBurst=5` / `StartLimitIntervalSec=30` so a custody-fail cannot
+  restart every three seconds forever. See ADR 0011.
+- Darwin PTY terminate no longer treats a completed `try_wait` as proof of
+  death when the process table still shows the child live, and uses BSD
+  process-group kill syntax. `PtySession` drop now last-resort `SIGKILL`s
+  the recorded child after terminate.
+- Release publish installs the same hash-pinned minisign 0.11 linux binary
+  the installer already uses, instead of `apt-get install minisign` (which
+  can stall indefinitely on `ubuntu-latest`).
+
+## v1.2.14 — Detached commands, hashed overwrite, bounded grants
+
+- Durable MCP operation quota is configurable via Worker env
+  `MCP_OPS_MAX_PER_TENANT` (default 20_000). Tool responses warn with
+  `mcp_ops_quota_pressure` at ≥ 60% occupancy, `ownmesh_system_diagnose`
+  reports `control_plane.mcp_ops_quota`, and keyless terminal rows are
+  hard-deleted at the 7-day result TTL instead of occupying a 30-day
+  idempotency tombstone. Fail-closed `OWNMESH_E_MCP_OP_QUOTA` and keyed
+  receipt retention are unchanged.
+- `ownmesh_get_operation` accepts optional `wait_ms` (clamped to 25s) to
+  long-poll until a terminal snapshot. Concurrent waiters per tenant are
+  capped; excess calls return the current snapshot with
+  `mcp_get_operation_wait_saturated` and do not persist that warning.
+- `ownmesh_transfer_plan` accepts optional `overwrite_expected_sha256`. When
+  set, destination replacement is allowed only if the existing file matches
+  that hash at preflight and publish. Blind `force`/`overwrite` remains
+  rejected. `ownmesh transfer plan --overwrite-expected-sha256` exposes the
+  same bound.
+- `ownmesh_command_run` / `ownmesh_run_command` accept `detach: true` so a
+  long-running command is dispatched without the synchronous timeout clamp
+  or the five-minute dispatch / poll expiry. Device Room keeps the pending
+  correlation past the ordinary 15-minute TTL; the hard cap is 24 hours or
+  cancel. Agent reconnect does not start a second spawn of an in-process
+  job (that would fail the op-journal as CONFLICT); if the live loop is
+  gone the completion is parked and published on the next session. Every
+  live-loop turn publishes every parked row (not only the inbound
+  correlation), so a dropped `Notify` wakeup cannot strand a detached
+  result until the 24h expiry.
+  Completion is retrieved with `ownmesh_get_operation`. Concurrent
+  detached jobs per device are capped fail-closed. The synchronous
+  `timeout_ms` clamp is configurable via Worker env `MCP_MAX_TIMEOUT_MS`
+  (default 300000, hard ceiling 3600000). Timed-out synchronous commands
+  include hint `use detach:true or a session for long-running commands`.
+- An unreadable, over-budget, or unremovable-backup op-journal no longer
+  refuses `ownmeshd` startup. The daemon starts read-only (`OWNMESH_E_JOURNAL_DEGRADED`
+  for side effects) and surfaces `journal_degraded` in `system_diagnose` /
+  `ownmesh doctor`. Local repair is `ownmesh doctor --repair-journal
+  --i-understand-replay-risk`.
+- Bounded tool grants (`grant_type: "bounded_tool"`) lift policy **Ask** only
+  for an explicit tool allowlist, optional workspace, TTL ≤ 4 hours, and
+  optional max-use count. Matching requires the mint device id and the
+  request's canonical tool plus capability/kind; a client-supplied tool name
+  cannot lift a different capability. Principal and device id are stamped on
+  the mint approval at enqueue from the verified remote dispatch, not reread
+  from the live session at recovery execute. Deny still wins, including
+  recommended/workspace_only `command.run`. Minting is the same fresh-passkey
+  admin path as policy preset (`ownmesh grants mint` / `ownmesh_grants_mint`).
+  Revoke and lockdown are local tightening. See ADR 0012.
+- `/approve` lists pending operations for an authenticated human session.
+  Selected sets are bound by a v2 presence cookie whose commitment is SHA-256
+  of server-looked-up `operation_id:payload_hash` lines (max 32). Each decision
+  is still consumed per operation. Deny-all of the listed pending set requires
+  session + CSRF + same-origin, not a passkey. Notification channels never
+  carry approval authority.
+
+## v1.2.13 — Runtime reliability and cross-platform repair
+
+- Expired sidecar transition journal records are reconciled non-blockingly
+  instead of poisoning every future session; a record is cleared only when
+  session/supervisor state and an OS-level or supervisor liveness probe prove
+  every referenced predecessor/successor sidecar is dead, and retained
+  fail-closed with a health surface otherwise. A failed supervisor sweep no
+  longer untracks a live host.
+- Completed op-journal entries are compacted to exact-once durable receipts
+  before persistence; terminal receipts have a bounded 30-day lifecycle and a
+  lingering pre-compaction `.bak` is removed *before* the compacted write
+  (so a crash between the write and the cleanup cannot leave a legacy
+  large-body copy behind; the backup is recovered from if the primary is
+  missing, and an unremovable stale backup at load refuses startup
+  fail-closed with an actionable message; runtime persistence also fails
+  closed and rolls back its in-memory mutation). Completed markers without the
+  exact-once `operation_id` are classified uncertain (never replayed,
+  compacted, or evicted). Compact receipts keep the original field names
+  (`id` stays `id`, plus an additive `session_id` alias for `session.open`),
+  so the first and the replayed public responses are schema-stable.
+- Op-journal near-capacity eviction is proactive: the byte-pressure projection
+  includes the incoming in-progress marker, so a journal within one marker's
+  worth of the 4 MiB cap evicts expired completed receipts *before* inserting
+  the marker instead of refusing the new side-effect key with a byte-budget
+  failure while eligible receipts sat unused. Control Plane idempotency
+  tombstones past the 30-day hard-delete window are expired *before* the
+  existing-row lookup, so a closed-window key is minted as a fresh operation
+  instead of returning `existing` forever.
+- Windows executable resolution follows PATHEXT semantics everywhere:
+  npm-style extensionless shims never beat an invocable `.exe/.cmd/.bat`
+  sibling, batch shims run through the pinned absolute `cmd.exe`, and default
+  interactive sessions resolve the shell through the same shared resolver.
+  Generic command execution retains proxy invocation paths while separately
+  pinning their canonical backing executable.
+  Default PTY shells fail closed: an unresolvable `$SHELL`/bare `cmd.exe` is
+  never handed to a spawner (the absolute system `cmd.exe` or `/bin/sh` is
+  used instead), and the live PTY spawner re-resolves and rejects
+  unresolvable programs with the exact reason. Unix uses `portable-pty` 0.9 so
+  macOS children start with cleared inherited signal masks; Windows remains on
+  0.8.1 because 0.9 enables `PSEUDOCONSOLE_INHERIT_CURSOR`, whose `ESC[6n`
+  handshake blocks an unattended ConPTY before command output. Darwin
+  termination snapshots descendants by controlling TTY, PTY
+  session, and ancestry. It first freezes the dedicated TTY, preventing a
+  waiting parent shell from running its next command when a leaf exits, then
+  directly kills the snapshot and the frozen TTY remainder around the leader
+  signal (Apple `pkill` has no `-s sid` selector). Bounded
+  confirmation checks both the child handle and exact PID state in the process
+  table; an absent PID confirms exit, a zombie is
+  authoritatively reaped, and Darwin's `P_WEXIT` (`E`) state is accepted as
+  committed to kernel exit without a potentially blocking synchronous wait;
+  every ordinary live/observation-error state remains fail-closed.
+- Linux user-CLI discovery covers `~/.local/bin`, Cargo, Nix, npm-global and
+  NVM node bins without sourcing shell startup files; service PATH mismatch is
+  surfaced in diagnostics.
+- The shipped systemd user unit is reconciled with OwnMesh custody and
+  registered workspaces without disabling hardening — this is **process-level
+  and proc-visibility** hardening only; the unit deliberately provides no
+  `ProtectSystem=`-style filesystem confinement or systemd workspace
+  allow-list (every filesystem namespacing directive would force
+  `PrivateUsers=yes` in a per-user service and hide real uids, breaking
+  byte-for-byte custody validation; ADR 0011). The daemon also reads
+  `/proc/self/uid_map` at startup and logs an actionable warning when the
+  effective unit has placed it inside a user namespace that hides real host
+  uids (custody still fails closed; the warning explains cause and
+  remediation). Doctor discloses degraded
+  service protection and honors `SYSTEMD_UNIT_PATH` replace semantics (a
+  unit outside the effective search path is never reported as loaded).
+- `system.diagnose`/`ownmesh doctor` no longer report `healthy` alongside
+  poisoned transition journals, dangerous op-journal pressure, or official
+  profile-discovery failures; durable in-progress operation markers are shown
+  as warnings. Remote session mutations are exactly-once, completed review
+  receipts preserve failed/cancelled phase, and completed session/review
+  retries are looked up before mutable local preflight. Error mapping preserves the actionable cause
+  (Win32 error 193, missing profile executables, journal repair hints).
+  Free-form diagnosis-note redaction also covers marker-plus-filler forms
+  (`token is <long-opaque-value>`, `api key was <value>`), not just
+  assignment/space-delimited shapes.
+- Linux enrollment uses the OS hostname instead of `unknown-host` when
+  environment variables are absent.
+
+## v1.2.12 — Workspace activation and transfer expiry
+
+- Newly registered workspaces stay `pending_activation` until the Agent
+  generation is observed, so `workspace_list` cannot imply execution readiness.
+  A completed remove is not revived by a later stale list of the same generation.
+- `workspace_not_available` now carries a bounded cause and next action.
+  Fresh-passkey `approval_required` responses always include a same-origin
+  `approval_url`. Linux enrollment uses the OS hostname instead of
+  `unknown-host`.
+- Transfer plan/send/status expose typed next-action semantics, expire
+  non-terminal transfers, and revalidate the immutable source at send. The TUI
+  Devices screen can refresh Control Plane inventory on an explicit keypress.
+
 ## v1.2.11 — Crash-safe self-update
 
 - `ownmesh update` now performs the complete signed upgrade lifecycle: session

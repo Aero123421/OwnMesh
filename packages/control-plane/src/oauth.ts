@@ -32,14 +32,18 @@ import {
   applyNoStore,
   bearer,
   BodyTooLargeError,
+  DuplicateFormFieldError,
   html,
   json as jsonBase,
   nowIso,
+  normalizeUserCode,
   readBody,
   readRequestJsonLimited,
   requireScope,
-  verifyPkceS256,
+  pkceS256Challenge,
+  validPkceVerifier,
   sha256Hex,
+  UnsupportedMediaTypeError,
   verifyEd25519Hex,
   type JsonInit,
 } from "./util.ts";
@@ -47,6 +51,23 @@ import {
 /** All OAuth/device JSON responses default to Cache-Control: no-store, no-cache. */
 function json(data: unknown, init: JsonInit = {}): Response {
   return jsonBase(data, { ...init, noStore: true });
+}
+
+async function readOAuthBody(req: Request): Promise<Record<string, string> | Response> {
+  try {
+    return await readBody(req);
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      return json({ error: "invalid_request" }, { status: 413 });
+    }
+    if (error instanceof UnsupportedMediaTypeError) {
+      return json({ error: "unsupported_media_type" }, { status: 415 });
+    }
+    if (error instanceof DuplicateFormFieldError || error instanceof SyntaxError) {
+      return json({ error: "invalid_request" }, { status: 400 });
+    }
+    throw error;
+  }
 }
 
 export type AuthenticatedPrincipal = { id: string; tenant_id: string; display_name?: string };
@@ -175,10 +196,10 @@ export function oauthMetadata(
   return meta;
 }
 
-export function protectedResourceMetadata(resource: string) {
+export function protectedResourceMetadata(resource: string, authorizationServer = resource) {
   return {
     resource,
-    authorization_servers: [resource],
+    authorization_servers: [authorizationServer],
     scopes_supported: [
       "ownmesh.read",
       "ownmesh.write",
@@ -593,7 +614,9 @@ export async function handleToken(
   req: Request,
   store: ControlPlaneStore,
 ): Promise<Response> {
-  const body = await readBody(req);
+  const parsedBody = await readOAuthBody(req);
+  if (parsedBody instanceof Response) return parsedBody;
+  const body = parsedBody;
   const grant = body.grant_type;
   await store.ensureBootstrap();
 
@@ -635,35 +658,25 @@ export async function handleToken(
   }
 
   if (grant === "authorization_code") {
-    if (!body.code || !body.code_verifier || !body.redirect_uri) {
-      return json({ error: "invalid_request" }, { status: 400 });
-    }
-    const auth = await store.takeAuthCode(body.code);
-    if (!auth) return json({ error: "invalid_grant" }, { status: 400 });
-    if (auth.redirect_uri !== body.redirect_uri) {
-      return json(
-        {
-          error: "invalid_grant",
-          error_description: "redirect_uri mismatch",
-        },
-        { status: 400 },
-      );
-    }
-    if (body.client_id && body.client_id !== auth.client_id) {
+    // Keep all code/binding failures indistinguishable and, critically, do not
+    // consume the code until the complete public-client binding matches.
+    if (
+      !body.code || !body.client_id || !body.redirect_uri || !body.code_verifier ||
+      !validPkceVerifier(body.code_verifier)
+    ) {
       return json({ error: "invalid_grant" }, { status: 400 });
     }
-    const pkceOk = await verifyPkceS256(body.code_verifier, auth.code_challenge);
-    if (!pkceOk) {
-      return json(
-        { error: "invalid_grant", error_description: "pkce verification failed" },
-        { status: 400 },
-      );
+    const redemption = await store.redeemAuthCode({
+      code: body.code,
+      clientId: body.client_id,
+      redirectUri: body.redirect_uri,
+      codeChallenge: await pkceS256Challenge(body.code_verifier),
+    });
+    if (redemption.status !== "redeemed") {
+      return json({ error: "invalid_grant" }, { status: 400 });
     }
-    const tok = await store.issueTokens(
-      auth.client_id,
-      auth.principal_id,
-      auth.scope,
-    );
+    const auth = redemption.record;
+    const tok = redemption.token;
     await store.appendAudit({
       id: randomId("aud_"),
       tenant_id: tok.tenant_id,
@@ -775,7 +788,9 @@ export async function handleRevoke(
   req: Request,
   store: ControlPlaneStore,
 ): Promise<Response> {
-  const body = await readBody(req);
+  const parsedBody = await readOAuthBody(req);
+  if (parsedBody instanceof Response) return parsedBody;
+  const body = parsedBody;
   const token = body.token || "";
   if (token) {
     // RFC 7009: always 200. Audit only when the token matches a real issued record,
@@ -802,8 +817,11 @@ export async function handleDeviceAuthorization(
   req: Request,
   store: ControlPlaneStore,
   issuer: string,
+  userCodeGenerator: () => string = generateUserCode,
 ): Promise<Response> {
-  const body = await readBody(req);
+  const parsedBody = await readOAuthBody(req);
+  if (parsedBody instanceof Response) return parsedBody;
+  const body = parsedBody;
   const clientId = body.client_id || "";
   const scope = body.scope || DEFAULT_SCOPE;
   await store.ensureBootstrap();
@@ -813,19 +831,32 @@ export async function handleDeviceAuthorization(
   if (!validScope(scope)) return json({ error: "invalid_scope" }, { status: 400 });
 
   const deviceCode = randomToken("dcode_");
-  const userCode = generateUserCode();
   const verificationUri = `${issuer}/oauth/device`;
   const expiresIn = 900;
-  await store.putDeviceCode({
-    device_code: deviceCode,
-    user_code: userCode,
-    client_id: clientId,
-    scope,
-    verification_uri: verificationUri,
-    interval_sec: 5,
-    expires_at: Date.now() + expiresIn * 1000,
-    status: "pending",
-  });
+  let userCode = "";
+  let created = false;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = normalizeUserCode(userCodeGenerator());
+    if (!candidate) continue;
+    const result = await store.putDeviceCode({
+      device_code: deviceCode,
+      user_code: candidate,
+      client_id: clientId,
+      scope,
+      verification_uri: verificationUri,
+      interval_sec: 5,
+      expires_at: Date.now() + expiresIn * 1000,
+      status: "pending",
+    });
+    if (result === "created") {
+      userCode = candidate;
+      created = true;
+      break;
+    }
+  }
+  if (!created) {
+    return json({ error: "temporarily_unavailable" }, { status: 503 });
+  }
 
   return json({
     device_code: deviceCode,
@@ -859,8 +890,8 @@ export async function handleDeviceVerification(
 
   if (req.method === "GET") {
     const url = new URL(req.url);
-    const userCode = (url.searchParams.get("user_code") || "").trim().toUpperCase();
-    if (!userCode) {
+    const rawUserCode = url.searchParams.get("user_code") || "";
+    if (!rawUserCode.trim()) {
       return html(authPage({
         locale,
         title: authText(locale, { en: "Device sign in — OwnMesh", ja: "デバイスのサインイン — OwnMesh", zh: "设备登录 — OwnMesh", ru: "Вход устройства — OwnMesh" }),
@@ -873,6 +904,13 @@ export async function handleDeviceVerification(
         noStore: true,
         headers: { "content-security-policy": AUTH_PAGE_CSP },
       });
+    }
+    const userCode = normalizeUserCode(rawUserCode);
+    if (!userCode) {
+      return json(
+        { error: "invalid_request", error_description: "malformed device code" },
+        { status: 400 },
+      );
     }
     const dc = await store.getDeviceCodeByUserCode(userCode);
     const client = dc ? await store.getClient(dc.client_id) : null;
@@ -901,7 +939,9 @@ export async function handleDeviceVerification(
     });
   }
   if (req.method === "POST") {
-    const body = await readBody(req);
+    const parsedBody = await readOAuthBody(req);
+    if (parsedBody instanceof Response) return parsedBody;
+    const body = parsedBody;
     if ((body.decision !== "approve" && body.decision !== "deny") || !body.transaction_id || !body.csrf_token) {
       return json({ error: "invalid_request" }, { status: 400 });
     }
@@ -1142,14 +1182,15 @@ export async function handleDevices(
     // Every daemon creates a device-local `ws_default`. Register its id under
     // this exact device at enrollment time so pre-ready and legacy Agents do
     // not inherit another device's same-named custody row. The root never
-    // leaves the Agent.
+    // leaves the Agent, and the reservation stays pending until a generation
+    // is observed.
     await store.putWorkspace({
       workspace_id: "ws_default",
       tenant_id: rec.tenant_id,
       device_id: deviceId,
       owner_principal_id: rec.principal,
       version: 1,
-      active: true,
+      active: false,
       created_at: created,
       updated_at: created,
     });

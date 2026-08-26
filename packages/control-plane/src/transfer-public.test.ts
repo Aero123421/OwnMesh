@@ -46,6 +46,12 @@ test("public transfer tools have strict schemas and plan stores no payload mater
   assert.equal(rejected.error?.message, "invalid transfer plan arguments");
   const unknown = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-3", overwrite: true });
   assert.equal(unknown.error?.message, "unknown transfer argument");
+  const badHash = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-4", overwrite_expected_sha256: "not-a-hash" });
+  assert.equal(badHash.error?.message, "overwrite_expected_sha256 must be 64 lowercase hex characters");
+  const bound = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-5", overwrite_expected_sha256: "ab".repeat(32) });
+  assert.equal((bound.result!.structuredContent!.data.transfer as Record<string, unknown>).overwrite_expected_sha256, "ab".repeat(32));
+  const rebound = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "xfer-5", overwrite_expected_sha256: "cd".repeat(32) });
+  assert.equal(rebound.error?.message, "idempotency_key is bound to a different transfer plan");
 });
 
 test("send dispatches only source authenticated preflight and cancel fences state", async () => {
@@ -59,6 +65,12 @@ test("send dispatches only source authenticated preflight and cancel fences stat
   assert.equal(payload.capability, "transfer.preflight_source");
   assert.equal((payload.arguments as Record<string, unknown>).session_nonce, `nonce_${transferId}`);
   assert.equal(JSON.stringify(sent.result!.structuredContent!.data).includes("ticket"), false);
+  const sentTransfer = sent.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(sentTransfer.next_action, "wait_for_source");
+  assert.equal(sentTransfer.terminal, false);
+  assert.equal(sentTransfer.retryable, true);
+  assert.equal(sentTransfer.phase, "source_preflight");
+  assert.equal(sentTransfer.poll_after_ms, 750);
   const cancelled = await invoke(f, "ownmesh_transfer_cancel", { transfer_id: transferId, idempotency_key: "cancel-1" });
   const transfer = cancelled.result!.structuredContent!.data.transfer as Record<string, unknown>;
   assert.equal(transfer.state, "cancelled");
@@ -376,6 +388,7 @@ test("concurrent public sends claim one start pair and cancel targets only that 
   await f.store.putDevice({ ...destinationDevice, public_key: destinationPublicKey });
   const planSha256 = "a".repeat(64); const sourceSha256 = "b".repeat(64);
   const sourcePreflightId = "op_concurrent_source_preflight"; const destinationPreflightId = "op_concurrent_destination_preflight";
+  const revalidateId = "op_concurrent_source_revalidate";
   const expiresAt = Date.parse(original.expires_at);
   const sourceReply = {
     role: "source" as const, transfer_id: transferId, tenant_id: original.tenant_id, device_id: original.source_device_id,
@@ -403,7 +416,8 @@ test("concurrent public sends claim one start pair and cancel targets only that 
   const ready: TransferPlanMeta = {
     ...original, state: "destination_preflight", plan_sha256: planSha256, source_sha256: sourceSha256, source_size_bytes: 3,
     source_plan_id: "plan_concurrent_source", source_preflight_operation_id: sourcePreflightId,
-    destination_preflight_operation_id: destinationPreflightId, send_idempotency_key: "concurrent-send",
+    destination_preflight_operation_id: destinationPreflightId, source_send_revalidate_operation_id: revalidateId,
+    send_idempotency_key: "concurrent-send",
   };
   await f.store.updateMcpOperation(transferId, { status: "pending", data: { __ownmesh_transfer_plan: ready } });
   for (const [operation_id, device_id, tool, reply] of [
@@ -412,6 +426,12 @@ test("concurrent public sends claim one start pair and cancel targets only that 
   ] as const) {
     await f.store.putMcpOperation({ ...parent, operation_id, correlation_id: operation_id, device_id, tool, status: "completed", summary: "authenticated preflight", data: { transfer_preflight: reply }, idempotency_key: operation_id, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
   }
+  await f.store.putMcpOperation({
+    ...parent, operation_id: revalidateId, correlation_id: revalidateId, device_id: "dev_source",
+    tool: "__transfer_preflight_source_send", status: "completed", summary: "send-boundary source revalidated",
+    data: { source_plan: { plan_id: "plan_concurrent_source", size_bytes: 3, sha256: sourceSha256 } },
+    idempotency_key: revalidateId, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+  });
 
   const sends = await Promise.all([
     invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "concurrent-send" }),
@@ -515,6 +535,11 @@ test("durable plan grant identity survives epoch/fence advance but binds immutab
   const first = await transferGrantPayloadHash(meta, "a".repeat(64), 7);
   assert.equal(await transferGrantPayloadHash({ ...meta, epoch: 2, fence: 2 }, "a".repeat(64), 7), first);
   assert.notEqual(await transferGrantPayloadHash({ ...meta, destination_path: "out/other.bin" }, "a".repeat(64), 7), first);
+  assert.notEqual(
+    await transferGrantPayloadHash({ ...meta, overwrite_expected_sha256: "ab".repeat(32) }, "a".repeat(64), 7),
+    first,
+    "content-bound replacement must change the grant identity",
+  );
 });
 
 test("durable transfer-start outbox recursively excludes bearer, JTI, and ephemeral fields", () => {
@@ -539,4 +564,110 @@ test("transfer start audited facts exclude live bearer and duplicate workspace r
   }), {
     transfer_id: "xfer_1", destination_workspace_id: "ws_destination", epoch: 1, fence: 2,
   });
+});
+
+test("expired planned and sending transfers become terminal on status and send", async () => {
+  const f = await fixture();
+  const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/a.bin", destination_path: "out/a.bin", idempotency_key: "expire-plan" });
+  const transferId = created.result!.structuredContent!.operation_id;
+  const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
+  const meta = parent.data.__ownmesh_transfer_plan as Record<string, unknown>;
+  await f.store.updateMcpOperation(transferId, {
+    status: "pending",
+    data: { __ownmesh_transfer_plan: { ...meta, expires_at: new Date(Date.now() - 1000).toISOString() } },
+  });
+  const status = await invoke(f, "ownmesh_transfer_status", { transfer_id: transferId });
+  const expired = status.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(expired.state, "expired");
+  assert.equal(expired.phase, "expired");
+  assert.equal(expired.terminal, true);
+  assert.equal(expired.retryable, false);
+  assert.equal(expired.next_action, "none");
+  assert.equal(expired.failure_phase, "planned");
+  const send = await invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "expire-send" });
+  assert.equal((send.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "expired");
+  assert.equal(f.routed.length, 0);
+
+  const sendingPlan = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/b.bin", destination_path: "out/b.bin", idempotency_key: "expire-sending-plan" });
+  const sendingId = sendingPlan.result!.structuredContent!.operation_id;
+  const sendingParent = await f.store.getMcpOperation(sendingId); assert.ok(sendingParent);
+  const sendingMeta = sendingParent.data.__ownmesh_transfer_plan as Record<string, unknown>;
+  await f.store.updateMcpOperation(sendingId, {
+    status: "running",
+    data: { __ownmesh_transfer_plan: { ...sendingMeta, state: "sending", expires_at: new Date(Date.now() - 5).toISOString(), source_start_operation_id: "op_exp_source", destination_start_operation_id: "op_exp_destination", source_start_routed: true, destination_start_routed: true } },
+  });
+  for (const [operation_id, device_id] of [["op_exp_source", "dev_source"], ["op_exp_destination", "dev_destination"]] as const) {
+    await f.store.putMcpOperation({ ...sendingParent, operation_id, correlation_id: operation_id, device_id, tool: "__transfer_start", status: "pending", summary: "still pumping", data: {}, idempotency_key: operation_id, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  }
+  const sendingStatus = await invoke(f, "ownmesh_transfer_status", { transfer_id: sendingId });
+  assert.equal((sendingStatus.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "expired");
+  await f.store.updateMcpOperation("op_exp_source", { status: "completed", data: { plan_id: "late_source" } }, ["pending"]);
+  await f.store.updateMcpOperation("op_exp_destination", { status: "completed", data: { plan_id: "late_destination" } }, ["pending"]);
+  const late = await invoke(f, "ownmesh_transfer_status", { transfer_id: sendingId });
+  assert.equal((late.result!.structuredContent!.data.transfer as Record<string, unknown>).state, "expired");
+  const listed = await invoke(f, "ownmesh_transfer_list", {});
+  const listedExpired = (listed.result!.structuredContent!.data.transfers as Array<Record<string, unknown>>).find((entry) => entry.operation_id === sendingId);
+  assert.equal(listedExpired?.state, "expired");
+});
+
+test("send skips completed internal stages and exposes typed next_action", async () => {
+  const f = await fixture();
+  const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/skip.bin", destination_path: "out/skip.bin", idempotency_key: "skip-plan" });
+  const transferId = created.result!.structuredContent!.operation_id;
+  const first = await invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "skip-send" });
+  const firstTransfer = first.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(firstTransfer.state, "source_preflight");
+  const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
+  const meta = parent.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  const sourceId = meta.source_preflight_operation_id!;
+  await f.store.updateMcpOperation(sourceId, {
+    status: "completed",
+    summary: "source hashed",
+    data: {
+      transfer_preflight: { plan_sha256: "c".repeat(64) },
+      source_plan: { plan_id: "plan_skip_source", size_bytes: 4, sha256: "d".repeat(64) },
+    },
+  }, ["pending"]);
+  const advanced = await invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "skip-send" });
+  const advancedTransfer = advanced.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(advancedTransfer.state, "source_final_preflight");
+  assert.equal(advancedTransfer.next_action, "wait_for_source");
+  assert.equal(advancedTransfer.phase, "source_final_preflight");
+  assert.equal((f.routed.at(-1)!.operation.payload as Record<string, unknown>).capability, "transfer.preflight_source");
+});
+
+test("send-boundary source mutation fails closed before tickets are minted", async () => {
+  const f = await fixture();
+  const created = await invoke(f, "ownmesh_transfer_plan", { source_device_id: "dev_source", destination_device_id: "dev_destination", source_workspace_id: "ws_source", destination_workspace_id: "ws_destination", source_path: "in/mut.bin", destination_path: "out/mut.bin", idempotency_key: "mut-plan" });
+  const transferId = created.result!.structuredContent!.operation_id;
+  const parent = await f.store.getMcpOperation(transferId); assert.ok(parent);
+  const original = parent.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  const sourcePreflightId = "op_mut_final"; const destinationPreflightId = "op_mut_dest";
+  const ready: TransferPlanMeta = {
+    ...original, state: "destination_preflight", plan_sha256: "a".repeat(64), source_sha256: "b".repeat(64), source_size_bytes: 8,
+    source_plan_id: "plan_mut_source", source_preflight_operation_id: sourcePreflightId,
+    destination_preflight_operation_id: destinationPreflightId, send_idempotency_key: "mut-send",
+  };
+  await f.store.updateMcpOperation(transferId, { status: "pending", data: { __ownmesh_transfer_plan: ready } });
+  await f.store.putMcpOperation({ ...parent, operation_id: sourcePreflightId, correlation_id: sourcePreflightId, device_id: "dev_source", tool: "__transfer_preflight_source_final", status: "completed", summary: "final", data: { transfer_preflight: { plan_sha256: "a".repeat(64) } }, idempotency_key: sourcePreflightId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  await f.store.putMcpOperation({ ...parent, operation_id: destinationPreflightId, correlation_id: destinationPreflightId, device_id: "dev_destination", tool: "__transfer_preflight_destination", status: "completed", summary: "dest ready", data: { transfer_preflight: { plan_sha256: "a".repeat(64) } }, idempotency_key: destinationPreflightId, created_at: new Date().toISOString(), updated_at: new Date().toISOString() });
+  const waiting = await invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "mut-send" });
+  const waitingTransfer = waiting.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(waitingTransfer.state, "destination_preflight");
+  assert.equal(waitingTransfer.next_action, "wait_for_source");
+  assert.equal(f.liveRouted.length, 0);
+  const current = await f.store.getMcpOperation(transferId); assert.ok(current);
+  const currentMeta = current.data.__ownmesh_transfer_plan as TransferPlanMeta;
+  assert.equal(typeof currentMeta.source_send_revalidate_operation_id, "string");
+  await f.store.updateMcpOperation(currentMeta.source_send_revalidate_operation_id!, {
+    status: "failed",
+    summary: "source changed after preflight evidence",
+    data: { error: { code: "OWNMESH_E_TRANSFER_SOURCE_CHANGED", retryable: false } },
+  }, ["pending"]);
+  const failed = await invoke(f, "ownmesh_transfer_send", { transfer_id: transferId, idempotency_key: "mut-send" });
+  const failedTransfer = failed.result!.structuredContent!.data.transfer as Record<string, unknown>;
+  assert.equal(failedTransfer.state, "failed");
+  assert.equal(failedTransfer.terminal, true);
+  assert.equal(failedTransfer.next_action, "none");
+  assert.equal(f.liveRouted.length, 0);
 });

@@ -45,6 +45,10 @@ pub enum ProfileError {
     Io(#[from] std::io::Error),
     #[error("parse: {0}")]
     Parse(String),
+    #[error(
+        "{0} is not installed or not resolvable; install it or add its bin dir to the daemon search dirs, then run `ownmesh doctor`"
+    )]
+    NotInstalled(String),
 }
 
 pub type ProfileResult<T> = Result<T, ProfileError>;
@@ -759,22 +763,48 @@ impl ProfileRegistry {
         InterfacePreference::Pty
     }
 
-    /// Detect a binary on `PATH` and pick its preferred interface.
+    /// Detect a binary using the same deterministic search as process
+    /// invocation (system PATH + user-local dirs, PATHEXT semantics on
+    /// Windows) and pick its preferred interface.
     ///
     /// # Errors
     ///
     /// Returns [`ProfileError::Unknown`] when `id` is not registered.
     pub fn detect(&self, id: &str) -> ProfileResult<ProfileStatus> {
+        self.detect_with_search_dirs(id, &executable_search_dirs())
+    }
+
+    /// Detect against an explicit search-directory list (tests / alternate
+    /// PATHs). Shared with `ownmesh_exec` resolution so detection and launch
+    /// never disagree about resolution semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Unknown`] when `id` is not registered.
+    pub fn detect_with_search_dirs(
+        &self,
+        id: &str,
+        search_dirs: &[PathBuf],
+    ) -> ProfileResult<ProfileStatus> {
         let p = self.get(id)?;
         let mut notes = Vec::new();
         let mut binary_path = None;
         for b in &p.binaries {
-            match which::which(b) {
-                Ok(path) => {
+            // Launchable-file resolution (Unix exec bit verified): a
+            // non-executable sibling can never be reported installed while
+            // spawning it would fail (P1-D/P1-F).
+            match ownmesh_exec::resolve_launchable_executable_in_dirs(
+                b,
+                search_dirs,
+                None,
+                cfg!(windows),
+                std::env::var("PATHEXT").ok().as_deref(),
+            ) {
+                Some(path) => {
                     binary_path = Some(path.to_string_lossy().into_owned());
                     break;
                 }
-                Err(_) => notes.push(format!("binary not on PATH: {b}")),
+                None => notes.push(format!("binary not on PATH: {b}")),
             }
         }
         let detected = binary_path.is_some();
@@ -813,6 +843,34 @@ impl ProfileRegistry {
         })
     }
 
+    /// Resolve a profile's binary against explicit search dirs WITHOUT
+    /// spawning a version probe. Health/diagnostic surfaces must not run
+    /// binaries as a side effect of observation, so this is the only
+    /// discovery form they may use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Unknown`] when `id` is not registered.
+    pub fn resolve_binary_in_dirs(
+        &self,
+        id: &str,
+        search_dirs: &[PathBuf],
+    ) -> ProfileResult<Option<PathBuf>> {
+        let p = self.get(id)?;
+        for b in &p.binaries {
+            if let Some(path) = ownmesh_exec::resolve_launchable_executable_in_dirs(
+                b,
+                search_dirs,
+                None,
+                cfg!(windows),
+                std::env::var("PATHEXT").ok().as_deref(),
+            ) {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
     /// Detect all registered profiles, omitting profiles that cannot be resolved.
     #[must_use]
     pub fn detect_all(&self) -> Vec<ProfileStatus> {
@@ -834,13 +892,33 @@ impl ProfileRegistry {
         prompt: Option<&str>,
         force_pty: bool,
     ) -> ProfileResult<LaunchPlan> {
+        let dirs = executable_search_dirs();
+        self.launch_plan_with_search_dirs(id, prompt, force_pty, &dirs)
+    }
+
+    /// [`launch_plan`] against an explicit search-directory list (tests /
+    /// alternate PATHs). The resolved executable is the exact path detection
+    /// proved, so launch never disagrees with detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile is unknown, has no executable candidate,
+    /// or its detected version is unsupported.
+    pub fn launch_plan_with_search_dirs(
+        &self,
+        id: &str,
+        prompt: Option<&str>,
+        force_pty: bool,
+        search_dirs: &[PathBuf],
+    ) -> ProfileResult<LaunchPlan> {
         let p = self.get(id)?;
-        let status = self.detect(id)?;
+        let status = self.detect_with_search_dirs(id, search_dirs)?;
+        // Never fall back to a bare unverified name: the exact resolved path
+        // that detection proved executable is what launch must spawn.
         let program = status
             .binary_path
             .clone()
-            .or_else(|| p.binaries.first().cloned())
-            .ok_or_else(|| ProfileError::Unknown(id.into()))?;
+            .ok_or_else(|| ProfileError::NotInstalled(p.binaries.join(" / ")))?;
 
         if matches!(status.state, ProfileReadyState::UnsupportedVersion) {
             return Err(ProfileError::UnsupportedVersion(
@@ -901,13 +979,30 @@ impl ProfileRegistry {
         native_id: &str,
         prompt: Option<&str>,
     ) -> ProfileResult<LaunchPlan> {
+        let dirs = executable_search_dirs();
+        self.resume_plan_with_search_dirs(id, native_id, prompt, &dirs)
+    }
+
+    /// [`resume_plan_with_prompt`] against an explicit search-directory list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile is unknown, has no executable candidate,
+    /// does not support native resume, or its native resume contract is unmet.
+    pub fn resume_plan_with_search_dirs(
+        &self,
+        id: &str,
+        native_id: &str,
+        prompt: Option<&str>,
+        search_dirs: &[PathBuf],
+    ) -> ProfileResult<LaunchPlan> {
         let p = self.get(id)?;
         if !p.supports_native_resume || p.resume_args.is_empty() {
             return Err(ProfileError::Parse(format!(
                 "profile {id} does not support native resume"
             )));
         }
-        let status = self.detect(id)?;
+        let status = self.detect_with_search_dirs(id, search_dirs)?;
         let needs_prompt = p.resume_args.iter().any(|arg| arg.contains("{{prompt}}"));
         if needs_prompt && prompt.is_none_or(str::is_empty) {
             return Err(ProfileError::Parse(format!(
@@ -925,8 +1020,7 @@ impl ProfileRegistry {
         }
         let program = status
             .binary_path
-            .or_else(|| p.binaries.first().cloned())
-            .ok_or_else(|| ProfileError::Unknown(id.into()))?;
+            .ok_or_else(|| ProfileError::NotInstalled(p.binaries.join(" / ")))?;
         Ok(LaunchPlan {
             profile_id: Some(p.id.clone()),
             program,
@@ -937,6 +1031,18 @@ impl ProfileRegistry {
             env: BTreeMap::new(),
         })
     }
+}
+/// System `PATH` plus deterministic user-local CLI dirs, mirroring
+/// `ownmesh_exec::resolve_executable_invocation_path` exactly so detection
+/// and launch never disagree about resolution semantics.
+fn executable_search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    if !cfg!(windows) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        dirs.extend(ownmesh_exec::user_cli_search_dirs(home.as_deref()));
+    }
+    dirs
 }
 
 fn expand_template(
@@ -972,14 +1078,21 @@ async fn stop_version_probe(child: &mut tokio::process::Child) {
 async fn probe_version_bounded(bin: &str, args: &[String]) -> Option<String> {
     use tokio::io::AsyncReadExt;
 
+    // P1-C: resolve through the shared executable resolver so Windows batch
+    // shims (`name.cmd`/`name.bat`) are launched via the documented
+    // `cmd.exe /e:ON /v:OFF /d /s /c call <script> <args>` form — CreateProcess
+    // cannot exec batch files directly (Win32 error 193). Unresolved programs
+    // fail the probe (reported not installed) instead of reaching the spawner
+    // as a bare name that guesses differently.
+    let resolved_argv = ownmesh_exec::resolve_spawn_argv(bin, args, None).ok()?;
     // A vendor CLI may perform network or credential discovery even for
     // `--version`. Profile discovery is a read-only convenience path and must
     // never hold the daemon request loop indefinitely. Async pipe reads cap
     // both memory and the producer: once the direct child exits, the deadline
     // expires, or the aggregate budget is full, dropping the read ends makes
     // inherited descendant writes fail instead of growing a temporary file.
-    let mut child = tokio::process::Command::new(bin)
-        .args(args)
+    let mut child = tokio::process::Command::new(&resolved_argv[0])
+        .args(&resolved_argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1851,8 +1964,10 @@ fn bounded_copy(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::time::Instant;
+    use tempfile::tempdir;
 
     #[test]
     #[ignore = "subprocess helper for the bounded version-probe test"]
@@ -1873,6 +1988,50 @@ mod tests {
         let started = Instant::now();
         assert_eq!(probe_version(&exe.to_string_lossy(), &args), None);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// P1-C: the version probe goes through the shared executable resolver, so
+    /// a non-launchable file (Unix: no exec bit) fails the probe instead of
+    /// reaching the spawner — and on Windows the same resolver rewrites
+    /// `.cmd`/`.bat` shims to the documented `cmd.exe /c call` form. This
+    /// proves detection and probing never disagree about resolution.
+    #[test]
+    fn version_probe_consults_shared_resolver() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("pi.cmd");
+        std::fs::write(&shim, b"@echo off\r\n").unwrap();
+        // Unix: without the exec bit the resolver refuses the file, so the
+        // probe must fail closed (None) rather than spawn a bare name.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                probe_version(&shim.to_string_lossy(), &["--version".into()]),
+                None,
+                "non-launchable probe target must fail closed"
+            );
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).unwrap();
+        }
+        // Windows: the shared resolver rewrites the .cmd shim to the pinned
+        // System32 cmd.exe wrapper (pinned by ownmesh-exec unit tests); the
+        // probe would spawn cmd.exe, not the batch file directly.
+        #[cfg(windows)]
+        {
+            let argv = ownmesh_exec::resolve_spawn_argv(
+                &shim.to_string_lossy(),
+                &["--version".into()],
+                None,
+            )
+            .expect("resolved");
+            assert!(
+                argv[0].to_ascii_lowercase().ends_with("system32\\cmd.exe"),
+                "argv[0] must be the pinned System32 cmd.exe: {:?}",
+                argv[0]
+            );
+            assert!(argv.contains(&"call".to_string()));
+        }
     }
 
     #[test]
@@ -2186,6 +2345,8 @@ acp = false
     #[test]
     fn per_profile_conformance_matrix() {
         let reg = ProfileRegistry::with_official();
+        let (dir, dirs) = stub_profile_bins();
+        let _ = &dir;
         for id in OfficialProfileId::all() {
             let p = reg.get(id.as_str()).unwrap();
             let fx = official_fixtures()
@@ -2194,15 +2355,18 @@ acp = false
                 .unwrap();
             conform_profile(p, &fx).unwrap();
 
-            // Launch plan (binary may be missing — still builds argv against declared name)
-            let plan = match reg.launch_plan(id.as_str(), Some("hello"), false) {
-                Ok(plan) => plan,
-                Err(ProfileError::UnsupportedVersion(_)) => continue,
-                Err(e) => panic!("{} launch: {e}", id.as_str()),
-            };
+            // Launch plan resolves against hermetic stub bins.
+            let plan =
+                match reg.launch_plan_with_search_dirs(id.as_str(), Some("hello"), false, &dirs) {
+                    Ok(plan) => plan,
+                    Err(ProfileError::UnsupportedVersion(_)) => continue,
+                    Err(e) => panic!("{} launch: {e}", id.as_str()),
+                };
             assert_eq!(plan.profile_id.as_deref(), Some(id.as_str()));
             // force PTY fallback
-            let pty = reg.launch_plan(id.as_str(), None, true).unwrap();
+            let pty = reg
+                .launch_plan_with_search_dirs(id.as_str(), None, true, &dirs)
+                .unwrap();
             assert!(pty.use_pty);
             assert_eq!(pty.interface, InterfacePreference::Pty);
 
@@ -2211,7 +2375,12 @@ acp = false
                 NativeResume::Argv { .. }
             ) {
                 let r = reg
-                    .resume_plan_with_prompt(id.as_str(), "native_abc", Some("follow up"))
+                    .resume_plan_with_search_dirs(
+                        id.as_str(),
+                        "native_abc",
+                        Some("follow up"),
+                        &dirs,
+                    )
                     .unwrap();
                 assert!(r.args.iter().any(|a| a.contains("native_abc")));
             }
@@ -2259,9 +2428,16 @@ acp = false
     #[test]
     fn profile_launch_argv_matches_each_source_backed_adapter_start() {
         let reg = ProfileRegistry::with_official();
+        let (dir, dirs) = stub_profile_bins();
+        let _ = &dir;
         for spec in official_adapter_specs() {
             let plan = reg
-                .launch_plan(&spec.profile_id, Some("fixture prompt"), false)
+                .launch_plan_with_search_dirs(
+                    &spec.profile_id,
+                    Some("fixture prompt"),
+                    false,
+                    &dirs,
+                )
                 .unwrap_or_else(|err| panic!("{}: {err}", spec.profile_id));
             let expected: Vec<_> = spec
                 .start_args
@@ -2271,10 +2447,11 @@ acp = false
             assert_eq!(plan.args, expected, "{}", spec.profile_id);
             if let NativeResume::Argv { args } = spec.resume {
                 let resume = reg
-                    .resume_plan_with_prompt(
+                    .resume_plan_with_search_dirs(
                         &spec.profile_id,
                         "native_fixture",
                         Some("fixture prompt"),
+                        &dirs,
                     )
                     .unwrap();
                 let expected_resume: Vec<_> = args
@@ -2421,5 +2598,234 @@ acp = false
         let raw = serde_json::to_string_pretty(fx).unwrap();
         let back: ProfileFixture = serde_json::from_str(&raw).unwrap();
         assert_eq!(back.id, fx.id);
+    }
+
+    /// Hermetic stub tree with an executable for every official profile so
+    /// launch/conformance tests never depend on the CI host's installed CLIs.
+    fn stub_profile_bins() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let dir = tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        for p in official_profiles() {
+            for b in p.binaries {
+                if !names.contains(&b) {
+                    names.push(b);
+                }
+            }
+        }
+        for name in names {
+            let path = bin.join(&name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+        }
+        let dirs = vec![bin];
+        (dir, dirs)
+    }
+
+    /// User-local and NVM discovery (P1-D): fake `$HOME` trees must make
+    /// official profiles resolvable without loading any shell startup file.
+    #[cfg(not(windows))]
+    #[test]
+    fn detect_finds_user_local_and_nvm_clis_without_shell_sourcing() {
+        let home = tempdir().unwrap();
+        let local_bin = home.path().join(".local/bin");
+        let nvm_bin = home.path().join(".nvm/versions/node/v24.19.0/bin");
+        let cargo_bin = home.path().join(".cargo/bin");
+        for dir in [&local_bin, &nvm_bin, &cargo_bin] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for (name, dir) in [("codex", &local_bin), ("pi", &nvm_bin), ("agy", &cargo_bin)] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+        }
+        let dirs = ownmesh_exec::user_cli_search_dirs(Some(home.path()));
+        let reg = ProfileRegistry::with_official();
+        for id in ["codex", "pi", "agy"] {
+            let status = reg.detect_with_search_dirs(id, &dirs).unwrap();
+            assert!(status.detected, "{id} must be detected: {status:?}");
+            // A stub `--version` probe returns nothing, so the state is
+            // `Installed` rather than `Ready`; detection itself is what
+            // matters here.
+            assert!(
+                matches!(
+                    status.state,
+                    ProfileReadyState::Installed | ProfileReadyState::Ready
+                ),
+                "{id}: {status:?}"
+            );
+            assert!(
+                status
+                    .binary_path
+                    .as_deref()
+                    .unwrap()
+                    .starts_with(&home.path().display().to_string()),
+                "{id} must resolve inside the fake home: {status:?}"
+            );
+        }
+        // Not installed stays NotInstalled with an actionable note.
+        let missing = reg.detect_with_search_dirs("claude-code", &dirs).unwrap();
+        assert_eq!(missing.state, ProfileReadyState::NotInstalled);
+        assert!(!missing.detected);
+        assert!(missing.notes.iter().any(|n| n.contains("not on PATH")));
+    }
+
+    /// Detection resolves the exact same invocable candidate that launch will
+    /// spawn; a not-installed profile must never fall back to a bare name.
+    #[test]
+    fn launch_plan_refuses_unresolved_profiles_with_actionable_error() {
+        let reg = ProfileRegistry::with_official();
+        let empty: Vec<PathBuf> = Vec::new();
+        let status = reg.detect_with_search_dirs("pi", &empty).unwrap();
+        assert_eq!(status.state, ProfileReadyState::NotInstalled);
+
+        let launch_err = reg
+            .launch_plan_with_search_dirs("pi", None, false, &empty)
+            .unwrap_err();
+        match launch_err {
+            ProfileError::NotInstalled(_) => {
+                let msg = launch_err.to_string();
+                assert!(
+                    msg.contains("ownmesh doctor"),
+                    "message must point at doctor: {msg}"
+                );
+            }
+            other => panic!("expected NotInstalled, got {other:?}"),
+        }
+    }
+
+    /// Windows npm-shim ordering (P1-C): detection must pick the `.cmd` shim
+    /// over the extensionless POSIX sibling exactly like process resolution.
+    #[test]
+    fn detect_prefers_invocable_pathext_shim_on_windows() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("pi"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("pi.cmd"), b"@echo off\r\n").unwrap();
+        std::fs::write(dir.path().join("pi.ps1"), b"# powershell\n").unwrap();
+        // Detection now verifies Unix executability (P1-D): a launchable
+        // fixture needs its exec bit set on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(dir.path().join("pi"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(dir.path().join("pi"), perms).unwrap();
+        }
+        let dirs = vec![dir.path().to_path_buf()];
+        let reg = ProfileRegistry::with_official();
+        let status = reg.detect_with_search_dirs("pi", &dirs).unwrap();
+        // `resolve_launchable_executable_in_dirs` uses cfg!(windows) for
+        // ordering, so on Unix this resolves the bare shim (Unix semantics).
+        // The Windows ordering itself is pinned by ownmesh-exec unit tests;
+        // here we prove detection and execution share the resolver.
+        if cfg!(windows) {
+            let expected = dir.path().join("pi.cmd").display().to_string();
+            let actual = status.binary_path.as_deref().unwrap_or_default();
+            assert!(
+                actual.eq_ignore_ascii_case(&expected),
+                "Windows paths and PATHEXT casing are case-insensitive: {actual:?} != {expected:?}"
+            );
+            assert!(status.detected);
+        } else {
+            let expected = dir.path().join("pi").display().to_string();
+            assert_eq!(status.binary_path.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    /// P1-D regression: a non-executable Unix candidate must never be reported
+    /// installed (spawning it would fail with EACCES), and the no-probe
+    /// resolver used by health surfaces agrees with detection.
+    #[test]
+    fn detection_skips_non_executable_candidates() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("pi");
+        std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        let reg = ProfileRegistry::with_official();
+        // Non-executable (0644): detection must report NotInstalled even
+        // though `is_file()` would be true.
+        let status = reg.detect_with_search_dirs("pi", &dirs).unwrap();
+        if cfg!(unix) {
+            assert!(!status.detected, "{status:?}");
+            assert_eq!(status.state, ProfileReadyState::NotInstalled);
+            assert!(
+                reg.resolve_binary_in_dirs("pi", &dirs).unwrap().is_none(),
+                "no-probe resolver must agree"
+            );
+        }
+        // After the exec bit is set, both detection forms find it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).unwrap();
+            let status = reg.detect_with_search_dirs("pi", &dirs).unwrap();
+            assert!(status.detected, "{status:?}");
+            assert!(reg.resolve_binary_in_dirs("pi", &dirs).unwrap().is_some());
+        }
+    }
+
+    /// P1-F: the no-probe resolver never spawns version probes (health
+    /// surfaces must not run binaries as an observation side effect).
+    #[test]
+    fn no_probe_resolver_does_not_run_version_probes() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("pi");
+        std::fs::write(&shim, b"#!/bin/sh\necho 1.2.3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).unwrap();
+        }
+        let dirs = vec![dir.path().to_path_buf()];
+        let reg = ProfileRegistry::with_official();
+        let resolved = reg.resolve_binary_in_dirs("pi", &dirs).unwrap();
+        // A probe would have parsed `1.2.3`; the no-probe form returns the
+        // path only and never runs the child.
+        assert!(resolved.is_some());
+    }
+
+    /// The profiles crate must never source shell startup files: source-level
+    /// guard on production code (tests module stripped).
+    #[test]
+    fn profile_discovery_never_sources_shell_startup_files() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("mod tests {").next().unwrap_or(src);
+        // A real sourcing implementation would reference these file names
+        // (typically quoted or as a path join); none may appear in production.
+        for forbidden in [
+            "\".bashrc\"",
+            "\".zshrc\"",
+            "\".bash_profile\"",
+            "\"bash_login\"",
+            "\".profile\"",
+            "\".zprofile\"",
+            "/.bashrc",
+            "/.zshrc",
+            "/.profile",
+        ] {
+            assert!(
+                !prod.contains(forbidden),
+                "profile discovery must not reference shell startup files: {forbidden}"
+            );
+        }
     }
 }

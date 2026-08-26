@@ -1,0 +1,28 @@
+[package]
+name = "ownmesh-transition-journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Owner-only durable intent journal for sidecar controller transitions (shared model + validation)"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+# Test-only API surface (unvalidated journal injection) used by the daemon's
+# fail-closed regression tests; never enabled in release builds.
+test-support = []
+
+[dependencies]
+ownmesh-ipc = { path = "../ownmesh-ipc" }
+ownmesh-session = { path = "../ownmesh-session" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

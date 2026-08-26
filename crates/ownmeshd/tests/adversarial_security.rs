@@ -44,7 +44,41 @@ use runtime::{runtime_handler, session_methods, DaemonRuntime, WorkspaceEntry};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use tempfile::tempdir;
+/// Owner-only tempdir: `tempfile` respects the process umask, and the daemon
+/// custody attestation rejects group/world-writable ancestors, so tests pin
+/// mode 0700 to stay umask-independent.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    let dir = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn compile_multicall_fixture(output_dir: &std::path::Path) -> std::path::PathBuf {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-fixtures/executable-multicall.rs");
+    let output = output_dir.join(if cfg!(windows) {
+        "ownmesh-security-multicall-fixture.exe"
+    } else {
+        "ownmesh-security-multicall-fixture"
+    });
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let status = std::process::Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("-C")
+        .arg("debuginfo=0")
+        .arg(&source)
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .expect("launch rustc for deterministic multicall fixture");
+    assert!(status.success(), "compile deterministic multicall fixture");
+    output
+}
 use tokio::sync::Mutex;
 
 fn now_unix() -> i64 {
@@ -529,15 +563,234 @@ async fn approval_delay_cannot_swap_structured_symlink_to_shell() {
 
     std::fs::remove_file(&alias).unwrap();
     symlink("/bin/sh", &alias).unwrap();
-    // IPC approve is fail-closed; exercise pin revalidation via direct runtime dispatch.
-    let approved = direct_human_approve(&runtime, &approval_id, false, None)
+    // The approved action named this exact proxy entry. Retargeting it must
+    // fail closed; silently substituting the canonical backing changes argv0
+    // semantics and is not the action the human approved.
+    let denied = direct_human_approve(&runtime, &approval_id, false, None)
         .await
-        .expect("approval must execute the safely pinned canonical echo target");
-    assert_eq!(approved["approval_required"], false);
+        .expect_err("retargeted invocation must require fresh authorization");
+    match denied {
+        IpcError::Remote { code, message } => {
+            assert_eq!(code, app_error::EXECUTABLE_IDENTITY_DRIFT);
+            assert!(message.contains("OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT"));
+        }
+        other => panic!("unexpected drift error: {other:?}"),
+    }
     assert!(
         !shell_marker.exists(),
         "the swapped shell alias must never be reopened or executed"
     );
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn approval_delay_never_falls_back_to_multicall_backing_argv0() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    let client = named_client(endpoint, paths.runtime_dir.clone(), "ownmesh");
+    let backing = compile_multicall_fixture(dir.path());
+    let alias = dir.path().join("echo");
+    let canary = dir.path().join("unapproved-multicall-branch");
+    symlink(&backing, &alias).unwrap();
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask structured, deny raw".into()),
+            rules: vec![
+                PolicyRule {
+                    id: "deny-raw".into(),
+                    decision: Decision::Deny,
+                    priority: 100,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("raw_shell".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "ask-structured".into(),
+                    decision: Decision::Ask,
+                    priority: 10,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("structured".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+            ],
+        });
+    }
+
+    let pending = client
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": alias,
+                "args": ["shell", canary.to_string_lossy()],
+                "idempotency_key": "approval-multicall-recreate",
+            })),
+        )
+        .await
+        .expect("enqueue harmless echo proxy semantics");
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    // Same target and content, but a different proxy directory entry. The old
+    // fallback launched `backing` directly, changing argv0 and selecting the
+    // fixture's canary branch.
+    let recreated = dir.path().join("echo-recreated");
+    symlink(&backing, &recreated).unwrap();
+    std::fs::rename(&recreated, &alias).unwrap();
+    let denied = direct_human_approve(&runtime, &approval_id, false, None)
+        .await
+        .expect_err("recreated proxy must require fresh authorization");
+    assert_remote_code(denied, app_error::EXECUTABLE_IDENTITY_DRIFT);
+    assert!(!canary.exists(), "unapproved multicall branch must not run");
+
+    server.request_shutdown();
+    let _ = handle.await;
+}
+
+/// P0-B review (Medium/high): generic `command.run` must retain the
+/// *invocation* path (resolved but not canonicalized) for proxy executables
+/// such as rustup's `cargo` (whose argv[0] filename drives dispatch) while
+/// pinning the canonical backing path for identity. The old code replaced the
+/// request program with the canonical backing, so a rustup-style proxy would
+/// spawn the backing binary under the wrong argv[0] and fail. Review pinning
+/// already keeps both paths (`invocation_pin`/`pin`); command execution must
+/// not disagree. The swap test above proves a changed invocation is rejected
+/// instead of falling back to a different argv0.
+#[cfg(unix)]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn command_run_retains_invocation_path_and_pins_both_identities() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().unwrap();
+    let paths = OwnMeshPaths::for_base(dir.path());
+    let (server, handle, endpoint, runtime) = start_test_daemon(&paths).await;
+    let client = named_client(endpoint, paths.runtime_dir.clone(), "ownmesh");
+
+    {
+        let mut guard = runtime.lock().await;
+        guard.set_policy_for_test(PolicyDocument {
+            preset: AccessPreset::Custom,
+            note: Some("ask structured, deny raw".into()),
+            rules: vec![
+                PolicyRule {
+                    id: "deny-raw".into(),
+                    decision: Decision::Deny,
+                    priority: 100,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("raw_shell".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+                PolicyRule {
+                    id: "ask-structured".into(),
+                    decision: Decision::Ask,
+                    priority: 10,
+                    capability: "command.run".into(),
+                    when_elevated: None,
+                    when_kind: Some("structured".into()),
+                    path_prefix: None,
+                    program_equals: None,
+                    when_tag: None,
+                    description: None,
+                },
+            ],
+        });
+    }
+
+    // A deterministic multicall proxy: the approved basename `echo` selects
+    // its harmless branch, while launching the backing under its own basename
+    // would interpret argv[1] as a subcommand selector.
+    let backing = compile_multicall_fixture(dir.path());
+    let alias = dir.path().join("echo");
+    symlink(&backing, &alias).unwrap();
+
+    let pending = client
+        .call(
+            methods::OPS_EXEC,
+            Some(json!({
+                "kind": "structured",
+                "program": alias.to_string_lossy(),
+                "args": ["normal-proxy"],
+                "idempotency_key": "invocation-path-retain-1",
+            })),
+        )
+        .await
+        .expect("enqueue structured command");
+    let approval_id = pending["approval_id"].as_str().unwrap().to_owned();
+
+    {
+        let guard = runtime.lock().await;
+        let record = guard
+            .approvals
+            .get(&approval_id)
+            .expect("deferred approval record");
+        let runtime::PendingRequest::Exec(params) = &record.request else {
+            panic!("expected an Exec request");
+        };
+        // The invocation path (the symlink name) is retained as the spawn
+        // program so argv[0]-driven proxy dispatch keeps working — it is
+        // never canonicalized away to the backing binary.
+        assert_eq!(
+            params.program,
+            alias.to_string_lossy(),
+            "command.run must keep the invocation path, not canonicalize it away"
+        );
+        // The invocation path is pinned separately…
+        let invocation_pin = params
+            .invocation_pin
+            .as_ref()
+            .expect("invocation pin must be set");
+        assert_eq!(invocation_pin.path, alias.to_string_lossy());
+        assert_eq!(invocation_pin.policy_kind, "structured");
+        // …and the canonical backing is pinned separately for identity.
+        let backing_pin = params
+            .executable_pin
+            .as_ref()
+            .expect("backing pin must be set");
+        assert_ne!(
+            backing_pin.path,
+            alias.to_string_lossy(),
+            "the backing pin must point at the canonical target, not the alias"
+        );
+        assert!(std::path::Path::new(&backing_pin.path).is_absolute());
+        assert_eq!(backing_pin.policy_kind, "structured");
+        let facts = record.facts.as_ref().expect("approval facts");
+        assert_eq!(
+            facts
+                .invocation_identity
+                .as_ref()
+                .expect("invocation identity fact")
+                .path,
+            alias.to_string_lossy()
+        );
+    }
+
+    let approved = direct_human_approve(&runtime, &approval_id, false, None)
+        .await
+        .expect("unchanged proxy invocation must run");
+    assert_eq!(approved["approval_required"], false);
+    assert_eq!(approved["result"]["exit_code"], 0);
+    assert_eq!(approved["result"]["stdout"], "normal-proxy\n");
 
     server.request_shutdown();
     let _ = handle.await;
@@ -1891,7 +2144,7 @@ async fn production_approval_rejects_executable_content_swap_toctou() {
         .expect_err("content-swapped executable must fail closed");
     match denied {
         IpcError::Remote { code, message } => {
-            assert_eq!(code, app_error::POLICY_DENIED, "{message}");
+            assert_eq!(code, app_error::EXECUTABLE_IDENTITY_DRIFT, "{message}");
             let lower = message.to_ascii_lowercase();
             assert!(
                 lower.contains("identity")
@@ -2200,6 +2453,9 @@ async fn production_command_run_temporary_grant_never_issued_or_matched() {
         len: 64,
         device: Some(1),
         inode: Some(2),
+        path_device: Some(1),
+        path_inode: Some(2),
+        link_target: None,
         policy_kind: kind.into(),
     };
     {
@@ -2414,6 +2670,7 @@ async fn production_filesystem_temporary_grant_still_works() {
         let guard = runtime.lock().await;
         assert_eq!(guard.grants_for_test().len(), 1);
         let grant = &guard.grants_for_test()[0];
+        let grant = grant.as_temporary().expect("temporary filesystem grant");
         assert_eq!(grant.capability, "filesystem.write");
         // The grant records the approved path. Before it did, `path_prefix` was
         // `None`, which the matcher reads as "every path".

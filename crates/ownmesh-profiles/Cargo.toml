@@ -19,7 +19,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
 toml = "0.8"
-which = "7"
+ownmesh-exec = { path = "../ownmesh-exec" }
 
 [dev-dependencies]
 tempfile = "3"

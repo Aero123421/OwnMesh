@@ -19,11 +19,25 @@
 )]
 
 use ownmesh_diagnostics::{
-    build_support_bundle, redact_text, run_doctor, BinaryObservation, CheckStatus,
-    ConfigObservation, ControlPlaneObservation, CredentialObservation, CredentialState,
-    DaemonObservation, DoctorInput, PrivacyPolicyObservation, ServiceObservation,
+    prepare_support_bundle, redact_text, run_doctor, write_prepared_support_bundle,
+    BinaryObservation, CheckStatus, ConfigObservation, ControlPlaneObservation,
+    CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
+    DoctorInput, DoctorOutcome, JournalsObservation, PrivacyPolicyObservation,
+    PublicDiagnosticEvent, PublicJournalHealth, PublicPlatformFacts, PublicServiceFacts,
+    ServiceObservation, SupportBundleError, SupportBundleInput,
 };
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            hex.push(char::from(HEX[usize::from(byte >> 4)]));
+            hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            hex
+        })
+}
 
 fn base_input() -> DoctorInput {
     DoctorInput {
@@ -53,11 +67,20 @@ fn base_input() -> DoctorInput {
             auth_session_present: true,
             enrolled_device_id_present: true,
         },
+        credential_store: CredentialStoreObservation {
+            metadata_present: true,
+            backend_name: Some("preferred(os-keychain)".into()),
+            fallback_policy: Some("primary_preferred_encrypted_file_fallback".into()),
+            degraded: false,
+            residual_fallback_entries: 0,
+            read_error: None,
+        },
         daemon: DaemonObservation {
             endpoint: Some("local".into()),
             reachable: true,
             pid: Some(1),
             message: None,
+            agent_route: Some("online".into()),
         },
         control_plane: ControlPlaneObservation {
             configured: true,
@@ -65,6 +88,7 @@ fn base_input() -> DoctorInput {
             probed: false,
             reachable: None,
             http_status: None,
+            reported_version: None,
             message: None,
         },
         privacy_policy: PrivacyPolicyObservation {
@@ -86,7 +110,13 @@ fn base_input() -> DoctorInput {
             running: Some(true),
             unit_path: None,
             message: None,
+            hardening: None,
+            // Non-Linux/undetectable in the base fixture; linger-specific
+            // rows are covered by dedicated tests below.
+            linger: None,
         },
+        journals: JournalsObservation::default(),
+        profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
     }
 }
 
@@ -106,6 +136,119 @@ fn doctor_passes_when_telemetry_and_relay_off() {
         .find(|c| c.id == "privacy.relay")
         .unwrap();
     assert_eq!(rel.status, CheckStatus::Pass);
+}
+
+/// #141: an offline Agent route while the daemon is reachable must fail the
+/// report — a green /health or local IPC must not hide an offline ChatGPT
+/// device.
+#[test]
+fn offline_agent_route_fails_the_report_while_daemon_is_up() {
+    let mut input = base_input();
+    input.daemon.agent_route = Some("offline".into());
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "daemon.agent_route")
+        .expect("offline route must be disclosed");
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert!(!report.ok && report.outcome == DoctorOutcome::Error);
+}
+
+#[test]
+fn online_agent_route_passes_and_absent_route_is_omitted() {
+    let online = run_doctor(&base_input());
+    let check = online
+        .checks
+        .iter()
+        .find(|check| check.id == "daemon.agent_route")
+        .expect("online route row present");
+    assert_eq!(check.status, CheckStatus::Pass);
+
+    // Older daemon (method unsupported): the row is omitted, not guessed.
+    let mut absent = base_input();
+    absent.daemon.agent_route = None;
+    let report = run_doctor(&absent);
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|check| check.id == "daemon.agent_route"),
+        "unknown route must not fabricate a check"
+    );
+}
+
+/// #143: Linger=no on an otherwise ready device is a warn that names the
+/// operator command; OwnMesh never enables lingering itself.
+#[test]
+fn linux_linger_off_warns_without_enabling_anything() {
+    let mut input = base_input();
+    input.service.linger = Some(false);
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.linger")
+        .expect("linger=no must be disclosed");
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(check.message.contains("loginctl enable-linger"));
+    // The warn lifts the outcome to Warn (still exit-ok, never healthy).
+    assert!(report.outcome == DoctorOutcome::Warn);
+
+    let mut lingering = base_input();
+    lingering.service.linger = Some(true);
+    let report = run_doctor(&lingering);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.linger")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass);
+}
+
+/// #144: a fully-baselined hardening unit still discloses that
+/// RestrictNamespaces=yes blocks containers/sandbox tools.
+#[test]
+fn baseline_hardening_pass_discloses_namespace_restriction() {
+    let mut input = base_input();
+    let hardening = ownmesh_diagnostics::ServiceHardeningObservation {
+        no_new_privileges: true,
+        umask_set: true,
+        restrict_suidsgid: true,
+        restrict_realtime: true,
+        lock_personality: true,
+        system_call_architectures: true,
+        restrict_namespaces: true,
+        protect_proc: true,
+        ..Default::default()
+    };
+    input.service.hardening = Some(hardening);
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.hardening")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass);
+    assert!(check.message.contains("RestrictNamespaces=yes"));
+    assert!(check.message.contains("RestrictNamespaces=no"));
+}
+
+#[test]
+fn doctor_surfaces_credential_fallback_provenance() {
+    let mut input = base_input();
+    input.credential_store.backend_name = Some("preferred(encrypted-file)".into());
+    input.credential_store.degraded = true;
+    input.credential_store.residual_fallback_entries = 2;
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "credential.store")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(check.message.contains("encrypted-file"));
+    assert!(check.message.contains("residual_fallback_entries=2"));
 }
 
 #[test]
@@ -153,23 +296,140 @@ fn credential_states_are_explicit_without_values() {
     assert!(!json.contains("refresh_token"));
 }
 
+fn support_input() -> SupportBundleInput {
+    SupportBundleInput {
+        doctor: run_doctor(&base_input()),
+        platform: PublicPlatformFacts {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            ownmesh_version: "1.2.17".into(),
+        },
+        service: PublicServiceFacts {
+            platform: "systemd-user".into(),
+            supported: true,
+            installed: true,
+            running: Some(true),
+            hardening_summary: Some("baseline active".into()),
+        },
+        journal_health: PublicJournalHealth::default(),
+        recent_events: vec![PublicDiagnosticEvent {
+            kind: "service".into(),
+            message: "daemon ready".into(),
+        }],
+    }
+}
+
 #[test]
-fn support_bundle_always_redacted_and_strips_secrets() {
-    let doctor = run_doctor(&DoctorInput::default());
-    let mut sections = BTreeMap::new();
-    sections.insert(
-        "env".into(),
-        "access_token=super-secret-value\npassword=hunter2\n innocuous".into(),
+fn support_bundle_is_typed_scanned_and_preview_bytes_are_exact_export() {
+    let prepared = prepare_support_bundle(support_input(), 1_700_000_000).unwrap();
+    assert_eq!(prepared.schema_version(), 2);
+    assert_eq!(prepared.sha256_hex().len(), 64);
+    assert_eq!(prepared.size(), prepared.bytes().len());
+    let serialized = std::str::from_utf8(prepared.bytes()).unwrap();
+    assert!(serialized.contains("journal_health"));
+    assert!(!serialized.contains("sections"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("support.json");
+    write_prepared_support_bundle(&path, &prepared).unwrap();
+    let exported = std::fs::read(&path).unwrap();
+    assert_eq!(exported, prepared.bytes());
+    assert_eq!(sha256_hex(&exported), prepared.sha256_hex());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn support_bundle_secret_scanner_fails_closed_without_echoing_secret() {
+    let mut input = support_input();
+    input.recent_events[0].message = "Authorization: Bearer super.secret.material".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
     );
-    sections.insert("note".into(), "authorization: Bearer abc.def.ghi".into());
-    let bundle = build_support_bundle(doctor, sections, 1_700_000_000);
-    assert!(bundle.redacted);
-    let env = bundle.sections.get("env").unwrap();
-    assert!(env.contains("REDACTED"));
-    assert!(!env.contains("super-secret-value"));
-    assert!(!env.contains("hunter2"));
-    let note = bundle.sections.get("note").unwrap();
-    assert!(!note.contains("abc.def.ghi"));
+    let text = error.to_string();
+    assert!(!text.contains("super.secret.material"));
+}
+
+#[test]
+fn support_bundle_rejects_secret_query_parameters() {
+    let mut input = support_input();
+    input.recent_events[0].message =
+        "request failed at https://example.test/callback?access_token=canary".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
+    );
+    assert!(!error.to_string().contains("canary"));
+}
+
+#[test]
+fn support_bundle_rejects_unlabeled_high_entropy_values() {
+    let mut input = support_input();
+    input.recent_events[0].message = "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7Go2Qw9Rx4Kp6".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
+    );
+}
+
+#[test]
+fn support_bundle_rejects_encoded_split_and_unicode_secret_forms() {
+    for message in [
+        r#"{"access_token":"json-canary"}"#,
+        "Authorization:
+Bearer split-line-canary",
+        "Ａｕｔｈｏｒｉｚａｔｉｏｎ： Ｂｅａｒｅｒ full-width-canary",
+        "request failed at https://example.test/callback?%61ccess_token=percent-canary",
+        "-----BEGIN
+PRIVATE KEY-----
+canary",
+    ] {
+        let mut input = support_input();
+        input.recent_events[0].message = message.into();
+        let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+        assert_eq!(
+            error,
+            SupportBundleError::SuspiciousContent("recent_events".into()),
+            "scanner accepted {message:?}",
+        );
+        assert!(!error.to_string().contains("canary"));
+    }
+}
+
+#[test]
+fn support_bundle_rejects_base64_secret_containing_slash() {
+    let mut input = support_input();
+    input.recent_events[0].message = "mF9qB0sT2Vx7Nz4Yk8Wc3Pd6Hr1La5Ue0Ji7/Go2Qw9Rx4Kp6".into();
+    let error = prepare_support_bundle(input, 1_700_000_000).unwrap_err();
+    assert_eq!(
+        error,
+        SupportBundleError::SuspiciousContent("recent_events".into())
+    );
+}
+
+#[test]
+fn support_bundle_allows_bounded_paths_and_non_secret_status_text() {
+    let mut input = support_input();
+    input.recent_events[0].message =
+        "/home/alice/.local/state/ownmesh/service-restart-pending".into();
+    prepare_support_bundle(input, 1_700_000_000).unwrap();
+}
+
+#[test]
+fn support_bundle_allows_long_but_low_entropy_diagnostic_text() {
+    let mut input = support_input();
+    input.recent_events[0].message = "service-restart-".repeat(8);
+    prepare_support_bundle(input, 1_700_000_000).unwrap();
 }
 
 #[test]

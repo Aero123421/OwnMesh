@@ -4,10 +4,11 @@ use crate::cli::{Cli, UpdateArgs, UpdateCmd, UpdateWorkerArgs};
 use ownmesh_config::{load_config, save_config, OwnMeshPaths};
 use ownmesh_domain::ExitCode;
 use ownmesh_update::{
-    current_install_dir, finalize_apply, is_homebrew_install, looks_secret,
-    recover_interrupted_apply, redact_json, redact_url, rollback_apply, ApplyReport, CheckReport,
-    FetchKind, FetchRequest, FetchResponse, HttpTransport, UpdateChannel, UpdateEngine,
-    UpdateError, UpdateMode, UpdateSettings, ALLOWED_HOSTS,
+    current_install_dir, finalize_apply, finalize_interrupted_commit, interrupted_apply_pending,
+    is_homebrew_install, looks_secret, recover_interrupted_apply, redact_json, redact_url,
+    rollback_apply, verify_applied_binaries, ApplyReport, CheckReport, FetchKind, FetchRequest,
+    FetchResponse, HttpTransport, UpdateChannel, UpdateEngine, UpdateError, UpdateMode,
+    UpdateSettings, ALLOWED_HOSTS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -313,6 +314,44 @@ fn transaction_owner_alive(transaction: &UpdateTransaction) -> Result<bool, Stri
     process_identity_alive(transaction.owner_pid, transaction.owner_birth_id)
 }
 
+fn recover_recorded_transaction(
+    transaction: &UpdateTransaction,
+    install_dir: &Path,
+) -> Result<(), ExitCode> {
+    let recorded_install = fs::canonicalize(&transaction.install_dir).map_err(|error| {
+        eprintln!("ownmesh update: resolve interrupted install directory: {error}");
+        ExitCode::Authorization
+    })?;
+    if recorded_install != install_dir {
+        eprintln!("ownmesh update: interrupted transaction install binding refused");
+        return Err(ExitCode::Authorization);
+    }
+    if transaction.phase == "commit_decided" {
+        finalize_interrupted_commit(install_dir).map_err(|error| {
+            eprintln!("ownmesh update: finish interrupted committed update: {error}");
+            ExitCode::Internal
+        })?;
+        restore_committed_service(transaction, install_dir).map_err(|error| {
+            eprintln!("ownmesh update: restore committed service state: {error}");
+            ExitCode::Internal
+        })?;
+    } else {
+        quiesce_interrupted_service(transaction, install_dir).map_err(|error| {
+            eprintln!("ownmesh update: quiesce interrupted service: {error}");
+            ExitCode::Internal
+        })?;
+        recover_interrupted_apply(install_dir).map_err(|error| {
+            eprintln!("ownmesh update: recover interrupted update: {error}");
+            ExitCode::Internal
+        })?;
+        restore_abandoned_service(transaction, install_dir).map_err(|error| {
+            eprintln!("ownmesh update: recover interrupted service state: {error}");
+            ExitCode::Internal
+        })?;
+    }
+    Ok(())
+}
+
 fn begin_transaction(
     paths: &OwnMeshPaths,
     install_dir: &Path,
@@ -322,7 +361,6 @@ fn begin_transaction(
         eprintln!("ownmesh update: {error}");
         ExitCode::Internal
     })?;
-    gc_old_workers(&dir);
     let lock_path = transaction_lock_path(paths);
     if lock_path.exists() {
         let lock = read_transaction_lock(paths).map_err(|error| {
@@ -336,57 +374,84 @@ fn begin_transaction(
         let matching = existing
             .as_ref()
             .is_some_and(|transaction| transaction.id == lock.transaction_id);
-        let terminal = matching && existing.as_ref().is_some_and(UpdateTransaction::terminal);
         let owner_alive =
             process_identity_alive(lock.owner_pid, lock.owner_birth_id).map_err(|error| {
                 eprintln!("ownmesh update: {error}");
                 ExitCode::Internal
             })?;
-        if terminal || !owner_alive {
-            if let Some(transaction) = &existing {
-                if matching && !terminal {
-                    let recorded_install =
-                        fs::canonicalize(&transaction.install_dir).map_err(|error| {
-                            eprintln!(
-                                "ownmesh update: resolve interrupted install directory: {error}"
-                            );
-                            ExitCode::Authorization
-                        })?;
-                    if recorded_install != install_dir {
-                        eprintln!(
-                            "ownmesh update: interrupted transaction install binding refused"
-                        );
-                        return Err(ExitCode::Authorization);
-                    }
-                    quiesce_interrupted_service(transaction, install_dir).map_err(|error| {
-                        eprintln!("ownmesh update: quiesce interrupted service: {error}");
-                        ExitCode::Internal
-                    })?;
-                    recover_interrupted_apply(install_dir).map_err(|error| {
-                        eprintln!("ownmesh update: recover interrupted update: {error}");
-                        ExitCode::Internal
-                    })?;
-                    restore_abandoned_service(transaction, install_dir).map_err(|error| {
-                        eprintln!("ownmesh update: recover interrupted service state: {error}");
-                        ExitCode::Internal
-                    })?;
-                }
-            }
-            fs::remove_file(&lock_path).map_err(|error| {
-                eprintln!("ownmesh update: clear inactive transaction lock: {error}");
-                ExitCode::Internal
-            })?;
-        } else {
+        if owner_alive {
             let phase = existing
                 .as_ref()
-                .map(|transaction| transaction.phase.as_str())
-                .unwrap_or("unknown");
+                .map_or("unknown", |transaction| transaction.phase.as_str());
             eprintln!(
                 "ownmesh update: another update transaction is active (phase={phase}); run `ownmesh update status`"
             );
             return Err(ExitCode::UsageConfig);
         }
+        if let Some(transaction) = &existing {
+            let pending = interrupted_apply_pending(install_dir).map_err(|error| {
+                eprintln!("ownmesh update: inspect interrupted update: {error}");
+                ExitCode::Internal
+            })?;
+            if matching
+                && (!transaction.terminal()
+                    || (pending && matches!(transaction.phase.as_str(), "failed" | "rolled_back")))
+            {
+                recover_recorded_transaction(transaction, install_dir)?;
+            } else if matching
+                && pending
+                && matches!(transaction.phase.as_str(), "completed" | "current")
+            {
+                eprintln!(
+                    "ownmesh update: committed transaction has unexpected rollback evidence; recovery refused"
+                );
+                return Err(ExitCode::Authorization);
+            }
+        }
+        fs::remove_file(&lock_path).map_err(|error| {
+            eprintln!("ownmesh update: clear inactive transaction lock: {error}");
+            ExitCode::Internal
+        })?;
+    } else {
+        let pending = interrupted_apply_pending(install_dir).map_err(|error| {
+            eprintln!("ownmesh update: inspect retained update journal: {error}");
+            ExitCode::Internal
+        })?;
+        if pending {
+            let transaction = read_transaction(paths)
+                .map_err(|error| {
+                    eprintln!("ownmesh update: {error}");
+                    ExitCode::Internal
+                })?
+                .ok_or_else(|| {
+                    eprintln!(
+                        "ownmesh update: orphaned apply journal has no bound transaction; recovery refused"
+                    );
+                    ExitCode::Authorization
+                })?;
+            if transaction_owner_alive(&transaction).map_err(|error| {
+                eprintln!("ownmesh update: {error}");
+                ExitCode::Internal
+            })? {
+                eprintln!(
+                    "ownmesh update: retained apply journal is still owned by a live updater"
+                );
+                return Err(ExitCode::UsageConfig);
+            }
+            if matches!(transaction.phase.as_str(), "completed" | "current") {
+                eprintln!(
+                    "ownmesh update: committed transaction has unexpected rollback evidence; recovery refused"
+                );
+                return Err(ExitCode::Authorization);
+            }
+            recover_recorded_transaction(&transaction, install_dir)?;
+        }
     }
+
+    // Only collect stale private workers after proving that no live
+    // transaction owns one. This prevents filename-based GC from deleting
+    // the executable of an active updater.
+    gc_old_workers(&dir);
 
     let id = format!("upd_{}", uuid::Uuid::new_v4().simple());
     let owner_pid = std::process::id();
@@ -492,6 +557,35 @@ fn restore_abandoned_service(
     )
 }
 
+fn restore_committed_service(
+    transaction: &UpdateTransaction,
+    install_dir: &Path,
+) -> Result<(), String> {
+    if transaction.service_was_running != Some(true) {
+        return Ok(());
+    }
+    let expected = transaction
+        .target_version
+        .as_deref()
+        .ok_or_else(|| "committed update is missing target version".to_owned())?;
+    let cli = install_dir.join(format!("ownmesh{}", std::env::consts::EXE_SUFFIX));
+    if daemon_status(&cli)
+        .and_then(|status| {
+            status
+                .pointer("/daemon/version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(expected)
+    {
+        return Ok(());
+    }
+    run_child(&cli, &["--json", "service", "start"])
+        .map_err(|_| "committed user service could not be restored".to_owned())?;
+    wait_for_daemon_version(&cli, Some(expected), UPDATE_DAEMON_READY_TIMEOUT)
+}
+
 fn finish_transaction(paths: &OwnMeshPaths) {
     let _ = fs::remove_file(transaction_lock_path(paths));
 }
@@ -511,11 +605,64 @@ fn gc_old_workers(dir: &Path) {
         if !name.starts_with("ownmesh-update-worker-") {
             continue;
         }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
         if current.as_ref().is_some_and(|active| *active == path) {
             continue;
         }
         let _ = fs::remove_file(path);
     }
+}
+
+#[cfg(windows)]
+fn create_private_worker(source: &Path, worker: &Path) -> std::io::Result<()> {
+    let mut input = fs::File::open(source)?;
+    let expected_len = input.metadata()?.len();
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(worker)?;
+    let copied = std::io::copy(&mut input, &mut output)?;
+    if copied != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "private update worker copy length mismatch",
+        ));
+    }
+    output.sync_all()?;
+    drop(output);
+    drop(input);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fail_worker_bootstrap(
+    paths: &OwnMeshPaths,
+    transaction: &UpdateTransaction,
+    worker: Option<&Path>,
+    child: Option<&mut std::process::Child>,
+    message: String,
+) -> ExitCode {
+    if let Some(child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut recorded = transaction.clone();
+    recorded.error = Some(message.clone());
+    if let Err(error) = set_phase(paths, &mut recorded, "failed") {
+        eprintln!("ownmesh update: persist worker bootstrap failure: {error}");
+    }
+    finish_transaction(paths);
+    if let Some(worker) = worker {
+        if let Err(error) = fs::remove_file(worker) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("ownmesh update: remove failed private worker: {error}");
+            }
+        }
+    }
+    eprintln!("ownmesh update: {message}");
+    ExitCode::Internal
 }
 
 #[cfg(windows)]
@@ -527,69 +674,78 @@ fn launch_detached_worker(
     use std::os::windows::process::CommandExt;
 
     let source = std::env::current_exe().map_err(|error| {
-        eprintln!("ownmesh update: locate current executable: {error}");
-        ExitCode::Internal
+        fail_worker_bootstrap(
+            paths,
+            transaction,
+            None,
+            None,
+            format!("locate current executable: {error}"),
+        )
     })?;
     let worker = update_dir(paths).join(format!(
         "ownmesh-update-worker-{}{}",
         transaction.id,
         std::env::consts::EXE_SUFFIX
     ));
-    fs::copy(&source, &worker).map_err(|error| {
-        eprintln!("ownmesh update: create private update worker: {error}");
-        ExitCode::Internal
+    create_private_worker(&source, &worker).map_err(|error| {
+        let raw = error
+            .raw_os_error()
+            .map_or_else(|| "none".to_owned(), |code| code.to_string());
+        fail_worker_bootstrap(
+            paths,
+            transaction,
+            Some(&worker),
+            None,
+            format!("create/flush private update worker (os_error={raw}): {error}"),
+        )
     })?;
-    fs::File::open(&worker)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| {
-            eprintln!("ownmesh update: flush private update worker: {error}");
-            ExitCode::Internal
-        })?;
 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let spawn = Command::new(&worker)
+    let mut spawn_cmd = Command::new(&worker);
+    spawn_cmd
         .arg("__update-worker")
         .arg("--transaction-id")
         .arg(&transaction.id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-        .spawn();
-    let mut child = match spawn {
-        Ok(child) => child,
+        .stderr(Stdio::null());
+    apply_ownmesh_path_env(&mut spawn_cmd, paths);
+    spawn_cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    let mut child = spawn_cmd.spawn().map_err(|error| {
+        fail_worker_bootstrap(
+            paths,
+            transaction,
+            Some(&worker),
+            None,
+            format!("start private worker: {error}"),
+        )
+    })?;
+    let child_pid = child.id();
+    let child_birth_id = match wait_for_process_birth_id(child_pid) {
+        Ok(value) => value,
         Err(error) => {
-            let mut recorded = transaction.clone();
-            recorded.error = Some("failed to start the private update worker".into());
-            let _ = set_phase(paths, &mut recorded, "failed");
-            finish_transaction(paths);
-            let _ = fs::remove_file(&worker);
-            eprintln!("ownmesh update: start private worker: {error}");
-            return Err(ExitCode::Internal);
+            return Err(fail_worker_bootstrap(
+                paths,
+                transaction,
+                Some(&worker),
+                Some(&mut child),
+                format!("bind private worker identity: {error}"),
+            ));
         }
     };
-    let child_pid = child.id();
-    let child_birth_id = wait_for_process_birth_id(child_pid).map_err(|error| {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = fs::remove_file(&worker);
-        eprintln!("ownmesh update: bind private worker identity: {error}");
-        ExitCode::Internal
-    })?;
     let mut recorded = transaction.clone();
     recorded.worker_path = Some(worker.display().to_string());
     recorded.owner_pid = child_pid;
     recorded.owner_birth_id = child_birth_id;
     if let Err(error) = set_phase(paths, &mut recorded, "worker_started") {
-        let _ = child.kill();
-        let _ = child.wait();
-        recorded.error = Some("failed to start the private update worker".into());
-        let _ = set_phase(paths, &mut recorded, "failed");
-        finish_transaction(paths);
-        let _ = fs::remove_file(&worker);
-        eprintln!("ownmesh update: record private worker: {error}");
-        return Err(ExitCode::Internal);
+        return Err(fail_worker_bootstrap(
+            paths,
+            transaction,
+            Some(&worker),
+            Some(&mut child),
+            format!("record private worker identity: {error}"),
+        ));
     }
     let _ = cli;
     Ok(())
@@ -688,7 +844,12 @@ pub(crate) fn run_worker(cli: &Cli, args: &UpdateWorkerArgs) -> Result<(), ExitC
             })?;
             finish_transaction(&paths);
             if !cfg!(windows) {
-                emit_applied(cli, &report, transaction.target_version.as_deref());
+                emit_applied(
+                    cli,
+                    &report,
+                    transaction.target_version.as_deref(),
+                    transaction.service_was_running == Some(true),
+                );
             }
             Ok(())
         }
@@ -706,12 +867,21 @@ pub(crate) fn run_worker(cli: &Cli, args: &UpdateWorkerArgs) -> Result<(), ExitC
         }
         Err(message) => {
             transaction.error = Some(message);
-            if transaction.phase == "rolled_back" {
+            if matches!(
+                transaction.phase.as_str(),
+                "commit_decided" | "recovery_required"
+            ) {
+                // Keep the lock and committed phase durable. The worker is
+                // about to exit, so the next invocation will finish journal/
+                // backup cleanup without ever restoring the old binaries.
                 let _ = write_transaction(&paths, &transaction);
+            } else if transaction.phase == "rolled_back" {
+                let _ = write_transaction(&paths, &transaction);
+                finish_transaction(&paths);
             } else {
                 let _ = set_phase(&paths, &mut transaction, "failed");
+                finish_transaction(&paths);
             }
-            finish_transaction(&paths);
             if cfg!(windows) {
                 Err(ExitCode::Internal)
             } else {
@@ -800,16 +970,37 @@ fn perform_worker_update(
         .map_err(|error| format!("locate update worker executable: {error}"))?;
     let lifecycle = prepare_service_for_update(paths, transaction, &command_exe)?;
 
+    let installed_cli = install_dir.join(format!("ownmesh{}", std::env::consts::EXE_SUFFIX));
     set_phase(paths, transaction, "applying")?;
-    let report = match engine.apply_verified(&artifacts) {
+    let mut report = match engine.apply_verified(&artifacts) {
         Ok(report) => report,
         Err(error) => {
-            restore_service_after_failed_update(lifecycle, &command_exe);
-            return Err(error.to_string());
+            let message = error.to_string();
+            let pending = interrupted_apply_pending(install_dir)
+                .map_err(|inspect| format!("{message}; inspect recovery evidence: {inspect}"))?;
+            if pending {
+                match recover_interrupted_apply(install_dir) {
+                    Ok(_) => {
+                        restore_service_after_failed_update(lifecycle, &installed_cli)?;
+                        transaction.error = Some(message.clone());
+                        set_phase(paths, transaction, "rolled_back")?;
+                        return Err(format!("{message}; previous binaries restored"));
+                    }
+                    Err(recovery_error) => {
+                        transaction.error =
+                            Some(format!("{message}; recovery required: {recovery_error}"));
+                        set_phase(paths, transaction, "recovery_required")?;
+                        return Err(format!(
+                            "{message}; rollback failed and durable recovery evidence was retained: {recovery_error}"
+                        ));
+                    }
+                }
+            }
+            restore_service_after_failed_update(lifecycle, &installed_cli)?;
+            return Err(message);
         }
     };
 
-    let installed_cli = install_dir.join(format!("ownmesh{}", std::env::consts::EXE_SUFFIX));
     set_phase(paths, transaction, "restarting")?;
     let post_result = verify_and_restart(
         &installed_cli,
@@ -817,32 +1008,35 @@ fn perform_worker_update(
         lifecycle.was_running,
     );
     if let Err(error) = post_result {
-        let _ = run_child(&command_exe, &["--json", "service", "stop"]);
-        let _ = wait_for_daemon_offline(&command_exe, Duration::from_secs(15));
-        rollback_apply(&report)
-            .map_err(|rollback_error| format!("{error}; rollback also failed: {rollback_error}"))?;
-        restore_service_after_failed_update(lifecycle, &installed_cli);
-        if lifecycle.was_running {
-            wait_for_daemon_version(
-                &installed_cli,
-                Some(&transaction.from_version),
-                UPDATE_DAEMON_READY_TIMEOUT,
-            )
-            .map_err(|rollback_health| {
-                format!(
-                    "{error}; binaries restored but old daemon health failed: {rollback_health}"
-                )
-            })?;
-        }
-        transaction.error = Some(error.clone());
-        set_phase(paths, transaction, "rolled_back")?;
+        rollback_uncommitted_update(
+            paths,
+            transaction,
+            &report,
+            lifecycle,
+            &command_exe,
+            &installed_cli,
+            &error,
+        )?;
         return Err(format!("{error}; previous binaries restored"));
     }
-    if let Err(error) = finalize_apply(&report) {
-        transaction.error = Some(format!(
-            "update verified; old backup cleanup is pending: {error}"
-        ));
+    if let Err(error) = verify_applied_binaries(&report) {
+        let message = format!("verify installed binary set before commit: {error}");
+        rollback_uncommitted_update(
+            paths,
+            transaction,
+            &report,
+            lifecycle,
+            &command_exe,
+            &installed_cli,
+            &message,
+        )?;
+        return Err(format!("{message}; previous binaries restored"));
     }
+    // Durable outer commit decision precedes removal of rollback evidence.
+    // Recovery at/after this phase completes the new set and never restores old binaries.
+    set_phase(paths, transaction, "commit_decided")?;
+    report.backup_cleanup_pending =
+        !finalize_apply(&report).map_err(|error| format!("finalize committed update: {error}"))?;
     Ok(Some(report))
 }
 
@@ -865,11 +1059,7 @@ fn prepare_service_for_update(
         .and_then(|value| value.get("running"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let mut daemon_online = daemon_status(command_exe).is_some();
-    if !daemon_online && os_running {
-        let _ = run_child(command_exe, &["--json", "service", "restart"]);
-        daemon_online = wait_for_daemon_version(command_exe, None, Duration::from_secs(15)).is_ok();
-    }
+    let daemon_online = daemon_status(command_exe).is_some();
     let was_running = daemon_online || os_running;
     transaction.service_was_running = Some(was_running);
     set_phase(paths, transaction, "draining")?;
@@ -891,10 +1081,52 @@ fn prepare_service_for_update(
     })
 }
 
-fn restore_service_after_failed_update(state: ServiceUpdateState, command_exe: &Path) {
-    if state.was_running && state.stopped {
-        let _ = run_child(command_exe, &["--json", "service", "start"]);
+fn rollback_uncommitted_update(
+    paths: &OwnMeshPaths,
+    transaction: &mut UpdateTransaction,
+    report: &ApplyReport,
+    state: ServiceUpdateState,
+    command_exe: &Path,
+    installed_cli: &Path,
+    reason: &str,
+) -> Result<(), String> {
+    if state.was_running {
+        let _ = run_child(command_exe, &["--json", "service", "stop"]);
+        let _ = wait_for_daemon_offline(command_exe, Duration::from_secs(15));
     }
+    if let Err(rollback_error) = rollback_apply(report) {
+        transaction.error = Some(format!(
+            "{reason}; rollback failed and recovery is required: {rollback_error}"
+        ));
+        set_phase(paths, transaction, "recovery_required")?;
+        return Err(format!(
+            "{reason}; rollback failed and durable recovery evidence was retained: {rollback_error}"
+        ));
+    }
+    restore_service_after_failed_update(state, installed_cli)?;
+    if state.was_running {
+        wait_for_daemon_version(
+            installed_cli,
+            Some(&transaction.from_version),
+            UPDATE_DAEMON_READY_TIMEOUT,
+        )
+        .map_err(|rollback_health| {
+            format!("{reason}; binaries restored but old daemon health failed: {rollback_health}")
+        })?;
+    }
+    transaction.error = Some(reason.to_owned());
+    set_phase(paths, transaction, "rolled_back")
+}
+
+fn restore_service_after_failed_update(
+    state: ServiceUpdateState,
+    command_exe: &Path,
+) -> Result<(), String> {
+    if state.was_running && state.stopped {
+        run_child(command_exe, &["--json", "service", "start"])
+            .map_err(|error| format!("restore user service after failed update: {error}"))?;
+    }
+    Ok(())
 }
 
 fn verify_and_restart(
@@ -919,10 +1151,19 @@ fn verify_and_restart(
     Ok(())
 }
 
+fn apply_ownmesh_path_env(command: &mut Command, paths: &OwnMeshPaths) {
+    command.env("OWNMESH_CONFIG_DIR", &paths.config_dir);
+    command.env("OWNMESH_STATE_DIR", &paths.state_dir);
+    command.env("OWNMESH_RUNTIME_DIR", &paths.runtime_dir);
+}
+
 fn run_child(program: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    if let Ok(paths) = OwnMeshPaths::discover() {
+        apply_ownmesh_path_env(&mut command, &paths);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("start {}: {error}", program.display()))?;
     if output.status.success() {
@@ -959,20 +1200,38 @@ fn wait_for_daemon_version(
     }
 }
 
+fn service_running(program: &Path) -> Option<bool> {
+    let output = run_child(program, &["--json", "service", "status"]).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()?
+        .get("running")
+        .and_then(serde_json::Value::as_bool)
+}
+
 fn wait_for_daemon_offline(program: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if daemon_status(program).is_none() {
+        let ipc_offline = daemon_status(program).is_none();
+        let service_active = service_running(program) == Some(true);
+        if ipc_offline && !service_active {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err("OwnMesh daemon did not stop before binary replacement".into());
+            return Err(
+                "OwnMesh daemon could not be proven stopped (IPC/service observations disagree)"
+                    .into(),
+            );
         }
         thread::sleep(Duration::from_millis(200));
     }
 }
 
-fn emit_applied(cli: &Cli, report: &ApplyReport, target_version: Option<&str>) {
+fn emit_applied(
+    cli: &Cli,
+    report: &ApplyReport,
+    target_version: Option<&str>,
+    daemon_verified: bool,
+) {
     if cli.json {
         println!(
             "{}",
@@ -982,6 +1241,12 @@ fn emit_applied(cli: &Cli, report: &ApplyReport, target_version: Option<&str>) {
                 "version": target_version,
                 "install_dir": report.install_dir,
                 "written": report.written,
+                "verification": {
+                    "binary_hashes": "passed",
+                    "cli_version": "passed",
+                    "daemon_version": if daemon_verified { "passed" } else { "skipped_not_running" },
+                    "backup_cleanup": if report.backup_cleanup_pending { "pending" } else { "passed" }
+                }
             }))
         );
     } else {
@@ -990,7 +1255,16 @@ fn emit_applied(cli: &Cli, report: &ApplyReport, target_version: Option<&str>) {
             target_version.unwrap_or("?"),
             report.written.len()
         );
-        println!("  CLI and daemon version checks passed");
+        if daemon_verified {
+            println!("  binary hashes, CLI version, and daemon version checks passed");
+        } else {
+            println!("  binary hashes and CLI version checks passed; daemon check skipped (service was not running)");
+        }
+        if report.backup_cleanup_pending {
+            println!(
+                "  backup cleanup is pending and will be retried on the next update invocation"
+            );
+        }
     }
 }
 
@@ -1279,6 +1553,33 @@ mod tests {
     use clap::Parser;
     use ownmesh_update::network_check_allowed;
     use serde_json::Value;
+
+    #[test]
+    fn apply_ownmesh_path_env_pins_all_three_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut command = Command::new("ownmesh");
+        apply_ownmesh_path_env(&mut command, &paths);
+        let env = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("OWNMESH_CONFIG_DIR"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(paths.config_dir.as_os_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("OWNMESH_STATE_DIR"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(paths.state_dir.as_os_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("OWNMESH_RUNTIME_DIR"))
+                .map(std::ffi::OsString::as_os_str),
+            Some(paths.runtime_dir.as_os_str())
+        );
+    }
 
     #[test]
     fn channel_parse_roundtrip_samples() {

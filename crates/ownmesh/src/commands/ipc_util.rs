@@ -104,6 +104,12 @@ fn classify_ipc_err(err: &IpcError) -> (&'static str, String, Option<&'static st
             Some("inspect the decision with `ownmesh policy explain <operation>`"),
             ExitCode::Authorization,
         ),
+        IpcError::Remote { code, message } if *code == app_error::EXECUTABLE_IDENTITY_DRIFT => (
+            "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT",
+            format!("executable identity changed: {message}"),
+            Some("submit the exact command again to request fresh authorization"),
+            ExitCode::Authorization,
+        ),
         IpcError::Remote { code, message } if *code == app_error::LOCKDOWN => (
             "OWNMESH_E_LOCKDOWN",
             format!("lockdown: {message}"),
@@ -247,6 +253,18 @@ mod tests {
     }
 
     #[test]
+    fn executable_identity_drift_maps_to_fresh_authorization() {
+        let (code, message, hint, exit) = classify_ipc_err(&IpcError::Remote {
+            code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+            message: "identity changed".into(),
+        });
+        assert_eq!(code, "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT");
+        assert_eq!(exit, ExitCode::Authorization);
+        assert!(message.contains("identity changed"));
+        assert!(hint.is_some_and(|value| value.contains("fresh authorization")));
+    }
+
+    #[test]
     fn every_classified_code_is_namespaced() {
         for err in [
             IpcError::Timeout,
@@ -268,6 +286,10 @@ mod tests {
             IpcError::Remote {
                 code: app_error::TOKEN_REVOKED,
                 message: "revoked".into(),
+            },
+            IpcError::Remote {
+                code: app_error::EXECUTABLE_IDENTITY_DRIFT,
+                message: "changed".into(),
             },
         ] {
             let (code, message, _, _) = classify_ipc_err(&err);
