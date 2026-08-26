@@ -55,6 +55,29 @@ pnpm -r lint
 python scripts/check_release_quality.py
 ```
 
+### Local validation and CI policy
+
+Treat CI as the final cross-platform verification of a change, not as the
+first place to discover failures that can be reproduced locally.
+
+- Keep local commits small, coherent, and independently reviewable. Run the
+  focused tests for the affected crate, package, script, or fixture after each
+  logical change.
+- Before opening or updating a pull request, run the complete quality gates
+  above when the local environment supports them. Make several local commits
+  if useful, then push a coherent batch so every small checkpoint does not
+  trigger a separate CI run.
+- If a local platform or toolchain cannot run a required gate, record exactly
+  what was not run and leave that platform-specific verification to CI. Do not
+  describe an unavailable or skipped gate as passing.
+- Classify a CI failure before retrying it. Reproduce and fix change-related
+  failures locally where possible, then push the tested fix. Rerun an unchanged
+  job only when the evidence points to a transient infrastructure or confirmed
+  flaky-test failure; do not repeatedly rerun an unexplained failure.
+- Windows, macOS, Linux, hosted-service, permission, signing, provenance, and
+  release-workflow checks that cannot be reproduced faithfully on one
+  development machine remain required CI or release gates.
+
 Workspace Rust lints forbid `unsafe_code` and enable Clippy `pedantic` (as warnings elevated to errors in CI via `-D warnings`).
 
 Four crates opt out of the `unsafe_code` forbid because they bind OS APIs
