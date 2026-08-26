@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ownmesh.dev/schemas/workspace-registry.schema.json",
+  "title": "OwnMesh device workspace registry snapshot",
+  "description": "Full device-local workspace registry snapshot as advertised in ready.workspace_registry and in incremental workspace.registry refreshes (ADR 0014). Identifiers and generations follow the domain shapes; the Control Plane additionally requires ws_default, sorted unique ids, and at most 64 entries.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "enforce_workspace",
+    "workspaces"
+  ],
+  "properties": {
+    "enforce_workspace": {
+      "type": "boolean",
+      "description": "Device policy: restricted modes pin exec cwd to a registered workspace root."
+    },
+    "workspaces": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "generation"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^ws_[A-Za-z0-9_-]*$",
+            "maxLength": 128
+          },
+          "generation": {
+            "type": "string",
+            "pattern": "^wsg_[a-f0-9]{32}$",
+            "description": "Opaque generation that changes whenever the workspace root changes; the only mapping fact sent off-device."
+          }
+        }
+      }
+    }
+  }
+}

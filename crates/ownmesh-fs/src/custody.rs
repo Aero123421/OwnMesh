@@ -609,7 +609,63 @@ pub(crate) fn publish_retained_file_no_replace(
             .last()
             .ok_or_else(|| FsError::InvalidPath("empty workspace ancestry".into()))?;
         let parent_final = ensure_handle_under_workspace(parent, ws)?;
-        publish_retained_file_to_parent_no_replace(parent, &parent_final, leaf, source)
+        publish_retained_file_to_parent(parent, &parent_final, leaf, source, false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (ws, parent_rel, leaf, source);
+        Err(FsError::InvalidPath(
+            "restricted retained transfer publish is unsupported on this platform".into(),
+        ))
+    }
+}
+
+pub(crate) fn publish_retained_file_replace_if_hash(
+    ws: &WorkspaceRoot,
+    rel: &Path,
+    source: &File,
+    expected_sha256: &str,
+    new_sha256: &str,
+) -> FsResult<()> {
+    let (mut dest, dest_path) = open_regular_file_read(ws, rel)?;
+    let actual = hash_open_file(&mut dest, &dest_path)?;
+    drop(dest);
+    if actual == new_sha256 {
+        return Ok(());
+    }
+    if actual != expected_sha256 {
+        return Err(FsError::HashMismatch {
+            path: dest_path,
+            expected: expected_sha256.to_string(),
+            actual,
+        });
+    }
+    let (mut dest_again, dest_path_again) = open_regular_file_read(ws, rel)?;
+    let actual_again = hash_open_file(&mut dest_again, &dest_path_again)?;
+    drop(dest_again);
+    if actual_again != expected_sha256 {
+        return Err(FsError::HashMismatch {
+            path: dest_path_again,
+            expected: expected_sha256.to_string(),
+            actual: actual_again,
+        });
+    }
+    let components = relative_components(rel)?;
+    let (leaf, parents) = components
+        .split_last()
+        .ok_or_else(|| FsError::InvalidPath("empty transfer destination".into()))?;
+    let mut parent_rel = PathBuf::new();
+    for component in parents {
+        parent_rel.push(component);
+    }
+    #[cfg(windows)]
+    {
+        let ancestors = retain_workspace_ancestor_chain(ws, &parent_rel)?;
+        let parent = ancestors
+            .last()
+            .ok_or_else(|| FsError::InvalidPath("empty workspace ancestry".into()))?;
+        let parent_final = ensure_handle_under_workspace(parent, ws)?;
+        publish_retained_file_to_parent(parent, &parent_final, leaf, source, true)
     }
     #[cfg(not(windows))]
     {
@@ -624,11 +680,12 @@ pub(crate) fn publish_retained_file_no_replace(
 /// from path admission so adversarial tests can rename the lexical parent
 /// after the handle is retained and prove the side effect remains pinned.
 #[cfg(any(windows, all(test, target_os = "linux")))]
-fn publish_retained_file_to_parent_no_replace(
+fn publish_retained_file_to_parent(
     parent: &File,
     parent_final: &Path,
     leaf: &std::ffi::OsString,
     source: &File,
+    replace_if_exists: bool,
 ) -> FsResult<()> {
     #[cfg(windows)]
     {
@@ -649,8 +706,11 @@ fn publish_retained_file_to_parent_no_replace(
         if name.is_empty() {
             return Err(FsError::InvalidPath("empty transfer destination".into()));
         }
-        let (mut buffer, total) =
-            file_link_information_buffer(parent.as_raw_handle() as HANDLE, &name)?;
+        let (mut buffer, total) = file_link_information_buffer(
+            parent.as_raw_handle() as HANDLE,
+            &name,
+            replace_if_exists,
+        )?;
         unsafe {
             let mut io_status: IO_STATUS_BLOCK = std::mem::zeroed();
             let status = NtSetInformationFile(
@@ -673,7 +733,7 @@ fn publish_retained_file_to_parent_no_replace(
     }
     #[cfg(not(windows))]
     {
-        let _ = (parent, parent_final, leaf, source);
+        let _ = (parent, parent_final, leaf, source, replace_if_exists);
         Err(FsError::InvalidPath(
             "restricted handle-relative transfer publish is unsupported on this platform".into(),
         ))
@@ -696,6 +756,7 @@ struct FileLinkInformation {
 fn file_link_information_buffer(
     root_directory: windows_sys::Win32::Foundation::HANDLE,
     name: &[u16],
+    replace_if_exists: bool,
 ) -> FsResult<(Vec<u8>, u32)> {
     let name_bytes = name
         .len()
@@ -718,7 +779,8 @@ fn file_link_information_buffer(
         // has only u8 alignment, so every multi-byte field is unaligned.
         *buffer
             .as_mut_ptr()
-            .add(std::mem::offset_of!(FileLinkInformation, replace_if_exists)) = 0;
+            .add(std::mem::offset_of!(FileLinkInformation, replace_if_exists)) =
+            u8::from(replace_if_exists);
         std::ptr::write_unaligned(
             buffer
                 .as_mut_ptr()
@@ -1985,11 +2047,12 @@ mod tests {
         fs::rename(&safe, &held).unwrap();
         symlink(outside.path(), &safe).unwrap();
 
-        let error = publish_retained_file_to_parent_no_replace(
+        let error = publish_retained_file_to_parent(
             &parent,
             &parent_final,
             &"artifact.bin".into(),
             &source,
+            false,
         )
         .unwrap_err();
 
@@ -2054,7 +2117,8 @@ mod tests {
             &[u16::from(b'a'), u16::from(b'b'), u16::from(b'c')][..],
         ] {
             let (buffer, total) =
-                file_link_information_buffer(std::ptr::null_mut::<u8>() as HANDLE, name).unwrap();
+                file_link_information_buffer(std::ptr::null_mut::<u8>() as HANDLE, name, false)
+                    .unwrap();
             assert_eq!(buffer.len(), file_name_offset + std::mem::size_of_val(name));
             assert_eq!(usize::try_from(total).unwrap(), buffer.len());
             let copied = name
@@ -2117,11 +2181,12 @@ mod tests {
             "a protected lexical parent cannot be replaced by a junction"
         );
 
-        publish_retained_file_to_parent_no_replace(
+        publish_retained_file_to_parent(
             parent,
             &parent_final,
             &"artifact.bin".into(),
             &source,
+            false,
         )
         .expect("protected retained-parent FileLinkInfo publish must succeed");
         assert!(

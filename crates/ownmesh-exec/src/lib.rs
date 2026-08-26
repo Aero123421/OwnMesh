@@ -16,9 +16,15 @@
     clippy::needless_borrows_for_generic_args
 )]
 
+mod prepared;
+
+pub use prepared::{prepare_executable, prepare_executable_with_interpreter, PreparedExecutable};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -56,6 +62,12 @@ pub enum ExecError {
     ResourceLimit(String),
     #[error("cancelled")]
     Cancelled,
+    /// Process spawn failed because the OS rejected the executable image format.
+    #[error("{0}")]
+    ExecutableFormat(String),
+    /// Process spawn failed for another reason.
+    #[error("{0}")]
+    Spawn(String),
 }
 
 /// Result alias.
@@ -144,17 +156,29 @@ const SCRIPT_EXTENSIONS: &[&str] = &[
 /// cannot execute a different payload after human approval.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutablePin {
-    /// Canonical absolute path that was inspected.
+    /// Exact absolute invocation or backing path that was inspected.
     pub path: String,
     /// Hex SHA-256 of the full file contents at pin time.
     pub content_sha256: String,
     /// Byte length at pin time (fast reject before hashing).
     pub len: u64,
-    /// Platform file identity (Unix dev+ino; Windows unavailable → None).
+    /// Platform volume/device identity (Unix `st_dev`; Windows volume serial).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<u64>,
+    /// Platform file identity (Unix inode; Windows file index).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inode: Option<u64>,
+    /// Identity of the invocation directory entry before symlink/reparse
+    /// traversal. These fields bind proxy semantics as well as the target
+    /// image, so deleting and recreating an otherwise identical proxy still
+    /// requires re-authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_inode: Option<u64>,
+    /// Exact symlink/reparse target recorded for proxy invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
     /// Policy classification recorded with the pin (`structured` / `raw_shell`).
     pub policy_kind: String,
 }
@@ -234,17 +258,24 @@ fn path_has_shebang(path: &Path) -> bool {
 }
 
 fn is_script_or_interpreter_in_dir(program: &str, cwd: Option<&Path>) -> bool {
-    if known_interpreter_name(program) || script_extension(program) {
+    // Script-like payloads (`.sh`/`.py`/`.cmd`/`.bat`/`.ps1`/…) and known
+    // interpreters are always classified raw on every platform: the payload
+    // is shell or script-host content, so a policy denying `raw_shell` must
+    // deny it too. This deliberately includes Windows batch shims
+    // (`.cmd`/`.bat`): `cmd.exe` interprets their file content with full
+    // shell semantics even when the argv is passed literally, so classifying
+    // them as structured would let a raw_shell-denying policy authorize shell
+    // execution. Resolution (PATHEXT ordering) is a separate concern from
+    // policy classification.
+    let script_like = |s: &str| known_interpreter_name(s) || script_extension(s);
+    if script_like(program) {
         return true;
     }
     let resolved = resolve_executable_path(program, cwd);
     let Some(path) = resolved.as_deref() else {
         return false;
     };
-    if path
-        .to_str()
-        .is_some_and(|s| known_interpreter_name(s) || script_extension(s))
-    {
+    if path.to_str().is_some_and(script_like) {
         return true;
     }
     path_has_shebang(path)
@@ -259,15 +290,19 @@ pub const MAX_EXECUTABLE_PIN_BYTES: u64 = ownmesh_domain::MAX_STRUCTURED_EXECUTA
 pub const MAX_JOURNAL_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Stream SHA-256 of a regular file up to `max_bytes` without unbounded allocation.
-fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResult<String> {
+fn hash_open_file_bounded(
+    file: &mut File,
+    display_path: &Path,
+    expected_len: u64,
+    max_bytes: u64,
+) -> ExecResult<String> {
     if expected_len > max_bytes {
         return Err(ExecError::ResourceLimit(format!(
             "executable exceeds {max_bytes} byte pin budget: {} ({expected_len} bytes)",
-            path.display()
+            display_path.display()
         )));
     }
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
@@ -280,7 +315,7 @@ fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResu
         if total > max_bytes {
             return Err(ExecError::ResourceLimit(format!(
                 "executable exceeded {max_bytes} byte pin budget while hashing: {}",
-                path.display()
+                display_path.display()
             )));
         }
         hasher.update(&buf[..n]);
@@ -293,27 +328,144 @@ fn hash_file_bounded(path: &Path, expected_len: u64, max_bytes: u64) -> ExecResu
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn file_has_shebang(file: &mut File) -> ExecResult<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = [0_u8; 2];
+    let read = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(read == 2 && magic == *b"#!")
+}
+
+#[cfg(unix)]
+fn path_entry_identity(path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok((Some(metadata.dev()), Some(metadata.ino())))
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns a valid handle for the duration of the call and the
+    // output structure is fully initialized before it is read.
+    if unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            std::ptr::from_mut(&mut information),
+        )
+    } == 0
+    {
+        return Err(ExecError::Io(std::io::Error::last_os_error()));
+    }
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((
+        Some(u64::from(information.dwVolumeSerialNumber)),
+        Some(index),
+    ))
+}
+
+#[cfg(windows)]
+fn path_entry_identity(path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    windows_handle_identity(&file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_entry_identity(_path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    Ok((None, None))
+}
+
+#[cfg(unix)]
+fn open_file_identity(file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((Some(metadata.dev()), Some(metadata.ino())))
+}
+
+#[cfg(windows)]
+fn open_file_identity(file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    windows_handle_identity(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_file_identity(_file: &File) -> ExecResult<(Option<u64>, Option<u64>)> {
+    Ok((None, None))
+}
+
+fn current_link_target(path: &Path) -> ExecResult<Option<String>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(Some(
+            std::fs::read_link(path)?.to_string_lossy().into_owned(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Device/inode identity of a path, without hashing its contents.
+///
+/// Recognizes the same file reached through a different path, symlink, or
+/// hard link — the identity check [`pin_executable`] performs, minus the
+/// full-content digest, for callers that only need "is this the same file?".
+///
+/// # Errors
+///
+/// Returns an error when the path cannot be opened or inspected.
+pub fn file_identity(path: &Path) -> ExecResult<(Option<u64>, Option<u64>)> {
+    let file = File::open(path)?;
+    open_file_identity(&file)
+}
+
 /// Capture device/inode/content digest for a structured executable path.
 ///
 /// # Errors
 ///
 /// Returns an error when the path cannot be read or is not a regular file.
 pub fn pin_executable(path: &Path, policy_kind: CommandKind) -> ExecResult<ExecutablePin> {
-    let meta = std::fs::metadata(path)?;
+    let (path_device, path_inode) = path_entry_identity(path)?;
+    let link_target = current_link_target(path)?;
+    let mut file = File::open(path)?;
+    let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(ExecError::Journal(format!(
             "executable pin requires a regular file: {}",
             path.display()
         )));
     }
-    let content_sha256 = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES)?;
-    let (device, inode) = file_identity(&meta);
+    let content_sha256 =
+        hash_open_file_bounded(&mut file, path, meta.len(), MAX_EXECUTABLE_PIN_BYTES)?;
+    let (device, inode) = open_file_identity(&file)?;
+    if path_entry_identity(path)? != (path_device, path_inode)
+        || current_link_target(path)? != link_target
+    {
+        return Err(ExecError::Journal(
+            "executable invocation entry changed while pinning; retry authorization".into(),
+        ));
+    }
     Ok(ExecutablePin {
         path: path.to_string_lossy().into_owned(),
         content_sha256,
         len: meta.len(),
         device,
         inode,
+        path_device,
+        path_inode,
+        link_target,
         policy_kind: policy_kind.as_str().to_owned(),
     })
 }
@@ -324,9 +476,57 @@ pub fn pin_executable(path: &Path, policy_kind: CommandKind) -> ExecResult<Execu
 ///
 /// Returns [`ExecError::Journal`] describing the mismatch / IO failure.
 pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
-    let meta = std::fs::metadata(path).map_err(|e| {
+    verify_path_entry_pin(path, pin)?;
+    let mut file = File::open(path).map_err(|e| {
         ExecError::Journal(format!(
             "executable pin revalidation failed for {}: {e}",
+            path.display()
+        ))
+    })?;
+    verify_open_file_pin(&mut file, path, pin)?;
+    verify_path_entry_pin(path, pin)?;
+    Ok(())
+}
+
+fn verify_path_entry_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
+    let actual_link = current_link_target(path).map_err(|error| {
+        ExecError::Journal(format!(
+            "executable invocation entry revalidation failed for {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(any(unix, windows))]
+    if pin.path_device.is_none() || pin.path_inode.is_none() {
+        return Err(ExecError::Journal(
+            "legacy executable pin lacks invocation entry identity; request must be re-authorized"
+                .into(),
+        ));
+    }
+    let actual_identity = path_entry_identity(path).map_err(|error| {
+        ExecError::Journal(format!(
+            "executable invocation identity revalidation failed for {}: {error}",
+            path.display()
+        ))
+    })?;
+    if (pin.path_device.is_some() || pin.path_inode.is_some())
+        && actual_identity != (pin.path_device, pin.path_inode)
+    {
+        return Err(ExecError::Journal(
+            "executable invocation entry identity drifted; request must be re-authorized".into(),
+        ));
+    }
+    if actual_link != pin.link_target {
+        return Err(ExecError::Journal(
+            "executable invocation link target drifted; request must be re-authorized".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_open_file_pin(file: &mut File, path: &Path, pin: &ExecutablePin) -> ExecResult<()> {
+    let meta = file.metadata().map_err(|e| {
+        ExecError::Journal(format!(
+            "executable handle revalidation failed for {}: {e}",
             path.display()
         ))
     })?;
@@ -343,7 +543,7 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
             meta.len()
         )));
     }
-    let (device, inode) = file_identity(&meta);
+    let (device, inode) = open_file_identity(file)?;
     if (pin.device.is_some() || pin.inode.is_some()) && (device != pin.device || inode != pin.inode)
     {
         return Err(ExecError::Journal(
@@ -351,12 +551,13 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
                 .into(),
         ));
     }
-    let digest = hash_file_bounded(path, meta.len(), MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
-        ExecError::Journal(format!(
-            "executable content revalidation failed for {}: {e}",
-            path.display()
-        ))
-    })?;
+    let digest =
+        hash_open_file_bounded(file, path, meta.len(), MAX_EXECUTABLE_PIN_BYTES).map_err(|e| {
+            ExecError::Journal(format!(
+                "executable content revalidation failed for {}: {e}",
+                path.display()
+            ))
+        })?;
     if digest != pin.content_sha256 {
         return Err(ExecError::Journal(
             "executable content digest drifted before execution; request must be re-authorized"
@@ -364,8 +565,12 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
         ));
     }
     if pin.policy_kind == CommandKind::Structured.as_str()
-        && (path_has_shebang(path) || path.to_str().is_some_and(script_extension))
+        && (file_has_shebang(file)? || path.to_str().is_some_and(script_extension))
     {
+        // A structured pin must never point at a shell/script payload —
+        // including a Windows batch shim (`.cmd`/`.bat`), whose file content
+        // `cmd.exe` interprets with full shell semantics. Such a file must be
+        // re-authorized as raw_shell before execution.
         return Err(ExecError::Journal(
             "executable became a script/shebang payload before execution; request must be re-authorized"
                 .into(),
@@ -374,15 +579,593 @@ pub fn verify_executable_pin(path: &Path, pin: &ExecutablePin) -> ExecResult<()>
     Ok(())
 }
 
-#[cfg(unix)]
-fn file_identity(meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
-    use std::os::unix::fs::MetadataExt;
-    (Some(meta.dev()), Some(meta.ino()))
+/// Windows no-extension candidate ordering following `PATHEXT` semantics.
+///
+/// The default `PATHEXT` is `.COM;.EXE;.BAT;.CMD`.  Only extensions that the
+/// platform can actually invoke directly (`exe`, `com`, `cmd`, `bat`) are kept:
+/// `.ps1`/`.sh` siblings are *not* invocable by `CreateProcess` and must never
+/// win over a real shim (npm ships an extensionless POSIX shim next to
+/// `name.cmd`/`name.ps1`; selecting the extensionless sibling fails with Win32
+/// error 193).  The bare name is always *last* so a genuine extensionless
+/// native binary stays reachable when no invocable sibling exists.
+///
+/// Pure so the ordering can be unit-tested on any platform.
+#[must_use]
+pub fn windows_pathext_candidates(raw: &str, pathext: Option<&str>) -> Vec<String> {
+    const INVOCABLE: [&str; 4] = ["exe", "com", "cmd", "bat"];
+    const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+    // A caller-supplied extension (e.g. `pi.cmd`) is used verbatim and never
+    // goes through PATHEXT ordering.
+    if Path::new(raw).extension().is_some() {
+        return vec![raw.to_string()];
+    }
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for entry in pathext.unwrap_or(DEFAULT_PATHEXT).split(';') {
+        let ext = entry.trim().trim_start_matches('.');
+        if ext.is_empty() {
+            continue;
+        }
+        let lower = ext.to_ascii_lowercase();
+        if !INVOCABLE.contains(&lower.as_str()) || seen.contains(&lower) {
+            continue;
+        }
+        seen.push(lower);
+        out.push(format!("{raw}.{ext}"));
+    }
+    out.push(raw.to_string());
+    out
 }
 
-#[cfg(not(unix))]
-fn file_identity(_meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
-    (None, None)
+/// Ordered per-directory candidate paths for a program name.
+///
+/// With `windows_style` (Windows only) and a caller-supplied name without an
+/// extension, the `PATHEXT` invocable siblings come first; otherwise the bare
+/// name is the only candidate (Unix semantics unchanged).
+#[must_use]
+pub fn executable_candidates_in_directory(
+    directory: &Path,
+    raw: &str,
+    windows_style: bool,
+    pathext: Option<&str>,
+) -> Vec<PathBuf> {
+    if windows_style && Path::new(raw).extension().is_none() {
+        windows_pathext_candidates(raw, pathext)
+            .into_iter()
+            .map(|name| directory.join(name))
+            .collect()
+    } else {
+        vec![directory.join(raw)]
+    }
+}
+
+/// Deterministic, shell-free user-local CLI search directories (Unix).
+///
+/// Mirrors the common login-shell `PATH` additions (`~/.local/bin`, Cargo,
+/// Nix, npm-global and NVM node-version bins) without loading any shell
+/// startup file.  The daemon service inherits a system-only `PATH`, so these
+/// directories make user-installed developer CLIs discoverable with the exact
+/// same per-directory candidate logic used for process invocation — there is
+/// no detect-ready-then-spawn-bare-name gap.  Windows returns no extra
+/// directories because user bins are already reachable through the user PATH.
+#[must_use]
+pub fn user_cli_search_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let _ = home;
+        Vec::new()
+    }
+    #[cfg(not(windows))]
+    {
+        fn push_unique(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(home) = home {
+            for sub in [
+                ".local/bin",
+                ".cargo/bin",
+                ".nix-profile/bin",
+                ".npm-global/bin",
+            ] {
+                push_unique(&mut dirs, home.join(sub));
+            }
+            // NVM layouts: ~/.nvm/versions/node/<version>/bin. Only version-like
+            // directories (e.g. `v22.14.1`) are searched; symlinks such as
+            // `current` are skipped so the order is deterministic and duplicate
+            // bins are not searched twice.
+            let nvm_node = home.join(".nvm").join("versions").join("node");
+            if let Ok(entries) = std::fs::read_dir(&nvm_node) {
+                let mut versions: Vec<String> = entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| {
+                        name.len() > 1
+                            && name.starts_with('v')
+                            && name[1..].chars().all(|c| c.is_ascii_digit() || c == '.')
+                    })
+                    .collect();
+                versions.sort();
+                for version in versions {
+                    push_unique(&mut dirs, nvm_node.join(version).join("bin"));
+                }
+            }
+        }
+        push_unique(
+            &mut dirs,
+            PathBuf::from("/nix/var/nix/profiles/default/bin"),
+        );
+        dirs
+    }
+}
+
+/// Deterministic labels for every directory a bare-name spawn resolution
+/// searches: the service `PATH` first, then the user-local CLI extras that
+/// are not already on it (#145). Home prefixes collapse to `~` so diagnostics
+/// and errors stay readable without leaking absolute home paths.
+#[must_use]
+pub fn spawn_search_dir_labels() -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    // `dirs` is extended with the user-local extras on Unix only; Windows
+    // keeps the inherited user PATH, so the mut is unused there.
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        for dir in user_cli_search_dirs(home.as_deref()) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+        collapse_home_in_labels(&dirs, &mut labels);
+    }
+    #[cfg(windows)]
+    {
+        for dir in &dirs {
+            labels.push(dir.display().to_string());
+        }
+    }
+    labels
+}
+
+#[cfg(not(windows))]
+fn collapse_home_in_labels(dirs: &[PathBuf], labels: &mut Vec<String>) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for dir in dirs {
+        if let Some(home) = &home {
+            if let Ok(stripped) = dir.strip_prefix(home) {
+                let rest = stripped.to_string_lossy();
+                if rest.is_empty() {
+                    labels.push("~".into());
+                } else {
+                    labels.push(format!("~/{rest}"));
+                }
+                continue;
+            }
+        }
+        labels.push(dir.display().to_string());
+    }
+}
+
+/// Bounded note listing the directories spawn resolution searches (#145).
+#[must_use]
+pub fn searched_dirs_note() -> String {
+    const MAX_DIRS_LISTED: usize = 12;
+    let labels = spawn_search_dir_labels();
+    if labels.is_empty() {
+        return "resolution searched the daemon service PATH (empty) and found no user-local \
+                CLI directories; shell startup files are never sourced"
+            .into();
+    }
+    let shown: Vec<String> = labels.iter().take(MAX_DIRS_LISTED).cloned().collect();
+    let omitted = labels.len().saturating_sub(shown.len());
+    let omitted_note = if omitted > 0 {
+        format!(" (+{omitted} more)")
+    } else {
+        String::new()
+    };
+    format!(
+        "resolution searched the daemon service PATH plus these user-local CLI directories: \
+         {}{omitted_note}; shell startup files are never sourced",
+        shown.join(", ")
+    )
+}
+
+/// Bounded, actionable description of a spawn-resolution failure (#145): the
+/// generic cause is followed by the directories actually searched so an
+/// operator can see why "works in my shell" differs from the daemon service
+/// resolution — without ever sourcing a shell rc.
+#[must_use]
+pub fn describe_spawn_resolve_error(error: &SpawnResolveError) -> String {
+    let base = error.to_string();
+    if !matches!(error, SpawnResolveError::NotFound) {
+        return base;
+    }
+    format!("{base}; {}", searched_dirs_note())
+}
+
+/// True when `path` is a regular file the platform can actually spawn.
+///
+/// On Unix this additionally requires at least one execute bit, so a
+/// non-executable sibling (e.g. a leftover npm extensionless shim without
+/// its shebang bit) can never be reported "installed" while spawning it
+/// would fail with `EACCES`.  Windows has no exec bits: the PATHEXT
+/// extension ordering carries invocability, so the file attribute alone is
+/// the correct check there.
+#[must_use]
+pub fn is_launchable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolve a bare program name across explicit search directories using the
+/// same candidate ordering as [`resolve_executable_invocation_path`].
+///
+/// `dirs` are searched in order; relative entries are resolved against `cwd`.
+/// `windows_style` enables `PATHEXT` candidate ordering (callers pass
+/// `cfg!(windows)`), and `pathext` supplies the extension list (callers pass
+/// `std::env::var("PATHEXT")`); both are parameters so the Windows ordering
+/// can be unit-tested on any platform without mutating process env.  This is
+/// the pure core shared by the daemon, profile detection, review pinning and
+/// session launch so all four consumers agree about resolution.
+#[must_use]
+pub fn resolve_executable_in_dirs(
+    program: &str,
+    dirs: &[PathBuf],
+    cwd: Option<&Path>,
+    windows_style: bool,
+    pathext: Option<&str>,
+) -> Option<PathBuf> {
+    let raw = program.trim().trim_matches('"').trim_matches('\'');
+    if raw.is_empty() {
+        return None;
+    }
+    for directory in dirs {
+        let directory = if directory.is_absolute() {
+            directory.clone()
+        } else {
+            cwd.unwrap_or_else(|| Path::new(".")).join(directory)
+        };
+        for candidate in executable_candidates_in_directory(&directory, raw, windows_style, pathext)
+        {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Like [`resolve_executable_in_dirs`] but skips candidates that are not
+/// actually launchable ([`is_launchable_file`]).  Profile detection uses this
+/// so a non-executable Unix file can never be reported "installed" while the
+/// launch path it yields would fail at spawn.
+#[must_use]
+pub fn resolve_launchable_executable_in_dirs(
+    program: &str,
+    dirs: &[PathBuf],
+    cwd: Option<&Path>,
+    windows_style: bool,
+    pathext: Option<&str>,
+) -> Option<PathBuf> {
+    let raw = program.trim().trim_matches('"').trim_matches('\'');
+    if raw.is_empty() {
+        return None;
+    }
+    for directory in dirs {
+        let directory = if directory.is_absolute() {
+            directory.clone()
+        } else {
+            cwd.unwrap_or_else(|| Path::new(".")).join(directory)
+        };
+        for candidate in executable_candidates_in_directory(&directory, raw, windows_style, pathext)
+        {
+            if is_launchable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Why a launch argv could not be produced from a requested program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnResolveError {
+    /// The program could not be resolved to a launchable executable (not on
+    /// PATH/user-local dirs, or not a launchable file).
+    NotFound,
+    /// Windows batch launch: a script path or argument contains characters
+    /// that `cmd.exe /c` would reinterpret (embedded quotes, `%`/`!`
+    /// expansion, control characters, or cmd metacharacters that cannot be
+    /// quoted by the PTY spawner). Launching would change the requested argv,
+    /// so the request fails closed.
+    CmdUnsafeArgument,
+}
+
+impl std::fmt::Display for SpawnResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnResolveError::NotFound => write!(f, "executable could not be resolved"),
+            SpawnResolveError::CmdUnsafeArgument => write!(
+                f,
+                "argument cannot be passed through cmd.exe safely (quotes, %, !, or unquoted cmd metacharacters)"
+            ),
+        }
+    }
+}
+
+/// True when `token` would be mangled by `cmd.exe /c` parsing no matter how
+/// it is quoted: embedded quotes (the PTY spawner re-escapes them in a way
+/// cmd does not understand), `%` (always expanded), `!` (delayed expansion
+/// cannot be guaranteed off for every child), and control characters.
+fn cmd_always_unsafe(token: &str) -> bool {
+    token
+        .chars()
+        .any(|c| matches!(c, '"' | '%' | '!') || c.is_control())
+}
+
+/// True when `token` contains a character cmd interprets *unquoted* on a
+/// command line: command separator/redirection/grouping/escape.
+fn cmd_bare_unsafe(token: &str) -> bool {
+    token
+        .chars()
+        .any(|c| matches!(c, '&' | '|' | '<' | '>' | '(' | ')' | '^'))
+}
+
+/// True when `token` can be passed as one *separate* argv entry to a spawner
+/// that quotes tokens containing whitespace (portable-pty `append_quoted`).
+/// Quoted cmd metacharacters are literal, so a token with whitespace (and
+/// therefore quoted) may safely contain `& | < > ( ) ^`; a bare token with
+/// those characters cannot.
+fn cmd_token_safe(token: &str) -> bool {
+    if cmd_always_unsafe(token) {
+        return false;
+    }
+    if token.contains(char::is_whitespace) {
+        return true;
+    }
+    !cmd_bare_unsafe(token)
+}
+
+/// Resolve a launch argv (program + args) into something the platform can
+/// actually spawn, using the shared resolution semantics (PATH + user-local
+/// dirs, PATHEXT ordering on Windows).
+///
+/// - Unix: `argv[0]` is replaced with the resolved absolute path; resolution
+///   failure returns an error so the caller never hands a bare name to a
+///   spawner that would guess differently.
+/// - Windows: `argv[0]` is replaced with the resolved invocable path.  When
+///   the resolved target is a `.cmd`/`.bat` batch script, the argv is
+///   rewritten to the documented `cmd.exe /e:ON /v:OFF /d /s /c call ...`
+///   form because `CreateProcess` cannot execute batch files directly (Win32
+///   error 193) — see the [CreateProcess documentation].  Tokens that cannot
+///   be represented safely fail closed with
+///   [`SpawnResolveError::CmdUnsafeArgument`] instead of producing a command
+///   line that differs from the requested argv.
+///
+/// [CreateProcess documentation]: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa
+pub fn resolve_spawn_argv(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<Vec<String>, SpawnResolveError> {
+    // `dirs` is only extended on Unix (user-local CLI discovery); Windows
+    // keeps the inherited user PATH, so the `mut` is unused there. An unset
+    // `PATH` is treated as empty (never a hard failure) so the deterministic
+    // user-local dirs are still searched — matching profile discovery, which
+    // must not disagree with spawn resolution (P1-D).
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        dirs.extend(user_cli_search_dirs(home.as_deref()));
+    }
+    resolve_spawn_argv_in_dirs(
+        program,
+        args,
+        &dirs,
+        cwd,
+        cfg!(windows),
+        std::env::var("PATHEXT").ok().as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_spawn_argv`]; parameters keep the Windows rewrite
+/// unit-testable on any platform.
+pub fn resolve_spawn_argv_in_dirs(
+    program: &str,
+    args: &[String],
+    dirs: &[PathBuf],
+    cwd: Option<&Path>,
+    windows_style: bool,
+    pathext: Option<&str>,
+) -> Result<Vec<String>, SpawnResolveError> {
+    let raw = program.trim().trim_matches('"').trim_matches('\'');
+    if raw.is_empty() {
+        return Err(SpawnResolveError::NotFound);
+    }
+    let path = Path::new(raw);
+    // Absolute paths (and explicit relative paths) are launchable only if the
+    // exact file is a launchable regular file — never re-searched through dirs.
+    // On Windows, when the caller supplied no extension, PATHEXT semantics
+    // still apply: an invocable `.exe/.com/.cmd/.bat` sibling wins over an
+    // extensionless file (npm-style POSIX shims fail with Win32 error 193).
+    let resolved = if path.is_absolute() || raw.contains('/') || raw.contains('\\') {
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.unwrap_or_else(|| Path::new(".")).join(path)
+        };
+        if windows_style && Path::new(raw).extension().is_none() {
+            let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
+            let name = candidate
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut found = None;
+            for cand in executable_candidates_in_directory(parent, &name, true, pathext) {
+                if is_launchable_file(&cand) {
+                    found = Some(cand);
+                    break;
+                }
+            }
+            if let Some(found) = found {
+                found
+            } else if is_launchable_file(&candidate) {
+                candidate
+            } else {
+                return Err(SpawnResolveError::NotFound);
+            }
+        } else if !is_launchable_file(&candidate) {
+            return Err(SpawnResolveError::NotFound);
+        } else {
+            candidate
+        }
+    } else {
+        resolve_launchable_executable_in_dirs(raw, dirs, cwd, windows_style, pathext)
+            .ok_or(SpawnResolveError::NotFound)?
+    };
+    if windows_style {
+        let ext = resolved
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase());
+        if matches!(ext.as_deref(), Some("cmd" | "bat")) {
+            // CreateProcess cannot exec batch files (Win32 error 193). Run
+            // them through the documented cmd.exe form. Tokens are separate
+            // argv entries so the spawner's own quoting applies to each; the
+            // leading `call` keyword keeps cmd's /s quote-stripping rule from
+            // ever seeing a leading quote (the line is used verbatim).
+            return windows_batch_argv(&resolved, args);
+        }
+    }
+    let mut out = Vec::with_capacity(args.len() + 1);
+    out.push(resolved.to_string_lossy().into_owned());
+    out.extend(args.iter().cloned());
+    Ok(out)
+}
+
+/// Absolute path of `cmd.exe` used to launch Windows batch shims and raw
+/// shell strings.
+///
+/// `CreateProcess` resolves a bare `cmd.exe` by searching the parent
+/// executable's directory and the *current directory* before system
+/// directories, so an attacker-controllable working directory could shadow
+/// the real interpreter. A fully qualified `%SystemRoot%\System32\cmd.exe`
+/// is immune to that hijack. Pure so the Windows behavior is unit-testable
+/// on any platform; `system_root` is `%SystemRoot%` (fallback `C:\Windows`).
+#[must_use]
+pub fn windows_system_cmd_exe(system_root: Option<&str>) -> String {
+    let root = system_root
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .unwrap_or("C:\\Windows");
+    format!("{}\\System32\\cmd.exe", root.trim_end_matches(['/', '\\']))
+}
+
+/// Build a `cmd.exe` argv that launches a `.cmd`/`.bat` script while
+/// preserving argv semantics (P1-C).
+///
+/// `cmd.exe /e:ON /v:OFF /d /s /c call <script> <args...>` — each token is a
+/// separate argv entry, so a spawner (portable-pty) quotes tokens containing
+/// whitespace and cmd receives a verbatim line (the strip rule only fires on
+/// a leading quote, and the line starts with `call`).  Tokens that cmd would
+/// reinterpret — embedded quotes, `%`/`!` expansion, control characters, or
+/// cmd metacharacters that would appear unquoted — fail closed with
+/// [`SpawnResolveError::CmdUnsafeArgument`]: launching with a different argv
+/// than the caller requested is never an option.
+///
+/// `argv[0]` is the pinned absolute `%SystemRoot%\System32\cmd.exe` (never a
+/// bare name), so Windows process resolution cannot search the current
+/// directory for a shadowing `cmd.exe`/`cmd.com`.
+fn windows_batch_argv(script: &Path, args: &[String]) -> Result<Vec<String>, SpawnResolveError> {
+    let script_s = script.to_string_lossy();
+    if !cmd_token_safe(&script_s) {
+        return Err(SpawnResolveError::CmdUnsafeArgument);
+    }
+    for arg in args {
+        if !cmd_token_safe(arg) {
+            return Err(SpawnResolveError::CmdUnsafeArgument);
+        }
+    }
+    let mut out = Vec::with_capacity(args.len() + 7);
+    out.push(windows_system_cmd_exe(
+        std::env::var("SystemRoot").ok().as_deref(),
+    ));
+    out.push("/e:ON".into());
+    out.push("/v:OFF".into());
+    out.push("/d".into());
+    out.push("/s".into());
+    out.push("/c".into());
+    out.push("call".into());
+    out.push(script_s.into_owned());
+    out.extend(args.iter().cloned());
+    Ok(out)
+}
+
+/// Actionable spawn-error description (P2-H).
+///
+/// Win32 error 193 (invalid executable format) gets a specific hint about
+/// extensionless npm-style POSIX shims; everything else keeps the raw OS
+/// message so the underlying cause is never swallowed.
+#[must_use]
+pub fn map_spawn_error(program: &str, source: &std::io::Error) -> ExecError {
+    let message = describe_spawn_error(program, source);
+    if source.raw_os_error() == Some(193) {
+        ExecError::ExecutableFormat(message)
+    } else {
+        ExecError::Spawn(message)
+    }
+}
+
+fn describe_spawn_error(program: &str, source: &std::io::Error) -> String {
+    if source.raw_os_error() == Some(193) {
+        format!(
+            "failed to start `{program}`: not a valid Win32 application (error 193). \
+This usually means an extensionless POSIX shim was selected instead of its invocable \
+`{program}.exe/.cmd/.bat` sibling; rerun after upgrading, or use an explicit executable \
+extension so the invocable sibling wins"
+        )
+    } else if cfg!(target_os = "linux")
+        && matches!(
+            source.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+        )
+    {
+        // Linux systemd --user hardening ships `RestrictNamespaces=yes`
+        // (ADR 0011). Containers, sandbox tools and unshare create user or
+        // mount namespaces, so their first clone/unshare fails with EPERM and
+        // previously surfaced as an opaque OS error (#144). Name the directive
+        // and the documented operator drop-in; never loosen the default.
+        format!(
+            "failed to start `{program}`: {source}. This can happen when the program creates \
+Linux namespaces (containers, sandbox tools, unshare) while the ownmeshd service unit sets \
+`RestrictNamespaces=yes`. The default stays fail-closed; to allow namespaces for this device \
+only, add a local drop-in setting `RestrictNamespaces=no` (`systemctl --user edit \
+ownmesh-ownmeshd.service`) — `ownmesh doctor` discloses the effective unit"
+        )
+    } else {
+        format!("failed to start `{program}`: {source}")
+    }
 }
 
 /// Resolve the executable path used for process invocation without dereferencing
@@ -390,6 +1173,13 @@ fn file_identity(_meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
 /// behavior (for example Rustup's `cargo.exe` proxy), so callers that need
 /// those semantics must retain this path separately from the canonical backing
 /// executable used for identity pinning.
+///
+/// Resolution uses the same launchable-file semantics as profile detection
+/// (Unix: at least one execute bit; Windows: PATHEXT invocable-sibling
+/// ordering), so command execution, review pinning, session launch and profile
+/// discovery never disagree about which file is invocable: a non-executable
+/// first PATH match is skipped exactly as discovery skips it, and an unset
+/// `PATH` still searches the deterministic user-local dirs (P1-D).
 #[must_use]
 pub fn resolve_executable_invocation_path(program: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     let absolute = |path: PathBuf| {
@@ -410,31 +1200,57 @@ pub fn resolve_executable_invocation_path(program: &str, cwd: Option<&Path>) -> 
         } else {
             cwd.unwrap_or_else(|| Path::new(".")).join(path)
         };
-        return candidate.is_file().then(|| absolute(candidate)).flatten();
-    }
-
-    let search = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&search) {
-        let directory = if directory.is_absolute() {
-            directory
-        } else {
-            cwd.unwrap_or_else(|| Path::new(".")).join(directory)
-        };
-        let direct = directory.join(raw);
-        if direct.is_file() {
-            return absolute(direct);
-        }
-        #[cfg(windows)]
-        if Path::new(raw).extension().is_none() {
-            for ext in ["exe", "cmd", "bat", "com"] {
-                let candidate = directory.join(format!("{raw}.{ext}"));
-                if candidate.is_file() {
-                    return absolute(candidate);
+        // Windows/PATHEXT semantics for explicit paths without an extension:
+        // an invocable `.exe/.com/.cmd/.bat` sibling wins over an extensionless
+        // file (npm-style POSIX shims fail with Win32 error 193). This keeps
+        // profile detection, command execution, review pinning and session
+        // launch agreeing about resolution (P1-C).
+        if cfg!(windows) && Path::new(raw).extension().is_none() {
+            let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
+            let name = candidate
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            for cand in executable_candidates_in_directory(
+                parent,
+                &name,
+                true,
+                std::env::var("PATHEXT").ok().as_deref(),
+            ) {
+                if is_launchable_file(&cand) {
+                    return absolute(cand);
                 }
             }
         }
+        return is_launchable_file(&candidate)
+            .then(|| absolute(candidate))
+            .flatten();
     }
-    None
+
+    // `dirs` is only extended on Unix (user-local CLI discovery); Windows
+    // keeps the inherited user PATH, so the `mut` is unused there. An unset
+    // `PATH` is treated as empty (never a hard failure) so the deterministic
+    // user-local dirs are still searched — matching profile discovery, which
+    // must not disagree with invocation resolution (P1-D).
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut dirs: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    // User-local CLI discovery (Unix).  The systemd user service inherits a
+    // system-only PATH; appending deterministic user dirs keeps installed
+    // developer CLIs resolvable without loading any shell startup file.
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        dirs.extend(user_cli_search_dirs(home.as_deref()));
+    }
+    resolve_launchable_executable_in_dirs(
+        raw,
+        &dirs,
+        cwd,
+        cfg!(windows),
+        std::env::var("PATHEXT").ok().as_deref(),
+    )
+    .and_then(absolute)
 }
 
 /// Resolve an executable through an explicit path or the current PATH.
@@ -598,6 +1414,21 @@ pub fn classify_command_kind(
 pub fn classify_command_kind_in_dir(
     requested: CommandKind,
     program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> CommandKind {
+    classify_command_kind_in_dir_with_style(requested, program, args, cwd)
+}
+
+/// Pure core of [`classify_command_kind_in_dir`].
+///
+/// Classification is platform-independent: a `.cmd`/`.bat` batch shim is
+/// shell content on Windows exactly as a `.sh` script is on Unix, so it is
+/// always `RawShell`. PATHEXT resolution (which sibling file wins) is a
+/// separate concern handled by the resolver; it never downgrades policy.
+fn classify_command_kind_in_dir_with_style(
+    requested: CommandKind,
+    program: &str,
     _args: &[String],
     cwd: Option<&Path>,
 ) -> CommandKind {
@@ -661,8 +1492,10 @@ fn default_max_output() -> usize {
 
 /// Absolute ceiling for captured stdout+stderr (bytes).
 pub const HARD_MAX_OUTPUT_BYTES: usize = 1_000_000;
-/// Absolute ceiling for wall-clock timeout (ms).
-pub const HARD_MAX_TIMEOUT_MS: u64 = 300_000;
+/// Absolute ceiling for wall-clock timeout (ms). Matches control-plane
+/// `MCP_MAX_TIMEOUT_MS_HARD_CEILING` so an operator-raised Worker clamp can
+/// still be enforced fail-closed on the device.
+pub const HARD_MAX_TIMEOUT_MS: u64 = 3_600_000;
 
 /// Captured command result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -679,6 +1512,9 @@ pub struct RunResult {
     pub timed_out: bool,
     pub duration_ms: u64,
     pub truncated: bool,
+    /// OS process id observed after spawn (absent on journal replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
     /// True when served from the idempotency journal.
     #[serde(default)]
     pub replayed: bool,
@@ -847,14 +1683,49 @@ fn build_command(req: &RunRequest) -> ExecResult<Command> {
     // RawShell string-wrapping here would double-wrap and change semantics.
     let mut cmd = match req.kind {
         CommandKind::Structured => {
-            let mut c = Command::new(&req.program);
-            c.args(&req.args);
-            c
+            #[cfg(windows)]
+            {
+                // CreateProcess cannot execute .cmd/.bat batch files directly
+                // (Win32 error 193). Resolve the argv through the shared
+                // Windows batch-aware resolver so npm-style shims launch via
+                // cmd.exe with literal argv; tokens cmd.exe would reinterpret
+                // fail closed (P1-C).
+                let argv = resolve_spawn_argv(&req.program, &req.args, req.cwd.as_deref())
+                    .map_err(|e| ExecError::Spawn(describe_spawn_resolve_error(&e)))?;
+                let mut c = Command::new(&argv[0]);
+                c.args(&argv[1..]);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                // Shared launchable resolver: PATH plus the deterministic
+                // user-local dirs (~/.local/bin, Cargo, Nix, NVM node bins),
+                // so command execution never disagrees with profile
+                // detection/review pinning/session launch about which file is
+                // invocable, and a bare name is never handed to the spawner
+                // (P1-D/P1-C). An unresolvable program fails closed before
+                // any process is spawned.
+                let argv = resolve_spawn_argv(&req.program, &req.args, req.cwd.as_deref())
+                    .map_err(|e| ExecError::Spawn(describe_spawn_resolve_error(&e)))?;
+                let mut c = Command::new(&argv[0]);
+                c.args(&argv[1..]);
+                c
+            }
         }
         CommandKind::RawShell => {
             #[cfg(windows)]
             {
-                let mut c = Command::new("cmd.exe");
+                // Pin the absolute system cmd.exe so CreateProcess can never
+                // resolve a shadowing `cmd.exe`/`cmd.com` from the current
+                // directory before system directories (CreateProcess search
+                // order). Fail closed when it cannot be located.
+                let cmd_exe = windows_system_cmd_exe(std::env::var("SystemRoot").ok().as_deref());
+                if !Path::new(&cmd_exe).is_file() {
+                    return Err(ExecError::Spawn(format!(
+                        "cmd.exe not found at {cmd_exe}; raw shell execution unavailable"
+                    )));
+                }
+                let mut c = Command::new(&cmd_exe);
                 let mut full = req.program.clone();
                 if !req.args.is_empty() {
                     full.push(' ');
@@ -1298,19 +2169,54 @@ pub async fn run_command(
 /// process tree without waiting for natural exit.
 pub async fn run_command_cancellable(
     req: &RunRequest,
+    journal: Option<&mut IdempotencyJournal>,
+    cancel: Option<watch::Receiver<bool>>,
+) -> ExecResult<RunResult> {
+    run_command_cancellable_inner(req, None, journal, cancel).await
+}
+
+/// Run a command from a consumed, handle-bound executable image.
+///
+/// Unlike [`run_command_cancellable`], this path never resolves `req.program`
+/// as the child image. For a structured request it is retained only as the
+/// approved `argv[0]`; for a raw-shell request it remains the approved command
+/// text while the prepared object is the pinned platform shell.
+pub async fn run_prepared_command_cancellable(
+    req: &RunRequest,
+    prepared: PreparedExecutable,
+    journal: Option<&mut IdempotencyJournal>,
+    cancel: Option<watch::Receiver<bool>>,
+) -> ExecResult<RunResult> {
+    run_command_cancellable_inner(req, Some(prepared), journal, cancel).await
+}
+
+fn capped_request(req: &RunRequest) -> RunRequest {
+    let mut capped = req.clone();
+    capped.max_output_bytes = req.max_output_bytes.clamp(1, HARD_MAX_OUTPUT_BYTES);
+    capped.timeout_ms = req.timeout_ms.map(|ms| ms.clamp(1, HARD_MAX_TIMEOUT_MS));
+    capped
+}
+
+async fn run_command_cancellable_inner(
+    req: &RunRequest,
+    prepared: Option<PreparedExecutable>,
     mut journal: Option<&mut IdempotencyJournal>,
     cancel: Option<watch::Receiver<bool>>,
 ) -> ExecResult<RunResult> {
     // Clamp untrusted ceilings before any allocation or spawn.
-    let max_output_bytes = req.max_output_bytes.clamp(1, HARD_MAX_OUTPUT_BYTES);
-    let timeout_ms = req.timeout_ms.map(|ms| ms.clamp(1, HARD_MAX_TIMEOUT_MS));
-    let mut capped = req.clone();
-    capped.max_output_bytes = max_output_bytes;
-    capped.timeout_ms = timeout_ms;
+    let capped = capped_request(req);
+    let max_output_bytes = capped.max_output_bytes;
 
     // Request validation/building has no external side effect and happens before
     // reserving the key. Spawn remains strictly after the durable marker.
-    let mut cmd = build_command(&capped)?;
+    let mut prepared_command = prepared
+        .map(|image| prepared::build_prepared_command(&capped, image))
+        .transpose()?;
+    let mut ordinary_command = if prepared_command.is_none() {
+        Some(build_command(&capped)?)
+    } else {
+        None
+    };
     if let (Some(key), Some(j)) = (capped.idempotency_key.as_deref(), journal.as_deref_mut()) {
         if let Some(prev) = j.get(key) {
             let mut replayed = prev.clone();
@@ -1326,7 +2232,22 @@ pub async fn run_command_cancellable(
     }
 
     let start = Instant::now();
-    let mut child = cmd.spawn()?;
+    let command = if let Some(prepared) = prepared_command.as_mut() {
+        &mut prepared.command
+    } else {
+        ordinary_command
+            .as_mut()
+            .expect("ordinary command exists when no prepared image was supplied")
+    };
+    let mut child = command
+        .spawn()
+        .map_err(|source| map_spawn_error(&req.program, &source))?;
+    // Retain custody until the child exits. On macOS a shebang launch may
+    // return from posix_spawn before the interpreter has reopened the staged
+    // script path; deleting it immediately would turn an approved launch into
+    // a child-side ENOENT. Linux and Windows also benefit from the simpler
+    // invariant that every prepared handle outlives the launched process.
+    let pid = child.id();
 
     if let Some(input) = &capped.stdin {
         if let Some(mut stdin) = child.stdin.take() {
@@ -1342,6 +2263,7 @@ pub async fn run_command_cancellable(
         collect_bounded_output(&mut child, max_output_bytes, timeout, cancel),
     )
     .await?;
+    drop(prepared_command);
 
     if cancelled {
         // Do not journal a cancelled attempt as a successful side effect; a
@@ -1375,6 +2297,7 @@ pub async fn run_command_cancellable(
             timed_out: true,
             duration_ms: start.elapsed().as_millis() as u64,
             truncated,
+            pid,
             replayed: false,
         }
     } else {
@@ -1387,6 +2310,7 @@ pub async fn run_command_cancellable(
             timed_out: false,
             duration_ms: start.elapsed().as_millis() as u64,
             truncated,
+            pid,
             replayed: false,
         }
     };
@@ -1745,10 +2669,28 @@ mod tests {
 
     #[test]
     fn invocation_resolution_keeps_relative_path_absolute_without_canonicalizing() {
-        let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let path = resolve_executable_invocation_path("./Cargo.toml", Some(cwd)).unwrap();
+        // A launchable fixture (exec bit set on Unix): invocation resolution
+        // must return an absolute path for a relative path without
+        // canonicalizing (symlinks preserved). Non-launchable files are
+        // rejected by the shared launchable-file semantics (P1-D/P1-F).
+        let dir = tempdir().unwrap();
+        let tool = dir.path().join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&tool).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&tool, perms).unwrap();
+        }
+        let path = resolve_executable_invocation_path("./tool", Some(dir.path())).unwrap();
         assert!(path.is_absolute(), "invocation path must be persistable");
-        assert_eq!(path, cwd.join("./Cargo.toml"));
+        assert_eq!(path, dir.path().join("./tool"));
+        // A non-launchable relative file is not an invocable executable.
+        assert_eq!(
+            resolve_executable_invocation_path("./Cargo.toml", Some(dir.path())),
+            None
+        );
     }
 
     #[test]
@@ -1873,6 +2815,130 @@ mod tests {
         assert_eq!(kind, CommandKind::RawShell);
     }
 
+    /// The Windows cmd.exe wrapper must always be the pinned absolute
+    /// `%SystemRoot%\System32\cmd.exe` so `CreateProcess` can never resolve a
+    /// shadowing `cmd.exe`/`cmd.com` from the current directory before system
+    /// directories (CreateProcess search order).
+    #[test]
+    fn windows_cmd_exe_is_pinned_absolute() {
+        assert_eq!(
+            windows_system_cmd_exe(None),
+            "C:\\Windows\\System32\\cmd.exe"
+        );
+        assert_eq!(
+            windows_system_cmd_exe(Some("D:\\Win")),
+            "D:\\Win\\System32\\cmd.exe"
+        );
+        assert_eq!(
+            windows_system_cmd_exe(Some("E:\\Win\\")),
+            "E:\\Win\\System32\\cmd.exe"
+        );
+        assert_eq!(
+            windows_system_cmd_exe(Some(" ")),
+            "C:\\Windows\\System32\\cmd.exe",
+            "an empty SystemRoot falls back to the standard path"
+        );
+    }
+
+    /// P1-C policy boundary: a `.cmd`/`.bat` batch shim is shell content
+    /// (`cmd.exe` interprets its file content with full shell semantics even
+    /// when argv is passed literally), so it must classify as `RawShell` on
+    /// every platform — a policy denying `raw_shell` must deny it. PATHEXT
+    /// resolution (which sibling file wins) is handled by the resolver and
+    /// never downgrades policy. A `.cmd` with a shebang is a Unix-style
+    /// script and stays fail-closed as well.
+    #[test]
+    fn classify_windows_batch_shim_is_raw_on_every_platform() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("pi.cmd");
+        std::fs::write(&shim, b"@echo off\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).unwrap();
+        }
+        let cwd = dir.path();
+        let args: Vec<String> = vec!["--version".into()];
+        let shim_abs = shim.to_string_lossy().into_owned();
+        // Batch shims are raw on every platform (including Windows): the
+        // payload is shell content that a raw_shell-denying policy must deny.
+        let kind = classify_command_kind_in_dir_with_style(
+            CommandKind::Structured,
+            &shim_abs,
+            &args,
+            Some(cwd),
+        );
+        assert_eq!(
+            kind,
+            CommandKind::RawShell,
+            "Windows .cmd shim must classify raw_shell (shell semantics)"
+        );
+        // A .bat sibling is equally raw.
+        let bat = dir.path().join("pi.bat");
+        std::fs::write(&bat, b"@echo off\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&bat).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&bat, perms).unwrap();
+        }
+        let kind = classify_command_kind_in_dir_with_style(
+            CommandKind::Structured,
+            &bat.to_string_lossy(),
+            &args,
+            Some(cwd),
+        );
+        assert_eq!(kind, CommandKind::RawShell, "Windows .bat shim must be raw");
+        // A .cmd with a shebang is a Unix-style script and stays fail-closed.
+        let shebang = dir.path().join("evil.cmd");
+        std::fs::write(&shebang, b"#!/bin/sh\necho hi\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shebang).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shebang, perms).unwrap();
+        }
+        let shebang_abs = shebang.to_string_lossy().into_owned();
+        let kind = classify_command_kind_in_dir_with_style(
+            CommandKind::Structured,
+            &shebang_abs,
+            &args,
+            Some(cwd),
+        );
+        assert_eq!(
+            kind,
+            CommandKind::RawShell,
+            "shebang .cmd stays fail-closed"
+        );
+    }
+
+    /// P1-C policy boundary: a structured pin must never accept a Windows
+    /// batch shim as a structured payload — the file content is shell code.
+    /// Revalidation therefore fails closed on every platform (the same as a
+    /// Unix script), so a batch shim must be re-authorized as raw_shell.
+    #[test]
+    fn verify_pin_rejects_windows_batch_shim_structured_payload() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("pi.cmd");
+        std::fs::write(&shim, b"@echo off\r\n").unwrap();
+        let pin = pin_executable(&shim, CommandKind::Structured).unwrap();
+        assert!(
+            verify_executable_pin(&shim, &pin).is_err(),
+            "structured pin must reject a Windows .cmd shim as a script payload"
+        );
+        let bat = dir.path().join("pi.bat");
+        std::fs::write(&bat, b"@echo off\r\n").unwrap();
+        let pin_bat = pin_executable(&bat, CommandKind::Structured).unwrap();
+        assert!(
+            verify_executable_pin(&bat, &pin_bat).is_err(),
+            "structured pin must reject a Windows .bat shim as a script payload"
+        );
+    }
+
     #[test]
     fn program_basename_handles_paths() {
         assert_eq!(program_basename("/bin/bash"), "bash");
@@ -1898,5 +2964,799 @@ mod tests {
         assert!(!is_shell_binary("bashful"));
         assert!(!is_shell_binary("notcmd"));
         assert!(!is_shell_binary(""));
+    }
+
+    /// P2-H: Win32 error 193 spawn failures must surface the actionable cause
+    /// (npm-style extensionless shim) instead of a generic internal error.
+    #[test]
+    fn spawn_error_mapper_preserves_actionable_cause() {
+        let generic = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let msg = describe_spawn_error("pi", &generic);
+        assert!(msg.contains("failed to start `pi`"));
+        assert!(msg.contains("no such file"), "raw cause preserved: {msg}");
+
+        // Win32 error 193 = invalid executable format.
+        let win32 = std::io::Error::from_raw_os_error(193);
+        let msg = describe_spawn_error("pi", &win32);
+        assert!(
+            msg.contains("not a valid Win32 application (error 193)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("extensionless POSIX shim"),
+            "actionable remediation expected: {msg}"
+        );
+        assert!(msg.contains("pi.exe/.cmd/.bat"), "{msg}");
+    }
+
+    /// #145: an unresolvable bare name must name the directories actually
+    /// searched so "works in my shell" mismatches are diagnosable.
+    #[test]
+    fn spawn_resolve_error_lists_searched_directories() {
+        let msg = describe_spawn_resolve_error(&SpawnResolveError::NotFound);
+        assert!(msg.contains("executable could not be resolved"), "{msg}");
+        assert!(
+            msg.contains("service PATH"),
+            "the service PATH must be named: {msg}"
+        );
+        assert!(
+            msg.contains("shell startup files are never sourced"),
+            "{msg}"
+        );
+        // The deterministic user-local extras appear (home-collapsed).
+        // Windows has no separate user-local discovery step (user bins ride
+        // the user PATH), so this expectation is Unix-only.
+        #[cfg(not(windows))]
+        {
+            let labels = spawn_search_dir_labels();
+            assert!(
+                labels.iter().any(|label| label.starts_with("~/.local/bin")),
+                "user-local dirs must be part of the searched set: {labels:?}"
+            );
+        }
+        // Bounded listing: at most 12 directories plus an omission note.
+        assert!(msg.len() < 2 * 1024, "message must stay bounded: {msg}");
+        // Non-NotFound errors keep their own Display text only.
+        let other = describe_spawn_resolve_error(&SpawnResolveError::CmdUnsafeArgument);
+        assert_eq!(other, SpawnResolveError::CmdUnsafeArgument.to_string());
+    }
+
+    /// #144: on Linux, an EPERM at spawn time names the shipped
+    /// RestrictNamespaces guard and the operator drop-in instead of surfacing
+    /// an opaque OS error. Other platforms keep the raw message.
+    #[test]
+    fn eperm_spawn_error_names_restrict_namespaces_guidance_on_linux() {
+        let eperm = std::io::Error::from_raw_os_error(1);
+        let msg = describe_spawn_error("docker", &eperm);
+        if cfg!(target_os = "linux") {
+            assert!(msg.contains("RestrictNamespaces=yes"), "{msg}");
+            assert!(msg.contains("RestrictNamespaces=no"), "{msg}");
+            assert!(msg.contains("ownmesh doctor"), "{msg}");
+        } else {
+            assert!(!msg.contains("RestrictNamespaces"), "{msg}");
+        }
+        // A non-EPERM error is never annotated with namespace guidance.
+        #[cfg(not(windows))]
+        {
+            let generic = std::io::Error::from_raw_os_error(2);
+            let msg = describe_spawn_error("docker", &generic);
+            assert!(!msg.contains("RestrictNamespaces"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn windows_pathext_candidates_order_invocable_before_bare_name() {
+        // Default PATHEXT: .COM;.EXE;.BAT;.CMD, bare name always last.
+        // Case is preserved from the PATHEXT string (Windows is case-insensitive).
+        let candidates = windows_pathext_candidates("pi", None);
+        assert_eq!(
+            candidates,
+            vec!["pi.COM", "pi.EXE", "pi.BAT", "pi.CMD", "pi"]
+        );
+        // PATHEXT entries that are not directly invocable (.ps1/.sh) and
+        // duplicates are filtered out; case is preserved from PATHEXT.
+        let candidates = windows_pathext_candidates("opencode", Some(";.PS1;.exe;.CMD;.SH;.cmd"));
+        assert_eq!(candidates, vec!["opencode.exe", "opencode.CMD", "opencode"]);
+        // Explicit extensions never go through PATHEXT ordering.
+        let candidates = windows_pathext_candidates("pi.cmd", None);
+        assert_eq!(candidates, vec!["pi.cmd"]);
+    }
+
+    #[test]
+    fn windows_candidate_resolution_prefers_cmd_shim_over_extensionless_sibling() {
+        // Regression for the npm-shim failure: `pi`, `pi.cmd` and `pi.ps1`
+        // siblings must resolve to the invocable `.cmd` shim, never the
+        // extensionless POSIX shim that fails with Win32 error 193.
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("pi"), b"#!/bin/sh\nexec node ...\n").unwrap();
+        std::fs::write(dir.path().join("pi.cmd"), b"@echo off\r\n").unwrap();
+        std::fs::write(dir.path().join("pi.ps1"), b"# powershell\n").unwrap();
+        std::fs::write(dir.path().join("pi.exe"), b"MZ").unwrap();
+
+        // PATHEXT order: .exe beats .cmd when both exist.  The fixtures use
+        // lowercase extensions matching the explicit lowercase PATHEXT below
+        // (the CI host filesystem may be case-sensitive).
+        let dirs = vec![dir.path().to_path_buf()];
+        let pathext = ".exe;.com;.cmd;.bat";
+        let resolved = resolve_executable_in_dirs("pi", &dirs, None, true, Some(pathext)).unwrap();
+        assert_eq!(resolved, dir.path().join("pi.exe"));
+
+        // Without .exe, the .cmd shim wins over the extensionless sibling.
+        std::fs::remove_file(dir.path().join("pi.exe")).unwrap();
+        let resolved = resolve_executable_in_dirs("pi", &dirs, None, true, Some(pathext)).unwrap();
+        assert_eq!(resolved, dir.path().join("pi.cmd"));
+        assert_ne!(
+            resolved,
+            dir.path().join("pi"),
+            "the extensionless POSIX shim must never win while an invocable sibling exists"
+        );
+
+        // A genuine extensionless native binary is still reachable when no
+        // PATHEXT sibling exists.
+        std::fs::remove_file(dir.path().join("pi.cmd")).unwrap();
+        std::fs::remove_file(dir.path().join("pi.ps1")).unwrap();
+        let resolved = resolve_executable_in_dirs("pi", &dirs, None, true, Some(pathext)).unwrap();
+        assert_eq!(resolved, dir.path().join("pi"));
+    }
+
+    #[test]
+    fn unix_resolution_is_bare_name_only() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("codex"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("codex.cmd"), b"@echo off\r\n").unwrap();
+        // Unix semantics: the bare file is the only candidate, even when a
+        // .cmd sibling exists (Windows PATHEXT semantics must not leak over).
+        let dirs = vec![dir.path().to_path_buf()];
+        let resolved = resolve_executable_in_dirs("codex", &dirs, None, false, None).unwrap();
+        assert_eq!(resolved, dir.path().join("codex"));
+    }
+
+    /// P1-C: an explicit relative path without an extension (`./pi`) must
+    /// follow Windows/PATHEXT semantics too — the invocable `.cmd` shim wins
+    /// over the extensionless npm-style sibling, so the old error-193 path
+    /// cannot win. The bare-name tests covered `pi`; this covers `./pi` and
+    /// `pi\\`-style explicit paths.
+    #[test]
+    fn explicit_relative_windows_path_prefers_invocable_sibling() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("pi"), b"#!/bin/sh\nexec node ...\n").unwrap();
+        std::fs::write(dir.path().join("pi.cmd"), b"@echo off\r\n").unwrap();
+        std::fs::write(dir.path().join("pi.ps1"), b"# powershell\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["pi", "pi.cmd", "pi.ps1"] {
+                let path = dir.path().join(name);
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+        }
+        let pathext = ".exe;.com;.cmd;.bat";
+
+        // `./pi` resolves to `./pi.cmd`, never the extensionless shim.
+        let argv =
+            resolve_spawn_argv_in_dirs("./pi", &[], &[], Some(dir.path()), true, Some(pathext))
+                .expect("resolve");
+        // The batch shim is launched through the documented cmd.exe form with
+        // the pinned absolute interpreter (never a bare `cmd.exe`, which
+        // CreateProcess could resolve from the current directory first).
+        assert!(
+            argv[0].to_ascii_lowercase().ends_with("system32\\cmd.exe"),
+            "batch shim must launch via the pinned System32 cmd.exe: {:?}",
+            argv[0]
+        );
+        assert!(argv.contains(&dir.path().join("pi.cmd").to_string_lossy().into_owned()));
+
+        // `pi\\`-style explicit path behaves identically (Windows only: on
+        // Unix a backslash is a literal filename character).
+        #[cfg(windows)]
+        {
+            let argv =
+                resolve_spawn_argv_in_dirs("pi\\", &[], &[], Some(dir.path()), true, Some(pathext))
+                    .expect("resolve");
+            assert!(argv.contains(&dir.path().join("pi.cmd").to_string_lossy().into_owned()));
+        }
+
+        // An explicit extension is used verbatim and never re-ordered.
+        let argv =
+            resolve_spawn_argv_in_dirs("./pi.cmd", &[], &[], Some(dir.path()), true, Some(pathext))
+                .expect("resolve");
+        assert!(argv.contains(&dir.path().join("./pi.cmd").to_string_lossy().into_owned()));
+
+        // A genuine extensionless native binary is still reachable when no
+        // PATHEXT sibling exists (the PATHEXT branch normalizes the `./`).
+        std::fs::remove_file(dir.path().join("pi.cmd")).unwrap();
+        std::fs::remove_file(dir.path().join("pi.ps1")).unwrap();
+        let argv =
+            resolve_spawn_argv_in_dirs("./pi", &[], &[], Some(dir.path()), true, Some(pathext))
+                .expect("resolve");
+        assert_eq!(argv[0], dir.path().join("pi").to_string_lossy());
+
+        // Unix behavior is unchanged: `./pi` is the exact file, never the
+        // `.cmd` sibling.
+        let argv = resolve_spawn_argv_in_dirs("./pi", &[], &[], Some(dir.path()), false, None)
+            .expect("resolve");
+        assert_eq!(argv[0], dir.path().join("./pi").to_string_lossy());
+    }
+
+    /// P1-D: launchable resolution skips non-executable Unix files instead of
+    /// reporting a candidate that could never spawn.
+    #[test]
+    fn launchable_resolution_requires_unix_exec_bit() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("pi");
+        std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        #[cfg(unix)]
+        {
+            // 0644: is_file() true, but not launchable.
+            assert!(!is_launchable_file(&shim));
+            assert!(
+                resolve_launchable_executable_in_dirs("pi", &dirs, None, false, None).is_none()
+            );
+            assert!(!is_launchable_file(&dir.path().join("missing")));
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).unwrap();
+            assert!(is_launchable_file(&shim));
+            let resolved =
+                resolve_launchable_executable_in_dirs("pi", &dirs, None, false, None).unwrap();
+            assert_eq!(resolved, shim);
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(is_launchable_file(&shim));
+            assert!(
+                resolve_launchable_executable_in_dirs("pi", &dirs, None, false, None).is_some()
+            );
+        }
+    }
+
+    /// P1-C: `build_command` (the structured `command.run` spawn path) must
+    /// route a `.cmd`/`.bat` program through the shared cmd.exe wrapper on
+    /// Windows — CreateProcess cannot exec batch files directly (Win32 error
+    /// 193). Runs on Windows CI; the pure resolver behavior is pinned on all
+    /// platforms by `spawn_argv_windows_selects_cmd_shim_and_wraps`.
+    #[cfg(windows)]
+    #[test]
+    fn build_command_wraps_windows_batch_shim_in_cmd_exe() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("pi.cmd");
+        std::fs::write(&shim, b"@echo off\r\n").unwrap();
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: shim.to_string_lossy().into_owned(),
+            args: vec!["--version".into()],
+            cwd: Some(dir.path().to_path_buf()),
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(5_000),
+            max_output_bytes: 64 * 1024,
+            idempotency_key: None,
+        };
+        let cmd = build_command(&req).expect("build_command");
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+        let argv: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            program.to_ascii_lowercase().ends_with("system32\\cmd.exe"),
+            "batch shim must launch via the pinned System32 cmd.exe: {program:?} {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a == "call"),
+            "cmd.exe wrapper must use `call`: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.ends_with("pi.cmd")),
+            "the resolved shim must be a separate argv token: {argv:?}"
+        );
+    }
+
+    /// P1-C: session launch argv resolution — npm-style `name` + `name.cmd` +
+    /// `name.ps1` siblings must select the invocable `.cmd` shim and rewrite
+    /// the argv to `cmd.exe /c "<shim>" <args>` (CreateProcess cannot exec
+    /// batch files directly).  Windows-only behavior is pinned here via the
+    /// `windows_style` parameter so it runs on any CI platform.
+    #[test]
+    fn spawn_argv_windows_selects_cmd_shim_and_wraps() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("pi"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(dir.path().join("pi.cmd"), b"@echo off\r\n").unwrap();
+        std::fs::write(dir.path().join("pi.ps1"), b"# powershell\n").unwrap();
+        // The `windows_style` simulation runs on any platform; give the
+        // fixtures the exec bit so the launchable check (Unix) matches real
+        // Windows behavior (any regular file).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["pi", "pi.cmd", "pi.ps1"] {
+                let mut perms = std::fs::metadata(dir.path().join(name))
+                    .unwrap()
+                    .permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(dir.path().join(name), perms).unwrap();
+            }
+        }
+        let dirs = vec![dir.path().to_path_buf()];
+        let pathext = ".exe;.com;.cmd;.bat";
+        let argv = resolve_spawn_argv_in_dirs(
+            "pi",
+            &["--version".into()],
+            &dirs,
+            None,
+            true,
+            Some(pathext),
+        )
+        .expect("resolved");
+        assert!(
+            argv[0].to_ascii_lowercase().ends_with("system32\\cmd.exe"),
+            "argv[0] must be the pinned System32 cmd.exe, not a bare name"
+        );
+        assert_eq!(argv[1], "/e:ON");
+        assert_eq!(argv[2], "/v:OFF");
+        assert_eq!(argv[3], "/d");
+        assert_eq!(argv[4], "/s");
+        assert_eq!(argv[5], "/c");
+        assert_eq!(argv[6], "call");
+        assert_eq!(
+            argv[7],
+            dir.path().join("pi.cmd").display().to_string(),
+            "the resolved .cmd shim must be a separate argv token after `call`"
+        );
+        assert_eq!(argv[8], "--version");
+        assert_eq!(argv.len(), 9);
+
+        // With .exe present, no cmd wrapper is needed.
+        std::fs::write(dir.path().join("pi.exe"), b"MZ").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(dir.path().join("pi.exe"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(dir.path().join("pi.exe"), perms).unwrap();
+        }
+        let argv = resolve_spawn_argv_in_dirs(
+            "pi",
+            &["--version".into()],
+            &dirs,
+            None,
+            true,
+            Some(pathext),
+        )
+        .expect("resolved");
+        assert_eq!(argv[0], dir.path().join("pi.exe").display().to_string());
+        assert_eq!(argv[1], "--version");
+
+        // Extensionless-only fallback: bare shim last (Windows has no exec
+        // bits; if no invocable sibling exists there is nothing better).
+        std::fs::remove_file(dir.path().join("pi.exe")).unwrap();
+        std::fs::remove_file(dir.path().join("pi.cmd")).unwrap();
+        std::fs::remove_file(dir.path().join("pi.ps1")).unwrap();
+        std::fs::write(dir.path().join("pi"), b"MZ").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(dir.path().join("pi"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(dir.path().join("pi"), perms).unwrap();
+        }
+        let argv =
+            resolve_spawn_argv_in_dirs("pi", &["-v".into()], &dirs, None, true, Some(pathext))
+                .expect("resolved");
+        assert_eq!(
+            argv,
+            vec![dir.path().join("pi").display().to_string(), "-v".into()]
+        );
+    }
+
+    /// P1-C: Unix session launch resolution replaces argv[0] with the resolved
+    /// absolute path and requires the exec bit.
+    #[test]
+    fn spawn_argv_unix_resolves_absolute_and_requires_exec() {
+        let dir = tempdir().unwrap();
+        let shim = dir.path().join("codex");
+        std::fs::write(&shim, b"#!/bin/sh\n").unwrap();
+        let dirs = vec![dir.path().to_path_buf()];
+        #[cfg(unix)]
+        {
+            // Non-executable: unresolved (never hand a bare name to a spawner).
+            assert_eq!(
+                resolve_spawn_argv_in_dirs("codex", &["exec".into()], &dirs, None, false, None),
+                Err(SpawnResolveError::NotFound)
+            );
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).unwrap();
+            let argv =
+                resolve_spawn_argv_in_dirs("codex", &["exec".into()], &dirs, None, false, None)
+                    .expect("resolved");
+            assert_eq!(argv[0], shim.display().to_string());
+            assert_eq!(argv[1], "exec");
+            // Absolute-path programs are verified directly (profile launch plans).
+            let argv = resolve_spawn_argv_in_dirs(
+                shim.to_str().unwrap(),
+                &["exec".into()],
+                &[],
+                None,
+                false,
+                None,
+            )
+            .expect("absolute path");
+            assert_eq!(argv[0], shim.display().to_string());
+        }
+        #[cfg(not(unix))]
+        {
+            let argv =
+                resolve_spawn_argv_in_dirs("codex", &["exec".into()], &dirs, None, false, None)
+                    .expect("resolved");
+            assert_eq!(argv[0], shim.display().to_string());
+        }
+    }
+
+    /// P1-D review: the actual spawn path (`build_command` behind
+    /// `run_command`) must fail closed when a structured program resolves to
+    /// nothing, instead of silently handing a bare name to the spawner and
+    /// letting the OS PATH lookup disagree with profile detection and review
+    /// pinning. An absolute path to a missing file is deterministic on every
+    /// platform and exercises the shared `resolve_spawn_argv` core on Unix
+    /// (Windows already routes through it).
+    #[tokio::test]
+    async fn structured_spawn_fails_closed_when_program_is_unresolvable() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("no-such-ownmesh-tool");
+        let req = RunRequest {
+            kind: CommandKind::Structured,
+            program: missing.to_string_lossy().into_owned(),
+            args: vec![],
+            cwd: None,
+            env: HashMap::new(),
+            stdin: None,
+            timeout_ms: Some(5_000),
+            max_output_bytes: 64 * 1024,
+            idempotency_key: None,
+        };
+        let err = run_command(&req, None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not be resolved") || msg.contains("Spawn"),
+            "unresolvable structured program must fail closed before spawn: {msg}"
+        );
+    }
+
+    /// P1-C: Windows batch launch must preserve argv semantics or fail closed.
+    /// Tokens with whitespace are quoted by the spawner, so quoted cmd
+    /// metacharacters are literal; bare metacharacters, embedded quotes, `%`/
+    /// `!` and control characters are rejected with `CmdUnsafeArgument`.
+    #[test]
+    #[allow(clippy::too_many_lines)] // exhaustive fail-closed matrix stays one test
+    fn windows_batch_argv_preserves_argv_or_fails_closed() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("pi.cmd"), b"@echo off\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.path().join("pi.cmd"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let dirs = vec![dir.path().to_path_buf()];
+        let pathext = ".exe;.com;.cmd;.bat";
+        let resolve = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
+            resolve_spawn_argv_in_dirs("pi", &owned, &dirs, None, true, Some(pathext))
+        };
+
+        // Spaces in args and in the script path stay separate argv tokens
+        // (the spawner quotes them); `call` keeps cmd's /s strip rule inert.
+        let with_space = resolve(&["two words", "a&b c"]).expect("quoted tokens");
+        assert_eq!(
+            with_space[7],
+            dir.path().join("pi.cmd").display().to_string()
+        );
+        assert_eq!(with_space[8], "two words");
+        assert_eq!(with_space[9], "a&b c");
+
+        // Bare cmd metacharacters cannot be quoted by the spawner -> fail closed.
+        assert_eq!(resolve(&["a&b"]), Err(SpawnResolveError::CmdUnsafeArgument));
+        assert_eq!(resolve(&["a|b"]), Err(SpawnResolveError::CmdUnsafeArgument));
+        assert_eq!(resolve(&["a^b"]), Err(SpawnResolveError::CmdUnsafeArgument));
+        assert_eq!(resolve(&["(a)"]), Err(SpawnResolveError::CmdUnsafeArgument));
+
+        // Embedded quotes are never representable through cmd.exe -> fail closed.
+        assert_eq!(
+            resolve(&["say \"hi\""]),
+            Err(SpawnResolveError::CmdUnsafeArgument)
+        );
+
+        // % and ! expansion cannot be neutralized -> fail closed.
+        assert_eq!(
+            resolve(&["100%"]),
+            Err(SpawnResolveError::CmdUnsafeArgument)
+        );
+        assert_eq!(
+            resolve(&["bang!"]),
+            Err(SpawnResolveError::CmdUnsafeArgument)
+        );
+
+        // Control characters -> fail closed.
+        assert_eq!(
+            resolve(&["line\nbreak"]),
+            Err(SpawnResolveError::CmdUnsafeArgument)
+        );
+        assert_eq!(
+            resolve(&["a\rb"]),
+            Err(SpawnResolveError::CmdUnsafeArgument)
+        );
+
+        // A script path with whitespace is representable (quoted + call).
+        std::fs::create_dir_all(dir.path().join("Program Files (x86)")).unwrap();
+        let spaced = dir.path().join("Program Files (x86)").join("pi.cmd");
+        std::fs::write(&spaced, b"@echo off\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&spaced, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dirs_spaced = vec![spaced.parent().unwrap().to_path_buf()];
+        let argv = resolve_spawn_argv_in_dirs(
+            "pi",
+            &["--version".into()],
+            &dirs_spaced,
+            None,
+            true,
+            Some(pathext),
+        )
+        .expect("spaced script path stays a single quoted token");
+        assert_eq!(argv[6], "call");
+        assert_eq!(argv[7], spaced.display().to_string());
+
+        // ...but a script path with a % or ! fails closed too.
+        let bad = dir.path().join("pi%x.cmd");
+        std::fs::write(&bad, b"@echo off\r\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let dirs_bad = vec![dir.path().to_path_buf()];
+        assert_eq!(
+            resolve_spawn_argv_in_dirs(
+                "pi%x",
+                &["--version".into()],
+                &dirs_bad,
+                None,
+                true,
+                Some(pathext),
+            ),
+            Err(SpawnResolveError::CmdUnsafeArgument)
+        );
+    }
+
+    #[test]
+    fn cmd_token_safety_predicate_is_explicit() {
+        // Bare-safe: alphanumerics, path chars, dashes, dots, `=`, `,`, `;`.
+        for token in ["--version", "C:\\npm\\pi.cmd", "key=value", "a,b;c"] {
+            assert!(cmd_token_safe(token), "{token} must be bare-safe");
+        }
+        // Whitespace triggers spawner quoting -> metachars become literal.
+        assert!(cmd_token_safe("a&b c"));
+        assert!(cmd_token_safe("Program Files (x86)"));
+        // Always unsafe.
+        for token in ["a\"b", "100%", "bang!", "x\ny", "a\rb"] {
+            assert!(!cmd_token_safe(token), "{token:?} must be rejected");
+        }
+        // Bare metachars are unsafe.
+        for token in ["a&b", "a|b", "a<b", "a>b", "(a)", "a^b"] {
+            assert!(!cmd_token_safe(token), "{token:?} must be rejected");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn user_cli_search_dirs_are_deterministic_and_shell_free() {
+        let home = tempdir().unwrap();
+        // NVM layout with several node versions.
+        let nvm = home.path().join(".nvm").join("versions").join("node");
+        std::fs::create_dir_all(nvm.join("v20.19.0").join("bin")).unwrap();
+        std::fs::create_dir_all(nvm.join("v18.3.1").join("bin")).unwrap();
+        std::fs::create_dir_all(nvm.join("v22.14.1").join("bin")).unwrap();
+        // Decoy non-version entry must be ignored.
+        std::fs::create_dir_all(nvm.join("current").join("bin")).unwrap();
+
+        let dirs = user_cli_search_dirs(Some(home.path()));
+        let names: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        assert!(names.contains(&home.path().join(".local/bin").display().to_string()));
+        assert!(names.contains(&home.path().join(".cargo/bin").display().to_string()));
+        assert!(names.contains(&home.path().join(".nix-profile/bin").display().to_string()));
+        assert!(names.contains(&home.path().join(".npm-global/bin").display().to_string()));
+        assert!(names.contains(&"/nix/var/nix/profiles/default/bin".to_string()));
+        // NVM versions sorted ascending (indices must be strictly increasing).
+        let positions: Vec<usize> = ["v18.3.1", "v20.19.0", "v22.14.1"]
+            .iter()
+            .map(|v| {
+                names
+                    .iter()
+                    .position(|n| n.ends_with(&format!("/.nvm/versions/node/{v}/bin")))
+                    .expect("nvm bin dir present")
+            })
+            .collect();
+        assert_eq!(
+            positions,
+            {
+                let mut sorted = positions.clone();
+                sorted.sort_unstable();
+                sorted
+            },
+            "nvm versions must be sorted: {names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.ends_with("/.nvm/versions/node/current/bin")),
+            "decoy non-version dir must not be searched: {names:?}"
+        );
+        // No home: only the fixed nix profile dir remains; deterministic and
+        // never loads any shell startup file (source-level guard below).
+        assert_eq!(
+            user_cli_search_dirs(None),
+            vec![PathBuf::from("/nix/var/nix/profiles/default/bin")]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_cli_search_dirs_are_empty_on_windows() {
+        let home = tempdir().unwrap();
+        assert!(user_cli_search_dirs(Some(home.path())).is_empty());
+        assert!(user_cli_search_dirs(None).is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn user_local_dir_resolution_finds_installed_clis() {
+        let home = tempdir().unwrap();
+        let local_bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        std::fs::write(local_bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(local_bin.join("codex"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(local_bin.join("codex"), perms).unwrap();
+        }
+        let nvm_bin = home.path().join(".nvm/versions/node/v24.19.0/bin");
+        std::fs::create_dir_all(&nvm_bin).unwrap();
+        std::fs::write(nvm_bin.join("pi"), b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(nvm_bin.join("pi")).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(nvm_bin.join("pi"), perms).unwrap();
+        }
+        let dirs = user_cli_search_dirs(Some(home.path()));
+        assert_eq!(
+            resolve_executable_in_dirs("codex", &dirs, None, false, None),
+            Some(local_bin.join("codex"))
+        );
+        assert_eq!(
+            resolve_executable_in_dirs("pi", &dirs, None, false, None),
+            Some(nvm_bin.join("pi"))
+        );
+        assert_eq!(
+            resolve_executable_in_dirs("absent-cli", &dirs, None, false, None),
+            None
+        );
+    }
+
+    /// The user-CLI discovery path must never load a shell startup file:
+    /// source-level guard on the production code (tests module stripped).
+    #[test]
+    fn user_cli_discovery_never_sources_shell_startup_files() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        // A real sourcing implementation would have to reference these file
+        // names or spawn a shell; none may appear in production code.
+        for forbidden in [
+            ".bashrc",
+            ".zshrc",
+            ".bash_profile",
+            "bash_login",
+            ".profile",
+            ".zprofile",
+        ] {
+            assert!(
+                !prod.contains(forbidden),
+                "user CLI discovery must not reference shell startup files: {forbidden}"
+            );
+        }
+    }
+
+    /// P1-D/P1-F: invocation-path resolution must use the same launchable-file
+    /// semantics as profile detection. A non-executable first PATH match must
+    /// be skipped (a later executable wins), so command/review pinning can
+    /// never pin a file that discovery would not report installed and that
+    /// spawning would reject with EACCES.
+    #[cfg(unix)]
+    #[test]
+    fn invocation_resolution_skips_non_launchable_first_match() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        // Non-executable first match (leftover shim without its exec bit).
+        std::fs::write(first.join("codex"), b"#!/bin/sh\n").unwrap();
+        // Executable later match.
+        std::fs::write(second.join("codex"), b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(second.join("codex"))
+                .unwrap()
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(second.join("codex"), perms).unwrap();
+        }
+        let dirs = vec![first.clone(), second.clone()];
+        // Profile detection (launchable) skips the first match.
+        assert_eq!(
+            resolve_launchable_executable_in_dirs("codex", &dirs, None, false, None),
+            Some(second.join("codex"))
+        );
+        // Invocation resolution uses the same launchable core, so it must
+        // agree (P1-F: no detect-ready-then-pin-unlaunchable divergence).
+        assert_eq!(
+            resolve_launchable_executable_in_dirs("codex", &dirs, None, false, None),
+            Some(second.join("codex"))
+        );
+        // And spawn resolution agrees too.
+        let argv = resolve_spawn_argv_in_dirs("codex", &[], &dirs, None, false, None).unwrap();
+        assert_eq!(argv[0], second.join("codex").to_string_lossy());
+    }
+
+    /// P1-D: an unset `PATH` must not make invocation/spawn resolution fail
+    /// before the deterministic user-local dirs are searched — discovery and
+    /// launch must agree even when the service environment has no PATH.
+    #[cfg(not(windows))]
+    #[test]
+    fn unset_path_still_searches_user_local_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("codex"), b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(bin.join("codex")).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(bin.join("codex"), perms).unwrap();
+        }
+        // The pure dirs core: user-local dirs are searched even with an empty
+        // PATH-derived list (the production wrapper treats unset PATH as
+        // empty and appends these dirs).
+        let dirs = user_cli_search_dirs(Some(home.path()));
+        assert_eq!(
+            resolve_launchable_executable_in_dirs("codex", &dirs, None, false, None),
+            Some(bin.join("codex")),
+            "user-local dirs must be searched with no PATH"
+        );
+        let argv = resolve_spawn_argv_in_dirs("codex", &[], &dirs, None, false, None).unwrap();
+        assert_eq!(argv[0], bin.join("codex").to_string_lossy());
     }
 }

@@ -91,6 +91,8 @@ pub enum ErrorCode {
     Authorization,
     #[serde(rename = "OWNMESH_E_POLICY_DENIED")]
     PolicyDenied,
+    #[serde(rename = "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT")]
+    ExecutableIdentityDrift,
 
     // exit 5
     #[serde(rename = "OWNMESH_E_DEVICE_OFFLINE")]
@@ -113,10 +115,20 @@ pub enum ErrorCode {
     ControllerConflict,
     #[serde(rename = "OWNMESH_E_SESSION_NOT_CONTROLLER")]
     SessionNotController,
+    #[serde(rename = "OWNMESH_E_JOURNAL_CAPACITY")]
+    JournalCapacity,
+    #[serde(rename = "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED")]
+    TransitionRecoveryRequired,
+    /// A requested execution would run an OwnMesh binary that re-enters this
+    /// daemon's IPC, which deadlocks the runtime it is executing under (#160).
+    #[serde(rename = "OWNMESH_E_SELF_REENTRANT_EXEC")]
+    SelfReentrantExec,
 
     // exit 8
     #[serde(rename = "OWNMESH_E_PROFILE_UNAVAILABLE")]
     ProfileUnavailable,
+    #[serde(rename = "OWNMESH_E_EXECUTABLE_FORMAT")]
+    ExecutableFormat,
 
     // exit 9
     #[serde(rename = "OWNMESH_E_INTERNAL")]
@@ -137,6 +149,7 @@ impl ErrorCode {
             Self::Authentication => "OWNMESH_E_AUTHENTICATION",
             Self::Authorization => "OWNMESH_E_AUTHORIZATION",
             Self::PolicyDenied => "OWNMESH_E_POLICY_DENIED",
+            Self::ExecutableIdentityDrift => "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT",
             Self::DeviceOffline => "OWNMESH_E_DEVICE_OFFLINE",
             Self::Timeout => "OWNMESH_E_TIMEOUT",
             Self::Cancelled => "OWNMESH_E_CANCELLED",
@@ -145,7 +158,11 @@ impl ErrorCode {
             Self::StaleSnapshot => "OWNMESH_E_STALE_SNAPSHOT",
             Self::ControllerConflict => "OWNMESH_E_CONTROLLER_CONFLICT",
             Self::SessionNotController => "OWNMESH_E_SESSION_NOT_CONTROLLER",
+            Self::JournalCapacity => "OWNMESH_E_JOURNAL_CAPACITY",
+            Self::TransitionRecoveryRequired => "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED",
+            Self::SelfReentrantExec => "OWNMESH_E_SELF_REENTRANT_EXEC",
             Self::ProfileUnavailable => "OWNMESH_E_PROFILE_UNAVAILABLE",
+            Self::ExecutableFormat => "OWNMESH_E_EXECUTABLE_FORMAT",
             Self::Internal => "OWNMESH_E_INTERNAL",
         }
     }
@@ -166,6 +183,7 @@ impl ErrorCode {
             "OWNMESH_E_AUTHENTICATION" => Ok(Self::Authentication),
             "OWNMESH_E_AUTHORIZATION" => Ok(Self::Authorization),
             "OWNMESH_E_POLICY_DENIED" => Ok(Self::PolicyDenied),
+            "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT" => Ok(Self::ExecutableIdentityDrift),
             "OWNMESH_E_DEVICE_OFFLINE" => Ok(Self::DeviceOffline),
             "OWNMESH_E_TIMEOUT" => Ok(Self::Timeout),
             "OWNMESH_E_CANCELLED" => Ok(Self::Cancelled),
@@ -174,7 +192,11 @@ impl ErrorCode {
             "OWNMESH_E_STALE_SNAPSHOT" => Ok(Self::StaleSnapshot),
             "OWNMESH_E_CONTROLLER_CONFLICT" => Ok(Self::ControllerConflict),
             "OWNMESH_E_SESSION_NOT_CONTROLLER" => Ok(Self::SessionNotController),
+            "OWNMESH_E_JOURNAL_CAPACITY" => Ok(Self::JournalCapacity),
+            "OWNMESH_E_TRANSITION_RECOVERY_REQUIRED" => Ok(Self::TransitionRecoveryRequired),
+            "OWNMESH_E_SELF_REENTRANT_EXEC" => Ok(Self::SelfReentrantExec),
             "OWNMESH_E_PROFILE_UNAVAILABLE" => Ok(Self::ProfileUnavailable),
+            "OWNMESH_E_EXECUTABLE_FORMAT" => Ok(Self::ExecutableFormat),
             "OWNMESH_E_INTERNAL" => Ok(Self::Internal),
             _ => Err(DomainError::new(
                 Self::InvalidArgument,
@@ -194,14 +216,19 @@ impl ErrorCode {
             | Self::UnsupportedProtocol
             | Self::Config => ExitCode::UsageConfig,
             Self::Authentication => ExitCode::Authentication,
-            Self::Authorization | Self::PolicyDenied => ExitCode::Authorization,
+            Self::Authorization | Self::PolicyDenied | Self::ExecutableIdentityDrift => {
+                ExitCode::Authorization
+            }
             Self::DeviceOffline => ExitCode::DeviceOffline,
             Self::Timeout | Self::Cancelled | Self::Expired => ExitCode::TimeoutCancelled,
             Self::Conflict
             | Self::StaleSnapshot
             | Self::ControllerConflict
-            | Self::SessionNotController => ExitCode::Conflict,
-            Self::ProfileUnavailable => ExitCode::ProfileUnavailable,
+            | Self::SessionNotController
+            | Self::JournalCapacity
+            | Self::TransitionRecoveryRequired
+            | Self::SelfReentrantExec => ExitCode::Conflict,
+            Self::ProfileUnavailable | Self::ExecutableFormat => ExitCode::ProfileUnavailable,
             Self::Internal => ExitCode::Internal,
         }
     }
@@ -211,7 +238,12 @@ impl ErrorCode {
     pub const fn retryable(self) -> bool {
         matches!(
             self,
-            Self::DeviceOffline | Self::Timeout | Self::Conflict | Self::Internal
+            Self::DeviceOffline
+                | Self::Timeout
+                | Self::Conflict
+                | Self::JournalCapacity
+                | Self::TransitionRecoveryRequired
+                | Self::Internal
         )
     }
 }
@@ -382,6 +414,14 @@ mod tests {
         let err = DomainError::new(ErrorCode::Expired, "expired");
         assert_eq!(err.exit_code(), ExitCode::TimeoutCancelled);
         assert_eq!(err.code.as_str(), "OWNMESH_E_EXPIRED");
+    }
+
+    #[test]
+    fn executable_identity_drift_requires_fresh_authorization() {
+        let code = ErrorCode::parse("OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT").unwrap();
+        assert_eq!(code, ErrorCode::ExecutableIdentityDrift);
+        assert_eq!(code.exit_code(), ExitCode::Authorization);
+        assert!(!code.retryable());
     }
 
     #[test]

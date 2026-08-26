@@ -5,7 +5,7 @@ OwnMesh は Full Access を正式に提供するため、「操作を禁止す�
 **Threat model:** [`THREAT_MODEL.md`](./THREAT_MODEL.md)  
 **Evidence rule:** each checkbox lists automated tests and/or docs. `harden-07` locks invariants; waived feature depth is marked **W-***.
 
-Legend: ✅ covered by automated tests in v1.2.7 · ⚠ partial / best-effort · ⏸ waived feature depth (invariant may still be locked)
+Legend: ✅ covered by automated tests in v1.2.16 · ⚠ partial / best-effort · ⏸ waived feature depth (invariant may still be locked)
 
 ## 1. Identity と Token
 
@@ -79,6 +79,10 @@ Legend: ✅ covered by automated tests in v1.2.7 · ⚠ partial / best-effort ·
   **Tests:** `ownmesh-exec/tests/security_command_injection.rs`
 - [x] raw shell は別 capability/tool として記録される  
   **Tests:** MCP catalog separation tests; policy capability split
+- [x] approval-bound invocation/proxy と backing image を別々に pin し、drift 時に代替 path を起動しない
+  **Tests:** `ownmeshd/tests/adversarial_security.rs` multicall fixture / delete / retarget tests; ADR 0013
+- [x] executable verification と OS image-open を同じ prepared object に結合する
+  **Tests:** `ownmesh-exec/tests/prepared_executable_security.rs`, `prepared_executable_windows.rs` (replace, in-place write, parent/junction drift, exact argv0)
 - [x] OS ごとの quoting を自前で文字列連結しない  
   **Tests:** structured argv passed as discrete args (injection suite)
 - [x] cwd、environment、stdin、timeout、kill semantics を明示する  

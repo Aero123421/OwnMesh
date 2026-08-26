@@ -99,8 +99,8 @@ test("device verification requires authenticated one-time CSRF transaction and b
   const results = await Promise.all([exchange(), exchange()]);
   assert.deepEqual(results.map((r) => r.status).sort(), [200, 400]);
 
-  await store.putDeviceCode({ device_code: "dcode_denied", user_code: "UVWX-YZ23", client_id: "cli", scope: "ownmesh.read", verification_uri: "https://cp.test/oauth/device", interval_sec: 5, expires_at: Date.now() + 60_000, status: "pending" });
-  const denyPage = await handleDeviceVerification(new Request("https://cp.test/oauth/device?user_code=UVWX-YZ23", { headers: { "accept-language": "ja-JP" } }), store, { principal });
+  await store.putDeviceCode({ device_code: "dcode_denied", user_code: "NPQR-STVW", client_id: "cli", scope: "ownmesh.read", verification_uri: "https://cp.test/oauth/device", interval_sec: 5, expires_at: Date.now() + 60_000, status: "pending" });
+  const denyPage = await handleDeviceVerification(new Request("https://cp.test/oauth/device?user_code=NPQR-STVW", { headers: { "accept-language": "ja-JP" } }), store, { principal });
   const denyHtml = await denyPage.text();
   assert.match(denyHtml, /<html lang="ja-JP">/);
   assert.match(denyHtml, /name="decision" value="deny"/);
@@ -241,11 +241,8 @@ test("audit and approval routes authenticate and approval handler is live", asyn
     { AUTH_PROVIDER: authProvider },
     ctx,
   );
-  assert.equal(approval.status, 400);
-  assert.deepEqual(await approval.json(), {
-    error: "invalid_request",
-    error_description: "operation_id required",
-  });
+  assert.equal(approval.status, 200);
+  assert.match(await approval.text(), /Review pending operations/);
   __setTestStore(null);
 });
 

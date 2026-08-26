@@ -84,6 +84,10 @@ pub enum TransferError {
     HashMismatch,
     #[error("destination already exists")]
     DestinationExists,
+    #[error("destination is missing; overwrite_expected_sha256 requires an existing file")]
+    DestinationMissing,
+    #[error("destination hash mismatch: expected {expected}, observed {actual}")]
+    DestinationHashMismatch { expected: String, actual: String },
     #[error("transfer is in a terminal state")]
     Terminal,
     #[error("transfer lease is held by another owner")]
@@ -104,6 +108,32 @@ pub type TransferResult<T> = Result<T, TransferError>;
 
 fn io_error(error: std::io::Error) -> TransferError {
     TransferError::Io(error.to_string())
+}
+
+fn map_publish_fs_error(error: ownmesh_fs::FsError) -> TransferError {
+    match error {
+        ownmesh_fs::FsError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            TransferError::DestinationExists
+        }
+        ownmesh_fs::FsError::NotFound(_) => TransferError::DestinationMissing,
+        ownmesh_fs::FsError::HashMismatch {
+            expected, actual, ..
+        } => TransferError::DestinationHashMismatch { expected, actual },
+        // `ownmesh-fs` fails restricted handle-relative publication
+        // closed with this exact platform capability sentinel. Keep
+        // it distinct from malformed destination paths so callers
+        // can report a supported surface that is unavailable on this
+        // OS instead of a generic transfer failure.
+        ownmesh_fs::FsError::InvalidPath(message)
+            if message
+                == "restricted retained transfer publish is unsupported on this platform" =>
+        {
+            TransferError::PlatformUnsupported
+        }
+        _ => TransferError::CustodyUnavailable,
+    }
 }
 
 fn open_owner_only_file_append_retry(path: &Path) -> TransferResult<File> {
@@ -356,6 +386,11 @@ pub struct TransferPlan {
     size_bytes: u64,
     sha256: String,
     plan_sha256: String,
+    /// Content-bound replacement target. Absent keeps no-replace semantics.
+    /// Not part of `from_verified` canonical bytes; the grant payload hash
+    /// already binds this fact when the control plane included it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overwrite_expected_sha256: Option<String>,
 }
 
 impl TransferPlan {
@@ -424,6 +459,7 @@ impl TransferPlan {
             size_bytes,
             sha256,
             plan_sha256,
+            overwrite_expected_sha256: None,
         })
     }
 
@@ -439,6 +475,9 @@ impl TransferPlan {
         )?;
         if self.id != expected.id || self.plan_sha256 != expected.plan_sha256 {
             return Err(TransferError::InvalidPlan("plan binding digest".into()));
+        }
+        if let Some(hash) = &self.overwrite_expected_sha256 {
+            validate_hash(hash, "overwrite_expected_sha256")?;
         }
         Ok(())
     }
@@ -472,6 +511,22 @@ impl TransferPlan {
     #[must_use]
     pub fn plan_sha256(&self) -> &str {
         &self.plan_sha256
+    }
+    #[must_use]
+    pub fn overwrite_expected_sha256(&self) -> Option<&str> {
+        self.overwrite_expected_sha256.as_deref()
+    }
+    /// Attach a content-bound replacement hash after identity verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::InvalidPlan`] when the hash is not 64 lowercase hex.
+    pub fn with_overwrite_expected_sha256(mut self, hash: Option<String>) -> TransferResult<Self> {
+        if let Some(value) = &hash {
+            validate_hash(value, "overwrite_expected_sha256")?;
+        }
+        self.overwrite_expected_sha256 = hash;
+        Ok(self)
     }
 }
 
@@ -2210,6 +2265,21 @@ impl JournalStore {
         atomic_write_owner_only(&path, &bytes).map_err(|_| TransferError::CustodyUnavailable)
     }
 
+    /// Publish a fully received private part. Absent overwrite hash keeps
+    /// no-replace semantics; a bound hash authorizes atomic replacement of
+    /// that exact prior content only.
+    pub fn publish_completed(
+        &self,
+        plan: &TransferPlan,
+        destination_workspace: &ownmesh_fs::WorkspaceRoot,
+    ) -> TransferResult<()> {
+        if plan.overwrite_expected_sha256().is_some() {
+            self.publish_completed_replace_if_hash(plan, destination_workspace)
+        } else {
+            self.publish_completed_no_replace(plan, destination_workspace)
+        }
+    }
+
     /// Publish a fully received private part without replacing an existing
     /// destination.  The completed journal, immutable plan, and part hash are
     /// all revalidated here so a daemon restart cannot turn a path supplied by
@@ -2219,6 +2289,38 @@ impl JournalStore {
         plan: &TransferPlan,
         destination_workspace: &ownmesh_fs::WorkspaceRoot,
     ) -> TransferResult<()> {
+        let file = self.open_verified_completed_part(plan)?;
+        destination_workspace
+            .publish_retained_transfer_file_no_replace(
+                Path::new(&plan.binding().destination_relative_path),
+                &file,
+            )
+            .map_err(map_publish_fs_error)
+    }
+
+    /// Replace an existing destination only when its current hash matches the
+    /// plan's bound `overwrite_expected_sha256`. A destination that already
+    /// holds the new artifact is treated as a successful replay.
+    pub fn publish_completed_replace_if_hash(
+        &self,
+        plan: &TransferPlan,
+        destination_workspace: &ownmesh_fs::WorkspaceRoot,
+    ) -> TransferResult<()> {
+        let expected = plan
+            .overwrite_expected_sha256()
+            .ok_or_else(|| TransferError::InvalidPlan("overwrite hash required".into()))?;
+        let file = self.open_verified_completed_part(plan)?;
+        destination_workspace
+            .publish_retained_transfer_file_replace_if_hash(
+                Path::new(&plan.binding().destination_relative_path),
+                &file,
+                expected,
+                plan.sha256(),
+            )
+            .map_err(map_publish_fs_error)
+    }
+
+    fn open_verified_completed_part(&self, plan: &TransferPlan) -> TransferResult<File> {
         plan.validate_at(now_unix())?;
         let journal = self.load(plan)?.ok_or(TransferError::Terminal)?;
         if journal.state != JournalState::Completed || journal.bytes_received != plan.size_bytes {
@@ -2232,32 +2334,7 @@ impl JournalStore {
         if size != plan.size_bytes || digest != plan.sha256 {
             return Err(TransferError::HashMismatch);
         }
-        destination_workspace
-            .publish_retained_transfer_file_no_replace(
-                Path::new(&plan.binding().destination_relative_path),
-                &file,
-            )
-            .map_err(|error| {
-                match error {
-                ownmesh_fs::FsError::Io { source, .. }
-                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
-                {
-                    TransferError::DestinationExists
-                }
-                // `ownmesh-fs` fails restricted handle-relative publication
-                // closed with this exact platform capability sentinel. Keep
-                // it distinct from malformed destination paths so callers
-                // can report a supported surface that is unavailable on this
-                // OS instead of a generic transfer failure.
-                ownmesh_fs::FsError::InvalidPath(message)
-                    if message
-                        == "restricted retained transfer publish is unsupported on this platform" =>
-                {
-                    TransferError::PlatformUnsupported
-                }
-                _ => TransferError::CustodyUnavailable,
-            }
-            })
+        Ok(file)
     }
 
     /// Remove only this plan's private generation part after a durable

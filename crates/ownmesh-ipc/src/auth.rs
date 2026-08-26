@@ -728,6 +728,7 @@ pub fn human_operator_method(method: &str) -> bool {
             | methods::ADMIN_DAEMON_UNLOCK_REQUEST
             | methods::ADMIN_TOKEN_REVOKE_REQUEST
             | methods::ADMIN_APPROVAL_BRIDGE_REQUEST
+            | methods::ADMIN_GRANTS_MINT_REQUEST
     )
 }
 
@@ -1036,7 +1037,18 @@ pub fn redact_secrets(input: &str, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    /// Owner-only tempdir: `tempfile` respects the process umask, and the
+    /// daemon custody attestation rejects group/world-writable ancestors, so
+    /// tests pin mode 0700 to stay umask-independent.
+    fn tempdir() -> std::io::Result<tempfile::TempDir> {
+        let dir = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(dir)
+    }
 
     #[test]
     fn token_roundtrip_file() {
@@ -1312,6 +1324,7 @@ mod tests {
             methods::ADMIN_DAEMON_UNLOCK_REQUEST,
             methods::ADMIN_TOKEN_REVOKE_REQUEST,
             methods::ADMIN_APPROVAL_BRIDGE_REQUEST,
+            methods::ADMIN_GRANTS_MINT_REQUEST,
         ] {
             assert!(
                 gate.authorize_method(method, &uncred_id).is_err(),
@@ -1329,6 +1342,9 @@ mod tests {
             methods::POLICY_SHOW,
             methods::APPROVAL_LIST,
             methods::DAEMON_LOCKDOWN,
+            methods::GRANTS_LIST,
+            methods::GRANTS_SHOW,
+            methods::GRANTS_REVOKE,
             "session.open",
             "session.write",
             "session.claim",
