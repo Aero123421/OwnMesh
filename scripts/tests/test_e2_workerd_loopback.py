@@ -1596,31 +1596,33 @@ def main() -> int:
             # E5: replay must surface real process output from the live PTY host.
             import time as _time
             live_marker = f"E5_LIVE_PTY_{marker}"
-            saw_live = live_marker in ses_dump or live_marker.encode() in sidecar_bytes(ses_done)
-            if not saw_live:
-                for attempt in range(12):
-                    rep_sc = structured(
-                        mcp_call(
-                            issuer,
-                            access_token,
-                            "ownmesh_session_replay",
-                            {
-                                "device_id": device_id,
-                                "session_id": ses_id,
-                                "workspace_id": "ws_default",
-                                "from_seq": 1,
-                                "async": True,
-                                "idempotency_key": f"idem_ses_rep_{marker}_{attempt}",
-                            },
-                            rpc_id=40 + attempt,
-                        )
+            saw_live = False
+            for attempt in range(12):
+                rep_sc = structured(
+                    mcp_call(
+                        issuer,
+                        access_token,
+                        "ownmesh_session_replay",
+                        {
+                            "device_id": device_id,
+                            "session_id": ses_id,
+                            "workspace_id": "ws_default",
+                            "from_seq": 1,
+                            "sidecar_cursor": 0,
+                            "max_bytes": 1024,
+                            "raw_sidecar": True,
+                            "async": True,
+                            "idempotency_key": f"idem_ses_rep_{marker}_{attempt}",
+                        },
+                        rpc_id=40 + attempt,
                     )
-                    rep_op = str(rep_sc.get("operation_id") or "")
-                    rep_done = wait_operation(issuer, access_token, rep_op, want={"completed"})
-                    if live_marker in json.dumps(rep_done) or live_marker.encode() in sidecar_bytes(rep_done):
-                        saw_live = True
-                        break
-                    _time.sleep(0.25)
+                )
+                rep_op = str(rep_sc.get("operation_id") or "")
+                rep_done = wait_operation(issuer, access_token, rep_op, want={"completed"})
+                if live_marker.encode() in sidecar_bytes(rep_done):
+                    saw_live = True
+                    break
+                _time.sleep(0.25)
             if not saw_live:
                 raise RuntimeError(
                     f"live PTY session must produce real process output containing {live_marker}"
@@ -1661,6 +1663,9 @@ def main() -> int:
                         "workspace_id": "ws_default",
                         "from_seq": 1,
                         "max_chunks": 1,
+                        "sidecar_cursor": 0,
+                        "max_bytes": 1024,
+                        "raw_sidecar": True,
                         "async": True,
                         "idempotency_key": f"idem_ses_other_replay_{marker}",
                     },
@@ -1670,8 +1675,7 @@ def main() -> int:
             other_rep_done = wait_operation(
                 issuer, access_token_other, str(other_rep_sc.get("operation_id") or ""), want={"completed"}
             )
-            other_rep_dump = json.dumps(other_rep_done)
-            if live_marker not in other_rep_dump and live_marker.encode() not in sidecar_bytes(other_rep_done):
+            if live_marker.encode() not in sidecar_bytes(other_rep_done):
                 raise RuntimeError(f"observer replay must expose live process output: {other_rep_done}")
 
             # Second session for observer lease checks (interactive shell).
@@ -1997,6 +2001,7 @@ def main() -> int:
                         "from_seq": 1,
                         "sidecar_cursor": 0,
                         "max_bytes": 1024,
+                        "raw_sidecar": True,
                         "async": True,
                         "idempotency_key": f"idem_ses_restart_replay_{marker}",
                     },
