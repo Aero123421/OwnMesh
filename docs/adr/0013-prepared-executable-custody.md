@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-19
+- Amended: 2026-08-26
 - Deciders: OwnMesh runtime maintainers
 
 ## Context
@@ -50,10 +51,21 @@ Platform implementations are:
   exec; an approved shebang script retains its sealed descriptor across the
   kernel's interpreter handoff so that the interpreter reads the prepared
   content rather than the mutable original path.
-- **macOS:** copy from the verified handle into an atomically-created,
-  owner-only private runtime directory, retain the create-new handle, fsync
-  and verify the copied digest, preserve the approved `argv[0]`, retain custody
-  through `posix_spawn`, and clean it up immediately afterward.
+- **macOS:** ordinary user-controlled executables are copied from the verified
+  handle into an atomically-created, owner-only private runtime directory. The
+  create-new handle is retained, the copy is fsynced and re-hashed, the approved
+  `argv[0]` is preserved, and custody remains live through `posix_spawn` before
+  immediate cleanup. Darwin `SF_RESTRICTED` platform binaries use a narrower
+  path: macOS 26 kills a byte-identical private copy even when its embedded code
+  signature still verifies. For those images only, OwnMesh requires the open
+  backing file to be root-owned, non-group/other-writable, and
+  `SF_RESTRICTED`; requires every canonical ancestor to be root-owned,
+  non-group/other-writable, non-symlink, and non-writable by the daemon after
+  ACL evaluation; retains the invocation, backing, and opened ancestor handles;
+  revalidates the pins; and launches the immutable verified backing path while
+  keeping the approved invocation as `argv[0]`. A protected image whose custody
+  cannot be proven fails before spawn. OwnMesh never rewrites or ad-hoc signs
+  an approved executable.
 - **Windows:** open the image, invocation entry, backing entry, and every
   ancestor without write/delete sharing; verify size, digest, volume serial,
   and file index from the held handles; then call `CreateProcess` with the
@@ -80,11 +92,13 @@ path lookup, or policy work occurs after fork in that closure.
 - A backing digest is evidence, not substitute execution authority.
 - Preparation may copy up to the existing executable pin size limit. Linux
   uses sealed anonymous memory; macOS briefly uses an owner-only private
-  snapshot; Windows retains several read-only handles until spawn.
+  snapshot for ordinary images and immutable path custody for restricted
+  platform images; Windows retains several read-only handles until spawn.
 - macOS binaries that depend on their physical executable directory for
-  adjacent resources may fail rather than run under changed semantics. Such a
-  failure is preferable to reopening an unverified path and is covered by the
-  platform release matrix.
+  adjacent resources may fail rather than run under changed semantics when
+  they use snapshot custody. Restricted Apple platform binaries retain their
+  protected physical backing path. Such a failure is preferable to reopening
+  an attacker-writable path and is covered by the platform release matrix.
 - Timeout, cancellation, output bounds, process-tree handling, and idempotency
   remain in the shared post-spawn runner.
 
