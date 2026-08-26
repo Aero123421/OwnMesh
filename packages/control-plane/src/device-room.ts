@@ -2710,7 +2710,17 @@ export class DeviceRoom {
           : correlationId;
       try {
         const store = createStore(this.env);
-        const operation = await store.getMcpOperation(operationId);
+        // approval.decision uses a fresh notification operation id that is not
+        // stored in D1. Its authorization, however, is deliberately bound to
+        // the original approval_required operation. Revalidate that target at
+        // this final delivery boundary so a workspace remap cannot make an old
+        // approval execute against a new local root.
+        const approvalDecision = approvalDecisionBindingFromPayload(body.payload);
+        const authorityOperationId = approvalDecision?.target_operation_id || operationId;
+        const operation = await store.getMcpOperation(authorityOperationId);
+        if (approvalDecision && !operation) {
+          return json({ error: "binding_mismatch" }, { status: 403 });
+        }
         if (operation) {
           if (
             operation.device_id !== this.deviceId ||
@@ -2736,7 +2746,7 @@ export class DeviceRoom {
               status: "rejected",
               detail: {
                 code: "OWNMESH_E_OPERATION_DISPATCH_FENCED",
-                operation_id: operationId,
+                operation_id: authorityOperationId,
                 operation_status: operation.status,
               },
             });
@@ -2745,7 +2755,7 @@ export class DeviceRoom {
           if (workspaceCheck === "storage_unavailable") throw new Error("storage_unavailable");
           if (workspaceCheck !== "ok") {
             await store.updateMcpOperation(
-              operationId,
+              authorityOperationId,
               {
                 status: "failed",
                 summary: "workspace authority changed before device delivery",
@@ -2769,7 +2779,7 @@ export class DeviceRoom {
               status: "rejected",
               detail: {
                 code: "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
-                operation_id: operationId,
+                operation_id: authorityOperationId,
               },
             });
           }

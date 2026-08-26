@@ -1770,6 +1770,149 @@ test("first generation observation terminally invalidates a pre-generation pendi
   );
 });
 
+test("approval decision refuses a target whose workspace generation changed", async () => {
+  const { adapter, store } = openSqliteAdapter();
+  const deviceId = "dev_workspace_remap_approval_01";
+  await seedActiveDevice(store, deviceId);
+  const now = new Date().toISOString();
+  await store.putWorkspace({
+    workspace_id: "ws_default",
+    tenant_id: DEFAULT_TENANT,
+    device_id: deviceId,
+    owner_principal_id: "prin_dev",
+    version: 1,
+    active: true,
+    created_at: now,
+    updated_at: now,
+  });
+  const principal = await store.getPrincipal("prin_dev");
+  assert.ok(principal);
+  const targetOperationId = "op_workspace_remap_approval_target_01";
+  const targetAction = {
+    capability: "fs.write",
+    action: "fs.write",
+    tool: "ownmesh_fs_write",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    principal_credential_generation: principal.credential_generation,
+    principal_revocation_epoch: principal.revocation_epoch,
+    workspace_id: "ws_default",
+    workspace_version: 1,
+    facts: { path: "approved.txt" },
+  };
+  await store.putMcpOperation({
+    operation_id: targetOperationId,
+    tenant_id: DEFAULT_TENANT,
+    principal_id: "prin_dev",
+    device_id: deviceId,
+    tool: "ownmesh_fs_write",
+    status: "approval_required",
+    summary: "awaiting approval",
+    data: {},
+    truncated: false,
+    next_cursor: null,
+    approval_required: true,
+    warnings: [],
+    correlation_id: targetOperationId,
+    workspace_id: "ws_default",
+    action: targetAction,
+    policy_authority: "ownmesh_device",
+    created_at: now,
+    updated_at: now,
+  });
+
+  // The same id now denotes a newly observed local root. The decision remains
+  // bound to version 1 and must never reach the Agent.
+  await store.syncDeviceWorkspaces(deviceId, [{
+    id: "ws_default",
+    generation: "wsg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  }]);
+  assert.equal((await store.getWorkspace(deviceId, "ws_default"))?.version, 2);
+
+  const room = new DeviceRoom(mockDOState(), {
+    DB: adapter as unknown as D1Database,
+    SESSION_SECRET,
+  });
+  await room.ready;
+  room.deviceId = deviceId;
+  room.router.deviceId = deviceId;
+  room.router.registerSession({
+    role: "agent", device_id: deviceId, session_id: "ags_workspace_remap_approval",
+    connected_at: Date.now(), phase: "ready", remote_routing_enabled: true,
+  });
+  let sends = 0;
+  room.router.sendToSession = () => {
+    sends += 1;
+    return true;
+  };
+
+  const decisionOperationId = "op_workspace_remap_approval_decision_01";
+  const approvalId = "apr_workspace_remap_01";
+  const transactionId = "aob_workspace_remap_01";
+  const decisionAction = {
+    capability: "approval.decision",
+    action: "approval.decision",
+    tool: "ownmesh_approval_decision",
+    device_id: deviceId,
+    principal_id: "prin_dev",
+    tenant_id: DEFAULT_TENANT,
+    principal_credential_generation: principal.credential_generation,
+    principal_revocation_epoch: principal.revocation_epoch,
+    workspace_id: "ws_default",
+    workspace_version: 1,
+    operation_id: decisionOperationId,
+    outbox_id: transactionId,
+    facts: {
+      target_operation_id: targetOperationId,
+      decision: "approve",
+      approval_id: approvalId,
+    },
+  };
+  const body = {
+    type: "approval.decision",
+    correlation_id: decisionOperationId,
+    payload: {
+      operation_id: decisionOperationId,
+      capability: "approval.decision",
+      workspace_id: "ws_default",
+      authorization: { bound_action: decisionAction },
+      arguments: {
+        target_operation_id: targetOperationId,
+        decision: "approve",
+        approval_id: approvalId,
+      },
+    },
+  };
+  const { headers, bodyText } = await operationHeaders(deviceId, body, {
+    correlation_id: decisionOperationId,
+  });
+  const response = await room.fetch(
+    new Request(`https://device-room/operation?device_id=${deviceId}`, {
+      method: "POST",
+      headers,
+      body: bodyText,
+    }),
+  );
+  const result = (await response.json()) as {
+    status?: string;
+    detail?: { code?: string; operation_id?: string };
+  };
+
+  assert.equal(response.status, 200);
+  assert.equal(result.status, "rejected");
+  assert.equal(result.detail?.code, "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED");
+  assert.equal(result.detail?.operation_id, targetOperationId);
+  assert.equal(sends, 0);
+  assert.equal(room.router.pending.has(decisionOperationId), false);
+  const failed = await store.getMcpOperation(targetOperationId);
+  assert.equal(failed?.status, "failed");
+  assert.equal(
+    ((failed?.data.error as { code?: string } | undefined)?.code),
+    "OWNMESH_E_WORKSPACE_AUTHORITY_CHANGED",
+  );
+});
+
 test("cancel_requested durably fences a pending operation before Agent redelivery", async () => {
   const { adapter, store } = openSqliteAdapter();
   const deviceId = "dev_cancel_fence_redelivery_01";

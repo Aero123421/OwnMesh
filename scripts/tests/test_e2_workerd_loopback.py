@@ -2881,7 +2881,8 @@ def main() -> int:
             review_id = find_value(review_done, "review_id")
             if not isinstance(review_id, str) or not review_id.startswith("rev_"):
                 raise RuntimeError(f"review.start missing durable receipt: {review_done}")
-            if find_value(review_done, "phase") != "failed":
+            review_receipt = review_done.get("data")
+            if not isinstance(review_receipt, dict) or review_receipt.get("phase") != "failed":
                 raise RuntimeError(f"review must retain failed test result separately: {review_done}")
             if run_checked([git, "rev-parse", "HEAD"], cwd=review_root, env=base_env, capture=True) != head_before_review:
                 raise RuntimeError("review implicitly changed Git HEAD/ref")
