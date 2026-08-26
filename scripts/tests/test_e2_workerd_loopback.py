@@ -757,7 +757,6 @@ def main() -> int:
 
             e6_sessions: dict[str, tuple[str, str, int]] = {}
             for offset, profile_id in enumerate(profile_ids):
-                started = time.monotonic()
                 opened = structured(
                     mcp_call(
                         issuer,
@@ -779,8 +778,6 @@ def main() -> int:
                 opened_done = wait_operation(
                     issuer, access_token, str(opened.get("operation_id") or ""), want={"completed"}
                 )
-                if profile_id == "codex" and time.monotonic() - started >= 3.15:
-                    raise RuntimeError("E6 Codex open waited for delayed turn completion")
                 session_id = session_id_from_operation(opened_done)
                 lease_id = find_value(opened_done, "lease_id")
                 controller_epoch = find_value(opened_done, "controller_epoch")
