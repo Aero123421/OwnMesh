@@ -86,9 +86,7 @@ def daemon_env(
     (config / "config.toml").write_text(
         "\n".join([
             "schema_version = 1", 'active_instance = "local"', "",
-            "[service_socket]",
-            f'path = "pipe:ownmesh-e9-{device_id}"' if os.name == "nt" else f'path = "ownmesh-e9-{device_id}.sock"',
-            "", "[[instances]]", 'id = "local"', f'base_url = "{issuer}"', "",
+            "[[instances]]", 'id = "local"', f'base_url = "{issuer}"', "",
         ]),
         encoding="utf-8",
     )
@@ -441,9 +439,9 @@ def main() -> int:
     with RetryingTemporaryDirectory(prefix="ownmesh-e9-workerd-") as raw:
         temp = Path(raw)
         persist = temp / "wrangler-state"
-        # The Windows daemon pipe name is bounded.  Put the differentiating
-        # component early enough that path normalization cannot truncate both
-        # Agent endpoints to the same name.
+        # Separate runtime roots feed the production default endpoint resolver:
+        # Windows hashes each root into a distinct bounded pipe name, while Unix
+        # relocates an overlong default socket to its owner-scoped short path.
         source_root, destination_root = temp / "s", temp / "d"
         source_env = daemon_env(root=source_root, issuer=issuer, device_id=device_source, credential=credential_source,
                                 service=f"dev.ownmesh.loopback-test.e9.source.{marker}", password=password)
