@@ -32,6 +32,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[2]
 CONTROL_PLANE = ROOT / "packages" / "control-plane"
 E6_FIXTURE = ROOT / "scripts" / "tests" / "fixtures" / "e6_adapter_fixture.py"
+OPERATION_NAMES: dict[str, str] = {}
 
 
 def install_e6_profile_fixtures(directory: Path) -> None:
@@ -305,6 +306,9 @@ def mcp_call(issuer: str, token: str, name: str, arguments: dict[str, object], r
     result = body.get("result")
     if not isinstance(result, dict):
         raise RuntimeError(f"mcp {name} missing result: {body}")
+    operation_id = find_value(result, "operation_id")
+    if name != "ownmesh_get_operation" and isinstance(operation_id, str):
+        OPERATION_NAMES[operation_id] = name
     return result
 
 
@@ -399,9 +403,15 @@ def wait_operation(issuer: str, token: str, operation_id: str, *, want: set[str]
         if status in want:
             return sc
         if status in {"failed", "denied", "cancelled", "device_offline"} and status not in want:
-            raise RuntimeError(f"operation {operation_id} terminal failure: {sc}")
+            operation_name = OPERATION_NAMES.get(operation_id, "unknown")
+            raise RuntimeError(
+                f"operation {operation_id} ({operation_name}) terminal failure: {sc}"
+            )
         time.sleep(0.25)
-    raise RuntimeError(f"timed out waiting for {operation_id} in {want}; last={last}")
+    operation_name = OPERATION_NAMES.get(operation_id, "unknown")
+    raise RuntimeError(
+        f"timed out waiting for {operation_id} ({operation_name}) in {want}; last={last}"
+    )
 
 
 def main() -> int:
