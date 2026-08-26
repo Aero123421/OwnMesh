@@ -2096,7 +2096,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "uuid",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2173,7 +2173,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "uuid",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2189,7 +2189,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "walkdir",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2229,7 +2229,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3024,7 +3024,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
