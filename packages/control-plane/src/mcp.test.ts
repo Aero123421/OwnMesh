@@ -27,6 +27,7 @@ import {
   mcpCatalogRevision,
   mcpSessionCatalogRevision,
   principalRevocationEpochOf,
+  boundPrincipalAuthorityCurrent,
   PUBLISHED_MCP_TOOLS,
   __setGetOperationWaiterCapForTest,
 } from "./mcp.ts";
@@ -181,6 +182,53 @@ test("MCP invalid bearer is HTTP 401 invalid_token on initialize and tools/call"
   assert.equal(call.status, 401);
   const callBody = (await call.json()) as { error?: { message: string } };
   assert.equal(callBody.error?.message, "invalid_token");
+});
+
+// The delivery gate must refuse a corrupt stored epoch for *both* binding
+// shapes. The entry-point guards stop fresh requests, but an operation already
+// pending under a pre-0018 legacy binding is redelivered through this gate
+// alone, where a generation match would otherwise still let it through.
+test("the shared authority gate refuses a corrupt stored epoch on either binding shape", () => {
+  const legacy = { principal_id: "p", tenant_id: "t", generation: 1, revocation_epoch: null };
+  const withEpoch = { principal_id: "p", tenant_id: "t", generation: 1, revocation_epoch: 1 };
+  const corrupt = { tenant_id: "t", credential_generation: 1, revocation_epoch: 0 };
+
+  assert.equal(
+    boundPrincipalAuthorityCurrent(legacy, corrupt),
+    false,
+    "a legacy binding must not pass on a generation match while the stored epoch is unreadable",
+  );
+  assert.equal(boundPrincipalAuthorityCurrent(withEpoch, corrupt), false);
+
+  // An absent stored epoch is a pre-migration record, not corruption, and
+  // still resolves to the initial epoch.
+  assert.equal(
+    boundPrincipalAuthorityCurrent(legacy, { tenant_id: "t", credential_generation: 1 }),
+    true,
+  );
+  assert.equal(
+    boundPrincipalAuthorityCurrent(withEpoch, { tenant_id: "t", credential_generation: 1 }),
+    true,
+  );
+
+  // A routine refresh (generation moves, epoch does not) stays deliverable;
+  // a revocation (epoch advances) does not.
+  assert.equal(
+    boundPrincipalAuthorityCurrent(withEpoch, {
+      tenant_id: "t",
+      credential_generation: 9,
+      revocation_epoch: 1,
+    }),
+    true,
+  );
+  assert.equal(
+    boundPrincipalAuthorityCurrent(withEpoch, {
+      tenant_id: "t",
+      credential_generation: 1,
+      revocation_epoch: 2,
+    }),
+    false,
+  );
 });
 
 test("MCP fails closed when a stored principal revocation epoch is corrupt", async () => {

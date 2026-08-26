@@ -3311,11 +3311,19 @@ export function boundPrincipalAuthority(
  */
 export function boundPrincipalAuthorityCurrent(
   binding: BoundPrincipalAuthority,
-  principal: { tenant_id: string; credential_generation: number; revocation_epoch?: number | null } | null,
+  principal: { tenant_id: string; credential_generation: number; revocation_epoch?: unknown } | null,
 ): boolean {
   if (!principal || principal.tenant_id !== binding.tenant_id) return false;
+  // A corrupt *stored* epoch means the principal's revocation state is
+  // unknown, which is refused whatever shape the binding has. The legacy
+  // branch below exists for an absent epoch on the *binding*; it must not
+  // double as an excuse to ignore a stored value we cannot read. Without this
+  // the generation comparison would still pass for a pre-0018 binding, which
+  // is the same fail-open the entry-point guards close for fresh requests.
+  const current = principalRevocationEpochOf(principal);
+  if (current === null) return false;
   if (binding.revocation_epoch !== null) {
-    return principalRevocationEpochOf(principal) === binding.revocation_epoch;
+    return current === binding.revocation_epoch;
   }
   return principal.credential_generation === binding.generation;
 }
