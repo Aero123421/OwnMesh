@@ -132,9 +132,22 @@ pub struct StructuredProcessHost {
     child: Mutex<Child>,
     stdout: Arc<Mutex<ByteRing>>,
     stderr: Arc<Mutex<ByteRing>>,
+    /// Real child exit code, reaped exactly once by [`Self::reconcile_child_exit`].
+    /// Neither reader thread synthesizes a code of its own.
+    exit_code: Mutex<Option<u32>>,
     stop: Arc<AtomicBool>,
     readers: Vec<JoinHandle<()>>,
+    /// One flag per reader, set by its guard *after* the ring is marked
+    /// terminal. `true` therefore means "this stream published EOF in order and
+    /// will never append again", which a bounded wait can rely on.
+    reader_finished: Vec<Arc<AtomicBool>>,
 }
+
+/// How long a forced termination waits for the readers to publish EOF
+/// themselves before sealing the streams. Bounded because an orphaned
+/// descendant that inherited the pipes can hold them open indefinitely.
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(500);
+const READER_DRAIN_POLL: Duration = Duration::from_millis(10);
 
 impl StructuredProcessHost {
     pub fn spawn(cmd: &PtyCommand, size: PtySize) -> Result<Self, String> {
@@ -176,8 +189,20 @@ impl StructuredProcessHost {
         let stop = Arc::new(AtomicBool::new(false));
         let out_ring = Arc::new(Mutex::new(ByteRing::new()));
         let err_ring = Arc::new(Mutex::new(ByteRing::new()));
-        let out_reader = spawn_pipe_ring_reader(stdout, Arc::clone(&out_ring), Arc::clone(&stop));
-        let err_reader = spawn_pipe_ring_reader(stderr, Arc::clone(&err_ring), Arc::clone(&stop));
+        let out_done = Arc::new(AtomicBool::new(false));
+        let err_done = Arc::new(AtomicBool::new(false));
+        let out_reader = spawn_pipe_ring_reader(
+            stdout,
+            Arc::clone(&out_ring),
+            Arc::clone(&stop),
+            Arc::clone(&out_done),
+        );
+        let err_reader = spawn_pipe_ring_reader(
+            stderr,
+            Arc::clone(&err_ring),
+            Arc::clone(&stop),
+            Arc::clone(&err_done),
+        );
         Ok(Self {
             handle: SessionHostHandle {
                 session_id: format!("proc_{pid}"),
@@ -190,8 +215,10 @@ impl StructuredProcessHost {
             child: Mutex::new(child),
             stdout: out_ring,
             stderr: err_ring,
+            exit_code: Mutex::new(None),
             stop,
             readers: vec![out_reader, err_reader],
+            reader_finished: vec![out_done, err_done],
         })
     }
 
@@ -208,11 +235,32 @@ impl StructuredProcessHost {
     }
 
     pub fn drain_stdout(&self, max: usize) -> Result<RawDrainOutput, String> {
-        drain_ring(&self.stdout, max)
+        self.drain_stream(&self.stdout, max)
     }
     pub fn drain_stderr(&self, max: usize) -> Result<RawDrainOutput, String> {
-        drain_ring(&self.stderr, max)
+        self.drain_stream(&self.stderr, max)
     }
+
+    /// Drain one stream, then report *aggregate* structured completion.
+    ///
+    /// Terminal state is deliberately not per-stream: one stream reaching EOF
+    /// early must not publish exit while the other still has final bytes to
+    /// transfer. The ring lock is released before the aggregate is computed so
+    /// the two ring locks are never held at once.
+    fn drain_stream(
+        &self,
+        ring: &Arc<Mutex<ByteRing>>,
+        max: usize,
+    ) -> Result<RawDrainOutput, String> {
+        let (bytes, truncated, remaining) = {
+            let mut ring = ring.lock().map_err(|e| e.to_string())?;
+            ring.drain(max.clamp(1, LIVE_OUTPUT_RING_BYTES))
+        };
+        let exited = self.is_exited();
+        let exit_code = if exited { self.exit_code() } else { None };
+        Ok((bytes, truncated, exited, exit_code, remaining))
+    }
+
     pub fn pending_stdout_bytes(&self) -> usize {
         self.stdout.lock().map(|r| r.remaining()).unwrap_or(0)
     }
@@ -223,24 +271,121 @@ impl StructuredProcessHost {
         self.pending_stdout_bytes()
             .saturating_add(self.pending_stderr_bytes())
     }
+
+    /// True when the structured session is terminal: the child has been reaped
+    /// **and** both pipe readers have crossed their EOF barriers.
+    ///
+    /// Requiring both stream EOFs after the child exit keeps the ordering
+    /// invariant the PTY host documents — final bytes are always in the ring
+    /// before completion is visible.
     pub fn is_exited(&self) -> bool {
-        self.stdout.lock().map(|r| r.exited).unwrap_or(true)
-            && self.stderr.lock().map(|r| r.exited).unwrap_or(true)
+        let streams_at_eof = self.stdout.lock().map(|r| r.exited).unwrap_or(true)
+            && self.stderr.lock().map(|r| r.exited).unwrap_or(true);
+        streams_at_eof && self.reconcile_child_exit().is_some()
+    }
+
+    /// Real exit code of the child once reaped, without re-reaping.
+    pub fn exit_code(&self) -> Option<u32> {
+        self.reconcile_child_exit()
+    }
+
+    /// Reap the child at most once and cache its real exit code.
+    ///
+    /// A signal-terminated child has no `code()`; the shell `128 + signal`
+    /// convention is used so callers still receive a non-zero terminal code.
+    fn reconcile_child_exit(&self) -> Option<u32> {
+        if let Ok(cached) = self.exit_code.lock() {
+            if cached.is_some() {
+                return *cached;
+            }
+        }
+        let status = {
+            let mut child = self.child.lock().ok()?;
+            child.try_wait().ok().flatten()?
+        };
+        let code = exit_status_code(status);
+        if let Ok(mut cached) = self.exit_code.lock() {
+            *cached = Some(code);
+        }
+        Some(code)
     }
 
     pub fn terminate(&mut self) -> Result<(), String> {
+        self.terminate_with(terminate_std_child_tree)
+    }
+
+    /// Termination with an injectable kill, so the failure path is testable.
+    fn terminate_with(
+        &mut self,
+        kill: impl FnOnce(&mut Child) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(mut stdin) = self.stdin.lock() {
             *stdin = None;
         }
-        let mut child = self.child.lock().map_err(|e| e.to_string())?;
-        let result = terminate_std_child_tree(&mut child);
+        let result = {
+            let mut child = self.child.lock().map_err(|e| e.to_string())?;
+            kill(&mut child)
+        };
+        // A failed kill proves nothing: the child may still be alive and its
+        // readers may still append. Returning here without publishing EOF keeps
+        // the host non-terminal so the supervisor re-tracks and retries it.
+        result?;
+
+        // The kill succeeded, so the child is reaped; capture its real status.
+        let _ = self.reconcile_child_exit();
+
+        // Give the readers a bounded chance to publish EOF themselves, which
+        // keeps the documented ordering: every byte they already read reaches
+        // the ring before its EOF becomes visible.
+        if !self.await_readers_finished(READER_DRAIN_GRACE) {
+            // A descendant that inherited the pipes is holding them open, so
+            // the readers may never wake. Publish completion and seal the
+            // streams in the same critical section: after this, a late push is
+            // dropped and disclosed instead of appearing after `exited=true`.
+            self.seal_streams();
+        }
+
         for reader in self.readers.drain(..) {
             let _ = std::thread::Builder::new().spawn(move || {
                 let _ = reader.join();
             });
         }
-        result
+        Ok(())
+    }
+
+    /// Wait up to `grace` for every reader to publish its own EOF.
+    fn await_readers_finished(&self, grace: Duration) -> bool {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            if self
+                .reader_finished
+                .iter()
+                .all(|done| done.load(Ordering::SeqCst))
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(READER_DRAIN_POLL);
+        }
+    }
+
+    /// Publish terminal state and refuse further appends, atomically per ring.
+    fn seal_streams(&self) {
+        for ring in [&self.stdout, &self.stderr] {
+            let mut ring = ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !ring.exited {
+                // Bytes that a parked reader has not transferred are lost by
+                // this forced cutoff; say so rather than implying clean EOF.
+                ring.truncated = true;
+            }
+            ring.sealed = true;
+            ring.exited = true;
+        }
     }
 }
 
@@ -250,12 +395,47 @@ impl Drop for StructuredProcessHost {
     }
 }
 
+/// Marks a stream ring terminal on every way out of its reader thread.
+///
+/// EOF, a non-retryable read error, a stop request, and an unwind all run this
+/// `Drop`, so a reader can never terminate silently and leave the stream
+/// looking permanently live.
+struct StreamEofGuard {
+    ring: Arc<Mutex<ByteRing>>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Drop for StreamEofGuard {
+    fn drop(&mut self) {
+        // A panicking reader must still publish EOF; the ring's byte state is
+        // append-only, so recovering a poisoned lock cannot expose a torn value.
+        {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ring.exited = true;
+        }
+        // Ordered after the ring is marked terminal, so an observer that sees
+        // this flag knows EOF is published and no append can follow.
+        self.finished.store(true, Ordering::SeqCst);
+    }
+}
+
 fn spawn_pipe_ring_reader<R: Read + Send + 'static>(
     mut reader: R,
     ring: Arc<Mutex<ByteRing>>,
     stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        // The guard runs after the final `push`, preserving the ordering
+        // invariant: every byte read from this stream is in the ring before
+        // its EOF becomes visible.
+        let _eof = StreamEofGuard {
+            ring: Arc::clone(&ring),
+            finished,
+        };
         let mut buf = [0_u8; 8192];
         while !stop.load(Ordering::SeqCst) {
             match reader.read(&mut buf) {
@@ -265,16 +445,31 @@ fn spawn_pipe_ring_reader<R: Read + Send + 'static>(
                         r.push(&buf[..n]);
                     }
                 }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
                 Err(_) => break,
             }
         }
     })
 }
 
-fn drain_ring(ring: &Arc<Mutex<ByteRing>>, max: usize) -> Result<RawDrainOutput, String> {
-    let mut ring = ring.lock().map_err(|e| e.to_string())?;
-    let (bytes, truncated, remaining) = ring.drain(max.clamp(1, LIVE_OUTPUT_RING_BYTES));
-    Ok((bytes, truncated, ring.exited, ring.exit_code, remaining))
+/// Terminal exit code for a reaped child, including signal termination.
+fn exit_status_code(status: std::process::ExitStatus) -> u32 {
+    if let Some(code) = status.code() {
+        return u32::try_from(code).unwrap_or(u32::from(u8::MAX));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128_u32.saturating_add(u32::try_from(signal).unwrap_or(0));
+        }
+    }
+    // No code and no signal: terminal but unclassifiable. Report failure
+    // rather than inventing success.
+    1
 }
 
 fn terminate_std_child_tree(child: &mut Child) -> Result<(), String> {
@@ -309,6 +504,12 @@ struct ByteRing {
     truncated: bool,
     /// Child exited (EOF observed or try_wait succeeded).
     exited: bool,
+    /// No further append is accepted. Set together with `exited` when a forced
+    /// termination publishes completion while a reader may still be parked on
+    /// a pipe an orphaned descendant holds open. Sealing is what makes
+    /// "no bytes appear after `exited=true`" an invariant rather than a race:
+    /// a late push is dropped and disclosed through `truncated`.
+    sealed: bool,
     exit_code: Option<u32>,
 }
 
@@ -319,12 +520,19 @@ impl ByteRing {
             bytes: 0,
             truncated: false,
             exited: false,
+            sealed: false,
             exit_code: None,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
+            return;
+        }
+        if self.sealed {
+            // Terminal state is already published; accepting these bytes would
+            // make output appear after EOF. Drop them and disclose the loss.
+            self.truncated = true;
             return;
         }
         self.buf.extend(chunk.iter().copied());
@@ -1032,6 +1240,28 @@ pub fn spawn_pty(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String> 
     }
 }
 
+/// PTY spawn failures must stay honest about likely systemd hardening causes
+/// (#144): on Linux the shipped `--user` unit sets `RestrictNamespaces=yes`,
+/// so programs that create namespaces at startup fail with an opaque EPERM.
+/// Name the directive and the documented operator drop-in; the default stays
+/// fail-closed.
+fn annotate_pty_spawn_error(stage: &str, error: &dyn std::fmt::Display) -> String {
+    let detail = error.to_string();
+    let lower = detail.to_ascii_lowercase();
+    if cfg!(target_os = "linux") && (lower.contains("permission denied") || lower.contains("eperm"))
+    {
+        format!(
+            "{stage}: {detail}. This can happen when the program creates Linux namespaces \
+(containers, sandbox tools, unshare) while the ownmeshd service unit sets \
+`RestrictNamespaces=yes`. The default stays fail-closed; a local drop-in setting \
+`RestrictNamespaces=no` (`systemctl --user edit ownmesh-ownmeshd.service`) allows namespaces \
+for this device — `ownmesh doctor` discloses the effective unit"
+        )
+    } else {
+        format!("{stage}: {detail}")
+    }
+}
+
 fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String> {
     let system = native_pty_system();
     let pair = system
@@ -1066,7 +1296,7 @@ fn spawn_portable(cmd: &PtyCommand, size: PtySize) -> Result<PtySession, String>
     let child = pair
         .slave
         .spawn_command(builder)
-        .map_err(|e| format!("spawn: {e}"))?;
+        .map_err(|e| annotate_pty_spawn_error("spawn", &e))?;
     drop(pair.slave);
 
     let pid = child.process_id();
@@ -1145,7 +1375,7 @@ fn spawn_live_portable(cmd: &PtyCommand, size: PtySize) -> Result<LiveHost, Stri
     let child = pair
         .slave
         .spawn_command(builder)
-        .map_err(|e| format!("spawn: {e}"))?;
+        .map_err(|e| annotate_pty_spawn_error("spawn", &e))?;
     drop(pair.slave);
 
     let pid = child.process_id();
@@ -2003,5 +2233,316 @@ mod tests {
         assert!(host.write_frame(b"x").is_err());
         assert!(host.write_frame(&vec![b'x'; 64 * 1024 + 1]).is_err());
         host.terminate().unwrap();
+    }
+
+    /// Structured child that writes to both streams and exits with `code`.
+    fn structured_exit_command(code: i32) -> PtyCommand {
+        if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    format!("echo out & echo err 1>&2 & exit /b {code}"),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!("printf out; printf err >&2; exit {code}"),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        }
+    }
+
+    /// Poll until the structured host reports terminal state, bounded so a
+    /// regression fails the test instead of hanging it.
+    fn await_structured_exit(host: &StructuredProcessHost) -> bool {
+        for _ in 0..200 {
+            if host.is_exited() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    #[test]
+    fn structured_child_publishes_eof_and_a_real_exit_code() {
+        for expected in [0_u32, 3_u32] {
+            let mut host = StructuredProcessHost::spawn(
+                &structured_exit_command(i32::try_from(expected).unwrap()),
+                PtySize::default(),
+            )
+            .unwrap();
+            assert!(
+                await_structured_exit(&host),
+                "structured host never reported exit for code {expected}"
+            );
+
+            let (out, _, out_exited, out_code, _) = host.drain_stdout(4096).unwrap();
+            let (err, _, err_exited, err_code, _) = host.drain_stderr(4096).unwrap();
+            // Final bytes are buffered before completion becomes visible.
+            assert!(String::from_utf8_lossy(&out).contains("out"));
+            assert!(String::from_utf8_lossy(&err).contains("err"));
+            assert!(out_exited && err_exited, "both drains must report exit");
+            assert_eq!(out_code, Some(expected));
+            assert_eq!(err_code, Some(expected));
+            host.terminate().unwrap();
+        }
+    }
+
+    #[test]
+    fn one_stream_closing_early_does_not_publish_exit() {
+        // stdout closes immediately; stderr writes only after a delay. Exit
+        // must not be visible while the second stream still has bytes coming.
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec![
+                    "/C".into(),
+                    "ping -n 2 127.0.0.1 >nul & echo late 1>&2".into(),
+                ],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exec 1>&-; sleep 1; printf late >&2".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !host.is_exited(),
+            "early stdout EOF must not publish structured completion"
+        );
+
+        assert!(await_structured_exit(&host));
+        let (err, _, exited, _, _) = host.drain_stderr(4096).unwrap();
+        assert!(exited);
+        assert!(
+            String::from_utf8_lossy(&err).contains("late"),
+            "late stderr bytes must survive the EOF barrier"
+        );
+        host.terminate().unwrap();
+    }
+
+    /// #152 review: no bytes may appear after terminal state is published.
+    ///
+    /// Deterministic by construction: a writer races the cutoff continuously,
+    /// so an unsealed window is observable rather than timing-dependent. This
+    /// is the same critical section `seal_streams` uses.
+    #[test]
+    fn a_sealed_stream_never_accepts_bytes_after_exit_is_published() {
+        let ring = Arc::new(Mutex::new(ByteRing::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let ring = Arc::clone(&ring);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    if let Ok(mut ring) = ring.lock() {
+                        ring.push(b"spam");
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Publish completion and seal together, as a forced cutoff does.
+        {
+            let mut ring = ring.lock().unwrap();
+            ring.truncated = true;
+            ring.sealed = true;
+            ring.exited = true;
+        }
+        // Drain everything that legitimately arrived before the seal.
+        let remaining = {
+            let mut ring = ring.lock().unwrap();
+            ring.drain(LIVE_OUTPUT_RING_BYTES).2
+        };
+        assert_eq!(remaining, 0, "ring must be fully drained after the seal");
+
+        // The writer is still racing; nothing may land from here on.
+        std::thread::sleep(Duration::from_millis(100));
+        let (after, _, remaining_after) = {
+            let mut ring = ring.lock().unwrap();
+            ring.drain(LIVE_OUTPUT_RING_BYTES)
+        };
+        stop.store(true, Ordering::SeqCst);
+        writer.join().unwrap();
+        assert!(
+            after.is_empty() && remaining_after == 0,
+            "{} bytes appeared after exit was published",
+            after.len()
+        );
+    }
+
+    /// Terminate always leaves the session terminal, whichever path it took.
+    ///
+    /// Which path that is depends on the platform: a shell that execs its
+    /// command leaves no descendant holding the pipes, so the readers publish
+    /// EOF themselves and no seal is needed. That difference is not part of the
+    /// contract — being terminal afterwards is.
+    #[test]
+    fn terminate_always_publishes_a_terminal_state() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        host.terminate().unwrap();
+
+        for ring in [&host.stdout, &host.stderr] {
+            assert!(
+                ring.lock().unwrap().exited,
+                "terminate must publish completion on every platform"
+            );
+        }
+        assert!(host.is_exited());
+    }
+
+    /// The forced-cutoff publication itself: while the child is alive the
+    /// readers are necessarily parked, so sealing must publish completion,
+    /// refuse further appends, and disclose the bytes it cut off. Deterministic
+    /// on every platform because it does not depend on how the kill propagates.
+    #[test]
+    fn sealing_publishes_completion_and_discloses_the_cutoff() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // The child is live, so neither reader can have reached EOF.
+        for ring in [&host.stdout, &host.stderr] {
+            assert!(
+                !ring.lock().unwrap().exited,
+                "a live child's readers must not have published EOF yet"
+            );
+        }
+
+        host.seal_streams();
+
+        for ring in [&host.stdout, &host.stderr] {
+            let ring = ring.lock().unwrap();
+            assert!(ring.exited, "a forced cutoff must publish completion");
+            assert!(
+                ring.sealed,
+                "a forced cutoff must seal the stream so no append can follow"
+            );
+            assert!(
+                ring.truncated,
+                "a forced cutoff loses untransferred bytes and must disclose it"
+            );
+        }
+        let _ = host.terminate();
+    }
+
+    /// A termination that failed proves nothing about the child or its
+    /// readers, so it must not publish EOF — the host stays non-terminal and
+    /// the supervisor can retry.
+    #[test]
+    fn failed_termination_does_not_publish_eof() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let error = host
+            .terminate_with(|_| Err("injected kill failure".into()))
+            .unwrap_err();
+        assert_eq!(error, "injected kill failure");
+        assert!(
+            !host.is_exited(),
+            "a failed termination must not report a terminal session"
+        );
+        for ring in [&host.stdout, &host.stderr] {
+            let ring = ring.lock().unwrap();
+            assert!(!ring.exited, "a failed termination must not publish EOF");
+            assert!(
+                !ring.sealed,
+                "a failed termination must not seal the stream"
+            );
+        }
+
+        // The real termination still works afterwards.
+        host.terminate().unwrap();
+        assert!(await_structured_exit(&host));
+    }
+
+    #[test]
+    fn forced_termination_publishes_a_terminal_state() {
+        let cmd = if cfg!(windows) {
+            PtyCommand {
+                program: "cmd.exe".into(),
+                args: vec!["/C".into(), "ping -n 60 127.0.0.1 >nul".into()],
+                cwd: None,
+                env: vec![],
+            }
+        } else {
+            PtyCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 60".into()],
+                cwd: None,
+                env: vec![],
+            }
+        };
+        let mut host = StructuredProcessHost::spawn(&cmd, PtySize::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!host.is_exited(), "a live child must not report exit");
+
+        host.terminate().unwrap();
+        assert!(await_structured_exit(&host));
+        assert!(
+            host.exit_code().is_some(),
+            "a terminated child must still carry a terminal exit code"
+        );
     }
 }

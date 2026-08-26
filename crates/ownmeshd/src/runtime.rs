@@ -671,6 +671,10 @@ pub struct DaemonRuntime {
     workspaces: Vec<WorkspaceEntry>,
     #[allow(dead_code)]
     workspaces_path: PathBuf,
+    /// #146: notified whenever the device-local registry changes so the live
+    /// Agent transport can publish an incremental `workspace.registry`
+    /// snapshot. `None` in unit tests without a transport.
+    workspace_registry_notify: Option<Arc<tokio::sync::Notify>>,
     enforce_workspace: bool,
     log_path: PathBuf,
     sessions: SessionManager,
@@ -687,9 +691,17 @@ pub struct DaemonRuntime {
     /// retained fail-closed and surfaced here instead of poisoning unrelated
     /// future sessions.
     transition_recovery_health: TransitionRecoveryHealth,
+    /// Sessions the last reattach pass could not resolve either way and
+    /// retained fail-closed. Reported through `system.diagnose` so the
+    /// indeterminate case is queryable, not only visible in daemon logs.
+    pub(super) reattach_retained_sessions: usize,
     review_manifests: ReviewManifestStore,
     review_results: ReviewResultStore,
     transition_recovery_running: bool,
+    /// Live Agent-route presence shared by the transport (#141). `None` in
+    /// unit-test runtimes where no transport is wired; doctor and
+    /// system.diagnose report `unknown` instead of guessing.
+    route_presence: Option<watch::Receiver<ownmesh_ipc::AgentRoutePresence>>,
     /// Optional cancel signal for the currently executing remote command.
     /// Lives only for the duration of `dispatch_cancellable`.
     active_cancel: Option<watch::Receiver<bool>>,
@@ -892,6 +904,7 @@ impl DaemonRuntime {
             workspace_root,
             workspaces,
             workspaces_path,
+            workspace_registry_notify: None,
             enforce_workspace,
             log_path,
             sessions,
@@ -900,9 +913,11 @@ impl DaemonRuntime {
             supervisor: None,
             transition_journal,
             transition_recovery_health: TransitionRecoveryHealth::default(),
+            reattach_retained_sessions: 0,
             review_manifests,
             review_results,
             transition_recovery_running: false,
+            route_presence: None,
             active_cancel: None,
             active_remote_operation_id: None,
             active_remote_expires_at_unix: None,
@@ -1401,6 +1416,52 @@ retry — refusing the persist rather than claiming compaction succeeded while t
     }
 
     /// Resolve a registered workspace root by id (default → `ws_default`).
+    #[allow(clippy::needless_pass_by_value)]
+    fn handle_route_status(&self) -> Value {
+        // #141: live Agent-route presence as observed by the transport —
+        // the same condition the control plane reports to MCP clients as
+        // `connection_status`. No secrets, no keychain reads.
+        let route = self
+            .route_presence
+            .as_ref()
+            .map(|rx| rx.borrow().as_str())
+            .unwrap_or("unknown");
+        json!({
+            "schema_version": 1,
+            "route": route,
+        })
+    }
+
+    /// Wire the live Agent-route presence channel installed by the daemon
+    /// (#141). Absent in unit tests; consumers then see `unknown`.
+    pub fn install_route_presence(
+        &mut self,
+        receiver: watch::Receiver<ownmesh_ipc::AgentRoutePresence>,
+    ) {
+        self.route_presence = Some(receiver);
+    }
+
+    /// Live Agent-route presence string for system.diagnose facts (#141).
+    pub(crate) fn agent_route_presence(&self) -> Option<&'static str> {
+        self.route_presence.as_ref().map(|rx| rx.borrow().as_str())
+    }
+
+    /// Wire the workspace-registry change channel installed by the daemon
+    /// (#146): registry mutations notify the live transport.
+    pub fn install_workspace_registry_notify(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.workspace_registry_notify = Some(notify);
+    }
+
+    /// Signal the transport that the device-local registry changed (#146).
+    /// Fire-and-forget: the next live-loop turn publishes a full snapshot,
+    /// and a disconnected transport simply picks it up in the next handshake.
+    pub(crate) fn notify_workspace_registry_changed(&self) {
+        if let Some(notify) = &self.workspace_registry_notify {
+            notify.notify_one();
+        }
+    }
+
+    /// Resolve a registered workspace root by id (default → `ws_default`).
     ///
     /// Restricted modes pin and authorize against the selected root only.
     /// Unknown ids fail closed (never fall back to another tenant/device root).
@@ -1613,6 +1674,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::POLICY_SHOW,
             methods::POLICY_VALIDATE,
             methods::STATUS,
+            methods::ROUTE_STATUS,
             methods::PING,
             methods::GRANTS_LIST,
             methods::GRANTS_SHOW,
@@ -1650,6 +1712,7 @@ retry — refusing the persist rather than claiming compaction succeeded while t
             methods::GRANTS_LIST,
             methods::GRANTS_SHOW,
             methods::GRANTS_REVOKE,
+            methods::ROUTE_STATUS,
             ops_methods::SYSTEM_DIAGNOSE,
             ops_methods::GIT_STATUS,
             ops_methods::GIT_DIFF,
@@ -2018,6 +2081,73 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
         Ok(())
     }
 
+    /// Reconcile a durable in-progress marker with a terminal, definitive
+    /// failure outcome (#142). The dispatch finished with a non-retryable
+    /// error, so leaving the marker in place would strand the caller's
+    /// idempotency key forever and keep doctor reporting an uncertain
+    /// in-flight mutation. The marker becomes a compact *failed* receipt:
+    /// replaying the same key still cannot re-run a side effect — it replays
+    /// the stored failure.
+    ///
+    /// Safety envelope (ADR 0010 unchanged): only this operation's own
+    /// in-progress marker is reconciled (the `operation_id` must match);
+    /// completed receipts and unknown/forward-version states stay untouched;
+    /// a crash between reserve and terminal result still leaves the
+    /// exact-once in-progress marker for operator reconciliation. Returns
+    /// `Ok(true)` only when a marker was actually reconciled.
+    fn fail_idempotent(
+        &mut self,
+        key: Option<&String>,
+        operation_id: &str,
+        error_code: i64,
+        error_message: &str,
+    ) -> IpcResult<bool> {
+        let Some(key) = key else {
+            return Ok(false);
+        };
+        let Some(entry) = self.op_journal.get(key) else {
+            return Ok(false);
+        };
+        if op_journal_entry_state(entry) != OpJournalEntryState::InProgress {
+            return Ok(false);
+        }
+        if entry.get("operation_id").and_then(Value::as_str) != Some(operation_id) {
+            return Ok(false);
+        }
+        let receipt = json!({
+            "durable_receipt": true,
+            "status": "failed",
+            "operation_id": operation_id,
+            "error": {
+                "code": error_code,
+                "message": bounded_journal_error_message(error_message),
+                "retryable": false,
+            },
+        });
+        self.store_idempotent(Some(key), &receipt)?;
+        Ok(true)
+    }
+
+    /// Transport entry point for [`Self::fail_idempotent`]: reconcile the
+    /// caller's reserved journal key after a remote dispatch produced a
+    /// terminal failed/cancelled device result (#142). Recomputes the same
+    /// principal-namespaced journal key the admission path reserved.
+    pub fn reconcile_failed_idempotent(
+        &mut self,
+        idempotency_key: &str,
+        principal_key: &str,
+        operation_id: &str,
+        error_code: i64,
+        error_message: &str,
+    ) -> bool {
+        let requester_principal = canonicalize_principal_key(principal_key);
+        let journal_key = principal_journal_key(&requester_principal, idempotency_key);
+        matches!(
+            self.fail_idempotent(Some(&journal_key), operation_id, error_code, error_message,),
+            Ok(true)
+        )
+    }
+
     async fn gate_and_run(
         &mut self,
         facts: OperationFacts,
@@ -2032,6 +2162,24 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
             .as_ref()
             .map(|k| principal_journal_key(&requester_principal, k));
         if let Some(prev) = self.lookup_idempotent(journal_key.as_ref())? {
+            // A reconciled terminal failure (#142) replays as the same
+            // definitive error — never as a new attempt and never disguised
+            // as a completed result. The stored JSON-RPC code/message are the
+            // exact pair the first attempt produced.
+            if prev.get("status").and_then(Value::as_str) == Some("failed") {
+                let error = prev.get("error").cloned().unwrap_or_else(|| json!({}));
+                return Err(IpcError::Remote {
+                    code: error
+                        .get("code")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(app_error::INTERNAL),
+                    message: error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| "operation previously failed".into()),
+                });
+            }
             let mut replayed = prev;
             if let Some(obj) = replayed.as_object_mut() {
                 obj.insert("replayed".into(), json!(true));
@@ -2158,10 +2306,41 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                     return Err(journal_degraded_error(reason));
                 }
                 self.begin_idempotent(journal_key.as_ref(), &operation_id)?;
-                // Once the durable marker exists, every execution/finalization error
-                // deliberately leaves it in place. Retrying an uncertain external
-                // side effect is less safe than requiring operator reconciliation.
-                let result = self.execute_request(&request).await?;
+                // A crash between this reserve and a terminal outcome must
+                // keep the exact-once marker (ADR 0010). But a definitive
+                // execution error is itself terminal: reconcile the marker
+                // into a compact failed receipt so the key replays the same
+                // failure instead of being stranded as an eternal in_progress
+                // marker (#142).
+                let executed = self.execute_request(&request).await;
+                let result = match executed {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let (code, message) = match &error {
+                            IpcError::Remote { code, message } => (*code, message.clone()),
+                            _ => (app_error::INTERNAL, error.to_string()),
+                        };
+                        if let Err(reconcile_error) = self.fail_idempotent(
+                            journal_key.as_ref(),
+                            &operation_id,
+                            code,
+                            &message,
+                        ) {
+                            eprintln!(
+                                "warning: failed to persist terminal failure receipt \
+                                 {operation_id}: {reconcile_error:?}"
+                            );
+                        }
+                        self.append_audit(
+                            "operation.failed",
+                            Some(&facts.capability),
+                            Some(&operation_id),
+                            Some("allow"),
+                            "execution returned a terminal error; journal marker reconciled",
+                        );
+                        return Err(error);
+                    }
+                };
                 let body = json!({
                     "approval_required": false,
                     "operation_id": operation_id,
@@ -2271,6 +2450,11 @@ receipts; refuse new idempotency key (run `ownmesh doctor` for journal pressure)
                 message: "OWNMESH_E_EXECUTABLE_IDENTITY_DRIFT: command classification changed; request must be re-authorized".into(),
             });
         }
+
+        // #160: the authoritative pre-spawn gate. `handle_exec` rejects the
+        // same request at admission, but an approved request executes here
+        // later and must never reach spawn either.
+        reject_self_reentrant_ownmesh_exec(&p.program, &p.args)?;
 
         let _detached_guard = if p.detach {
             Some(acquire_detached_slot()?)
@@ -3016,6 +3200,10 @@ path or install the tool so detection and execution agree",
                 },
             )?);
         }
+        // #160: refuse a self-reentrant OwnMesh invocation before it consumes
+        // an idempotency key or an approval, so the caller gets one bounded
+        // typed error instead of a device-wide stall.
+        reject_self_reentrant_ownmesh_exec(&p.program, &p.args)?;
         // Facts carry only server-computed pin identity — never client digests.
         let facts = OperationFacts {
             capability: "command.run".into(),
@@ -5474,6 +5662,7 @@ path or install the tool so detection and execution agree",
         self.check_lockdown(method)?;
         self.check_journal_degraded(method)?;
         match method {
+            methods::ROUTE_STATUS => Ok(self.handle_route_status()),
             methods::OPS_EXEC => self.handle_exec(params, client).await,
             methods::OPS_FS_LIST => self.handle_fs_list(params, client).await,
             methods::OPS_FS_STAT => self.handle_fs_stat(params, client).await,
@@ -5707,6 +5896,15 @@ path or install the tool so detection and execution agree",
         }
         let mut recovered_pids = Vec::new();
         let mut interrupted_opens = Vec::new();
+        // Sessions this pass could not resolve either way. Counted rather than
+        // only logged so the indeterminate case has a queryable representation
+        // (surfaced through `system.diagnose`) instead of living in a stderr
+        // stream a service manager may discard.
+        let mut retained = 0_usize;
+        // #31: sessions whose child the supervisor proves is gone. Terminal
+        // reconciliation is what stops one dead short-lived session from being
+        // re-examined — and re-rejected — on every later reattach.
+        let mut exited_sessions = Vec::new();
         {
             let proxy = self.supervisor.as_ref().ok_or_else(|| IpcError::Remote {
                 code: app_error::CONFLICT,
@@ -5717,60 +5915,91 @@ path or install the tool so detection and execution agree",
                 if state == ownmesh_session::SessionState::Starting {
                     let transition_id =
                         format!("open-recovery:{session_id}:{}", binding.controller_epoch);
-                    proxy
-                        .terminate(&exact, transition_id)
-                        .await
-                        .map_err(|error| IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!(
-                                "interrupted persistent session {session_id} cleanup is pending: {error}"
-                            ),
-                        })?;
+                    if let Err(error) = proxy.terminate(&exact, transition_id).await {
+                        // Fail closed for *this* session only: a cleanup that
+                        // could not be acknowledged keeps its record for
+                        // explicit recovery. This is now the only signal that
+                        // the record was retained — the RPC itself succeeds —
+                        // so it is a structured, filterable event carrying the
+                        // session id rather than a bare stderr line.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %error,
+                            "interrupted persistent session cleanup is pending; record retained"
+                        );
+                        retained += 1;
+                        continue;
+                    }
                     interrupted_opens.push(session_id);
                     continue;
                 }
                 if binding.binding_expires_unix <= now {
                     continue;
                 }
-                let status = proxy
-                    .status(&exact)
-                    .await
-                    .map_err(|error| IpcError::Remote {
-                        code: app_error::CONFLICT,
-                        message: format!(
-                            "persistent session {session_id} cannot reattach without respawn: {error}"
-                        ),
-                    })?;
+                let status = match proxy.status(&exact).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        // The supervisor could not answer for this session.
+                        // That is indeterminate, not proof of death, so the
+                        // record is retained — but it must not stop an
+                        // unrelated session from reattaching or opening.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            error = %error,
+                            "persistent session cannot reattach without respawn; record retained"
+                        );
+                        retained += 1;
+                        continue;
+                    }
+                };
                 let (pid, birth) = match (status.pid, status.process_birth_id) {
                     (Some(pid), Some(birth)) if !status.exited => (pid, birth),
+                    // The supervisor is authoritative and says this host has
+                    // no live child. A short-lived process that exited before
+                    // (or right after) publication lands here; previously the
+                    // whole reattach aborted, which made every later
+                    // `session_open`, `replay` and `close` fail while naming
+                    // that unrelated stale session (#31).
                     _ => {
-                        return Err(IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!(
-                                "persistent session {session_id} did not attest child process identity"
-                            ),
-                        });
+                        exited_sessions.push(session_id);
+                        continue;
                     }
                 };
                 if let (Some(expected_pid), Some(expected_birth)) =
                     (binding.child_pid, binding.child_process_birth)
                 {
                     if pid != expected_pid || birth != expected_birth {
-                        return Err(IpcError::Remote {
-                            code: app_error::CONFLICT,
-                            message: format!(
-                                "persistent session {session_id} child process identity changed during reattach"
-                            ),
-                        });
+                        // A different process under the same host binding is a
+                        // real conflict, but still a per-session one: retain
+                        // the record fail-closed and keep going.
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "persistent session child process identity changed during reattach; \
+                             record retained"
+                        );
+                        retained += 1;
+                        continue;
                     }
                 }
                 recovered_pids.push((session_id, pid, birth));
             }
         }
-        if recovered_pids.is_empty() && interrupted_opens.is_empty() {
+        // Publish the retained count even when there is nothing to commit, so a
+        // pass that resolved nothing still reports what it could not resolve.
+        self.reattach_retained_sessions = retained;
+        if recovered_pids.is_empty() && interrupted_opens.is_empty() && exited_sessions.is_empty() {
             return Ok(());
         }
         let snapshot = self.sessions.clone();
+        for session_id in exited_sessions {
+            self.sessions.close(&session_id).map_err(session_err)?;
+            self.sessions
+                .set_sidecar_host_binding(&session_id, None)
+                .map_err(session_err)?;
+            self.sessions
+                .set_host_pid(&session_id, None)
+                .map_err(session_err)?;
+        }
         for session_id in interrupted_opens {
             self.sessions.close(&session_id).map_err(session_err)?;
             self.sessions
@@ -6192,9 +6421,10 @@ recorded lease id; retained fail-closed — run `ownmesh doctor` or inspect {} "
     ///
     /// 1. **OS process proof.** For each binding that carries the attested
     ///    child identity (`child_pid` + `child_process_birth`), ask the OS
-    ///    whether that exact process still exists. `process_birth_id`
-    ///    returns `Ok(None)` only when the OS confirmed the PID no longer
-    ///    exists; a reused PID reports a different birth, which equally
+    ///    whether that exact process is still running.
+    ///    `running_process_birth_id` returns `Ok(None)` only when the OS
+    ///    confirmed the PID is gone or the process exited without being
+    ///    reaped (#31); a reused PID reports a different birth, which equally
     ///    proves the original child is gone. A matching birth means that
     ///    sidecar is still live → retain (never contradicted by the
     ///    supervisor). An inspection error is indeterminate and falls
@@ -6226,9 +6456,12 @@ recorded lease id; retained fail-closed — run `ownmesh doctor` or inspect {} "
         for binding in bindings {
             if let Some((pid, expected_birth)) = binding.child_pid.zip(binding.child_process_birth)
             {
-                match ownmesh_ipc::process_birth_id(pid) {
-                    // OS-confirmed gone, or the PID was reused by a different
-                    // process: the original child is provably dead.
+                // #31: an exited-but-unreaped child must count as dead here
+                // too, or its expired record is retained forever.
+                match ownmesh_ipc::running_process_birth_id(pid) {
+                    // OS-confirmed gone (including exited-not-yet-reaped), or
+                    // the PID was reused by a different process: the original
+                    // child is provably dead.
                     Ok(None) => {}
                     Ok(Some(birth)) if birth != expected_birth => {}
                     // The attested child is still live: that is authoritative
@@ -7530,9 +7763,132 @@ fn persistent_sidecar_has_terminal_receipt(
         && receipt.controller_epoch == binding.controller_epoch
 }
 
+/// Basenames of the OwnMesh binaries whose normal entry points open this
+/// daemon's IPC. Never used on its own — a basename is trivially spoofed by
+/// copying or renaming an unrelated program — only to *find* candidate paths
+/// whose file identity is then compared.
+#[cfg(windows)]
+const OWNMESH_IPC_BINARY_NAMES: &[&str] = &["ownmesh.exe", "ownmeshd.exe"];
+#[cfg(not(windows))]
+const OWNMESH_IPC_BINARY_NAMES: &[&str] = &["ownmesh", "ownmeshd"];
+
+/// Candidate absolute paths of OwnMesh binaries that re-enter daemon IPC.
+///
+/// Covers the running daemon image, its installed siblings, and whatever the
+/// spawn search would resolve, so a request naming any of them — directly, by
+/// symlink, by hard link, or through PATH — lands on the same file identity.
+fn ownmesh_ipc_binary_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+    if let Ok(current) = std::env::current_exe() {
+        // A Linux image replaced by an upgrade reads back with a `(deleted)`
+        // suffix and cannot be opened; identity lookup skips it and the
+        // installed siblings below still match (#150).
+        if let Some(dir) = current.parent().map(Path::to_path_buf) {
+            for name in OWNMESH_IPC_BINARY_NAMES {
+                push(dir.join(name));
+            }
+        }
+        push(current);
+    }
+    for name in OWNMESH_IPC_BINARY_NAMES {
+        if let Some(resolved) = resolve_executable_path(name, None) {
+            push(resolved);
+        }
+    }
+    paths
+}
+
+/// OwnMesh CLI argv forms proven to exit before any daemon IPC is opened.
+///
+/// Clap answers `--version`/`--help` and terminates during argument parsing,
+/// before a subcommand runs, so these can never re-enter the runtime. The rule
+/// is deliberately narrow: exactly one argument, matched exactly. Anything
+/// with a subcommand, an `--` separator, or extra arguments is refused with
+/// the rest of the family, because whether clap still short-circuits then
+/// depends on how that subcommand declares trailing arguments.
+fn ownmesh_argv_never_opens_ipc(args: &[String]) -> bool {
+    matches!(args, [only] if matches!(only.as_str(), "--version" | "-V" | "--help" | "-h"))
+}
+
+/// True when `identity` names the same file as one of `candidates`.
+///
+/// A platform that cannot report file identity (`None`) falls back to a
+/// canonical-path comparison rather than silently matching nothing.
+fn same_file_as_any(
+    path: &Path,
+    identity: (Option<u64>, Option<u64>),
+    candidates: &[PathBuf],
+) -> bool {
+    let canonical = std::fs::canonicalize(path).ok();
+    candidates.iter().any(|candidate| {
+        if let (Some(device), Some(inode)) = identity {
+            if let Ok((Some(candidate_device), Some(candidate_inode))) =
+                ownmesh_exec::file_identity(candidate)
+            {
+                return device == candidate_device && inode == candidate_inode;
+            }
+        }
+        canonical
+            .as_ref()
+            .zip(std::fs::canonicalize(candidate).ok().as_ref())
+            .is_some_and(|(a, b)| a == b)
+    })
+}
+
+/// Refuse an execution request that would run an OwnMesh binary which
+/// re-enters this daemon's IPC (#160).
+///
+/// The daemon holds one global runtime mutex across a `command.run` child's
+/// full lifetime. A child that synchronously calls back into daemon IPC waits
+/// for that same mutex, so neither side can progress and every later request
+/// for the device queues behind the deadlock — one permitted command makes the
+/// whole device look broken.
+///
+/// This is a bounded pre-spawn guard, not the concurrency fix: it cannot see
+/// an OwnMesh CLI call inside a shell string or a script, which is why the
+/// runtime lock still must not be held across arbitrary child work.
+fn reject_self_reentrant_ownmesh_exec(program: &str, args: &[String]) -> IpcResult<()> {
+    let path = Path::new(program);
+    if !path.is_absolute() {
+        // Structured requests are resolved to an absolute path before this
+        // runs; a relative program is a shell payload and is not identifiable.
+        return Ok(());
+    }
+    let Ok(identity) = ownmesh_exec::file_identity(path) else {
+        return Ok(());
+    };
+    let candidates = ownmesh_ipc_binary_paths();
+    if !same_file_as_any(path, identity, &candidates) {
+        return Ok(());
+    }
+    if ownmesh_argv_never_opens_ipc(args) {
+        return Ok(());
+    }
+    Err(IpcError::Remote {
+        code: app_error::SELF_REENTRANT_EXEC,
+        message: "OWNMESH_E_SELF_REENTRANT_EXEC: running the OwnMesh CLI on the device it \
+manages would re-enter the daemon and block every later request for this device; use the \
+dedicated tools (system.diagnose, policy/grants/workspace) instead. Only `--version` and \
+`--help` are executable this way."
+            .into(),
+    })
+}
+
 /// A process is live only when both the stored PID and OS-issued birth witness
-/// still match. A missing/changing witness proves the original child ended,
-/// but does not assign ownership to a reused PID.
+/// still match **and** the OS reports it as still running. A missing/changing
+/// witness proves the original child ended, but does not assign ownership to a
+/// reused PID.
+///
+/// #31: `running_process_birth_id` — not the plain birth witness — is the
+/// liveness authority here. A child that exited without being reaped keeps its
+/// PID and start time, so the plain witness reported a zombie as live and
+/// close/terminate answered "authenticated child is still alive, refusing
+/// PID-only termination" for a session whose process was already gone.
 fn persistent_child_is_live(binding: &SidecarHostBinding) -> Result<bool, String> {
     let pid = binding
         .child_pid
@@ -7540,7 +7896,7 @@ fn persistent_child_is_live(binding: &SidecarHostBinding) -> Result<bool, String
     let expected = binding
         .child_process_birth
         .ok_or("persistent sidecar binding lacks a durable child birth witness")?;
-    match ownmesh_ipc::process_birth_id(pid)? {
+    match ownmesh_ipc::running_process_birth_id(pid)? {
         Some(observed) => Ok(observed == expected),
         None => Ok(false),
     }
@@ -7635,6 +7991,40 @@ mod device_binding_tests {
             .as_str()
             .unwrap()
             .contains("Independent of access_preset"));
+    }
+
+    /// #146: registry mutations store a Notify permit so the live transport's
+    /// `workspace_registry_notify` wakes on the next select turn.
+    #[tokio::test]
+    async fn workspace_mutations_notify_the_registry_listener() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        runtime.install_workspace_registry_notify(notify.clone());
+
+        // With no waiter parked, notify_one stores exactly one permit.
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        runtime
+            .handle_workspace_add(
+                Some(json!({
+                    "path": root.to_string_lossy(),
+                    "id": "ws_proj",
+                })),
+                &ClientIdentity::new("client:local:test", "test"),
+            )
+            .unwrap();
+        // The stored permit must be observable immediately.
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("workspace_add must signal the registry listener");
+
+        // A remove signals again for the next drain turn.
+        runtime.notify_workspace_registry_changed();
+        tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
+            .await
+            .expect("a subsequent change must be signalled too");
     }
 
     #[test]
@@ -7837,6 +8227,166 @@ mod device_binding_tests {
         assert!(recovered.host_pid.is_none());
     }
 
+    /// #31: one stale session must never poison unrelated session work.
+    ///
+    /// A short-lived child that exits leaves a `running` record whose host the
+    /// supervisor reports as exited. Reattach used to abort the whole pass
+    /// with `did not attest child process identity`, and because reattach runs
+    /// on the way to *every* supervisor-backed call, later `session_open`,
+    /// `replay` and `close` all failed while naming that unrelated session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exited_session_is_reconciled_and_never_blocks_a_live_one() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let sidecar_root = paths.state_dir.join("session-supervisor");
+        let (supervisor_server, _) =
+            ownmesh_session_host::SupervisorIpcServer::new(&sidecar_root, &paths.runtime_dir)
+                .unwrap();
+        let endpoint = supervisor_server.endpoint().clone();
+        let server = Arc::clone(supervisor_server.server());
+        let server_task = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move { server.serve().await.unwrap() }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let management =
+            read_management_credential(supervisor_server.credential_state_dir()).unwrap();
+        let supervisor =
+            SupervisorClient::bootstrap(endpoint, paths.runtime_dir.clone(), management)
+                .await
+                .unwrap();
+
+        let mut spawn_session = |title: &str, program: &str, args: Vec<String>| {
+            let session = runtime
+                .sessions
+                .open(
+                    SessionKind::Pty,
+                    title,
+                    "client:remote:tenant:owner",
+                    DaemonRuntime::now(),
+                    None,
+                )
+                .unwrap();
+            let lease = session.controller.clone().unwrap();
+            (
+                session.id.clone(),
+                SupervisorSpawnRequest {
+                    session_id: session.id,
+                    device_id: "dev_a".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "client:remote:tenant:owner".into(),
+                    controller_epoch: lease.epoch,
+                    binding_expires_unix: lease.expires_unix,
+                    host_expires_unix: DaemonRuntime::now() + 7_200,
+                    command: SupervisorCommand {
+                        program: program.to_owned(),
+                        args,
+                        cwd: None,
+                        env: Vec::new(),
+                    },
+                    cols: 80,
+                    rows: 24,
+                    io_mode: HostIoMode::StructuredPipes,
+                    profile_id: Some("test-profile".into()),
+                    adapter_dialect: Some("test-jsonl".into()),
+                },
+                lease.expires_unix,
+            )
+        };
+
+        // A short-lived child that exits almost immediately.
+        let (short_id, short_request, short_expiry) =
+            spawn_session("short-lived", "/bin/sh", vec!["-c".into(), "exit 0".into()]);
+        // An unrelated long-lived child that must keep working.
+        let (long_id, long_request, long_expiry) = spawn_session(
+            "long-lived",
+            "/bin/sh",
+            vec!["-c".into(), "sleep 30".into()],
+        );
+
+        let short_exact = supervisor.spawn(short_request).await.unwrap();
+        let long_exact = supervisor.spawn(long_request).await.unwrap();
+        let binding_for = |exact: &SupervisorBinding, expires: i64| SidecarHostBinding {
+            device_id: exact.device_id.clone(),
+            workspace_id: exact.workspace_id.clone(),
+            owner_principal: exact.owner_principal.clone(),
+            host_nonce: exact.host_nonce.clone(),
+            controller_epoch: exact.controller_epoch,
+            binding_expires_unix: expires,
+            host_expires_unix: DaemonRuntime::now() + 7_200,
+            child_pid: None,
+            child_process_birth: None,
+        };
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&short_id, Some(binding_for(&short_exact, short_expiry)))
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&long_id, Some(binding_for(&long_exact, long_expiry)))
+            .unwrap();
+        runtime.persist_sessions().unwrap();
+        runtime.supervisor = Some(supervisor);
+
+        // Wait until the supervisor observes the short-lived child's exit.
+        for _ in 0..200 {
+            let status = runtime
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .status(&short_exact)
+                .await;
+            if status.map(|s| s.exited).unwrap_or(true) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        runtime
+            .reattach_persistent_sidecars()
+            .await
+            .expect("an exited session must not fail the whole reattach pass");
+
+        assert_eq!(
+            runtime.sessions.get(&short_id).unwrap().state,
+            ownmesh_session::SessionState::Closed,
+            "an exited child reconciles to terminal instead of staying `running`"
+        );
+        assert!(runtime
+            .sessions
+            .get(&short_id)
+            .unwrap()
+            .sidecar_host
+            .is_none());
+        assert_eq!(
+            runtime.sessions.get(&long_id).unwrap().state,
+            ownmesh_session::SessionState::Running,
+            "an unrelated live session must survive the same pass"
+        );
+        assert!(
+            runtime.sessions.get(&long_id).unwrap().host_pid.is_some(),
+            "the live session must still reattach to its child"
+        );
+
+        // The stale record is gone, so a second pass is clean and an unrelated
+        // new session can be opened.
+        runtime
+            .reattach_persistent_sidecars()
+            .await
+            .expect("reattach stays clean once the stale record is reconciled");
+
+        let _ = runtime
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .terminate(&long_exact, format!("test-cleanup:{long_id}"))
+            .await;
+        server.request_shutdown();
+        server_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn close_retry_after_restart_terminates_an_interrupted_starting_sidecar() {
         let dir = tempdir().unwrap();
@@ -8018,6 +8568,165 @@ mod device_binding_tests {
             runtime.sessions.get(&session.id).unwrap().state,
             ownmesh_session::SessionState::Running
         );
+    }
+
+    /// #31 (Linux regression): a short-lived session child that exited
+    /// without being reaped keeps its PID and start time, so the birth-witness
+    /// probe reported it as live. `close` then refused to reconcile
+    /// ("authenticated child is still alive, refusing PID-only termination")
+    /// and the dead session stayed pinned as `running` forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_child_reconciles_to_terminal_instead_of_blocking_close() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let session = runtime
+            .sessions
+            .open(
+                SessionKind::Pty,
+                "zombie-child",
+                "client:remote:tenant:owner",
+                DaemonRuntime::now(),
+                None,
+            )
+            .unwrap();
+
+        // A real short-lived child, deliberately left unreaped.
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let child_pid = child.id();
+        let child_process_birth = ownmesh_ipc::process_birth_id(child_pid)
+            .expect("probe succeeds")
+            .expect("a freshly spawned child has a birth witness");
+        for _ in 0..200 {
+            if ownmesh_ipc::running_process_birth_id(child_pid) == Ok(None) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            ownmesh_ipc::running_process_birth_id(child_pid),
+            Ok(None),
+            "child did not become a zombie"
+        );
+        // The PID slot and start time survive, which is exactly what used to
+        // be mistaken for liveness.
+        assert_eq!(
+            ownmesh_ipc::process_birth_id(child_pid),
+            Ok(Some(child_process_birth))
+        );
+
+        runtime
+            .sessions
+            .set_host_pid(&session.id, Some(child_pid))
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(
+                &session.id,
+                Some(SidecarHostBinding {
+                    device_id: "dev_a".into(),
+                    workspace_id: "ws_default".into(),
+                    owner_principal: "client:remote:tenant:owner".into(),
+                    host_nonce: "host_nonce".into(),
+                    controller_epoch: 1,
+                    binding_expires_unix: DaemonRuntime::now() + 60,
+                    host_expires_unix: DaemonRuntime::now() + 600,
+                    child_pid: Some(child_pid),
+                    child_process_birth: Some(child_process_birth),
+                }),
+            )
+            .unwrap();
+
+        // Close with the supervisor unavailable now converges to terminal.
+        let reconciled = runtime
+            .reconcile_terminal_after_supervisor_failure(&session.id, TransitionKind::Close)
+            .expect("a zombie child must not block reconciliation");
+        assert!(reconciled);
+        let recovered = runtime.sessions.get(&session.id).unwrap();
+        assert_eq!(recovered.state, ownmesh_session::SessionState::Closed);
+        assert!(recovered.sidecar_host.is_none());
+
+        child.wait().expect("reap the child");
+    }
+
+    /// #31: the same zombie is reconciled during an ordinary read, so
+    /// `session_show` / `session_list` stop reporting a dead session as
+    /// `running`. A genuinely live child is still never terminalized.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_time_reconciliation_clears_a_zombie_but_keeps_a_live_child() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let now = DaemonRuntime::now();
+        let bind = |pid: u32, birth: u64| SidecarHostBinding {
+            device_id: "dev_a".into(),
+            workspace_id: "ws_default".into(),
+            owner_principal: "owner".into(),
+            host_nonce: "host_nonce".into(),
+            controller_epoch: 1,
+            binding_expires_unix: now + 60,
+            host_expires_unix: now + 600,
+            child_pid: Some(pid),
+            child_process_birth: Some(birth),
+        };
+
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let dead_pid = child.id();
+        let dead_birth = ownmesh_ipc::process_birth_id(dead_pid)
+            .expect("probe succeeds")
+            .expect("birth witness");
+        for _ in 0..200 {
+            if ownmesh_ipc::running_process_birth_id(dead_pid) == Ok(None) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(ownmesh_ipc::running_process_birth_id(dead_pid), Ok(None));
+
+        let dead = runtime
+            .sessions
+            .open(SessionKind::Pty, "dead", "owner", now, None)
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&dead.id, Some(bind(dead_pid, dead_birth)))
+            .unwrap();
+
+        let live_pid = std::process::id();
+        let live_birth = ownmesh_ipc::process_birth_id(live_pid)
+            .expect("probe succeeds")
+            .expect("this test process is live");
+        let live = runtime
+            .sessions
+            .open(SessionKind::Pty, "live", "owner", now, None)
+            .unwrap();
+        runtime
+            .sessions
+            .set_sidecar_host_binding(&live.id, Some(bind(live_pid, live_birth)))
+            .unwrap();
+
+        assert_eq!(
+            runtime.reconcile_dead_persistent_sessions().unwrap(),
+            1,
+            "only the provably dead session is reconciled"
+        );
+        assert_eq!(
+            runtime.sessions.get(&dead.id).unwrap().state,
+            ownmesh_session::SessionState::Closed
+        );
+        assert_eq!(
+            runtime.sessions.get(&live.id).unwrap().state,
+            ownmesh_session::SessionState::Running,
+            "a live attested child is never falsely terminalized"
+        );
+
+        child.wait().expect("reap the child");
     }
 
     #[tokio::test]
@@ -9795,6 +10504,11 @@ fn op_journal_durable_view(journal: &HashMap<String, Value>) -> HashMap<String, 
                         .map(|v| (flag, v))
                 })
                 .collect();
+        // A reconciled terminal failure (#142) carries a small bounded
+        // `error` object (code/message/retryable). Preserving it keeps a
+        // replayed key returning the original definitive error instead of a
+        // generic one; the message is already capped at write time.
+        let error = value.get("error").filter(|v| v.is_object()).cloned();
         let mut compact = json!({
             "durable_receipt": true,
             "truncated": true,
@@ -9841,10 +10555,27 @@ fn op_journal_durable_view(journal: &HashMap<String, Value>) -> HashMap<String, 
             if let Some(session) = session {
                 object.insert("session".into(), session);
             }
+            if let Some(error) = error {
+                object.insert("error".into(), error);
+            }
         }
         out.insert(key.clone(), compact);
     }
     out
+}
+
+/// Cap a stored failure message so reconciled failed receipts stay small
+/// journal entries regardless of the underlying error text.
+fn bounded_journal_error_message(message: &str) -> String {
+    const MAX_MESSAGE_BYTES: usize = 512;
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return message.to_owned();
+    }
+    let mut cut = MAX_MESSAGE_BYTES;
+    while cut > 0 && !message.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &message[..cut])
 }
 
 fn read_bounded_state_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
@@ -10043,15 +10774,61 @@ mod broker_intent_tests {
         Ok(dir)
     }
 
+    /// A launchable, structured system executable that is **not** an OwnMesh
+    /// binary.
+    ///
+    /// This deliberately no longer falls back to `current_exe()`: the daemon
+    /// image is part of the OwnMesh binary set, so `command.run` now refuses it
+    /// before spawn (#160). Using the test binary here would exercise that
+    /// refusal instead of whatever the caller meant to test.
+    ///
+    /// `cmd.exe` is likewise unusable — it reclassifies as `raw_shell` and
+    /// changes the policy path under test.
     fn fixture_executable() -> PathBuf {
         #[cfg(target_os = "linux")]
         {
             PathBuf::from("/bin/true")
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // macOS ships coreutils-style helpers under /usr/bin, not /bin.
+            PathBuf::from("/usr/bin/true")
+        }
+        #[cfg(windows)]
+        {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+            // Any one of these is a stock System32 component; take the first
+            // that is actually present rather than betting on a single name.
+            ["whoami.exe", "hostname.exe", "where.exe"]
+                .iter()
+                .map(|name| PathBuf::from(format!("{root}\\System32\\{name}")))
+                .find(|candidate| candidate.is_file())
+                .expect("a stock System32 executable must exist")
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             std::env::current_exe().unwrap()
         }
+    }
+
+    /// The shared exec fixture must stay usable by every test that only needs
+    /// "some launchable program". If it ever names an OwnMesh binary again,
+    /// the self-reentrancy guard refuses it and unrelated tests start failing
+    /// on whichever platform the fixture falls back on — which is exactly how
+    /// this was found, on a macOS runner rather than locally.
+    #[test]
+    fn the_exec_fixture_is_never_refused_as_a_self_reentrant_ownmesh_binary() {
+        let fixture = fixture_executable();
+        assert!(
+            fixture.exists(),
+            "exec fixture must exist on this platform: {}",
+            fixture.display()
+        );
+        assert!(
+            reject_self_reentrant_ownmesh_exec(&fixture.display().to_string(), &[]).is_ok(),
+            "the shared exec fixture must not be an OwnMesh binary: {}",
+            fixture.display()
+        );
     }
 
     fn bound_runtime() -> (tempfile::TempDir, DaemonRuntime, ExecParams) {
@@ -10309,7 +11086,7 @@ mod broker_intent_tests {
     }
 
     #[tokio::test]
-    async fn local_elevation_stays_in_the_same_runtime_and_uncertain_marker_blocks_replay() {
+    async fn local_elevation_stays_in_the_same_runtime_and_terminal_failure_never_reruns() {
         let temp = tempdir().unwrap();
         let paths = OwnMeshPaths::for_base(temp.path());
         let mut runtime = DaemonRuntime::open(&paths).unwrap();
@@ -10329,12 +11106,16 @@ mod broker_intent_tests {
             .await
             .expect_err("local elevation must not fall back to local spawning");
         assert!(first.to_string().contains("broker") || first.to_string().contains("binding"));
+        // #142: the definitive failure reconciles the reserved marker into a
+        // terminal failed receipt, so a retry replays that same stored error.
+        // It must never rerun the operation and never masquerade as success.
         let second = runtime
             .dispatch(methods::OPS_EXEC, Some(params), &client)
             .await
-            .expect_err("uncertain elevated operation must not rerun");
+            .expect_err("terminal failure must not rerun");
         assert!(
-            second.to_string().contains("in-progress") || second.to_string().contains("uncertain")
+            second.to_string().contains("broker") || second.to_string().contains("binding"),
+            "replay must return the stored terminal failure: {second}"
         );
     }
 
@@ -10374,6 +11155,151 @@ mod broker_intent_tests {
             runtime.op_journal.is_empty(),
             "no side-effect receipt may exist"
         );
+    }
+
+    /// #160: an OwnMesh CLI child that re-enters daemon IPC deadlocks the
+    /// runtime mutex the daemon holds across the child's lifetime, and every
+    /// later request for the device queues behind it. Detection must survive
+    /// renaming, hard links, and symlinks — a basename check would miss all
+    /// three.
+    #[cfg(unix)]
+    #[test]
+    fn a_renamed_or_linked_ownmesh_binary_is_refused_before_spawn() {
+        let dir = tempdir().unwrap();
+        // `current_exe()` is in the candidate set, so this test binary stands
+        // in for an installed OwnMesh binary.
+        let current = std::env::current_exe().unwrap();
+
+        let hard_link = dir.path().join("totally-unrelated-name");
+        let linked = std::fs::hard_link(&current, &hard_link).is_ok();
+        let symlink = dir.path().join("also-unrelated");
+        std::os::unix::fs::symlink(&current, &symlink).unwrap();
+
+        let refused = |path: &Path, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            reject_self_reentrant_ownmesh_exec(&path.display().to_string(), &args)
+        };
+
+        // A typed code, not just a message prefix: a client must be able to
+        // tell this apart from every other conflict without substring-matching
+        // prose that anyone could reword.
+        let error = refused(&current, &["doctor"]).unwrap_err();
+        match &error {
+            IpcError::Remote { code, message } => {
+                assert_eq!(*code, app_error::SELF_REENTRANT_EXEC);
+                assert!(
+                    message.contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a typed self-reentrancy refusal, got {other}"),
+        }
+        assert_eq!(
+            ownmesh_domain::ErrorCode::parse("OWNMESH_E_SELF_REENTRANT_EXEC").unwrap(),
+            ownmesh_domain::ErrorCode::SelfReentrantExec,
+            "the wire code must round-trip through the shared taxonomy"
+        );
+        assert!(
+            refused(&symlink, &["doctor", "--json", "--offline"]).is_err(),
+            "a symlink to an OwnMesh binary is the same file"
+        );
+        if linked {
+            assert!(
+                refused(&hard_link, &["status"]).is_err(),
+                "a hard link under an unrelated name is the same file"
+            );
+        }
+
+        // Proven no-IPC informational entry points stay usable, including
+        // through the same links.
+        for informational in [vec!["--version"], vec!["-V"], vec!["--help"], vec!["-h"]] {
+            assert!(
+                refused(&current, &informational).is_ok(),
+                "{informational:?} exits during argument parsing"
+            );
+            assert!(refused(&symlink, &informational).is_ok());
+        }
+        // Anything beyond that single argument is refused with the family:
+        // whether clap still short-circuits depends on the subcommand.
+        assert!(refused(&current, &["doctor", "--help"]).is_err());
+        assert!(refused(&current, &["--version", "extra"]).is_err());
+        assert!(refused(&current, &[]).is_err());
+
+        // An unrelated program is untouched. `/bin/sh` rather than `/bin/true`:
+        // only `/bin/sh` is guaranteed on every Unix (macOS ships `true` under
+        // `/usr/bin`), and a path that does not exist would pass this
+        // assertion without proving anything.
+        assert!(Path::new("/bin/sh").exists());
+        assert!(
+            reject_self_reentrant_ownmesh_exec("/bin/sh", &["-c".into(), "true".into()]).is_ok()
+        );
+        // A non-absolute program is a shell payload, not an identifiable file.
+        assert!(reject_self_reentrant_ownmesh_exec("ownmesh", &["doctor".into()]).is_ok());
+    }
+
+    /// #160: the refusal is reachable through the real dispatch path and is a
+    /// terminal typed error, not a stalled operation. Nothing is authorized
+    /// and no side-effect receipt is written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn self_reentrant_exec_fails_fast_without_authorizing_anything() {
+        let temp = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(temp.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        runtime.set_policy_for_test(preset_document(AccessPreset::FullAccess));
+        let client = ClientIdentity::new("exec-reentrancy-test", "test");
+        let current = std::env::current_exe().unwrap();
+
+        let error = runtime
+            .dispatch(
+                methods::OPS_EXEC,
+                Some(json!({
+                    "program": current.display().to_string(),
+                    "args": ["doctor", "--json", "--offline"],
+                    "kind": "structured",
+                    "workspace_id": "ws_default",
+                    "idempotency_key": "reentrant_doctor_1",
+                })),
+                &client,
+            )
+            .await
+            .expect_err("a self-reentrant OwnMesh invocation must fail before spawn");
+        match &error {
+            IpcError::Remote { code, message } => {
+                assert_eq!(*code, app_error::SELF_REENTRANT_EXEC);
+                assert!(
+                    message.contains("OWNMESH_E_SELF_REENTRANT_EXEC"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a typed self-reentrancy refusal, got {other}"),
+        }
+        assert!(
+            runtime.op_journal.is_empty(),
+            "a pre-admission refusal must not consume an idempotency key"
+        );
+
+        // An unrelated command on the same runtime still works, which is the
+        // property the deadlock destroyed. Linux only: `fixture_executable`
+        // falls back to this test binary elsewhere, and this test binary is
+        // exactly what the guard is supposed to refuse.
+        #[cfg(target_os = "linux")]
+        {
+            let ok = runtime
+                .dispatch(
+                    methods::OPS_EXEC,
+                    Some(json!({
+                        "program": fixture_executable().display().to_string(),
+                        "args": [],
+                        "kind": "structured",
+                        "workspace_id": "ws_default",
+                    })),
+                    &client,
+                )
+                .await
+                .expect("an unrelated command must remain executable");
+            assert_eq!(ok.get("approval_required"), Some(&json!(false)));
+        }
     }
 
     #[test]
@@ -11848,6 +12774,154 @@ mod journal_lifecycle_tests {
         // Replay of an in-progress key stays refused.
         let err = runtime.lookup_idempotent(key.as_ref()).unwrap_err();
         assert!(err.to_string().contains("in-progress"), "{err}");
+    }
+
+    /// #142: a terminal execution failure must reconcile its reserved marker
+    /// into a compact failed receipt instead of stranding an eternal
+    /// in_progress key. A crash between reserve and terminal result keeps the
+    /// marker (exact-once commit point), which is what this test's starting
+    /// point models.
+    #[test]
+    fn terminal_failure_reconciles_in_progress_marker_into_failed_receipt() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+        let journal_key = Some("prin\u{1f}op_failed".to_string());
+        runtime
+            .begin_idempotent(journal_key.as_ref(), "op_failed_1")
+            .expect("begin marker");
+        assert!(runtime.op_journal_key_is_in_progress_for_test("op_failed"));
+
+        let reconciled = runtime.reconcile_failed_idempotent(
+            "op_failed",
+            "prin",
+            "op_failed_1",
+            app_error::INVALID_PARAMS,
+            "no such file",
+        );
+        assert!(reconciled, "own in-progress marker must reconcile");
+        assert!(
+            !runtime.op_journal_key_is_in_progress_for_test("op_failed"),
+            "marker no longer in progress after reconciliation"
+        );
+
+        // The durable file holds the compact failed receipt, not the marker.
+        let raw = std::fs::read_to_string(paths.state_dir.join("op-journal.json")).unwrap();
+        let durable: HashMap<String, Value> = serde_json::from_str(&raw).unwrap();
+        let receipt = durable.get(journal_key.as_deref().unwrap()).unwrap();
+        assert!(
+            receipt.get(OP_JOURNAL_STATE_FIELD).is_none(),
+            "compacted receipts classify via positive proof, not the marker field"
+        );
+        assert_eq!(
+            receipt.get("status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(receipt.get("durable_receipt"), Some(&Value::Bool(true)));
+        let error = receipt
+            .get("error")
+            .expect("bounded error object survives compaction");
+        assert_eq!(
+            error.get("code").and_then(Value::as_i64),
+            Some(app_error::INVALID_PARAMS)
+        );
+        assert_eq!(
+            error.get("message").and_then(Value::as_str),
+            Some("no such file")
+        );
+        assert_eq!(error.get("retryable"), Some(&Value::Bool(false)));
+
+        // Reconciling again (or after any other terminal outcome) is a no-op.
+        let again = runtime.reconcile_failed_idempotent(
+            "op_failed",
+            "prin",
+            "op_failed_1",
+            app_error::INTERNAL,
+            "second attempt",
+        );
+        assert!(!again, "completed receipts are never rewritten");
+    }
+
+    /// #142 safety envelope: reconciliation only touches this operation's own
+    /// in_progress marker — foreign operation ids, unknown keys, and
+    /// completed/uncertain entries stay untouched.
+    #[test]
+    fn failure_reconciliation_is_scoped_to_the_own_in_progress_marker() {
+        let dir = tempdir().unwrap();
+        let paths = OwnMeshPaths::for_base(dir.path());
+        let mut runtime = DaemonRuntime::open(&paths).unwrap();
+
+        // Unknown key: nothing to reconcile.
+        assert!(!runtime.reconcile_failed_idempotent(
+            "missing",
+            "prin",
+            "op_x",
+            app_error::INTERNAL,
+            "boom"
+        ));
+
+        // Marker reserved under a different operation id: never clobbered.
+        let key = Some("prin\u{1f}op_other".to_string());
+        runtime
+            .begin_idempotent(key.as_ref(), "op_reserved_by_a")
+            .expect("begin");
+        assert!(!runtime.reconcile_failed_idempotent(
+            "op_other",
+            "prin",
+            "op_reserved_by_b",
+            app_error::INTERNAL,
+            "boom"
+        ));
+        assert!(
+            runtime.op_journal_key_is_in_progress_for_test("op_other"),
+            "foreign operation id must not reconcile"
+        );
+
+        // Uncertain (unknown state) entries stay verbatim fail-closed.
+        runtime.op_journal.insert(
+            "prin\u{1f}op_uncertain".into(),
+            json!({
+                OP_JOURNAL_STATE_FIELD: "phase_two",
+                "operation_id": "op_uncertain_1",
+            }),
+        );
+        assert!(!runtime.reconcile_failed_idempotent(
+            "op_uncertain",
+            "prin",
+            "op_uncertain_1",
+            app_error::INTERNAL,
+            "boom"
+        ));
+        assert!(runtime.has_op_journal_key_for_test("prin\u{1f}op_uncertain"));
+        let entry = runtime
+            .op_journal
+            .get("prin\u{1f}op_uncertain")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            entry.get(OP_JOURNAL_STATE_FIELD).and_then(Value::as_str),
+            Some("phase_two")
+        );
+
+        // Completed receipts stay untouched (a replayed success is intact).
+        let completed = json!({
+            "durable_receipt": true,
+            "truncated": true,
+            "status": "completed",
+            "operation_id": "op_done",
+            OP_JOURNAL_COMPLETED_UNIX_FIELD: DaemonRuntime::now(),
+        });
+        runtime
+            .op_journal
+            .insert("prin\u{1f}op_done".into(), completed);
+        assert!(!runtime.reconcile_failed_idempotent(
+            "op_done",
+            "prin",
+            "op_done",
+            app_error::INTERNAL,
+            "boom"
+        ));
+        assert!(runtime.has_op_journal_key_for_test("prin\u{1f}op_done"));
     }
 
     /// P0-B: near capacity, only old completed receipts are evicted; a fresh

@@ -2,6 +2,208 @@
 
 ## Unreleased
 
+Mitigates the concrete failure modes reproduced from the 2026-08-25 production
+session (#158–#162) and the reopened Linux session regression (#31). These
+changes do not claim every issue acceptance criterion is complete: live
+ChatGPT/production canaries, the Cloudflare WAF configuration, transactional
+multi-session reattach, and the runtime-wide execution-lock redesign remain
+tracked in their original issues.
+
+### Device availability
+
+- A remote `command_run` of the OwnMesh CLI is refused before spawn with
+  `OWNMESH_E_SELF_REENTRANT_EXEC` instead of deadlocking the daemon. The daemon
+  holds one runtime mutex across a child's whole lifetime, so a child that
+  synchronously re-enters daemon IPC waited on the lock its own parent held —
+  and every later filesystem, Git, session, and diagnosis request for that
+  device queued behind it until the first operation was cancelled by hand.
+  Detection uses OS file identity, so the same installed file reached after a
+  rename, through a hard link, or through a symlink is recognized; `--version`
+  and `--help` stay executable because they exit during argument parsing,
+  before any IPC is opened. A byte-for-byte copied executable and invocation
+  through a shell or script remain outside this guard, so #160 stays open for
+  the runtime-wide lock redesign.
+- Linux session lifecycle treats an exited-but-unreaped child as exited. A
+  zombie keeps its PID slot and kernel start time, so the birth-witness probe
+  reported it as live: `close` answered "authenticated child is still alive,
+  refusing PID-only termination", the dead session stayed pinned as `running`,
+  and one such record made every later `session_open`, `replay`, and `close`
+  fail while naming that unrelated session. PID-reuse protection is unchanged —
+  the birth witness is still compared, it just no longer counts a zombie as
+  running (#31).
+- Reattach now isolates failures per session. A session the supervisor proves
+  has no live child reconciles to terminal; an indeterminate one is retained
+  fail-closed. Neither aborts the pass for unrelated sessions (#31).
+- `session_show` reconciles provably dead records during an ordinary read, so a
+  finished session stops being displayed as `running` (#31).
+
+### Authorization continuity
+
+- A routine OAuth refresh rotation no longer invalidates queued device
+  operations. Revocation and refresh-token reuse now advance a separate
+  `revocation_epoch`, and device operations bind to that epoch rather than to
+  every credential issuance. Access tokens live 15 minutes, so an operation
+  waiting through a reconnect, a Durable Object wake, or a temporary queue
+  blockage previously crossed a refresh boundary and was failed as a
+  non-retryable credential mismatch — indistinguishable from a real revocation
+  (#162).
+- Explicit revocation and refresh-family reuse still terminally invalidate every
+  operation authorized by the affected family, and an invalidated operation is
+  never rebound, redelivered, or retried in place.
+- The public error names a bounded reason (`explicit_revocation`,
+  `refresh_reuse`, `routine_refresh`, `unknown_generation_change`) without
+  exposing tokens, refresh families, or credential material. A credential
+  continuation returns `OWNMESH_E_AUTHORIZATION_REFRESHED` with
+  `retryable: true` and `next_action: resubmit` instead of a bare
+  `retryable: false` a caller cannot act on (#162).
+
+### Diagnosis and catalog compatibility
+
+- The `system.diagnose` payload contract is validated independently of the
+  device protocol version. A newer Agent's additive checks and fields no longer
+  invalidate a diagnosis: the scan window is a fixed bound rather than the size
+  of the Control Plane's own known-id set, which is what silently truncated the
+  required `sessions` check once the Agent began emitting `agent_route` ahead of
+  it, collapsing a valid diagnosis into `invalid_response` (#161).
+- The single `invalid_response` bucket is replaced by bounded reason codes
+  (`unsupported_contract_version`, `missing_agent_metadata`,
+  `missing_required_check`, `bad_check_shape`, `bad_status`,
+  `malformed_payload`), and a different contract major returns
+  `unsupported_diagnosis_version` with the version numbers and an
+  `upgrade_control_plane` recommendation instead of blaming the device. A known
+  check with an unknown state stays visible as `unsupported_value` and lifts
+  `overall` away from `healthy`. Missing security-relevant checks remain
+  fail-closed (#161).
+- MCP exposes a deterministic catalog revision — a SHA-256 over exactly the
+  bytes `tools/list` returns — on `GET /mcp`, `/health`, `initialize._meta`, and
+  every `tools/list` response, so a deployment's catalog and a client's snapshot
+  can be compared directly (#158).
+- The catalog revision is bound into the MCP session id. A request carrying a
+  session minted under a different revision is answered with HTTP 404, which
+  MCP defines as "session expired, re-`initialize`", so a long-lived connector
+  converges on the current catalog after a deployment instead of serving a stale
+  one. `listChanged` stays `false`: this Streamable HTTP deployment has no
+  server-initiated stream and must not claim a notification it cannot deliver
+  (#158).
+- `pnpm run deploy:guided` verifies that the origin now serving traffic
+  advertises the version being released, and refuses to report success
+  otherwise. A deploy that leaves an older Worker live is what left production
+  three release generations behind while clients kept an old catalog (#158).
+
+### Deployment
+
+- `scripts/probe_machine_endpoints.py` checks MCP discovery and the OAuth
+  metadata endpoints from two HTTP stacks under several User-Agents and reports
+  which layer answered, so a Cloudflare browser-signature rejection (HTTP 403 /
+  Error 1010) is never mistaken for a Worker fault. Such a rejection never
+  reaches the Worker, carries no `WWW-Authenticate` challenge, and removes the
+  whole tool catalog rather than failing one operation. `docs/deploy-cloudflare.md`
+  documents the scoped WAF skip rule that fixes it while keeping rate limiting,
+  payload bounds, and authentication in force (#159).
+
+## v1.2.22 — Service lifecycle, endpoint, and session honesty
+
+Closes the nine open issues from the 2026-08-24 audit (#147–#155). Every one
+is displayed state that was not the authoritative state; each is closed by
+making the check authoritative rather than by relaxing the claim.
+
+### Service lifecycle honesty
+
+- `service start` and `service stop` now cross the observable daemon IPC
+  boundary instead of treating an accepted service-manager request as a
+  completed transition; a request that never reaches (or leaves) the endpoint
+  returns `OWNMESH_E_SERVICE` with the manager's own installed/running facts
+  rather than `ok:true` with `running:null` (#154).
+- macOS `service stop` boots the LaunchAgent out of the user domain, so
+  `KeepAlive=true` can no longer relaunch the daemon behind a reported stop;
+  `start` re-enables and bootstraps the job idempotently, and `uninstall`
+  refuses to delete the plist until launchd confirms the job is unloaded
+  (#147).
+- Linux `service uninstall` reports every `systemctl --user` failure and keeps
+  the unit and install record in place until the manager confirms the unit is
+  inactive, so a failed stop can no longer be hidden by deleting the unit file.
+  An unreachable user bus is no longer mistaken for an absent unit (#149).
+- `service install` compares the descriptor actually registered with the OS —
+  systemd unit body, macOS plist, and the Windows task's structural identity
+  (action and trigger cardinality plus every rendered setting, since Task
+  Scheduler reformats imported XML) — against a versioned descriptor digest
+  persisted in `user-service.json`. A hand-edited, older-version, or unreadable
+  descriptor is repaired instead of reported as idempotent success. Descriptor
+  identity is independent of whether the service is currently loaded, so a
+  deliberate `service stop` survives a later install (#153).
+- Probe results that prove nothing are classified as unknown rather than as
+  absence: `systemctl is-active` is read by reported state rather than exit
+  status (it exits non-zero for every state but `active`), and only an
+  explicitly reported absence from `launchctl print` allows the descriptor to
+  be removed (#147/#149).
+- The Windows Scheduled Task binds the daemon to the config/state/runtime
+  directories validated at install time, via typed `ownmeshd run
+  --config-dir/--state-dir/--runtime-dir` arguments shared by the XML import
+  and the `/TR` fallback — no `cmd /c set … &&` wrapper. Typed arguments
+  outrank `OWNMESH_*` environment variables, so an autostarted daemon can no
+  longer split one installation into two state trees (#148).
+
+### Endpoints and sessions
+
+- Unix endpoints are validated against the platform `sockaddr_un` capacity
+  before bind: a long but valid runtime directory now resolves to a
+  deterministic short owner-only pathname (0700, custody-attested) that every
+  producer and consumer derives identically, and an explicitly configured
+  socket path that cannot be bound is rejected with the required reduction
+  instead of failing later inside `bind` (#155).
+- Windows named pipes are scoped by a SHA-256 digest of the normalized runtime
+  path rather than a truncated alphanumeric filter, so distinct profiles can no
+  longer collide onto one pipe; a failed connect names the upgrade/restart
+  remedy for a daemon still on the legacy pipe name (#151).
+- Structured-pipe sessions publish EOF and a real exit code: each reader marks
+  its stream terminal on every exit path, the child is reaped once, and
+  completion requires child exit plus both stream EOFs so a late stream cannot
+  be truncated. Supervisor status and daemon diagnosis now observe a completed
+  structured child instead of reporting it live until TTL. A forced termination
+  waits a bounded grace for the readers to publish EOF themselves and only
+  seals the streams when a descendant still holds the pipes — refusing further
+  appends so no output can follow the reported completion, and disclosing the
+  cutoff rather than implying a clean EOF. A termination that failed publishes
+  nothing (#152).
+
+### Installer
+
+- The Unix installer recognizes a running `ownmeshd` whose executable was
+  replaced, which Linux reports as `/proc/<pid>/exe` → `<path> (deleted)`. The
+  suffix is stripped only after the remaining pathname matches the normalized
+  install-dir daemon, so upgrades restart and version-check the stale daemon
+  instead of silently leaving it running; matching is never by process name
+  (#150).
+
+See `docs/RELEASE_NOTES_v1.2.22.md` for details.
+
+## v1.2.21 — Transport availability, journal honesty, and Linux disclosure
+
+- Agent and transfer WebSocket connects are bounded (15 s) with RFC 8305-style
+  family interleaving and IPv4 fallback; a blackholed AAAA can no longer park a
+  reconnect forever (#140). `connect_timeout` is a typed reconnect category.
+- Terminal operation failures reconcile their reserved op-journal marker into
+  a compact failed receipt, so retries replay the stored failure instead of
+  being refused forever as in_progress keys; crash residue keeps exact-once
+  semantics per ADR 0010 (#142).
+- Doctor and system.diagnose expose live Agent-route presence via the new
+  credentialed `daemon.route_status` IPC method (`daemon.agent_route` check,
+  additive `agent_route` diagnosis id and `agent_route_offline` overall);
+  doctor no longer passes while ChatGPT sees the device offline (#141).
+- Incremental workspace registry refresh: ready agents publish the full
+  registry on device-local changes over one new authenticated message
+  (`workspace.registry` / ack, ADR 0014), so workspace activation no longer
+  waits for a reconnect (#146). Shared JSON schema added and validated in both
+  languages.
+- Linux disclosures without loosening defaults: spawn-resolution failures list
+  the searched directories (service PATH plus user-local extras, home
+  collapsed); EPERM spawn errors and the hardening pass row name
+  RestrictNamespaces=yes and its operator drop-in (#144/#145); doctor warns
+  when Linger=no so logout-killed agents are diagnosable, and TUI/docs state
+  the session-lifetime caveat (#143).
+
+See `docs/RELEASE_NOTES_v1.2.21.md` for details.
+
 ## v1.2.20 — TUI terminal-contract reliability
 
 - Ctrl+C is a universal emergency exit from every screen, overlay, wizard

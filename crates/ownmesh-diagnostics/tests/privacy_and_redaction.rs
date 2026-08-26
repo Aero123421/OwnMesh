@@ -22,9 +22,9 @@ use ownmesh_diagnostics::{
     prepare_support_bundle, redact_text, run_doctor, write_prepared_support_bundle,
     BinaryObservation, CheckStatus, ConfigObservation, ControlPlaneObservation,
     CredentialObservation, CredentialState, CredentialStoreObservation, DaemonObservation,
-    DoctorInput, JournalsObservation, PrivacyPolicyObservation, PublicDiagnosticEvent,
-    PublicJournalHealth, PublicPlatformFacts, PublicServiceFacts, ServiceObservation,
-    SupportBundleError, SupportBundleInput,
+    DoctorInput, DoctorOutcome, JournalsObservation, PrivacyPolicyObservation,
+    PublicDiagnosticEvent, PublicJournalHealth, PublicPlatformFacts, PublicServiceFacts,
+    ServiceObservation, SupportBundleError, SupportBundleInput,
 };
 use sha2::{Digest, Sha256};
 
@@ -80,6 +80,7 @@ fn base_input() -> DoctorInput {
             reachable: true,
             pid: Some(1),
             message: None,
+            agent_route: Some("online".into()),
         },
         control_plane: ControlPlaneObservation {
             configured: true,
@@ -110,6 +111,9 @@ fn base_input() -> DoctorInput {
             unit_path: None,
             message: None,
             hardening: None,
+            // Non-Linux/undetectable in the base fixture; linger-specific
+            // rows are covered by dedicated tests below.
+            linger: None,
         },
         journals: JournalsObservation::default(),
         profile_discovery: ownmesh_diagnostics::ProfileDiscoveryObservation::default(),
@@ -132,6 +136,102 @@ fn doctor_passes_when_telemetry_and_relay_off() {
         .find(|c| c.id == "privacy.relay")
         .unwrap();
     assert_eq!(rel.status, CheckStatus::Pass);
+}
+
+/// #141: an offline Agent route while the daemon is reachable must fail the
+/// report — a green /health or local IPC must not hide an offline ChatGPT
+/// device.
+#[test]
+fn offline_agent_route_fails_the_report_while_daemon_is_up() {
+    let mut input = base_input();
+    input.daemon.agent_route = Some("offline".into());
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "daemon.agent_route")
+        .expect("offline route must be disclosed");
+    assert_eq!(check.status, CheckStatus::Fail);
+    assert!(!report.ok && report.outcome == DoctorOutcome::Error);
+}
+
+#[test]
+fn online_agent_route_passes_and_absent_route_is_omitted() {
+    let online = run_doctor(&base_input());
+    let check = online
+        .checks
+        .iter()
+        .find(|check| check.id == "daemon.agent_route")
+        .expect("online route row present");
+    assert_eq!(check.status, CheckStatus::Pass);
+
+    // Older daemon (method unsupported): the row is omitted, not guessed.
+    let mut absent = base_input();
+    absent.daemon.agent_route = None;
+    let report = run_doctor(&absent);
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|check| check.id == "daemon.agent_route"),
+        "unknown route must not fabricate a check"
+    );
+}
+
+/// #143: Linger=no on an otherwise ready device is a warn that names the
+/// operator command; OwnMesh never enables lingering itself.
+#[test]
+fn linux_linger_off_warns_without_enabling_anything() {
+    let mut input = base_input();
+    input.service.linger = Some(false);
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.linger")
+        .expect("linger=no must be disclosed");
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(check.message.contains("loginctl enable-linger"));
+    // The warn lifts the outcome to Warn (still exit-ok, never healthy).
+    assert!(report.outcome == DoctorOutcome::Warn);
+
+    let mut lingering = base_input();
+    lingering.service.linger = Some(true);
+    let report = run_doctor(&lingering);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.linger")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass);
+}
+
+/// #144: a fully-baselined hardening unit still discloses that
+/// RestrictNamespaces=yes blocks containers/sandbox tools.
+#[test]
+fn baseline_hardening_pass_discloses_namespace_restriction() {
+    let mut input = base_input();
+    let hardening = ownmesh_diagnostics::ServiceHardeningObservation {
+        no_new_privileges: true,
+        umask_set: true,
+        restrict_suidsgid: true,
+        restrict_realtime: true,
+        lock_personality: true,
+        system_call_architectures: true,
+        restrict_namespaces: true,
+        protect_proc: true,
+        ..Default::default()
+    };
+    input.service.hardening = Some(hardening);
+    let report = run_doctor(&input);
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.id == "service.hardening")
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass);
+    assert!(check.message.contains("RestrictNamespaces=yes"));
+    assert!(check.message.contains("RestrictNamespaces=no"));
 }
 
 #[test]

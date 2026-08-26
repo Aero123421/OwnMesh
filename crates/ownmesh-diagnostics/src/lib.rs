@@ -269,6 +269,10 @@ pub struct DaemonObservation {
     /// Observed only from a successful local IPC `daemon.status` response.
     pub pid: Option<u32>,
     pub message: Option<String>,
+    /// Live Agent-route presence from `daemon.route_status` (#141):
+    /// `online` / `offline` / `disabled` / `unknown`. `None` when the daemon
+    /// is unreachable or the method is unsupported (older daemon).
+    pub agent_route: Option<String>,
 }
 
 /// Control-plane observation (URL may be shown; no tokens).
@@ -349,6 +353,11 @@ pub struct ServiceObservation {
     pub message: Option<String>,
     /// Effective service hardening disclosure (Linux systemd --user units).
     pub hardening: Option<ServiceHardeningObservation>,
+    /// Linux only: `loginctl show-user` linger state (#143). `Some(false)`
+    /// means the user manager (and this service) stops at GUI logout, so the
+    /// ChatGPT route lasts only as long as the desktop session. `None` when
+    /// not Linux or undetectable — never a keychain read.
+    pub linger: Option<bool>,
 }
 
 /// Effective hardening of an installed systemd --user unit as observed
@@ -695,6 +704,32 @@ pub fn run_doctor(input: &DoctorInput) -> DoctorReport {
         );
     }
 
+    // Live Agent route (#141): what the daemon's transport observes right now.
+    // A green /health or local IPC must not hide an offline ChatGPT route.
+    // `None` (daemon unreachable, or an older daemon without the method) omits
+    // the row instead of guessing; `unknown` is an honest pass with a note.
+    match input.daemon.agent_route.as_deref() {
+        Some("online") => checks.push(DoctorCheck::pass(
+            "daemon.agent_route",
+            "Agent WebSocket route to the control plane is connected",
+        )),
+        Some("offline") => checks.push(DoctorCheck::fail(
+            "daemon.agent_route",
+            "the daemon is running but its Agent WebSocket route to the control plane is \
+             not connected; MCP clients such as ChatGPT will report this device offline. \
+             Check connectivity (including IPv6 blackhole/hung reconnect), then inspect \
+             `ownmeshd` logs for reconnect activity",
+        )),
+        Some("disabled") => checks.push(DoctorCheck::pass(
+            "daemon.agent_route",
+            "remote Agent routing is disabled (no enrolled device credential); this \
+             device intentionally has no ChatGPT route",
+        )),
+        // `unknown` or an older daemon without the method: omit rather than
+        // guess.
+        _ => {}
+    }
+
     // Control plane
     if !input.control_plane.configured {
         checks.push(DoctorCheck::warn(
@@ -971,11 +1006,39 @@ ProtectProc=invisible); re-run `ownmesh service install` to restore the supporte
                 "effective unit hardening makes parts of the user/workspace hierarchy read-only; this can conflict with registered workspaces",
             ));
         } else {
+            // #144: a fully-baselined unit still ships RestrictNamespaces=yes,
+            // which blocks containers/sandbox tools/unshare. Keep the pass but
+            // disclose the availability impact and the operator drop-in.
+            let namespace_note = if h.restrict_namespaces {
+                " Programs that create Linux namespaces (containers, sandbox tools, \
+                 unshare) are blocked by RestrictNamespaces=yes; a local drop-in setting \
+                 `RestrictNamespaces=no` allows them for this device"
+            } else {
+                ""
+            };
             checks.push(DoctorCheck::pass(
                 "service.hardening",
-                "effective unit hardening baseline applied",
+                format!("effective unit hardening baseline applied.{namespace_note}"),
             ));
         }
+    }
+
+    // #143: Linux user services live only as long as the OS login session
+    // unless the operator enables lingering. OwnMesh never enables it
+    // silently — doctor discloses instead.
+    match input.service.linger {
+        Some(false) => checks.push(DoctorCheck::warn(
+            "service.linger",
+            "lingering is disabled (Linger=no): on this Linux desktop the user service — \
+             and with it the ChatGPT route — stops at GUI logout and starts only after you \
+             log in again. For an always-on device, enable it yourself once with \
+             `loginctl enable-linger $USER` (OwnMesh never enables it automatically)",
+        )),
+        Some(true) => checks.push(DoctorCheck::pass(
+            "service.linger",
+            "user manager lingers (Linger=yes): the service survives logout and starts at boot",
+        )),
+        None => {}
     }
 
     // Durable journals (P0-A/P0-B): a pending/expired transition record or

@@ -36,6 +36,7 @@ import {
   readRequestJsonLimited,
   requireScope,
   sha256Hex,
+  stableStringify,
 } from "./util.ts";
 import { SERVICE_NAME, SERVICE_VERSION } from "./util.ts";
 import {
@@ -1729,6 +1730,65 @@ export const PUBLISHED_MCP_TOOLS: readonly McpToolDef[] = MCP_TOOLS.filter(
   (tool) => !tool.aliasOf && !tool.hidden,
 );
 
+/**
+ * Deterministic revision of the published tool catalog (#158).
+ *
+ * `serverInfo.version` tracks the release train, so it cannot answer "is the
+ * catalog my client loaded still the catalog this Worker publishes?" — a
+ * deployment can change a tool's `inputSchema` without a version bump, and a
+ * stale Worker can advertise an old version while a client holds an even older
+ * snapshot. This digest covers exactly the bytes `tools/list` returns, so a
+ * production snapshot and a client snapshot can be compared directly.
+ *
+ * Ordering is deliberately included: `tools/list` returns the array in
+ * declaration order, and a reordering is a different response even though the
+ * set is the same.
+ */
+export function mcpCatalogFingerprint(): string {
+  return stableStringify(
+    PUBLISHED_MCP_TOOLS.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      annotations: tool.annotations ?? null,
+    })),
+  );
+}
+
+let cachedCatalogRevision: string | null = null;
+
+/**
+ * Short, stable catalog revision: the first 16 hex characters of the SHA-256
+ * over {@link mcpCatalogFingerprint}. Bounded so it can be embedded in a
+ * session id and compared by an operator without exposing anything secret —
+ * the catalog itself is already public through anonymous `tools/list`.
+ */
+export async function mcpCatalogRevision(): Promise<string> {
+  if (cachedCatalogRevision) return cachedCatalogRevision;
+  cachedCatalogRevision = (await sha256Hex(mcpCatalogFingerprint())).slice(0, 16);
+  return cachedCatalogRevision;
+}
+
+/** Session-id prefix that carries the catalog revision it was minted under. */
+const MCP_SESSION_PREFIX = "mcp";
+
+function mcpSessionId(revision: string): string {
+  return `${MCP_SESSION_PREFIX}_${revision}_${randomId("s")}`;
+}
+
+/**
+ * Catalog revision embedded in a client-presented `mcp-session-id`.
+ *
+ * Returns `null` for any id this Worker did not mint in the current format —
+ * an unrecognized session id is never treated as a stale catalog, so a client
+ * that invents its own id is not locked out.
+ */
+export function mcpSessionCatalogRevision(sessionId: string | null): string | null {
+  if (!sessionId) return null;
+  const match = /^mcp_([0-9a-f]{16})_/.exec(sessionId);
+  return match ? match[1] : null;
+}
+
 const ADMIN_MCP_TOOL_NAMES = new Set([
   "ownmesh_policy_preset",
   "ownmesh_policy_rule_add",
@@ -1910,6 +1970,10 @@ export type PublicOwnMeshError = {
   details?: {
     error?: string;
     status?: string;
+    /** Bounded authorization-invalidation cause (#162). */
+    reason?: string;
+    /** Bounded recovery hint that accompanies a recoverable `reason`. */
+    next_action?: string;
     http_status?: number;
     timeout_ms?: number;
     retry_after_ms?: number;
@@ -1966,12 +2030,67 @@ export type TrackedOperation = OwnMeshResultEnvelope & {
 };
 
 const SYSTEM_DIAGNOSIS_SCHEMA = "ownmesh.system_diagnosis/1.0" as const;
+/**
+ * #161: the diagnosis payload carries its own contract version, validated
+ * independently of the broad `ownmesh.device/1.x` protocol handshake.
+ *
+ * A same-major payload is forward-compatible: a newer Agent may add checks,
+ * states, and fields that this parser does not know, and the known,
+ * security-relevant checks still have to validate. A different major is an
+ * explicit, bounded `unsupported_diagnosis_version` result — never "the device
+ * sent garbage".
+ */
+const SYSTEM_DIAGNOSIS_CONTRACT_NAME = "ownmesh.system_diagnosis" as const;
+const SYSTEM_DIAGNOSIS_SUPPORTED_MAJOR = 1;
+/**
+ * Highest minor this parser understands; a higher minor is still accepted.
+ *
+ * Held at the minor the Agent actually emits. The Agent is pinned to `1.0`
+ * (raising it would be rejected outright by any Worker <= 1.2.22, which
+ * compares the schema string for exact equality), and this number is only ever
+ * shown to an operator who is already staring at a version-skew failure —
+ * advertising support for a `1.1` that does not exist would be a false lead at
+ * exactly the wrong moment.
+ */
+const SYSTEM_DIAGNOSIS_SUPPORTED_MINOR = 0;
+/**
+ * Bounded scan window for device-reported checks.
+ *
+ * This deliberately does NOT derive from the size of the known-id set: a
+ * newer Agent that emits an additive check *before* a required one would
+ * otherwise truncate the required check away and collapse an entirely valid
+ * diagnosis into `invalid_response` (the exact 1.2.19-Worker / 1.2.21-Agent
+ * failure in #161, where `agent_route` shifted `sessions` past the window).
+ */
+const SYSTEM_DIAGNOSIS_MAX_RAW_CHECKS = 64;
+/**
+ * Bounded, non-secret reasons a device diagnosis could not be interpreted.
+ * These replace the single `invalid_response` bucket so an operator can tell
+ * "upgrade the Worker" from "restart the Agent" from "a real device fault".
+ */
+type SystemDiagnosisRejection =
+  | "malformed_payload"
+  | "unsupported_contract_version"
+  | "missing_agent_metadata"
+  | "missing_required_check"
+  | "bad_check_shape"
+  | "bad_status";
 const SYSTEM_DIAGNOSIS_CHECK_IDS = new Set([
   "policy",
   "workspace",
   "daemon",
   "session_supervisor",
   "sessions",
+]);
+// #141 additive: device-observed live Agent-route presence. Older Agents omit
+// this check entirely; their diagnoses stay valid because every required id
+// above must be present and unknown ids are dropped either way. The Control
+// Plane additionally synthesizes its own authoritative `route` check from
+// DeviceRoom presence.
+const SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS = new Set(["agent_route"]);
+const SYSTEM_DIAGNOSIS_ALL_CHECK_IDS = new Set([
+  ...SYSTEM_DIAGNOSIS_CHECK_IDS,
+  ...SYSTEM_DIAGNOSIS_OPTIONAL_CHECK_IDS,
 ]);
 const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
   string,
@@ -1999,6 +2118,12 @@ const SYSTEM_DIAGNOSIS_CHECK_CONTRACT: Record<
   sessions: {
     healthy: { status: "pass", provenance: "authoritative" },
     stale: { status: "warn", provenance: "authoritative" },
+  },
+  agent_route: {
+    online: { status: "pass", provenance: "observed" },
+    disabled: { status: "pass", provenance: "observed" },
+    unknown: { status: "pass", provenance: "observed" },
+    offline: { status: "fail", provenance: "observed" },
   },
 };
 
@@ -2152,6 +2277,23 @@ function diagnosisCheck(
 }
 
 /**
+ * Parse the device-declared diagnosis contract version (#161).
+ *
+ * Returns `null` when the value is absent or is not
+ * `ownmesh.system_diagnosis/<major>.<minor>` — that is a malformed payload,
+ * not a version the Control Plane merely happens not to support.
+ */
+function parseDiagnosisContract(value: unknown): { major: number; minor: number } | null {
+  const text = diagnosisText(value, 64);
+  if (!text) return null;
+  const match = /^([a-z0-9_.]+)\/(\d{1,4})\.(\d{1,4})$/.exec(text);
+  if (!match || match[1] !== SYSTEM_DIAGNOSIS_CONTRACT_NAME) return null;
+  const major = Number(match[2]);
+  const minor = Number(match[3]);
+  return Number.isSafeInteger(major) && Number.isSafeInteger(minor) ? { major, minor } : null;
+}
+
+/**
  * Keep the remote diagnosis result a small allowlisted contract. An
  * authenticated-but-buggy Agent must not turn this tool into a log/path/env
  * exfiltration surface by adding fields to its result.
@@ -2202,21 +2344,50 @@ export function normalizeSystemDiagnosis(
     : null;
   const agentVersion = diagnosisAgentVersion(sourceAgent?.version);
   const protocolVersion = diagnosisProtocolVersion(sourceAgent?.protocol_version);
+  const contractVersion = parseDiagnosisContract(source?.schema);
   const rawChecks = Array.isArray(source?.checks) ? source.checks : [];
   const checks: Record<string, unknown>[] = [];
   const seen = new Set<string>();
-  for (const candidate of rawChecks.slice(0, SYSTEM_DIAGNOSIS_CHECK_IDS.size)) {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+  // Bounded evidence about *why* a known check was refused, so the public
+  // failure reason can name it without echoing device payloads (#161).
+  let sawBadCheckShape = false;
+  let sawBadStatus = false;
+  // A known check id carrying a state this parser does not know stays visible
+  // as `unsupported_value` instead of discarding the whole diagnosis. The
+  // status is the Control Plane's own conservative `warn`, never the device's
+  // claim, and `overall` is lifted away from `healthy` below.
+  let sawUnsupportedValue = false;
+  for (const candidate of rawChecks.slice(0, SYSTEM_DIAGNOSIS_MAX_RAW_CHECKS)) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      sawBadCheckShape = true;
+      continue;
+    }
     const check = candidate as Record<string, unknown>;
     const id = diagnosisText(check.id);
     const state = diagnosisText(check.state);
     const at = diagnosisTimestamp(check.observed_at);
-    const contract = id && state ? SYSTEM_DIAGNOSIS_CHECK_CONTRACT[id]?.[state] : undefined;
-    if (
-      !id || !SYSTEM_DIAGNOSIS_CHECK_IDS.has(id) || seen.has(id) ||
-      !state || !at || !contract ||
-      check.status !== contract.status || check.provenance !== contract.provenance
-    ) continue;
+    // Unknown ids are additive surface from a newer Agent: drop them silently
+    // (they never enter the allowlisted result) without blaming the payload.
+    if (!id || !SYSTEM_DIAGNOSIS_ALL_CHECK_IDS.has(id) || seen.has(id)) continue;
+    if (!state || !at) {
+      sawBadCheckShape = true;
+      continue;
+    }
+    const contract = SYSTEM_DIAGNOSIS_CHECK_CONTRACT[id]?.[state];
+    if (!contract) {
+      // Forward-compatible: a known check with a newer state value keeps the
+      // required id present and bounded rather than invalidating everything.
+      sawUnsupportedValue = true;
+      checks.push(diagnosisCheck(id, "warn", "unsupported_value", "observed", at));
+      seen.add(id);
+      continue;
+    }
+    if (check.status !== contract.status || check.provenance !== contract.provenance) {
+      // A known (id, state) pair whose status/provenance contradicts the
+      // contract is a device-side contract violation, not additive surface.
+      sawBadStatus = true;
+      continue;
+    }
     const counts: { count?: number; nonterminal_count?: number; stale_count?: number } = {};
     for (const key of ["count", "nonterminal_count", "stale_count"] as const) {
       const value = check[key];
@@ -2235,14 +2406,41 @@ export function normalizeSystemDiagnosis(
     seen.add(id);
   }
 
-  if (
-    source?.schema !== SYSTEM_DIAGNOSIS_SCHEMA || !sourceObservedAt ||
-    !agentVersion || !protocolVersion ||
-    seen.size !== SYSTEM_DIAGNOSIS_CHECK_IDS.size
-  ) {
+  const missingRequiredCheck = ![...SYSTEM_DIAGNOSIS_CHECK_IDS].every((id) => seen.has(id));
+  // Ordered so the most actionable cause wins: an unsupported contract tells
+  // the operator to upgrade the Worker, and must not be reported as a
+  // malformed device response just because this parser then found no checks.
+  const rejection: SystemDiagnosisRejection | null = !source || !contractVersion
+    ? "malformed_payload"
+    : contractVersion.major !== SYSTEM_DIAGNOSIS_SUPPORTED_MAJOR
+      ? "unsupported_contract_version"
+      : !sourceObservedAt
+        ? "malformed_payload"
+        : !agentVersion || !protocolVersion
+          ? "missing_agent_metadata"
+          : missingRequiredCheck
+            ? (sawBadStatus ? "bad_status" : sawBadCheckShape ? "bad_check_shape" : "missing_required_check")
+            : null;
+
+  if (rejection) {
+    const unsupportedContract = rejection === "unsupported_contract_version";
+    const deviceDiagnosis = diagnosisCheck(
+      "device_diagnosis",
+      "fail",
+      rejection,
+      "observed",
+      observedAt,
+    );
+    if (unsupportedContract && contractVersion) {
+      // Only version numbers cross this boundary — never the payload, a raw
+      // parser message, or any device-supplied text.
+      deviceDiagnosis.supported_contract = `${SYSTEM_DIAGNOSIS_CONTRACT_NAME}/${SYSTEM_DIAGNOSIS_SUPPORTED_MAJOR}.${SYSTEM_DIAGNOSIS_SUPPORTED_MINOR}`;
+      deviceDiagnosis.received_contract_major = contractVersion.major;
+      deviceDiagnosis.received_contract_minor = contractVersion.minor;
+    }
     return {
       schema: SYSTEM_DIAGNOSIS_SCHEMA,
-      overall: "diagnosis_unavailable",
+      overall: unsupportedContract ? "unsupported_diagnosis_version" : "diagnosis_unavailable",
       observed_at: observedAt,
       agent: {
         version: diagnosisAgentVersion(device.agent_version) || "unknown",
@@ -2250,12 +2448,11 @@ export function normalizeSystemDiagnosis(
         provenance: "cached",
         observed_at: diagnosisTimestamp(device.last_seen_at) || diagnosisTimestamp(device.created_at) || observedAt,
       },
-      checks: [
-        enrollment,
-        routeCheck,
-        diagnosisCheck("device_diagnosis", "fail", "invalid_response", "observed", observedAt),
-      ],
-      recommendation: "run_local_doctor",
+      checks: [enrollment, routeCheck, deviceDiagnosis],
+      // #160: recommending a remote `ownmesh doctor` is not always safe, and a
+      // version skew is a deployment fix, not a device fix.
+      recommendation: unsupportedContract ? "upgrade_control_plane" : "run_local_doctor",
+      diagnosis_rejection: rejection,
     };
   }
 
@@ -2319,14 +2516,22 @@ export function normalizeSystemDiagnosis(
                 ? "stale_sessions"
                 : stateFor("workspace") === "unbound_enforced"
                   ? "workspace_selection_required"
-                  : "healthy";
+                  : stateFor("agent_route") === "offline"
+                    ? "agent_route_offline"
+                    // #161: a known check whose state this parser does not
+                    // understand is honest uncertainty, never `healthy`.
+                    : sawUnsupportedValue
+                      ? "agent_contract_drift"
+                      : "healthy";
   const recommendation = overall === "lockdown"
     ? "unlock_locally"
     : overall === "supervisor_unavailable"
       ? "restart_session_supervisor"
       : overall === "journal_degraded"
         ? "repair_op_journal_locally"
-        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues"
+        : overall === "agent_contract_drift"
+        ? "upgrade_control_plane"
+        : overall === "transition_journal_issues" || overall === "op_journal_pressure" || overall === "op_journal_uncertain" || overall === "profile_discovery_issues" || overall === "agent_route_offline"
         ? "run_local_doctor"
         : overall === "stale_sessions"
           ? "reconcile_stale_sessions"
@@ -2917,15 +3122,37 @@ async function resolveMcpAccess(
   if (!rec) return mcpUnauthorized(id, issuer, "invalid_token");
   const principal = await store.getPrincipal(rec.principal);
   const principalCredentialGeneration = Number(principal?.credential_generation);
+  const principalRevocationEpoch = principalRevocationEpochOf(principal ?? {});
   if (
     !principal ||
     principal.tenant_id !== rec.tenant_id ||
     !Number.isSafeInteger(principalCredentialGeneration) ||
-    principalCredentialGeneration < 1
+    principalCredentialGeneration < 1 ||
+    principalRevocationEpoch === null
   ) {
     return mcpUnauthorized(id, issuer, "invalid_token");
   }
   return { rec, principal };
+}
+
+/**
+ * Revocation epoch of a principal record, defaulting to `1` only when the
+ * field is absent on a pre-migration record (#162).
+ *
+ * A record written before migration 0018 has no stored epoch. `1` is the
+ * schema default and the value every principal starts at, so a pre-migration
+ * record behaves exactly like one that has never been revoked — it never
+ * silently *grants* authority, because a later revocation still advances the
+ * stored value past it.
+ */
+export function principalRevocationEpochOf(principal: {
+  revocation_epoch?: unknown;
+}): number | null {
+  const epoch = principal.revocation_epoch;
+  if (epoch === undefined) return 1;
+  return typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch >= 1
+    ? epoch
+    : null;
 }
 
 function workspaceUnavailableMcpError(
@@ -3020,30 +3247,176 @@ export function readDispatchOutbox(data: Record<string, unknown> | null | undefi
 }
 
 /**
+ * Principal authority carried by an immutable bound action.
+ *
+ * `revocation_epoch` is absent on actions bound before the #162 split; those
+ * keep the original strict `credential_generation` comparison, so an older
+ * binding is never treated as more durable than the code that produced it.
+ */
+export type BoundPrincipalAuthority = {
+  principal_id: string;
+  tenant_id: string;
+  generation: number;
+  revocation_epoch: number | null;
+};
+
+/**
+ * Read the principal authority out of `payload.authorization.bound_action`.
+ *
+ * Returns `null` for anything missing or malformed — including a
+ * present-but-invalid revocation epoch, which is a corrupt binding rather
+ * than a legacy one.
+ */
+export function boundPrincipalAuthority(
+  payload: Record<string, unknown>,
+): BoundPrincipalAuthority | null {
+  const authorization = payload.authorization;
+  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return null;
+  const bound = (authorization as Record<string, unknown>).bound_action;
+  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return null;
+  const action = bound as Record<string, unknown>;
+  const principalId = action.principal_id;
+  const tenantId = action.tenant_id;
+  const generation = action.principal_credential_generation;
+  const epoch = action.principal_revocation_epoch;
+  if (
+    typeof principalId !== "string" || principalId.trim() === "" ||
+    typeof tenantId !== "string" || tenantId.trim() === "" ||
+    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
+  ) return null;
+  if (epoch !== undefined && (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 1)) {
+    return null;
+  }
+  return {
+    principal_id: principalId,
+    tenant_id: tenantId,
+    generation,
+    revocation_epoch: epoch === undefined ? null : epoch,
+  };
+}
+
+/**
+ * The single decision for "is this bound action's authority still
+ * authoritative?" (#162).
+ *
+ * Deliberately one exported function rather than a copy per gate. This
+ * boundary is evaluated at three separate points — Worker-side redelivery,
+ * the pre-route check, and DeviceRoom's final dispatch check — and two of
+ * them previously disagreed: DeviceRoom compared the revocation epoch while
+ * the Worker-side gates still compared every credential issuance, so a
+ * routine refresh still terminated a queued operation through the retry path.
+ *
+ * Authority is removed by revocation and refresh-family reuse, never by
+ * reissuing a token.
+ */
+export function boundPrincipalAuthorityCurrent(
+  binding: BoundPrincipalAuthority,
+  principal: { tenant_id: string; credential_generation: number; revocation_epoch?: unknown } | null,
+): boolean {
+  if (!principal || principal.tenant_id !== binding.tenant_id) return false;
+  // A corrupt *stored* epoch means the principal's revocation state is
+  // unknown, which is refused whatever shape the binding has. The legacy
+  // branch below exists for an absent epoch on the *binding*; it must not
+  // double as an excuse to ignore a stored value we cannot read. Without this
+  // the generation comparison would still pass for a pre-0018 binding, which
+  // is the same fail-open the entry-point guards close for fresh requests.
+  const current = principalRevocationEpochOf(principal);
+  if (current === null) return false;
+  if (binding.revocation_epoch !== null) {
+    return current === binding.revocation_epoch;
+  }
+  return principal.credential_generation === binding.generation;
+}
+
+/** Bounded, non-secret cause of a delivery-time authorization invalidation. */
+export type PrincipalAuthorityInvalidationReason =
+  | "explicit_revocation"
+  | "refresh_reuse"
+  | "routine_refresh"
+  | "unknown_generation_change";
+
+/**
+ * Why a bound action's authority is no longer current (#162).
+ *
+ * Never exposes tokens, refresh families, or credential material — only which
+ * class of event removed the authority. `routine_refresh` can only be reported
+ * for a legacy binding that carries no revocation epoch; current bindings are
+ * not invalidated by a rotation at all, which is the point of the split.
+ */
+export async function boundAuthorityInvalidationReason(
+  store: ControlPlaneStore,
+  payload: Record<string, unknown>,
+): Promise<PrincipalAuthorityInvalidationReason> {
+  const binding = boundPrincipalAuthority(payload);
+  if (!binding) return "unknown_generation_change";
+  try {
+    const current = await store.getPrincipal(binding.principal_id);
+    if (!current) return "unknown_generation_change";
+    const reason = current.revocation_reason;
+    if (reason === "explicit_revocation" || reason === "refresh_reuse") return reason;
+    // No revocation has ever been recorded for this principal, so whatever
+    // moved the issuance generation was a normal credential rotation.
+    return binding.revocation_epoch === null ? "routine_refresh" : "unknown_generation_change";
+  } catch {
+    return "unknown_generation_change";
+  }
+}
+
+/**
+ * The public error body for an invalidated authority, shared by every gate.
+ *
+ * A routine credential continuation is recoverable, a withdrawal of authority
+ * is not. The old operation is terminal either way — it is never rebound,
+ * retried, or dispatched under new credentials — but a caller told
+ * `retryable:false` for a healthy refresh has no way back, even though a
+ * freshly authorized request would succeed immediately.
+ */
+export function authorityInvalidationError(
+  reason: PrincipalAuthorityInvalidationReason,
+  boundary: "delivery" | "redelivery",
+): Record<string, unknown> {
+  const recoverable = reason === "routine_refresh";
+  return {
+    code: recoverable
+      ? "OWNMESH_E_AUTHORIZATION_REFRESHED"
+      : "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
+    message: recoverable
+      ? `principal credentials were refreshed before device ${boundary}; this operation was never delivered and can be resubmitted`
+      : `principal credential authority was revoked before device ${boundary}`,
+    retryable: recoverable,
+    // Under `details` so the bounded reason survives `compactPublicError`'s
+    // allowlist and is actually visible to the caller, not durable-record-only.
+    details: {
+      reason,
+      ...(recoverable ? { next_action: "resubmit" } : {}),
+    },
+  };
+}
+
+/** Summary line matching {@link authorityInvalidationError}. */
+export function authorityInvalidationSummary(
+  reason: PrincipalAuthorityInvalidationReason,
+  boundary: "delivery" | "redelivery",
+): string {
+  return reason === "routine_refresh"
+    ? `operation authorization was refreshed before device ${boundary}`
+    : `operation authorization invalidated before device ${boundary}`;
+}
+
+/**
  * Outbox payloads are immutable but can wait across a credential rotation.
- * Re-read the server-owned principal epoch immediately before a Worker-side
- * delivery attempt; DeviceRoom repeats this check immediately before socket
- * delivery. Missing or malformed authority is never considered current.
+ * Re-read the server-owned principal authority immediately before a
+ * Worker-side delivery attempt; DeviceRoom repeats this check immediately
+ * before socket delivery. Missing or malformed authority is never considered
+ * current.
  */
 async function boundCredentialGenerationCurrent(
   store: ControlPlaneStore,
   operation: { payload: Record<string, unknown> },
 ): Promise<boolean> {
-  const authorization = operation.payload.authorization;
-  if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) return false;
-  const bound = (authorization as Record<string, unknown>).bound_action;
-  if (!bound || typeof bound !== "object" || Array.isArray(bound)) return false;
-  const action = bound as Record<string, unknown>;
-  const principalId = action.principal_id;
-  const tenantId = action.tenant_id;
-  const generation = action.principal_credential_generation;
-  if (
-    typeof principalId !== "string" || principalId.trim() === "" ||
-    typeof tenantId !== "string" || tenantId.trim() === "" ||
-    typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1
-  ) return false;
-  const principal = await store.getPrincipal(principalId);
-  return principal?.tenant_id === tenantId && principal.credential_generation === generation;
+  const binding = boundPrincipalAuthority(operation.payload);
+  if (!binding) return false;
+  return boundPrincipalAuthorityCurrent(binding, await store.getPrincipal(binding.principal_id));
 }
 
 /** True when a non-terminal claim still needs (re)dispatch of the bound body. */
@@ -3185,6 +3558,7 @@ const PUBLIC_PRIVATE_KEYS = new Set([
   "principal",
   "principal_credential_generation",
   "principal_id",
+  "principal_revocation_epoch",
   "public_key",
   "tenant_id",
 ]);
@@ -3228,6 +3602,16 @@ function compactPublicError(value: unknown, fallbackMessage: string): PublicOwnM
   }
   if (typeof rawDetails.status === "string") {
     details.status = boundedPublicText(rawDetails.status, "unknown", 64);
+  }
+  // #162: the bounded authorization-invalidation reason and its recovery hint.
+  // Both are closed enums produced by `authorityInvalidationError`, never
+  // device- or client-supplied text, and they are useless to an operator if
+  // they only survive in the durable row.
+  if (typeof rawDetails.reason === "string") {
+    details.reason = boundedPublicText(rawDetails.reason, "unknown", 64);
+  }
+  if (typeof rawDetails.next_action === "string") {
+    details.next_action = boundedPublicText(rawDetails.next_action, "unknown", 64);
   }
   for (const key of ["http_status", "timeout_ms", "retry_after_ms"] as const) {
     const number = rawDetails[key];
@@ -3895,6 +4279,12 @@ export async function buildCanonicalAction(opts: {
   tenantId: string;
   /** Positive credential epoch read from the durable server-side principal record. */
   principalCredentialGeneration: number;
+  /**
+   * Positive revocation epoch read from the same record. Device delivery binds
+   * to this, not to the issuance generation, so a routine refresh rotation
+   * cannot invalidate already-authorized work (#162).
+   */
+  principalRevocationEpoch: number;
   /** Authenticated OAuth client id (never client-supplied). */
   oauthClientId?: string;
   /** Server-authorized E4 custody binding; never accepted from MCP arguments. */
@@ -3944,6 +4334,7 @@ export async function buildCanonicalAction(opts: {
     device_id: opts.deviceId,
     principal_id: opts.principalId,
     principal_credential_generation: opts.principalCredentialGeneration,
+    principal_revocation_epoch: opts.principalRevocationEpoch,
     tenant_id: opts.tenantId,
     oauth_client_id: opts.oauthClientId ?? null,
     workspace_id: workspaceId ?? null,
@@ -3964,7 +4355,11 @@ export async function buildCanonicalAction(opts: {
 export function semanticIdempotencyAction(
   action: Record<string, unknown>,
 ): Record<string, unknown> {
-  const { principal_credential_generation: _authorizationInstance, ...semantic } = action;
+  const {
+    principal_credential_generation: _authorizationInstance,
+    principal_revocation_epoch: _revocationInstance,
+    ...semantic
+  } = action;
   return semantic;
 }
 
@@ -4015,6 +4410,12 @@ export async function buildDeviceOperation(opts: {
   tenantId: string;
   /** Positive credential epoch read from the durable server-side principal record. */
   principalCredentialGeneration: number;
+  /**
+   * Positive revocation epoch read from the same record. Device delivery binds
+   * to this, not to the issuance generation, so a routine refresh rotation
+   * cannot invalidate already-authorized work (#162).
+   */
+  principalRevocationEpoch: number;
   expiresAt: string;
   claimVersion?: number;
   oauthClientId?: string;
@@ -4080,6 +4481,7 @@ export async function buildDeviceOperation(opts: {
       principalId: opts.principalId,
       tenantId: opts.tenantId,
       principalCredentialGeneration: opts.principalCredentialGeneration,
+      principalRevocationEpoch: opts.principalRevocationEpoch,
       oauthClientId: opts.oauthClientId,
       workspaceBinding: opts.workspaceBinding,
     }));
@@ -4446,7 +4848,7 @@ export async function finalTransferPlanHash(meta: TransferPlanMeta, grantPayload
 async function buildTransferStartOperation(opts: {
   transfer: TransferPlanMeta; role: "source" | "destination"; operationId: string;
   principal: string; tenant: string; clientId: string; ticket: string; planSha256: string;
-  grantPayloadHash: string; principalCredentialGeneration: number;
+  grantPayloadHash: string; principalCredentialGeneration: number; principalRevocationEpoch: number;
 }): Promise<Awaited<ReturnType<typeof buildDeviceOperation>>> {
   const meta = opts.transfer;
   const source = opts.role === "source";
@@ -4469,6 +4871,7 @@ async function buildTransferStartOperation(opts: {
     device_id: source ? meta.source_device_id : meta.destination_device_id,
     workspace_id: workspaceId, workspace_version: workspaceVersion, role: opts.role,
     principal_credential_generation: opts.principalCredentialGeneration,
+    principal_revocation_epoch: opts.principalRevocationEpoch,
     // The bearer is carried only on the Agent request; intentionally exclude it
     // from any public/audited action representation.
     facts: transferStartAuditedFacts(args),
@@ -4513,6 +4916,7 @@ type TransferCleanupContext = {
   tenant: string;
   clientId: string;
   principalCredentialGeneration: number;
+  principalRevocationEpoch: number;
   terminalizeTransferRoom?: McpHandleOptions["terminalizeTransferRoom"];
 };
 
@@ -4624,7 +5028,8 @@ async function reconcilePublishedSourceCleanup(
     const deviceOp = await buildDeviceOperation({
       toolName: "ownmesh_cancel_operation", operationId, deviceId: meta.source_device_id,
       principalId: context.principal, tenantId: context.tenant, expiresAt: meta.expires_at,
-      principalCredentialGeneration: context.principalCredentialGeneration, oauthClientId: context.clientId,
+      principalCredentialGeneration: context.principalCredentialGeneration,
+      principalRevocationEpoch: context.principalRevocationEpoch, oauthClientId: context.clientId,
       workspaceBinding: { workspace_id: meta.source_workspace_id, version: meta.source_workspace_version },
       args: { target_operation_id: sourceStartOperationId, idempotency_key: idempotencyKey },
     });
@@ -4657,7 +5062,8 @@ async function reconcilePublishedSourceCleanup(
   const deviceOp = await buildDeviceOperation({
     toolName: "__transfer_source_cleanup", operationId, deviceId: meta.source_device_id,
     principalId: context.principal, tenantId: context.tenant, expiresAt: meta.expires_at,
-    principalCredentialGeneration: context.principalCredentialGeneration, oauthClientId: context.clientId,
+    principalCredentialGeneration: context.principalCredentialGeneration,
+    principalRevocationEpoch: context.principalRevocationEpoch, oauthClientId: context.clientId,
     workspaceBinding: { workspace_id: meta.source_workspace_id, version: meta.source_workspace_version },
     args: { plan_id: meta.source_plan_id, epoch: meta.epoch, fence: meta.fence, idempotency_key: idempotencyKey },
   });
@@ -4843,7 +5249,7 @@ function transferNeedsFreshGeneration(meta: TransferPlanMeta, source: McpOperati
 }
 
 async function buildTransferPreflightOperation(opts: {
-  transfer: TransferPlanMeta; role: "source" | "destination"; operationId: string; principal: string; tenant: string; clientId: string; principalCredentialGeneration: number;
+  transfer: TransferPlanMeta; role: "source" | "destination"; operationId: string; principal: string; tenant: string; clientId: string; principalCredentialGeneration: number; principalRevocationEpoch: number;
 }): Promise<Awaited<ReturnType<typeof buildDeviceOperation>>> {
   const m = opts.transfer;
   const source = opts.role === "source";
@@ -4881,6 +5287,7 @@ async function buildTransferPreflightOperation(opts: {
     capability: action, action, tool: source ? "__transfer_preflight_source" : "__transfer_preflight_destination",
     device_id: deviceId, principal_id: opts.principal, tenant_id: opts.tenant, oauth_client_id: opts.clientId,
     principal_credential_generation: opts.principalCredentialGeneration,
+    principal_revocation_epoch: opts.principalRevocationEpoch,
     workspace_id: workspaceId, workspace_version: workspaceVersion,
     facts: Object.fromEntries(Object.entries(args).filter(([key]) => key !== "workspace_id")),
   };
@@ -4932,6 +5339,10 @@ export async function handleMcp(
       transport: "streamable-http",
       protocolVersion: MCP_PROTOCOL_VERSION,
       tools: PUBLISHED_MCP_TOOLS.length,
+      // #158: comparable without a bearer, so an operator or a synthetic
+      // probe can tell which catalog generation this deployment publishes.
+      service_version: SERVICE_VERSION,
+      catalog_revision: await mcpCatalogRevision(),
       policy_authority: "ownmesh_device",
     });
   }
@@ -4973,16 +5384,50 @@ export async function handleMcp(
     }
   }
 
+  const catalogRevision = await mcpCatalogRevision();
+
+  // #158: a long-lived MCP session that was established against an older
+  // catalog is stale the moment a deployment changes the published tools.
+  // This transport has no server->client push (`listChanged` stays false
+  // precisely because there is no SSE stream to deliver a notification on),
+  // so the honest alternative is to invalidate the session: MCP requires a
+  // client that receives HTTP 404 for a request carrying `Mcp-Session-Id` to
+  // start a new session by sending `initialize` again, which re-fetches the
+  // catalog. Only ids this Worker minted are checked, so a client that
+  // invents its own session id is never locked out.
+  const presentedSession = req.headers.get("mcp-session-id");
+  const presentedRevision = mcpSessionCatalogRevision(presentedSession);
+  if (method !== "initialize" && presentedRevision && presentedRevision !== catalogRevision) {
+    return json(
+      {
+        error: "mcp_session_expired",
+        reason: "tool_catalog_changed",
+        catalog_revision: catalogRevision,
+        session_catalog_revision: presentedRevision,
+      },
+      { status: 404 },
+    );
+  }
+
   if (method === "initialize") {
-    const sessionId = randomId("mcp_");
+    const sessionId = mcpSessionId(catalogRevision);
     return mcpResult(
       id,
       {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: {
+          // Deliberately false: this Streamable HTTP deployment has no
+          // server-initiated stream, so it cannot deliver
+          // `notifications/tools/list_changed`. Catalog changes are published
+          // by expiring the session above instead of by a claim the transport
+          // cannot honor.
           tools: { listChanged: false },
         },
         serverInfo: { name: SERVICE_NAME, version: SERVICE_VERSION },
+        _meta: {
+          "ownmesh/catalog_revision": catalogRevision,
+          "ownmesh/tool_count": PUBLISHED_MCP_TOOLS.length,
+        },
         instructions:
           "OwnMesh exposes device capabilities over MCP for ChatGPT-centered PC control. " +
           "After one-time CLI/TUI setup, ChatGPT is the primary operational UI. " +
@@ -5011,6 +5456,9 @@ export async function handleMcp(
         inputSchema: t.inputSchema,
         annotations: t.annotations,
       })),
+      // #158: the revision covers exactly these bytes, so a client snapshot
+      // and this deployment can be compared without diffing tool names.
+      _meta: { "ownmesh/catalog_revision": catalogRevision },
     });
   }
 
@@ -5020,6 +5468,10 @@ export async function handleMcp(
     if (!access) return mcpUnauthorized(id, issuer, "unauthorized");
     const { rec, principal } = access;
     const principalCredentialGeneration = Number(principal.credential_generation);
+    const principalRevocationEpoch = principalRevocationEpochOf(principal);
+    if (principalRevocationEpoch === null) {
+      return mcpUnauthorized(id, issuer, "invalid_token");
+    }
 
     const params = body.params || {};
     const name = String(params.name || "");
@@ -5216,7 +5668,7 @@ export async function handleMcp(
       ]);
       if (!source.ok || !destination.ok || !sourceWs.ok || !destinationWs.ok) return mcpError(id, -32004, "transfer_not_available");
       const meta: TransferPlanMeta = { transfer_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, source_path: sourcePath, destination_path: destinationPath, source_workspace_version: sourceWs.workspace.version, destination_workspace_version: destinationWs.workspace.version, epoch: 1, fence: 1, ttl_seconds: ttlSeconds, expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(), state: "planned", ...(overwriteExpected ? { overwrite_expected_sha256: overwriteExpected } : {}) };
-      const canonical = { capability: "transfer.plan", action: "transfer.plan", tool: name, principal_id: rec.principal, tenant_id: rec.tenant_id, principal_credential_generation: principalCredentialGeneration, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, facts: { source_path: sourcePath, destination_path: destinationPath, ttl_seconds: ttlSeconds, ...(overwriteExpected ? { overwrite_expected_sha256: overwriteExpected } : {}) } };
+      const canonical = { capability: "transfer.plan", action: "transfer.plan", tool: name, principal_id: rec.principal, tenant_id: rec.tenant_id, principal_credential_generation: principalCredentialGeneration, principal_revocation_epoch: principalRevocationEpoch, source_device_id: sourceDeviceId, destination_device_id: destinationDeviceId, source_workspace_id: sourceWorkspaceId, destination_workspace_id: destinationWorkspaceId, facts: { source_path: sourcePath, destination_path: destinationPath, ttl_seconds: ttlSeconds, ...(overwriteExpected ? { overwrite_expected_sha256: overwriteExpected } : {}) } };
       const claimed = await store.claimMcpOperationByIdempotency({
         operation_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, tool: name, status: "pending", summary: "transfer plan created", data: { [TRANSFER_META_KEY]: meta }, truncated: false, next_cursor: null, approval_required: false, warnings: injectWarnings, correlation_id: correlation, payload_hash: await hashCanonicalAction(canonical), idempotency_key: idem, workspace_id: sourceWorkspaceId, expires_at: meta.expires_at, claim_version: 1, action: canonical, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso(),
       });
@@ -5241,7 +5693,8 @@ export async function handleMcp(
       }
       ({ plan, meta } = await reconcileTransferStart(store, tracker, plan, meta, router ? {
         router, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id,
-        principalCredentialGeneration, terminalizeTransferRoom: opts.terminalizeTransferRoom,
+        principalCredentialGeneration, principalRevocationEpoch,
+        terminalizeTransferRoom: opts.terminalizeTransferRoom,
       } : undefined));
       ({ plan, meta } = await reconcileTransferCancellation(store, tracker, plan, meta));
       ({ plan, meta } = await reconcileTransferExpiry(store, tracker, plan, meta));
@@ -5263,6 +5716,7 @@ export async function handleMcp(
           toolName: "__transfer_artifact_get", operationId: artifactId, deviceId: meta.destination_device_id,
           principalId: rec.principal, tenantId: rec.tenant_id, expiresAt: meta.expires_at, claimVersion: 1,
           principalCredentialGeneration,
+          principalRevocationEpoch,
           oauthClientId: rec.client_id, workspaceBinding: { workspace_id: meta.destination_workspace_id, version: meta.destination_workspace_version },
           // Transport idempotency is bound by the outer operation envelope.
           // The Agent runtime contract is intentionally the exact artifact
@@ -5297,7 +5751,7 @@ export async function handleMcp(
         if (!cancellationMeta) return mcpError(id, -32004, "transfer_not_available");
         const cancelOps = await Promise.all(activeTargets.map(async ([target, deviceId, workspaceId, workspaceVersion, role]) => {
           const operationId = randomId("op_");
-          const deviceOp = await buildDeviceOperation({ toolName: "ownmesh_cancel_operation", operationId, deviceId, principalId: rec.principal, tenantId: rec.tenant_id, expiresAt: cancellationMeta.expires_at, claimVersion: 1, principalCredentialGeneration, oauthClientId: rec.client_id, workspaceBinding: { workspace_id: workspaceId, version: workspaceVersion }, args: { target_operation_id: target, idempotency_key: `transfer-cancel:${cancellationMeta.transfer_id}:${role}:${target}` } });
+          const deviceOp = await buildDeviceOperation({ toolName: "ownmesh_cancel_operation", operationId, deviceId, principalId: rec.principal, tenantId: rec.tenant_id, expiresAt: cancellationMeta.expires_at, claimVersion: 1, principalCredentialGeneration, principalRevocationEpoch, oauthClientId: rec.client_id, workspaceBinding: { workspace_id: workspaceId, version: workspaceVersion }, args: { target_operation_id: target, idempotency_key: `transfer-cancel:${cancellationMeta.transfer_id}:${role}:${target}` } });
           await store.putMcpOperation({ operation_id: operationId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: deviceId, tool: "__transfer_cancel_control", status: "pending", summary: `transfer ${role} cancellation requested`, data: { [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp), transfer_id: cancellationMeta.transfer_id, target_operation_id: target }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operationId, payload_hash: deviceOp.payload_hash, idempotency_key: `transfer-cancel:${cancellationMeta.transfer_id}:${role}:${target}`, workspace_id: workspaceId, expires_at: cancellationMeta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
           return { operationId, deviceId, deviceOp, role };
         }));
@@ -5347,7 +5801,7 @@ export async function handleMcp(
         if (meta.state === "planned") {
           if (!router) return mcpError(id, -32009, "device room unavailable");
           const preflightId = randomId("op_");
-          const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: preflightId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
+          const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: preflightId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration, principalRevocationEpoch });
           const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: "", epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${meta.transfer_id}`, coordinator_request_id: preflightId, workspace_version: meta.source_workspace_version };
           await store.putMcpOperation({ operation_id: preflightId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.source_device_id, tool: "__transfer_preflight_source", status: "pending", summary: "transfer source preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: preflightId, payload_hash: deviceOp.payload_hash, idempotency_key: preflightId, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
           const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
@@ -5390,7 +5844,7 @@ export async function handleMcp(
           const finalPlanSha256 = await finalTransferPlanHash(preliminary, grantPayloadHash, sourceDigest, sourceSize);
           const bound: TransferPlanMeta = { ...preliminary, plan_sha256: finalPlanSha256 };
           const finalSourceId = randomId("op_");
-          const deviceOp = await buildTransferPreflightOperation({ transfer: bound, role: "source", operationId: finalSourceId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
+          const deviceOp = await buildTransferPreflightOperation({ transfer: bound, role: "source", operationId: finalSourceId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration, principalRevocationEpoch });
           const expectation = { role: "source", transfer_id: bound.transfer_id, tenant_id: bound.tenant_id, plan_sha256: finalPlanSha256, epoch: bound.epoch, fence: bound.fence, expires_at: Date.parse(bound.expires_at), device_id: bound.source_device_id, workspace_id: bound.source_workspace_id, session_nonce: `nonce_${bound.transfer_id}`, coordinator_request_id: finalSourceId, workspace_version: bound.source_workspace_version };
           await store.putMcpOperation({ operation_id: finalSourceId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: bound.source_device_id, tool: "__transfer_preflight_source_final", status: "pending", summary: "transfer source final preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: finalSourceId, payload_hash: deviceOp.payload_hash, idempotency_key: finalSourceId, workspace_id: bound.source_workspace_id, expires_at: bound.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
           const routed = await router.routeToDevice(bound.source_device_id, deviceOp);
@@ -5421,7 +5875,7 @@ export async function handleMcp(
             break;
           }
           const destinationId = randomId("op_");
-          const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "destination", operationId: destinationId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
+          const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "destination", operationId: destinationId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration, principalRevocationEpoch });
           const expectation = { role: "destination", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.destination_device_id, workspace_id: meta.destination_workspace_id, session_nonce: `nonce_${meta.transfer_id}`, coordinator_request_id: destinationId, workspace_version: meta.destination_workspace_version };
           await store.putMcpOperation({ operation_id: destinationId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.destination_device_id, tool: "__transfer_preflight_destination", status: "pending", summary: "transfer destination preflight", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: destinationId, payload_hash: deviceOp.payload_hash, idempotency_key: destinationId, workspace_id: meta.destination_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
           const routed = await router.routeToDevice(meta.destination_device_id, deviceOp);
@@ -5452,7 +5906,7 @@ export async function handleMcp(
           if (!router) return mcpError(id, -32009, "device room unavailable");
           if (!meta.source_send_revalidate_operation_id) {
             const revalidateId = randomId("op_");
-            const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: revalidateId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration });
+            const deviceOp = await buildTransferPreflightOperation({ transfer: meta, role: "source", operationId: revalidateId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, principalCredentialGeneration, principalRevocationEpoch });
             const expectation = { role: "source", transfer_id: meta.transfer_id, tenant_id: meta.tenant_id, plan_sha256: meta.plan_sha256, epoch: meta.epoch, fence: meta.fence, expires_at: Date.parse(meta.expires_at), device_id: meta.source_device_id, workspace_id: meta.source_workspace_id, session_nonce: `nonce_${meta.transfer_id}`, coordinator_request_id: revalidateId, workspace_version: meta.source_workspace_version };
             await store.putMcpOperation({ operation_id: revalidateId, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: meta.source_device_id, tool: "__transfer_preflight_source_send", status: "pending", summary: "transfer source send-boundary revalidation", data: { __transfer_preflight_expectation: expectation, [DISPATCH_OUTBOX_KEY]: buildDispatchOutbox(deviceOp) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: revalidateId, payload_hash: deviceOp.payload_hash, idempotency_key: revalidateId, workspace_id: meta.source_workspace_id, expires_at: meta.expires_at, claim_version: 1, action: deviceOp.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
             const routed = await router.routeToDevice(meta.source_device_id, deviceOp);
@@ -5527,8 +5981,8 @@ export async function handleMcp(
             }, sourceReply as never, destinationReply as never, `nonce_${meta.transfer_id}`, randomId("jti_"), randomId("jti_"));
           } catch { return mcpError(id, -32009, "transfer execution proof invalid"); }
           const [sourceStart, destinationStart] = await Promise.all([
-            buildTransferStartOperation({ transfer: meta, role: "source", operationId: sourceStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.source_ticket, planSha256, grantPayloadHash, principalCredentialGeneration }),
-            buildTransferStartOperation({ transfer: meta, role: "destination", operationId: destinationStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.destination_ticket, planSha256, grantPayloadHash, principalCredentialGeneration }),
+            buildTransferStartOperation({ transfer: meta, role: "source", operationId: sourceStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.source_ticket, planSha256, grantPayloadHash, principalCredentialGeneration, principalRevocationEpoch }),
+            buildTransferStartOperation({ transfer: meta, role: "destination", operationId: destinationStartId, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id, ticket: tickets.destination_ticket, planSha256, grantPayloadHash, principalCredentialGeneration, principalRevocationEpoch }),
           ]);
           for (const [operation, deviceId, workspaceId, tool] of [[sourceStart, meta.source_device_id, meta.source_workspace_id, "__transfer_start_source"], [destinationStart, meta.destination_device_id, meta.destination_workspace_id, "__transfer_start_destination"]] as const) {
             await store.putMcpOperation({ operation_id: operation.correlation_id, tenant_id: rec.tenant_id, principal_id: rec.principal, device_id: deviceId, tool, status: "pending", summary: "ticket-bound transfer start", data: { [DISPATCH_OUTBOX_KEY]: buildTicketlessTransferStartOutbox(operation) }, truncated: false, next_cursor: null, approval_required: false, warnings: [], correlation_id: operation.correlation_id, payload_hash: operation.payload_hash, idempotency_key: operation.correlation_id, workspace_id: workspaceId, expires_at: meta.expires_at, claim_version: 1, action: operation.canonical_action, policy_authority: "ownmesh_device", created_at: nowIso(), updated_at: nowIso() });
@@ -5581,7 +6035,8 @@ export async function handleMcp(
         if (!candidate || !transfer || candidate.principal !== rec.principal || candidate.tenant_id !== rec.tenant_id) continue;
         ({ plan: candidate, meta: transfer } = await reconcileTransferStart(store, tracker, candidate, transfer, router ? {
           router, principal: rec.principal, tenant: rec.tenant_id, clientId: rec.client_id,
-          principalCredentialGeneration, terminalizeTransferRoom: opts.terminalizeTransferRoom,
+          principalCredentialGeneration, principalRevocationEpoch,
+        terminalizeTransferRoom: opts.terminalizeTransferRoom,
         } : undefined));
         ({ plan: candidate, meta: transfer } = await reconcileTransferCancellation(store, tracker, candidate, transfer));
         ({ plan: candidate, meta: transfer } = await reconcileTransferExpiry(store, tracker, candidate, transfer));
@@ -5844,6 +6299,7 @@ export async function handleMcp(
         principalId: rec.principal,
         tenantId: rec.tenant_id,
         principalCredentialGeneration,
+        principalRevocationEpoch,
         expiresAt: cancelExpiresAt,
         claimVersion: 1,
         oauthClientId: rec.client_id,
@@ -6382,6 +6838,7 @@ export async function handleMcp(
       principalId: rec.principal,
       tenantId: rec.tenant_id,
       principalCredentialGeneration,
+      principalRevocationEpoch,
       expiresAt,
       claimVersion,
       oauthClientId: rec.client_id,
@@ -6550,20 +7007,17 @@ export async function handleMcp(
         const box = readDispatchOutbox(replayed.data || {});
         if (box) {
           if (!(await boundCredentialGenerationCurrent(store, box.body))) {
+            const reason = await boundAuthorityInvalidationReason(store, box.body.payload);
             const rejected = await patchOp(
               store,
               tracker,
               replayed.operation_id,
               {
                 status: "failed",
-                summary: "operation authorization invalidated before device redelivery",
+                summary: authorityInvalidationSummary(reason, "redelivery"),
                 data: {
                   ...(replayed.data || {}),
-                  error: {
-                    code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-                    message: "principal credential rotated or was revoked before device redelivery",
-                    retryable: false,
-                  },
+                  error: authorityInvalidationError(reason, "redelivery"),
                 },
                 approval_required: false,
               },
@@ -6685,18 +7139,14 @@ export async function handleMcp(
     }
 
     if (!(await boundCredentialGenerationCurrent(store, deviceOp))) {
+      const reason = await boundAuthorityInvalidationReason(store, deviceOp.payload);
       const env = makeEnvelope({
         operation_id: operationId,
         status: "failed",
         device_id: deviceId,
-        summary: "operation authorization invalidated before device delivery",
+        summary: authorityInvalidationSummary(reason, "delivery"),
         data: {
-          error: {
-            code: "OWNMESH_E_PRINCIPAL_CREDENTIAL_GENERATION_MISMATCH",
-            message: "principal credential rotated or was revoked before device delivery",
-            retryable: false,
-            operation_id: operationId,
-          },
+          error: { ...authorityInvalidationError(reason, "delivery"), operation_id: operationId },
         },
         correlation_id: correlation,
         warnings: injectWarnings,
@@ -7427,8 +7877,13 @@ async function completeApprovalPost(
   if (denied) return denied;
   const approver = await store.getPrincipal(principal.id);
   const approverCredentialGeneration = Number(approver?.credential_generation);
-  if (!Number.isSafeInteger(approverCredentialGeneration) || approverCredentialGeneration < 1) {
-    return json({ error: "forbidden", error_description: "approver credential generation unavailable" }, { status: 403 });
+  const approverRevocationEpoch = principalRevocationEpochOf(approver ?? {});
+  if (
+    !Number.isSafeInteger(approverCredentialGeneration) ||
+    approverCredentialGeneration < 1 ||
+    approverRevocationEpoch === null
+  ) {
+    return json({ error: "forbidden", error_description: "approver authority unavailable" }, { status: 403 });
   }
   if (input.expectedOperationId && input.expectedOperationId !== op.operation_id) {
     return json({ error: "invalid_request", error_description: "operation_id mismatch" }, { status: 400 });
@@ -7729,6 +8184,7 @@ async function completeApprovalPost(
         principal_id: principal.id,
         tenant_id: principal.tenant_id,
         principal_credential_generation: approverCredentialGeneration,
+        principal_revocation_epoch: approverRevocationEpoch,
         oauth_client_id: null,
         workspace_id: op.workspace_id ?? null,
         facts: decisionFacts,
