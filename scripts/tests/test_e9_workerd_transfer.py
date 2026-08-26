@@ -646,10 +646,9 @@ def main() -> int:
             advance_until_state(
                 issuer, access, cancel_transfer_id, marker + "-cancel", {"destination_preflight"}
             )
-            public_call(issuer, access, "ownmesh_transfer_send", {
-                "transfer_id": cancel_transfer_id,
-                "idempotency_key": f"e9-send-{marker}-cancel",
-            }, 32)
+            advance_until_state(
+                issuer, access, cancel_transfer_id, marker + "-cancel", {"sending"}
+            )
             cancel_plan_id = local_plan_id_for_destination(
                 destination_root / "state", "cancel-output.bin", required_local_suffix=".json"
             )
